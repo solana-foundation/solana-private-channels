@@ -1,0 +1,32 @@
+[package]
+name = "contra-swap-program"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+] }
+
+[features]
+no-entrypoint = []
+idl = []
+devnet = []
+
+
+[dependencies]
+pinocchio = { workspace = true, features = ["copy"] }
+solana-address = { version = "2.0", features = ["curve25519"] }
+pinocchio-associated-token-account = { workspace = true }
+pinocchio-log = { workspace = true }
+pinocchio-system = { workspace = true }
+pinocchio-token = { workspace = true }
+codama = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+codama = { workspace = true }
+serde_json = { workspace = true }

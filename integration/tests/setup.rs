@@ -1,6 +1,10 @@
 #![allow(unused)]
 
 use {
+    contra_swap_program_client::{
+        instructions::{CreateDvpBuilder, FundDvpBuilder},
+        CONTRA_SWAP_PROGRAM_ID,
+    },
     solana_sdk::{
         account::AccountSharedData,
         hash::Hash,
@@ -177,6 +181,99 @@ pub fn withdraw_funds_transaction(
 
 pub fn empty_transaction(payer: &Keypair, recent_blockhash: Hash) -> Transaction {
     Transaction::new_signed_with_payer(&[], Some(&payer.pubkey()), &[payer], recent_blockhash)
+}
+
+pub fn swap_dvp_pda(
+    settlement_authority: &Pubkey,
+    user_a: &Pubkey,
+    user_b: &Pubkey,
+    mint_a: &Pubkey,
+    mint_b: &Pubkey,
+    nonce: u64,
+) -> (Pubkey, u8) {
+    let nonce_bytes = nonce.to_le_bytes();
+    Pubkey::find_program_address(
+        &[
+            b"dvp",
+            settlement_authority.as_ref(),
+            user_a.as_ref(),
+            user_b.as_ref(),
+            mint_a.as_ref(),
+            mint_b.as_ref(),
+            &nonce_bytes,
+        ],
+        &CONTRA_SWAP_PROGRAM_ID,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_dvp_transaction(
+    payer: &Keypair,
+    user_a: Pubkey,
+    user_b: Pubkey,
+    mint_a: &Pubkey,
+    mint_b: &Pubkey,
+    settlement_authority: Pubkey,
+    amount_a: u64,
+    amount_b: u64,
+    expiry_timestamp: i64,
+    earliest_settlement_timestamp: Option<i64>,
+    nonce: u64,
+    recent_blockhash: Hash,
+) -> Transaction {
+    let (swap_dvp, _) = swap_dvp_pda(
+        &settlement_authority,
+        &user_a,
+        &user_b,
+        mint_a,
+        mint_b,
+        nonce,
+    );
+    let dvp_ata_a = get_associated_token_address_with_program_id(&swap_dvp, mint_a, &spl_token::ID);
+    let dvp_ata_b = get_associated_token_address_with_program_id(&swap_dvp, mint_b, &spl_token::ID);
+
+    let mut builder = CreateDvpBuilder::new();
+    builder
+        .payer(payer.pubkey())
+        .swap_dvp(swap_dvp)
+        .mint_a(*mint_a)
+        .mint_b(*mint_b)
+        .dvp_ata_a(dvp_ata_a)
+        .dvp_ata_b(dvp_ata_b)
+        .user_a(user_a)
+        .user_b(user_b)
+        .settlement_authority(settlement_authority)
+        .amount_a(amount_a)
+        .amount_b(amount_b)
+        .expiry_timestamp(expiry_timestamp)
+        .nonce(nonce);
+    if let Some(t) = earliest_settlement_timestamp {
+        builder.earliest_settlement_timestamp(t);
+    }
+    let ix = builder.instruction();
+
+    Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], recent_blockhash)
+}
+
+pub fn fund_dvp_transaction(
+    signer: &Keypair,
+    swap_dvp: Pubkey,
+    leg_mint: &Pubkey,
+    recent_blockhash: Hash,
+) -> Transaction {
+    let signer_source_ata =
+        get_associated_token_address_with_program_id(&signer.pubkey(), leg_mint, &spl_token::ID);
+    let dvp_dest_ata =
+        get_associated_token_address_with_program_id(&swap_dvp, leg_mint, &spl_token::ID);
+
+    let ix = FundDvpBuilder::new()
+        .signer(signer.pubkey())
+        .swap_dvp(swap_dvp)
+        .signer_source_ata(signer_source_ata)
+        .dvp_dest_ata(dvp_dest_ata)
+        .instruction();
+
+    Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[signer], recent_blockhash)
 }
 
 pub fn mixed_transaction(

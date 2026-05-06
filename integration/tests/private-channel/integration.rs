@@ -355,6 +355,7 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     run_precompile_accounts_test(private_channel_ctx).await;
     run_spl_token_test(private_channel_ctx, solana_ctx, spl_token::ID).await;
     run_spl_token_test(private_channel_ctx, solana_ctx, spl_token_2022::ID).await;
+    run_swap_clock_tests(private_channel_ctx, solana_ctx).await;
     run_tx_replay_test(private_channel_ctx).await;
     run_transaction_count_test(private_channel_ctx).await;
     run_get_transaction_test(private_channel_ctx).await;

@@ -5,7 +5,7 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := build
 
-PROGRAM_DIRS := private-channel-escrow-program private-channel-withdraw-program
+PROGRAM_DIRS := private-channel-escrow-program private-channel-withdraw-program contra-swap-program
 RUST_DIRS := core indexer gateway auth
 FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
@@ -135,6 +135,7 @@ integration-test:
 	@echo "Running integration tests for all projects..."
 	@$(MAKE) -C private-channel-escrow-program integration-test
 	@$(MAKE) -C private-channel-withdraw-program integration-test
+	@$(MAKE) -C contra-swap-program integration-test
 	@# Delegate to integration/Makefile so escrow-feature grouping + the full
 	@# `[[test]]` set stay in one place. See integration/Makefile:integration-test
 	@# for the private-channel/test-tree/prod group ordering.

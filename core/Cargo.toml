@@ -17,6 +17,7 @@ bs58 = { workspace = true }
 clap = { workspace = true }
 private-channel-metrics = { path = "../metrics" }
 private-channel-withdraw-program-client = { path = "../private-channel-withdraw-program/clients/rust" }
+contra-swap-program-client = { path = "../contra-swap-program/clients/rust" }
 enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }

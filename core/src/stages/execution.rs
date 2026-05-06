@@ -12,6 +12,7 @@ use {
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
+            clock::set_clock_now,
             gasless_callback::{GaslessCallback, SnapshotCallback},
             gasless_rent_collector::GaslessRentCollector,
         },
@@ -429,6 +430,13 @@ pub async fn execute_batch(
         t_preload
     );
     metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
+
+    // Refresh the SVM's cached Clock sysvar from wall time. Contra has no
+    // real Clock source (see `crate::vm::clock`); without this, programs
+    // calling `Clock::get()` would read `unix_timestamp = 0`. Must run
+    // before any SVM execution in this batch — workers take read locks on
+    // the sysvar cache during syscalls, so a mid-batch write would deadlock.
+    set_clock_now(&execution_deps.vm);
 
     // Create processing environment and config
     let feature_set: SVMFeatureSet = SVMFeatureSet::all_enabled();

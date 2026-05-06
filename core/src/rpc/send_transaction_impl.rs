@@ -68,7 +68,7 @@ pub async fn send_transaction_impl(
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
 
-    // Filter: only accept SPL token, ATA, System Program, and Withdraw Program transactions
+    // Filter: only accept SPL token, ATA, System Program, Memo, Withdraw, and Swap Program transactions
     let is_allowed_transaction =
         sanitized_tx
             .message()
@@ -80,6 +80,7 @@ pub async fn send_transaction_impl(
                 || *program_id == solana_sdk::system_program::id()
                 || *program_id
                     == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+                || *program_id == contra_swap_program_client::CONTRA_SWAP_PROGRAM_ID
             });
 
     if !is_allowed_transaction {
@@ -96,7 +97,7 @@ pub async fn send_transaction_impl(
         );
         return Err(custom_error(
             INVALID_PARAMS_CODE,
-            "Only SPL token, ATA, Memo, System, and Withdraw program transactions are accepted",
+            "Only SPL token, ATA, Memo, System, Withdraw, and Swap program transactions are accepted",
         ));
     }
 
