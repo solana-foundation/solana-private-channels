@@ -25,7 +25,6 @@ pub const SWAP_DVP_SEED: &[u8] = b"dvp";
 
 pub const SIGNER_NOT_PARTY: u32 = ContraSwapProgramError::SignerNotParty as u32;
 pub const DVP_EXPIRED: u32 = ContraSwapProgramError::DvpExpired as u32;
-pub const LEG_ALREADY_FUNDED: u32 = ContraSwapProgramError::LegAlreadyFunded as u32;
 pub const SETTLEMENT_AUTHORITY_MISMATCH: u32 =
     ContraSwapProgramError::SettlementAuthorityMismatch as u32;
 pub const SETTLEMENT_TOO_EARLY: u32 = ContraSwapProgramError::SettlementTooEarly as u32;
@@ -76,6 +75,15 @@ impl TestContext {
         self.svm.get_sysvar::<Clock>().unix_timestamp
     }
 
+    pub fn advance_clock(&mut self, seconds: i64) {
+        let clock = self.svm.get_sysvar::<Clock>();
+        self.svm.set_sysvar(&Clock {
+            slot: clock.slot + seconds as u64,
+            unix_timestamp: clock.unix_timestamp + seconds,
+            ..clock
+        });
+    }
+
     pub fn airdrop_if_required(&mut self, pubkey: &Pubkey, lamports: u64) {
         let needs = match self.svm.get_account(pubkey) {
             Some(account) => account.lamports < MIN_LAMPORTS,
@@ -91,6 +99,10 @@ impl TestContext {
         ix: Instruction,
         signers: &[&Keypair],
     ) -> Result<TransactionMetadata, String> {
+        // Advance the blockhash before signing so back-to-back identical
+        // instructions (e.g. fund → reclaim → fund) don't collide on
+        // signature and trip litesvm's AlreadyProcessed guard.
+        self.svm.expire_blockhash();
         let mut all_signers = vec![&self.payer];
         all_signers.extend(signers);
         let tx = Transaction::new_signed_with_payer(

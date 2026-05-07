@@ -8,8 +8,6 @@ mod test_cancel_dvp;
 #[cfg(test)]
 mod test_create_dvp;
 #[cfg(test)]
-mod test_fund_dvp;
-#[cfg(test)]
 mod test_reclaim_dvp;
 #[cfg(test)]
 mod test_reject_dvp;

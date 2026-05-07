@@ -24,6 +24,13 @@ use pinocchio_token::{
 /// escrow ATAs. Rent lamports from the three closed accounts are
 /// swept to the settlement authority.
 ///
+/// Each leg transfers exactly `dvp.amount_x` to the counterparty. Any
+/// surplus held in the escrow above the leg amount (e.g. an over-deposit
+/// via raw SPL Transfer — the canonical funding path) is refunded to
+/// the leg's depositor on their own mint before the escrow is closed.
+/// This ensures the counterparty receives exactly the agreed amount and
+/// cannot capture an over-deposit.
+///
 /// # Account Layout
 /// 0. `[signer, writable]` settlement_authority - Must equal `dvp.settlement_authority`; receives closed-account rent
 /// 1. `[writable]` swap_dvp - SwapDvp PDA (signs CPIs as authority, then closed)
@@ -31,13 +38,15 @@ use pinocchio_token::{
 /// 3. `[writable]` dvp_ata_b - Escrow for the cash leg (drained, then closed)
 /// 4. `[writable]` user_a_ata_b - user_a's ATA for mint_b; receives the cash leg
 /// 5. `[writable]` user_b_ata_a - user_b's ATA for mint_a; receives the asset leg
-/// 6. `[]` token_program
+/// 6. `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund
+/// 7. `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund
+/// 8. `[]` token_program
 pub fn process_settle_dvp(
     program_id: &Address,
     accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
-    let [settlement_authority_info, swap_dvp_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, token_program_info] =
+    let [settlement_authority_info, swap_dvp_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -66,10 +75,12 @@ pub fn process_settle_dvp(
         }
     }
 
-    // All four ATAs must be canonical. The mint and user pubkeys come
+    // All six ATAs must be canonical. The mint and user pubkeys come
     // from state; the swap_dvp address is the on-chain account. Note
     // the cross: each user receives the *other* leg's mint, so user_a
-    // pairs with mint_b and user_b pairs with mint_a.
+    // pairs with mint_b and user_b pairs with mint_a. The surplus refund
+    // ATAs follow the Cancel/Reject pairing (each user gets their own
+    // mint back).
     // dvp_ata_a: DvP PDA's escrow for mint_a (asset, drained to user_b).
     verify_canonical_ata(
         dvp_ata_a_info,
@@ -98,13 +109,29 @@ pub fn process_settle_dvp(
         &dvp.mint_a,
         token_program_info,
     )?;
+    // user_a_ata_a: seller's ATA for mint_a — surplus refund destination
+    // for the asset leg. Address-only validation: only touched if
+    // surplus > 0, in which case the Transfer CPI fails naturally on an
+    // uninitialized destination.
+    verify_canonical_ata(
+        user_a_ata_a_info,
+        &dvp.user_a,
+        &dvp.mint_a,
+        token_program_info,
+    )?;
+    // user_b_ata_b: buyer's ATA for mint_b — surplus refund destination
+    // for the cash leg. Same address-only treatment as above.
+    verify_canonical_ata(
+        user_b_ata_b_info,
+        &dvp.user_b,
+        &dvp.mint_b,
+        token_program_info,
+    )?;
 
-    // Both legs must hold *at least* their target amount. We then
-    // transfer the actual balance (not `dvp.amount_x`), so any dust
-    // pre-deposited via a raw SPL Transfer rides along with the leg —
-    // user_b ends up with all of mint_a held in escrow, user_a with all
-    // of mint_b. This both prevents a dust grief on settlement and
-    // leaves a 0-balance escrow that CloseAccount accepts.
+    // Both legs must hold *at least* their target amount. Any balance
+    // above the target is treated as an over-deposit by the leg's
+    // depositor and refunded to them below, so the counterparty always
+    // receives exactly the agreed `dvp.amount_x`.
     let escrow_a_balance = TokenAccount::from_account_view(dvp_ata_a_info)?.amount();
     if escrow_a_balance < dvp.amount_a {
         return Err(ContraSwapProgramError::LegNotFunded.into());
@@ -124,7 +151,7 @@ pub fn process_settle_dvp(
         from: dvp_ata_b_info,
         to: user_a_ata_b_info,
         authority: swap_dvp_info,
-        amount: escrow_b_balance,
+        amount: dvp.amount_b,
     }
     .invoke_signed(&signer_seeds)?;
 
@@ -132,9 +159,33 @@ pub fn process_settle_dvp(
         from: dvp_ata_a_info,
         to: user_b_ata_a_info,
         authority: swap_dvp_info,
-        amount: escrow_a_balance,
+        amount: dvp.amount_a,
     }
     .invoke_signed(&signer_seeds)?;
+
+    // Refund any surplus to each leg's depositor so the escrows close
+    // empty and over-deposits don't leak to the counterparty.
+    let asset_surplus = escrow_a_balance - dvp.amount_a;
+    if asset_surplus > 0 {
+        Transfer {
+            from: dvp_ata_a_info,
+            to: user_a_ata_a_info,
+            authority: swap_dvp_info,
+            amount: asset_surplus,
+        }
+        .invoke_signed(&signer_seeds)?;
+    }
+
+    let cash_surplus = escrow_b_balance - dvp.amount_b;
+    if cash_surplus > 0 {
+        Transfer {
+            from: dvp_ata_b_info,
+            to: user_b_ata_b_info,
+            authority: swap_dvp_info,
+            amount: cash_surplus,
+        }
+        .invoke_signed(&signer_seeds)?;
+    }
 
     // Close both escrow ATAs; rent lamports go to settlement_authority.
     CloseAccount {

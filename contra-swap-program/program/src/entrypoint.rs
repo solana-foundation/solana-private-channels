@@ -3,8 +3,8 @@ use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, 
 use crate::{
     discriminator::ContraSwapInstructionDiscriminators,
     processor::{
-        process_cancel_dvp, process_create_dvp, process_fund_dvp, process_reclaim_dvp,
-        process_reject_dvp, process_settle_dvp,
+        process_cancel_dvp, process_create_dvp, process_reclaim_dvp, process_reject_dvp,
+        process_settle_dvp,
     },
 };
 
@@ -25,9 +25,6 @@ pub fn process_instruction(
     match discriminator {
         ContraSwapInstructionDiscriminators::CreateDvp => {
             process_create_dvp(program_id, accounts, instruction_data)
-        }
-        ContraSwapInstructionDiscriminators::FundDvp => {
-            process_fund_dvp(program_id, accounts, instruction_data)
         }
         ContraSwapInstructionDiscriminators::ReclaimDvp => {
             process_reclaim_dvp(program_id, accounts, instruction_data)

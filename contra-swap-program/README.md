@@ -8,7 +8,7 @@ Atomic delivery-versus-payment (DvP) escrow for P2P token swaps inside a Contra 
 
 Two parties — **`user_a`** (seller) and **`user_b`** (buyer) — agree to exchange `amount_a` of `mint_a` (the *asset* leg) for `amount_b` of `mint_b` (the *cash* leg). A third party, the **`settlement_authority`**, is the only address allowed to atomically settle the trade. Either party (or, via Cancel, the authority) can abort before settlement and recover their funded leg.
 
-The trade lives as a single `SwapDvp` PDA with two associated escrow ATAs (one per leg). Each side funds its own leg into the corresponding escrow; settlement transfers both legs in a single transaction and closes the PDA + escrows.
+The trade lives as a single `SwapDvp` PDA with two associated escrow ATAs (one per leg). Each side funds its own leg by sending tokens to the corresponding escrow ATA via a plain SPL Transfer — there's no custom funding instruction, so custodian integrations need no special program call. Settlement transfers both legs in a single transaction, refunds any over-deposit to the depositor, and closes the PDA + escrows.
 
 ## State
 
@@ -40,8 +40,9 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
                 ┌────────────────┴────────────────┐
                 ▼                                 ▼
          ┌─────────────┐                  ┌─────────────┐
-         │   Fund A    │                  │   Fund B    │  user_a / user_b
-         └──────┬──────┘                  └──────┬──────┘
+         │ SPL Transfer│                  │ SPL Transfer│  user_a / user_b
+         │ → escrow A  │                  │ → escrow B  │  (raw SPL — no
+         └──────┬──────┘                  └──────┬──────┘   program call)
                 │                                │
                 └────────────────┬───────────────┘
                                  │
@@ -60,34 +61,33 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
 | # | Name        | Signer                     | Effect                                                                          |
 |---|-------------|----------------------------|---------------------------------------------------------------------------------|
 | 0 | CreateDvp   | any                        | Allocates the SwapDvp PDA + both escrow ATAs. No funding.                       |
-| 1 | FundDvp     | `user_a` or `user_b`       | Tops up signer's leg escrow to `amount_x`.                                      |
-| 2 | ReclaimDvp  | `user_a` or `user_b`       | Drains signer's leg back to them. DvP stays open.                               |
-| 3 | SettleDvp   | `settlement_authority`     | Transfers both legs to recipients (cross), closes SwapDvp + escrows.            |
-| 4 | CancelDvp   | `settlement_authority`     | Refunds any funded legs to depositors, closes SwapDvp + escrows.                |
-| 5 | RejectDvp   | `user_a` or `user_b`       | Refunds any funded legs to depositors, closes SwapDvp + escrows.                |
+| 1 | ReclaimDvp  | `user_a` or `user_b`       | Drains signer's leg back to them. DvP stays open.                               |
+| 2 | SettleDvp   | `settlement_authority`     | Transfers `amount_x` of each leg to recipients (cross), refunds any over-deposit to the depositor, closes SwapDvp + escrows. |
+| 3 | CancelDvp   | `settlement_authority`     | Refunds any funded legs to depositors, closes SwapDvp + escrows.                |
+| 4 | RejectDvp   | `user_a` or `user_b`       | Refunds any funded legs to depositors, closes SwapDvp + escrows.                |
 
 ### Notes
 
-- **Top-up funding.** `FundDvp` transfers `amount_x − escrow_balance`, not a fixed `amount_x`. This is robust to anyone dropping tokens into the escrow ATA via a raw SPL Transfer (escrow PDAs are derivable from public state).
-- **Drain semantics.** `Settle`, `Cancel`, `Reject`, and `Reclaim` all transfer the escrow's *actual* balance, not `dvp.amount_x`. Any dust above target rides along with the leg, and the escrow is left empty so `CloseAccount` accepts it.
-- **Expiry.** `Fund`, `Reclaim`, and `Settle` reject after `expiry_timestamp`. `Cancel` and `Reject` always work — otherwise an expired-but-funded DvP would strand funds.
+- **Funding via raw SPL Transfer.** There is no on-program funding instruction. Each side deposits its leg by issuing a plain SPL Transfer to the leg's escrow ATA (escrow ATAs are derivable from public state). This keeps custodian integrations free of any custom program call.
+- **Settle clamps to `amount_x`.** Because anyone holding the leg mint can transfer tokens into an escrow ATA, the escrow may hold more than `amount_x`. Settle transfers exactly `amount_x` to the counterparty and refunds the surplus to the depositor's own-mint ATA, so over-deposits don't leak.
+- **Reclaim/Cancel/Reject drain the escrow.** These instructions transfer the escrow's *actual* balance back to the depositor, leaving a 0-balance escrow that `CloseAccount` accepts.
+- **Expiry.** `Reclaim` and `Settle` reject after `expiry_timestamp`. `Cancel` and `Reject` always work — otherwise an expired-but-funded DvP would strand funds. Funding via raw SPL Transfer is unauthenticated by the program; clients must avoid funding past expiry, but any tokens that do land are still recoverable via Cancel/Reject.
 - **Earliest settlement.** If `earliest_settlement_timestamp` is set, `Settle` additionally rejects when `now < earliest`.
 
 ## Errors
 
 | Code | Variant                       | When                                                                  |
 |------|-------------------------------|-----------------------------------------------------------------------|
-| 0    | `SignerNotParty`              | Fund/Reclaim/Reject signer is not `user_a` or `user_b`                |
-| 1    | `DvpExpired`                  | Fund/Reclaim/Settle after `expiry_timestamp`                          |
-| 2    | `LegAlreadyFunded`            | Fund called when escrow ≥ leg amount                                  |
-| 3    | `SettlementAuthorityMismatch` | Settle/Cancel signer is not `settlement_authority`                    |
-| 4    | `SettlementTooEarly`          | Settle when `now < earliest_settlement_timestamp`                     |
-| 5    | `LegNotFunded`                | Settle when an escrow holds less than its target amount               |
-| 6    | `ExpiryNotInFuture`           | Create with `expiry_timestamp <= now`                                 |
-| 7    | `EarliestAfterExpiry`         | Create with `earliest > expiry`                                       |
-| 8    | `SelfDvp`                     | Create with `user_a == user_b`                                        |
-| 9    | `SameMint`                    | Create with `mint_a == mint_b`                                        |
-| 10   | `ZeroAmount`                  | Create with `amount_a == 0` or `amount_b == 0`                        |
+| 0    | `SignerNotParty`              | Reclaim/Reject signer is not `user_a` or `user_b`                     |
+| 1    | `DvpExpired`                  | Reclaim/Settle after `expiry_timestamp`                               |
+| 2    | `SettlementAuthorityMismatch` | Settle/Cancel signer is not `settlement_authority`                    |
+| 3    | `SettlementTooEarly`          | Settle when `now < earliest_settlement_timestamp`                     |
+| 4    | `LegNotFunded`                | Settle when an escrow holds less than its target amount               |
+| 5    | `ExpiryNotInFuture`           | Create with `expiry_timestamp <= now`                                 |
+| 6    | `EarliestAfterExpiry`         | Create with `earliest > expiry`                                       |
+| 7    | `SelfDvp`                     | Create with `user_a == user_b`                                        |
+| 8    | `SameMint`                    | Create with `mint_a == mint_b`                                        |
+| 9    | `ZeroAmount`                  | Create with `amount_a == 0` or `amount_b == 0`                        |
 
 ## Build & test
 

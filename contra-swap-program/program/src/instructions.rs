@@ -5,13 +5,17 @@ use pinocchio::Address as Pubkey;
 
 /// Instructions for the Contra Swap Program.
 ///
-/// Lifecycle: Create → Fund (per leg) → Settle | (Reclaim per leg) | Cancel | Reject.
+/// Lifecycle: Create → fund each leg via raw SPL Transfer to the leg's
+/// escrow ATA → Settle | (Reclaim per leg) | Cancel | Reject. Funding
+/// is intentionally not a program instruction so that custodian
+/// integrations can use a plain SPL Transfer.
 /// Discriminator order matches `discriminator::ContraSwapInstructionDiscriminators`.
 #[repr(C, u8)]
 #[derive(Clone, Debug, PartialEq, CodamaInstructions)]
 pub enum ContraSwapProgramInstruction {
     /// Permissionless. Creates the SwapDvp PDA and both escrow ATAs.
-    /// No funding happens here; legs are deposited via `FundDvp`.
+    /// No funding happens here; each leg is deposited by sending tokens
+    /// via a raw SPL Transfer to the leg's escrow ATA.
     #[codama(account(
         name = "payer",
         docs = "Funds account/ATA creation rent",
@@ -56,29 +60,6 @@ pub enum ContraSwapProgramInstruction {
         earliest_settlement_timestamp: Option<i64>,
     } = 0,
 
-    /// Permissioned: signer must be `dvp.user_a` or `dvp.user_b`. The
-    /// signer's identity selects the leg: user_a deposits `amount_a` of
-    /// `mint_a`; user_b deposits `amount_b` of `mint_b`. The leg's
-    /// escrow must be empty (re-funding is rejected; reclaim first).
-    #[codama(account(
-        name = "signer",
-        docs = "Depositor; must equal dvp.user_a or dvp.user_b",
-        signer
-    ))]
-    #[codama(account(name = "swap_dvp", docs = "SwapDvp PDA owned by this program"))]
-    #[codama(account(
-        name = "signer_source_ata",
-        docs = "Signer's canonical ATA for the leg's mint",
-        writable
-    ))]
-    #[codama(account(
-        name = "dvp_dest_ata",
-        docs = "DvP's escrow ATA for the leg's mint",
-        writable
-    ))]
-    #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    FundDvp {} = 1,
-
     /// Permissioned: signer must be `dvp.user_a` or `dvp.user_b`. Drains
     /// the signer's leg back to the signer. The DvP stays open; the
     /// leg can be re-funded.
@@ -102,10 +83,11 @@ pub enum ContraSwapProgramInstruction {
         writable
     ))]
     #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    ReclaimDvp {} = 2,
+    ReclaimDvp {} = 1,
 
     /// Permissioned: signer must be `dvp.settlement_authority`. Atomic
     /// DvP settlement — cash to seller, asset to buyer — followed by
+    /// refunding any over-deposit surplus to each leg's depositor and
     /// closing both escrows and the SwapDvp PDA. Closed-account rent
     /// goes to the settlement authority.
     #[codama(account(
@@ -139,8 +121,18 @@ pub enum ContraSwapProgramInstruction {
         docs = "user_b's ATA for mint_a; receives the asset leg",
         writable
     ))]
+    #[codama(account(
+        name = "user_a_ata_a",
+        docs = "user_a's ATA for mint_a; receives any asset-leg surplus refund",
+        writable
+    ))]
+    #[codama(account(
+        name = "user_b_ata_b",
+        docs = "user_b's ATA for mint_b; receives any cash-leg surplus refund",
+        writable
+    ))]
     #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    SettleDvp {} = 3,
+    SettleDvp {} = 2,
 
     /// Permissioned: signer must be `dvp.settlement_authority`. Refunds
     /// any funded legs to their depositors and closes the trade. No
@@ -178,16 +170,22 @@ pub enum ContraSwapProgramInstruction {
         writable
     ))]
     #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    CancelDvp {} = 4,
+    CancelDvp {} = 3,
 
     /// Permissioned: signer must be `dvp.user_a` or `dvp.user_b`. Either
     /// counterparty can pull the plug; refunds any funded legs to their
     /// depositors and closes the trade. Closed-account rent goes to the
-    /// rejecting signer.
+    /// settlement authority (recorded in dvp.settlement_authority), keeping
+    /// rent accounting consistent with Settle and Cancel.
     #[codama(account(
         name = "signer",
-        docs = "Must equal dvp.user_a or dvp.user_b; receives closed-account rent",
+        docs = "Must equal dvp.user_a or dvp.user_b",
         signer,
+        writable
+    ))]
+    #[codama(account(
+        name = "settlement_authority",
+        docs = "Must equal dvp.settlement_authority; receives closed-account rent",
         writable
     ))]
     #[codama(account(
@@ -216,5 +214,5 @@ pub enum ContraSwapProgramInstruction {
         writable
     ))]
     #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    RejectDvp {} = 5,
+    RejectDvp {} = 4,
 }

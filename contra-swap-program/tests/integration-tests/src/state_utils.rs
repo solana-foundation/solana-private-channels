@@ -1,12 +1,12 @@
 use contra_swap_program_client::instructions::{
-    CancelDvpBuilder, CreateDvpBuilder, FundDvpBuilder, ReclaimDvpBuilder, RejectDvpBuilder,
-    SettleDvpBuilder,
+    CancelDvpBuilder, CreateDvpBuilder, ReclaimDvpBuilder, RejectDvpBuilder, SettleDvpBuilder,
 };
 use litesvm::types::TransactionMetadata;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
+use spl_token::{instruction::transfer as spl_transfer, ID as TOKEN_PROGRAM_ID};
 
 use crate::utils::{create_ata, dvp_ata, fund_wallet_ata, set_mint, swap_dvp_pda, TestContext};
 
@@ -99,24 +99,51 @@ pub fn assert_create_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
     context.send(ix, &[]).expect("CreateDvp")
 }
 
+/// Fund the asset leg by transferring `amount` of `mint_a` from
+/// `user_a_ata_a` to the escrow `dvp_ata_a` via a raw SPL Transfer.
+/// This is the canonical funding path — the program has no FundDvp
+/// instruction; legs are funded by ordinary token transfers so that
+/// custodian integrations need no custom program call.
+pub fn assert_fund_a_amount(
+    context: &mut TestContext,
+    fixture: &DvpFixture,
+    amount: u64,
+) -> TransactionMetadata {
+    let ix = spl_transfer(
+        &TOKEN_PROGRAM_ID,
+        &fixture.user_a_ata_a,
+        &fixture.dvp_ata_a,
+        &fixture.user_a.pubkey(),
+        &[],
+        amount,
+    )
+    .expect("build SPL transfer A");
+    context.send(ix, &[&fixture.user_a]).expect("fund leg A")
+}
+
+pub fn assert_fund_b_amount(
+    context: &mut TestContext,
+    fixture: &DvpFixture,
+    amount: u64,
+) -> TransactionMetadata {
+    let ix = spl_transfer(
+        &TOKEN_PROGRAM_ID,
+        &fixture.user_b_ata_b,
+        &fixture.dvp_ata_b,
+        &fixture.user_b.pubkey(),
+        &[],
+        amount,
+    )
+    .expect("build SPL transfer B");
+    context.send(ix, &[&fixture.user_b]).expect("fund leg B")
+}
+
 pub fn assert_fund_a(context: &mut TestContext, fixture: &DvpFixture) -> TransactionMetadata {
-    let ix = FundDvpBuilder::new()
-        .signer(fixture.user_a.pubkey())
-        .swap_dvp(fixture.swap_dvp)
-        .signer_source_ata(fixture.user_a_ata_a)
-        .dvp_dest_ata(fixture.dvp_ata_a)
-        .instruction();
-    context.send(ix, &[&fixture.user_a]).expect("FundDvp A")
+    assert_fund_a_amount(context, fixture, AMOUNT_A)
 }
 
 pub fn assert_fund_b(context: &mut TestContext, fixture: &DvpFixture) -> TransactionMetadata {
-    let ix = FundDvpBuilder::new()
-        .signer(fixture.user_b.pubkey())
-        .swap_dvp(fixture.swap_dvp)
-        .signer_source_ata(fixture.user_b_ata_b)
-        .dvp_dest_ata(fixture.dvp_ata_b)
-        .instruction();
-    context.send(ix, &[&fixture.user_b]).expect("FundDvp B")
+    assert_fund_b_amount(context, fixture, AMOUNT_B)
 }
 
 pub fn assert_reclaim_a(context: &mut TestContext, fixture: &DvpFixture) -> TransactionMetadata {
@@ -137,6 +164,8 @@ pub fn assert_settle_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_b(fixture.user_a_ata_b)
         .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
         .instruction();
     context
         .send(ix, &[&fixture.settlement_authority])
@@ -164,6 +193,7 @@ pub fn assert_reject_dvp(
 ) -> TransactionMetadata {
     let ix = RejectDvpBuilder::new()
         .signer(signer.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)

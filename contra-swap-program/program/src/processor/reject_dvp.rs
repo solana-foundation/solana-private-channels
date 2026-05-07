@@ -19,23 +19,24 @@ use pinocchio_token::{
 /// respective depositors and closing the SwapDvp + both escrow ATAs.
 /// No expiry check — Reject must work post-expiry too.
 ///
-/// Closed-account rent goes to the rejecting signer (not necessarily
-/// the original payer of CreateDvp).
+/// Closed-account rent goes to `dvp.settlement_authority`, matching the
+/// rent-recipient convention used by Settle and Cancel.
 ///
 /// # Account Layout
-/// 0. `[signer, writable]` signer - Must equal `dvp.user_a` or `dvp.user_b`; receives closed-account rent
-/// 1. `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
-/// 2. `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
-/// 3. `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
-/// 4. `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
-/// 5. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
-/// 6. `[]` token_program
+/// 0. `[signer, writable]` signer - Must equal `dvp.user_a` or `dvp.user_b`
+/// 1. `[writable]` settlement_authority - Must equal `dvp.settlement_authority`; receives closed-account rent
+/// 2. `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
+/// 3. `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
+/// 4. `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
+/// 5. `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
+/// 6. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
+/// 7. `[]` token_program
 pub fn process_reject_dvp(
     program_id: &Address,
     accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
-    let [signer_info, swap_dvp_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_info] =
+    let [signer_info, settlement_authority_info, swap_dvp_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -52,6 +53,10 @@ pub fn process_reject_dvp(
 
     if signer_info.address() != &dvp.user_a && signer_info.address() != &dvp.user_b {
         return Err(ContraSwapProgramError::SignerNotParty.into());
+    }
+
+    if settlement_authority_info.address() != &dvp.settlement_authority {
+        return Err(ContraSwapProgramError::SettlementAuthorityMismatch.into());
     }
 
     // Address-only validation: an unfunded leg's user ATA can be
@@ -118,21 +123,21 @@ pub fn process_reject_dvp(
 
     CloseAccount {
         account: dvp_ata_a_info,
-        destination: signer_info,
+        destination: settlement_authority_info,
         authority: swap_dvp_info,
     }
     .invoke_signed(&signer_seeds)?;
 
     CloseAccount {
         account: dvp_ata_b_info,
-        destination: signer_info,
+        destination: settlement_authority_info,
         authority: swap_dvp_info,
     }
     .invoke_signed(&signer_seeds)?;
 
-    let signer_lamports = signer_info.lamports();
-    signer_info.set_lamports(
-        signer_lamports
+    let authority_lamports = settlement_authority_info.lamports();
+    settlement_authority_info.set_lamports(
+        authority_lamports
             .checked_add(swap_dvp_info.lamports())
             .ok_or(ProgramError::ArithmeticOverflow)?,
     );

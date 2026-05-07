@@ -23,7 +23,9 @@ use pinocchio_associated_token_account::instructions::Create as CreateAta;
 /// Processes the CreateDvp instruction.
 ///
 /// Permissionless: any signer can pay the rent. The DvP starts empty;
-/// `FundDvp` deposits each leg separately.
+/// each leg is deposited by sending tokens to the leg's escrow ATA via
+/// a raw SPL Transfer (the canonical funding path so that custodian
+/// integrations need no custom program call).
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Funds account/ATA creation rent

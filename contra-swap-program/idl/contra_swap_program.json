@@ -127,53 +127,47 @@
       {
         "code": 2,
         "kind": "errorNode",
-        "message": "DvP leg is already funded",
-        "name": "legAlreadyFunded"
-      },
-      {
-        "code": 3,
-        "kind": "errorNode",
         "message": "Signer is not the settlement authority",
         "name": "settlementAuthorityMismatch"
       },
       {
-        "code": 4,
+        "code": 3,
         "kind": "errorNode",
         "message": "Settlement is not yet allowed",
         "name": "settlementTooEarly"
       },
       {
-        "code": 5,
+        "code": 4,
         "kind": "errorNode",
         "message": "DvP leg is not funded with the expected amount",
         "name": "legNotFunded"
       },
       {
-        "code": 6,
+        "code": 5,
         "kind": "errorNode",
         "message": "DvP expiry must be in the future at creation",
         "name": "expiryNotInFuture"
       },
       {
-        "code": 7,
+        "code": 6,
         "kind": "errorNode",
         "message": "Earliest settlement must not be after expiry",
         "name": "earliestAfterExpiry"
       },
       {
-        "code": 8,
+        "code": 7,
         "kind": "errorNode",
         "message": "user_a and user_b must differ",
         "name": "selfDvp"
       },
       {
-        "code": 9,
+        "code": 8,
         "kind": "errorNode",
         "message": "mint_a and mint_b must differ",
         "name": "sameMint"
       },
       {
-        "code": 10,
+        "code": 9,
         "kind": "errorNode",
         "message": "DvP leg amounts must be non-zero",
         "name": "zeroAmount"
@@ -183,63 +177,81 @@
       {
         "accounts": [
           {
-            "docs": ["Funds account/ATA creation rent"],
+            "docs": [
+              "Funds account/ATA creation rent"
+            ],
             "isSigner": true,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "payer"
           },
           {
-            "docs": ["SwapDvp PDA to be created"],
+            "docs": [
+              "SwapDvp PDA to be created"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
           },
           {
-            "docs": ["Mint of the asset leg (seller delivers)"],
+            "docs": [
+              "Mint of the asset leg (seller delivers)"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "mintA"
           },
           {
-            "docs": ["Mint of the cash leg (buyer delivers)"],
+            "docs": [
+              "Mint of the cash leg (buyer delivers)"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "mintB"
           },
           {
-            "docs": ["swap_dvp's ATA for mint_a (created here)"],
+            "docs": [
+              "swap_dvp's ATA for mint_a (created here)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaA"
           },
           {
-            "docs": ["swap_dvp's ATA for mint_b (created here)"],
+            "docs": [
+              "swap_dvp's ATA for mint_b (created here)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaB"
           },
           {
-            "docs": ["System program"],
+            "docs": [
+              "System program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "systemProgram"
           },
           {
-            "docs": ["SPL Token program"],
+            "docs": [
+              "SPL Token program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgram"
           },
           {
-            "docs": ["Associated Token Account program"],
+            "docs": [
+              "Associated Token Account program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
@@ -349,35 +361,45 @@
       {
         "accounts": [
           {
-            "docs": ["Depositor; must equal dvp.user_a or dvp.user_b"],
+            "docs": [
+              "Depositor; must equal dvp.user_a or dvp.user_b"
+            ],
             "isSigner": true,
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "signer"
           },
           {
-            "docs": ["SwapDvp PDA owned by this program"],
+            "docs": [
+              "SwapDvp PDA (signs the transfer as authority)"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
           },
           {
-            "docs": ["Signer's canonical ATA for the leg's mint"],
+            "docs": [
+              "DvP's escrow ATA for the leg's mint"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "signerSourceAta"
+            "name": "dvpSourceAta"
           },
           {
-            "docs": ["DvP's escrow ATA for the leg's mint"],
+            "docs": [
+              "Signer's canonical ATA for the leg's mint"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "dvpDestAta"
+            "name": "signerDestAta"
           },
           {
-            "docs": ["SPL Token program"],
+            "docs": [
+              "SPL Token program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
@@ -389,70 +411,6 @@
             "defaultValue": {
               "kind": "numberValueNode",
               "number": 1
-            },
-            "defaultValueStrategy": "omitted",
-            "kind": "instructionArgumentNode",
-            "name": "discriminator",
-            "type": {
-              "endian": "le",
-              "format": "u8",
-              "kind": "numberTypeNode"
-            }
-          }
-        ],
-        "discriminators": [
-          {
-            "kind": "fieldDiscriminatorNode",
-            "name": "discriminator",
-            "offset": 0
-          }
-        ],
-        "kind": "instructionNode",
-        "name": "fundDvp"
-      },
-      {
-        "accounts": [
-          {
-            "docs": ["Depositor; must equal dvp.user_a or dvp.user_b"],
-            "isSigner": true,
-            "isWritable": false,
-            "kind": "instructionAccountNode",
-            "name": "signer"
-          },
-          {
-            "docs": ["SwapDvp PDA (signs the transfer as authority)"],
-            "isSigner": false,
-            "isWritable": false,
-            "kind": "instructionAccountNode",
-            "name": "swapDvp"
-          },
-          {
-            "docs": ["DvP's escrow ATA for the leg's mint"],
-            "isSigner": false,
-            "isWritable": true,
-            "kind": "instructionAccountNode",
-            "name": "dvpSourceAta"
-          },
-          {
-            "docs": ["Signer's canonical ATA for the leg's mint"],
-            "isSigner": false,
-            "isWritable": true,
-            "kind": "instructionAccountNode",
-            "name": "signerDestAta"
-          },
-          {
-            "docs": ["SPL Token program"],
-            "isSigner": false,
-            "isWritable": false,
-            "kind": "instructionAccountNode",
-            "name": "tokenProgram"
-          }
-        ],
-        "arguments": [
-          {
-            "defaultValue": {
-              "kind": "numberValueNode",
-              "number": 2
             },
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
@@ -486,42 +444,72 @@
             "name": "settlementAuthority"
           },
           {
-            "docs": ["SwapDvp PDA (signs CPIs, then closed)"],
+            "docs": [
+              "SwapDvp PDA (signs CPIs, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
           },
           {
-            "docs": ["Asset escrow (drained, then closed)"],
+            "docs": [
+              "Asset escrow (drained, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaA"
           },
           {
-            "docs": ["Cash escrow (drained, then closed)"],
+            "docs": [
+              "Cash escrow (drained, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaB"
           },
           {
-            "docs": ["user_a's ATA for mint_b; receives the cash leg"],
+            "docs": [
+              "user_a's ATA for mint_b; receives the cash leg"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "userAAtaB"
           },
           {
-            "docs": ["user_b's ATA for mint_a; receives the asset leg"],
+            "docs": [
+              "user_b's ATA for mint_a; receives the asset leg"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "userBAtaA"
           },
           {
-            "docs": ["SPL Token program"],
+            "docs": [
+              "user_a's ATA for mint_a; receives any asset-leg surplus refund"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "userAAtaA"
+          },
+          {
+            "docs": [
+              "user_b's ATA for mint_b; receives any cash-leg surplus refund"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "userBAtaB"
+          },
+          {
+            "docs": [
+              "SPL Token program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
@@ -532,7 +520,7 @@
           {
             "defaultValue": {
               "kind": "numberValueNode",
-              "number": 3
+              "number": 2
             },
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
@@ -566,42 +554,54 @@
             "name": "settlementAuthority"
           },
           {
-            "docs": ["SwapDvp PDA (signs CPIs, then closed)"],
+            "docs": [
+              "SwapDvp PDA (signs CPIs, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
           },
           {
-            "docs": ["Asset escrow (drained if funded, then closed)"],
+            "docs": [
+              "Asset escrow (drained if funded, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaA"
           },
           {
-            "docs": ["Cash escrow (drained if funded, then closed)"],
+            "docs": [
+              "Cash escrow (drained if funded, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaB"
           },
           {
-            "docs": ["user_a's ATA for mint_a; refund destination"],
+            "docs": [
+              "user_a's ATA for mint_a; refund destination"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "userAAtaA"
           },
           {
-            "docs": ["user_b's ATA for mint_b; refund destination"],
+            "docs": [
+              "user_b's ATA for mint_b; refund destination"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "userBAtaB"
           },
           {
-            "docs": ["SPL Token program"],
+            "docs": [
+              "SPL Token program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
@@ -612,7 +612,7 @@
           {
             "defaultValue": {
               "kind": "numberValueNode",
-              "number": 4
+              "number": 3
             },
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
@@ -638,7 +638,7 @@
         "accounts": [
           {
             "docs": [
-              "Must equal dvp.user_a or dvp.user_b; receives closed-account rent"
+              "Must equal dvp.user_a or dvp.user_b"
             ],
             "isSigner": true,
             "isWritable": true,
@@ -646,42 +646,63 @@
             "name": "signer"
           },
           {
-            "docs": ["SwapDvp PDA (signs CPIs, then closed)"],
+            "docs": [
+              "Must equal dvp.settlement_authority; receives closed-account rent"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "settlementAuthority"
+          },
+          {
+            "docs": [
+              "SwapDvp PDA (signs CPIs, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
           },
           {
-            "docs": ["Asset escrow (drained if funded, then closed)"],
+            "docs": [
+              "Asset escrow (drained if funded, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaA"
           },
           {
-            "docs": ["Cash escrow (drained if funded, then closed)"],
+            "docs": [
+              "Cash escrow (drained if funded, then closed)"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "dvpAtaB"
           },
           {
-            "docs": ["user_a's ATA for mint_a; refund destination"],
+            "docs": [
+              "user_a's ATA for mint_a; refund destination"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "userAAtaA"
           },
           {
-            "docs": ["user_b's ATA for mint_b; refund destination"],
+            "docs": [
+              "user_b's ATA for mint_b; refund destination"
+            ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "userBAtaB"
           },
           {
-            "docs": ["SPL Token program"],
+            "docs": [
+              "SPL Token program"
+            ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
@@ -692,7 +713,7 @@
           {
             "defaultValue": {
               "kind": "numberValueNode",
-              "number": 5
+              "number": 4
             },
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
