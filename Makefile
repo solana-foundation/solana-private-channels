@@ -36,7 +36,16 @@ install-toolchain:
 	elif ! command -v solana >/dev/null 2>&1 || \
 	     [ "$$(solana --version 2>/dev/null | awk '{print $$2}')" != "$$SOLANA_VERSION" ]; then \
 	    echo "Installing Solana CLI v$$SOLANA_VERSION..."; \
-	    sh -c "$$(curl -sSfL https://release.anza.xyz/v$$SOLANA_VERSION/install)"; \
+	    attempt=0; \
+	    until sh -c "$$(curl -sSfL https://release.anza.xyz/v$$SOLANA_VERSION/install)"; do \
+	        attempt=$$((attempt + 1)); \
+	        if [ "$$attempt" -ge 3 ]; then \
+	            echo "Solana CLI install failed after 3 attempts"; exit 1; \
+	        fi; \
+	        delay=$$((attempt * 10)); \
+	        echo "Solana CLI install attempt $$attempt failed (transient network error from solana-install fetching the tarball); retrying in $${delay}s..."; \
+	        sleep "$$delay"; \
+	    done; \
 	else \
 	    echo "Solana CLI already at v$$SOLANA_VERSION — skipping"; \
 	fi
