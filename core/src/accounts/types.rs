@@ -92,7 +92,14 @@ impl StoredTransaction {
                                                 .into_vec()
                                                 .unwrap_or_default(),
                                         },
-                                        _ => panic!("Unexpected instruction type"),
+                                        // `inner_instructions` is constructed solely from
+                                        // `UiInstruction::Compiled` by `StoredTransaction`'s
+                                        // own builders (see `UiInstruction::Compiled(...)`
+                                        // construction further down in this file). The
+                                        // `Parsed` variant is never produced or accepted.
+                                        _ => unreachable!(
+                                            "inner_instructions only contains Compiled variants"
+                                        ),
                                     },
                                     stack_height: None,
                                 })

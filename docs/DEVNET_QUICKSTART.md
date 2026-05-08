@@ -288,7 +288,7 @@ docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .
 
 ## Get Help
 
-Solana Private Channels is still in the early stages of development. If you run into issues or bugs, please [create an issue](https://github.com/solana-foundation/contra/issues) and outline your steps to reproduce it. 
+Solana Private Channels is still in the early stages of development. If you run into issues or bugs, please [create an issue](https://github.com/solana-foundation/solana-private-channels/issues) and outline your steps to reproduce it. 
 
 ## Configuration Reference
 

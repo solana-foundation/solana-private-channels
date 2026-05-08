@@ -23,7 +23,7 @@ jobs:
   init-coverage-table:
     name: Initialize Coverage Table
     if: github.event_name == 'pull_request'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - name: Insert coverage skeleton into PR body
         uses: actions/github-script@v7
@@ -71,7 +71,7 @@ jobs:
 
   changes:
     name: Detect Changed Areas
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     outputs:
       rust_checks: ${{ steps.filter.outputs.rust_checks }}
       integration: ${{ steps.filter.outputs.integration }}
@@ -129,7 +129,7 @@ jobs:
     name: Build Shared Artifacts
     needs: changes
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
 
@@ -164,7 +164,7 @@ jobs:
     name: Check
     needs: changes
     if: needs.changes.outputs.rust_checks == 'true'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
 
@@ -195,7 +195,7 @@ jobs:
     name: Format
     needs: changes
     if: needs.changes.outputs.rust_checks == 'true'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
 
@@ -228,7 +228,7 @@ jobs:
     name: Clippy
     needs: changes
     if: needs.changes.outputs.rust_checks == 'true'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
 
@@ -260,7 +260,7 @@ jobs:
     name: Rust Integration Tests + E2E Coverage
     needs: [changes, build-artifacts]
     if: needs.changes.outputs.integration == 'true'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
 
@@ -330,7 +330,7 @@ jobs:
     name: Core + Indexer Unit Coverage
     needs: [changes, build-artifacts]
     if: needs.changes.outputs.core_indexer == 'true'
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
 

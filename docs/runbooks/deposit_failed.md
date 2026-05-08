@@ -18,10 +18,10 @@ maps to a specific sender-side site:
 | `error_message` | Source | Trigger |
 |---|---|---|
 | starts with `Failed idempotency lookup for transaction_id` | `sender/mint.rs` | `getSignaturesForAddress` RPC failed during pre-send memo scan. |
-| `Mint initialization failed` | `sender/transaction.rs` | Recipient's mint or ATA wasn't initialized; just-in-time init also failed. |
+| `Mint initialization failed` | `sender/transaction.rs` | The just-in-time `InitializeMint` transaction itself failed (e.g. RPC outage during init or send error). The *post-JIT* mint failure case (mint exists but unusable) has been peeled off into [`deposit_manual_review.md`](deposit_manual_review.md) § Path D. |
 | `Unexpected mint error` | `sender/transaction.rs` | `MintNotInitialized` confirmation result on a non-Mint tx (defensive; should never fire). |
 | `Confirmation failed - transaction status unknown, unsafe to retry` | `sender/transaction.rs` | RPC polling timed out for a non-idempotent send; mint may or may not have landed. |
-| free-form (often a program-error debug repr) | `sender/transaction.rs` | On-chain program error during confirmation (e.g. paused mint, bad mint authority) or RPC confirmation error. |
+| free-form (often a program-error debug repr) | `sender/transaction.rs` | On-chain program error during confirmation (e.g. paused mint, bad mint authority — `OwnerMismatch` from SPL Token's `mint_to`) or RPC confirmation error. **The most common rotated-admin-key case lands here, not in `manual_review`** — `OwnerMismatch` is `Custom(3)`, which is not in the JIT-trigger classifier's allow-list. |
 
 ## Recovery
 
@@ -91,6 +91,14 @@ Stop. [Escalate](_escalation.md) (Tier 2). Do not act.
 Re-arming to `pending` in the `AMBIGUOUS` case relies on the operator's
 own idempotency check; that check uses the same lookback window and will
 be just as blind. Do not lean on it alone for an old `processed_at`.
+
+## Cross-link — when ManualReview is the right runbook
+
+If you expected `Mint initialization failed` here but the row is in
+`manual_review` instead, see
+[`deposit_manual_review.md`](deposit_manual_review.md) § Path D —
+that's the path for a successful (or unnecessary) JIT followed by a
+structural mint problem (wrong authority, corrupt data).
 
 ## Special case - `Failed idempotency lookup`
 

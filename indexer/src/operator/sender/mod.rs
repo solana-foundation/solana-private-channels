@@ -5,7 +5,7 @@ mod state;
 mod transaction;
 pub mod types;
 
-pub use mint::{find_existing_mint_signature, find_existing_mint_signature_with_memo};
+pub use mint::{find_existing_mint_signature, find_existing_mint_signature_with_memo, JitOutcome};
 pub use types::TransactionStatusUpdate;
 
 #[cfg(any(test, feature = "test-mock-storage"))]
@@ -48,7 +48,7 @@ pub mod test_hooks {
         state: &mut SenderState,
         transaction_id: i64,
         instruction: super::types::InstructionWithSigners,
-    ) -> Option<super::types::InstructionWithSigners> {
+    ) -> super::mint::JitOutcome {
         super::mint::try_jit_mint_initialization(state, transaction_id, instruction).await
     }
 

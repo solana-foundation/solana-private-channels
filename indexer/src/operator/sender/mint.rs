@@ -11,6 +11,7 @@ use solana_keychain::SolanaSigner;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::program_option::COption;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::parse_instruction::ParsedInstruction;
@@ -34,32 +35,151 @@ struct ExpectedMintInstruction {
     amount: u64,
 }
 
-/// Attempt JIT mint initialization by sending initialize_mint transaction first
-/// Returns Some(mint_to_instruction) if successful, None if failed
+/// Verdict from `try_jit_mint_initialization`. The caller in
+/// `transaction.rs` matches on this to decide whether to recursively retry,
+/// quarantine the deposit to ManualReview, or route to the existing
+/// PermanentFailure path. The `String` payloads are operator-visible
+/// `error_message`s; ManualReview reasons are constructed in full here
+/// (with the literal `"Mint instruction failed after JIT: "` prefix) so
+/// `drill_1` can grep the runbook-dispatch substrings in a single source
+/// file.
+pub enum JitOutcome {
+    /// Mint is correctly initialized with the operator's admin as
+    /// `mint_authority`. Caller should retry the supplied instruction.
+    Retry(InstructionWithSigners),
+
+    /// Mint exists on-chain but in a state the operator cannot fix by
+    /// re-issuing `mint_to` (wrong authority, corrupt data, or post-init
+    /// inconsistency). Caller routes to `ManualReview`.
+    ManualReview(String),
+
+    /// Transient or builder failure (RPC, mint cache miss, build error).
+    /// Caller routes to the existing permanent-failure path (`Failed`
+    /// status).
+    PermanentFailure(String),
+}
+
+/// Outcome of decoding raw mint account bytes and comparing the embedded
+/// `mint_authority` to the operator's admin pubkey. Drives the
+/// `JitOutcome` branching in `try_jit_mint_initialization`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AuthorityCheck {
+    /// Mint decoded; `is_initialized = true`; `mint_authority` equals the
+    /// supplied expected authority. Retry is safe.
+    Match,
+    /// Mint decoded; `is_initialized = true`; `mint_authority` does NOT
+    /// equal the expected authority. Holds the actual authority for log /
+    /// error context. Quarantine to ManualReview.
+    Mismatch(Pubkey),
+    /// Mint decoded but `is_initialized = false`. The account is allocated
+    /// and SPL-Token-owned but not yet a mint. JIT proceeds to
+    /// InitializeMint.
+    Uninitialized,
+    /// Decode failed: data length wrong, COption discriminant invalid, or
+    /// other corruption. Quarantine to ManualReview — the operator cannot
+    /// recover this without engineering intervention.
+    CorruptData,
+}
+
+/// Decode `data` as an SPL `Mint` and classify it relative to the supplied
+/// expected authority.
+///
+/// SPL's `Mint::unpack` rejects uninitialized data (returns `Err`), which
+/// would conflate the legitimate "mint allocated but `is_initialized =
+/// false`" state with genuine corruption. To distinguish, this helper uses
+/// `Mint::unpack_unchecked` and inspects `is_initialized` itself.
+///
+/// Returns:
+/// - `Match` if decoded, initialized, and `mint_authority` equals the
+///   supplied `expected_authority`.
+/// - `Mismatch(actual)` if decoded and initialized but the authority
+///   differs. A mint with `mint_authority = COption::None` is treated as
+///   `Mismatch(Pubkey::default())` — the operator cannot `mint_to` a
+///   no-authority mint either way.
+/// - `Uninitialized` if the bytes decode but `is_initialized = false`
+///   (allocated, SPL-Token-owned, but not yet a mint).
+/// - `CorruptData` for any decode failure (wrong length, invalid `COption`
+///   discriminant, etc.).
+pub(super) fn decode_and_check_authority(
+    data: &[u8],
+    expected_authority: &Pubkey,
+) -> AuthorityCheck {
+    // `unpack_unchecked` differs from `unpack` only in skipping the
+    // is_initialized check, so wrong-length / invalid-discriminant inputs
+    // still surface as `Err` here.
+    let mint = match Mint::unpack_unchecked(data) {
+        Ok(m) => m,
+        Err(_) => return AuthorityCheck::CorruptData,
+    };
+    if !mint.is_initialized {
+        return AuthorityCheck::Uninitialized;
+    }
+    match mint.mint_authority {
+        COption::Some(actual) if actual == *expected_authority => AuthorityCheck::Match,
+        COption::Some(actual) => AuthorityCheck::Mismatch(actual),
+        COption::None => AuthorityCheck::Mismatch(Pubkey::default()),
+    }
+}
+
+// Operator-visible error_message literals constructed in this file.
+// Pinned by `drill_1_error_message_contracts_present_in_source` and the
+// runbook dispatch tables in `docs/runbooks/deposit_manual_review.md`.
+const MR_AUTHORITY_MISMATCH_PRECHECK: &str =
+    "Mint instruction failed after JIT: mint_authority mismatch — admin key rotated or mint owned by another authority";
+const MR_AUTHORITY_MISMATCH_POSTINIT: &str =
+    "Mint instruction failed after JIT: mint_authority mismatch — race with concurrent admin rotation during InitializeMint";
+const MR_CORRUPT_MINT_STATE: &str =
+    "Mint instruction failed after JIT: corrupt mint state on-chain — decode failed";
+
+/// Attempt JIT mint initialization. Returns a `JitOutcome` verdict for the
+/// caller to dispatch (Retry / ManualReview / PermanentFailure).
 pub(super) async fn try_jit_mint_initialization(
     state: &mut SenderState,
     transaction_id: i64,
     instruction: InstructionWithSigners,
-) -> Option<InstructionWithSigners> {
-    // 1. Get cached builder
-    let builder = state.mint_builders.get(&transaction_id)?.clone();
+) -> JitOutcome {
+    // 1. Get cached builder + extract mint.
+    let Some(builder) = state.mint_builders.get(&transaction_id).cloned() else {
+        return JitOutcome::PermanentFailure(format!(
+            "no cached MintToBuilder for transaction_id {}",
+            transaction_id
+        ));
+    };
+    let Some(mint) = builder.get_mint() else {
+        return JitOutcome::PermanentFailure(format!(
+            "MintToBuilder for transaction_id {} is missing mint pubkey",
+            transaction_id
+        ));
+    };
 
-    // 2. Extract mint pubkey
-    let mint = builder.get_mint()?;
+    let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
-    // 3. Check if mint is initialized on PrivateChannel. An account may exist at the
-    // mint address (allocated via `create_account`) with non-empty zeroed data
-    // and `is_initialized = false`; treating that as "present" skips JIT and
-    // the subsequent `mint_to` fails with `UninitializedAccount`. Gate on
-    // initialization, matching the `mint_is_initialized_on_chain` fallback.
+    // 2. Pre-check on-chain mint state.
     match state.rpc_client.get_account_data(&mint).await {
-        Ok(data) if is_initialized_mint_data(&data) => return Some(instruction),
-        Ok(_) => {
-            info!(
-                "Mint {} not initialized on PrivateChannel - attempting JIT initialization",
-                mint
-            );
-        }
+        Ok(data) => match decode_and_check_authority(&data, &admin_pubkey) {
+            AuthorityCheck::Match => return JitOutcome::Retry(instruction),
+            AuthorityCheck::Mismatch(actual) => {
+                warn!(
+                    "JIT pre-check: mint {} initialized with authority {} (expected admin {})",
+                    mint, actual, admin_pubkey
+                );
+                return JitOutcome::ManualReview(MR_AUTHORITY_MISMATCH_PRECHECK.to_string());
+            }
+            AuthorityCheck::CorruptData => {
+                warn!(
+                    "JIT pre-check: mint {} bytes do not decode as SPL Mint",
+                    mint
+                );
+                return JitOutcome::ManualReview(MR_CORRUPT_MINT_STATE.to_string());
+            }
+            AuthorityCheck::Uninitialized => {
+                info!(
+                    "Mint {} not initialized on PrivateChannel - attempting JIT initialization",
+                    mint
+                );
+                // fall through to init path
+            }
+        },
         Err(e) => {
             warn!(
                 "RPC error checking mint {} - assuming it doesn't exist: {}",
@@ -69,10 +189,10 @@ pub(super) async fn try_jit_mint_initialization(
         }
     }
 
-    // 4. Look up mint decimals from mint cache
+    // 3. Look up mint decimals from mint cache.
     let Ok(mint_metadata) = state.mint_cache.get_mint_metadata(&mint).await else {
         error!("Mint {} not found in mint cache", mint);
-        return None;
+        return JitOutcome::PermanentFailure(format!("mint not in mint cache: {}", mint));
     };
 
     info!(
@@ -80,8 +200,7 @@ pub(super) async fn try_jit_mint_initialization(
         mint_metadata.decimals, mint
     );
 
-    // 5. Build InitializeMint transaction
-    let admin_pubkey = SignerUtil::admin_signer().pubkey();
+    // 4. Build InitializeMint transaction.
     let init_mint_builder = InitializeMintBuilder::new(
         mint,
         mint_metadata.decimals,
@@ -92,7 +211,7 @@ pub(super) async fn try_jit_mint_initialization(
 
     let init_tx_builder = TransactionBuilder::InitializeMint(Box::new(init_mint_builder));
 
-    // 6. Convert to instruction using existing function
+    // 5. Convert to instruction.
     let init_instruction = match state
         .handle_transaction_builder(init_tx_builder.clone())
         .await
@@ -100,11 +219,14 @@ pub(super) async fn try_jit_mint_initialization(
         Ok(ix) => ix,
         Err(e) => {
             error!("Failed to build InitializeMint instruction: {}", e);
-            return None;
+            return JitOutcome::PermanentFailure(format!(
+                "Failed to build InitializeMint instruction: {}",
+                e
+            ));
         }
     };
 
-    // 7. Send transaction using existing function
+    // 6. Send transaction.
     info!("Sending InitializeMint transaction for mint {}", mint);
     let sig = match sign_and_send_transaction(
         state.rpc_client.clone(),
@@ -116,11 +238,14 @@ pub(super) async fn try_jit_mint_initialization(
         Ok(s) => s,
         Err(e) => {
             error!("Failed to send InitializeMint transaction: {}", e);
-            return None;
+            return JitOutcome::PermanentFailure(format!(
+                "Failed to send InitializeMint transaction: {}",
+                e
+            ));
         }
     };
 
-    // 8. Check confirmation using existing function
+    // 7. Wait for confirmation.
     let result = match check_transaction_status(
         state.rpc_client.clone(),
         &sig,
@@ -133,57 +258,134 @@ pub(super) async fn try_jit_mint_initialization(
         Ok(r) => r,
         Err(e) => {
             error!("Failed to check InitializeMint status: {}", e);
-            return None;
+            return JitOutcome::PermanentFailure(format!(
+                "Failed to check InitializeMint status: {}",
+                e
+            ));
         }
     };
 
+    // 8. Branch on confirmation result.
     match result {
         ConfirmationResult::Confirmed => {
             // `Confirmed` covers both a successful InitializeMint and the
             // `AccountAlreadyInitialized` race, which the extra error check
             // on this builder remaps to `Confirmed` without an RPC re-check.
             info!("InitializeMint transaction confirmed: {}", sig);
-            Some(instruction)
+
+            // Re-fetch and check authority — catches the race where another
+            // party initialized the same mint with a different authority
+            // during our send window.
+            let check = match state.rpc_client.get_account_data(&mint).await {
+                Ok(data) => decode_and_check_authority(&data, &admin_pubkey),
+                Err(_) => {
+                    mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await
+                }
+            };
+            jit_verdict(check, instruction, &mint, None)
         }
         _ => {
             // Fallback for unknown failures (network blips, timeouts): re-read
             // the mint on-chain with backoff in case it was initialized out-of-band.
-            if mint_is_initialized_on_chain(&state.rpc_client, &mint).await {
-                info!(
-                    "InitializeMint tx {} not confirmed (result={:?}), but mint {} is already \
-                     initialized on-chain — treating JIT as success",
-                    sig, result, mint
-                );
-                return Some(instruction);
-            }
-            error!(
-                "InitializeMint transaction could not be confirmed: {:?}",
-                result
-            );
-            None
+            let check =
+                mint_authority_check_with_backoff(&state.rpc_client, &mint, &admin_pubkey).await;
+            jit_verdict(check, instruction, &mint, Some(&result))
         }
     }
 }
 
-/// returns true if `data` decodes as an initialized SPL `Mint`.
-/// Non-Mint-length or malformed data → false. Zeroed Mint::LEN data → false.
-fn is_initialized_mint_data(data: &[u8]) -> bool {
-    Mint::unpack(data)
-        .map(|m| m.is_initialized)
-        .unwrap_or(false)
+/// Map an `AuthorityCheck` to a `JitOutcome`.
+///
+/// `fallback_result`:
+/// - `None` → post-`Confirmed` context (InitializeMint succeeded; we're
+///   re-checking the on-chain state to catch the post-init authority race).
+/// - `Some(result)` → fallback context (the InitializeMint poll did NOT
+///   return `Confirmed` — timeout / RPC error — and we're re-reading the
+///   mint with backoff in case it landed out-of-band).
+///
+/// The two contexts only diverge in two arms:
+/// - `Match`: the fallback path logs an info "treating-as-success" message
+///   so operators can see the race-recovery happen; post-init is silent.
+/// - `Uninitialized`: post-init treats this as an RPC inconsistency
+///   (InitializeMint said Confirmed but the mint isn't there); fallback
+///   treats it as the canonical "InitializeMint could not be confirmed"
+///   permanent failure that drives the existing Failed-runbook dispatch.
+fn jit_verdict(
+    check: AuthorityCheck,
+    instruction: InstructionWithSigners,
+    mint: &Pubkey,
+    fallback_result: Option<&ConfirmationResult>,
+) -> JitOutcome {
+    match check {
+        AuthorityCheck::Match => {
+            if let Some(result) = fallback_result {
+                info!(
+                    "InitializeMint not confirmed cleanly (result={:?}), but mint {} reads as \
+                     initialized with admin authority — treating JIT as success",
+                    result, mint
+                );
+            }
+            JitOutcome::Retry(instruction)
+        }
+        AuthorityCheck::Mismatch(actual) => {
+            warn!(
+                "JIT: mint {} initialized with authority {} (expected admin)",
+                mint, actual
+            );
+            JitOutcome::ManualReview(MR_AUTHORITY_MISMATCH_POSTINIT.to_string())
+        }
+        AuthorityCheck::CorruptData => {
+            warn!("JIT: mint {} bytes do not decode as SPL Mint", mint);
+            JitOutcome::ManualReview(MR_CORRUPT_MINT_STATE.to_string())
+        }
+        AuthorityCheck::Uninitialized => match fallback_result {
+            Some(result) => {
+                error!(
+                    "InitializeMint transaction could not be confirmed: {:?}",
+                    result
+                );
+                JitOutcome::PermanentFailure(
+                    "InitializeMint transaction could not be confirmed".to_string(),
+                )
+            }
+            None => {
+                error!(
+                    "JIT post-init: InitializeMint confirmed but mint {} reads as uninitialized",
+                    mint
+                );
+                JitOutcome::PermanentFailure(format!(
+                    "InitializeMint confirmed but mint {} reads as uninitialized — RPC inconsistency",
+                    mint
+                ))
+            }
+        },
+    }
 }
 
-/// Returns whether the mint is initialized on PrivateChannel, retrying with backoff
-/// to absorb read-RPC lag after a racing InitializeMint. Any error or
-/// uninitialized result on the final attempt is reported as `false`.
-async fn mint_is_initialized_on_chain(rpc_client: &RpcClientWithRetry, mint: &Pubkey) -> bool {
+/// Read the mint on-chain with backoff, returning the `AuthorityCheck`
+/// from the first successful decode. Absorbs read-RPC lag after a racing
+/// InitializeMint. On exhausted attempts with no successful decode,
+/// returns `Uninitialized` (the most conservative "I couldn't confirm
+/// it's there" reading — caller maps this to PermanentFailure on the   
+/// fallback path).
+async fn mint_authority_check_with_backoff(
+    rpc_client: &RpcClientWithRetry,
+    mint: &Pubkey,
+    expected_authority: &Pubkey,
+) -> AuthorityCheck {
     const ATTEMPTS: u32 = 4;
     const BACKOFF_MS: u64 = 250;
 
+    let mut last_check = AuthorityCheck::Uninitialized;
     for attempt in 0..ATTEMPTS {
         match rpc_client.get_account_data(mint).await {
-            Ok(data) if is_initialized_mint_data(&data) => return true,
-            Ok(_) => {}
+            Ok(data) => {
+                let check = decode_and_check_authority(&data, expected_authority);
+                if !matches!(check, AuthorityCheck::Uninitialized) {
+                    return check;
+                }
+                last_check = check;
+            }
             Err(e) => {
                 if attempt + 1 == ATTEMPTS {
                     warn!(
@@ -197,7 +399,7 @@ async fn mint_is_initialized_on_chain(rpc_client: &RpcClientWithRetry, mint: &Pu
             tokio::time::sleep(tokio::time::Duration::from_millis(BACKOFF_MS)).await;
         }
     }
-    false
+    last_check
 }
 
 /// Check recent ATA signatures for an already-confirmed mint carrying this transaction's
@@ -657,11 +859,12 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 #[cfg(test)]
 mod tests {
     use super::{
-        accounts_and_amount_match, expected_mint_instruction, instruction_has_expected_mint,
-        instruction_has_memo, is_initialized_mint_data, is_method_not_found_error, memo_matches,
-        parse_token_instruction_mint_amount, partially_decoded_instruction_has_expected_mint,
-        raw_instruction_has_expected_mint, strip_memo_length_prefix,
-        transaction_matches_expected_mint, ExpectedMintInstruction,
+        accounts_and_amount_match, decode_and_check_authority, expected_mint_instruction,
+        instruction_has_expected_mint, instruction_has_memo, is_method_not_found_error,
+        memo_matches, parse_token_instruction_mint_amount,
+        partially_decoded_instruction_has_expected_mint, raw_instruction_has_expected_mint,
+        strip_memo_length_prefix, transaction_matches_expected_mint, AuthorityCheck,
+        ExpectedMintInstruction,
     };
     use crate::operator::utils::instruction_util::{MintToBuilder, MintToBuilderWithTxnId};
     use solana_rpc_client_api::{
@@ -1521,14 +1724,14 @@ mod tests {
         assert_eq!(strip_memo_length_prefix("[123]no-space"), "[123]no-space");
     }
 
-    // Tests for the pure `is_initialized_mint_data` helper that drives the
-    // on-chain re-check in `try_jit_mint_initialization`. The async
-    // `mint_is_initialized_on_chain` wrapper is exercised indirectly via this
-    // helper plus the RPC boundary.
+    // Tests for `decode_and_check_authority`, the pure helper that drives
+    // the JIT pre-check, post-confirm re-check, and fallback backoff. Four
+    // variants must each be reachable: Match / Mismatch / Uninitialized /
+    // CorruptData.
 
-    fn pack_mint(is_initialized: bool) -> Vec<u8> {
+    fn pack_mint(is_initialized: bool, authority: COption<Pubkey>) -> Vec<u8> {
         let mint = Mint {
-            mint_authority: COption::Some(Pubkey::new_unique()),
+            mint_authority: authority,
             supply: 0,
             decimals: 6,
             is_initialized,
@@ -1539,45 +1742,96 @@ mod tests {
         data
     }
 
-    // Empty account data means the mint account was never created.
+    /// Initialized mint with `mint_authority` matching the supplied admin.
     #[test]
-    fn is_initialized_mint_data_empty_is_false() {
-        assert!(!is_initialized_mint_data(&[]));
+    fn decode_and_check_authority_match_returns_match() {
+        let admin = Pubkey::new_unique();
+        let data = pack_mint(true, COption::Some(admin));
+        assert_eq!(
+            decode_and_check_authority(&data, &admin),
+            AuthorityCheck::Match
+        );
     }
 
-    // Data of the wrong length (too short or too long) cannot be a valid mint.
+    /// Initialized mint with `mint_authority` set to a different pubkey
+    /// (the rotated-admin / different-operator scenario). Helper must
+    /// surface the actual authority for log/error context.
     #[test]
-    fn is_initialized_mint_data_wrong_length_is_false() {
-        assert!(!is_initialized_mint_data(&[0u8; 10]));
-        assert!(!is_initialized_mint_data(&[0xFFu8; Mint::LEN + 1]));
+    fn decode_and_check_authority_mismatch_returns_mismatch() {
+        let admin = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let data = pack_mint(true, COption::Some(other));
+        match decode_and_check_authority(&data, &admin) {
+            AuthorityCheck::Mismatch(actual) => assert_eq!(actual, other),
+            other => panic!("expected Mismatch, got {:?}", other),
+        }
     }
 
-    // A rent-exempt-but-uninitialized mint account (correct length, all zeros)
-    // is rejected by `Mint::unpack` because `is_initialized` is 0.
+    /// Initialized mint whose authority has been cleared (`COption::None`)
+    /// is treated as a mismatch with `Pubkey::default()` — the operator
+    /// cannot mint without an authority either way.
     #[test]
-    fn is_initialized_mint_data_zeroed_mint_len_is_false() {
-        assert!(!is_initialized_mint_data(&[0u8; Mint::LEN]));
+    fn decode_and_check_authority_no_authority_returns_mismatch_default() {
+        let admin = Pubkey::new_unique();
+        let data = pack_mint(true, COption::None);
+        match decode_and_check_authority(&data, &admin) {
+            AuthorityCheck::Mismatch(actual) => assert_eq!(actual, Pubkey::default()),
+            other => panic!("expected Mismatch, got {:?}", other),
+        }
     }
 
-    // Properly packed, initialized mint data is recognized as initialized.
+    /// Mint allocated and SPL-Token-owned but with `is_initialized = false`
+    /// (the legitimate JIT case where InitializeMint should run).
     #[test]
-    fn is_initialized_mint_data_packed_initialized_mint_is_true() {
-        let data = pack_mint(true);
-        assert!(is_initialized_mint_data(&data));
+    fn decode_and_check_authority_uninitialized_returns_uninitialized() {
+        let admin = Pubkey::new_unique();
+        let data = pack_mint(false, COption::Some(admin));
+        assert_eq!(
+            decode_and_check_authority(&data, &admin),
+            AuthorityCheck::Uninitialized
+        );
     }
 
-    // `Mint::pack` with `is_initialized = false` produces data that
-    // `Mint::unpack` rejects, so the helper reports "not initialized".
+    /// Empty account data — the mint account was never created. Pre-fix
+    /// this returned `false` from the old bool helper; the new helper
+    /// reports `CorruptData` (decode-fail) rather than `Uninitialized`,
+    /// because there is no reliable way to distinguish "account doesn't
+    /// exist" from "account has wrong-length corrupt data" via account
+    /// data alone. Both cases need JIT to attempt InitializeMint, but the
+    /// caller distinguishes by also checking `Err` from the RPC; this test
+    /// pins that empty/short data lands in `CorruptData`.
     #[test]
-    fn is_initialized_mint_data_packed_uninitialized_mint_is_false() {
-        let data = pack_mint(false);
-        assert!(!is_initialized_mint_data(&data));
+    fn decode_and_check_authority_empty_returns_corrupt() {
+        let admin = Pubkey::new_unique();
+        assert_eq!(
+            decode_and_check_authority(&[], &admin),
+            AuthorityCheck::CorruptData
+        );
     }
 
-    // Arbitrary bytes of the correct length are not a valid mint layout.
+    /// Data of the wrong length cannot decode as a mint.
     #[test]
-    fn is_initialized_mint_data_random_bytes_is_false() {
+    fn decode_and_check_authority_wrong_length_returns_corrupt() {
+        let admin = Pubkey::new_unique();
+        assert_eq!(
+            decode_and_check_authority(&[0u8; 10], &admin),
+            AuthorityCheck::CorruptData
+        );
+        assert_eq!(
+            decode_and_check_authority(&[0xFFu8; Mint::LEN + 1], &admin),
+            AuthorityCheck::CorruptData
+        );
+    }
+
+    /// Random bytes of the correct length usually contain an invalid
+    /// `COption` discriminant byte — `Mint::unpack` rejects them.
+    #[test]
+    fn decode_and_check_authority_random_bytes_returns_corrupt() {
+        let admin = Pubkey::new_unique();
         let data: Vec<u8> = (0u8..Mint::LEN as u8).collect();
-        assert!(!is_initialized_mint_data(&data));
+        assert_eq!(
+            decode_and_check_authority(&data, &admin),
+            AuthorityCheck::CorruptData
+        );
     }
 }

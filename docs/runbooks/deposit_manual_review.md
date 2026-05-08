@@ -16,6 +16,16 @@ Practically: a single deposit `manual_review` is a single row in trouble.
 Other deposits keep flowing. There is no collateral, no sweep, no halt to
 recover from.
 
+There are **two trigger surfaces** that can land a deposit in
+`manual_review`:
+
+1. **Processor-side row-data validation** — deterministic per-row error
+   raised before any RPC call (Paths A / B / C below).
+2. **Sender-side post-JIT mint failure** — the operator's just-in-time
+   mint-init helper found the on-chain mint in a state it cannot fix by
+   re-issuing `mint_to` (wrong authority on the private channel mint, or
+   corrupt mint data). See **Path D** for recovery.
+
 ## Symptom
 
 - Webhook with `status=manual_review`, `transaction_type=deposit`.
@@ -23,15 +33,23 @@ recover from.
 
 ## Triage
 
-There is one trigger surface: a deterministic per-row error in
-`processor.rs::process_deposit_funds`. `error_message` will contain one
-of:
+`error_message` distinguishes the two trigger surfaces and dispatches to
+the right Path below.
+
+### Processor-side surface (`processor.rs::process_deposit_funds`)
 
 | `error_message` contains | Cause |
 |---|---|
 | `invalid_pubkey` | `mint` or `recipient` field is not a valid base58 pubkey. |
 | `invalid_builder` | Builder rejected the row's data (e.g. negative amount). |
 | `program_error` | Generic builder error not covered by the specific variants. |
+
+### Sender-side post-JIT surface (`sender/mint.rs`)
+
+| `error_message` contains | Cause |
+|---|---|
+| `Mint instruction failed after JIT: mint_authority mismatch` | The on-chain mint's `mint_authority` is not the operator's admin pubkey. Two known triggers: (a) an existing mint on the private channel is owned by a different authority and `mint_to` produced one of the three classified `InstructionError` variants (rare — the most common rotated-admin case produces `OwnerMismatch` → `Custom(3)`, which routes to `Failed` instead of here); (b) post-`InitializeMint` race where another party initialized the same mint with a different authority during our send window. |
+| `Mint instruction failed after JIT: corrupt mint state` | The mint's account data does not decode as a valid SPL Mint (`COption` discriminant invalid, length mismatched). Defensive — should not occur in normal operation; investigate before any recovery. |
 
 Pull the row:
 
@@ -113,10 +131,84 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
+### Path D - sender-side post-JIT failure
+
+Triggered by the sender-side surface above (`error_message` starting
+with `Mint instruction failed after JIT:`). The operator's JIT helper
+examined on-chain reality and found the mint structurally unusable.
+Treat as a **configuration alarm**, not a transient.
+
+**Why this differs from `deposit_failed`.** The post-JIT path landed
+in `manual_review` (not `failed`) specifically because JIT's structural
+check distinguished it from generic program errors — the on-chain mint
+state needs human investigation before any retry can succeed.
+
+#### Step 1 - verify on-chain
+
+Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). Like Paths
+A / B / C but mandatory here: structural mint problems can mask a
+prior `mint_to` that landed.
+
+#### Step 2 - branch on verdict
+
+##### `LANDED <signature>` — mint already succeeded
+
+Mark `completed` with the observed signature (same SQL as
+[`deposit_failed.md`](deposit_failed.md) Path B). The unique partial
+index on `counterpart_signature` still applies; if it rejects the
+update, escalate before retrying.
+
+##### `NOT_LANDED` — inspect mint authority on the private channel
+
+```bash
+spl-token display <mint> --url <private-channel-rpc>
+```
+
+Compare the displayed `Mint authority` to the operator's current
+admin pubkey.
+
+- **Authority mismatch — current authority still accessible.**
+  Treasury / admin signs
+
+  ```bash
+  spl-token authorize <mint> mint-authority <new-authority>
+  ```
+
+  to point the mint at the current operator admin. Then re-arm to
+  `pending` (SQL below). The idempotency memo prevents double-mint.
+- **Authority mismatch — current authority lost** (e.g. old admin key
+  destroyed during rotation). The mint is permanently unusable.
+  **Escalate (Tier 1).** Recovery is a manual coordinated mint
+  replacement: deploy a fresh mint, migrate any existing balances
+  out-of-band, mark the deposit `failed`, and refund the depositor
+  through the same Tier 1 channel `deposit_failed` Path A uses.
+  **Do not re-arm to `pending`** — the next mint attempt will fail
+  the same way.
+- **`error_message` contains `corrupt mint state`.** Escalate (Tier
+  2). Corrupt mint data on a deployed chain is a structural anomaly
+  engineering must investigate before any recovery. Do not re-arm.
+
+##### `AMBIGUOUS`
+
+Stop. Escalate (Tier 2). Do not act.
+
+#### Re-arm SQL
+
+Only for the recoverable authority case after the underlying authority
+correction has been performed:
+
+```sql
+UPDATE transactions SET status = 'pending', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
 ## Post-incident artifacts
 
 - Transaction id, originating Solana `signature`, `recipient`, `mint`.
 - Full webhook `error_message`.
 - Recovery action taken.
-- If Path A: refund tracking ticket.
+- For Path A: refund tracking ticket.
+- For Path D: on-chain `mint_authority` before/after, the
+  `spl-token authorize` signature (if applicable), and the engineering
+  ticket for any mint-replacement coordination.
 

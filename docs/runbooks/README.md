@@ -18,7 +18,7 @@ no retries). All dispatch below is keyed on the webhook payload.
 | Alert (webhook payload) | `transaction_type` | Symptom | Runbook |
 |---|---|---|---|
 | `status=manual_review` | `withdrawal` | Single row stopped; pipeline may also be halted. | [`withdrawal_manual_review.md`](withdrawal_manual_review.md) |
-| `status=manual_review` | `deposit` | Single row stopped (deterministic build error). No halt, no collateral. | [`deposit_manual_review.md`](deposit_manual_review.md) |
+| `status=manual_review` | `deposit` | Single row stopped — either deterministic build error (processor) or sender-side post-JIT mint failure (mint authority mismatch / corrupt state). No halt, no collateral. | [`deposit_manual_review.md`](deposit_manual_review.md) |
 | `status=failed` | `withdrawal` | Single row terminated without on-chain proof. Rare for withdrawals. | [`withdrawal_failed.md`](withdrawal_failed.md) |
 | `status=failed` | `deposit` | **Primary deposit alert.** Sender-side terminal failure (RPC, build, confirmation, on-chain rejection). | [`deposit_failed.md`](deposit_failed.md) |
 | `status=failed_reminted` | `withdrawal` | Withdrawal failed; remint succeeded. Reconcile only. | [`withdrawal_failed_reminted.md`](withdrawal_failed_reminted.md) |
@@ -99,6 +99,7 @@ pins the relevant contract.
 | `drill_11_program_type_labels_match_runbooks` | both | Pins `ProgramType::as_label` to `withdraw` / `escrow`. |
 | `drill_12_withdrawal_failed_recovery_flows` | withdrawal | `withdrawal_failed.md` LANDED → completed-with-sig; cross-row signature fence still applies on `failed`; NOT_LANDED is terminal (markdown + operator code grep); AMBIGUOUS escalates without SQL. |
 | `drill_13_withdrawal_failed_reminted_reconcile` | withdrawal | `failed_reminted` transition writes `remint_signatures`; runbook contains zero mutating SQL; LANDED verdict cannot be silently absorbed via `SET status='completed'`; webhook `remint_signature` (singular) ↔ DB `remint_signatures` (plural) asymmetry pinned. |
+| `drill_14_deposit_manual_review_post_jit_recovery_flows` | deposit | `deposit_manual_review.md` § Path D: post-JIT trigger strings present in `mint.rs`; re-arm SQL flips `manual_review` → `pending` and is targeted by id (not error_message); idempotency memo prefix anchored. |
 
 Trigger (`make` shorthand, runs from repo root):
 
@@ -121,8 +122,11 @@ RUST_LOG=trace cargo test -p private-channel-indexer --test runbook_drills -- \
 
 - Before merging a runbook edit.
 - After changes to: `processor.rs`, `sender/transaction.rs` (and in
-  particular `send_fatal_error`, the source of the rare withdrawal
-  `failed` transition that drill_12 protects), `sender/remint.rs`,
-  `db_transaction_writer.rs` (including its webhook-payload serializer
-  — drill_13 anchors on the `"remint_signature"` JSON key string
-  literal), or the indexer schema.
+  particular `send_fatal_error` — drill_12; or the
+  `JitOutcome::ManualReview` caller-arm dispatch which emits the
+  `ManualReview` status update inline — drill_14), `sender/mint.rs`
+  (the `JitOutcome::ManualReview` reason strings live here — drill_14
+  specifically), `sender/remint.rs`, `db_transaction_writer.rs`
+  (including its webhook-payload serializer — drill_13 anchors on the
+  `"remint_signature"` JSON key string literal), or the indexer
+  schema.

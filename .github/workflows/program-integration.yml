@@ -29,7 +29,7 @@ permissions:
 jobs:
   integration-test:
     name: Program Integration Tests
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     timeout-minutes: 20
     steps:
       - name: Checkout repository

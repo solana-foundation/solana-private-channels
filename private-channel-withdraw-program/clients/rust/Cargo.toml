@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 description = "Rust client for the PrivateChannel Withdraw Program"
 license = "MIT"
-repository = "https://github.com/solana-foundation/private_channel/private-channel-withdraw-program"
+repository = "https://github.com/solana-foundation/solana-private-channels"
 
 [dependencies]
 borsh = { workspace = true }

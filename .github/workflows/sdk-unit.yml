@@ -35,7 +35,7 @@ on:
 jobs:
   typescript-sdk-unit:
     name: TypeScript SDK Unit Tests
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     strategy:
       matrix:
         program: [private-channel-escrow-program, private-channel-withdraw-program]

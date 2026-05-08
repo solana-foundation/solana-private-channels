@@ -55,8 +55,6 @@ use {
 const OLDEST_SYNCED_ACCOUNT_AGE: u64 = 60 * 60; // 1 hour
 struct AccountWithMeta {
     account: AccountSharedData,
-    // TODO: Implement this after we move settlement to a separate stage
-    #[allow(dead_code)]
     synced_since: Option<u64>,
     // Whether we deleted this account. We can't remove an account from the
     // HashMap while we keep it in-memory because it will fallback to the

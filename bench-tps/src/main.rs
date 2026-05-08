@@ -44,10 +44,10 @@ use {
         bench_metrics_init, {FLOW_DEPOSIT, FLOW_TRANSFER, FLOW_WITHDRAW},
     },
     clap::Parser,
-    private_channel_core::client::load_keypair,
     load::{build_destinations, run_generator, run_sender_task},
     load_deposit::{run_deposit_generator, run_deposit_sender_thread},
     load_withdraw::{run_withdraw_generator, run_withdraw_sender_thread},
+    private_channel_core::client::load_keypair,
     setup_deposit::find_instance_pda,
     solana_sdk::{signature::Keypair, signer::Signer},
     std::{
@@ -471,7 +471,8 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
 
     let _ = gen_handle.await;
     let _ = bh_handle.await;
-    let (start_private_channel_count, end_private_channel_count) = private_channel_metrics_handle.await.unwrap_or((0, 0));
+    let (start_private_channel_count, end_private_channel_count) =
+        private_channel_metrics_handle.await.unwrap_or((0, 0));
     let (start_mints, end_mints) = if let Some(h) = operator_handle {
         h.await.unwrap_or((0, 0))
     } else {
@@ -482,7 +483,8 @@ async fn run_withdraw(args: args::WithdrawArgs) -> Result<()> {
     }
 
     let sent = sent_count.load(Ordering::Relaxed);
-    let private_channel_burned = end_private_channel_count.saturating_sub(start_private_channel_count);
+    let private_channel_burned =
+        end_private_channel_count.saturating_sub(start_private_channel_count);
     let private_channel_tps = private_channel_burned as f64 / args.duration as f64;
 
     if args.operator_metrics_url.is_some() {

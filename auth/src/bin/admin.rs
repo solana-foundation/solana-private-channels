@@ -130,3 +130,156 @@ async fn attach_wallet(pool: &sqlx::PgPool, args: AttachWalletArgs) -> Result<()
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+    use sqlx::PgPool;
+    use std::sync::Mutex;
+    use testcontainers::{runners::AsyncRunner, ContainerAsync};
+    use testcontainers_modules::postgres::Postgres;
+
+    // env::set_var / remove_var mutate process-global state. The two `run` tests
+    // touch AUTH_DATABASE_URL — serialize them so they don't race when the
+    // surrounding test runner schedules them in parallel.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    async fn start_pool() -> (PgPool, ContainerAsync<Postgres>) {
+        let container = Postgres::default()
+            .with_db_name("auth_test")
+            .with_user("postgres")
+            .with_password("password")
+            .start()
+            .await
+            .expect("failed to start postgres container");
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:password@{}:{}/auth_test", host, port);
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("failed to connect");
+        db::init_schema(&pool).await.expect("schema init");
+        (pool, container)
+    }
+
+    fn attach_args(username: &str, pubkey: &str) -> AttachWalletArgs {
+        AttachWalletArgs {
+            username: username.into(),
+            pubkey: pubkey.into(),
+        }
+    }
+
+    fn run_args(command: Command) -> Args {
+        Args {
+            log_level: "info".into(),
+            json_logs: false,
+            command,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_rejects_missing_database_url() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = env::var("AUTH_DATABASE_URL").ok();
+        env::remove_var("AUTH_DATABASE_URL");
+
+        let result = run(run_args(Command::AttachWallet(attach_args("u", "p")))).await;
+
+        match prev {
+            Some(p) => env::set_var("AUTH_DATABASE_URL", p),
+            None => env::remove_var("AUTH_DATABASE_URL"),
+        }
+
+        let err = result.expect_err("expected error");
+        assert!(err.to_string().contains("is not set"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_rejects_non_postgres_url() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let prev = env::var("AUTH_DATABASE_URL").ok();
+        env::set_var("AUTH_DATABASE_URL", "mysql://localhost/test");
+
+        let result = run(run_args(Command::AttachWallet(attach_args("u", "p")))).await;
+
+        match prev {
+            Some(p) => env::set_var("AUTH_DATABASE_URL", p),
+            None => env::remove_var("AUTH_DATABASE_URL"),
+        }
+
+        let err = result.expect_err("expected error");
+        assert!(
+            err.to_string().contains("must be a PostgreSQL URL"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_wallet_rejects_invalid_pubkey() {
+        let (pool, _c) = start_pool().await;
+        let err = attach_wallet(&pool, attach_args("alice", "not-base58"))
+            .await
+            .expect_err("expected error");
+        assert!(err.to_string().contains("invalid pubkey"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn attach_wallet_rejects_unknown_user() {
+        let (pool, _c) = start_pool().await;
+        let pubkey = Pubkey::new_unique().to_string();
+        let err = attach_wallet(&pool, attach_args("ghost", &pubkey))
+            .await
+            .expect_err("expected error");
+        assert!(err.to_string().contains("user not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn attach_wallet_succeeds_for_known_user() {
+        let (pool, _c) = start_pool().await;
+        let user = db::insert_user(&pool, "bob", "$argon2id$placeholder")
+            .await
+            .expect("insert user");
+        let pubkey = Pubkey::new_unique().to_string();
+
+        attach_wallet(&pool, attach_args("bob", &pubkey))
+            .await
+            .expect("attach should succeed");
+
+        let wallets = db::list_verified_wallets(&pool, user.id)
+            .await
+            .expect("list wallets");
+        assert_eq!(wallets.len(), 1);
+        assert_eq!(wallets[0].pubkey, pubkey);
+    }
+
+    #[tokio::test]
+    async fn attach_wallet_reports_already_attached() {
+        let (pool, _c) = start_pool().await;
+        let user = db::insert_user(&pool, "carol", "$argon2id$placeholder")
+            .await
+            .expect("insert user");
+        let pubkey = Pubkey::new_unique().to_string();
+
+        attach_wallet(&pool, attach_args("carol", &pubkey))
+            .await
+            .expect("first attach should succeed");
+
+        let err = attach_wallet(&pool, attach_args("carol", &pubkey))
+            .await
+            .expect_err("second attach should fail");
+        assert!(
+            err.to_string().contains("is already attached"),
+            "got: {err}"
+        );
+
+        // The failed second attach must not duplicate the row.
+        let wallets = db::list_verified_wallets(&pool, user.id)
+            .await
+            .expect("list wallets");
+        assert_eq!(wallets.len(), 1, "failed attach should not duplicate row");
+        assert_eq!(wallets[0].pubkey, pubkey);
+    }
+}

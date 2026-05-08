@@ -179,12 +179,14 @@ impl AdminVm {
             processing_results.push(Ok(ProcessedTransaction::Executed(Box::new(executed))));
         }
 
+        // All three of these fields are intentional no-ops on the admin path:
+        //  - error_metrics / execute_timings: defaulting to zero contributes
+        //    nothing to the merged output (see execution.rs::merge_svm_outputs).
+        //  - balance_collector: gasless execution does not record balance
+        //    changes (see execution.rs:250).
         LoadAndExecuteSanitizedTransactionsOutput {
-            // TODO: Not implemented
             error_metrics: TransactionErrorMetrics::default(),
-            // TODO: No implemented
             execute_timings: ExecuteTimings::default(),
-            // TODO: Not implemented
             balance_collector: None,
             processing_results,
         }

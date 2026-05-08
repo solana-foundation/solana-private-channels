@@ -423,8 +423,10 @@ pub async fn run_setup_deposit_phase(
     // every first deposit, blocking the sender loop ~200 ms each time.
     // ------------------------------------------------------------------
     let t6b = Instant::now();
-    let private_channel_rpc =
-        RpcClient::new_with_commitment(private_channel_rpc_url.to_string(), CommitmentConfig::confirmed());
+    let private_channel_rpc = RpcClient::new_with_commitment(
+        private_channel_rpc_url.to_string(),
+        CommitmentConfig::confirmed(),
+    );
     let private_channel_mint_sig = 'send: {
         let mut last_err = String::new();
         for (attempt, &delay_secs) in send_retry_delays.iter().enumerate() {
@@ -466,7 +468,9 @@ pub async fn run_setup_deposit_phase(
     )
     .await?;
     if !retry.is_empty() {
-        return Err(anyhow::anyhow!("PrivateChannel initialize_mint failed to confirm"));
+        return Err(anyhow::anyhow!(
+            "PrivateChannel initialize_mint failed to confirm"
+        ));
     }
     info!(
         %mint,

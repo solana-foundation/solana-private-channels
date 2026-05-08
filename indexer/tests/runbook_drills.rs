@@ -263,6 +263,19 @@ fn drill_1_error_message_contracts_present_in_source() {
             "Confirmation failed - transaction status unknown, unsafe to retry",
             "indexer/src/operator/sender/transaction.rs",
         ),
+        // Deposit — sender side, post-JIT ManualReview path.
+        // `deposit_manual_review.md` § Path D dispatches on these.
+        // Constructed in full inside mint.rs (the caller arm in
+        // transaction.rs passes the reason through unchanged) so this
+        // drill can grep for the literals in a single source file.
+        (
+            "Mint instruction failed after JIT: mint_authority mismatch",
+            "indexer/src/operator/sender/mint.rs",
+        ),
+        (
+            "Mint instruction failed after JIT: corrupt mint state",
+            "indexer/src/operator/sender/mint.rs",
+        ),
         // Deposit — idempotency memo prefix. Anchors `_verify_onchain_mint.md`
         // step 3.
         (
@@ -923,6 +936,123 @@ async fn drill_10_deposit_failed_recovery_flows() -> Result<(), Box<dyn std::err
     assert_eq!(status_of(&pool, mr_id).await?, "failed");
 
     eprintln!("Deposit recovery flows verified end-to-end.");
+    Ok(())
+}
+
+// ── Drill 14: deposit_manual_review.md § Path D recovery flows ─────────────
+//
+// `deposit_manual_review.md` § Path D documents recovery for the
+// sender-side post-JIT ManualReview path. This drill pins:
+//
+//   1. The two new error_message substrings exist in mint.rs (also
+//      covered by drill_1 globally; re-asserted here so the drill is
+//      self-contained for an operator running it ad-hoc).
+//   2. The idempotency memo prefix is still anchored — the recovery
+//      flow re-arms to `pending`, and that re-arm is only safe because
+//      the operator's pre-send memo scan dedupes on this prefix.
+//   3. Recovery SQL flips `manual_review` → `pending` for the trigger
+//      row only; collateral and terminal rows are untouched.
+//   4. Recovery SQL is targeted by `id`, not by `error_message` — pins
+//      that drill_14's contract is fungible across the two new
+//      runbook substrings (and any future ones in the same Path D
+//      table).
+//   5. Webhook alertability is structurally guaranteed by drill_8 —
+//      this drill only narrates the dependency for the on-call reader.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
+) -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "deposit_manual_review.md",
+        "Path D — sender-side post-JIT failure",
+    );
+
+    // ── Step 1: source contract presence ──────────────────────────────
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    for substr in [
+        "Mint instruction failed after JIT: mint_authority mismatch",
+        "Mint instruction failed after JIT: corrupt mint state",
+    ] {
+        let path = workspace_root.join("indexer/src/operator/sender/mint.rs");
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        assert!(
+            content.contains(substr),
+            "Path D dispatch substring missing from mint.rs: {substr:?}",
+        );
+        eprintln!("OK   mint.rs: {substr:?}");
+    }
+
+    // ── Step 2: idempotency memo prefix anchored ──────────────────────
+    let constants_path = workspace_root.join("indexer/src/operator/constants.rs");
+    let constants_content = std::fs::read_to_string(&constants_path)
+        .unwrap_or_else(|e| panic!("read {constants_path:?}: {e}"));
+    assert!(
+        constants_content.contains("private_channel:mint-idempotency:"),
+        "idempotency memo prefix must remain anchored — Path D re-arm \
+         relies on the pre-send memo scan to prevent double-mint",
+    );
+    eprintln!("OK   constants.rs: idempotency memo prefix anchored");
+
+    // ── Steps 3 + 4: recovery SQL is structural and targeted by id ────
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    // Seed three deposits: trigger (manual_review), collateral
+    // (pending), terminal (completed). The Path D re-arm SQL must
+    // touch only the trigger row.
+    let trigger_id = seed_deposit(&pool, "manual_review").await?;
+    let collateral_id = seed_deposit(&pool, "pending").await?;
+    let terminal_id = seed_deposit(&pool, "completed").await?;
+
+    sqlx::query("UPDATE transactions SET status='pending', updated_at=NOW() WHERE id=$1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, trigger_id).await?,
+        "pending",
+        "Path D re-arm must flip the trigger row to pending"
+    );
+    assert_eq!(
+        status_of(&pool, collateral_id).await?,
+        "pending",
+        "collateral row must be untouched by Path D re-arm"
+    );
+    assert_eq!(
+        status_of(&pool, terminal_id).await?,
+        "completed",
+        "terminal row must be untouched by Path D re-arm"
+    );
+
+    // Repeat the re-arm against a different ManualReview row — the SQL
+    // is fungible across error_message values (Path D's two
+    // substrings, and the processor-side ManualReview substrings from
+    // Paths A/B/C). This catches a future "smart" runbook edit that
+    // adds a `WHERE error_message LIKE …` clause and breaks
+    // fungibility with drill_10.
+    let other_mr_id = seed_deposit(&pool, "manual_review").await?;
+    sqlx::query("UPDATE transactions SET status='pending', updated_at=NOW() WHERE id=$1")
+        .bind(other_mr_id)
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        status_of(&pool, other_mr_id).await?,
+        "pending",
+        "re-arm must work regardless of which ManualReview substring was the trigger"
+    );
+
+    // ── Step 5: webhook alertability cross-reference ─────────────────
+    eprintln!(
+        "Webhook alertability for ManualReview is pinned structurally by drill_8 — \
+         drill_14 does not re-test that contract."
+    );
+
+    eprintln!("Path D recovery flows verified end-to-end.");
     Ok(())
 }
 

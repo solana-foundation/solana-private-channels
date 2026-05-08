@@ -67,7 +67,8 @@ fn build_deposit_tx(
         token_program: spl_token::id(),
         associated_token_program: spl_associated_token_account::id(),
         event_authority: config.event_authority,
-        private_channel_escrow_program: private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        private_channel_escrow_program:
+            private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     };
 
     let deposit_ix = accounts.instruction(DepositInstructionArgs {

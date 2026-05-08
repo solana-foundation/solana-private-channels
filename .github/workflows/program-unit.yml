@@ -28,7 +28,7 @@ permissions:
 jobs:
   unit-test:
     name: Unit Tests with Coverage
-    runs-on: contra-runner-1
+    runs-on: private-channel-runner-1
     timeout-minutes: 40
     steps:
       - name: Checkout repository

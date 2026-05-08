@@ -12,7 +12,9 @@ use {
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_WITHDRAW},
         types::{BatchQueue, BenchState, WithdrawConfig, MAX_QUEUE_DEPTH},
     },
-    private_channel_withdraw_program_client::instructions::{WithdrawFunds, WithdrawFundsInstructionArgs},
+    private_channel_withdraw_program_client::instructions::{
+        WithdrawFunds, WithdrawFundsInstructionArgs,
+    },
     solana_sdk::{
         hash::Hash, instruction::Instruction, pubkey, pubkey::Pubkey, signature::Keypair,
         signer::Signer, transaction::Transaction,

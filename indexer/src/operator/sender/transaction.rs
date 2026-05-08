@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tracing::{error, info, info_span, warn, Instrument};
 
 use super::mint::{
-    cleanup_mint_builder, find_existing_mint_signature, try_jit_mint_initialization,
+    cleanup_mint_builder, find_existing_mint_signature, try_jit_mint_initialization, JitOutcome,
 };
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
@@ -421,42 +421,67 @@ pub(super) fn handle_confirmation_result<'a>(
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "mint_not_initialized"])
                     .inc();
-                if let Some(txn_id) = ctx.transaction_id {
-                    if state.mint_builders.contains_key(&txn_id) {
-                        warn!("Mint account not initialized - attempting JIT initialization");
-
-                        if let Some(new_instruction) =
-                            try_jit_mint_initialization(state, txn_id, instruction.clone()).await
-                        {
-                            info!("Retrying with JIT mint initialization");
-                            send_and_confirm(
-                                state,
-                                new_instruction,
-                                compute_unit_price,
-                                ctx,
-                                retry_policy,
-                                extra_error_checks_policy,
-                                storage_tx,
-                            )
-                            .await;
-                        } else {
-                            handle_permanent_failure(
-                                state,
-                                ctx,
-                                storage_tx,
-                                "Mint initialization failed",
-                            )
-                            .await;
-                        }
-                    } else {
-                        error!("MintNotInitialized error for non-Mint transaction");
-                        handle_permanent_failure(state, ctx, storage_tx, "Unexpected mint error")
-                            .await;
-                    }
-                } else {
+                let Some(txn_id) = ctx.transaction_id else {
                     error!("MintNotInitialized error without transaction_id");
                     handle_permanent_failure(state, ctx, storage_tx, "Mint initialization failed")
                         .await;
+                    return;
+                };
+                if !state.mint_builders.contains_key(&txn_id) {
+                    error!("MintNotInitialized error for non-Mint transaction");
+                    handle_permanent_failure(state, ctx, storage_tx, "Unexpected mint error").await;
+                    return;
+                }
+                warn!(
+                    "Mint not initialized — running JIT verdict for txn {}",
+                    txn_id
+                );
+                match try_jit_mint_initialization(state, txn_id, instruction.clone()).await {
+                    JitOutcome::Retry(new_instruction) => {
+                        info!("JIT verdict: Retry — re-issuing mint instruction");
+                        send_and_confirm(
+                            state,
+                            new_instruction,
+                            compute_unit_price,
+                            ctx,
+                            retry_policy,
+                            extra_error_checks_policy,
+                            storage_tx,
+                        )
+                        .await;
+                    }
+                    JitOutcome::ManualReview(reason) => {
+                        metrics::OPERATOR_TRANSACTION_ERRORS
+                            .with_label_values(&[pt, "mint_jit_manual_review"])
+                            .inc();
+                        error!("JIT verdict: ManualReview — {}", reason);
+                        send_guaranteed(
+                            storage_tx,
+                            TransactionStatusUpdate {
+                                transaction_id: txn_id,
+                                trace_id: ctx.trace_id.clone(),
+                                status: TransactionStatus::ManualReview,
+                                counterpart_signature: None,
+                                processed_at: Some(Utc::now()),
+                                error_message: Some(reason),
+                                remint_signature: None,
+                                remint_attempted: false,
+                            },
+                            "transaction status update",
+                        )
+                        .await
+                        .ok();
+                        // Release the cached MintToBuilder so it doesn't
+                        // linger past the terminal transition. For deposits
+                        // ctx.withdrawal_nonce is None, so the remint /
+                        // pending_signatures cleanup is a no-op; Mirrors
+                        // the cleanup pattern in handle_permanent_failure.
+                        cleanup_failed_transaction(state, ctx.withdrawal_nonce);
+                        state.mint_builders.remove(&txn_id);
+                    }
+                    JitOutcome::PermanentFailure(reason) => {
+                        handle_permanent_failure(state, ctx, storage_tx, &reason).await;
+                    }
                 }
             }
             Ok(ConfirmationResult::Retry) => match retry_policy {

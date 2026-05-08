@@ -3,7 +3,7 @@
     "version": "1.0.0",
     "main": "index.js",
     "description": "Solana Private Channels Withdraw Program",
-    "repository": "git@github.com:solana-foundation/contra.git",
+    "repository": "git@github.com:solana-foundation/solana-private-channels.git",
     "license": "MIT",
     "scripts": {
         "build": "cd clients/typescript && tsc",
