@@ -171,6 +171,12 @@
         "kind": "errorNode",
         "message": "DvP leg amounts must be non-zero",
         "name": "zeroAmount"
+      },
+      {
+        "code": 10,
+        "kind": "errorNode",
+        "message": "Mint carries an unsupported Token-2022 extension",
+        "name": "blockedMintExtension"
       }
     ],
     "instructions": [
@@ -241,12 +247,21 @@
           },
           {
             "docs": [
-              "SPL Token program"
+              "SPL Token or Token-2022 program; must own mint_a"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "tokenProgram"
+            "name": "tokenProgramA"
+          },
+          {
+            "docs": [
+              "SPL Token or Token-2022 program; must own mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "tokenProgramB"
           },
           {
             "docs": [
@@ -380,6 +395,15 @@
           },
           {
             "docs": [
+              "Mint of the leg being reclaimed; must equal dvp.mint_a or dvp.mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mint"
+          },
+          {
+            "docs": [
               "DvP's escrow ATA for the leg's mint"
             ],
             "isSigner": false,
@@ -398,7 +422,7 @@
           },
           {
             "docs": [
-              "SPL Token program"
+              "SPL Token or Token-2022 program; must own mint"
             ],
             "isSigner": false,
             "isWritable": false,
@@ -451,6 +475,24 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
+          },
+          {
+            "docs": [
+              "Must equal dvp.mint_a"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mintA"
+          },
+          {
+            "docs": [
+              "Must equal dvp.mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mintB"
           },
           {
             "docs": [
@@ -508,12 +550,21 @@
           },
           {
             "docs": [
-              "SPL Token program"
+              "SPL Token or Token-2022 program; must own mint_a"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "tokenProgram"
+            "name": "tokenProgramA"
+          },
+          {
+            "docs": [
+              "SPL Token or Token-2022 program; must own mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "tokenProgramB"
           }
         ],
         "arguments": [
@@ -525,6 +576,15 @@
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
             "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "legAExtrasCount",
             "type": {
               "endian": "le",
               "format": "u8",
@@ -564,6 +624,24 @@
           },
           {
             "docs": [
+              "Must equal dvp.mint_a"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mintA"
+          },
+          {
+            "docs": [
+              "Must equal dvp.mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mintB"
+          },
+          {
+            "docs": [
               "Asset escrow (drained if funded, then closed)"
             ],
             "isSigner": false,
@@ -600,12 +678,21 @@
           },
           {
             "docs": [
-              "SPL Token program"
+              "SPL Token or Token-2022 program; must own mint_a"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "tokenProgram"
+            "name": "tokenProgramA"
+          },
+          {
+            "docs": [
+              "SPL Token or Token-2022 program; must own mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "tokenProgramB"
           }
         ],
         "arguments": [
@@ -617,6 +704,15 @@
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
             "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "legAExtrasCount",
             "type": {
               "endian": "le",
               "format": "u8",
@@ -665,6 +761,24 @@
           },
           {
             "docs": [
+              "Must equal dvp.mint_a"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mintA"
+          },
+          {
+            "docs": [
+              "Must equal dvp.mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "mintB"
+          },
+          {
+            "docs": [
               "Asset escrow (drained if funded, then closed)"
             ],
             "isSigner": false,
@@ -701,12 +815,21 @@
           },
           {
             "docs": [
-              "SPL Token program"
+              "SPL Token or Token-2022 program; must own mint_a"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "tokenProgram"
+            "name": "tokenProgramA"
+          },
+          {
+            "docs": [
+              "SPL Token or Token-2022 program; must own mint_b"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "tokenProgramB"
           }
         ],
         "arguments": [
@@ -718,6 +841,15 @@
             "defaultValueStrategy": "omitted",
             "kind": "instructionArgumentNode",
             "name": "discriminator",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "legAExtrasCount",
             "type": {
               "endian": "le",
               "format": "u8",

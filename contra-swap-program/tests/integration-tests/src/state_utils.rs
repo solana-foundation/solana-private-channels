@@ -6,21 +6,29 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
-use spl_token::{instruction::transfer as spl_transfer, ID as TOKEN_PROGRAM_ID};
+use spl_token_2022::instruction::transfer_checked;
 
-use crate::utils::{create_ata, dvp_ata, fund_wallet_ata, set_mint, swap_dvp_pda, TestContext};
+use crate::utils::{
+    create_ata, dvp_ata, fund_wallet_ata, set_mint, swap_dvp_pda, TestContext, TOKEN_PROGRAM_ID,
+};
 
 pub const AMOUNT_A: u64 = 75_000;
 pub const AMOUNT_B: u64 = 50_000;
 pub const INITIAL_BALANCE: u64 = 200_000;
 
-/// Pubkeys and ATAs for one DvP, built by `setup_dvp`.
+/// Pubkeys and ATAs for one DvP, built by `setup_dvp`. `token_program_a`
+/// and `token_program_b` default to legacy SPL Token for backwards
+/// compatibility with the original tests; tests that exercise Token-2022
+/// (or mixed-program) lifecycles construct the fixture directly with
+/// `setup_dvp_with_programs`.
 pub struct DvpFixture {
     pub user_a: Keypair,
     pub user_b: Keypair,
     pub settlement_authority: Keypair,
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
+    pub token_program_a: Pubkey,
+    pub token_program_b: Pubkey,
     pub swap_dvp: Pubkey,
     pub user_a_ata_a: Pubkey,
     pub user_a_ata_b: Pubkey,
@@ -33,23 +41,33 @@ pub struct DvpFixture {
 }
 
 /// Mints, two users with their own leg pre-funded, the settle-recipient
-/// cross ATAs pre-created (Settle's Transfer requires them initialized),
-/// and the SwapDvp PDA address derived for `nonce`. Does not call
-/// CreateDvp; use `assert_create_dvp` for that.
-pub fn setup_dvp(context: &mut TestContext, nonce: u64) -> DvpFixture {
+/// cross ATAs pre-created (Settle's TransferChecked requires them
+/// initialized), and the SwapDvp PDA address derived for `nonce`. Does
+/// not call CreateDvp; use `assert_create_dvp` for that.
+///
+/// Each leg's mint is created as a *bare* mint owned by the supplied
+/// `token_program_*`. Tests that need extensions on a leg's mint should
+/// overwrite the mint with one of the `set_mint_2022_with_*` builders
+/// after this returns but before calling `assert_create_dvp`.
+pub fn setup_dvp_with_programs(
+    context: &mut TestContext,
+    nonce: u64,
+    token_program_a: Pubkey,
+    token_program_b: Pubkey,
+) -> DvpFixture {
     let user_a = Keypair::new();
     let user_b = Keypair::new();
     let settlement_authority = Keypair::new();
     let mint_a = Keypair::new().pubkey();
     let mint_b = Keypair::new().pubkey();
 
-    set_mint(context, &mint_a);
-    set_mint(context, &mint_b);
+    set_mint(context, &mint_a, &token_program_a);
+    set_mint(context, &mint_b, &token_program_b);
 
-    let user_a_ata_a = fund_wallet_ata(context, &user_a, &mint_a, INITIAL_BALANCE);
-    let user_b_ata_b = fund_wallet_ata(context, &user_b, &mint_b, INITIAL_BALANCE);
-    let user_a_ata_b = create_ata(context, &user_a.pubkey(), &mint_b);
-    let user_b_ata_a = create_ata(context, &user_b.pubkey(), &mint_a);
+    let user_a_ata_a = fund_wallet_ata(context, &user_a, &mint_a, INITIAL_BALANCE, &token_program_a);
+    let user_b_ata_b = fund_wallet_ata(context, &user_b, &mint_b, INITIAL_BALANCE, &token_program_b);
+    let user_a_ata_b = create_ata(context, &user_a.pubkey(), &mint_b, &token_program_b);
+    let user_b_ata_a = create_ata(context, &user_b.pubkey(), &mint_a, &token_program_a);
 
     context.airdrop_if_required(&settlement_authority.pubkey(), 1_000_000_000);
 
@@ -63,13 +81,15 @@ pub fn setup_dvp(context: &mut TestContext, nonce: u64) -> DvpFixture {
     );
 
     DvpFixture {
-        dvp_ata_a: dvp_ata(&swap_dvp, &mint_a),
-        dvp_ata_b: dvp_ata(&swap_dvp, &mint_b),
+        dvp_ata_a: dvp_ata(&swap_dvp, &mint_a, &token_program_a),
+        dvp_ata_b: dvp_ata(&swap_dvp, &mint_b, &token_program_b),
         user_a,
         user_b,
         settlement_authority,
         mint_a,
         mint_b,
+        token_program_a,
+        token_program_b,
         swap_dvp,
         user_a_ata_a,
         user_a_ata_b,
@@ -80,6 +100,11 @@ pub fn setup_dvp(context: &mut TestContext, nonce: u64) -> DvpFixture {
     }
 }
 
+/// Backwards-compatible default: both legs on legacy SPL Token.
+pub fn setup_dvp(context: &mut TestContext, nonce: u64) -> DvpFixture {
+    setup_dvp_with_programs(context, nonce, TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID)
+}
+
 pub fn assert_create_dvp(context: &mut TestContext, fixture: &DvpFixture) -> TransactionMetadata {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
@@ -88,6 +113,8 @@ pub fn assert_create_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
         .user_a(fixture.user_a.pubkey())
         .user_b(fixture.user_b.pubkey())
         .settlement_authority(fixture.settlement_authority.pubkey())
@@ -99,26 +126,46 @@ pub fn assert_create_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
     context.send(ix, &[]).expect("CreateDvp")
 }
 
-/// Fund the asset leg by transferring `amount` of `mint_a` from
-/// `user_a_ata_a` to the escrow `dvp_ata_a` via a raw SPL Transfer.
-/// This is the canonical funding path — the program has no FundDvp
-/// instruction; legs are funded by ordinary token transfers so that
-/// custodian integrations need no custom program call.
+/// Fund a leg by issuing a raw `TransferChecked` (the canonical funding
+/// path — the program has no FundDvp instruction). `TransferChecked`
+/// works against both legacy SPL Token and Token-2022 programs.
+fn fund_leg(
+    context: &mut TestContext,
+    user: &Keypair,
+    source_ata: &Pubkey,
+    dest_ata: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+) -> TransactionMetadata {
+    let ix = transfer_checked(
+        token_program,
+        source_ata,
+        mint,
+        dest_ata,
+        &user.pubkey(),
+        &[],
+        amount,
+        6, // matches the `decimals` field in set_mint / set_mint_2022_*
+    )
+    .expect("build TransferChecked");
+    context.send(ix, &[user]).expect("fund leg")
+}
+
 pub fn assert_fund_a_amount(
     context: &mut TestContext,
     fixture: &DvpFixture,
     amount: u64,
 ) -> TransactionMetadata {
-    let ix = spl_transfer(
-        &TOKEN_PROGRAM_ID,
+    fund_leg(
+        context,
+        &fixture.user_a,
         &fixture.user_a_ata_a,
         &fixture.dvp_ata_a,
-        &fixture.user_a.pubkey(),
-        &[],
+        &fixture.mint_a,
+        &fixture.token_program_a,
         amount,
     )
-    .expect("build SPL transfer A");
-    context.send(ix, &[&fixture.user_a]).expect("fund leg A")
 }
 
 pub fn assert_fund_b_amount(
@@ -126,16 +173,15 @@ pub fn assert_fund_b_amount(
     fixture: &DvpFixture,
     amount: u64,
 ) -> TransactionMetadata {
-    let ix = spl_transfer(
-        &TOKEN_PROGRAM_ID,
+    fund_leg(
+        context,
+        &fixture.user_b,
         &fixture.user_b_ata_b,
         &fixture.dvp_ata_b,
-        &fixture.user_b.pubkey(),
-        &[],
+        &fixture.mint_b,
+        &fixture.token_program_b,
         amount,
     )
-    .expect("build SPL transfer B");
-    context.send(ix, &[&fixture.user_b]).expect("fund leg B")
 }
 
 pub fn assert_fund_a(context: &mut TestContext, fixture: &DvpFixture) -> TransactionMetadata {
@@ -150,8 +196,10 @@ pub fn assert_reclaim_a(context: &mut TestContext, fixture: &DvpFixture) -> Tran
     let ix = ReclaimDvpBuilder::new()
         .signer(fixture.user_a.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint(fixture.mint_a)
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(fixture.user_a_ata_a)
+        .token_program(fixture.token_program_a)
         .instruction();
     context.send(ix, &[&fixture.user_a]).expect("ReclaimDvp A")
 }
@@ -160,12 +208,17 @@ pub fn assert_settle_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
     let ix = SettleDvpBuilder::new()
         .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_b(fixture.user_a_ata_b)
         .user_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     context
         .send(ix, &[&fixture.settlement_authority])
@@ -176,10 +229,15 @@ pub fn assert_cancel_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
     let ix = CancelDvpBuilder::new()
         .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     context
         .send(ix, &[&fixture.settlement_authority])
@@ -195,10 +253,15 @@ pub fn assert_reject_dvp(
         .signer(signer.pubkey())
         .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     context.send(ix, &[signer]).expect("RejectDvp")
 }

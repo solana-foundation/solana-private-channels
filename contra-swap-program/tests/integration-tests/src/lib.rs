@@ -13,3 +13,5 @@ mod test_reclaim_dvp;
 mod test_reject_dvp;
 #[cfg(test)]
 mod test_settle_dvp;
+#[cfg(test)]
+mod test_token_2022;

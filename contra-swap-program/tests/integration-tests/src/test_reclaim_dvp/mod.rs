@@ -1,6 +1,6 @@
 use contra_swap_program_client::instructions::ReclaimDvpBuilder;
 use solana_sdk::signature::{Keypair, Signer};
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 
 use crate::{
     state_utils::{
@@ -49,8 +49,10 @@ fn test_reclaim_dvp_b_success() {
     let ix = ReclaimDvpBuilder::new()
         .signer(fixture.user_b.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint(fixture.mint_b)
         .dvp_source_ata(fixture.dvp_ata_b)
         .signer_dest_ata(fixture.user_b_ata_b)
+        .token_program(fixture.token_program_b)
         .instruction();
     context
         .send(ix, &[&fixture.user_b])
@@ -72,13 +74,18 @@ fn test_reclaim_dvp_rejects_settlement_authority() {
 
     // settlement_authority is not a depositor, so the leg-selection
     // arm in process_reclaim_dvp returns SignerNotParty.
-    let auth_ata_a =
-        get_associated_token_address(&fixture.settlement_authority.pubkey(), &fixture.mint_a);
+    let auth_ata_a = get_associated_token_address_with_program_id(
+        &fixture.settlement_authority.pubkey(),
+        &fixture.mint_a,
+        &fixture.token_program_a,
+    );
     let ix = ReclaimDvpBuilder::new()
         .signer(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint(fixture.mint_a)
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(auth_ata_a)
+        .token_program(fixture.token_program_a)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_program_error(result, SIGNER_NOT_PARTY);
@@ -93,13 +100,19 @@ fn test_reclaim_dvp_rejects_third_party() {
 
     let outsider = Keypair::new();
     context.airdrop_if_required(&outsider.pubkey(), 1_000_000_000);
-    let outsider_ata_a = get_associated_token_address(&outsider.pubkey(), &fixture.mint_a);
+    let outsider_ata_a = get_associated_token_address_with_program_id(
+        &outsider.pubkey(),
+        &fixture.mint_a,
+        &fixture.token_program_a,
+    );
 
     let ix = ReclaimDvpBuilder::new()
         .signer(outsider.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint(fixture.mint_a)
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(outsider_ata_a)
+        .token_program(fixture.token_program_a)
         .instruction();
     let result = context.send(ix, &[&outsider]);
     assert_program_error(result, SIGNER_NOT_PARTY);
@@ -121,8 +134,10 @@ fn test_reclaim_dvp_rejects_post_expiry() {
     let ix = ReclaimDvpBuilder::new()
         .signer(fixture.user_a.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint(fixture.mint_a)
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(fixture.user_a_ata_a)
+        .token_program(fixture.token_program_a)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
     assert_program_error(result, DVP_EXPIRED);

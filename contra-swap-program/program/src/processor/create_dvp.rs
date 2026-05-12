@@ -7,7 +7,7 @@ use crate::{
         verify_system_program, verify_token_program,
     },
     processor::shared::pda_utils::create_pda_account,
-    processor::shared::token_utils::verify_canonical_ata,
+    processor::shared::token_utils::{validate_mint_extensions, verify_canonical_ata},
     require_len,
     state::swap_dvp::{SwapDvp, SWAP_DVP_SEED},
 };
@@ -35,8 +35,9 @@ use pinocchio_associated_token_account::instructions::Create as CreateAta;
 /// 4. `[writable]` dvp_ata_a - swap_dvp's ATA for mint_a (created here)
 /// 5. `[writable]` dvp_ata_b - swap_dvp's ATA for mint_b (created here)
 /// 6. `[]` system_program
-/// 7. `[]` token_program
-/// 8. `[]` associated_token_program
+/// 7. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
+/// 8. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 9. `[]` associated_token_program
 ///
 /// # Instruction Data
 /// * `user_a` (Pubkey) - Seller
@@ -55,7 +56,7 @@ pub fn process_create_dvp(
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
-    let [payer_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, system_program_info, token_program_info, associated_token_program_info] =
+    let [payer_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, system_program_info, token_program_a_info, token_program_b_info, associated_token_program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -64,10 +65,13 @@ pub fn process_create_dvp(
     verify_signer(payer_info, true)?;
     verify_system_account(swap_dvp_info, true)?;
     verify_system_program(system_program_info)?;
-    verify_token_program(token_program_info)?;
+    verify_token_program(token_program_a_info)?;
+    verify_token_program(token_program_b_info)?;
     verify_ata_program(associated_token_program_info)?;
-    verify_account_owner(mint_a_info, token_program_info.address())?;
-    verify_account_owner(mint_b_info, token_program_info.address())?;
+    verify_account_owner(mint_a_info, token_program_a_info.address())?;
+    verify_account_owner(mint_b_info, token_program_b_info.address())?;
+    validate_mint_extensions(mint_a_info)?;
+    validate_mint_extensions(mint_b_info)?;
 
     let now = Clock::get()?.unix_timestamp;
     validate_args(&args, mint_a_info.address(), mint_b_info.address(), now)?;
@@ -110,14 +114,14 @@ pub fn process_create_dvp(
         dvp_ata_a_info,
         swap_dvp_info.address(),
         mint_a_info.address(),
-        token_program_info,
+        token_program_a_info,
     )?;
     // dvp_ata_b is the DvP PDA's ATA for mint_b (cash escrow).
     verify_canonical_ata(
         dvp_ata_b_info,
         swap_dvp_info.address(),
         mint_b_info.address(),
-        token_program_info,
+        token_program_b_info,
     )?;
 
     let rent = Rent::get()?;
@@ -137,7 +141,7 @@ pub fn process_create_dvp(
         wallet: swap_dvp_info,
         mint: mint_a_info,
         system_program: system_program_info,
-        token_program: token_program_info,
+        token_program: token_program_a_info,
     }
     .invoke()?;
 
@@ -147,7 +151,7 @@ pub fn process_create_dvp(
         wallet: swap_dvp_info,
         mint: mint_b_info,
         system_program: system_program_info,
-        token_program: token_program_info,
+        token_program: token_program_b_info,
     }
     .invoke()?;
 

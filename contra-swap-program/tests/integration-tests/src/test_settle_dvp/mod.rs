@@ -97,12 +97,17 @@ fn test_settle_dvp_rejects_user_as_authority() {
     let ix = SettleDvpBuilder::new()
         .settlement_authority(fixture.user_a.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_b(fixture.user_a_ata_b)
         .user_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
     assert_program_error(result, SETTLEMENT_AUTHORITY_MISMATCH);
@@ -122,12 +127,17 @@ fn test_settle_dvp_rejects_third_party_as_authority() {
     let ix = SettleDvpBuilder::new()
         .settlement_authority(outsider.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_b(fixture.user_a_ata_b)
         .user_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&outsider]);
     assert_program_error(result, SETTLEMENT_AUTHORITY_MISMATCH);
@@ -143,12 +153,17 @@ fn test_settle_dvp_rejects_when_neither_leg_funded() {
         SettleDvpBuilder::new()
             .settlement_authority(fixture.settlement_authority.pubkey())
             .swap_dvp(fixture.swap_dvp)
+            .mint_a(fixture.mint_a)
+            .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
             .dvp_ata_b(fixture.dvp_ata_b)
             .user_a_ata_b(fixture.user_a_ata_b)
             .user_b_ata_a(fixture.user_b_ata_a)
             .user_a_ata_a(fixture.user_a_ata_a)
             .user_b_ata_b(fixture.user_b_ata_b)
+            .token_program_a(fixture.token_program_a)
+            .token_program_b(fixture.token_program_b)
+            .leg_a_extras_count(0)
             .instruction(),
         &[&fixture.settlement_authority],
     );
@@ -168,12 +183,17 @@ fn test_settle_dvp_rejects_when_only_leg_b_funded() {
         SettleDvpBuilder::new()
             .settlement_authority(fixture.settlement_authority.pubkey())
             .swap_dvp(fixture.swap_dvp)
+            .mint_a(fixture.mint_a)
+            .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
             .dvp_ata_b(fixture.dvp_ata_b)
             .user_a_ata_b(fixture.user_a_ata_b)
             .user_b_ata_a(fixture.user_b_ata_a)
             .user_a_ata_a(fixture.user_a_ata_a)
             .user_b_ata_b(fixture.user_b_ata_b)
+            .token_program_a(fixture.token_program_a)
+            .token_program_b(fixture.token_program_b)
+            .leg_a_extras_count(0)
             .instruction(),
         &[&fixture.settlement_authority],
     );
@@ -193,12 +213,17 @@ fn test_settle_dvp_rejects_when_only_leg_a_funded() {
         SettleDvpBuilder::new()
             .settlement_authority(fixture.settlement_authority.pubkey())
             .swap_dvp(fixture.swap_dvp)
+            .mint_a(fixture.mint_a)
+            .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
             .dvp_ata_b(fixture.dvp_ata_b)
             .user_a_ata_b(fixture.user_a_ata_b)
             .user_b_ata_a(fixture.user_b_ata_a)
             .user_a_ata_a(fixture.user_a_ata_a)
             .user_b_ata_b(fixture.user_b_ata_b)
+            .token_program_a(fixture.token_program_a)
+            .token_program_b(fixture.token_program_b)
+            .leg_a_extras_count(0)
             .instruction(),
         &[&fixture.settlement_authority],
     );
@@ -243,7 +268,13 @@ fn test_settle_dvp_treats_third_party_donation_as_gift() {
 
     let donor = Keypair::new();
     let donation = AMOUNT_A + 500;
-    let donor_ata_a = fund_wallet_ata(&mut context, &donor, &fixture.mint_a, donation);
+    let donor_ata_a = fund_wallet_ata(
+        &mut context,
+        &donor,
+        &fixture.mint_a,
+        donation,
+        &fixture.token_program_a,
+    );
 
     let donate_ix = spl_transfer(
         &TOKEN_PROGRAM_ID,
@@ -296,8 +327,8 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
         &first_dvp.mint_b,
         second_nonce,
     );
-    let second_dvp_ata_a = dvp_ata(&second_swap_dvp, &first_dvp.mint_a);
-    let second_dvp_ata_b = dvp_ata(&second_swap_dvp, &first_dvp.mint_b);
+    let second_dvp_ata_a = dvp_ata(&second_swap_dvp, &first_dvp.mint_a, &first_dvp.token_program_a);
+    let second_dvp_ata_b = dvp_ata(&second_swap_dvp, &first_dvp.mint_b, &first_dvp.token_program_b);
 
     let create_second = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
@@ -306,6 +337,8 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
         .mint_b(first_dvp.mint_b)
         .dvp_ata_a(second_dvp_ata_a)
         .dvp_ata_b(second_dvp_ata_b)
+        .token_program_a(first_dvp.token_program_a)
+        .token_program_b(first_dvp.token_program_b)
         .user_a(first_dvp.user_a.pubkey())
         .user_b(first_dvp.user_b.pubkey())
         .settlement_authority(first_dvp.settlement_authority.pubkey())
@@ -335,10 +368,15 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
     let cancel_second = CancelDvpBuilder::new()
         .settlement_authority(first_dvp.settlement_authority.pubkey())
         .swap_dvp(second_swap_dvp)
+        .mint_a(first_dvp.mint_a)
+        .mint_b(first_dvp.mint_b)
         .dvp_ata_a(second_dvp_ata_a)
         .dvp_ata_b(second_dvp_ata_b)
         .user_a_ata_a(first_dvp.user_a_ata_a)
         .user_b_ata_b(first_dvp.user_b_ata_b)
+        .token_program_a(first_dvp.token_program_a)
+        .token_program_b(first_dvp.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     context
         .send(cancel_second, &[&first_dvp.settlement_authority])

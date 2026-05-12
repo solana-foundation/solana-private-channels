@@ -1,10 +1,7 @@
 #![allow(unused)]
 
 use {
-    contra_swap_program_client::{
-        instructions::{CreateDvpBuilder, FundDvpBuilder},
-        CONTRA_SWAP_PROGRAM_ID,
-    },
+    contra_swap_program_client::{instructions::CreateDvpBuilder, CONTRA_SWAP_PROGRAM_ID},
     solana_sdk::{
         account::AccountSharedData,
         hash::Hash,
@@ -240,6 +237,8 @@ pub fn create_dvp_transaction(
         .mint_b(*mint_b)
         .dvp_ata_a(dvp_ata_a)
         .dvp_ata_b(dvp_ata_b)
+        .token_program_a(spl_token::ID)
+        .token_program_b(spl_token::ID)
         .user_a(user_a)
         .user_b(user_b)
         .settlement_authority(settlement_authority)
@@ -255,10 +254,15 @@ pub fn create_dvp_transaction(
     Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer], recent_blockhash)
 }
 
+/// Fund a DvP leg by issuing a plain SPL transfer from the signer's ATA
+/// to the DvP's escrow ATA. The swap program no longer has a `FundDvp`
+/// instruction — funding is intentionally an out-of-band SPL transfer so
+/// custodian integrations need no custom program call.
 pub fn fund_dvp_transaction(
     signer: &Keypair,
     swap_dvp: Pubkey,
     leg_mint: &Pubkey,
+    amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
     let signer_source_ata =
@@ -266,12 +270,15 @@ pub fn fund_dvp_transaction(
     let dvp_dest_ata =
         get_associated_token_address_with_program_id(&swap_dvp, leg_mint, &spl_token::ID);
 
-    let ix = FundDvpBuilder::new()
-        .signer(signer.pubkey())
-        .swap_dvp(swap_dvp)
-        .signer_source_ata(signer_source_ata)
-        .dvp_dest_ata(dvp_dest_ata)
-        .instruction();
+    let ix = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &signer_source_ata,
+        &dvp_dest_ata,
+        &signer.pubkey(),
+        &[],
+        amount,
+    )
+    .expect("build SPL transfer for DvP funding");
 
     Transaction::new_signed_with_payer(&[ix], Some(&signer.pubkey()), &[signer], recent_blockhash)
 }

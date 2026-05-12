@@ -108,10 +108,15 @@ fn test_reject_dvp_rejects_settlement_authority_as_signer() {
         .signer(fixture.settlement_authority.pubkey())
         .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_program_error(result, SIGNER_NOT_PARTY);
@@ -131,10 +136,15 @@ fn test_reject_dvp_rejects_third_party() {
         .signer(outsider.pubkey())
         .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&outsider]);
     assert_program_error(result, SIGNER_NOT_PARTY);

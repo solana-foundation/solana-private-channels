@@ -10,6 +10,25 @@ use pinocchio::Address as Pubkey;
 /// is intentionally not a program instruction so that custodian
 /// integrations can use a plain SPL Transfer.
 /// Discriminator order matches `discriminator::ContraSwapInstructionDiscriminators`.
+///
+/// Token-2022: every transfer instruction accepts a separate token
+/// program per leg (`token_program_a` / `token_program_b`), enabling
+/// cross-program swaps (e.g. legacy-SPL ↔ Token-2022). Each token
+/// program account must match the owner of its leg's mint. Mints
+/// carrying amount-mutating Token-2022 extensions (ConfidentialTransfer,
+/// TransferFee, InterestBearing, ScaledUiAmount) are rejected at
+/// CreateDvp; later instructions do not re-check so that funds remain
+/// recoverable if a mint's extension parameters change post-Create.
+///
+/// TransferHook is supported: instructions that issue a `TransferChecked`
+/// CPI (Settle/Cancel/Reject/Reclaim) treat any accounts beyond their
+/// fixed prefix as transfer-hook extras forwarded to the token program.
+/// Settle/Cancel/Reject split the trailing accounts between the two legs
+/// via the `leg_a_extras_count: u8` data field; Reclaim has a single
+/// leg, so all trailing accounts feed its one CPI. The client is
+/// responsible for resolving the hook's `ExtraAccountMetaList`
+/// off-chain and supplying the resulting accounts in the order the hook
+/// expects.
 #[repr(C, u8)]
 #[derive(Clone, Debug, PartialEq, CodamaInstructions)]
 pub enum ContraSwapProgramInstruction {
@@ -36,7 +55,14 @@ pub enum ContraSwapProgramInstruction {
         writable
     ))]
     #[codama(account(name = "system_program", docs = "System program"))]
-    #[codama(account(name = "token_program", docs = "SPL Token program"))]
+    #[codama(account(
+        name = "token_program_a",
+        docs = "SPL Token or Token-2022 program; must own mint_a"
+    ))]
+    #[codama(account(
+        name = "token_program_b",
+        docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
     #[codama(account(
         name = "associated_token_program",
         docs = "Associated Token Account program"
@@ -73,6 +99,10 @@ pub enum ContraSwapProgramInstruction {
         docs = "SwapDvp PDA (signs the transfer as authority)"
     ))]
     #[codama(account(
+        name = "mint",
+        docs = "Mint of the leg being reclaimed; must equal dvp.mint_a or dvp.mint_b"
+    ))]
+    #[codama(account(
         name = "dvp_source_ata",
         docs = "DvP's escrow ATA for the leg's mint",
         writable
@@ -82,7 +112,10 @@ pub enum ContraSwapProgramInstruction {
         docs = "Signer's canonical ATA for the leg's mint",
         writable
     ))]
-    #[codama(account(name = "token_program", docs = "SPL Token program"))]
+    #[codama(account(
+        name = "token_program",
+        docs = "SPL Token or Token-2022 program; must own mint"
+    ))]
     ReclaimDvp {} = 1,
 
     /// Permissioned: signer must be `dvp.settlement_authority`. Atomic
@@ -101,6 +134,8 @@ pub enum ContraSwapProgramInstruction {
         docs = "SwapDvp PDA (signs CPIs, then closed)",
         writable
     ))]
+    #[codama(account(name = "mint_a", docs = "Must equal dvp.mint_a"))]
+    #[codama(account(name = "mint_b", docs = "Must equal dvp.mint_b"))]
     #[codama(account(
         name = "dvp_ata_a",
         docs = "Asset escrow (drained, then closed)",
@@ -131,8 +166,22 @@ pub enum ContraSwapProgramInstruction {
         docs = "user_b's ATA for mint_b; receives any cash-leg surplus refund",
         writable
     ))]
-    #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    SettleDvp {} = 2,
+    #[codama(account(
+        name = "token_program_a",
+        docs = "SPL Token or Token-2022 program; must own mint_a"
+    ))]
+    #[codama(account(
+        name = "token_program_b",
+        docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    SettleDvp {
+        /// Splits the trailing remaining accounts between the two
+        /// legs' `TransferChecked` CPIs. The first
+        /// `leg_a_extras_count` remaining accounts go to leg A; the
+        /// rest go to leg B. Either value can be 0 independently
+        /// (e.g. only leg B's mint carries a transfer hook).
+        leg_a_extras_count: u8,
+    } = 2,
 
     /// Permissioned: signer must be `dvp.settlement_authority`. Refunds
     /// any funded legs to their depositors and closes the trade. No
@@ -149,6 +198,8 @@ pub enum ContraSwapProgramInstruction {
         docs = "SwapDvp PDA (signs CPIs, then closed)",
         writable
     ))]
+    #[codama(account(name = "mint_a", docs = "Must equal dvp.mint_a"))]
+    #[codama(account(name = "mint_b", docs = "Must equal dvp.mint_b"))]
     #[codama(account(
         name = "dvp_ata_a",
         docs = "Asset escrow (drained if funded, then closed)",
@@ -169,8 +220,22 @@ pub enum ContraSwapProgramInstruction {
         docs = "user_b's ATA for mint_b; refund destination",
         writable
     ))]
-    #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    CancelDvp {} = 3,
+    #[codama(account(
+        name = "token_program_a",
+        docs = "SPL Token or Token-2022 program; must own mint_a"
+    ))]
+    #[codama(account(
+        name = "token_program_b",
+        docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    CancelDvp {
+        /// Splits the trailing remaining accounts between the two
+        /// legs' refund `TransferChecked` CPIs. The first
+        /// `leg_a_extras_count` remaining accounts go to leg A; the
+        /// rest go to leg B. Accounts for an unfunded leg are ignored
+        /// since that leg's transfer is skipped.
+        leg_a_extras_count: u8,
+    } = 3,
 
     /// Permissioned: signer must be `dvp.user_a` or `dvp.user_b`. Either
     /// counterparty can pull the plug; refunds any funded legs to their
@@ -193,6 +258,8 @@ pub enum ContraSwapProgramInstruction {
         docs = "SwapDvp PDA (signs CPIs, then closed)",
         writable
     ))]
+    #[codama(account(name = "mint_a", docs = "Must equal dvp.mint_a"))]
+    #[codama(account(name = "mint_b", docs = "Must equal dvp.mint_b"))]
     #[codama(account(
         name = "dvp_ata_a",
         docs = "Asset escrow (drained if funded, then closed)",
@@ -213,6 +280,20 @@ pub enum ContraSwapProgramInstruction {
         docs = "user_b's ATA for mint_b; refund destination",
         writable
     ))]
-    #[codama(account(name = "token_program", docs = "SPL Token program"))]
-    RejectDvp {} = 4,
+    #[codama(account(
+        name = "token_program_a",
+        docs = "SPL Token or Token-2022 program; must own mint_a"
+    ))]
+    #[codama(account(
+        name = "token_program_b",
+        docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    RejectDvp {
+        /// Splits the trailing remaining accounts between the two
+        /// legs' refund `TransferChecked` CPIs. The first
+        /// `leg_a_extras_count` remaining accounts go to leg A; the
+        /// rest go to leg B. Accounts for an unfunded leg are ignored
+        /// since that leg's transfer is skipped.
+        leg_a_extras_count: u8,
+    } = 4,
 }

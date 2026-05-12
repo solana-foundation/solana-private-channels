@@ -1,6 +1,7 @@
 use pinocchio::{account::AccountView, address::Address, error::ProgramError};
 use pinocchio_associated_token_account::ID as ATA_PROGRAM_ID;
 use pinocchio_token::ID as TOKEN_PROGRAM_ID;
+use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
 #[inline(always)]
 pub fn verify_signer(info: &AccountView, expect_writable: bool) -> Result<(), ProgramError> {
@@ -54,18 +55,13 @@ pub fn verify_ata_program(info: &AccountView) -> Result<(), ProgramError> {
     Ok(())
 }
 
+/// Accepts either legacy SPL Token or Token-2022 as the program info
+/// argument. The caller is responsible for binding the mint to this
+/// program via `verify_account_owner(mint, token_program.address())`.
 #[inline(always)]
 pub fn verify_token_program(info: &AccountView) -> Result<(), ProgramError> {
-    if info.address().ne(&TOKEN_PROGRAM_ID) {
+    if info.address().ne(&TOKEN_PROGRAM_ID) && info.address().ne(&TOKEN_2022_PROGRAM_ID) {
         return Err(ProgramError::IncorrectProgramId);
-    }
-    Ok(())
-}
-
-#[inline(always)]
-pub fn verify_token_program_account(info: &AccountView) -> Result<(), ProgramError> {
-    if !info.owned_by(&TOKEN_PROGRAM_ID) {
-        return Err(ProgramError::InvalidAccountOwner);
     }
     Ok(())
 }

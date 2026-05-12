@@ -1,16 +1,20 @@
 use crate::{
     error::ContraSwapProgramError,
     processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
-    processor::shared::token_utils::verify_canonical_ata,
+    processor::shared::token_utils::{
+        get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
+    },
+    processor::shared::utils::split_leg_remaining_accounts,
     state::swap_dvp::SwapDvp,
 };
 use pinocchio::{
     account::AccountView, address::Address, cpi::Signer, error::ProgramError, ProgramResult,
 };
-use pinocchio_token::{
-    instructions::{CloseAccount, Transfer},
-    state::TokenAccount,
-};
+use pinocchio_token_2022::instructions::CloseAccount;
+
+/// Length of the fixed account prefix; anything beyond this is treated
+/// as transfer-hook remaining accounts split between the two legs.
+const FIXED_ACCOUNTS_LEN: usize = 11;
 
 /// Processes the RejectDvp instruction.
 ///
@@ -22,28 +26,46 @@ use pinocchio_token::{
 /// Closed-account rent goes to `dvp.settlement_authority`, matching the
 /// rent-recipient convention used by Settle and Cancel.
 ///
+/// Extension validation is **not** performed here — Create is the
+/// consent point. Reject must remain available even if a mint's
+/// extension parameters change post-Create so funds are never stranded.
+///
 /// # Account Layout
-/// 0. `[signer, writable]` signer - Must equal `dvp.user_a` or `dvp.user_b`
-/// 1. `[writable]` settlement_authority - Must equal `dvp.settlement_authority`; receives closed-account rent
-/// 2. `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
-/// 3. `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
-/// 4. `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
-/// 5. `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
-/// 6. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
-/// 7. `[]` token_program
+/// 0.  `[signer, writable]` signer - Must equal `dvp.user_a` or `dvp.user_b`
+/// 1.  `[writable]` settlement_authority - Must equal `dvp.settlement_authority`; receives closed-account rent
+/// 2.  `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
+/// 3.  `[]` mint_a - Must equal `dvp.mint_a`
+/// 4.  `[]` mint_b - Must equal `dvp.mint_b`
+/// 5.  `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
+/// 6.  `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
+/// 7.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
+/// 8.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
+/// 9.  `[]` token_program_a - SPL Token or Token-2022; must own mint_a
+/// 10. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 11..11+leg_a_extras_count. Transfer-hook extras forwarded to leg A's
+///     refund `TransferChecked` CPI (only consumed if leg A was funded).
+/// rest. Transfer-hook extras forwarded to leg B's refund
+///     `TransferChecked` CPI (only consumed if leg B was funded).
+///
+/// # Instruction Data
+/// * `leg_a_extras_count` (u8) - Split point between leg A and leg B
+///   trailing accounts.
 pub fn process_reject_dvp(
     program_id: &Address,
     accounts: &[AccountView],
-    _instruction_data: &[u8],
+    instruction_data: &[u8],
 ) -> ProgramResult {
-    let [signer_info, settlement_authority_info, swap_dvp_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_info] =
-        accounts
+    let (fixed, leg_a_extras, leg_b_extras) =
+        split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
+    let [signer_info, settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
+        fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
     verify_signer(signer_info, true)?;
-    verify_token_program(token_program_info)?;
+    verify_token_program(token_program_a_info)?;
+    verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
@@ -59,6 +81,12 @@ pub fn process_reject_dvp(
         return Err(ContraSwapProgramError::SettlementAuthorityMismatch.into());
     }
 
+    if mint_a_info.address() != &dvp.mint_a || mint_b_info.address() != &dvp.mint_b {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    verify_account_owner(mint_a_info, token_program_a_info.address())?;
+    verify_account_owner(mint_b_info, token_program_b_info.address())?;
+
     // Address-only validation: an unfunded leg's user ATA can be
     // uninitialized; the canonical pubkey is well-defined regardless.
     // Note: refund pairing — each user gets their *own* mint back (not
@@ -68,28 +96,28 @@ pub fn process_reject_dvp(
         dvp_ata_a_info,
         swap_dvp_info.address(),
         &dvp.mint_a,
-        token_program_info,
+        token_program_a_info,
     )?;
     // dvp_ata_b: DvP PDA's escrow for mint_b (cash escrow).
     verify_canonical_ata(
         dvp_ata_b_info,
         swap_dvp_info.address(),
         &dvp.mint_b,
-        token_program_info,
+        token_program_b_info,
     )?;
     // user_a_ata_a: seller's ATA for mint_a — refund destination if asset leg was funded.
     verify_canonical_ata(
         user_a_ata_a_info,
         &dvp.user_a,
         &dvp.mint_a,
-        token_program_info,
+        token_program_a_info,
     )?;
     // user_b_ata_b: buyer's ATA for mint_b — refund destination if cash leg was funded.
     verify_canonical_ata(
         user_b_ata_b_info,
         &dvp.user_b,
         &dvp.mint_b,
-        token_program_info,
+        token_program_b_info,
     )?;
 
     let (nonce_bytes, bump_bytes) = dvp.seed_buffers();
@@ -99,32 +127,41 @@ pub fn process_reject_dvp(
     // Refund each leg only if its escrow has a balance. Transfers the
     // actual balance, not `dvp.amount_x`, so an unfunded leg is a clean
     // skip rather than an InsufficientFunds failure.
-    let leg_a_amount = TokenAccount::from_account_view(dvp_ata_a_info)?.amount();
+    let leg_a_amount = get_token_account_balance(dvp_ata_a_info)?;
     if leg_a_amount > 0 {
-        Transfer {
-            from: dvp_ata_a_info,
-            to: user_a_ata_a_info,
-            authority: swap_dvp_info,
-            amount: leg_a_amount,
-        }
-        .invoke_signed(&signer_seeds)?;
+        transfer_checked_cpi(
+            dvp_ata_a_info,
+            mint_a_info,
+            user_a_ata_a_info,
+            swap_dvp_info,
+            leg_a_amount,
+            get_mint_decimals(mint_a_info)?,
+            token_program_a_info.address(),
+            leg_a_extras,
+            &signer_seeds,
+        )?;
     }
 
-    let leg_b_amount = TokenAccount::from_account_view(dvp_ata_b_info)?.amount();
+    let leg_b_amount = get_token_account_balance(dvp_ata_b_info)?;
     if leg_b_amount > 0 {
-        Transfer {
-            from: dvp_ata_b_info,
-            to: user_b_ata_b_info,
-            authority: swap_dvp_info,
-            amount: leg_b_amount,
-        }
-        .invoke_signed(&signer_seeds)?;
+        transfer_checked_cpi(
+            dvp_ata_b_info,
+            mint_b_info,
+            user_b_ata_b_info,
+            swap_dvp_info,
+            leg_b_amount,
+            get_mint_decimals(mint_b_info)?,
+            token_program_b_info.address(),
+            leg_b_extras,
+            &signer_seeds,
+        )?;
     }
 
     CloseAccount {
         account: dvp_ata_a_info,
         destination: settlement_authority_info,
         authority: swap_dvp_info,
+        token_program: token_program_a_info.address(),
     }
     .invoke_signed(&signer_seeds)?;
 
@@ -132,6 +169,7 @@ pub fn process_reject_dvp(
         account: dvp_ata_b_info,
         destination: settlement_authority_info,
         authority: swap_dvp_info,
+        token_program: token_program_b_info.address(),
     }
     .invoke_signed(&signer_seeds)?;
 

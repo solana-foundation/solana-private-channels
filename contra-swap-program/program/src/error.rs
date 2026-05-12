@@ -45,6 +45,12 @@ pub enum ContraSwapProgramError {
     /// (9) `amount_a == 0` or `amount_b == 0`
     #[error("DvP leg amounts must be non-zero")]
     ZeroAmount,
+
+    /// (10) Mint carries a Token-2022 extension the swap program refuses
+    /// to support (confidential transfer, transfer fee, interest bearing,
+    /// scaled UI amount). Checked only at CreateDvp.
+    #[error("Mint carries an unsupported Token-2022 extension")]
+    BlockedMintExtension,
 }
 
 impl From<ContraSwapProgramError> for ProgramError {

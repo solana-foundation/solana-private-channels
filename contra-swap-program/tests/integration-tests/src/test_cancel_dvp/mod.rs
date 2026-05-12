@@ -133,10 +133,15 @@ fn test_cancel_dvp_rejects_user_signer() {
     let ix = CancelDvpBuilder::new()
         .settlement_authority(fixture.user_a.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
     assert_program_error(result, SETTLEMENT_AUTHORITY_MISMATCH);
@@ -156,10 +161,15 @@ fn test_cancel_dvp_rejects_third_party() {
     let ix = CancelDvpBuilder::new()
         .settlement_authority(outsider.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&outsider]);
     assert_program_error(result, SETTLEMENT_AUTHORITY_MISMATCH);
