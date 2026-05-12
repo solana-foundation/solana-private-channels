@@ -124,7 +124,7 @@ impl AccountsDB {
             &ProcessedTransaction,
         )>,
         block_info: Option<BlockInfo>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<super::write_batch::AddressSignatureRow>, String> {
         super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 

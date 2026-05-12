@@ -75,6 +75,10 @@ services:
       -c archive_mode=on
       -c archive_command='cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f'
       -c listen_addresses='*'
+      -c shared_buffers=${PRIVATE_CHANNEL_PG_SHARED_BUFFERS:-4GB}
+      -c synchronous_commit=${PRIVATE_CHANNEL_PG_SYNCHRONOUS_COMMIT:-off}
+      -c wal_compression=${PRIVATE_CHANNEL_PG_WAL_COMPRESSION:-lz4}
+      -c max_wal_size=${PRIVATE_CHANNEL_PG_MAX_WAL_SIZE:-4GB}
     networks:
       - private-channel-network
     healthcheck:

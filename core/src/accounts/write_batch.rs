@@ -16,6 +16,17 @@ use {
     tracing::warn,
 };
 
+/// One (address, slot, signature) triple destined for the `address_signatures`
+/// index. Built by the settler's atomic write_batch and shipped to the
+/// background `address_index_writer` worker via a bounded channel; the writer
+/// is the only thing that inserts into the table.
+#[derive(Debug, Clone)]
+pub struct AddressSignatureRow {
+    pub address: Vec<u8>,
+    pub slot: i64,
+    pub signature: Vec<u8>,
+}
+
 pub async fn write_batch(
     db: &mut AccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],
@@ -27,13 +38,15 @@ pub async fn write_batch(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-) -> Result<(), String> {
+) -> Result<Vec<AddressSignatureRow>, String> {
     match db {
         AccountsDB::Postgres(postgres_db) => {
             write_batch_postgres(postgres_db, account_settlements, transactions, block_info).await
         }
         AccountsDB::Redis(redis_db) => {
-            write_batch_redis(redis_db, account_settlements, transactions, block_info).await
+            write_batch_redis(redis_db, account_settlements, transactions, block_info)
+                .await
+                .map(|()| Vec::new())
         }
     }
 }
@@ -56,14 +69,14 @@ async fn write_batch_postgres(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-) -> Result<(), String> {
+) -> Result<Vec<AddressSignatureRow>, String> {
     if db.read_only {
         warn!("Attempted to write batch in read-only mode");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if account_settlements.is_empty() && transactions.is_empty() && block_info.is_none() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let pool = Arc::clone(&db.pool);
@@ -101,12 +114,11 @@ async fn write_batch_postgres(
     let tx_count = transactions.len() as i64;
     let mut sig_bytes_vec: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
     let mut tx_data_vec: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
-    // Parallel arrays for the address_signatures index. We can't size these up
-    // front because each transaction contributes a variable number of rows
-    // (one per account key referenced in the message).
-    let mut addr_sig_addresses: Vec<Vec<u8>> = Vec::new();
-    let mut addr_sig_slots: Vec<i64> = Vec::new();
-    let mut addr_sig_signatures: Vec<Vec<u8>> = Vec::new();
+    // Build address_signatures rows here (one per account key referenced in
+    // each tx) but ship them out to the background writer after COMMIT below;
+    // they are no longer part of the atomic transaction. ~5–7 rows per tx is
+    // typical, so use that as the initial capacity hint.
+    let mut addr_sig_rows: Vec<AddressSignatureRow> = Vec::with_capacity(transactions.len() * 7);
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         sig_bytes_vec.push(signature.as_ref().to_vec());
@@ -116,10 +128,13 @@ async fn write_batch_postgres(
         // Index every account key the transaction touches, not just the fee
         // payer — getSignaturesForAddress must return a hit for any address
         // that appeared in the message (writable or read-only).
+        let sig_bytes = signature.as_ref().to_vec();
         for pubkey in transaction.message().account_keys().iter() {
-            addr_sig_addresses.push(pubkey.to_bytes().to_vec());
-            addr_sig_slots.push(tx_slot as i64);
-            addr_sig_signatures.push(signature.as_ref().to_vec());
+            addr_sig_rows.push(AddressSignatureRow {
+                address: pubkey.to_bytes().to_vec(),
+                slot: tx_slot as i64,
+                signature: sig_bytes.clone(),
+            });
         }
     }
 
@@ -177,25 +192,6 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
 
-    // Bulk-insert address_signatures in the same atomic transaction as the
-    // rows they point at — a reader on a partial commit would see a signature
-    // in the index with no matching transactions row. ON CONFLICT DO NOTHING
-    // because the same (address, slot, signature) triple can legitimately
-    // recur across retries of the same batch.
-    if !addr_sig_addresses.is_empty() {
-        sqlx::query(
-            "INSERT INTO address_signatures (address, slot, signature)
-             SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::bytea[])
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(&addr_sig_addresses)
-        .bind(&addr_sig_slots)
-        .bind(&addr_sig_signatures)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to bulk insert address signatures: {}", e))?;
-    }
-
     // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
     // via this path and MVCC returns the caller's own last commit.
     if tx_count > 0 {
@@ -249,7 +245,7 @@ async fn write_batch_postgres(
         .await
         .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
-    Ok(())
+    Ok(addr_sig_rows)
 }
 
 pub(crate) async fn write_batch_redis(

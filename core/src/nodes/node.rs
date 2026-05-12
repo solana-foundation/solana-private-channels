@@ -8,9 +8,13 @@ use {
         scheduler::ConflictFreeBatch,
         stage_metrics::{NoopMetrics, SharedMetrics},
         stages::{
-            dedup::load_dedup_state, execution::start_execution_worker,
-            sequencer::start_sequence_worker, settle::start_settle_worker,
-            sigverify::start_sigverify_workerpool, AccountSettlement,
+            address_index_writer::{start_address_index_writer, AddressIndexWriterArgs},
+            dedup::load_dedup_state,
+            execution::start_execution_worker,
+            sequencer::start_sequence_worker,
+            settle::start_settle_worker,
+            sigverify::start_sigverify_workerpool,
+            AccountSettlement,
         },
     },
     futures::future::FutureExt,
@@ -167,11 +171,13 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             let sequencer_hb = crate::health::StageHeartbeat::new();
             let executor_hb = crate::health::StageHeartbeat::new();
             let settler_hb = crate::health::StageHeartbeat::new();
+            let addr_index_writer_hb = crate::health::StageHeartbeat::new();
             heartbeats.dedup = Some(Arc::clone(&dedup_hb));
             heartbeats.sigverify = Some(Arc::clone(&sigverify_hb));
             heartbeats.sequencer = Some(Arc::clone(&sequencer_hb));
             heartbeats.executor = Some(Arc::clone(&executor_hb));
             heartbeats.settler = Some(Arc::clone(&settler_hb));
+            heartbeats.address_index_writer = Some(Arc::clone(&addr_index_writer_hb));
 
             // Start dedup stage (filters duplicate transactions before sigverify)
             let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
@@ -228,10 +234,19 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             .await;
             write_workers.push(execution);
 
+            // Each item is one tick worth of (address, slot, signature) rows.
+            const ADDR_SIG_QUEUE_CAPACITY: usize = 1024;
+            // Hard cap on rows per writer COMMIT so individual flushes stay
+            // sub-second even under sustained load, keeps PG commit latency
+            // bounded regardless of how much the writer has backlogged.
+            const ADDR_SIG_FLUSH_CHUNK: usize = 5000;
+            let (addr_sig_tx, addr_sig_rx) = mpsc::channel(ADDR_SIG_QUEUE_CAPACITY);
+
             let settle = start_settle_worker(crate::stages::SettleArgs {
                 execution_results_rx,
                 settled_accounts_tx,
                 settled_blockhashes_tx,
+                address_signatures_tx: addr_sig_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 blocktime_ms: config.blocktime_ms,
                 perf_sample_period_secs: config.perf_sample_period_secs,
@@ -241,6 +256,20 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             })
             .await;
             write_workers.push(settle);
+
+            // Push the writer AFTER the settler so shutdown awaits in the
+            // right order: settler drains its buffer, drops its sender, the
+            // writer's recv_many returns 0, then it flushes any remainder.
+            let addr_index_writer = start_address_index_writer(AddressIndexWriterArgs {
+                rows_rx: addr_sig_rx,
+                accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+                flush_chunk_size: ADDR_SIG_FLUSH_CHUNK,
+                shutdown_token: shutdown_token.clone(),
+                metrics: Arc::clone(&config.metrics),
+                heartbeat: addr_index_writer_hb,
+            })
+            .await;
+            write_workers.push(addr_index_writer);
 
             (
                 Some(WriteDeps {

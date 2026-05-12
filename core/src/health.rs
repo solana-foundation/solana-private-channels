@@ -55,6 +55,7 @@ pub struct HeartbeatRegistry {
     pub sequencer: Option<Arc<StageHeartbeat>>,
     pub executor: Option<Arc<StageHeartbeat>>,
     pub settler: Option<Arc<StageHeartbeat>>,
+    pub address_index_writer: Option<Arc<StageHeartbeat>>,
 }
 
 impl HeartbeatRegistry {
@@ -70,6 +71,7 @@ impl HeartbeatRegistry {
             ("sequencer", &self.sequencer),
             ("executor", &self.executor),
             ("settler", &self.settler),
+            ("address_index_writer", &self.address_index_writer),
         ] {
             if let Some(hb) = hb {
                 if !hb.is_healthy() {

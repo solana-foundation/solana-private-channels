@@ -33,6 +33,13 @@ pub trait StageMetrics: Send + Sync {
     fn settler_settle_duration_ms(&self, ms: f64);
     fn settler_db_write_duration_ms(&self, ms: f64);
     fn settler_processing_duration_ms(&self, ms: f64);
+
+    // Address-index writer (off-critical-path background worker)
+    fn address_signatures_queue_depth(&self, depth: usize);
+    fn address_signatures_send_blocked_ms(&self, ms: f64);
+    fn address_signatures_flush_duration_ms(&self, ms: f64);
+    fn address_signatures_rows_flushed(&self, count: usize);
+    fn address_signatures_flush_errors_total(&self);
 }
 
 pub type SharedMetrics = Arc<dyn StageMetrics>;
@@ -101,13 +108,28 @@ impl StageMetrics for NoopMetrics {
     fn settler_processing_duration_ms(&self, ms: f64) {
         debug!("settler: processing_duration={:.3}ms", ms);
     }
+    fn address_signatures_queue_depth(&self, depth: usize) {
+        debug!("address_signatures: queue_depth={}", depth);
+    }
+    fn address_signatures_send_blocked_ms(&self, ms: f64) {
+        debug!("address_signatures: send_blocked={:.3}ms", ms);
+    }
+    fn address_signatures_flush_duration_ms(&self, ms: f64) {
+        debug!("address_signatures: flush_duration={:.3}ms", ms);
+    }
+    fn address_signatures_rows_flushed(&self, count: usize) {
+        debug!("address_signatures: rows_flushed={}", count);
+    }
+    fn address_signatures_flush_errors_total(&self) {
+        debug!("address_signatures: flush_error");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // PrometheusMetrics — enabled via --metrics; writes to global registry.
 // ---------------------------------------------------------------------------
 
-use private_channel_metrics::{counter_vec, init_metrics};
+use private_channel_metrics::{counter_vec, gauge_vec, init_metrics};
 
 // Counters
 counter_vec!(
@@ -182,6 +204,24 @@ counter_vec!(
     "Transactions settled to DB",
     &[]
 );
+counter_vec!(
+    ADDRESS_SIGNATURES_ROWS_FLUSHED,
+    "private_channel_address_signatures_rows_flushed_total",
+    "Rows flushed to address_signatures by the index writer",
+    &[]
+);
+counter_vec!(
+    ADDRESS_SIGNATURES_FLUSH_ERRORS,
+    "private_channel_address_signatures_flush_errors_total",
+    "Address-index writer flush failures (worker continues on next batch)",
+    &[]
+);
+gauge_vec!(
+    ADDRESS_SIGNATURES_QUEUE_DEPTH,
+    "private_channel_address_signatures_queue_depth",
+    "Last observed depth of the address_signatures bounded mpsc channel",
+    &[]
+);
 
 // Gauges
 
@@ -230,6 +270,18 @@ histogram_vec!(
     SETTLER_PROCESSING_DURATION,
     "private_channel_settler_processing_duration_ms",
     "Pre-DB account map building time in milliseconds",
+    &[]
+);
+histogram_vec!(
+    ADDRESS_SIGNATURES_SEND_BLOCKED,
+    "private_channel_address_signatures_send_blocked_ms",
+    "Settler-side mpsc::Sender::send().await blocking time in milliseconds",
+    &[]
+);
+histogram_vec!(
+    ADDRESS_SIGNATURES_FLUSH_DURATION,
+    "private_channel_address_signatures_flush_duration_ms",
+    "Address-index writer per-flush COMMIT time in milliseconds",
     &[]
 );
 
@@ -315,6 +367,31 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .observe(ms);
     }
+    fn address_signatures_queue_depth(&self, depth: usize) {
+        ADDRESS_SIGNATURES_QUEUE_DEPTH
+            .with_label_values(&[] as &[&str])
+            .set(depth as f64);
+    }
+    fn address_signatures_send_blocked_ms(&self, ms: f64) {
+        ADDRESS_SIGNATURES_SEND_BLOCKED
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
+    }
+    fn address_signatures_flush_duration_ms(&self, ms: f64) {
+        ADDRESS_SIGNATURES_FLUSH_DURATION
+            .with_label_values(&[] as &[&str])
+            .observe(ms);
+    }
+    fn address_signatures_rows_flushed(&self, count: usize) {
+        ADDRESS_SIGNATURES_ROWS_FLUSHED
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
+    }
+    fn address_signatures_flush_errors_total(&self) {
+        ADDRESS_SIGNATURES_FLUSH_ERRORS
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
 }
 
 /// Force-initialise all metric statics so they appear in /metrics from startup.
@@ -339,6 +416,11 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_BOB_UPDATE_DURATION,
         SETTLER_SETTLE_DURATION,
         SETTLER_DB_WRITE_DURATION,
-        SETTLER_PROCESSING_DURATION
+        SETTLER_PROCESSING_DURATION,
+        ADDRESS_SIGNATURES_ROWS_FLUSHED,
+        ADDRESS_SIGNATURES_FLUSH_ERRORS,
+        ADDRESS_SIGNATURES_QUEUE_DEPTH,
+        ADDRESS_SIGNATURES_SEND_BLOCKED,
+        ADDRESS_SIGNATURES_FLUSH_DURATION
     );
 }
