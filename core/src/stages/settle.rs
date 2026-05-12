@@ -567,13 +567,27 @@ async fn settle_transactions(
     // `transactions` already; the index writer fills in the read view with
     // an eventually-consistent gap of <1 writer-flush interval. .send().await
     // applies backpressure when the bounded channel fills.
+    //
+    // A closed channel (writer task exited) is logged and tolerated: the
+    // atomic commit has already succeeded, so the only consequence is that
+    // `address_signatures` is missing this tick's entries. That's the same
+    // eventually-consistent contract `getSignaturesForAddress` already
+    // tolerates — not a reason to tear down the settler.
     if let Some(tx) = address_signatures_tx {
         if !addr_sig_rows.is_empty() {
             let send_t0 = tokio::time::Instant::now();
-            tx.send(addr_sig_rows)
-                .await
-                .map_err(|_| "address_signatures channel closed")?;
-            metrics.address_signatures_send_blocked_ms(send_t0.elapsed().as_secs_f64() * 1000.0);
+            match tx.send(addr_sig_rows).await {
+                Ok(()) => {
+                    metrics.address_signatures_send_blocked_ms(
+                        send_t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "address_signatures writer dropped; index entries for this tick will not be written"
+                    );
+                }
+            }
         }
     }
 

@@ -37,7 +37,7 @@ pub use {
 mod tests {
     use super::*;
     use crate::accounts::{traits::BlockInfo, AccountsDB};
-    use crate::test_helpers::create_test_sanitized_transaction;
+    use crate::test_helpers::{create_test_sanitized_transaction, flush_address_signatures_sync};
     use solana_rpc_client_types::response::RpcPerfSample;
     use solana_sdk::{
         account::AccountSharedData,
@@ -607,13 +607,15 @@ mod tests {
         let sig = *tx.signature();
         let processed = make_executed_tx(vec![]);
 
-        db.write_batch(
-            &[],
-            vec![(sig, &tx, 5, 1_700_000_000, &processed)],
-            Some(make_block_info(5, Hash::new_unique())),
-        )
-        .await
-        .unwrap();
+        let addr_sig_rows = db
+            .write_batch(
+                &[],
+                vec![(sig, &tx, 5, 1_700_000_000, &processed)],
+                Some(make_block_info(5, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        flush_address_signatures_sync(&db, &addr_sig_rows).await;
 
         let deps = make_read_deps(db);
         let sigs = get_signatures_for_address_impl::get_signatures_for_address_impl(
@@ -667,13 +669,15 @@ mod tests {
             let to = Pubkey::new_unique();
             let tx = create_test_sanitized_transaction(&from, &to, slot);
             let sig = *tx.signature();
-            db.write_batch(
-                &[],
-                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
-                Some(make_block_info(slot, Hash::new_unique())),
-            )
-            .await
-            .unwrap();
+            let addr_sig_rows = db
+                .write_batch(
+                    &[],
+                    vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                    Some(make_block_info(slot, Hash::new_unique())),
+                )
+                .await
+                .unwrap();
+            flush_address_signatures_sync(&db, &addr_sig_rows).await;
         }
 
         let deps = make_read_deps(db);
@@ -703,13 +707,15 @@ mod tests {
             let to = Pubkey::new_unique();
             let tx = create_test_sanitized_transaction(&from, &to, slot);
             let sig = *tx.signature();
-            db.write_batch(
-                &[],
-                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
-                Some(make_block_info(slot, Hash::new_unique())),
-            )
-            .await
-            .unwrap();
+            let addr_sig_rows = db
+                .write_batch(
+                    &[],
+                    vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                    Some(make_block_info(slot, Hash::new_unique())),
+                )
+                .await
+                .unwrap();
+            flush_address_signatures_sync(&db, &addr_sig_rows).await;
         }
 
         let deps = make_read_deps(db);

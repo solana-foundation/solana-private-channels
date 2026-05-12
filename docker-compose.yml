@@ -80,7 +80,10 @@ services:
       -c archive_command='cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f'
       -c listen_addresses='*'
       -c shared_buffers=${PRIVATE_CHANNEL_PG_SHARED_BUFFERS:-4GB}
-      -c synchronous_commit=${PRIVATE_CHANNEL_PG_SYNCHRONOUS_COMMIT:-off}
+      # Defaults to `on` (full crash durability). The bench profile in
+      # bench-tps/.env explicitly opts into `off` for throughput; operators
+      # who want the same trade-off in production must do so deliberately.
+      -c synchronous_commit=${PRIVATE_CHANNEL_PG_SYNCHRONOUS_COMMIT:-on}
       -c wal_compression=${PRIVATE_CHANNEL_PG_WAL_COMPRESSION:-lz4}
       -c max_wal_size=${PRIVATE_CHANNEL_PG_MAX_WAL_SIZE:-4GB}
     networks:
