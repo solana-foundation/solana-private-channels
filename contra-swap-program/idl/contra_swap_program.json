@@ -737,7 +737,7 @@
               "Must equal dvp.user_a or dvp.user_b"
             ],
             "isSigner": true,
-            "isWritable": true,
+            "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "signer"
           },

@@ -53,10 +53,12 @@ const FIXED_ACCOUNTS_LEN: usize = 12;
 /// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund
 /// 10. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 11. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
-/// 12..12+leg_a_extras_count. Transfer-hook extras forwarded to leg A's
-///     `TransferChecked` CPI (hook program, validation PDA, and any
-///     accounts resolved from `ExtraAccountMetaList`).
-/// rest. Transfer-hook extras forwarded to leg B's `TransferChecked` CPI.
+///
+/// Trailing accounts (variable):
+/// - First `leg_a_extras_count` go to leg A's `TransferChecked` CPI
+///   (hook program, validation PDA, and any accounts resolved from
+///   `ExtraAccountMetaList`).
+/// - The rest go to leg B's `TransferChecked` CPI.
 ///
 /// # Instruction Data
 /// * `leg_a_extras_count` (u8) - Split point between leg A and leg B

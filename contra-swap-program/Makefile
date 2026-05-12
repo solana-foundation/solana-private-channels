@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := build
 
-.PHONY: install build fmt generate-idl generate-clients
+.PHONY: install build build-hook-fixture fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
 
 # Install JS deps (codama renderers, tsx, etc.)
@@ -17,6 +17,14 @@ install:
 build:
 	$(MAKE) generate-clients
 	cd program && cargo-build-sbf
+	$(MAKE) build-hook-fixture
+
+# Build the no-op transfer-hook program used only by integration tests.
+# Loaded into LiteSVM so hook-bearing Token-2022 mints can be exercised
+# end-to-end. The .so lands in the workspace target/deploy/ alongside
+# the swap program's .so.
+build-hook-fixture:
+	cd tests/transfer-hook-fixture && cargo-build-sbf
 
 # Generate the Codama IDL from the program's annotations.
 generate-idl:

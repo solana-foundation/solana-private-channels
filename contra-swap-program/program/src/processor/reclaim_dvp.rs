@@ -49,10 +49,11 @@ const FIXED_ACCOUNTS_LEN: usize = 6;
 /// 3. `[writable]`  dvp_source_ata  - DvP's escrow ATA for the leg's mint
 /// 4. `[writable]`  signer_dest_ata - Signer's canonical ATA for the leg's mint
 /// 5. `[]`          token_program   - SPL Token or Token-2022; must own `mint`
-/// 6.. Transfer-hook extras forwarded to the refund `TransferChecked`
-///     CPI (hook program, validation PDA, and any accounts resolved
-///     from `ExtraAccountMetaList`). Empty for legacy SPL Token and
-///     hook-less Token-2022 mints.
+///
+/// Trailing accounts (variable): transfer-hook extras forwarded to the
+/// refund `TransferChecked` CPI (hook program, validation PDA, and any
+/// accounts resolved from `ExtraAccountMetaList`). Empty for legacy SPL
+/// Token and hook-less Token-2022 mints.
 pub fn process_reclaim_dvp(
     program_id: &Address,
     accounts: &[AccountView],

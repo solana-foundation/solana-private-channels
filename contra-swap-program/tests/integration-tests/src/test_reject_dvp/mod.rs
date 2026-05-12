@@ -6,7 +6,10 @@ use crate::{
         assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp, setup_dvp,
         INITIAL_BALANCE,
     },
-    utils::{assert_program_error, get_token_balance, TestContext, SIGNER_NOT_PARTY},
+    utils::{
+        assert_instruction_error, assert_program_error, get_token_balance, TestContext,
+        SIGNER_NOT_PARTY,
+    },
 };
 
 #[test]
@@ -120,6 +123,34 @@ fn test_reject_dvp_rejects_settlement_authority_as_signer() {
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_program_error(result, SIGNER_NOT_PARTY);
+}
+
+/// Mid-trade mint substitution: passing a mint pubkey that differs
+/// from the one stored at Create must fail. Pins the
+/// `mint_a_info.address() != dvp.mint_a` guard in process_reject_dvp.
+#[test]
+fn test_reject_dvp_rejects_substituted_mint_a() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+
+    let ix = RejectDvpBuilder::new()
+        .signer(fixture.user_a.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_b)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
+        .instruction();
+    let result = context.send(ix, &[&fixture.user_a]);
+    assert_instruction_error(result, "InvalidAccountData");
 }
 
 #[test]

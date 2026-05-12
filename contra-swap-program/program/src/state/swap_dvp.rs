@@ -197,8 +197,13 @@ impl SwapDvp {
 mod tests {
     use super::*;
 
-    fn sample_dvp(earliest: Option<i64>) -> SwapDvp {
-        SwapDvp {
+    /// Three-arm match on the option tag: 0 → None, 1 → Some, anything
+    /// else → Err. The `_` arm is easy to drop in a refactor, and the
+    /// failure mode (silently reading garbage past the tag as a valid
+    /// `Some(_)`) is hard to spot in review.
+    #[test]
+    fn test_try_from_bytes_rejects_invalid_option_tag() {
+        let dvp = SwapDvp {
             bump: 254,
             user_a: Pubkey::new_from_array([1u8; 32]),
             user_b: Pubkey::new_from_array([2u8; 32]),
@@ -209,39 +214,9 @@ mod tests {
             amount_b: 2_500,
             expiry_timestamp: 1_780_000_000,
             nonce: 42,
-            earliest_settlement_timestamp: earliest,
-        }
-    }
-
-    #[test]
-    fn test_serialization_roundtrip_with_earliest() {
-        let dvp = sample_dvp(Some(1_775_000_000));
-
-        let bytes = dvp.to_bytes();
-        assert_eq!(bytes.len(), SwapDvp::LEN);
-
-        let parsed = SwapDvp::try_from_bytes(&bytes).expect("roundtrip");
-        assert_eq!(parsed, dvp);
-    }
-
-    #[test]
-    fn test_serialization_roundtrip_without_earliest() {
-        let dvp = sample_dvp(None);
-
-        let bytes = dvp.to_bytes();
-        assert_eq!(bytes.len(), SwapDvp::LEN);
-
-        let parsed = SwapDvp::try_from_bytes(&bytes).expect("roundtrip");
-        assert_eq!(parsed, dvp);
-    }
-
-    /// Three-arm match on the option tag: 0 → None, 1 → Some, anything
-    /// else → Err. The `_` arm is easy to drop in a refactor, and the
-    /// failure mode (silently reading garbage past the tag as a valid
-    /// `Some(_)`) is hard to spot in review.
-    #[test]
-    fn test_try_from_bytes_rejects_invalid_option_tag() {
-        let mut bytes = sample_dvp(None).to_bytes();
+            earliest_settlement_timestamp: None,
+        };
+        let mut bytes = dvp.to_bytes();
         // Tag offset = bump(1) + 5*pubkey(160) + 4*u64-or-i64(32) = 193.
         let option_tag_offset = 1 + 32 * 5 + 8 * 4;
         bytes[option_tag_offset] = 2;

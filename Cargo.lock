@@ -16306,8 +16306,10 @@ dependencies = [
  "solana-sdk",
  "spl-associated-token-account 4.0.0",
  "spl-pod 0.5.1",
+ "spl-tlv-account-resolution 0.10.0",
  "spl-token 6.0.0",
  "spl-token-2022 9.0.0",
+ "spl-transfer-hook-interface 0.10.0",
 ]
 
 [[package]]
@@ -17064,6 +17066,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "transfer-hook-fixture"
+version = "0.1.0"
+dependencies = [
+ "pinocchio",
+ "pinocchio-log",
+ "solana-address 2.1.0",
 ]
 
 [[package]]

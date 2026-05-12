@@ -1,5 +1,7 @@
 use pinocchio::{account::AccountView, error::ProgramError};
 
+use crate::processor::shared::token_utils::MAX_HOOK_REMAINING_ACCOUNTS;
+
 #[macro_export]
 macro_rules! require_len {
     ($data:expr, $len:expr) => {
@@ -28,18 +30,12 @@ macro_rules! require {
 /// the parse + bounds-check + split so each processor only writes the
 /// fixed-prefix destructuring.
 #[inline(always)]
+#[allow(clippy::type_complexity)]
 pub fn split_leg_remaining_accounts<'a>(
     accounts: &'a [AccountView],
     instruction_data: &[u8],
     fixed_len: usize,
-) -> Result<
-    (
-        &'a [AccountView],
-        &'a [AccountView],
-        &'a [AccountView],
-    ),
-    ProgramError,
-> {
+) -> Result<(&'a [AccountView], &'a [AccountView], &'a [AccountView]), ProgramError> {
     if instruction_data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -54,5 +50,13 @@ pub fn split_leg_remaining_accounts<'a>(
         return Err(ProgramError::InvalidInstructionData);
     }
     let (leg_a_extras, leg_b_extras) = remaining.split_at(leg_a_extras_count);
+    // Both legs must fit the per-CPI cap that `transfer_checked_cpi`
+    // enforces; checking here surfaces an obvious instruction-data
+    // error rather than the late `InvalidArgument` from inside the CPI.
+    if leg_a_extras.len() > MAX_HOOK_REMAINING_ACCOUNTS
+        || leg_b_extras.len() > MAX_HOOK_REMAINING_ACCOUNTS
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     Ok((fixed, leg_a_extras, leg_b_extras))
 }

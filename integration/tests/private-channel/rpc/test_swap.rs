@@ -5,7 +5,7 @@
 //! `CreateDvp`'s validation rejects when `expiry <= now`. With Clock unset
 //! (default = 0) the check evaluates `wall_now() - 60 <= 0` → false, so
 //! CreateDvp would *succeed*. With `set_clock_now` populating the cache,
-//! the check fires and CreateDvp errors with `ExpiryNotInFuture` (custom 6).
+//! the check fires and CreateDvp errors with `ExpiryNotInFuture` (custom 5).
 //!
 //! A second case (future expiry → Create + Fund succeed, escrow holds
 //! amount_a) is non-discriminating against the Clock=0 bug but catches
@@ -37,7 +37,7 @@ const AMOUNT_A: u64 = 75_000;
 const AMOUNT_B: u64 = 50_000;
 
 /// `ContraSwapProgramError::ExpiryNotInFuture` discriminant.
-const EXPIRY_NOT_IN_FUTURE_CODE: u32 = 6;
+const EXPIRY_NOT_IN_FUTURE_CODE: u32 = 5;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);

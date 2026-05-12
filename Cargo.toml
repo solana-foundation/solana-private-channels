@@ -18,6 +18,7 @@ members = [
     "bench-tps",
     "contra-swap-program/program",
     "contra-swap-program/tests/integration-tests",
+    "contra-swap-program/tests/transfer-hook-fixture",
     "contra-swap-program/clients/rust",
 ]
 

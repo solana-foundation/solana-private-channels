@@ -64,8 +64,10 @@ pub fn setup_dvp_with_programs(
     set_mint(context, &mint_a, &token_program_a);
     set_mint(context, &mint_b, &token_program_b);
 
-    let user_a_ata_a = fund_wallet_ata(context, &user_a, &mint_a, INITIAL_BALANCE, &token_program_a);
-    let user_b_ata_b = fund_wallet_ata(context, &user_b, &mint_b, INITIAL_BALANCE, &token_program_b);
+    let user_a_ata_a =
+        fund_wallet_ata(context, &user_a, &mint_a, INITIAL_BALANCE, &token_program_a);
+    let user_b_ata_b =
+        fund_wallet_ata(context, &user_b, &mint_b, INITIAL_BALANCE, &token_program_b);
     let user_a_ata_b = create_ata(context, &user_a.pubkey(), &mint_b, &token_program_b);
     let user_b_ata_a = create_ata(context, &user_b.pubkey(), &mint_a, &token_program_a);
 

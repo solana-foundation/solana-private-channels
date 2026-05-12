@@ -19,12 +19,15 @@ use spl_token::state::{Account as TokenAccount, Mint};
 use spl_token_2022::{
     extension::{
         confidential_transfer::ConfidentialTransferMint,
-        interest_bearing_mint::InterestBearingConfig, pausable::PausableConfig,
-        permanent_delegate::PermanentDelegate, scaled_ui_amount::ScaledUiAmountConfig,
-        transfer_fee::TransferFeeConfig, transfer_hook::TransferHook, BaseStateWithExtensionsMut,
-        ExtensionType, PodStateWithExtensionsMut,
+        interest_bearing_mint::InterestBearingConfig,
+        pausable::PausableConfig,
+        permanent_delegate::PermanentDelegate,
+        scaled_ui_amount::ScaledUiAmountConfig,
+        transfer_fee::TransferFeeConfig,
+        transfer_hook::{TransferHook, TransferHookAccount},
+        BaseStateWithExtensionsMut, ExtensionType, PodStateWithExtensionsMut,
     },
-    pod::PodMint,
+    pod::{PodAccount, PodMint},
     state::{Account as Token2022Account, AccountState, Mint as Token2022Mint},
 };
 
@@ -33,6 +36,11 @@ pub use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
 pub const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 pub const SWAP_PROGRAM_ID: Pubkey = CONTRA_SWAP_PROGRAM_ID;
+
+/// Program ID of the no-op transfer-hook fixture loaded into LiteSVM
+/// for hook-bearing Token-2022 lifecycle tests. Matches
+/// `declare_id!` in `contra-swap-program/tests/transfer-hook-fixture/src/lib.rs`.
+pub const HOOK_FIXTURE_PROGRAM_ID: Pubkey = pubkey!("HookqJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC");
 
 pub const SWAP_DVP_SEED: &[u8] = b"dvp";
 
@@ -78,6 +86,9 @@ impl TestContext {
 
         let program_data = include_bytes!("../../../../target/deploy/contra_swap_program.so");
         let _ = svm.add_program(SWAP_PROGRAM_ID, program_data);
+
+        let hook_data = include_bytes!("../../../../target/deploy/transfer_hook_fixture.so");
+        let _ = svm.add_program(HOOK_FIXTURE_PROGRAM_ID, hook_data);
 
         let payer = Keypair::new();
         svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
@@ -314,6 +325,33 @@ pub fn assert_program_error(result: Result<TransactionMetadata, String>, expecte
     }
 }
 
+/// Assert the tx failed with a built-in `ProgramError` variant (anything
+/// that surfaces as `InstructionError(_, <Variant>)` rather than
+/// `Custom(N)` — `InvalidAccountData`, `InvalidSeeds`, etc.). Matches
+/// the full `InstructionError(0, <Variant>)` substring so it can't
+/// spuriously hit on the same variant name appearing elsewhere in the
+/// error string.
+pub fn assert_instruction_error(
+    result: Result<TransactionMetadata, String>,
+    expected_variant: &str,
+) {
+    match result {
+        Err(e) => {
+            let needle = format!("InstructionError(0, {})", expected_variant);
+            assert!(
+                e.contains(&needle),
+                "expected {} in error, got: {}",
+                needle,
+                e
+            );
+        }
+        Ok(_) => panic!(
+            "expected tx to fail with InstructionError(_, {})",
+            expected_variant
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Token-2022 mint builders with extensions.
 //
@@ -331,8 +369,7 @@ fn build_mint_2022_with_extensions(
 ) -> Vec<u8> {
     let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(extensions).unwrap();
     let mut data = vec![0u8; space];
-    let mut state =
-        PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
+    let mut state = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
     init_extension(&mut state);
     *state.base = PodMint {
         mint_authority: COption::None.into(),
@@ -407,6 +444,105 @@ pub fn set_mint_2022_with_transfer_hook(
     write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
 }
 
+/// Writes a Token-2022 token account with the `TransferHookAccount`
+/// extension initialized. Token-2022's `process_transfer` calls
+/// `set_transferring` on both source and destination, which reads the
+/// `TransferHookAccount` extension off each — a bare 165-byte account
+/// would fail with `InvalidAccountData`. Real ATAs created by the SPL
+/// ATA program against a hook-bearing mint already carry this
+/// extension; this helper is the test-side equivalent for any user ATA
+/// that was created *before* its mint gained `TransferHook` (or had its
+/// data stomped by `set_token_balance`).
+pub fn set_token_2022_with_hook_account(
+    context: &mut TestContext,
+    ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) {
+    use spl_token_2022::pod::PodCOption;
+
+    let space = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+        ExtensionType::TransferHookAccount,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; space];
+    let mut state =
+        PodStateWithExtensionsMut::<PodAccount>::unpack_uninitialized(&mut data).unwrap();
+    state.init_extension::<TransferHookAccount>(true).unwrap();
+    *state.base = PodAccount {
+        mint: *mint,
+        owner: *owner,
+        amount: amount.into(),
+        delegate: PodCOption::none(),
+        state: AccountState::Initialized as u8,
+        is_native: PodCOption::none(),
+        delegated_amount: 0u64.into(),
+        close_authority: PodCOption::none(),
+    };
+    state.init_account_type().unwrap();
+    write_account(context, ata, data, TOKEN_2022_PROGRAM_ID, 2_039_280);
+}
+
+/// Sets up a Token-2022 mint that delegates to the test hook fixture
+/// (`HOOK_FIXTURE_PROGRAM_ID`) and creates its `ExtraAccountMetaList`
+/// validation PDA declaring **one** extra account: the system program.
+///
+/// The hook fixture only logs the account count it receives, so the
+/// tests assert `hook accounts: N` where N is the standard 5 (source,
+/// mint, destination, authority, validation PDA) plus the 1 extra we
+/// declared here = **6**. Use [`hook_extras_for_mint`] to get the
+/// trailing accounts the client must pass to Settle/Cancel/Reject/Reclaim
+/// for this mint.
+pub fn setup_hook_mint(context: &mut TestContext, mint: &Pubkey) {
+    use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
+    use spl_transfer_hook_interface::{
+        get_extra_account_metas_address, instruction::ExecuteInstruction,
+    };
+
+    set_mint_2022_with_transfer_hook(
+        context,
+        mint,
+        &HOOK_FIXTURE_PROGRAM_ID,
+        &context.payer.pubkey(),
+    );
+
+    let validation_pda = get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID);
+    let extras =
+        vec![
+            ExtraAccountMeta::new_with_pubkey(&solana_program::system_program::ID, false, false)
+                .unwrap(),
+        ];
+    let size = ExtraAccountMetaList::size_of(extras.len()).unwrap();
+    let mut data = vec![0u8; size];
+    ExtraAccountMetaList::init::<ExecuteInstruction>(&mut data, &extras).unwrap();
+    write_account(
+        context,
+        &validation_pda,
+        data,
+        HOOK_FIXTURE_PROGRAM_ID,
+        1_000_000_000,
+    );
+}
+
+/// Returns the trailing accounts the client must append to a
+/// `TransferChecked` (here surfaced as the swap program's
+/// `leg_*_extras`) when transferring a mint set up via
+/// [`setup_hook_mint`]. Order matches `spl_transfer_hook_interface`'s
+/// offchain resolver: declared extras first, then the hook program ID,
+/// then the validation PDA.
+pub fn hook_extras_for_mint(mint: &Pubkey) -> Vec<solana_sdk::instruction::AccountMeta> {
+    use solana_sdk::instruction::AccountMeta;
+    use spl_transfer_hook_interface::get_extra_account_metas_address;
+
+    let validation_pda = get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID);
+    vec![
+        AccountMeta::new_readonly(solana_program::system_program::ID, false),
+        AccountMeta::new_readonly(HOOK_FIXTURE_PROGRAM_ID, false),
+        AccountMeta::new_readonly(validation_pda, false),
+    ]
+}
+
 /// TransferFeeConfig — a blocked extension; used in negative tests.
 pub fn set_mint_2022_with_transfer_fee(
     context: &mut TestContext,
@@ -478,7 +614,9 @@ pub fn set_mint_2022_with_confidential_transfer(
 ) {
     let data =
         build_mint_2022_with_extensions(&[ExtensionType::ConfidentialTransferMint], |state| {
-            let ext = state.init_extension::<ConfidentialTransferMint>(true).unwrap();
+            let ext = state
+                .init_extension::<ConfidentialTransferMint>(true)
+                .unwrap();
             ext.authority = OptionalNonZeroPubkey::try_from(Some(*authority)).unwrap();
             ext.auto_approve_new_accounts = false.into();
             ext.auditor_elgamal_pubkey = Default::default();

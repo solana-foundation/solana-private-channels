@@ -242,12 +242,7 @@ pub enum ContraSwapProgramInstruction {
     /// depositors and closes the trade. Closed-account rent goes to the
     /// settlement authority (recorded in dvp.settlement_authority), keeping
     /// rent accounting consistent with Settle and Cancel.
-    #[codama(account(
-        name = "signer",
-        docs = "Must equal dvp.user_a or dvp.user_b",
-        signer,
-        writable
-    ))]
+    #[codama(account(name = "signer", docs = "Must equal dvp.user_a or dvp.user_b", signer))]
     #[codama(account(
         name = "settlement_authority",
         docs = "Must equal dvp.settlement_authority; receives closed-account rent",

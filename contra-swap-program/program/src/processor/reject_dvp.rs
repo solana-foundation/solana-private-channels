@@ -31,7 +31,7 @@ const FIXED_ACCOUNTS_LEN: usize = 11;
 /// extension parameters change post-Create so funds are never stranded.
 ///
 /// # Account Layout
-/// 0.  `[signer, writable]` signer - Must equal `dvp.user_a` or `dvp.user_b`
+/// 0.  `[signer]` signer - Must equal `dvp.user_a` or `dvp.user_b`
 /// 1.  `[writable]` settlement_authority - Must equal `dvp.settlement_authority`; receives closed-account rent
 /// 2.  `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
 /// 3.  `[]` mint_a - Must equal `dvp.mint_a`
@@ -42,10 +42,12 @@ const FIXED_ACCOUNTS_LEN: usize = 11;
 /// 8.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
 /// 9.  `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 10. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
-/// 11..11+leg_a_extras_count. Transfer-hook extras forwarded to leg A's
-///     refund `TransferChecked` CPI (only consumed if leg A was funded).
-/// rest. Transfer-hook extras forwarded to leg B's refund
-///     `TransferChecked` CPI (only consumed if leg B was funded).
+///
+/// Trailing accounts (variable):
+/// - First `leg_a_extras_count` go to leg A's refund `TransferChecked`
+///   CPI (only consumed if leg A was funded).
+/// - The rest go to leg B's refund `TransferChecked` CPI (only consumed
+///   if leg B was funded).
 ///
 /// # Instruction Data
 /// * `leg_a_extras_count` (u8) - Split point between leg A and leg B
@@ -63,7 +65,7 @@ pub fn process_reject_dvp(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    verify_signer(signer_info, true)?;
+    verify_signer(signer_info, false)?;
     verify_token_program(token_program_a_info)?;
     verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;

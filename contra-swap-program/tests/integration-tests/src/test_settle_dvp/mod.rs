@@ -10,8 +10,9 @@ use crate::{
         assert_fund_b_amount, assert_settle_dvp, setup_dvp, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
     },
     utils::{
-        assert_program_error, dvp_ata, fund_wallet_ata, get_token_balance, swap_dvp_pda,
-        TestContext, LEG_NOT_FUNDED, SETTLEMENT_AUTHORITY_MISMATCH,
+        assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
+        get_token_balance, swap_dvp_pda, TestContext, DVP_EXPIRED, LEG_NOT_FUNDED,
+        SETTLEMENT_AUTHORITY_MISMATCH, SETTLEMENT_TOO_EARLY,
     },
 };
 
@@ -305,6 +306,165 @@ fn test_settle_dvp_treats_third_party_donation_as_gift() {
     assert_eq!(get_token_balance(&context, &donor_ata_a), 0);
 }
 
+/// Settle is locked out post-expiry — the property that makes Cancel
+/// and Reject the only drainage paths after expiry. Without this lock,
+/// the documented "expired DvPs drain only via Cancel/Reject" invariant
+/// would be a comment, not a property.
+#[test]
+fn test_settle_dvp_rejects_post_expiry() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    let advance = fixture.expiry - context.now() + 1;
+    context.advance_clock(advance);
+
+    let ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_ata_b(fixture.user_a_ata_b)
+        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
+        .instruction();
+    let result = context.send(ix, &[&fixture.settlement_authority]);
+    assert_program_error(result, DVP_EXPIRED);
+}
+
+/// A DvP with `earliest_settlement_timestamp` set in the future must
+/// reject Settle attempts before that time. The only test coverage of
+/// the entire `earliest_settlement_timestamp` field.
+#[test]
+fn test_settle_dvp_rejects_before_earliest_settlement() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    // Build CreateDvp by hand to pin earliest_settlement_timestamp.
+    let earliest = context.now() + 60 * 30;
+    let create_ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .earliest_settlement_timestamp(earliest)
+        .instruction();
+    context
+        .send(create_ix, &[])
+        .expect("CreateDvp with earliest");
+
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    // Now is < earliest; Settle must reject.
+    let ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_ata_b(fixture.user_a_ata_b)
+        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
+        .instruction();
+    let result = context.send(ix, &[&fixture.settlement_authority]);
+    assert_program_error(result, SETTLEMENT_TOO_EARLY);
+}
+
+/// Mid-trade mint substitution: caller passes a mint pubkey that
+/// differs from the one stored at Create. The processor's
+/// `mint_a_info.address() != dvp.mint_a` guard fires with
+/// `InvalidAccountData`. Without this test, that guard could be deleted
+/// silently.
+#[test]
+fn test_settle_dvp_rejects_substituted_mint_a() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    // Swap in mint_b's pubkey for mint_a — a real account that exists
+    // and is owned by a valid token program, but isn't the one stored
+    // on the DvP. The mint-match check runs before owner validation.
+    let ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_b)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_ata_b(fixture.user_a_ata_b)
+        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
+        .instruction();
+    let result = context.send(ix, &[&fixture.settlement_authority]);
+    assert_instruction_error(result, "InvalidAccountData");
+}
+
+/// Cross-delivery pairing: at Settle, user_a's recipient is their
+/// `mint_b` ATA (cash leg), user_b's is their `mint_a` ATA (asset leg).
+/// If the two are swapped the trade would deliver to wrong wallets;
+/// `verify_canonical_ata` catches it with `InvalidSeeds` because the
+/// passed ATA isn't canonical for the (user, mint, token_program)
+/// triple the program expects.
+#[test]
+fn test_settle_dvp_rejects_swapped_cross_atas() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    // user_a_ata_b should be (user_a, mint_b); instead pass user_a's
+    // mint_a ATA. Same wallet, wrong mint → not canonical.
+    let ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_ata_b(fixture.user_a_ata_a)
+        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .leg_a_extras_count(0)
+        .instruction();
+    let result = context.send(ix, &[&fixture.settlement_authority]);
+    assert_instruction_error(result, "InvalidSeeds");
+}
+
 /// Two DvPs between the same parties + mints, disambiguated only by
 /// `nonce`, must be fully independent: settling one leaves the other's
 /// PDA and escrows untouched, and the second can subsequently be
@@ -327,8 +487,16 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
         &first_dvp.mint_b,
         second_nonce,
     );
-    let second_dvp_ata_a = dvp_ata(&second_swap_dvp, &first_dvp.mint_a, &first_dvp.token_program_a);
-    let second_dvp_ata_b = dvp_ata(&second_swap_dvp, &first_dvp.mint_b, &first_dvp.token_program_b);
+    let second_dvp_ata_a = dvp_ata(
+        &second_swap_dvp,
+        &first_dvp.mint_a,
+        &first_dvp.token_program_a,
+    );
+    let second_dvp_ata_b = dvp_ata(
+        &second_swap_dvp,
+        &first_dvp.mint_b,
+        &first_dvp.token_program_b,
+    );
 
     let create_second = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())

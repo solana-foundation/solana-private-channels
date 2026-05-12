@@ -1,0 +1,12 @@
+[package]
+name = "transfer-hook-fixture"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+pinocchio = { workspace = true, features = ["cpi"] }
+pinocchio-log = { workspace = true }
+solana-address = { version = "2.0", features = ["curve25519", "decode"] }

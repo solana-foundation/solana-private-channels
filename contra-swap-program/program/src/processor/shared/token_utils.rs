@@ -155,6 +155,7 @@ const MAX_TRANSFER_CHECKED_ACCOUNTS: usize = 4 + MAX_HOOK_REMAINING_ACCOUNTS;
 /// (discriminator `12`, `amount: u64 LE`, `decimals: u8`) but built by
 /// hand so the account list can carry hook extras.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub fn transfer_checked_cpi(
     from: &AccountView,
     mint: &AccountView,

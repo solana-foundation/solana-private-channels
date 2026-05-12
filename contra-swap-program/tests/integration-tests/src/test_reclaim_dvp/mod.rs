@@ -182,4 +182,3 @@ fn test_reclaim_then_refund_then_settle() {
     assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), AMOUNT_A);
     assert!(context.get_account(&fixture.swap_dvp).is_none());
 }
-

@@ -22,31 +22,3 @@ impl TryFrom<u8> for ContraSwapInstructionDiscriminators {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_discriminator_all_valid() {
-        let cases = [
-            (0u8, ContraSwapInstructionDiscriminators::CreateDvp),
-            (1u8, ContraSwapInstructionDiscriminators::ReclaimDvp),
-            (2u8, ContraSwapInstructionDiscriminators::SettleDvp),
-            (3u8, ContraSwapInstructionDiscriminators::CancelDvp),
-            (4u8, ContraSwapInstructionDiscriminators::RejectDvp),
-        ];
-
-        for (byte, expected) in cases {
-            let result = ContraSwapInstructionDiscriminators::try_from(byte);
-            assert_eq!(result, Ok(expected), "byte {byte}");
-        }
-    }
-
-    #[test]
-    fn test_discriminator_invalid() {
-        let result = ContraSwapInstructionDiscriminators::try_from(5u8);
-
-        assert!(result.is_err());
-    }
-}

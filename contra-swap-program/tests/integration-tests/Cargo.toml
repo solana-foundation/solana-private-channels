@@ -15,3 +15,5 @@ spl-associated-token-account = { version = "4.0.0", features = [
     "no-entrypoint",
 ] }
 solana-program-pack = "2.2.1"
+spl-tlv-account-resolution = "0.10.0"
+spl-transfer-hook-interface = "0.10.0"
