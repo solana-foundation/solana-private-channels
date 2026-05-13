@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use {
-    contra_swap_program_client::{instructions::CreateDvpBuilder, CONTRA_SWAP_PROGRAM_ID},
+    dvp_swap_program_client::{instructions::CreateDvpBuilder, DVP_SWAP_PROGRAM_ID},
     solana_sdk::{
         account::AccountSharedData,
         hash::Hash,
@@ -199,7 +199,7 @@ pub fn swap_dvp_pda(
             mint_b.as_ref(),
             &nonce_bytes,
         ],
-        &CONTRA_SWAP_PROGRAM_ID,
+        &DVP_SWAP_PROGRAM_ID,
     )
 }
 

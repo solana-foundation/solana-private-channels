@@ -16,10 +16,10 @@ members = [
     "test_utils",
     "scripts/devnet",
     "bench-tps",
-    "contra-swap-program/program",
-    "contra-swap-program/tests/integration-tests",
-    "contra-swap-program/tests/transfer-hook-fixture",
-    "contra-swap-program/clients/rust",
+    "dvp-swap-program/program",
+    "dvp-swap-program/tests/integration-tests",
+    "dvp-swap-program/tests/transfer-hook-fixture",
+    "dvp-swap-program/clients/rust",
 ]
 
 resolver = "2"
@@ -149,6 +149,6 @@ private-channel-escrow-program-client = { path = "private-channel-escrow-program
 private-channel-withdraw-program-client = { path = "private-channel-withdraw-program/clients/rust", features = [
     "fetch",
 ] }
-contra-swap-program-client = { path = "contra-swap-program/clients/rust", features = [
+dvp-swap-program-client = { path = "dvp-swap-program/clients/rust", features = [
     "fetch",
 ] }

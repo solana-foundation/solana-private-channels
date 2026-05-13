@@ -2301,40 +2301,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
-name = "contra-swap-program"
-version = "0.1.0"
-dependencies = [
- "codama",
- "pinocchio",
- "pinocchio-associated-token-account",
- "pinocchio-log",
- "pinocchio-system",
- "pinocchio-token",
- "pinocchio-token-2022",
- "serde_json",
- "solana-address 2.1.0",
- "spl-token-2022 9.0.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "contra-swap-program-client"
-version = "0.0.1"
-dependencies = [
- "borsh 1.5.7",
- "num-derive",
- "num-traits",
- "solana-account 2.2.1",
- "solana-account-info 2.3.0",
- "solana-client 2.3.10",
- "solana-cpi 2.2.1",
- "solana-instruction 2.3.0",
- "solana-program-error 2.2.2",
- "solana-pubkey 2.4.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,6 +2905,40 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dvp-swap-program"
+version = "0.1.0"
+dependencies = [
+ "codama",
+ "pinocchio",
+ "pinocchio-associated-token-account",
+ "pinocchio-log",
+ "pinocchio-system",
+ "pinocchio-token",
+ "pinocchio-token-2022",
+ "serde_json",
+ "solana-address 2.1.0",
+ "spl-token-2022 9.0.0",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "dvp-swap-program-client"
+version = "0.0.1"
+dependencies = [
+ "borsh 1.5.7",
+ "num-derive",
+ "num-traits",
+ "solana-account 2.2.1",
+ "solana-account-info 2.3.0",
+ "solana-client 2.3.10",
+ "solana-cpi 2.2.1",
+ "solana-instruction 2.3.0",
+ "solana-program-error 2.2.2",
+ "solana-pubkey 2.4.0",
+ "thiserror 2.0.17",
+]
 
 [[package]]
 name = "dyn-clone"
@@ -6370,7 +6370,7 @@ dependencies = [
  "bincode",
  "bs58",
  "clap 4.5.48",
- "contra-swap-program-client",
+ "dvp-swap-program-client",
  "enum_dispatch",
  "futures 0.3.31",
  "hex",
@@ -6561,7 +6561,7 @@ dependencies = [
  "bincode",
  "bs58",
  "chrono",
- "contra-swap-program-client",
+ "dvp-swap-program-client",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-util",
@@ -16296,10 +16296,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tests-contra-swap-program"
+name = "tests-dvp-swap-program"
 version = "0.1.0"
 dependencies = [
- "contra-swap-program-client",
+ "dvp-swap-program-client",
  "litesvm",
  "solana-program",
  "solana-program-pack 2.2.1",

@@ -206,7 +206,7 @@ private-channel-indexer = { path = "../indexer", features = [
     "test-mock-storage",
 ] }
 private-channel-withdraw-program-client = { path = "../private-channel-withdraw-program/clients/rust" }
-contra-swap-program-client = { path = "../contra-swap-program/clients/rust" }
+dvp-swap-program-client = { path = "../dvp-swap-program/clients/rust" }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

@@ -80,7 +80,7 @@ pub async fn send_transaction_impl(
                 || *program_id == solana_sdk::system_program::id()
                 || *program_id
                     == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
-                || *program_id == contra_swap_program_client::CONTRA_SWAP_PROGRAM_ID
+                || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
             });
 
     if !is_allowed_transaction {

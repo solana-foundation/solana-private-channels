@@ -36,7 +36,7 @@ const DEPOSIT_B: u64 = 1;
 const AMOUNT_A: u64 = 75_000;
 const AMOUNT_B: u64 = 50_000;
 
-/// `ContraSwapProgramError::ExpiryNotInFuture` discriminant.
+/// `DvpSwapProgramError::ExpiryNotInFuture` discriminant.
 const EXPIRY_NOT_IN_FUTURE_CODE: u32 = 5;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
