@@ -1,6 +1,4 @@
-use dvp_swap_program_client::instructions::{
-    CancelDvpBuilder, CreateDvpBuilder, SettleDvpBuilder,
-};
+use dvp_swap_program_client::instructions::{CancelDvpBuilder, CreateDvpBuilder, SettleDvpBuilder};
 use solana_sdk::signature::{Keypair, Signer};
 use spl_token::{instruction::transfer as spl_transfer, ID as TOKEN_PROGRAM_ID};
 

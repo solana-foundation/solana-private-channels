@@ -42,7 +42,10 @@ const EXPIRY_NOT_IN_FUTURE_CODE: u32 = 5;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn run_swap_clock_tests(private_channel_ctx: &PrivateChannelContext, solana_ctx: &SolanaContext) {
+pub async fn run_swap_clock_tests(
+    private_channel_ctx: &PrivateChannelContext,
+    solana_ctx: &SolanaContext,
+) {
     println!("\n=== Swap: Clock injection via DvP expiry checks ===");
 
     let user_a = Keypair::new();
@@ -53,9 +56,15 @@ pub async fn run_swap_clock_tests(private_channel_ctx: &PrivateChannelContext, s
     let mint_b = mint_b_kp.pubkey();
     let settlement_authority = private_channel_ctx.operator_key.pubkey();
 
-    bootstrap_user_a(private_channel_ctx, solana_ctx, &user_a, &mint_a_kp, &mint_b_kp)
-        .await
-        .unwrap();
+    bootstrap_user_a(
+        private_channel_ctx,
+        solana_ctx,
+        &user_a,
+        &mint_a_kp,
+        &mint_b_kp,
+    )
+    .await
+    .unwrap();
 
     case_past_expiry_blocks_create(
         private_channel_ctx,
@@ -106,7 +115,10 @@ async fn case_past_expiry_blocks_create(
         nonce,
         bh,
     );
-    let create_sig = private_channel_ctx.send_transaction(&create_tx).await.unwrap();
+    let create_sig = private_channel_ctx
+        .send_transaction(&create_tx)
+        .await
+        .unwrap();
     assert_tx_failed_with_custom(
         private_channel_ctx,
         &create_sig.to_string(),
@@ -151,15 +163,24 @@ async fn case_future_expiry_funds_ok(
         nonce,
         bh,
     );
-    let create_sig = private_channel_ctx.send_transaction(&create_tx).await.unwrap();
+    let create_sig = private_channel_ctx
+        .send_transaction(&create_tx)
+        .await
+        .unwrap();
     assert_tx_succeeded(private_channel_ctx, &create_sig.to_string()).await;
 
     let bh = private_channel_ctx.get_blockhash().await.unwrap();
     let fund_tx = setup::fund_dvp_transaction(user_a, swap_dvp, mint_a, AMOUNT_A, bh);
-    let fund_sig = private_channel_ctx.send_transaction(&fund_tx).await.unwrap();
+    let fund_sig = private_channel_ctx
+        .send_transaction(&fund_tx)
+        .await
+        .unwrap();
     assert_tx_succeeded(private_channel_ctx, &fund_sig.to_string()).await;
 
-    let escrow = private_channel_ctx.get_token_balance(&dvp_ata_a).await.unwrap();
+    let escrow = private_channel_ctx
+        .get_token_balance(&dvp_ata_a)
+        .await
+        .unwrap();
     assert_eq!(
         escrow, AMOUNT_A,
         "asset escrow should hold AMOUNT_A after future-expiry FundDvp"
@@ -188,7 +209,11 @@ async fn assert_tx_succeeded(private_channel_ctx: &PrivateChannelContext, sig: &
 
 /// Polls `getTransaction` until landed; asserts `meta.err` matches
 /// `{"InstructionError":[<idx>, {"Custom": <code>}]}`.
-async fn assert_tx_failed_with_custom(private_channel_ctx: &PrivateChannelContext, sig: &str, code: u32) {
+async fn assert_tx_failed_with_custom(
+    private_channel_ctx: &PrivateChannelContext,
+    sig: &str,
+    code: u32,
+) {
     let meta = wait_for_tx_meta(private_channel_ctx, sig).await;
     let err = meta
         .get("err")
@@ -205,7 +230,10 @@ async fn assert_tx_failed_with_custom(private_channel_ctx: &PrivateChannelContex
     );
 }
 
-async fn wait_for_tx_meta(private_channel_ctx: &PrivateChannelContext, sig: &str) -> serde_json::Value {
+async fn wait_for_tx_meta(
+    private_channel_ctx: &PrivateChannelContext,
+    sig: &str,
+) -> serde_json::Value {
     let parsed_sig = sig.parse().expect("valid signature");
     let started = Instant::now();
     while started.elapsed() < POLL_TIMEOUT {
@@ -241,11 +269,19 @@ async fn bootstrap_user_a(
 
     println!("Creating mint_a on test validator: {mint_a}");
     solana_ctx
-        .create_mint(mint_a_kp, &private_channel_ctx.operator_key.pubkey(), MINT_DECIMALS)
+        .create_mint(
+            mint_a_kp,
+            &private_channel_ctx.operator_key.pubkey(),
+            MINT_DECIMALS,
+        )
         .await?;
     println!("Creating mint_b on test validator: {mint_b}");
     solana_ctx
-        .create_mint(mint_b_kp, &private_channel_ctx.operator_key.pubkey(), MINT_DECIMALS)
+        .create_mint(
+            mint_b_kp,
+            &private_channel_ctx.operator_key.pubkey(),
+            MINT_DECIMALS,
+        )
         .await?;
 
     allow_mint_in_escrow(solana_ctx, mint_a_kp).await?;
@@ -384,7 +420,11 @@ async fn deposit_to_escrow(
     ))
 }
 
-async fn wait_for_private_channel_balance(private_channel_ctx: &PrivateChannelContext, ata: &Pubkey, expected: u64) {
+async fn wait_for_private_channel_balance(
+    private_channel_ctx: &PrivateChannelContext,
+    ata: &Pubkey,
+    expected: u64,
+) {
     let started = Instant::now();
     while started.elapsed() < POLL_TIMEOUT {
         if let Ok(balance) = private_channel_ctx.get_token_balance(ata).await {
