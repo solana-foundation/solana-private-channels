@@ -155,7 +155,7 @@ async fn case_future_expiry_funds_ok(
     assert_tx_succeeded(private_channel_ctx, &create_sig.to_string()).await;
 
     let bh = private_channel_ctx.get_blockhash().await.unwrap();
-    let fund_tx = setup::fund_dvp_transaction(user_a, swap_dvp, mint_a, bh);
+    let fund_tx = setup::fund_dvp_transaction(user_a, swap_dvp, mint_a, AMOUNT_A, bh);
     let fund_sig = private_channel_ctx.send_transaction(&fund_tx).await.unwrap();
     assert_tx_succeeded(private_channel_ctx, &fund_sig.to_string()).await;
 
