@@ -6,11 +6,13 @@ Single-host deployment automation for Solana Private Channels. Wraps `docker-com
 
 ## Prerequisites
 
-Run [`scripts/install-prereqs.sh`](./scripts/install-prereqs.sh) once to install **all** prerequisites: both control node and target host (Ubuntu/Debian, idempotent). Preflight re-verifies them on every run and fails fast with an actionable message before touching the host.
+Run [`scripts/install-prereqs.sh`](./scripts/install-prereqs.sh) once **on both the control node and the target host** (Ubuntu/Debian, idempotent). Preflight re-verifies them on every run and fails fast with an actionable message before touching the host.
 
 ```
-./scripts/install-prereqs.sh        # one-shot install on a fresh control node
+./scripts/install-prereqs.sh        # run on control node, then again on the target host
 ```
+
+Uses `sudo` (apt + Docker repo). Run this in a terminal that can show password prompts, or `sudo -v` first to cache credentials.
 
 **Control node** (where you run `ansible-playbook`):
 

@@ -85,6 +85,41 @@ pub(crate) async fn start_test_postgres_raw() -> (
     (db, container)
 }
 
+/// Synchronously insert `address_signatures` rows that `write_batch` would
+/// otherwise emit asynchronously through the `address_index_writer` worker.
+///
+/// In production `write_batch` returns the (address, slot, signature) tuples
+/// and the settler sends them on the bounded mpsc channel — the writer task
+/// flushes them to `address_signatures` shortly after the atomic commit. In
+/// tests that don't start the writer, callers must perform this flush inline
+/// before any `get_signatures_for_address` read, otherwise the read sees an
+/// empty index for rows that were "written" by `write_batch`.
+#[cfg(test)]
+pub(crate) async fn flush_address_signatures_sync(
+    db: &crate::accounts::AccountsDB,
+    rows: &[crate::accounts::write_batch::AddressSignatureRow],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    if let crate::accounts::AccountsDB::Postgres(pg) = db {
+        let addresses: Vec<&[u8]> = rows.iter().map(|r| r.address.as_slice()).collect();
+        let slots: Vec<i64> = rows.iter().map(|r| r.slot).collect();
+        let signatures: Vec<&[u8]> = rows.iter().map(|r| r.signature.as_slice()).collect();
+        sqlx::query(
+            "INSERT INTO address_signatures (address, slot, signature)
+             SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::bytea[])
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&addresses)
+        .bind(&slots)
+        .bind(&signatures)
+        .execute(pg.pool.as_ref())
+        .await
+        .expect("test helper: flush_address_signatures_sync failed");
+    }
+}
+
 /// Return the connection URL for an already-running testcontainers Postgres instance.
 /// Useful when a test needs the raw URL (e.g. to pass to `run_node` or a worker).
 #[cfg(test)]

@@ -1,7 +1,8 @@
 use {
     crate::{
         accounts::{
-            postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::BlockInfo, AccountsDB,
+            postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::BlockInfo,
+            write_batch::AddressSignatureRow, AccountsDB,
         },
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
@@ -119,6 +120,8 @@ pub struct SettleArgs {
     )>,
     pub settled_accounts_tx: mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>,
     pub settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
+    /// Bounded channel to the background `address_index_writer`.
+    pub address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
     pub accountsdb_connection_url: String,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64,
@@ -132,6 +135,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         execution_results_rx,
         settled_accounts_tx,
         settled_blockhashes_tx,
+        address_signatures_tx,
         accountsdb_connection_url,
         blocktime_ms,
         perf_sample_period_secs,
@@ -148,6 +152,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             )>,
             settled_accounts_tx: mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>,
             settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
+            address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
             accountsdb_connection_url: String,
             blocktime_ms: u64,
             perf_sample_period_secs: u64,
@@ -269,6 +274,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             redis_db.as_mut(),
                             &processing_results,
                             &metrics,
+                            Some(&address_signatures_tx),
                         )
                         .await
                         {
@@ -371,6 +377,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     redis_db.as_mut(),
                     &processing_results,
                     &metrics,
+                    Some(&address_signatures_tx),
                 )
                 .await
                 {
@@ -400,6 +407,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             execution_results_rx,
             settled_accounts_tx,
             settled_blockhashes_tx,
+            address_signatures_tx,
             accountsdb_connection_url,
             blocktime_ms,
             perf_sample_period_secs,
@@ -423,9 +431,16 @@ async fn settle_transactions(
     redis_db: Option<&mut RedisAccountsDB>,
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
     metrics: &crate::stage_metrics::SharedMetrics,
+    address_signatures_tx: Option<&mpsc::Sender<Vec<AddressSignatureRow>>>,
 ) -> Result<SettleResult, Box<dyn std::error::Error>> {
     let t_total = tokio::time::Instant::now();
-    let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> = HashMap::new();
+    // Preallocate per-tick collections from the known result count so the hot
+    // path doesn't pay the geometric-growth realloc tax on every tick. The 4×
+    // hint absorbs SPL/ATA-creation flows where a single tx can write to up to
+    // four accounts; transfers stay well under the load factor.
+    let n = processing_results.len();
+    let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> =
+        HashMap::with_capacity(n * 4);
 
     // Determine block time
     let block_time = SystemTime::now()
@@ -454,9 +469,9 @@ async fn settle_transactions(
 
     // Phase 1: build account maps and transaction lists
     let t_processing_start = tokio::time::Instant::now();
-    let mut block_transaction_signatures = Vec::new();
-    let mut block_transaction_recent_blockhashes = Vec::new();
-    let mut transactions_for_db = Vec::new();
+    let mut block_transaction_signatures = Vec::with_capacity(n);
+    let mut block_transaction_recent_blockhashes = Vec::with_capacity(n);
+    let mut transactions_for_db = Vec::with_capacity(n);
 
     for (processing_result, sanitized_transaction) in processing_results.iter() {
         let signature = sanitized_transaction.signature();
@@ -539,7 +554,7 @@ async fn settle_transactions(
 
     // Phase 2: Postgres write (source of truth, fatal on failure)
     let t_db_start = tokio::time::Instant::now();
-    accounts_db
+    let addr_sig_rows = accounts_db
         .write_batch(
             &accounts_vec,
             transactions_for_db.clone(),
@@ -547,6 +562,34 @@ async fn settle_transactions(
         )
         .await?;
     let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Send-after-commit: address_signatures rows are durable in
+    // `transactions` already; the index writer fills in the read view with
+    // an eventually-consistent gap of <1 writer-flush interval. .send().await
+    // applies backpressure when the bounded channel fills.
+    //
+    // A closed channel (writer task exited) is logged and tolerated: the
+    // atomic commit has already succeeded, so the only consequence is that
+    // `address_signatures` is missing this tick's entries. That's the same
+    // eventually-consistent contract `getSignaturesForAddress` already
+    // tolerates — not a reason to tear down the settler.
+    if let Some(tx) = address_signatures_tx {
+        if !addr_sig_rows.is_empty() {
+            let send_t0 = tokio::time::Instant::now();
+            match tx.send(addr_sig_rows).await {
+                Ok(()) => {
+                    metrics.address_signatures_send_blocked_ms(
+                        send_t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        "address_signatures writer dropped; index entries for this tick will not be written"
+                    );
+                }
+            }
+        }
+    }
 
     // Phase 3: Redis write best-effort (non-fatal)
     let t_redis_start = tokio::time::Instant::now();
@@ -639,6 +682,7 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await;
         assert!(result.is_ok());
@@ -658,6 +702,7 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -673,6 +718,7 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -700,6 +746,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -738,6 +785,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -769,6 +817,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -800,6 +849,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -832,6 +882,7 @@ mod tests {
             None,
             &results1,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -858,6 +909,7 @@ mod tests {
             None,
             &results2,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -899,6 +951,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1051,12 +1104,14 @@ mod tests {
         let (_exec_tx, exec_rx) = mpsc::unbounded_channel();
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
 
         let handle = start_settle_worker(SettleArgs {
             execution_results_rx: exec_rx,
             settled_accounts_tx,
             settled_blockhashes_tx,
+            address_signatures_tx,
             accountsdb_connection_url: url,
             blocktime_ms: 100,
             perf_sample_period_secs: 60,
@@ -1080,12 +1135,14 @@ mod tests {
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
         let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
 
         let _handle = start_settle_worker(SettleArgs {
             execution_results_rx: exec_rx,
             settled_accounts_tx,
             settled_blockhashes_tx,
+            address_signatures_tx,
             accountsdb_connection_url: url,
             blocktime_ms: 50, // fast for testing
             perf_sample_period_secs: 3600,
@@ -1133,12 +1190,14 @@ mod tests {
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
 
         let handle = start_settle_worker(SettleArgs {
             execution_results_rx: exec_rx,
             settled_accounts_tx,
             settled_blockhashes_tx,
+            address_signatures_tx,
             accountsdb_connection_url: url,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
@@ -1204,6 +1263,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1250,6 +1310,7 @@ mod tests {
             None,
             &results1,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1281,6 +1342,7 @@ mod tests {
             None,
             &results2,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1346,6 +1408,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1404,6 +1467,7 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1445,6 +1509,7 @@ mod tests {
             None,
             &[(Ok(executed), tx)],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
         )
         .await
         .unwrap();
@@ -1494,12 +1559,14 @@ mod tests {
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
         let (_settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (_settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
         let shutdown = CancellationToken::new();
 
         let _handle = start_settle_worker(SettleArgs {
             execution_results_rx: exec_rx,
             settled_accounts_tx: _settled_accounts_tx,
             settled_blockhashes_tx: _settled_blockhashes_tx,
+            address_signatures_tx,
             accountsdb_connection_url: url.clone(),
             blocktime_ms: 50,
             perf_sample_period_secs: 1, // fires after 1s

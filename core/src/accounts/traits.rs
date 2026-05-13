@@ -124,7 +124,7 @@ impl AccountsDB {
             &ProcessedTransaction,
         )>,
         block_info: Option<BlockInfo>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<super::write_batch::AddressSignatureRow>, String> {
         super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
@@ -181,8 +181,8 @@ mod tests {
     use super::*;
     use crate::stages::AccountSettlement;
     use crate::test_helpers::{
-        create_test_block_info, create_test_sanitized_transaction, start_test_postgres,
-        start_test_redis,
+        create_test_block_info, create_test_sanitized_transaction, flush_address_signatures_sync,
+        start_test_postgres, start_test_redis,
     };
     use solana_sdk::account::AccountSharedData;
     use solana_sdk::signature::{Keypair, Signer};
@@ -516,13 +516,15 @@ mod tests {
             programs_modified_by_tx: HashMap::new(),
         }));
 
-        db.write_batch(
-            &[],
-            vec![(sig, &tx, 7, 1_700_000_000, &processed)],
-            Some(create_test_block_info(7, Hash::new_unique())),
-        )
-        .await
-        .unwrap();
+        let addr_sig_rows = db
+            .write_batch(
+                &[],
+                vec![(sig, &tx, 7, 1_700_000_000, &processed)],
+                Some(create_test_block_info(7, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        flush_address_signatures_sync(&db, &addr_sig_rows).await;
 
         let results = db
             .get_signatures_for_address(&from.pubkey(), 10, None, None)
@@ -579,17 +581,19 @@ mod tests {
             }))
         };
 
-        db.write_batch(
-            &[],
-            vec![
-                (sig_a, &tx_a, 5, 1_700_000_000, &make_processed()),
-                (sig_b, &tx_b, 5, 1_700_000_000, &make_processed()),
-                (sig_c, &tx_c, 5, 1_700_000_000, &make_processed()),
-            ],
-            Some(create_test_block_info(5, Hash::new_unique())),
-        )
-        .await
-        .unwrap();
+        let addr_sig_rows = db
+            .write_batch(
+                &[],
+                vec![
+                    (sig_a, &tx_a, 5, 1_700_000_000, &make_processed()),
+                    (sig_b, &tx_b, 5, 1_700_000_000, &make_processed()),
+                    (sig_c, &tx_c, 5, 1_700_000_000, &make_processed()),
+                ],
+                Some(create_test_block_info(5, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        flush_address_signatures_sync(&db, &addr_sig_rows).await;
 
         let results = db
             .get_signatures_for_address(&to, 10, None, None)
@@ -643,13 +647,15 @@ mod tests {
             },
             programs_modified_by_tx: HashMap::new(),
         }));
-        db.write_batch(
-            &[],
-            vec![(sig, &tx, slot, 1_700_000_000, &processed)],
-            Some(create_test_block_info(slot, Hash::new_unique())),
-        )
-        .await
-        .unwrap();
+        let addr_sig_rows = db
+            .write_batch(
+                &[],
+                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        flush_address_signatures_sync(db, &addr_sig_rows).await;
         sig
     }
 
@@ -801,10 +807,11 @@ mod tests {
             .collect();
 
         let block = create_test_block_info(slot, Hash::new_unique());
-        pg_db
+        let pg_addr_sig_rows = pg_db
             .write_batch(&[], batch_refs.clone(), Some(block.clone()))
             .await
             .unwrap();
+        flush_address_signatures_sync(&pg_db, &pg_addr_sig_rows).await;
         redis_db
             .write_batch(&[], batch_refs, Some(block))
             .await
