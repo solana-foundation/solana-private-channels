@@ -4,6 +4,7 @@ SHELL := /usr/bin/env bash
 
 .PHONY: install build build-hook-fixture fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
+.PHONY: unit-coverage coverage-html all-coverage
 
 # Install JS deps (codama renderers, tsx, etc.)
 install:
@@ -57,3 +58,18 @@ integration-test-no-build:
 integration-test: build integration-test-no-build
 
 all-test: unit-test integration-test
+
+# Run unit tests with coverage
+unit-coverage:
+	@echo "Running unit tests with coverage..."
+	@mkdir -p ../coverage
+	@cd program && cargo llvm-cov --lib --tests --lcov --output-path ../../coverage/coverage-dvp-swap-unit.lcov
+
+# Generate HTML coverage report
+coverage-html:
+	@echo "Generating HTML coverage report..."
+	@mkdir -p ../coverage
+	@cd program && cargo llvm-cov --html --output-dir ../../coverage/coverage-dvp-swap-html
+
+# Run all coverage tasks
+all-coverage: unit-coverage coverage-html

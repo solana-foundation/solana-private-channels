@@ -6,6 +6,7 @@ on:
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
+      - "dvp-swap-program/**"
       - "Cargo.*"
       - "Makefile"
       - ".github/workflows/program-integration.yml"
@@ -15,6 +16,7 @@ on:
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
+      - "dvp-swap-program/**"
       - "Cargo.*"
       - "Makefile"
       - ".github/workflows/program-integration.yml"
@@ -46,12 +48,16 @@ jobs:
         run: |
           make -C private-channel-escrow-program build
           make -C private-channel-withdraw-program build
+          make -C dvp-swap-program build
 
       - name: Run escrow integration tests
         run: make -C private-channel-escrow-program integration-test-no-build
 
       - name: Run withdraw integration tests
         run: make -C private-channel-withdraw-program integration-test-no-build
+
+      - name: Run DvP swap integration tests
+        run: make -C dvp-swap-program integration-test-no-build
 
       - name: Show failure logs
         if: failure()
