@@ -29,7 +29,7 @@
 //! in-flight syscall.
 
 use {
-    crate::processor::ContraForkGraph,
+    crate::processor::PrivateChannelForkGraph,
     solana_sdk::clock::Clock,
     solana_svm::transaction_processor::TransactionBatchProcessor,
     std::time::{SystemTime, UNIX_EPOCH},
@@ -43,7 +43,7 @@ use {
 ///
 /// Must be called before any SVM execution in the batch — see the
 /// thread-safety note in the module docs.
-pub fn set_clock_now(processor: &TransactionBatchProcessor<ContraForkGraph>) {
+pub fn set_clock_now(processor: &TransactionBatchProcessor<PrivateChannelForkGraph>) {
     let unix_timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time is before UNIX_EPOCH")
@@ -69,7 +69,7 @@ mod tests {
     /// Reads via `get_sysvar_cache_for_tests` to verify the round-trip.
     #[test]
     fn set_clock_now_writes_current_unix_timestamp() {
-        let processor = TransactionBatchProcessor::<ContraForkGraph>::default();
+        let processor = TransactionBatchProcessor::<PrivateChannelForkGraph>::default();
 
         let before = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -105,7 +105,7 @@ mod tests {
     /// that latches the first-write value or ignores subsequent calls.
     #[test]
     fn set_clock_now_advances_on_repeat_call() {
-        let processor = TransactionBatchProcessor::<ContraForkGraph>::default();
+        let processor = TransactionBatchProcessor::<PrivateChannelForkGraph>::default();
 
         set_clock_now(&processor);
         let first = processor
@@ -136,7 +136,7 @@ mod tests {
     /// `unix_timestamp = 0`. Documents why injection is required.
     #[test]
     fn default_processor_has_no_clock_until_injected() {
-        let processor = TransactionBatchProcessor::<ContraForkGraph>::default();
+        let processor = TransactionBatchProcessor::<PrivateChannelForkGraph>::default();
         assert!(
             processor.get_sysvar_cache_for_tests().get_clock().is_err(),
             "default sysvar cache must not contain a Clock until set_clock_now is called"
