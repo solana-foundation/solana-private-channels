@@ -89,25 +89,32 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(ProgramError::InvalidAccountOwner)
 }
 
-/// Reject Token-2022 mints carrying any extension that breaks the
-/// "escrow balance == sum of deposits" invariant the rest of the
-/// processor relies on (settle's surplus-refund math, equality checks
-/// against `dvp.amount_x`, etc.).
+/// Reject Token-2022 mints whose extensions silently break the
+/// "escrow balance == sum of deposits" invariant: `ConfidentialTransfer`(+Fee),
+/// `TransferFee`, `InterestBearing`, `ScaledUiAmount`. These cause the
+/// credited amount to drift from the debited amount, so the program
+/// would settle "successfully" while a leg comes up short.
 ///
-/// Blocked: `ConfidentialTransferMint`, `ConfidentialTransferFeeConfig`,
-/// `TransferFeeConfig`, `InterestBearingConfig`, `ScaledUiAmountConfig`.
-/// Everything else (Pausable, PermanentDelegate, NonTransferable,
-/// MintCloseAuthority, MetadataPointer, GroupPointer, TransferHook, …)
-/// is allowed. `TransferHook` is supported via `transfer_checked_cpi`:
-/// the client resolves the hook's `ExtraAccountMetaList` off-chain and
-/// passes the resulting accounts as trailing accounts to the
-/// instruction, which forwards them through the `TransferChecked` CPI.
+/// Everything else is allowed, including `Pausable`, `PermanentDelegate`,
+/// `NonTransferable`, `DefaultAccountState`, `TransferHook`, etc.
+/// These fail *loudly* (reverted CPI, atomic rollback) rather than
+/// silently — funds stay in escrow and recover once the blocking
+/// condition lifts. `PermanentDelegate` is a deliberate carve-out for
+/// regulated RWA tokens (issuer/transfer-agent clawback is an
+/// intrinsic property of the asset).
 ///
-/// Called **only at CreateDvp**. Unwind paths (Settle/Cancel/Reject/
-/// Reclaim) skip this check so funds remain recoverable even if a
-/// blocked extension's parameters are activated post-Create.
+/// Residual griefing/clawback surface the program does not defend
+/// against on-chain: a `Pausable` authority can pause mid-trade, a
+/// `PermanentDelegate` can drain or claw back, a `FreezeAuthority` can
+/// freeze the escrow ATA, a `TransferHook` EAML can be updated to
+/// exceed the per-CPI account cap (`MAX_HOOK_REMAINING_ACCOUNTS`) or
+/// to error unconditionally. Traders are expected to vet the mints
+/// they agree to transact in; mint-authority trust is not a problem
+/// the program can solve.
 ///
-/// Legacy SPL Token mints carry no extensions; this is a no-op for them.
+/// Called only at CreateDvp. Unwind paths skip this check so funds
+/// remain recoverable if extension parameters change post-Create.
+/// No-op for legacy SPL Token mints.
 #[inline(always)]
 pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
     if !mint_info.owned_by(&TOKEN_2022_PROGRAM_ID) {
@@ -133,10 +140,20 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
 }
 
 /// Maximum number of hook extras (validation PDA, hook program ID, and
-/// any accounts resolved from `ExtraAccountMetaList`) accepted per
-/// `TransferChecked` CPI. Bounds the per-CPI stack frame; the call
-/// returns `InvalidArgument` if the caller provides more.
-pub const MAX_HOOK_REMAINING_ACCOUNTS: usize = 16;
+/// `ExtraAccountMetaList`-resolved accounts) accepted per
+/// `TransferChecked` CPI. The cap is an implementation constraint —
+/// the metas array passed to `invoke_signed_with_bounds` is
+/// stack-allocated under a const generic and must be sized at compile
+/// time — not a security check. Sized to fit comfortably inside SBF's
+/// stack frame budget.
+///
+/// Residual griefing surface: a mint authority can call
+/// `UpdateExtraAccountMetaList` and push an EAML with more than
+/// `MAX_HOOK_REMAINING_ACCOUNTS - 2` entries, bricking every transfer
+/// CPI on that leg until the authority relents. Treated the same way
+/// as the other mint-authority surfaces in `validate_mint_extensions`:
+/// counterparty risk, not a program-correctness problem.
+pub const MAX_HOOK_REMAINING_ACCOUNTS: usize = 32;
 const MAX_TRANSFER_CHECKED_ACCOUNTS: usize = 4 + MAX_HOOK_REMAINING_ACCOUNTS;
 
 /// `TransferChecked` CPI on SPL Token or Token-2022 with a trailing

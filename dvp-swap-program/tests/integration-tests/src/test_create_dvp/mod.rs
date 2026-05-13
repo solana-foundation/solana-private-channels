@@ -1,5 +1,6 @@
 use dvp_swap_program_client::instructions::CreateDvpBuilder;
-use solana_sdk::signature::Signer;
+use solana_sdk::signature::{Keypair, Signer};
+use spl_associated_token_account::instruction::create_associated_token_account;
 
 use crate::{
     state_utils::{assert_create_dvp, setup_dvp, AMOUNT_A, AMOUNT_B},
@@ -193,4 +194,36 @@ fn test_create_dvp_rejects_zero_amount_b() {
         .instruction();
 
     assert_program_error(context.send(ix, &[]), ZERO_AMOUNT);
+}
+
+/// A front-runner pre-creates the canonical asset escrow ATA before
+/// CreateDvp lands. CreateDvp must accept the existing account
+/// (idempotent path) instead of bricking the trade.
+#[test]
+fn test_create_dvp_succeeds_when_escrow_ata_was_pre_created() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let frontrunner = Keypair::new();
+    context.airdrop_if_required(&frontrunner.pubkey(), 1_000_000_000);
+    let pre_create_ix = create_associated_token_account(
+        &frontrunner.pubkey(),
+        &fixture.swap_dvp,
+        &fixture.mint_a,
+        &fixture.token_program_a,
+    );
+    context
+        .send(pre_create_ix, &[&frontrunner])
+        .expect("front-runner pre-creates dvp_ata_a");
+    assert!(
+        context.get_account(&fixture.dvp_ata_a).is_some(),
+        "dvp_ata_a must exist after front-run"
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+
+    assert!(context.get_account(&fixture.swap_dvp).is_some());
+    assert!(context.get_account(&fixture.dvp_ata_b).is_some());
+    assert_eq!(get_token_balance(&context, &fixture.dvp_ata_a), 0);
+    assert_eq!(get_token_balance(&context, &fixture.dvp_ata_b), 0);
 }

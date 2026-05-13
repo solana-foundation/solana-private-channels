@@ -79,18 +79,18 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
 
 ## Errors
 
-| Code | Variant                       | When                                                    |
-| ---- | ----------------------------- | ------------------------------------------------------- |
-| 0    | `SignerNotParty`              | Reclaim/Reject signer is not `user_a` or `user_b`       |
-| 1    | `DvpExpired`                  | Reclaim/Settle after `expiry_timestamp`                 |
-| 2    | `SettlementAuthorityMismatch` | Settle/Cancel signer is not `settlement_authority`      |
-| 3    | `SettlementTooEarly`          | Settle when `now < earliest_settlement_timestamp`       |
-| 4    | `LegNotFunded`                | Settle when an escrow holds less than its target amount |
-| 5    | `ExpiryNotInFuture`           | Create with `expiry_timestamp <= now`                   |
-| 6    | `EarliestAfterExpiry`         | Create with `earliest > expiry`                         |
-| 7    | `SelfDvp`                     | Create with `user_a == user_b`                          |
-| 8    | `SameMint`                    | Create with `mint_a == mint_b`                          |
-| 9    | `ZeroAmount`                  | Create with `amount_a == 0` or `amount_b == 0`          |
+| Code | Variant                       | When                                                                                                                                 |
+| ---- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | `SignerNotParty`              | Reclaim/Reject signer is not `user_a` or `user_b`                                                                                    |
+| 1    | `DvpExpired`                  | Reclaim/Settle after `expiry_timestamp`                                                                                              |
+| 2    | `SettlementAuthorityMismatch` | Settle/Cancel signer is not `settlement_authority`                                                                                   |
+| 3    | `SettlementTooEarly`          | Settle when `now < earliest_settlement_timestamp`                                                                                    |
+| 4    | `LegNotFunded`                | Settle when an escrow holds less than its target amount                                                                              |
+| 5    | `ExpiryNotInFuture`           | Create with `expiry_timestamp <= now`                                                                                                |
+| 6    | `EarliestAfterExpiry`         | Create with `earliest > expiry`                                                                                                      |
+| 7    | `SelfDvp`                     | Create with `user_a == user_b`                                                                                                       |
+| 8    | `SameMint`                    | Create with `mint_a == mint_b`                                                                                                       |
+| 9    | `ZeroAmount`                  | Create with `amount_a == 0` or `amount_b == 0`                                                                                       |
 | 10   | `BlockedMintExtension`        | Create with a Token-2022 mint carrying an unsupported extension (TransferFee, InterestBearing, ScaledUiAmount, ConfidentialTransfer) |
 
 ## Build & test

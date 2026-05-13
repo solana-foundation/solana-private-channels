@@ -18,7 +18,7 @@ use pinocchio::{
     sysvars::{clock::Clock, rent::Rent, Sysvar},
     ProgramResult,
 };
-use pinocchio_associated_token_account::instructions::Create as CreateAta;
+use pinocchio_associated_token_account::instructions::CreateIdempotent as CreateAtaIdempotent;
 
 /// Processes the CreateDvp instruction.
 ///
@@ -135,7 +135,7 @@ pub fn process_create_dvp(
         None,
     )?;
 
-    CreateAta {
+    CreateAtaIdempotent {
         funding_account: payer_info,
         account: dvp_ata_a_info,
         wallet: swap_dvp_info,
@@ -145,7 +145,7 @@ pub fn process_create_dvp(
     }
     .invoke()?;
 
-    CreateAta {
+    CreateAtaIdempotent {
         funding_account: payer_info,
         account: dvp_ata_b_info,
         wallet: swap_dvp_info,

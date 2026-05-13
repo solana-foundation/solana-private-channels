@@ -240,12 +240,13 @@ pub enum DvpSwapProgramInstruction {
     /// Permissioned: signer must be `dvp.user_a` or `dvp.user_b`. Either
     /// counterparty can pull the plug; refunds any funded legs to their
     /// depositors and closes the trade. Closed-account rent goes to the
-    /// settlement authority (recorded in dvp.settlement_authority), keeping
-    /// rent accounting consistent with Settle and Cancel.
-    #[codama(account(name = "signer", docs = "Must equal dvp.user_a or dvp.user_b", signer))]
+    /// signer, not `dvp.settlement_authority` — Reject is the safety
+    /// valve and must work even if the settlement authority is
+    /// unreachable (e.g. a sysvar or executable address).
     #[codama(account(
-        name = "settlement_authority",
-        docs = "Must equal dvp.settlement_authority; receives closed-account rent",
+        name = "signer",
+        docs = "Must equal dvp.user_a or dvp.user_b; receives closed-account rent",
+        signer,
         writable
     ))]
     #[codama(account(

@@ -14,7 +14,7 @@ use pinocchio_token_2022::instructions::CloseAccount;
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts split between the two legs.
-const FIXED_ACCOUNTS_LEN: usize = 11;
+const FIXED_ACCOUNTS_LEN: usize = 10;
 
 /// Processes the RejectDvp instruction.
 ///
@@ -23,25 +23,28 @@ const FIXED_ACCOUNTS_LEN: usize = 11;
 /// respective depositors and closing the SwapDvp + both escrow ATAs.
 /// No expiry check — Reject must work post-expiry too.
 ///
-/// Closed-account rent goes to `dvp.settlement_authority`, matching the
-/// rent-recipient convention used by Settle and Cancel.
+/// Closed-account rent goes to `signer`, not `dvp.settlement_authority`.
+/// Reject is the safety valve and must work even if the configured
+/// settlement authority is unreachable (e.g. a sysvar or executable
+/// the runtime refuses to pass as writable). Settle and Cancel still
+/// pay rent to the settlement authority — it's their signer there, so
+/// it's already required to be usable.
 ///
 /// Extension validation is **not** performed here — Create is the
 /// consent point. Reject must remain available even if a mint's
 /// extension parameters change post-Create so funds are never stranded.
 ///
 /// # Account Layout
-/// 0.  `[signer]` signer - Must equal `dvp.user_a` or `dvp.user_b`
-/// 1.  `[writable]` settlement_authority - Must equal `dvp.settlement_authority`; receives closed-account rent
-/// 2.  `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
-/// 3.  `[]` mint_a - Must equal `dvp.mint_a`
-/// 4.  `[]` mint_b - Must equal `dvp.mint_b`
-/// 5.  `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
-/// 6.  `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
-/// 7.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
-/// 8.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
-/// 9.  `[]` token_program_a - SPL Token or Token-2022; must own mint_a
-/// 10. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 0. `[signer, writable]` signer - Must equal `dvp.user_a` or `dvp.user_b`; receives closed-account rent
+/// 1. `[writable]` swap_dvp - SwapDvp PDA (signs CPIs, then closed)
+/// 2. `[]` mint_a - Must equal `dvp.mint_a`
+/// 3. `[]` mint_b - Must equal `dvp.mint_b`
+/// 4. `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
+/// 5. `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
+/// 6. `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
+/// 7. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
+/// 8. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
+/// 9. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
 ///
 /// Trailing accounts (variable):
 /// - First `leg_a_extras_count` go to leg A's refund `TransferChecked`
@@ -59,13 +62,13 @@ pub fn process_reject_dvp(
 ) -> ProgramResult {
     let (fixed, leg_a_extras, leg_b_extras) =
         split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
-    let [signer_info, settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
+    let [signer_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    verify_signer(signer_info, false)?;
+    verify_signer(signer_info, true)?;
     verify_token_program(token_program_a_info)?;
     verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
@@ -77,10 +80,6 @@ pub fn process_reject_dvp(
 
     if signer_info.address() != &dvp.user_a && signer_info.address() != &dvp.user_b {
         return Err(DvpSwapProgramError::SignerNotParty.into());
-    }
-
-    if settlement_authority_info.address() != &dvp.settlement_authority {
-        return Err(DvpSwapProgramError::SettlementAuthorityMismatch.into());
     }
 
     if mint_a_info.address() != &dvp.mint_a || mint_b_info.address() != &dvp.mint_b {
@@ -126,10 +125,12 @@ pub fn process_reject_dvp(
     let swap_dvp_seeds = dvp.signing_seeds(&nonce_bytes, &bump_bytes);
     let signer_seeds = [Signer::from(&swap_dvp_seeds)];
 
-    // Refund each leg only if its escrow has a balance. Transfers the
-    // actual balance, not `dvp.amount_x`, so an unfunded leg is a clean
-    // skip rather than an InsufficientFunds failure.
+    // Snapshot both balances before any CPI runs, so a hook drain of
+    // one leg during the other leg's refund forces InsufficientFunds
+    // on the second transfer instead of being silently skipped.
     let leg_a_amount = get_token_account_balance(dvp_ata_a_info)?;
+    let leg_b_amount = get_token_account_balance(dvp_ata_b_info)?;
+
     if leg_a_amount > 0 {
         transfer_checked_cpi(
             dvp_ata_a_info,
@@ -144,7 +145,6 @@ pub fn process_reject_dvp(
         )?;
     }
 
-    let leg_b_amount = get_token_account_balance(dvp_ata_b_info)?;
     if leg_b_amount > 0 {
         transfer_checked_cpi(
             dvp_ata_b_info,
@@ -159,9 +159,13 @@ pub fn process_reject_dvp(
         )?;
     }
 
+    // Rent recipient is the signer, not `dvp.settlement_authority`.
+    // Reject must remain callable even if the settlement authority is
+    // unreachable (e.g. sysvar/executable address that the runtime
+    // refuses to pass as writable); see the doc comment above.
     CloseAccount {
         account: dvp_ata_a_info,
-        destination: settlement_authority_info,
+        destination: signer_info,
         authority: swap_dvp_info,
         token_program: token_program_a_info.address(),
     }
@@ -169,15 +173,15 @@ pub fn process_reject_dvp(
 
     CloseAccount {
         account: dvp_ata_b_info,
-        destination: settlement_authority_info,
+        destination: signer_info,
         authority: swap_dvp_info,
         token_program: token_program_b_info.address(),
     }
     .invoke_signed(&signer_seeds)?;
 
-    let authority_lamports = settlement_authority_info.lamports();
-    settlement_authority_info.set_lamports(
-        authority_lamports
+    let signer_lamports = signer_info.lamports();
+    signer_info.set_lamports(
+        signer_lamports
             .checked_add(swap_dvp_info.lamports())
             .ok_or(ProgramError::ArithmeticOverflow)?,
     );

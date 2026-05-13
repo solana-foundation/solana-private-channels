@@ -1,14 +1,19 @@
-use dvp_swap_program_client::instructions::RejectDvpBuilder;
-use solana_sdk::signature::{Keypair, Signer};
+use dvp_swap_program_client::instructions::{CreateDvpBuilder, RejectDvpBuilder};
+use solana_program::pubkey;
+use solana_sdk::{
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+};
+use spl_token_2022::instruction::transfer_checked;
 
 use crate::{
     state_utils::{
-        assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp, setup_dvp,
-        INITIAL_BALANCE,
+        assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp, setup_dvp, AMOUNT_A,
+        AMOUNT_B, INITIAL_BALANCE,
     },
     utils::{
-        assert_instruction_error, assert_program_error, get_token_balance, TestContext,
-        SIGNER_NOT_PARTY,
+        assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
+        get_token_balance, set_mint, swap_dvp_pda, TestContext, SIGNER_NOT_PARTY, TOKEN_PROGRAM_ID,
     },
 };
 
@@ -98,8 +103,9 @@ fn test_reject_dvp_works_post_expiry() {
 }
 
 /// Reject's authorization is the inverse of Cancel's: only the
-/// counterparties may sign. The settlement authority is the rent
-/// recipient, never a valid signer.
+/// counterparties may sign. The settlement authority is not a Reject
+/// account at all post-finding-1, so the only thing left to lock down
+/// is that submitting it as the signer fails on the party check.
 #[test]
 fn test_reject_dvp_rejects_settlement_authority_as_signer() {
     let mut context = TestContext::new();
@@ -109,7 +115,6 @@ fn test_reject_dvp_rejects_settlement_authority_as_signer() {
 
     let ix = RejectDvpBuilder::new()
         .signer(fixture.settlement_authority.pubkey())
-        .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
@@ -137,7 +142,6 @@ fn test_reject_dvp_rejects_substituted_mint_a() {
 
     let ix = RejectDvpBuilder::new()
         .signer(fixture.user_a.pubkey())
-        .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
         .mint_a(fixture.mint_b)
         .mint_b(fixture.mint_b)
@@ -165,7 +169,6 @@ fn test_reject_dvp_rejects_third_party() {
 
     let ix = RejectDvpBuilder::new()
         .signer(outsider.pubkey())
-        .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
@@ -179,4 +182,105 @@ fn test_reject_dvp_rejects_third_party() {
         .instruction();
     let result = context.send(ix, &[&outsider]);
     assert_program_error(result, SIGNER_NOT_PARTY);
+}
+
+/// Reject must work even when `settlement_authority` is a pubkey
+/// nobody can sign as (here, the Clock sysvar). Settle and Cancel are
+/// unreachable in that case; Reject is the safety valve.
+#[test]
+fn test_reject_dvp_works_when_settlement_authority_is_unreachable() {
+    let mut context = TestContext::new();
+
+    // Clock sysvar — no private key, so nobody can sign Settle/Cancel
+    // as this authority.
+    let unreachable_authority: Pubkey = pubkey!("SysvarC1ock11111111111111111111111111111111");
+
+    let user_a = Keypair::new();
+    let user_b = Keypair::new();
+    let mint_a = Keypair::new().pubkey();
+    let mint_b = Keypair::new().pubkey();
+    set_mint(&mut context, &mint_a, &TOKEN_PROGRAM_ID);
+    set_mint(&mut context, &mint_b, &TOKEN_PROGRAM_ID);
+
+    let user_a_ata_a = fund_wallet_ata(
+        &mut context,
+        &user_a,
+        &mint_a,
+        INITIAL_BALANCE,
+        &TOKEN_PROGRAM_ID,
+    );
+    let user_b_ata_b = fund_wallet_ata(
+        &mut context,
+        &user_b,
+        &mint_b,
+        INITIAL_BALANCE,
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let nonce: u64 = 0;
+    let (swap_dvp, _) = swap_dvp_pda(
+        &unreachable_authority,
+        &user_a.pubkey(),
+        &user_b.pubkey(),
+        &mint_a,
+        &mint_b,
+        nonce,
+    );
+    let dvp_ata_a = dvp_ata(&swap_dvp, &mint_a, &TOKEN_PROGRAM_ID);
+    let dvp_ata_b = dvp_ata(&swap_dvp, &mint_b, &TOKEN_PROGRAM_ID);
+
+    let expiry = context.now() + 3600;
+    let create_ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(swap_dvp)
+        .mint_a(mint_a)
+        .mint_b(mint_b)
+        .dvp_ata_a(dvp_ata_a)
+        .dvp_ata_b(dvp_ata_b)
+        .token_program_a(TOKEN_PROGRAM_ID)
+        .token_program_b(TOKEN_PROGRAM_ID)
+        .user_a(user_a.pubkey())
+        .user_b(user_b.pubkey())
+        .settlement_authority(unreachable_authority)
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(expiry)
+        .nonce(nonce)
+        .instruction();
+    context.send(create_ix, &[]).expect("CreateDvp");
+
+    let fund_ix = transfer_checked(
+        &TOKEN_PROGRAM_ID,
+        &user_a_ata_a,
+        &mint_a,
+        &dvp_ata_a,
+        &user_a.pubkey(),
+        &[],
+        AMOUNT_A,
+        6,
+    )
+    .expect("build TransferChecked");
+    context.send(fund_ix, &[&user_a]).expect("fund leg A");
+
+    let reject_ix = RejectDvpBuilder::new()
+        .signer(user_a.pubkey())
+        .swap_dvp(swap_dvp)
+        .mint_a(mint_a)
+        .mint_b(mint_b)
+        .dvp_ata_a(dvp_ata_a)
+        .dvp_ata_b(dvp_ata_b)
+        .user_a_ata_a(user_a_ata_a)
+        .user_b_ata_b(user_b_ata_b)
+        .token_program_a(TOKEN_PROGRAM_ID)
+        .token_program_b(TOKEN_PROGRAM_ID)
+        .leg_a_extras_count(0)
+        .instruction();
+    context
+        .send(reject_ix, &[&user_a])
+        .expect("Reject must succeed despite unreachable settlement_authority");
+
+    assert_eq!(get_token_balance(&context, &user_a_ata_a), INITIAL_BALANCE);
+    assert!(context.get_account(&swap_dvp).is_none());
+    assert!(context.get_account(&dvp_ata_a).is_none());
+    assert!(context.get_account(&dvp_ata_b).is_none());
 }

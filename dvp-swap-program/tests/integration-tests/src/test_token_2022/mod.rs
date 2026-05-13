@@ -594,7 +594,6 @@ fn test_reject_with_hook_on_mint_a() {
     let leg_a_extras = hook_extras_for_mint(&fixture.mint_a);
     let ix = RejectDvpBuilder::new()
         .signer(fixture.user_a.pubkey())
-        .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)

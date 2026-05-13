@@ -124,11 +124,12 @@ pub fn process_cancel_dvp(
     let swap_dvp_seeds = dvp.signing_seeds(&nonce_bytes, &bump_bytes);
     let signer_seeds = [Signer::from(&swap_dvp_seeds)];
 
-    // Refund each leg if and only if its escrow has a balance. We
-    // transfer the actual balance rather than `dvp.amount_x` so that
-    // an unfunded leg is a clean skip rather than an InsufficientFunds
-    // failure.
+    // Snapshot both balances before any CPI runs, so a hook drain of
+    // one leg during the other leg's refund forces InsufficientFunds
+    // on the second transfer instead of being silently skipped.
     let leg_a_amount = get_token_account_balance(dvp_ata_a_info)?;
+    let leg_b_amount = get_token_account_balance(dvp_ata_b_info)?;
+
     if leg_a_amount > 0 {
         transfer_checked_cpi(
             dvp_ata_a_info,
@@ -143,7 +144,6 @@ pub fn process_cancel_dvp(
         )?;
     }
 
-    let leg_b_amount = get_token_account_balance(dvp_ata_b_info)?;
     if leg_b_amount > 0 {
         transfer_checked_cpi(
             dvp_ata_b_info,

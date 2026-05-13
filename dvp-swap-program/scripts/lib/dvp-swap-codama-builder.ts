@@ -6,9 +6,7 @@ export class DvpSwapCodamaBuilder {
 
   constructor(dvpSwapIdl: unknown) {
     const idlJson =
-      typeof dvpSwapIdl === "string"
-        ? dvpSwapIdl
-        : JSON.stringify(dvpSwapIdl);
+      typeof dvpSwapIdl === "string" ? dvpSwapIdl : JSON.stringify(dvpSwapIdl);
     this.codama = createFromJson(idlJson);
   }
 

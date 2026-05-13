@@ -253,7 +253,6 @@ pub fn assert_reject_dvp(
 ) -> TransactionMetadata {
     let ix = RejectDvpBuilder::new()
         .signer(signer.pubkey())
-        .settlement_authority(fixture.settlement_authority.pubkey())
         .swap_dvp(fixture.swap_dvp)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
