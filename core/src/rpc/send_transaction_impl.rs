@@ -69,17 +69,19 @@ pub async fn send_transaction_impl(
     let sanitized_tx = runtime_tx.into_inner_transaction();
 
     // Filter: only accept SPL token, ATA, System Program, and Withdraw Program transactions
+    let withdraw_program_id = solana_sdk::pubkey::Pubkey::new_from_array(
+        private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
+    );
     let is_allowed_transaction =
         sanitized_tx
             .message()
             .program_instructions_iter()
             .all(|(program_id, _)| {
                 *program_id == spl_token::id()
-                || *program_id == spl_associated_token_account::id()
-                || *program_id == spl_memo::id()
-                || *program_id == solana_sdk::system_program::id()
-                || *program_id
-                    == private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+                    || *program_id == spl_associated_token_account::id()
+                    || *program_id == spl_memo::id()
+                    || *program_id == solana_sdk::system_program::id()
+                    || *program_id == withdraw_program_id
             });
 
     if !is_allowed_transaction {

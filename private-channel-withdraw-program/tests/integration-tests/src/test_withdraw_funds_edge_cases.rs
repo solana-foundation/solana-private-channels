@@ -1,4 +1,5 @@
 use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
+use solana_instruction::AccountMeta as V3AccountMeta;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -8,7 +9,7 @@ use spl_associated_token_account::get_associated_token_address;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
 use crate::utils::{
-    assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+    assert_program_error, set_mint, setup_test_balances, to_addr, TestContext, ATA_PROGRAM_ID,
     INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR, INVALID_MINT_ERROR,
     MISSING_REQUIRED_SIGNATURE_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
@@ -31,11 +32,11 @@ fn test_withdraw_funds_wrong_mint() {
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(wrong_mint.pubkey()) // Wrong mint — no valid Mint data in SVM
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(wrong_mint.pubkey())) // Wrong mint — no valid Mint data in SVM
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
@@ -58,15 +59,15 @@ fn test_withdraw_funds_non_signer_user() {
 
     // Build canonical instruction, then strip the signer flag from user account
     let mut instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
-    instruction.accounts[0] = AccountMeta::new_readonly(user.pubkey(), false);
+    instruction.accounts[0] = V3AccountMeta::new_readonly(to_addr(user.pubkey()), false);
 
     let result = context.send_transaction_with_signers(instruction, &[]);
 
@@ -88,16 +89,16 @@ fn test_withdraw_funds_wrong_ata_program() {
 
     // Build instruction with wrong ATA program
     let mut instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(fake_ata_program)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(fake_ata_program))
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
     // Override account 4 (associated_token_program) with a fake address
-    instruction.accounts[4] = AccountMeta::new_readonly(fake_ata_program, false);
+    instruction.accounts[4] = V3AccountMeta::new_readonly(to_addr(fake_ata_program), false);
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
@@ -119,15 +120,15 @@ fn test_withdraw_funds_wrong_token_program() {
 
     // Build instruction with wrong token program
     let mut instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(user_ata)
-        .token_program(fake_token_program)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(fake_token_program))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
-    instruction.accounts[3] = AccountMeta::new_readonly(fake_token_program, false);
+    instruction.accounts[3] = V3AccountMeta::new_readonly(to_addr(fake_token_program), false);
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
@@ -147,15 +148,15 @@ fn test_withdraw_funds_wrong_ata_address() {
 
     // Use a random address instead of the correct ATA
     let mut instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(wrong_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(wrong_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
-    instruction.accounts[2] = AccountMeta::new(wrong_ata, false);
+    instruction.accounts[2] = V3AccountMeta::new(to_addr(wrong_ata), false);
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 

@@ -132,6 +132,12 @@ async fn attach_wallet(pool: &sqlx::PgPool, args: AttachWalletArgs) -> Result<()
 }
 
 #[cfg(test)]
+// `ENV_LOCK` is a synchronous Mutex held across `.await` on purpose: it
+// serializes process-global env-var mutation across async tests. An async
+// Mutex would defeat the point (the body of each test isn't itself async-
+// contended; it just must not interleave with another test). Clippy can't
+// distinguish the two cases here, so silence the lint module-wide.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use solana_sdk::pubkey::Pubkey;

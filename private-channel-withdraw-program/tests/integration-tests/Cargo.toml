@@ -9,6 +9,10 @@ private-channel-withdraw-program-client = { workspace = true, features = ["fetch
 # Use LiteSVM compatible versions instead of workspace versions
 solana-sdk = "2.3.1"
 solana-program = "2.3.0"
+# The codama-generated client emits `solana_address::Address` and
+# `solana_instruction::Instruction` (3.x); we convert at the boundary.
+solana-address = "2"
+solana-instruction = "3"
 spl-token = "6.0.0"
 spl-associated-token-account = { version = "4.0.0", features = [
     "no-entrypoint",

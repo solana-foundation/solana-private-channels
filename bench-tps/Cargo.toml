@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 # but { workspace = true } breaks compilation — solana-sdk is still 2.x.
 solana-client = "2.3.10"
 reqwest = { workspace = true }
+solana-address = { workspace = true }
+solana-instruction = { workspace = true }
 solana-sdk = { workspace = true }
 solana-system-interface = { workspace = true }
 spl-associated-token-account = { workspace = true }

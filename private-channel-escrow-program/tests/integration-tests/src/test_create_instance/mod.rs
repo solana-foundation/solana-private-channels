@@ -1,3 +1,4 @@
+use crate::utils::to_addr;
 use crate::{
     pda_utils::{find_event_authority_pda, find_instance_pda},
     state_utils::assert_get_or_create_instance,
@@ -45,13 +46,13 @@ fn test_create_instance_duplicate() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = CreateInstanceBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin2.pubkey())
-        .instance_seed(instance_seed.pubkey())
-        .instance(instance_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin2.pubkey()))
+        .instance_seed(to_addr(instance_seed.pubkey()))
+        .instance(to_addr(instance_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -75,13 +76,13 @@ fn test_create_instance_invalid_pda() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = CreateInstanceBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance_seed(instance_seed.pubkey())
-        .instance(wrong_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance_seed(to_addr(instance_seed.pubkey()))
+        .instance(to_addr(wrong_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(1) // Wrong bump
         .instruction();
 

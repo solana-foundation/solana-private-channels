@@ -265,7 +265,7 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
         &[b"instance", escrow_instance.pubkey().as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes()),
     );
 
     // Start both indexers in parallel — each has its own DB and datasource

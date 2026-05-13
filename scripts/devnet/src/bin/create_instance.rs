@@ -1,3 +1,4 @@
+use devnet_scripts::{ix_v3_to_sdk, to_addr};
 use private_channel_escrow_program_client::{
     instructions::CreateInstanceBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
@@ -15,15 +16,19 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const INSTANCE_SEED: &[u8] = b"instance";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 
+fn program_id_as_pubkey() -> Pubkey {
+    Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes())
+}
+
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED, instance_seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &program_id_as_pubkey(),
     )
 }
 
 fn find_event_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &program_id_as_pubkey())
 }
 
 fn main() -> Result<()> {
@@ -60,19 +65,19 @@ fn main() -> Result<()> {
     println!("Instance PDA: {}", instance_pda);
 
     let instruction = CreateInstanceBuilder::new()
-        .payer(admin_keypair.pubkey())
-        .admin(admin_keypair.pubkey())
-        .instance_seed(instance_seed.pubkey())
-        .instance(instance_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
+        .payer(to_addr(admin_keypair.pubkey()))
+        .admin(to_addr(admin_keypair.pubkey()))
+        .instance_seed(to_addr(instance_seed.pubkey()))
+        .instance(to_addr(instance_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .instruction();
 
     let recent_blockhash = client.get_latest_blockhash()?;
     let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
+        &[ix_v3_to_sdk(instruction)],
         Some(&admin_keypair.pubkey()),
         &[&admin_keypair, &instance_seed],
         recent_blockhash,

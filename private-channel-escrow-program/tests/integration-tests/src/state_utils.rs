@@ -1,7 +1,7 @@
 use crate::assertions::{assert_deposit_balances, assert_release_funds_balances};
 use crate::pda_utils::{find_allowed_mint_pda, find_event_authority_pda};
 use crate::utils::{
-    assert_event_discriminator_present, get_token_balance, ATA_PROGRAM_ID,
+    assert_event_discriminator_present, get_token_balance, to_addr, ATA_PROGRAM_ID,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use crate::{
@@ -47,13 +47,13 @@ pub fn assert_get_or_create_instance(
 
     // Use the generated client (this works in test_create_instance_invalid_pda)
     let instruction = CreateInstanceBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance_seed(instance_seed.pubkey())
-        .instance(instance_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance_seed(to_addr(instance_seed.pubkey()))
+        .instance(to_addr(instance_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -118,17 +118,17 @@ pub fn assert_get_or_allow_mint(
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(*instance_pda)
-        .mint(*mint)
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(token_program_id) // Use detected token program
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .mint(to_addr(*mint))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(token_program_id)) // Use detected token program
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -172,14 +172,14 @@ pub fn assert_get_or_block_mint(
         .lamports;
 
     let instruction = BlockMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(*instance_pda)
-        .mint(*mint)
-        .allowed_mint(*allowed_mint_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .mint(to_addr(*mint))
+        .allowed_mint(to_addr(*allowed_mint_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let transaction_metadata = context
@@ -226,14 +226,14 @@ pub fn assert_get_or_add_operator(
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AddOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(*instance_pda)
-        .operator(*wallet)
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .operator(to_addr(*wallet))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -277,14 +277,14 @@ pub fn assert_get_or_remove_operator(
         .lamports;
 
     let instruction = RemoveOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(*instance_pda)
-        .operator(*wallet)
-        .operator_pda(*operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .operator(to_addr(*wallet))
+        .operator_pda(to_addr(*operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let transaction_metadata = context
@@ -325,12 +325,12 @@ pub fn assert_get_or_set_new_admin(
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = SetNewAdminBuilder::new()
-        .payer(context.payer.pubkey())
-        .current_admin(current_admin.pubkey())
-        .instance(*instance_pda)
-        .new_admin(new_admin.pubkey())
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .current_admin(to_addr(current_admin.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .new_admin(to_addr(new_admin.pubkey()))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let transaction_metadata = context
@@ -379,22 +379,22 @@ pub fn assert_get_or_deposit(
 
     let mut binding = DepositBuilder::new();
     let builder = binding
-        .payer(context.payer.pubkey())
-        .user(user.pubkey())
-        .instance(*instance_pda)
-        .mint(*mint)
-        .allowed_mint(allowed_mint_pda)
-        .user_ata(user_ata)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(*token_program)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .user(to_addr(user.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .mint(to_addr(*mint))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .user_ata(to_addr(user_ata))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(*token_program))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .amount(amount);
 
     let instruction = if let Some(recipient) = recipient {
-        builder.recipient(recipient).instruction()
+        builder.recipient(to_addr(recipient)).instruction()
     } else {
         builder.instruction()
     };
@@ -452,20 +452,20 @@ pub fn assert_get_or_release_funds(
     let instance_balance_before = get_token_balance(context, &instance_ata);
 
     let instruction = ReleaseFundsBuilder::new()
-        .payer(context.payer.pubkey())
-        .operator(operator.pubkey())
-        .instance(*instance_pda)
-        .operator_pda(*operator_pda)
-        .mint(*mint)
-        .allowed_mint(allowed_mint_pda)
-        .user_ata(user_ata)
-        .instance_ata(instance_ata)
-        .token_program(*token_program)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .operator(to_addr(operator.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .operator_pda(to_addr(*operator_pda))
+        .mint(to_addr(*mint))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .user_ata(to_addr(user_ata))
+        .instance_ata(to_addr(instance_ata))
+        .token_program(to_addr(*token_program))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .amount(amount)
-        .user(*user)
+        .user(to_addr(*user))
         .new_withdrawal_root(new_withdrawal_root)
         .transaction_nonce(transaction_nonce)
         .sibling_proofs(sibling_proofs)
@@ -526,12 +526,12 @@ pub fn assert_get_or_reset_smt_root(
     let previous_tree_index = current_instance.current_tree_index;
 
     let instruction = ResetSmtRootBuilder::new()
-        .payer(context.payer.pubkey())
-        .operator(operator.pubkey())
-        .instance(*instance_pda)
-        .operator_pda(*operator_pda)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .operator(to_addr(operator.pubkey()))
+        .instance(to_addr(*instance_pda))
+        .operator_pda(to_addr(*operator_pda))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let transaction_metadata = context.send_transaction_with_signers_with_transaction_result(

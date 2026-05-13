@@ -5,6 +5,7 @@ use private_channel_escrow_program_client::{
     instructions::{AllowMintBuilder, CreateInstanceBuilder, DepositBuilder},
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
+use private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -15,6 +16,12 @@ use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use std::time::Duration;
+
+/// Convert the program-ID `Address` constant (v3) into a `solana_sdk` `Pubkey`
+/// for use with `find_program_address` and other v2 RPC paths.
+fn escrow_program_id_sdk() -> Pubkey {
+    Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes())
+}
 
 // Import helpers module
 mod helpers;
@@ -27,18 +34,18 @@ const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED, instance_seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
 fn find_event_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &escrow_program_id_sdk())
 }
 
 fn find_allowed_mint_pda(instance: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[ALLOWED_MINT_SEED, instance.as_ref(), mint.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
@@ -51,16 +58,18 @@ async fn send_create_instance(
 
     let (event_authority_pda, _) = find_event_authority_pda();
 
-    let instruction = CreateInstanceBuilder::new()
-        .payer(my_wallet.pubkey())
-        .admin(my_wallet.pubkey())
-        .instance_seed(instance_seed.pubkey())
-        .instance(instance_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .bump(bump)
-        .instruction();
+    let instruction = ix_v3_to_sdk(
+        CreateInstanceBuilder::new()
+            .payer(my_wallet.pubkey().to_bytes().into())
+            .admin(my_wallet.pubkey().to_bytes().into())
+            .instance_seed(instance_seed.pubkey().to_bytes().into())
+            .instance(instance_pda.to_bytes().into())
+            .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+            .event_authority(event_authority_pda.to_bytes().into())
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .bump(bump)
+            .instruction(),
+    );
 
     let signature = send_and_confirm_instructions(
         client,
@@ -86,20 +95,22 @@ async fn send_allow_mint(
     let instance_ata =
         get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_PROGRAM_ID);
 
-    let instruction = AllowMintBuilder::new()
-        .payer(admin.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance)
-        .mint(mint)
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(spl_associated_token_account::ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .bump(bump)
-        .instruction();
+    let instruction = ix_v3_to_sdk(
+        AllowMintBuilder::new()
+            .payer(admin.pubkey().to_bytes().into())
+            .admin(admin.pubkey().to_bytes().into())
+            .instance(instance.to_bytes().into())
+            .mint(mint.to_bytes().into())
+            .allowed_mint(allowed_mint_pda.to_bytes().into())
+            .instance_ata(instance_ata.to_bytes().into())
+            .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+            .token_program(TOKEN_PROGRAM_ID.to_bytes().into())
+            .associated_token_program(spl_associated_token_account::ID.to_bytes().into())
+            .event_authority(event_authority_pda.to_bytes().into())
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .bump(bump)
+            .instruction(),
+    );
 
     let signature =
         send_and_confirm_instructions(client, &[instruction], admin, &[admin], "Allow Mint")
@@ -126,25 +137,25 @@ async fn send_deposit(
 
     let mut builder = DepositBuilder::new();
     builder
-        .payer(user.pubkey())
-        .user(user.pubkey())
-        .instance(instance)
-        .mint(mint)
-        .allowed_mint(allowed_mint_pda)
-        .user_ata(user_ata)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(spl_associated_token_account::ID)
-        .event_authority(event_authority_pda)
+        .payer(user.pubkey().to_bytes().into())
+        .user(user.pubkey().to_bytes().into())
+        .instance(instance.to_bytes().into())
+        .mint(mint.to_bytes().into())
+        .allowed_mint(allowed_mint_pda.to_bytes().into())
+        .user_ata(user_ata.to_bytes().into())
+        .instance_ata(instance_ata.to_bytes().into())
+        .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+        .token_program(TOKEN_PROGRAM_ID.to_bytes().into())
+        .associated_token_program(spl_associated_token_account::ID.to_bytes().into())
+        .event_authority(event_authority_pda.to_bytes().into())
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .amount(amount);
 
-    let instruction = if let Some(recipient) = recipient {
-        builder.recipient(recipient).instruction()
+    let instruction = ix_v3_to_sdk(if let Some(recipient) = recipient {
+        builder.recipient(recipient.to_bytes().into()).instruction()
     } else {
         builder.instruction()
-    };
+    });
 
     let signature =
         send_and_confirm_instructions(client, &[instruction], user, &[user], "Deposit").await?;

@@ -153,19 +153,22 @@ pub fn withdraw_funds_transaction(
     amount: u64,
     recent_blockhash: Hash,
 ) -> Transaction {
+    use private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk;
     use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
 
     let token_account =
         get_associated_token_address_with_program_id(&from.pubkey(), mint, &spl_token::ID);
 
-    let withdraw_ix = WithdrawFundsBuilder::new()
-        .user(from.pubkey())
-        .mint(*mint)
-        .token_account(token_account)
-        .token_program(spl_token::id())
-        .associated_token_program(spl_associated_token_account::id())
-        .amount(amount)
-        .instruction();
+    let withdraw_ix = ix_v3_to_sdk(
+        WithdrawFundsBuilder::new()
+            .user(from.pubkey().to_bytes().into())
+            .mint(mint.to_bytes().into())
+            .token_account(token_account.to_bytes().into())
+            .token_program(spl_token::id().to_bytes().into())
+            .associated_token_program(spl_associated_token_account::id().to_bytes().into())
+            .amount(amount)
+            .instruction(),
+    );
 
     Transaction::new_signed_with_payer(
         &[withdraw_ix],

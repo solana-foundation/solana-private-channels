@@ -85,13 +85,13 @@ fn build_precompiles() -> HashMap<Pubkey, AccountSharedData> {
 
     // PrivateChannel Withdraw program.
     let withdraw_elf = include_bytes!("../../precompiles/private_channel_withdraw_program.so");
-    let (_, withdraw_account) = bpf_loader_program_account(
-        &private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
-        withdraw_elf,
-        &rent,
+    let withdraw_program_id = Pubkey::new_from_array(
+        private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
     );
+    let (_, withdraw_account) =
+        bpf_loader_program_account(&withdraw_program_id, withdraw_elf, &rent);
     precompiles.insert(
-        private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        withdraw_program_id,
         AccountSharedData::from(withdraw_account),
     );
 
@@ -110,9 +110,9 @@ mod tests {
         assert!(PRECOMPILES.contains_key(&spl_associated_token_account::ID));
         assert!(PRECOMPILES.contains_key(&solana_sdk_ids::sysvar::rent::ID));
         assert!(PRECOMPILES.contains_key(&spl_memo::id()));
-        assert!(PRECOMPILES.contains_key(
-            &private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
-        ));
+        assert!(PRECOMPILES.contains_key(&Pubkey::new_from_array(
+            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes()
+        )));
         assert_eq!(PRECOMPILES.len(), 6);
     }
 
@@ -122,7 +122,10 @@ mod tests {
             spl_token::ID,
             spl_associated_token_account::ID,
             spl_memo::id(),
-            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            Pubkey::new_from_array(
+                private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+                    .to_bytes(),
+            ),
         ] {
             let account = PRECOMPILES.get(&program_id).expect("missing precompile");
             assert!(account.executable(), "{} should be executable", program_id);

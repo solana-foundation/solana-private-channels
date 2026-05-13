@@ -12,6 +12,31 @@ use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
 use std::fmt::Display;
 
+/// Convert codama v3 `Instruction` → `solana_sdk::instruction::Instruction` (v2.x).
+///
+/// Duplicated in `bench-tps/src/instruction_util.rs` and
+/// `scripts/devnet/src/lib.rs`. The three consumers share no lightweight
+/// common dep, and a new crate for an 8-line helper isn't worth it.
+///
+/// Safe to duplicate: both types are 32-byte newtypes, so the only correct
+/// body is "copy the bytes and rebuild the struct" — no behavior to drift on.
+/// All three copies go away when the workspace migrates off `solana-sdk 2.x`.
+pub fn ix_v3_to_sdk(ix: solana_instruction::Instruction) -> Instruction {
+    Instruction {
+        program_id: Pubkey::new_from_array(ix.program_id.to_bytes()),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|m| AccountMeta {
+                pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
+
 pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:remint:";
 
 /*
@@ -85,11 +110,11 @@ impl TransactionBuilder {
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         match self {
             Self::ReleaseFunds(builder_with_nonce) => {
-                Ok(vec![builder_with_nonce.builder.instruction()])
+                Ok(vec![ix_v3_to_sdk(builder_with_nonce.builder.instruction())])
             }
             Self::InitializeMint(builder) => Ok(vec![builder.instruction()?]),
             Self::Mint(builder_with_txn_id) => builder_with_txn_id.builder.instructions(),
-            Self::ResetSmtRoot(builder) => Ok(vec![builder.instruction()]),
+            Self::ResetSmtRoot(builder) => Ok(vec![ix_v3_to_sdk(builder.instruction())]),
         }
     }
 
@@ -506,23 +531,29 @@ mod tests {
     // TransactionBuilder enum methods
     // ========================================================================
 
+    /// Convert a test `Pubkey` (v2) into the `solana_address::Address` (v3)
+    /// expected by the codama-generated builders.
+    fn addr(i: u8) -> solana_address::Address {
+        pk(i).to_bytes().into()
+    }
+
     fn make_release_funds_builder() -> TransactionBuilder {
         let mut inner = ReleaseFundsBuilder::new();
         inner
-            .payer(pk(1))
-            .operator(pk(2))
-            .instance(pk(3))
-            .operator_pda(pk(4))
-            .mint(pk(5))
-            .allowed_mint(pk(6))
-            .user_ata(pk(7))
-            .instance_ata(pk(8))
-            .token_program(spl_token::id())
-            .associated_token_program(spl_associated_token_account::id())
-            .event_authority(pk(10))
-            .private_channel_escrow_program(pk(11))
+            .payer(addr(1))
+            .operator(addr(2))
+            .instance(addr(3))
+            .operator_pda(addr(4))
+            .mint(addr(5))
+            .allowed_mint(addr(6))
+            .user_ata(addr(7))
+            .instance_ata(addr(8))
+            .token_program(spl_token::id().to_bytes().into())
+            .associated_token_program(spl_associated_token_account::id().to_bytes().into())
+            .event_authority(addr(10))
+            .private_channel_escrow_program(addr(11))
             .amount(100)
-            .user(pk(12))
+            .user(addr(12))
             .new_withdrawal_root([0u8; 32])
             .transaction_nonce(42)
             .sibling_proofs([0u8; 512]);
@@ -556,12 +587,12 @@ mod tests {
     fn make_reset_smt_builder() -> TransactionBuilder {
         let mut inner = ResetSmtRootBuilder::new();
         inner
-            .payer(pk(1))
-            .operator(pk(2))
-            .instance(pk(3))
-            .operator_pda(pk(4))
-            .event_authority(pk(5))
-            .private_channel_escrow_program(pk(6));
+            .payer(addr(1))
+            .operator(addr(2))
+            .instance(addr(3))
+            .operator_pda(addr(4))
+            .event_authority(addr(5))
+            .private_channel_escrow_program(addr(6));
         TransactionBuilder::ResetSmtRoot(Box::new(inner.clone()))
     }
 

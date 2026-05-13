@@ -19,6 +19,7 @@ use private_channel_escrow_program_client::instructions::{
     ReleaseFundsBuilder, ResetSmtRootBuilder,
 };
 use private_channel_metrics::MetricLabel;
+use solana_address::Address;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashMap;
@@ -26,6 +27,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, info_span, warn, Instrument};
+
+/// Convert a `solana_sdk::pubkey::Pubkey` (v2.x) into the
+/// `solana_address::Address` (v2.x) consumed by codama-generated builders.
+fn to_addr(pubkey: Pubkey) -> Address {
+    Address::new_from_array(pubkey.to_bytes())
+}
 
 pub struct ProcessorState {
     pub admin_pubkey: Pubkey,
@@ -361,16 +368,16 @@ async fn build_release_funds(
     // Sibling proofs and new withdrawal root are filled in by the sender once
     // the nonce reaches the front of the in-flight queue.
     builder
-        .payer(processor_state.admin_pubkey)
-        .operator(release_funds_state.operator_pubkey)
-        .instance(release_funds_state.instance_pda)
-        .operator_pda(release_funds_state.operator_pda)
-        .mint(mint)
-        .allowed_mint(allowed_mint_pda)
-        .user_ata(recipient_ata)
-        .instance_ata(instance_ata)
-        .token_program(token_program)
-        .user(recipient)
+        .payer(to_addr(processor_state.admin_pubkey))
+        .operator(to_addr(release_funds_state.operator_pubkey))
+        .instance(to_addr(release_funds_state.instance_pda))
+        .operator_pda(to_addr(release_funds_state.operator_pda))
+        .mint(to_addr(mint))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .user_ata(to_addr(recipient_ata))
+        .instance_ata(to_addr(instance_ata))
+        .token_program(to_addr(token_program))
+        .user(to_addr(recipient))
         .transaction_nonce(nonce);
 
     let amount = u64::try_from(transaction.amount).map_err(|_| {
@@ -422,11 +429,11 @@ fn build_scheduled_rotation(
 ) -> TransactionBuilder {
     let mut rotation_builder = ResetSmtRootBuilder::new();
     rotation_builder
-        .payer(admin_pubkey)
-        .operator(release_funds_state.operator_pubkey)
-        .instance(release_funds_state.instance_pda)
-        .operator_pda(release_funds_state.operator_pda)
-        .event_authority(release_funds_state.event_authority_pda);
+        .payer(to_addr(admin_pubkey))
+        .operator(to_addr(release_funds_state.operator_pubkey))
+        .instance(to_addr(release_funds_state.instance_pda))
+        .operator_pda(to_addr(release_funds_state.operator_pda))
+        .event_authority(to_addr(release_funds_state.event_authority_pda));
     TransactionBuilder::ResetSmtRoot(Box::new(rotation_builder))
 }
 

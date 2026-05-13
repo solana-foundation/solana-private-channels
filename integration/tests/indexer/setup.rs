@@ -4,6 +4,7 @@ use private_channel_escrow_program_client::{
     instructions::{AddOperatorBuilder, AllowMintBuilder, CreateInstanceBuilder},
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
+use private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -32,28 +33,36 @@ pub const TEST_ADMIN_KEYPAIR: [u8; 64] = [
     79, 26,
 ];
 
+/// The codama v3 generated client exposes the escrow program ID as a
+/// `solana_address::Address` constant.  Most of the test code still operates
+/// on `solana_sdk::pubkey::Pubkey` (find_program_address, RpcClient inputs),
+/// so we maintain a Pubkey-typed mirror for that boundary.
+fn escrow_program_id_sdk() -> Pubkey {
+    Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes())
+}
+
 pub fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED, instance_seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
 pub fn find_event_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &escrow_program_id_sdk())
 }
 
 pub fn find_allowed_mint_pda(instance: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[ALLOWED_MINT_SEED, instance.as_ref(), mint.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
 pub fn find_operator_pda(instance: &Pubkey, operator: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[OPERATOR_SEED, instance.as_ref(), operator.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
@@ -148,20 +157,22 @@ impl TestEnvironment {
         let instance_ata =
             get_associated_token_address_with_program_id(&instance_pda, &mint, &TOKEN_PROGRAM_ID);
 
-        let allow_ix = AllowMintBuilder::new()
-            .payer(admin.pubkey())
-            .admin(admin.pubkey())
-            .instance(instance_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint_pda)
-            .instance_ata(instance_ata)
-            .system_program(SYSTEM_PROGRAM_ID)
-            .token_program(TOKEN_PROGRAM_ID)
-            .associated_token_program(spl_associated_token_account::ID)
-            .event_authority(event_authority_pda)
-            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-            .bump(bump)
-            .instruction();
+        let allow_ix = ix_v3_to_sdk(
+            AllowMintBuilder::new()
+                .payer(admin.pubkey().to_bytes().into())
+                .admin(admin.pubkey().to_bytes().into())
+                .instance(instance_pda.to_bytes().into())
+                .mint(mint.to_bytes().into())
+                .allowed_mint(allowed_mint_pda.to_bytes().into())
+                .instance_ata(instance_ata.to_bytes().into())
+                .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+                .token_program(TOKEN_PROGRAM_ID.to_bytes().into())
+                .associated_token_program(spl_associated_token_account::ID.to_bytes().into())
+                .event_authority(event_authority_pda.to_bytes().into())
+                .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+                .bump(bump)
+                .instruction(),
+        );
 
         send_and_confirm_instructions(client, &[allow_ix], &admin, &[&admin], "Allow Mint").await?;
 
@@ -191,16 +202,18 @@ impl TestEnvironment {
             return Ok((instance_seed, instance_pda));
         }
 
-        let create_ix = CreateInstanceBuilder::new()
-            .payer(admin.pubkey())
-            .admin(admin.pubkey())
-            .instance_seed(instance_seed.pubkey())
-            .instance(instance_pda)
-            .system_program(SYSTEM_PROGRAM_ID)
-            .event_authority(event_authority_pda)
-            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-            .bump(bump)
-            .instruction();
+        let create_ix = ix_v3_to_sdk(
+            CreateInstanceBuilder::new()
+                .payer(admin.pubkey().to_bytes().into())
+                .admin(admin.pubkey().to_bytes().into())
+                .instance_seed(instance_seed.pubkey().to_bytes().into())
+                .instance(instance_pda.to_bytes().into())
+                .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+                .event_authority(event_authority_pda.to_bytes().into())
+                .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+                .bump(bump)
+                .instruction(),
+        );
 
         send_and_confirm_instructions(
             client,
@@ -232,17 +245,19 @@ impl TestEnvironment {
             return Ok(());
         }
 
-        let add_operator_ix = AddOperatorBuilder::new()
-            .payer(operator.pubkey())
-            .admin(operator.pubkey())
-            .operator(operator.pubkey())
-            .instance(instance_pda)
-            .operator_pda(operator_pda)
-            .system_program(SYSTEM_PROGRAM_ID)
-            .event_authority(event_authority_pda)
-            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-            .bump(bump)
-            .instruction();
+        let add_operator_ix = ix_v3_to_sdk(
+            AddOperatorBuilder::new()
+                .payer(operator.pubkey().to_bytes().into())
+                .admin(operator.pubkey().to_bytes().into())
+                .operator(operator.pubkey().to_bytes().into())
+                .instance(instance_pda.to_bytes().into())
+                .operator_pda(operator_pda.to_bytes().into())
+                .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+                .event_authority(event_authority_pda.to_bytes().into())
+                .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+                .bump(bump)
+                .instruction(),
+        );
 
         send_and_confirm_instructions(
             client,

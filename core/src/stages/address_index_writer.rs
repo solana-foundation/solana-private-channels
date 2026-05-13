@@ -100,8 +100,18 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
 
         // Drain anything still buffered after shutdown / channel close so we
         // don't drop addr_sig rows whose transactions row is already durable.
+        // Apply the same chunking the steady-state path uses — a backlogged
+        // shutdown can hold thousands of messages (channel cap 1024 × O(100)
+        // rows each), and a single unchunked UNNEST would exceed
+        // `flush_chunk_size` by orders of magnitude and risk timing out.
         while let Ok(batch) = rows_rx.try_recv() {
             flat.extend(batch);
+        }
+        while flat.len() >= flush_chunk_size {
+            let take = flat.split_off(flush_chunk_size);
+            let chunk = std::mem::replace(&mut flat, take);
+            flush_chunk(&pool, &chunk, &metrics).await;
+            heartbeat.record_progress();
         }
         if !flat.is_empty() {
             flush_chunk(&pool, &flat, &metrics).await;

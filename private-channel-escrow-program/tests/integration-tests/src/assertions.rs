@@ -1,6 +1,6 @@
 use crate::smt_utils::EMPTY_TREE_ROOT;
 use crate::utils::get_token_balance;
-use crate::utils::{TestContext, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
+use crate::utils::{to_pubkey, TestContext, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
 use private_channel_escrow_program_client::{accounts::Instance, AllowedMint, Operator};
 use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
@@ -23,9 +23,9 @@ pub fn assert_instance_account(
     let instance =
         Instance::from_bytes(&account.data).expect("Should deserialize instance account");
 
-    assert_eq!(instance.admin, *expected_admin);
+    assert_eq!(to_pubkey(&instance.admin), *expected_admin);
     assert_eq!(instance.bump, expected_bump);
-    assert_eq!(instance.instance_seed, *expected_instance_seed);
+    assert_eq!(to_pubkey(&instance.instance_seed), *expected_instance_seed);
     assert_eq!(instance.current_tree_index, expected_current_tree_index);
 }
 
@@ -140,7 +140,7 @@ pub fn assert_instance_admin_updated(
     let instance =
         Instance::from_bytes(&account.data).expect("Should deserialize instance account");
 
-    assert_eq!(instance.admin, *expected_new_admin);
+    assert_eq!(to_pubkey(&instance.admin), *expected_new_admin);
 }
 
 pub fn assert_deposit_balances(

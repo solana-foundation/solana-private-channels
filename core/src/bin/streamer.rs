@@ -652,9 +652,10 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> StatusCode {
     let now = now_unix();
     let accounts_fresh =
         now - state.accounts_poll_at.load(Ordering::Relaxed) < HEALTH_STALE_THRESHOLD;
-    let indexer_fresh = state.indexer_poll_at.as_ref().map_or(true, |a| {
-        now - a.load(Ordering::Relaxed) < HEALTH_STALE_THRESHOLD
-    });
+    let indexer_fresh = state
+        .indexer_poll_at
+        .as_ref()
+        .is_none_or(|a| now - a.load(Ordering::Relaxed) < HEALTH_STALE_THRESHOLD);
     if accounts_fresh && indexer_fresh {
         StatusCode::OK
     } else {

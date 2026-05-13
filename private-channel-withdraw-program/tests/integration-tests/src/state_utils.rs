@@ -1,6 +1,6 @@
 use crate::{
     assertions::assert_balance_changed,
-    utils::{get_token_balance, TestContext, ATA_PROGRAM_ID},
+    utils::{get_token_balance, to_addr, TestContext, ATA_PROGRAM_ID},
 };
 use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
 use solana_sdk::{
@@ -26,15 +26,15 @@ pub fn assert_get_or_withdraw_funds(
 
     let mut binding = WithdrawFundsBuilder::new();
     let builder = binding
-        .user(user.pubkey())
-        .mint(*mint)
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(*mint))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(amount);
 
     if let Some(destination) = destination {
-        builder.destination(destination);
+        builder.destination(to_addr(destination));
     }
 
     let instruction = builder.instruction();

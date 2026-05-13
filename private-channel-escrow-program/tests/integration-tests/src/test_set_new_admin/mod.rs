@@ -1,3 +1,4 @@
+use crate::utils::to_addr;
 use crate::{
     pda_utils::find_event_authority_pda,
     smt_utils::ProcessorSMT,
@@ -96,12 +97,12 @@ fn test_set_new_admin_invalid_current_admin() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = SetNewAdminBuilder::new()
-        .payer(context.payer.pubkey())
-        .current_admin(wrong_admin.pubkey())
-        .instance(instance_pda)
-        .new_admin(new_admin.pubkey())
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .current_admin(to_addr(wrong_admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .new_admin(to_addr(new_admin.pubkey()))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&wrong_admin, &new_admin]);
@@ -127,12 +128,12 @@ fn test_set_new_admin_invalid_instance_account_owner() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = SetNewAdminBuilder::new()
-        .payer(context.payer.pubkey())
-        .current_admin(admin.pubkey())
-        .instance(fake_instance.pubkey())
-        .new_admin(new_admin.pubkey())
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .current_admin(to_addr(admin.pubkey()))
+        .instance(to_addr(fake_instance.pubkey()))
+        .new_admin(to_addr(new_admin.pubkey()))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin, &new_admin]);
@@ -212,17 +213,17 @@ fn test_set_new_admin_old_admin_locked_out() {
     );
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.pubkey())
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .mint(to_addr(mint.pubkey()))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 

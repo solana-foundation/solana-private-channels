@@ -4,6 +4,7 @@ use super::send_and_confirm_instructions;
 use super::test_types::{TransactionType, UserTransaction, BASE_AMOUNT, DEPOSITS_PER_USER};
 
 use private_channel_escrow_program_client::instructions::DepositBuilder;
+use private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk;
 use private_channel_withdraw_program_client::instructions::{
     WithdrawFunds, WithdrawFundsInstructionArgs,
 };
@@ -34,23 +35,25 @@ pub async fn execute_user_deposits(
     for deposit_num in 0..DEPOSITS_PER_USER {
         let amount = BASE_AMOUNT + (user_id as u64 * 1000) + deposit_num as u64;
 
-        let deposit_ix = DepositBuilder::new()
-            .payer(user.pubkey())
-            .user(user.pubkey())
-            .instance(instance)
-            .mint(mint)
-            .allowed_mint(allowed_mint_pda)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
-            .system_program(SYSTEM_PROGRAM_ID)
-            .token_program(TOKEN_PROGRAM_ID)
-            .associated_token_program(spl_associated_token_account::ID)
-            .event_authority(event_authority_pda)
-            .private_channel_escrow_program(
-                private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-            )
-            .amount(amount)
-            .instruction();
+        let deposit_ix = ix_v3_to_sdk(
+            DepositBuilder::new()
+                .payer(user.pubkey().to_bytes().into())
+                .user(user.pubkey().to_bytes().into())
+                .instance(instance.to_bytes().into())
+                .mint(mint.to_bytes().into())
+                .allowed_mint(allowed_mint_pda.to_bytes().into())
+                .user_ata(user_ata.to_bytes().into())
+                .instance_ata(instance_ata.to_bytes().into())
+                .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+                .token_program(TOKEN_PROGRAM_ID.to_bytes().into())
+                .associated_token_program(spl_associated_token_account::ID.to_bytes().into())
+                .event_authority(event_authority_pda.to_bytes().into())
+                .private_channel_escrow_program(
+                    private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                )
+                .amount(amount)
+                .instruction(),
+        );
 
         let signature =
             send_and_confirm_instructions(client, &[deposit_ix], &user, &[&user], "Deposit")
@@ -91,17 +94,19 @@ pub async fn execute_user_withdrawal(
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
 
-    let withdraw_ix = WithdrawFunds {
-        user: user.pubkey(),
-        mint,
-        token_account: user_ata,
-        token_program: TOKEN_PROGRAM_ID,
-        associated_token_program: spl_associated_token_account::ID,
-    }
-    .instruction(WithdrawFundsInstructionArgs {
-        amount: total_deposited,
-        destination: Some(user.pubkey()),
-    });
+    let withdraw_ix = ix_v3_to_sdk(
+        WithdrawFunds {
+            user: user.pubkey().to_bytes().into(),
+            mint: mint.to_bytes().into(),
+            token_account: user_ata.to_bytes().into(),
+            token_program: TOKEN_PROGRAM_ID.to_bytes().into(),
+            associated_token_program: spl_associated_token_account::ID.to_bytes().into(),
+        }
+        .instruction(WithdrawFundsInstructionArgs {
+            amount: total_deposited,
+            destination: Some(user.pubkey().to_bytes().into()),
+        }),
+    );
 
     let signature =
         send_and_confirm_instructions(client, &[withdraw_ix], user, &[user], "Withdraw")

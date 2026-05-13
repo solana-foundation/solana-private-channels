@@ -5,12 +5,76 @@ use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
     compute_budget::ComputeBudgetInstruction,
-    instruction::Instruction,
+    instruction::{AccountMeta as SdkAccountMeta, Instruction},
     program_option::COption,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
+
+/// Convert a solana-sdk 2.x `Pubkey` into a solana-address 2.x `Address`
+/// (the type emitted by the codama-generated builders).
+pub fn to_addr<P: PubkeyLike>(p: P) -> solana_address::Address {
+    solana_address::Address::new_from_array(p.pubkey_bytes())
+}
+
+pub trait PubkeyLike {
+    fn pubkey_bytes(&self) -> [u8; 32];
+}
+
+impl PubkeyLike for Pubkey {
+    fn pubkey_bytes(&self) -> [u8; 32] {
+        self.to_bytes()
+    }
+}
+
+impl PubkeyLike for &Pubkey {
+    fn pubkey_bytes(&self) -> [u8; 32] {
+        (**self).to_bytes()
+    }
+}
+
+/// Convert a solana-address 2.x `Address` into a solana-sdk 2.x `Pubkey`.
+pub fn to_pubkey(a: &solana_address::Address) -> Pubkey {
+    Pubkey::new_from_array(a.to_bytes())
+}
+
+/// Convert the v3 `solana_instruction::Instruction` returned by codama-generated
+/// builders into the solana-sdk 2.x `Instruction` accepted by LiteSVM's
+/// transaction APIs.
+pub fn from_v3_ix(ix: solana_instruction::Instruction) -> Instruction {
+    Instruction {
+        program_id: Pubkey::new_from_array(ix.program_id.to_bytes()),
+        accounts: ix
+            .accounts
+            .into_iter()
+            .map(|m| SdkAccountMeta {
+                pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: ix.data,
+    }
+}
+
+/// Polymorphic conversion so `send_transaction*` accepts both v3
+/// `solana_instruction::Instruction` and solana-sdk 2.x `Instruction`.
+pub trait IntoSdkInstruction {
+    fn into_sdk_instruction(self) -> Instruction;
+}
+
+impl IntoSdkInstruction for Instruction {
+    fn into_sdk_instruction(self) -> Instruction {
+        self
+    }
+}
+
+impl IntoSdkInstruction for solana_instruction::Instruction {
+    fn into_sdk_instruction(self) -> Instruction {
+        from_v3_ix(self)
+    }
+}
 use spl_token::{
     state::{Account as TokenAccount, Mint},
     ID as TOKEN_PROGRAM_ID,
@@ -117,8 +181,9 @@ impl TestContext {
 
     pub fn send_transaction(
         &mut self,
-        instruction: Instruction,
+        instruction: impl IntoSdkInstruction,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let instruction = instruction.into_sdk_instruction();
         let transaction = Transaction::new_signed_with_payer(
             &[instruction],
             Some(&self.payer.pubkey()),
@@ -135,7 +200,7 @@ impl TestContext {
 
     pub fn send_transaction_with_signers(
         &mut self,
-        instruction: Instruction,
+        instruction: impl IntoSdkInstruction,
         signers: &[&Keypair],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.send_transaction_with_signers_with_transaction_result(
@@ -149,11 +214,12 @@ impl TestContext {
 
     pub fn send_transaction_with_signers_with_transaction_result(
         &mut self,
-        instruction: Instruction,
+        instruction: impl IntoSdkInstruction,
         signers: &[&Keypair],
         enable_profiling: bool,
         cu_limit: Option<u32>,
     ) -> Result<TransactionMetadata, Box<dyn std::error::Error>> {
+        let instruction = instruction.into_sdk_instruction();
         let mut all_signers = vec![&self.payer];
         all_signers.extend(signers);
 

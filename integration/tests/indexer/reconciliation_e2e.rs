@@ -34,7 +34,7 @@ use testcontainers_modules::postgres::Postgres;
 fn instance_pda(seed: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[b"instance", seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes()),
     )
     .0
 }

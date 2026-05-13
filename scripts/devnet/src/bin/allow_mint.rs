@@ -1,3 +1,4 @@
+use devnet_scripts::{ix_v3_to_sdk, to_addr};
 use private_channel_escrow_program_client::{
     instructions::{AllowMint, AllowMintInstructionArgs},
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -17,15 +18,19 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 
+fn program_id_as_pubkey() -> Pubkey {
+    Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes())
+}
+
 fn find_allowed_mint_pda(instance: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[ALLOWED_MINT_SEED, instance.as_ref(), mint.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &program_id_as_pubkey(),
     )
 }
 
 fn find_event_authority_pda() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &program_id_as_pubkey())
 }
 
 fn main() -> Result<()> {
@@ -65,23 +70,23 @@ fn main() -> Result<()> {
     println!("Instance ATA: {}", instance_ata);
 
     let instruction = AllowMint {
-        payer: admin_keypair.pubkey(),
-        admin: admin_keypair.pubkey(),
-        instance: instance_id,
-        mint,
-        allowed_mint: allowed_mint_pda,
-        instance_ata,
-        system_program: SYSTEM_PROGRAM_ID,
-        token_program: spl_token::ID,
-        associated_token_program: spl_associated_token_account::ID,
-        event_authority: event_authority_pda,
+        payer: to_addr(admin_keypair.pubkey()),
+        admin: to_addr(admin_keypair.pubkey()),
+        instance: to_addr(instance_id),
+        mint: to_addr(mint),
+        allowed_mint: to_addr(allowed_mint_pda),
+        instance_ata: to_addr(instance_ata),
+        system_program: to_addr(SYSTEM_PROGRAM_ID),
+        token_program: to_addr(spl_token::ID),
+        associated_token_program: to_addr(spl_associated_token_account::ID),
+        event_authority: to_addr(event_authority_pda),
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     }
     .instruction(AllowMintInstructionArgs { bump });
 
     let recent_blockhash = client.get_latest_blockhash()?;
     let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
+        &[ix_v3_to_sdk(instruction)],
         Some(&admin_keypair.pubkey()),
         &[&admin_keypair],
         recent_blockhash,

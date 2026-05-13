@@ -1,3 +1,4 @@
+use crate::utils::to_addr;
 use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance},
@@ -78,17 +79,17 @@ fn test_allow_mint_duplicate() {
     );
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.pubkey())
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .mint(to_addr(mint.pubkey()))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -125,17 +126,17 @@ fn test_allow_mint_invalid_pda() {
     );
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.pubkey())
-        .allowed_mint(wrong_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .mint(to_addr(mint.pubkey()))
+        .allowed_mint(to_addr(wrong_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(1) // Wrong bump
         .instruction();
 
@@ -227,17 +228,17 @@ fn test_allow_mint_invalid_admin() {
     );
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(wrong_admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.pubkey())
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(wrong_admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .mint(to_addr(mint.pubkey()))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -272,17 +273,17 @@ fn test_allow_mint_invalid_instance_account_owner() {
     );
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(fake_instance.pubkey())
-        .mint(mint.pubkey())
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(fake_instance.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -401,17 +402,17 @@ fn test_allow_mint_token_2022_transfer_hook_blocked() {
     );
 
     let instruction = AllowMintBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .mint(mint.pubkey())
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(TOKEN_2022_PROGRAM_ID)
-        .associated_token_program(spl_associated_token_account::ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .mint(to_addr(mint.pubkey()))
+        .allowed_mint(to_addr(allowed_mint_pda))
+        .instance_ata(to_addr(instance_ata))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .token_program(to_addr(TOKEN_2022_PROGRAM_ID))
+        .associated_token_program(to_addr(spl_associated_token_account::ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 

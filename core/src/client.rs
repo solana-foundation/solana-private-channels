@@ -76,20 +76,45 @@ pub fn create_withdraw_funds(
     blockhash: Hash,
 ) -> Transaction {
     use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
+    use solana_sdk::instruction::{AccountMeta, Instruction as SdkInstruction};
 
     let from_pubkey = from.pubkey();
     let token_account = get_associated_token_address(&from_pubkey, mint);
 
-    let withdraw_ix = WithdrawFundsBuilder::new()
-        .user(from_pubkey)
-        .mint(*mint)
-        .token_account(token_account)
-        .token_program(spl_token::id())
-        .associated_token_program(spl_associated_token_account::id())
+    // The codama-generated builder consumes/returns `solana_address::Address` and
+    // `solana_instruction::Instruction` (v3.x). solana-sdk 2.x's `Transaction` API
+    // wants the v2.x `solana_sdk::instruction::Instruction` — convert via bytes at
+    // the boundary.
+    let withdraw_ix_v3 = WithdrawFundsBuilder::new()
+        .user(pubkey_to_address(&from_pubkey))
+        .mint(pubkey_to_address(mint))
+        .token_account(pubkey_to_address(&token_account))
+        .token_program(pubkey_to_address(&spl_token::id()))
+        .associated_token_program(pubkey_to_address(&spl_associated_token_account::id()))
         .amount(amount)
         .instruction();
 
+    let withdraw_ix = SdkInstruction {
+        program_id: Pubkey::new_from_array(withdraw_ix_v3.program_id.to_bytes()),
+        accounts: withdraw_ix_v3
+            .accounts
+            .iter()
+            .map(|m| AccountMeta {
+                pubkey: Pubkey::new_from_array(m.pubkey.to_bytes()),
+                is_signer: m.is_signer,
+                is_writable: m.is_writable,
+            })
+            .collect(),
+        data: withdraw_ix_v3.data,
+    };
+
     Transaction::new_signed_with_payer(&[withdraw_ix], Some(&from_pubkey), &[from], blockhash)
+}
+
+/// Convert a `solana_sdk::pubkey::Pubkey` (v2.x) into a `solana_address::Address`
+/// (v3.x, used by the codama-generated clients).
+fn pubkey_to_address(pubkey: &Pubkey) -> solana_address::Address {
+    solana_address::Address::new_from_array(pubkey.to_bytes())
 }
 
 /// Create an admin transaction to initialize a mint
@@ -390,7 +415,10 @@ mod tests {
         // Program must be the PrivateChannel withdraw program
         assert_eq!(
             resolve_program_id(&tx, 0),
-            private_channel_withdraw_program_client::programs::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            Pubkey::new_from_array(
+                private_channel_withdraw_program_client::programs::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+                    .to_bytes()
+            ),
         );
 
         // Account keys must include the derived ATA, mint, and token programs

@@ -10,7 +10,7 @@ use spl_token::ID as TOKEN_PROGRAM_ID;
 use crate::{
     state_utils::assert_get_or_withdraw_funds,
     utils::{
-        assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        assert_program_error, set_mint, setup_test_balances, to_addr, TestContext, ATA_PROGRAM_ID,
         INVALID_INSTRUCTION_DATA_ERROR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         TOKEN_INSUFFICIENT_FUNDS_ERROR, ZERO_AMOUNT_ERROR,
     },
@@ -76,11 +76,11 @@ fn test_withdraw_funds_insufficient_funds() {
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
@@ -101,11 +101,11 @@ fn test_withdraw_funds_zero_amount() {
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(0)
         .instruction();
 
@@ -145,13 +145,13 @@ fn test_withdraw_funds_event_emission() {
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
-        .user(user.pubkey())
-        .mint(mint.pubkey())
-        .token_account(user_ata)
-        .token_program(TOKEN_PROGRAM_ID)
-        .associated_token_program(ATA_PROGRAM_ID)
+        .user(to_addr(user.pubkey()))
+        .mint(to_addr(mint.pubkey()))
+        .token_account(to_addr(user_ata))
+        .token_program(to_addr(TOKEN_PROGRAM_ID))
+        .associated_token_program(to_addr(ATA_PROGRAM_ID))
         .amount(amount)
-        .destination(destination)
+        .destination(to_addr(destination))
         .instruction();
 
     let meta = context

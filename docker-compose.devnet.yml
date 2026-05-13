@@ -64,6 +64,9 @@ services:
       - postgres-primary-wal-archive:/wal_archive
       - ./init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./init-primary-hba.sh:/docker-entrypoint-initdb.d/02-hba.sh:ro
+    # `synchronous_commit` defaults to `on` (full crash durability). The bench
+    # profile in bench-tps/.env explicitly opts into `off` for throughput;
+    # operators who want the same trade-off in production must do so deliberately.
     command: |
       postgres
       -c wal_level=replica
@@ -76,9 +79,6 @@ services:
       -c archive_command='cp %p /wal_archive/%f.tmp && mv /wal_archive/%f.tmp /wal_archive/%f'
       -c listen_addresses='*'
       -c shared_buffers=${PRIVATE_CHANNEL_PG_SHARED_BUFFERS:-4GB}
-      # Defaults to `on` (full crash durability). The bench profile in
-      # bench-tps/.env explicitly opts into `off` for throughput; operators
-      # who want the same trade-off in production must do so deliberately.
       -c synchronous_commit=${PRIVATE_CHANNEL_PG_SYNCHRONOUS_COMMIT:-on}
       -c wal_compression=${PRIVATE_CHANNEL_PG_WAL_COMPRESSION:-lz4}
       -c max_wal_size=${PRIVATE_CHANNEL_PG_MAX_WAL_SIZE:-4GB}

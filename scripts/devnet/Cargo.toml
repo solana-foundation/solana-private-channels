@@ -15,3 +15,7 @@ solana-sdk.workspace = true
 solana-system-interface.workspace = true
 spl-associated-token-account.workspace = true
 spl-token.workspace = true
+# Generated builders speak solana_address::Address / solana_instruction v3.x;
+# we convert at the boundary in `lib.rs`.
+solana-address = "2"
+solana-instruction = "3"

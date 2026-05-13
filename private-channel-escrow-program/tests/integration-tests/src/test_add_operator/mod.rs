@@ -1,3 +1,4 @@
+use crate::utils::to_addr;
 use crate::{
     pda_utils::{find_event_authority_pda, find_operator_pda},
     state_utils::{assert_get_or_add_operator, assert_get_or_create_instance},
@@ -65,14 +66,14 @@ fn test_add_operator_duplicate() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AddOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .operator(operator_wallet.pubkey())
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -102,14 +103,14 @@ fn test_add_operator_invalid_pda() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AddOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .operator(operator_wallet.pubkey())
-        .operator_pda(wrong_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(wrong_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(1) // Wrong bump
         .instruction();
 
@@ -184,14 +185,14 @@ fn test_add_operator_invalid_admin() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AddOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(wrong_admin.pubkey())
-        .instance(instance_pda)
-        .operator(operator_wallet.pubkey())
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(wrong_admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 
@@ -220,14 +221,14 @@ fn test_add_operator_invalid_instance_account_owner() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = AddOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(fake_instance.pubkey())
-        .operator(operator_wallet.pubkey())
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(fake_instance.pubkey()))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .bump(bump)
         .instruction();
 

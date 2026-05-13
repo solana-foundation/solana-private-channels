@@ -10,6 +10,7 @@
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_WITHDRAW},
+        instruction_util::ix_v3_to_sdk,
         types::{BatchQueue, BenchState, WithdrawConfig, MAX_QUEUE_DEPTH},
     },
     private_channel_withdraw_program_client::instructions::{
@@ -51,17 +52,17 @@ fn build_withdraw_tx(
     let token_account = get_associated_token_address(&withdrawer_pubkey, &config.mint);
 
     let accounts = WithdrawFunds {
-        user: withdrawer_pubkey,
-        mint: config.mint,
-        token_account,
-        token_program: spl_token::id(),
-        associated_token_program: spl_associated_token_account::id(),
+        user: withdrawer_pubkey.to_bytes().into(),
+        mint: config.mint.to_bytes().into(),
+        token_account: token_account.to_bytes().into(),
+        token_program: spl_token::id().to_bytes().into(),
+        associated_token_program: spl_associated_token_account::id().to_bytes().into(),
     };
 
-    let ix = accounts.instruction(WithdrawFundsInstructionArgs {
+    let ix = ix_v3_to_sdk(accounts.instruction(WithdrawFundsInstructionArgs {
         amount: WITHDRAW_AMOUNT,
         destination: None,
-    });
+    }));
 
     let memo_ix = Instruction {
         program_id: MEMO_PROGRAM_ID,

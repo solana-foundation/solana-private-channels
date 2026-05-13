@@ -72,7 +72,10 @@ pub fn create_transaction_batch_processor<AccountsDB: TransactionProcessingCallb
             spl_token::id(),
             spl_associated_token_account::id(),
             spl_memo::id(),
-            private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            solana_sdk::pubkey::Pubkey::new_from_array(
+                private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+                    .to_bytes(),
+            ),
         ];
 
         // Loop over all BPF programs and add them to the cache

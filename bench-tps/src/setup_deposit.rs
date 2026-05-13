@@ -20,6 +20,7 @@
 
 use {
     crate::{
+        instruction_util::ix_v3_to_sdk,
         rpc::{poll_confirmations, send_parallel},
         types::{BenchState, DepositConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
@@ -57,11 +58,17 @@ const MIN_ADMIN_LAMPORTS: u64 = 10_000_000_000;
 /// 100 SOL top-up
 const AIRDROP_LAMPORTS: u64 = 100_000_000_000;
 
+/// Convert the program-ID `Address` constant (codama v3) into a `solana_sdk`
+/// `Pubkey` for use with `find_program_address` and other v2 RPC paths.
+fn escrow_program_id_sdk() -> Pubkey {
+    Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes())
+}
+
 /// Derive the escrow instance PDA from the instance-seed keypair's pubkey.
 pub fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED_PREFIX, instance_seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
@@ -73,13 +80,13 @@ fn find_allowed_mint_pda(instance_pda: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
             instance_pda.as_ref(),
             mint.as_ref(),
         ],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     )
 }
 
 /// Derive the Anchor event-authority PDA for the escrow program.
 fn find_event_authority() -> (Pubkey, u8) {
-    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &escrow_program_id_sdk())
 }
 
 /// Run all deposit setup tasks and return the `DepositConfig` needed by the
@@ -203,18 +210,20 @@ pub async fn run_setup_deposit_phase(
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
-                    let create_ix = CreateInstance {
-                        payer: admin_keypair.pubkey(),
-                        admin: admin_keypair.pubkey(),
-                        instance_seed: instance_seed_pubkey,
-                        instance: instance_pda,
-                        system_program: program::id(),
-                        event_authority,
-                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-                    }
-                    .instruction(CreateInstanceInstructionArgs {
-                        bump: instance_bump,
-                    });
+                    let create_ix = ix_v3_to_sdk(
+                        CreateInstance {
+                            payer: admin_keypair.pubkey().to_bytes().into(),
+                            admin: admin_keypair.pubkey().to_bytes().into(),
+                            instance_seed: instance_seed_pubkey.to_bytes().into(),
+                            instance: instance_pda.to_bytes().into(),
+                            system_program: program::id().to_bytes().into(),
+                            event_authority: event_authority.to_bytes().into(),
+                            private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                        }
+                        .instruction(CreateInstanceInstructionArgs {
+                            bump: instance_bump,
+                        }),
+                    );
                     let tx = Transaction::new_signed_with_payer(
                         &[create_ix],
                         Some(&admin_keypair.pubkey()),
@@ -499,20 +508,24 @@ pub async fn run_setup_deposit_phase(
                     last_err = e.to_string();
                 }
                 Ok(blockhash) => {
-                    let allow_ix = AllowMint {
-                        payer: admin_keypair.pubkey(),
-                        admin: admin_keypair.pubkey(),
-                        instance: instance_pda,
-                        mint,
-                        allowed_mint: allowed_mint_pda,
-                        instance_ata,
-                        system_program: program::id(),
-                        token_program: spl_token::id(),
-                        associated_token_program: spl_associated_token_account::id(),
-                        event_authority,
-                        private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-                    }
-                    .instruction(AllowMintInstructionArgs { bump: allow_bump });
+                    let allow_ix = ix_v3_to_sdk(
+                        AllowMint {
+                            payer: admin_keypair.pubkey().to_bytes().into(),
+                            admin: admin_keypair.pubkey().to_bytes().into(),
+                            instance: instance_pda.to_bytes().into(),
+                            mint: mint.to_bytes().into(),
+                            allowed_mint: allowed_mint_pda.to_bytes().into(),
+                            instance_ata: instance_ata.to_bytes().into(),
+                            system_program: program::id().to_bytes().into(),
+                            token_program: spl_token::id().to_bytes().into(),
+                            associated_token_program: spl_associated_token_account::id()
+                                .to_bytes()
+                                .into(),
+                            event_authority: event_authority.to_bytes().into(),
+                            private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                        }
+                        .instruction(AllowMintInstructionArgs { bump: allow_bump }),
+                    );
                     let tx = Transaction::new_signed_with_payer(
                         &[allow_ix],
                         Some(&admin_keypair.pubkey()),

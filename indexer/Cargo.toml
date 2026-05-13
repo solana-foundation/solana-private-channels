@@ -35,6 +35,8 @@ figment = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+solana-address = { workspace = true }
+solana-instruction = { workspace = true }
 solana-sdk = { workspace = true }
 solana-system-interface = { workspace = true }
 spl-token = { workspace = true }

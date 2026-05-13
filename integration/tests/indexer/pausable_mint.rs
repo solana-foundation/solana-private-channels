@@ -29,6 +29,7 @@ use helpers::db;
 use private_channel_escrow_program_client::{
     instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
+use private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk;
 use private_channel_indexer::storage::common::models::{
     DbMint, DbTransaction, TransactionStatus, TransactionType,
 };
@@ -186,20 +187,22 @@ async fn allow_mint_for_program(
     let instance_ata =
         get_associated_token_address_with_program_id(&instance, &mint, &token_program);
 
-    let ix = AllowMintBuilder::new()
-        .payer(admin.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance)
-        .mint(mint)
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(token_program)
-        .associated_token_program(spl_associated_token_account::ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .bump(bump)
-        .instruction();
+    let ix = ix_v3_to_sdk(
+        AllowMintBuilder::new()
+            .payer(admin.pubkey().to_bytes().into())
+            .admin(admin.pubkey().to_bytes().into())
+            .instance(instance.to_bytes().into())
+            .mint(mint.to_bytes().into())
+            .allowed_mint(allowed_mint_pda.to_bytes().into())
+            .instance_ata(instance_ata.to_bytes().into())
+            .system_program(SYSTEM_PROGRAM_ID.to_bytes().into())
+            .token_program(token_program.to_bytes().into())
+            .associated_token_program(spl_associated_token_account::ID.to_bytes().into())
+            .event_authority(event_authority_pda.to_bytes().into())
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .bump(bump)
+            .instruction(),
+    );
 
     let recent_blockhash = client.get_latest_blockhash().await?;
     let tx = Transaction::new_signed_with_payer(

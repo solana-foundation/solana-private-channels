@@ -1,3 +1,4 @@
+use crate::utils::to_addr;
 use crate::{
     pda_utils::{find_event_authority_pda, find_operator_pda},
     smt_utils::ProcessorSMT,
@@ -72,14 +73,14 @@ fn test_remove_operator_nonexistent() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = RemoveOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance_pda)
-        .operator(operator_wallet.pubkey())
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
@@ -171,14 +172,14 @@ fn test_remove_operator_invalid_admin() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = RemoveOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(wrong_admin.pubkey())
-        .instance(instance_pda)
-        .operator(operator_wallet.pubkey())
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(wrong_admin.pubkey()))
+        .instance(to_addr(instance_pda))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&wrong_admin]);
@@ -207,14 +208,14 @@ fn test_remove_operator_invalid_instance_account_owner() {
     let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = RemoveOperatorBuilder::new()
-        .payer(context.payer.pubkey())
-        .admin(admin.pubkey())
-        .instance(fake_instance.pubkey())
-        .operator(operator_wallet.pubkey())
-        .operator_pda(operator_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .payer(to_addr(context.payer.pubkey()))
+        .admin(to_addr(admin.pubkey()))
+        .instance(to_addr(fake_instance.pubkey()))
+        .operator(to_addr(operator_wallet.pubkey()))
+        .operator_pda(to_addr(operator_pda))
+        .system_program(to_addr(SYSTEM_PROGRAM_ID))
+        .event_authority(to_addr(event_authority_pda))
+        .private_channel_escrow_program(to_addr(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID))
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);

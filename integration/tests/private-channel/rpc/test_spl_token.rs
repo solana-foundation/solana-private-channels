@@ -12,6 +12,7 @@ use {
         },
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
+    private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk,
     private_channel_indexer::storage::TransactionType,
     solana_account_decoder_client_types::UiAccountData,
     solana_pubkey::Pubkey,
@@ -23,6 +24,12 @@ use {
     std::time::Duration,
     tokio::time::sleep,
 };
+
+/// Mirror of the codama v3 `solana_address::Address` constant as a v2 `Pubkey`,
+/// for use with `find_program_address` and RpcClient queries.
+fn escrow_program_id_sdk() -> Pubkey {
+    Pubkey::new_from_array(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes())
+}
 
 use super::{
     test_context::{PrivateChannelContext, SolanaContext},
@@ -90,7 +97,7 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
     // Derive instance PDA
     let (instance_pda, instance_bump) = Pubkey::find_program_address(
         &[b"instance", solana_ctx.escrow_instance.pubkey().as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     );
     println!("Instance seed: {}", solana_ctx.escrow_instance.pubkey());
     println!("Instance PDA: {} (bump: {})", instance_pda, instance_bump);
@@ -101,13 +108,15 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
     }
     println!("Instance PDA account not found, creating...");
 
-    let create_instance_ix = CreateInstanceBuilder::new()
-        .payer(solana_ctx.operator_key.pubkey())
-        .admin(solana_ctx.operator_key.pubkey())
-        .instance_seed(solana_ctx.escrow_instance.pubkey())
-        .instance(instance_pda)
-        .bump(instance_bump)
-        .instruction();
+    let create_instance_ix = ix_v3_to_sdk(
+        CreateInstanceBuilder::new()
+            .payer(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .admin(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .instance_seed(solana_ctx.escrow_instance.pubkey().to_bytes().into())
+            .instance(instance_pda.to_bytes().into())
+            .bump(instance_bump)
+            .instruction(),
+    );
 
     let blockhash = solana_ctx.get_latest_blockhash().await?;
     let create_instance_tx = Transaction::new_signed_with_payer(
@@ -137,17 +146,19 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
             instance_pda.as_ref(),
             solana_ctx.operator_key.pubkey().as_ref(),
         ],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     );
 
-    let add_operator_ix = AddOperatorBuilder::new()
-        .payer(solana_ctx.operator_key.pubkey())
-        .admin(solana_ctx.operator_key.pubkey())
-        .instance(instance_pda)
-        .operator(solana_ctx.operator_key.pubkey())
-        .operator_pda(operator_pda)
-        .bump(operator_bump)
-        .instruction();
+    let add_operator_ix = ix_v3_to_sdk(
+        AddOperatorBuilder::new()
+            .payer(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .admin(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .instance(instance_pda.to_bytes().into())
+            .operator(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .operator_pda(operator_pda.to_bytes().into())
+            .bump(operator_bump)
+            .instruction(),
+    );
 
     let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
     let add_operator_tx = Transaction::new_signed_with_payer(
@@ -174,14 +185,14 @@ async fn allow_mint_on_escrow_instance(
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
         &[b"instance", solana_ctx.escrow_instance.pubkey().as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     );
 
     // Derive allowed_mint PDA
     let mint_pubkey = Pubkey::from(mint_keypair.pubkey().to_bytes());
     let (allowed_mint_pda, allowed_mint_bump) = Pubkey::find_program_address(
         &[b"allowed_mint", instance_pda.as_ref(), mint_pubkey.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     );
 
     // Derive instance ATA (escrow account for this mint)
@@ -192,16 +203,18 @@ async fn allow_mint_on_escrow_instance(
     );
     let instance_ata_pubkey = Pubkey::from(instance_ata.to_bytes());
 
-    let allow_mint_ix = AllowMintBuilder::new()
-        .payer(solana_ctx.operator_key.pubkey())
-        .admin(solana_ctx.operator_key.pubkey())
-        .instance(instance_pda)
-        .mint(mint_pubkey)
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata_pubkey)
-        .token_program(*token_program_id)
-        .bump(allowed_mint_bump)
-        .instruction();
+    let allow_mint_ix = ix_v3_to_sdk(
+        AllowMintBuilder::new()
+            .payer(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .admin(solana_ctx.operator_key.pubkey().to_bytes().into())
+            .instance(instance_pda.to_bytes().into())
+            .mint(mint_pubkey.to_bytes().into())
+            .allowed_mint(allowed_mint_pda.to_bytes().into())
+            .instance_ata(instance_ata_pubkey.to_bytes().into())
+            .token_program(token_program_id.to_bytes().into())
+            .bump(allowed_mint_bump)
+            .instruction(),
+    );
 
     let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
     let allow_mint_tx = Transaction::new_signed_with_payer(
@@ -373,7 +386,7 @@ async fn solana_deposit(
     // Derive instance PDA
     let (instance_pda, _instance_bump) = Pubkey::find_program_address(
         &[b"instance", instance_seed_pubkey.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     );
 
     println!(
@@ -387,7 +400,7 @@ async fn solana_deposit(
     let mint_pubkey = Pubkey::from(solana_mint.to_bytes());
     let (allowed_mint_pda, _) = Pubkey::find_program_address(
         &[b"allowed_mint", instance_pda.as_ref(), mint_pubkey.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        &escrow_program_id_sdk(),
     );
     let instance_ata =
         get_associated_token_address_with_program_id(&instance_pda, solana_mint, token_program_id);
@@ -410,17 +423,19 @@ async fn solana_deposit(
         );
         let user_ata_pubkey = Pubkey::from(user_solana_ata.to_bytes());
 
-        let deposit_ix = DepositBuilder::new()
-            .payer(user_pubkey)
-            .user(user_pubkey)
-            .instance(instance_pda)
-            .mint(mint_pubkey)
-            .allowed_mint(allowed_mint_pda)
-            .token_program(*token_program_id)
-            .user_ata(user_ata_pubkey)
-            .instance_ata(instance_ata_pubkey)
-            .amount(amount)
-            .instruction();
+        let deposit_ix = ix_v3_to_sdk(
+            DepositBuilder::new()
+                .payer(user_pubkey.to_bytes().into())
+                .user(user_pubkey.to_bytes().into())
+                .instance(instance_pda.to_bytes().into())
+                .mint(mint_pubkey.to_bytes().into())
+                .allowed_mint(allowed_mint_pda.to_bytes().into())
+                .token_program(token_program_id.to_bytes().into())
+                .user_ata(user_ata_pubkey.to_bytes().into())
+                .instance_ata(instance_ata_pubkey.to_bytes().into())
+                .amount(amount)
+                .instruction(),
+        );
 
         let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
         let deposit_tx = Transaction::new_signed_with_payer(

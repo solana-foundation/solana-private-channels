@@ -129,23 +129,25 @@ async fn setup_test_environments(
                 &spl_token::ID,
             );
 
-        let deposit_ix = private_channel_escrow_program_client::instructions::DepositBuilder::new()
-            .payer(user.pubkey())
-            .user(user.pubkey())
-            .instance(env.instance)
-            .mint(env.mint)
-            .allowed_mint(allowed_mint_pda)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
-            .system_program(solana_system_interface::program::ID)
-            .token_program(spl_token::ID)
-            .associated_token_program(spl_associated_token_account::ID)
-            .event_authority(event_authority_pda)
-            .private_channel_escrow_program(
-                private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-            )
-            .amount(amount)
-            .instruction();
+        let deposit_ix = private_channel_indexer::operator::utils::instruction_util::ix_v3_to_sdk(
+            private_channel_escrow_program_client::instructions::DepositBuilder::new()
+                .payer(user.pubkey().to_bytes().into())
+                .user(user.pubkey().to_bytes().into())
+                .instance(env.instance.to_bytes().into())
+                .mint(env.mint.to_bytes().into())
+                .allowed_mint(allowed_mint_pda.to_bytes().into())
+                .user_ata(user_ata.to_bytes().into())
+                .instance_ata(instance_ata.to_bytes().into())
+                .system_program(solana_system_interface::program::ID.to_bytes().into())
+                .token_program(spl_token::ID.to_bytes().into())
+                .associated_token_program(spl_associated_token_account::ID.to_bytes().into())
+                .event_authority(event_authority_pda.to_bytes().into())
+                .private_channel_escrow_program(
+                    private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+                )
+                .amount(amount)
+                .instruction(),
+        );
 
         let signature = helpers::send_and_confirm_instructions(
             client.as_ref(),

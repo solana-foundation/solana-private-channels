@@ -1,3 +1,4 @@
+use devnet_scripts::{ix_v3_to_sdk, to_addr};
 use private_channel_withdraw_program_client::instructions::{
     WithdrawFunds, WithdrawFundsInstructionArgs,
 };
@@ -58,20 +59,20 @@ fn main() -> Result<()> {
     println!("User ATA (on PrivateChannel): {}", user_ata);
 
     let instruction = WithdrawFunds {
-        user: user_keypair.pubkey(),
-        mint,
-        token_account: user_ata,
-        token_program: spl_token::ID,
-        associated_token_program: spl_associated_token_account::ID,
+        user: to_addr(user_keypair.pubkey()),
+        mint: to_addr(mint),
+        token_account: to_addr(user_ata),
+        token_program: to_addr(spl_token::ID),
+        associated_token_program: to_addr(spl_associated_token_account::ID),
     }
     .instruction(WithdrawFundsInstructionArgs {
         amount,
-        destination,
+        destination: destination.map(to_addr),
     });
 
     let recent_blockhash = client.get_latest_blockhash()?;
     let transaction = Transaction::new_signed_with_payer(
-        &[instruction],
+        &[ix_v3_to_sdk(instruction)],
         Some(&user_keypair.pubkey()),
         &[&user_keypair],
         recent_blockhash,

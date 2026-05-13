@@ -10,6 +10,7 @@
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_DEPOSIT},
+        instruction_util::ix_v3_to_sdk,
         types::{BatchQueue, BenchState, DepositConfig, MAX_QUEUE_DEPTH},
     },
     private_channel_escrow_program_client::instructions::{Deposit, DepositInstructionArgs},
@@ -56,25 +57,25 @@ fn build_deposit_tx(
     let user_ata = get_associated_token_address(&depositor_pubkey, &config.mint);
 
     let accounts = Deposit {
-        payer: depositor_pubkey,
-        user: depositor_pubkey,
-        instance: config.instance_pda,
-        mint: config.mint,
-        allowed_mint: config.allowed_mint_pda,
-        user_ata,
-        instance_ata: config.instance_ata,
-        system_program: solana_sdk::system_program::id(),
-        token_program: spl_token::id(),
-        associated_token_program: spl_associated_token_account::id(),
-        event_authority: config.event_authority,
+        payer: depositor_pubkey.to_bytes().into(),
+        user: depositor_pubkey.to_bytes().into(),
+        instance: config.instance_pda.to_bytes().into(),
+        mint: config.mint.to_bytes().into(),
+        allowed_mint: config.allowed_mint_pda.to_bytes().into(),
+        user_ata: user_ata.to_bytes().into(),
+        instance_ata: config.instance_ata.to_bytes().into(),
+        system_program: solana_sdk::system_program::id().to_bytes().into(),
+        token_program: spl_token::id().to_bytes().into(),
+        associated_token_program: spl_associated_token_account::id().to_bytes().into(),
+        event_authority: config.event_authority.to_bytes().into(),
         private_channel_escrow_program:
             private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     };
 
-    let deposit_ix = accounts.instruction(DepositInstructionArgs {
+    let deposit_ix = ix_v3_to_sdk(accounts.instruction(DepositInstructionArgs {
         amount: DEPOSIT_AMOUNT,
         recipient: None,
-    });
+    }));
 
     let memo_ix = Instruction {
         program_id: MEMO_PROGRAM_ID,
