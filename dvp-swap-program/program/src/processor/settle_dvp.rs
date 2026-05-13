@@ -206,6 +206,14 @@ pub fn process_settle_dvp(
 
     // Refund any surplus to each leg's depositor so the escrows close
     // empty and over-deposits don't leak to the counterparty.
+    //
+    // The surplus CPI reuses the leg's hook extras but transfers to a
+    // different destination (depositor's own-mint ATA, not counterparty).
+    // Hooks whose ExtraAccountMetaList resolves accounts from the
+    // transfer destination (rare but spec-valid) will reject this CPI
+    // and revert the whole Settle. Recovery: depositor calls Reclaim,
+    // re-funds exactly amount_x, retries Settle. See README "TransferHook
+    // + over-deposit caveat".
     let asset_surplus = escrow_a_balance - dvp.amount_a;
     if asset_surplus > 0 {
         transfer_checked_cpi(

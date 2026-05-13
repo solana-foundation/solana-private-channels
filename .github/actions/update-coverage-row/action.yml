@@ -73,7 +73,7 @@ runs:
             throw new Error(`Invalid coverage data: hit=${process.env.INPUT_LINES_HIT}, total=${process.env.INPUT_LINES_TOTAL}`);
           }
 
-          const VALID_COMPONENTS = ['Core', 'Indexer', 'Gateway', 'Auth', 'Withdraw Program', 'Escrow Program', 'E2E Integration'];
+          const VALID_COMPONENTS = ['Core', 'Indexer', 'Gateway', 'Auth', 'Withdraw Program', 'Escrow Program', 'DvP Swap Program', 'E2E Integration'];
           if (!VALID_COMPONENTS.includes(component)) {
             throw new Error(`Unknown component "${component}". Valid: ${VALID_COMPONENTS.join(', ')}`);
           }
