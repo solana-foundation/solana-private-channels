@@ -34,10 +34,15 @@ privateChannelEscrowCodama.accept(
     }),
 );
 
-// Generate TypeScript client
+// Generate TypeScript client (renderers-js v2 signature: first arg is the
+// package root, generatedFolder option points at the codegen subdir).
+// syncPackageJson is disabled because we don't publish the generated client
+// as a standalone npm package — admin-ui consumes it via Vite path alias.
 privateChannelEscrowCodama.accept(
-    renderJavaScriptVisitor(path.join(typescriptClientsDir, 'src', 'generated'), {
+    renderJavaScriptVisitor(typescriptClientsDir, {
         formatCode: true,
+        generatedFolder: 'src/generated',
+        syncPackageJson: false,
         deleteFolderBeforeRendering: true,
     }),
 );

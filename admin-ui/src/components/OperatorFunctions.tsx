@@ -104,9 +104,9 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
         userAta,
         amount: BigInt(amount),
         user: address(userAddress),
-        newWithdrawalRoot: withdrawalRootBytes,
+        newWithdrawalRoot: Array.from(withdrawalRootBytes),
         transactionNonce: BigInt(transactionNonce),
-        siblingProofs: proofsBytes,
+        siblingProofs: Array.from(proofsBytes),
       });
 
       console.log('Created release funds instruction:', instruction);
