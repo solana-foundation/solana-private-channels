@@ -42,9 +42,7 @@ pub async fn run_precompile_accounts_test(private_channel_ctx: &PrivateChannelCo
             expect_empty_data: false,
         },
         TestPrecompile {
-            pubkey: solana_sdk::pubkey::Pubkey::new_from_array(
-                PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
-            ),
+            pubkey: PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
             name: "PrivateChannel Withdraw Program",
             executable: true,
             expect_empty_data: false,

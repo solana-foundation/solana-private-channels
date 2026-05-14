@@ -1,7 +1,6 @@
 use crate::error::{OperatorError, ProgramError};
 use crate::operator::sender::mint;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
-use crate::operator::utils::instruction_util::ix_v3_to_sdk;
 use crate::operator::{ReleaseFundsBuilderWithNonce, SIBLING_PROOF_SIZE};
 use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
 use solana_keychain::Signer;
@@ -84,7 +83,7 @@ impl SenderSMTState {
             .new_withdrawal_root(new_root);
 
         Ok(InstructionWithSigners {
-            instructions: vec![ix_v3_to_sdk(builder.instruction())],
+            instructions: vec![builder.instruction()],
             fee_payer,
             signers,
             compute_budget,
@@ -267,7 +266,7 @@ mod tests {
 
     fn make_release_funds_builder() -> ReleaseFundsBuilder {
         let mut b = ReleaseFundsBuilder::new();
-        let pk: solana_address::Address = Pubkey::new_unique().to_bytes().into();
+        let pk = Pubkey::new_unique();
         b.payer(pk)
             .operator(pk)
             .instance(pk)
@@ -276,7 +275,7 @@ mod tests {
             .allowed_mint(pk)
             .user_ata(pk)
             .instance_ata(pk)
-            .token_program(spl_token::id().to_bytes().into())
+            .token_program(spl_token::id())
             .user(pk)
             .amount(1000)
             .transaction_nonce(0);

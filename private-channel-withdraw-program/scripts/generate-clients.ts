@@ -23,18 +23,17 @@ const configPreserver = preserveConfigFiles(typescriptClientsDir, rustClientsDir
 
 // Generate Rust client
 privateChannelWithdrawCodama.accept(
-    renderRustVisitor(rustClientsDir, {
+    renderRustVisitor(path.join(rustClientsDir, 'src', 'generated'), {
         formatCode: true,
-        generatedFolder: 'src/generated',
+        crateFolder: rustClientsDir,
         deleteFolderBeforeRendering: true,
     }),
 );
 
 // Generate TypeScript client
 privateChannelWithdrawCodama.accept(
-    renderJavaScriptVisitor(typescriptClientsDir, {
+    renderJavaScriptVisitor(path.join(typescriptClientsDir, 'src', 'generated'), {
         formatCode: true,
-        generatedFolder: 'src/generated',
         deleteFolderBeforeRendering: true,
     }),
 );
