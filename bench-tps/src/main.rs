@@ -27,7 +27,6 @@
 mod args;
 mod background;
 mod bench_metrics;
-mod instruction_util;
 mod load;
 mod load_deposit;
 mod load_withdraw;
