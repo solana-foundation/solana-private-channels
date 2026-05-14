@@ -6,7 +6,7 @@ interface ConfigPreserver {
 }
 
 export function preserveConfigFiles(typescriptClientsDir: string, rustClientsDir: string): ConfigPreserver {
-    const filesToPreserve = ['package.json', 'tsconfig.json', '.npmignore', 'pnpm-lock.yaml', 'Cargo.toml'];
+    const filesToPreserve = ['tsconfig.json', '.npmignore', 'pnpm-lock.yaml', 'Cargo.toml'];
     const preservedFiles = new Map<string, string>();
 
     filesToPreserve.forEach(filename => {
