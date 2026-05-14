@@ -41,8 +41,8 @@ const FIXED_ACCOUNTS_LEN: usize = 10;
 /// 3. `[]` mint_b - Must equal `dvp.mint_b`
 /// 4. `[writable]` dvp_ata_a - Asset escrow (drained if funded, then closed)
 /// 5. `[writable]` dvp_ata_b - Cash escrow (drained if funded, then closed)
-/// 6. `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination
-/// 7. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination
+/// 6. `[writable]` user_a_ata_a - user_a's ATA for mint_a; refund destination (caller must pre-initialize if leg A is funded)
+/// 7. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination (caller must pre-initialize if leg B is funded)
 /// 8. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 9. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
 ///

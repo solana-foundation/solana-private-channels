@@ -47,10 +47,10 @@ const FIXED_ACCOUNTS_LEN: usize = 12;
 /// 3.  `[]` mint_b - Must equal `dvp.mint_b`
 /// 4.  `[writable]` dvp_ata_a - Escrow for the asset leg (drained, then closed)
 /// 5.  `[writable]` dvp_ata_b - Escrow for the cash leg (drained, then closed)
-/// 6.  `[writable]` user_a_ata_b - user_a's ATA for mint_b; receives the cash leg
-/// 7.  `[writable]` user_b_ata_a - user_b's ATA for mint_a; receives the asset leg
-/// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund
-/// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund
+/// 6.  `[writable]` user_a_ata_b - user_a's ATA for mint_b; receives the cash leg (caller must pre-initialize)
+/// 7.  `[writable]` user_b_ata_a - user_b's ATA for mint_a; receives the asset leg (caller must pre-initialize)
+/// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
+/// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
 /// 10. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 11. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
 ///

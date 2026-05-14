@@ -123,7 +123,7 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
 
     let data = mint_info.try_borrow()?;
     let mint = StateWithExtensions::<Token2022MintState>::unpack(&data)
-        .map_err(|_| DvpSwapProgramError::BlockedMintExtension)?;
+        .map_err(|_| ProgramError::InvalidAccountData)?;
 
     if mint.get_extension::<ConfidentialTransferMint>().is_ok()
         || mint

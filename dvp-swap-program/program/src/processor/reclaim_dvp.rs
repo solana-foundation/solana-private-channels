@@ -47,7 +47,7 @@ const FIXED_ACCOUNTS_LEN: usize = 6;
 /// 1. `[]`          swap_dvp        - SwapDvp PDA (signs the transfer as authority)
 /// 2. `[]`          mint            - Mint of the leg being reclaimed; must equal `dvp.mint_a` or `dvp.mint_b`
 /// 3. `[writable]`  dvp_source_ata  - DvP's escrow ATA for the leg's mint
-/// 4. `[writable]`  signer_dest_ata - Signer's canonical ATA for the leg's mint
+/// 4. `[writable]`  signer_dest_ata - Signer's canonical ATA for the leg's mint (caller must pre-initialize if the leg has a non-zero balance)
 /// 5. `[]`          token_program   - SPL Token or Token-2022; must own `mint`
 ///
 /// Trailing accounts (variable): transfer-hook extras forwarded to the
