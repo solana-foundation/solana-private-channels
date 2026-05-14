@@ -30,7 +30,7 @@ x-default-logging: &default-logging
 # Shared image+build for every Rust service that compiles from the main Dockerfile.
 # All such services share one byte-identical image; per-service tags would be 8
 # copies of the same artifact differing only in compose metadata. Each service
-# overrides only `command:` (and per-service env). Pin in CI/Railway via
+# overrides only `command:` (and per-service env). Pin in CI via
 # PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus,
 # grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
 x-private-channel-app: &private-channel-app
@@ -576,9 +576,9 @@ services:
       start_period: 15s
 
   # Grafana for visualization. Uses Dockerfile.grafana so the image bakes in
-  # provisioning + dashboards (matters for Railway/standalone where bind mounts
-  # aren't available). Locally the bind mounts below shadow the baked content
-  # so edits hot-reload without rebuilding.
+  # provisioning + dashboards (matters for standalone deployments where bind
+  # mounts aren't available). Locally the bind mounts below shadow the baked
+  # content so edits hot-reload without rebuilding.
   grafana:
     build:
       context: .

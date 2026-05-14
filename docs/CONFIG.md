@@ -141,15 +141,3 @@ private-channel-admin truncate --keep-slots 100000 --dry-run
 | `scripts/reconcile-escrow-balance.sh` | Reconcile on-chain vs DB escrow balances (supports alert webhooks) |
 | `scripts/devnet/devnet-test.sh` | Full E2E test: instance creation through deposit/withdrawal/backfill validation |
 
-### Activity Generator
-
-**Source**: [`core/src/bin/activity.rs`](../core/src/bin/activity.rs)
-
-For load testing, the `activity` binary generates synthetic traffic:
-
-```shell
-activity --rpc-url http://localhost:8900 \
-         --admin-keypair operator-keypair.json \
-         --users 10 \
-         --user-delay-ms 1000
-```

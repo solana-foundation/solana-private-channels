@@ -281,9 +281,9 @@ patch_env "COMMON_ESCROW_INSTANCE_ID" "${BENCH_DEPOSIT_INSTANCE_PDA}"
 
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
-# --env-file in docker compose, so without this re-source the operator and
-# activity containers would inherit the stale empty ADMIN_PRIVATE_KEY that
-# was exported during the initial Step 3 source.
+# --env-file in docker compose, so without this re-source the operator
+# containers would inherit the stale empty ADMIN_PRIVATE_KEY that was
+# exported during the initial Step 3 source.
 # shellcheck disable=SC1091
 set -a; source "${BENCH_ENV}"; set +a
 
@@ -333,14 +333,14 @@ fi
 # ---------------------------------------------------------------------------
 COMPOSE=(docker compose -f "${REPO_ROOT}/docker-compose.yml" --env-file "${REPO_ROOT}/versions.env" --env-file "${BENCH_ENV}")
 
-# Only 4 distinct images get built: 9 of the 12 services share the single
+# Only 4 distinct images get built: 8 of the 11 services share the single
 # private-channel-app image (via the x-private-channel-app YAML anchor in
 # docker-compose.yml). The validator, prometheus, and grafana services have
 # their own Dockerfiles and therefore their own images. Listing the merged
 # services here would make images_exist() always return false, forcing a
 # full rebuild every run.
 BUILT_IMAGES=(private-channel-app private-channel-validator private-channel-prometheus private-channel-grafana)
-BUILT_SERVICES=(write-node read-node gateway streamer activity validator indexer-solana indexer-private-channel operator-solana operator-private-channel prometheus grafana)
+BUILT_SERVICES=(write-node read-node gateway streamer validator indexer-solana indexer-private-channel operator-solana operator-private-channel prometheus grafana)
 
 images_exist() {
     # docker image inspect exits non-zero if any image in the list is missing.

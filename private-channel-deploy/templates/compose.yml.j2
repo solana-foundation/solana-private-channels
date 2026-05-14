@@ -13,7 +13,7 @@
 {% set img_prefix = image_registry ~ '/' %}
 
 services:
-{% for svc in ['write-node', 'read-node', 'gateway', 'streamer', 'auth', 'activity',
+{% for svc in ['write-node', 'read-node', 'gateway', 'streamer', 'auth',
                'indexer-solana', 'indexer-private-channel', 'operator-solana', 'operator-private-channel'] %}
   {{ svc }}:
     # Pin every Solana Private Channels-app service to the deployed image tag.
