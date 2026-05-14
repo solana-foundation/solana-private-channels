@@ -22,4 +22,3 @@
 - **[System Invariants](INVARIANTS.md)** — Safety and correctness invariants with implementation status
 - **[Technical Requirements](TECHNICAL_REQUIREMENTS.md)** — Hardware specs, software versions, ports, and firewall rules
 - **[Configuration & Operations](CONFIG.md)** — Service configuration, tuning guidelines, restart/recovery, and operational tools
-- **[Railway Deployment](RAILWAY.md)** — Multi-service deployment to Railway with observability

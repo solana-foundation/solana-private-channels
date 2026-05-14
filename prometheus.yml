@@ -10,7 +10,7 @@ scrape_configs:
     metric_relabel_configs:
       # Keep only metrics for specific containers
       - source_labels: [container_label_com_docker_compose_service]
-        regex: '(write-node|read-node|gateway|streamer|postgres-primary|postgres-replica|postgres-indexer|activity|validator|indexer-solana|indexer-private_channel|operator-solana|operator-private_channel)'
+        regex: '(write-node|read-node|gateway|streamer|postgres-primary|postgres-replica|postgres-indexer|validator|indexer-solana|indexer-private_channel|operator-solana|operator-private_channel)'
         action: keep
 
   # Indexer & Operator app-level metrics

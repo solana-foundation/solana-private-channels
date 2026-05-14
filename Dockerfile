@@ -149,7 +149,6 @@ RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
         -p auth \
     && mkdir -p /out \
     && cp target/release/node /out/node \
-    && cp target/release/activity /out/activity \
     && cp target/release/admin /out/admin \
     && cp target/release/gateway /out/gateway \
     && cp target/release/indexer /out/indexer \
@@ -178,7 +177,6 @@ RUN useradd -m -u 1000 -s /bin/bash private_channel
 # Copy the binaries from builder. Source paths are /out/ (a normal layer in the builder
 # stage), not target/release/ (a cache mount which is not visible across stages).
 COPY --from=builder /out/node /usr/local/bin/private-channel-node
-COPY --from=builder /out/activity /usr/local/bin/activity
 COPY --from=builder /out/admin /usr/local/bin/admin
 COPY --from=builder /out/gateway /usr/local/bin/gateway
 COPY --from=builder /out/indexer /usr/local/bin/indexer

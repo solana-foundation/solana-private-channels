@@ -603,7 +603,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 
 async fn handle_ws_connection(mut socket: WebSocket, state: Arc<AppState>) {
     let mut rx = state.tx_sender.subscribe();
-    // Send a ping every 20s to keep Railway's proxy from killing the connection.
+    // Send a ping every 20s to keep idle reverse proxies from killing the connection.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 

@@ -2,9 +2,10 @@
 # Requires Docker >= 26.0 (BuildKit + the `--mount=type=cache` directives below).
 #
 # NODE_VERSION / PNPM_VERSION: versions.env is the source of truth (consumed by docker
-# compose). Railway builds don't read versions.env, so defaults are set below as fallbacks
-# — Railway should still set them explicitly via Build Args so a versions.env bump doesn't
-# silently drift. Bump these defaults in lockstep with versions.env when raising the pins.
+# compose). Standalone builds don't read versions.env, so defaults are set below as
+# fallbacks — callers should still set them explicitly via Build Args so a versions.env
+# bump doesn't silently drift. Bump these defaults in lockstep with versions.env when
+# raising the pins.
 # Standalone build (outside compose): see README "Building a single Dockerfile standalone".
 ARG NODE_VERSION=24.7.0
 FROM node:${NODE_VERSION}-slim AS builder
