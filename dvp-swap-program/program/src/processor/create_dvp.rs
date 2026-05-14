@@ -8,7 +8,7 @@ use crate::{
     },
     processor::shared::pda_utils::create_pda_account,
     processor::shared::token_utils::{validate_mint_extensions, verify_canonical_ata},
-    require_len,
+    require, require_len,
     state::swap_dvp::{SwapDvp, SWAP_DVP_SEED},
 };
 use pinocchio::{
@@ -89,9 +89,25 @@ pub fn process_create_dvp(
         ],
         program_id,
     );
-    if swap_dvp_info.address() != &expected_swap_dvp {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    require!(
+        swap_dvp_info.address() == &expected_swap_dvp,
+        ProgramError::InvalidSeeds
+    );
+
+    // dvp_ata_a is the DvP PDA's ATA for mint_a (asset escrow).
+    verify_canonical_ata(
+        dvp_ata_a_info,
+        swap_dvp_info.address(),
+        mint_a_info.address(),
+        token_program_a_info,
+    )?;
+    // dvp_ata_b is the DvP PDA's ATA for mint_b (cash escrow).
+    verify_canonical_ata(
+        dvp_ata_b_info,
+        swap_dvp_info.address(),
+        mint_b_info.address(),
+        token_program_b_info,
+    )?;
 
     let dvp = SwapDvp {
         bump,
@@ -108,21 +124,6 @@ pub fn process_create_dvp(
     };
     let (nonce_bytes, bump_bytes) = dvp.seed_buffers();
     let swap_dvp_seeds = dvp.signing_seeds(&nonce_bytes, &bump_bytes);
-
-    // dvp_ata_a is the DvP PDA's ATA for mint_a (asset escrow).
-    verify_canonical_ata(
-        dvp_ata_a_info,
-        swap_dvp_info.address(),
-        mint_a_info.address(),
-        token_program_a_info,
-    )?;
-    // dvp_ata_b is the DvP PDA's ATA for mint_b (cash escrow).
-    verify_canonical_ata(
-        dvp_ata_b_info,
-        swap_dvp_info.address(),
-        mint_b_info.address(),
-        token_program_b_info,
-    )?;
 
     let rent = Rent::get()?;
     create_pda_account(
@@ -259,23 +260,22 @@ fn validate_args(
     mint_b: &Address,
     now: i64,
 ) -> Result<(), ProgramError> {
-    if args.expiry_timestamp <= now {
-        return Err(DvpSwapProgramError::ExpiryNotInFuture.into());
-    }
+    require!(
+        args.expiry_timestamp > now,
+        DvpSwapProgramError::ExpiryNotInFuture
+    );
     if let Some(earliest) = args.earliest_settlement_timestamp {
-        if earliest > args.expiry_timestamp {
-            return Err(DvpSwapProgramError::EarliestAfterExpiry.into());
-        }
+        require!(
+            earliest <= args.expiry_timestamp,
+            DvpSwapProgramError::EarliestAfterExpiry
+        );
     }
-    if args.user_a == args.user_b {
-        return Err(DvpSwapProgramError::SelfDvp.into());
-    }
-    if mint_a == mint_b {
-        return Err(DvpSwapProgramError::SameMint.into());
-    }
-    if args.amount_a == 0 || args.amount_b == 0 {
-        return Err(DvpSwapProgramError::ZeroAmount.into());
-    }
+    require!(args.user_a != args.user_b, DvpSwapProgramError::SelfDvp);
+    require!(mint_a != mint_b, DvpSwapProgramError::SameMint);
+    require!(
+        args.amount_a != 0 && args.amount_b != 0,
+        DvpSwapProgramError::ZeroAmount
+    );
     Ok(())
 }
 

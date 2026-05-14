@@ -5,6 +5,7 @@ use crate::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
     processor::shared::utils::split_leg_remaining_accounts,
+    require,
     state::swap_dvp::SwapDvp,
 };
 use pinocchio::{
@@ -86,25 +87,23 @@ pub fn process_settle_dvp(
         SwapDvp::try_from_bytes(&data)?
     };
 
-    if settlement_authority_info.address() != &dvp.settlement_authority {
-        return Err(DvpSwapProgramError::SettlementAuthorityMismatch.into());
-    }
+    require!(
+        settlement_authority_info.address() == &dvp.settlement_authority,
+        DvpSwapProgramError::SettlementAuthorityMismatch
+    );
 
     // Bind each mint account to state and to its declared token program.
-    if mint_a_info.address() != &dvp.mint_a || mint_b_info.address() != &dvp.mint_b {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    require!(
+        mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
+        ProgramError::InvalidAccountData
+    );
     verify_account_owner(mint_a_info, token_program_a_info.address())?;
     verify_account_owner(mint_b_info, token_program_b_info.address())?;
 
     let now = Clock::get()?.unix_timestamp;
-    if now > dvp.expiry_timestamp {
-        return Err(DvpSwapProgramError::DvpExpired.into());
-    }
+    require!(now <= dvp.expiry_timestamp, DvpSwapProgramError::DvpExpired);
     if let Some(earliest) = dvp.earliest_settlement_timestamp {
-        if now < earliest {
-            return Err(DvpSwapProgramError::SettlementTooEarly.into());
-        }
+        require!(now >= earliest, DvpSwapProgramError::SettlementTooEarly);
     }
 
     // All six ATAs must be canonical. Note the cross at Settle: each user
@@ -163,13 +162,15 @@ pub fn process_settle_dvp(
     // depositor and refunded to them below, so the counterparty always
     // receives exactly the agreed `dvp.amount_x`.
     let escrow_a_balance = get_token_account_balance(dvp_ata_a_info)?;
-    if escrow_a_balance < dvp.amount_a {
-        return Err(DvpSwapProgramError::LegNotFunded.into());
-    }
+    require!(
+        escrow_a_balance >= dvp.amount_a,
+        DvpSwapProgramError::LegNotFunded
+    );
     let escrow_b_balance = get_token_account_balance(dvp_ata_b_info)?;
-    if escrow_b_balance < dvp.amount_b {
-        return Err(DvpSwapProgramError::LegNotFunded.into());
-    }
+    require!(
+        escrow_b_balance >= dvp.amount_b,
+        DvpSwapProgramError::LegNotFunded
+    );
 
     let decimals_a = get_mint_decimals(mint_a_info)?;
     let decimals_b = get_mint_decimals(mint_b_info)?;

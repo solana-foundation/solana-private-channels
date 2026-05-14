@@ -22,7 +22,7 @@ use spl_token_2022::extension::{
 };
 use spl_token_2022::state::Mint as Token2022MintState;
 
-use crate::error::DvpSwapProgramError;
+use crate::{error::DvpSwapProgramError, require};
 
 /// SPL Token / Token-2022 `TransferChecked` instruction discriminator.
 const TRANSFER_CHECKED_DISCRIMINATOR: u8 = 12;
@@ -48,9 +48,7 @@ pub fn verify_canonical_ata(
         &pinocchio_associated_token_account::ID,
     )
     .0;
-    if ata_info.address() != &expected {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    require!(ata_info.address() == &expected, ProgramError::InvalidSeeds);
     Ok(())
 }
 
@@ -184,9 +182,10 @@ pub fn transfer_checked_cpi(
     remaining: &[AccountView],
     signers: &[Signer],
 ) -> ProgramResult {
-    if remaining.len() > MAX_HOOK_REMAINING_ACCOUNTS {
-        return Err(ProgramError::InvalidArgument);
-    }
+    require!(
+        remaining.len() <= MAX_HOOK_REMAINING_ACCOUNTS,
+        ProgramError::InvalidArgument
+    );
     let total = 4 + remaining.len();
 
     // Account metas: 4 fixed + N trailing. Trailing forwards each

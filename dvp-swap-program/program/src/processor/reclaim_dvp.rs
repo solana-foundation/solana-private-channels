@@ -4,6 +4,7 @@ use crate::{
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
+    require,
     state::swap_dvp::SwapDvp,
 };
 use pinocchio::{
@@ -59,9 +60,10 @@ pub fn process_reclaim_dvp(
     accounts: &[AccountView],
     _instruction_data: &[u8],
 ) -> ProgramResult {
-    if accounts.len() < FIXED_ACCOUNTS_LEN {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    }
+    require!(
+        accounts.len() >= FIXED_ACCOUNTS_LEN,
+        ProgramError::NotEnoughAccountKeys
+    );
     let (fixed, remaining) = accounts.split_at(FIXED_ACCOUNTS_LEN);
     let [signer_info, swap_dvp_info, mint_info, dvp_source_ata_info, signer_dest_ata_info, token_program_info] =
         fixed
@@ -89,17 +91,16 @@ pub fn process_reclaim_dvp(
 
     // Bind the passed mint account to the state's mint pubkey and to the
     // token program that owns it.
-    if mint_info.address() != leg_mint {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    require!(
+        mint_info.address() == leg_mint,
+        ProgramError::InvalidAccountData
+    );
     verify_account_owner(mint_info, token_program_info.address())?;
 
     // Reclaim only works pre-expiry. After expiry, Cancel or Reject
     // is the way to drain a funded leg.
     let now = Clock::get()?.unix_timestamp;
-    if now > dvp.expiry_timestamp {
-        return Err(DvpSwapProgramError::DvpExpired.into());
-    }
+    require!(now <= dvp.expiry_timestamp, DvpSwapProgramError::DvpExpired);
 
     // Both ATAs must be canonical for the leg's token program.
     // dvp_source_ata is the DvP PDA's escrow for the leg's mint

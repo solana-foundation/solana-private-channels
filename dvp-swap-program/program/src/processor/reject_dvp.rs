@@ -5,6 +5,7 @@ use crate::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
     processor::shared::utils::split_leg_remaining_accounts,
+    require,
     state::swap_dvp::SwapDvp,
 };
 use pinocchio::{
@@ -78,13 +79,15 @@ pub fn process_reject_dvp(
         SwapDvp::try_from_bytes(&data)?
     };
 
-    if signer_info.address() != &dvp.user_a && signer_info.address() != &dvp.user_b {
-        return Err(DvpSwapProgramError::SignerNotParty.into());
-    }
+    require!(
+        signer_info.address() == &dvp.user_a || signer_info.address() == &dvp.user_b,
+        DvpSwapProgramError::SignerNotParty
+    );
 
-    if mint_a_info.address() != &dvp.mint_a || mint_b_info.address() != &dvp.mint_b {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    require!(
+        mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
+        ProgramError::InvalidAccountData
+    );
     verify_account_owner(mint_a_info, token_program_a_info.address())?;
     verify_account_owner(mint_b_info, token_program_b_info.address())?;
 
