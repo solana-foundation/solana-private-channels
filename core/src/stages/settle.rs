@@ -545,7 +545,7 @@ async fn settle_transactions(
         blockhash: next_blockhash,
         previous_blockhash: last_blockhash,
         parent_slot: last_slot,
-        // TODO: Do we need this?
+        // Surfaced through getBlock RPC; we don't track height separately so it mirrors next_slot.
         block_height: Some(next_slot),
         block_time: Some(block_time),
         transaction_signatures: block_transaction_signatures,

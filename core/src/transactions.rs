@@ -15,13 +15,6 @@ pub fn is_admin_instruction(program_id: &Pubkey, instruction_type: u8) -> bool {
         .is_some_and(|set| set.contains(&instruction_type))
 }
 
-// TODO: Make this configurable at startup
-/// Checks if an instruction is allowed. Currently, only SPL instructions are
-/// allowed
-pub fn is_allowed_instruction(program_id: &Pubkey, _instruction_type: u8) -> bool {
-    program_id == &spl_token::id()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,20 +34,5 @@ mod tests {
     fn unknown_program_is_not_admin() {
         let random = Pubkey::new_unique();
         assert!(!is_admin_instruction(&random, 0));
-    }
-
-    #[test]
-    fn test_is_allowed_instruction_spl_token() {
-        // SPL token transfer (type 3) should be allowed
-        assert!(is_allowed_instruction(&spl_token::id(), 3));
-        // SPL token initialize mint (type 0) should also be allowed
-        assert!(is_allowed_instruction(&spl_token::id(), 0));
-    }
-
-    #[test]
-    fn test_is_allowed_instruction_unknown() {
-        let random = Pubkey::new_unique();
-        assert!(!is_allowed_instruction(&random, 0));
-        assert!(!is_allowed_instruction(&random, 3));
     }
 }

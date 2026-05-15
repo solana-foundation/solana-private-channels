@@ -42,7 +42,7 @@ impl Default for RetryConfig {
 }
 
 /// Returns `true` for errors that will never succeed on retry.
-// TODO: remove -32601 check once the RPC endpoint implements all required methods.
+/// Covers JSON-RPC `-32601` (method not found) and `ForUser` messages reporting `AccountNotFound`.
 fn is_permanent_rpc_error(e: &client_error::Error) -> bool {
     let ErrorKind::RpcError(rpc_err) = e.kind() else {
         return false;
