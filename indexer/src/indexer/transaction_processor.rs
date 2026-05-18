@@ -222,7 +222,11 @@ fn convert_to_db_models(
 
     match &instruction_meta.instruction {
         ProgramInstruction::Escrow(escrow_ix) => match escrow_ix.as_ref() {
-            EscrowInstruction::Deposit { accounts, data, event } => {
+            EscrowInstruction::Deposit {
+                accounts,
+                data,
+                event,
+            } => {
                 let recipient = data
                     .recipient
                     .map(|r| r.to_string())

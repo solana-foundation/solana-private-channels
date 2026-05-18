@@ -23,7 +23,10 @@ const EVENT_IX_TAG_LE: &[u8] = &[0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d]
 const ALLOW_MINT_EVENT_DISCRIMINATOR: u8 = 1;
 const DEPOSIT_EVENT_DISCRIMINATOR: u8 = 6;
 const EVENT_DISCRIMINATOR_INDEX: usize = 8;
+// AllowMintEvent: tag(8)+disc(1)+instance_seed(32)+mint(32) = 73
 const EVENT_DECIMALS_INDEX: usize = 73;
+// DepositEvent: tag(8)+disc(1)+instance_seed(32)+user(32) = 73
+// (same offset, different event)
 const EVENT_AMOUNT_INDEX: usize = 73;
 
 // ******************************************************************************************
@@ -366,19 +369,19 @@ fn parse_deposit(
                 && event_data.starts_with(EVENT_IX_TAG_LE)
                 && event_data[EVENT_DISCRIMINATOR_INDEX] == DEPOSIT_EVENT_DISCRIMINATOR
             {
+                // Safety: the `>= 145` guard above guarantees this slice is
+                // always exactly 8 bytes; the unwrap cannot panic.
                 let amount_bytes: [u8; 8] = event_data[EVENT_AMOUNT_INDEX..EVENT_AMOUNT_INDEX + 8]
                     .try_into()
-                    .map_err(|_| ParserError::InstructionParseFailed {
-                        reason: "DepositEvent amount slice not 8 bytes".to_string()
-                    })?;
-                
+                    .unwrap();
+
                 let amount = u64::from_le_bytes(amount_bytes);
 
                 return Ok(Some(EscrowInstruction::Deposit {
                     accounts,
                     data: ix_data,
-                    event: DepositEvent { amount }
-                }))
+                    event: DepositEvent { amount },
+                }));
             }
         }
     }
