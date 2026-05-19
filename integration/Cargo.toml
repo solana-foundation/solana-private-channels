@@ -76,6 +76,10 @@ name = "bootstrap_validation"
 path = "tests/indexer/bootstrap_validation.rs"
 
 [[test]]
+name = "deposit_allowlist_e2e"
+path = "tests/indexer/deposit_allowlist_e2e.rs"
+
+[[test]]
 name = "withdrawal_null_nonce"
 path = "tests/indexer/withdrawal_null_nonce.rs"
 

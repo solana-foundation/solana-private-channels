@@ -1067,22 +1067,23 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
 // ── Drill 15: deposit_manual_review.md § Path E recovery flows ─────────────
 //
 // `deposit_manual_review.md` § Path E documents recovery for the
-// processor-side allowlist gate (`require_known_mint` rejects a deposit
-// whose mint has no row in `mints`). This drill pins:
+// processor-side allowlist gate (`assert_mint_allowlisted` rejects a
+// deposit whose mint has no row in `mints`). This drill pins:
 //
 //   1. The dispatch substring exists in source — `OperatorError::MintNotAllowed`'s
 //      `#[error(...)]` template lives in `error/operator.rs`, and is also
 //      anchored globally by drill_1.
 //   2. The classifier routes `MintNotAllowed` to a quarantine reason of
-//      `mint_not_allowed`, and the call to `require_known_mint` is
+//      `mint_not_allowed`, and the call to `assert_mint_allowlisted` is
 //      still wired into `process_deposit_funds`. A future refactor that
 //      drops either of these breaks Path E silently.
-//   3. Path E recovery SQL is fungible across sub-branches: 3a re-arms
-//      to `pending`, 3b marks `failed`. Both are id-targeted, both
-//      coexist with unrelated rows.
+//   3. Path E recovery SQL: 3a re-arms to `pending`; 3b `DELETE`s the
+//      row (the orphan reconciliation query has no status filter, so
+//      DELETE is the only way to silence it). Both are id-targeted and
+//      leave unrelated rows alone.
 //   4. The reconciliation cross-signal contract — the runbook references
-//      `orphan_deposit_mint` and that payload kind exists in
-//      `reconciliation.rs`.
+//      the orphan alert and reconciliation actually runs the
+//      orphan-mint check.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1174,18 +1175,26 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
         "Path E branch 3a re-arm must flip manual_review → pending",
     );
 
-    // 3b — not-allowlisted branch: terminal `failed`, refund out-of-band.
-    sqlx::query("UPDATE transactions SET status='failed', updated_at=NOW() WHERE id=$1")
+    // 3b — not-allowlisted branch: DELETE the row (the orphan
+    // reconciliation query has no status filter, so leaving a `failed`
+    // row in place would keep firing the orphan alert forever — the
+    // runbook prescribes DELETE for noise reduction after refund is
+    // coordinated out-of-band).
+    let rows_deleted = sqlx::query("DELETE FROM transactions WHERE id=$1")
         .bind(branch_3b_id)
         .execute(&pool)
-        .await?;
-    assert_eq!(
-        status_of(&pool, branch_3b_id).await?,
-        "failed",
-        "Path E branch 3b must terminate the row as failed",
-    );
+        .await?
+        .rows_affected();
+    assert_eq!(rows_deleted, 1, "Path E branch 3b must DELETE exactly the trigger row");
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE id=$1")
+            .bind(branch_3b_id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(exists, 0, "Path E branch 3b row must be gone after DELETE");
 
-    // Control: a completed row must be untouched by either recovery.
+    // Control: a completed row must be untouched by either recovery —
+    // and specifically not swept by the 3b DELETE.
     assert_eq!(
         status_of(&pool, control_id).await?,
         "completed",
@@ -1206,7 +1215,9 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
         .unwrap_or(step_3c_section.len());
     let step_3c_body = &step_3c_section[..next_section_idx];
     assert!(
-        !step_3c_body.contains("UPDATE transactions") && !step_3c_body.contains("INSERT INTO"),
+        !step_3c_body.contains("UPDATE transactions")
+            && !step_3c_body.contains("INSERT INTO")
+            && !step_3c_body.contains("DELETE FROM"),
         "Path E Step 3c (foreign-instance) must contain no mutating SQL — \
          escalate-only per the runbook",
     );
