@@ -241,6 +241,11 @@ fn convert_to_db_models(
             // Drop any escrow ix not scoped to the configured instance.
             // `None` configured => drop all (fail-closed).
             if configured_escrow_instance_id != Some(&escrow_instance_of(escrow_ix)) {
+                debug!(
+                    ix = ?escrow_ix,
+                    configured = ?configured_escrow_instance_id,
+                    "dropping escrow instruction: instance mismatch"
+                );
                 return (None, None);
             }
             match escrow_ix.as_ref() {
@@ -336,7 +341,7 @@ mod tests {
 
     /// Instance pubkey hardcoded by `make_reset_smt_root_instruction`.
     fn reset_smt_instance() -> Pubkey {
-        make_pubkey(12)
+        make_pubkey(21)
     }
 
     fn make_deposit_instruction(
