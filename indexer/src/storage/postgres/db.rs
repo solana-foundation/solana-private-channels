@@ -801,7 +801,8 @@ impl PostgresDb {
     }
 
     /// Returns `Ok(true)` if the row was updated, `Ok(false)` if it was
-    /// skipped (no longer in `Processing`). Callers branch on the bool to
+    /// skipped because the row is already in a terminal state (recovery
+    /// or another writer moved it first). Callers branch on the bool to
     /// avoid counting no-op writes as successful DB updates.
     pub async fn update_transaction_status_internal(
         &self,
@@ -810,11 +811,17 @@ impl PostgresDb {
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, sqlx::Error> {
-        // The `status = 'processing'` filter protects against this race:
-        // recovery has already moved a stuck row off `Processing`, but a
-        // late confirmation from the original (now-crashed) sender is
-        // still trying to mark it `Completed`. Without the filter, the
-        // late write would overwrite recovery's decision.
+        // The status filter protects against this race: recovery has
+        // already moved a stuck row off `Processing`, but a late
+        // confirmation from the original (now-crashed) sender is still
+        // trying to mark it `Completed`. Without the filter, the late
+        // write would overwrite recovery's decision.
+        //
+        // Both `processing` and `pending_remint` are allowed because the
+        // remint flow writes terminal states (`Completed`,
+        // `FailedReminted`, `ManualReview`) from `pending_remint` —
+        // recovery doesn't touch that status, so there's no race window
+        // to worry about there.
         let result = sqlx::query(
             r#"
             UPDATE transactions
@@ -823,7 +830,7 @@ impl PostgresDb {
                 counterpart_signature = $3,
                 processed_at = $4
             WHERE id = $1
-              AND status = 'processing'
+              AND status IN ('processing', 'pending_remint')
             "#,
         )
         .bind(transaction_id)
