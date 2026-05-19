@@ -1131,24 +1131,27 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
 
     // ── Step 3: cross-signal contract with reconciliation ────────────
     // Path E's recovery for the terminal branch tells the on-call that
-    // the reconciliation orphan alert is the same incident — so the
-    // runbook must reference that alert, and reconciliation must
-    // actually run the orphan-mint check. Anchor each side concretely.
+    // the reconciliation orphan check is the same incident — so the
+    // runbook must reference that check, and reconciliation must
+    // actually run the orphan-row check. Anchor each side concretely.
     let reconciliation_path = workspace_root.join("indexer/src/operator/reconciliation.rs");
     let reconciliation = std::fs::read_to_string(&reconciliation_path)
         .unwrap_or_else(|e| panic!("read {reconciliation_path:?}: {e}"));
     assert!(
-        reconciliation.contains("check_orphan_deposit_mints"),
-        "Reconciliation must run `check_orphan_deposit_mints` — the orphan \
+        reconciliation.contains("check_orphan_deposit_rows"),
+        "Reconciliation must run `check_orphan_deposit_rows` — the orphan \
          alert Path E's recovery refers to",
     );
     let runbook_path = workspace_root.join("docs/runbooks/deposit_manual_review.md");
     let runbook = std::fs::read_to_string(&runbook_path)
         .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
+    // Match the common stem so the assertion survives minor wording
+    // tweaks ("orphan alert" / "orphan check" / "orphan log") — what we
+    // anchor is the existence of the cross-link, not its exact phrasing.
     assert!(
-        runbook.contains("reconciliation orphan alert"),
+        runbook.contains("reconciliation orphan"),
         "deposit_manual_review.md Path E must reference the reconciliation \
-         orphan alert — without it, on-call triages the same incident twice",
+         orphan check — without it, on-call triages the same incident twice",
     );
     eprintln!("OK   reconciliation.rs + runbook: orphan-alert cross-link");
 

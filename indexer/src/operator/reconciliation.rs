@@ -193,13 +193,15 @@ async fn perform_reconciliation_check(
     // Balance reconciliation iterates `mints`, so deposit rows whose mint
     // has no `mints` entry never show up as a mismatch. Surface them
     // explicitly here, with dedup so we don't re-log on every tick.
-    check_orphan_deposit_mints(storage, previously_alerted_orphans).await;
+    check_orphan_deposit_rows(storage, previously_alerted_orphans).await;
 
     Ok(())
 }
 
-/// Surface orphan deposit mints (deposit rows whose mint isn't in `mints`)
-/// via logs only.
+/// Surface orphan deposit rows (deposits whose `mint` has no row in
+/// `mints`) via logs only — dedup is per `transactions.id`, so a single
+/// orphan mint with N stuck rows produces N independent alerts the first
+/// time each is observed and silence thereafter.
 /// Orphans are a softer signal: the deposit-side gate
 /// (`assert_mint_allowlisted`) has already refused to mint for them, so a
 /// log line into the central log pipeline is enough for triage.
@@ -213,7 +215,7 @@ async fn perform_reconciliation_check(
 ///
 /// Storage-query failures are logged at `warn!` and leave the dedup state
 /// untouched.
-async fn check_orphan_deposit_mints(
+async fn check_orphan_deposit_rows(
     storage: &Arc<Storage>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
 ) {
@@ -1336,14 +1338,14 @@ mod tests {
 
     // The dedup tests below cover the orphan-detection wiring at the
     // boundary we *can* exercise without a test validator: the
-    // `check_orphan_deposit_mints` helper, driven through its three state
+    // `check_orphan_deposit_rows` helper, driven through its three state
     // transitions (baseline / stable / new-orphan) plus the
     // storage-error path.
 
     /// Insert a deposit row whose mint has no `mints` entry. Used by the
     /// dedup tests below, the actual orphan-detection SQL is exercised by
     /// the storage-layer tests; here we only need MockStorage to return the
-    /// mint as orphaned so `check_orphan_deposit_mints` is driven through
+    /// mint as orphaned so `check_orphan_deposit_rows` is driven through
     /// its state transitions.
     fn seed_orphan_deposit(
         mock: &crate::storage::common::storage::mock::MockStorage,
@@ -1379,7 +1381,7 @@ mod tests {
     /// Baseline tick (`None` in → `Some` out): full current orphan set is
     /// captured into the dedup cache, info-log only.
     #[tokio::test]
-    async fn check_orphan_deposit_mints_baseline_seeds_state() {
+    async fn check_orphan_deposit_rows_baseline_seeds_state() {
         let mock = MockStorage::new();
         let id_a = seed_orphan_deposit(&mock, "mint_a");
         let id_b = seed_orphan_deposit(&mock, "mint_b");
@@ -1387,7 +1389,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let mut state: Option<HashSet<i64>> = None;
 
-        check_orphan_deposit_mints(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state).await;
 
         let seen = state.expect("baseline tick must populate dedup cache");
         assert_eq!(
@@ -1402,11 +1404,11 @@ mod tests {
     /// Baseline with no orphans still flips state to `Some(empty)` so the
     /// next tick is in delta mode.
     #[tokio::test]
-    async fn check_orphan_deposit_mints_baseline_with_no_orphans_still_flips_state() {
+    async fn check_orphan_deposit_rows_baseline_with_no_orphans_still_flips_state() {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mut state: Option<HashSet<i64>> = None;
 
-        check_orphan_deposit_mints(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state).await;
 
         let seen = state.expect("baseline must seed state even when empty");
         assert!(seen.is_empty());
@@ -1415,7 +1417,7 @@ mod tests {
     /// Delta tick where the orphan set hasn't changed: dedup cache must not
     /// grow and nothing should be logged (cache contents unchanged).
     #[tokio::test]
-    async fn check_orphan_deposit_mints_stable_orphans_dont_realert() {
+    async fn check_orphan_deposit_rows_stable_orphans_dont_realert() {
         let mock = MockStorage::new();
         let id_a = seed_orphan_deposit(&mock, "mint_a");
 
@@ -1425,7 +1427,7 @@ mod tests {
         // as far as state is concerned.
         let mut state: Option<HashSet<i64>> = Some([id_a].into_iter().collect());
 
-        check_orphan_deposit_mints(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state).await;
 
         let seen = state.expect("state should remain Some after delta tick");
         assert_eq!(seen.len(), 1, "stable orphan must not grow the cache");
@@ -1437,7 +1439,7 @@ mod tests {
     /// This is the regression guard for the old mint-level dedup, which
     /// would have silently suppressed subsequent deposits on a known mint.
     #[tokio::test]
-    async fn check_orphan_deposit_mints_new_orphan_extends_cache() {
+    async fn check_orphan_deposit_rows_new_orphan_extends_cache() {
         let mock = MockStorage::new();
         let id_a = seed_orphan_deposit(&mock, "shared_mint");
         let id_b = seed_orphan_deposit(&mock, "shared_mint");
@@ -1448,7 +1450,7 @@ mod tests {
         // trigger the error log even though the mint is already "known".
         let mut state: Option<HashSet<i64>> = Some([id_a].into_iter().collect());
 
-        check_orphan_deposit_mints(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state).await;
 
         let seen = state.expect("state should remain Some after delta tick");
         assert_eq!(seen.len(), 2, "cache should grow by exactly the new row");
@@ -1459,13 +1461,13 @@ mod tests {
     /// Storage failure must leave the dedup state untouched so the next
     /// tick can retry the baseline (or delta) cleanly.
     #[tokio::test]
-    async fn check_orphan_deposit_mints_storage_error_preserves_state() {
+    async fn check_orphan_deposit_rows_storage_error_preserves_state() {
         let mock = MockStorage::new();
         mock.set_should_fail("get_orphan_deposit_ids", true);
         let storage = Arc::new(Storage::Mock(mock));
         let mut state: Option<HashSet<i64>> = None;
 
-        check_orphan_deposit_mints(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state).await;
 
         assert!(
             state.is_none(),

@@ -297,8 +297,11 @@ Decode the instruction against the escrow program IDL. Classify:
 
 Once root cause is known and any refund is coordinated, capture the
 row's full content in the incident record and delete it. The
-reconciliation orphan alert has no status filter, so a `failed` row
-keeps firing it forever; removal is the only way to silence the noise:
+reconciliation orphan check has no status filter and runs with in-memory
+per-id dedup, so a `failed` row stays silent in steady state but
+re-appears in the orphan log on every operator restart (logs only — no
+webhook). Deleting the row is the only way to remove that recurring
+boot-time noise:
 
 ```sql
 DELETE FROM transactions WHERE id = :transaction_id;
