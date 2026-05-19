@@ -222,7 +222,11 @@ fn convert_to_db_models(
 
     match &instruction_meta.instruction {
         ProgramInstruction::Escrow(escrow_ix) => match escrow_ix.as_ref() {
-            EscrowInstruction::Deposit { accounts, data } => {
+            EscrowInstruction::Deposit {
+                accounts,
+                data,
+                event,
+            } => {
                 let recipient = data
                     .recipient
                     .map(|r| r.to_string())
@@ -235,7 +239,7 @@ fn convert_to_db_models(
                             signature.clone(),
                             instruction_meta.slot,
                             accounts.mint.to_string(),
-                            data.amount,
+                            event.amount,
                         )
                         .initiator(accounts.user.to_string())
                         .recipient(recipient)
@@ -286,7 +290,7 @@ mod tests {
     use super::*;
     use crate::indexer::datasource::common::parser::{
         AllowMintAccounts, AllowMintData, AllowMintEvent, DepositAccounts, DepositData,
-        ResetSmtRootAccounts, WithdrawFundsAccounts, WithdrawFundsData,
+        DepositEvent, ResetSmtRootAccounts, WithdrawFundsAccounts, WithdrawFundsData,
     };
     use crate::storage::common::storage::mock::MockStorage;
     use solana_sdk::pubkey::Pubkey;
@@ -324,6 +328,10 @@ mod tests {
                     amount: 1000,
                     recipient,
                 },
+                // event.amount differs from data.amount to prove the operator
+                // is fed the event-reported received amount (e.g. net of a
+                // Token-2022 transfer fee), not the caller-requested amount.
+                event: DepositEvent { amount: 990 },
             })),
             slot,
             program_type: ProgramType::Escrow,
@@ -410,7 +418,9 @@ mod tests {
         let txn = txn.unwrap();
         assert_eq!(txn.signature, "sig1");
         assert_eq!(txn.slot, 100);
-        assert_eq!(txn.amount, 1000);
+        // event.amount = 990, data.amount = 1000 (see make_deposit_instruction).
+        // The DB row must carry the event-reported amount.
+        assert_eq!(txn.amount, 990);
         assert_eq!(txn.recipient, recipient.to_string());
         assert_eq!(txn.initiator, make_pubkey(1).to_string());
         assert!(matches!(txn.transaction_type, TransactionType::Deposit));
