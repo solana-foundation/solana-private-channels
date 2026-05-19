@@ -1188,12 +1188,14 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
         .execute(&pool)
         .await?
         .rows_affected();
-    assert_eq!(rows_deleted, 1, "Path E branch 3b must DELETE exactly the trigger row");
-    let exists: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE id=$1")
-            .bind(branch_3b_id)
-            .fetch_one(&pool)
-            .await?;
+    assert_eq!(
+        rows_deleted, 1,
+        "Path E branch 3b must DELETE exactly the trigger row"
+    );
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE id=$1")
+        .bind(branch_3b_id)
+        .fetch_one(&pool)
+        .await?;
     assert_eq!(exists, 0, "Path E branch 3b row must be gone after DELETE");
 
     // Control: a completed row must be untouched by either recovery —

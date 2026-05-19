@@ -123,7 +123,7 @@ async fn orphan_query_returns_deposit_with_no_allowlist_entry(
     let (storage, _pg) = start_postgres().await?;
 
     let orphan_mint = Pubkey::new_unique().to_string();
-    let orphan_id = insert_deposit_row(&storage,"sig_orphan", &orphan_mint).await?;
+    let orphan_id = insert_deposit_row(&storage, "sig_orphan", &orphan_mint).await?;
 
     let ids = storage.get_orphan_deposit_ids().await?;
     assert_eq!(
@@ -144,8 +144,8 @@ async fn orphan_query_excludes_allowlisted_deposits() -> Result<(), Box<dyn std:
     let (storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique().to_string();
-    insert_mint_row(&storage,&mint).await?;
-    insert_deposit_row(&storage,"sig_allowed", &mint).await?;
+    insert_mint_row(&storage, &mint).await?;
+    insert_deposit_row(&storage, "sig_allowed", &mint).await?;
 
     let ids = storage.get_orphan_deposit_ids().await?;
     assert!(
@@ -167,7 +167,7 @@ async fn orphan_query_excludes_withdrawals() -> Result<(), Box<dyn std::error::E
 
     // No mints row; transaction_type = withdrawal.
     let mint = Pubkey::new_unique().to_string();
-    insert_withdrawal_row(&storage,"sig_w", &mint).await?;
+    insert_withdrawal_row(&storage, "sig_w", &mint).await?;
 
     let ids = storage.get_orphan_deposit_ids().await?;
     assert!(
@@ -190,9 +190,9 @@ async fn orphan_query_returns_every_orphan_row() -> Result<(), Box<dyn std::erro
     let (storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique().to_string();
-    let id1 = insert_deposit_row(&storage,"sig_1", &mint).await?;
-    let id2 = insert_deposit_row(&storage,"sig_2", &mint).await?;
-    let id3 = insert_deposit_row(&storage,"sig_3", &mint).await?;
+    let id1 = insert_deposit_row(&storage, "sig_1", &mint).await?;
+    let id2 = insert_deposit_row(&storage, "sig_2", &mint).await?;
+    let id3 = insert_deposit_row(&storage, "sig_3", &mint).await?;
 
     let mut ids = storage.get_orphan_deposit_ids().await?;
     ids.sort();
@@ -215,10 +215,10 @@ async fn orphan_query_isolates_orphans_in_mixed_state() -> Result<(), Box<dyn st
 
     let allowed_mint = Pubkey::new_unique().to_string();
     let orphan_mint = Pubkey::new_unique().to_string();
-    insert_mint_row(&storage,&allowed_mint).await?;
+    insert_mint_row(&storage, &allowed_mint).await?;
 
-    insert_deposit_row(&storage,"sig_allowed", &allowed_mint).await?;
-    let orphan_id = insert_deposit_row(&storage,"sig_orphan", &orphan_mint).await?;
+    insert_deposit_row(&storage, "sig_allowed", &allowed_mint).await?;
+    let orphan_id = insert_deposit_row(&storage, "sig_orphan", &orphan_mint).await?;
 
     let ids = storage.get_orphan_deposit_ids().await?;
     assert_eq!(
@@ -243,7 +243,7 @@ async fn orphan_query_clears_when_allowmint_arrives_late() -> Result<(), Box<dyn
     let (storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique().to_string();
-    let orphan_id = insert_deposit_row(&storage,"sig_late", &mint).await?;
+    let orphan_id = insert_deposit_row(&storage, "sig_late", &mint).await?;
 
     // Tick 1: row is orphaned because mints is empty.
     let ids_before = storage.get_orphan_deposit_ids().await?;
@@ -254,7 +254,7 @@ async fn orphan_query_clears_when_allowmint_arrives_late() -> Result<(), Box<dyn
     );
 
     // AllowMint arrives.
-    insert_mint_row(&storage,&mint).await?;
+    insert_mint_row(&storage, &mint).await?;
 
     // Tick 2: same row is no longer orphaned.
     let ids_after = storage.get_orphan_deposit_ids().await?;
@@ -290,7 +290,7 @@ async fn assert_mint_allowlisted_against_real_postgres() -> Result<(), Box<dyn s
     let _ = err;
 
     // AllowMint lands.
-    insert_mint_row(&storage,&mint.to_string()).await?;
+    insert_mint_row(&storage, &mint.to_string()).await?;
 
     // Post-AllowMint: the gate accepts. A fresh cache is used to rule
     // out any in-memory shortcut — every call must consult the DB.
@@ -329,7 +329,7 @@ async fn assert_mint_allowlisted_does_not_cache_negative_result(
         .expect_err("first call must refuse the unknown mint");
 
     // AllowMint lands between the two calls.
-    insert_mint_row(&storage,&mint.to_string()).await?;
+    insert_mint_row(&storage, &mint.to_string()).await?;
 
     // Second call on the same cache: gate must consult the DB again
     // and accept. A cached "not allowlisted" answer here would be a
@@ -372,7 +372,7 @@ async fn gate_and_orphan_query_agree_on_same_row() -> Result<(), Box<dyn std::er
     let (storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique();
-    let orphan_id = insert_deposit_row(&storage,"sig_shared", &mint.to_string()).await?;
+    let orphan_id = insert_deposit_row(&storage, "sig_shared", &mint.to_string()).await?;
     let cache = MintCache::new(storage.clone());
 
     // ── Pre-AllowMint state ──────────────────────────────────────────────
@@ -389,7 +389,7 @@ async fn gate_and_orphan_query_agree_on_same_row() -> Result<(), Box<dyn std::er
     );
 
     // ── AllowMint lands ──────────────────────────────────────────────────
-    insert_mint_row(&storage,&mint.to_string()).await?;
+    insert_mint_row(&storage, &mint.to_string()).await?;
 
     // ── Post-AllowMint state ─────────────────────────────────────────────
     cache
