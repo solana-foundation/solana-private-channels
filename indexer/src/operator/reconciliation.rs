@@ -242,8 +242,10 @@ async fn check_orphan_deposit_mints(
         }
         Some(seen) => {
             // Delta pass, only NEW orphan rows (not in `seen`) get logged.
-            let new_orphans: Vec<i64> =
-                orphans.into_iter().filter(|id| !seen.contains(id)).collect();
+            let new_orphans: Vec<i64> = orphans
+                .into_iter()
+                .filter(|id| !seen.contains(id))
+                .collect();
 
             if new_orphans.is_empty() {
                 // Steady state, silent to avoid log spam on every tick.

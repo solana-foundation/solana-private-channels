@@ -16,7 +16,7 @@ Practically: a single deposit `manual_review` is a single row in trouble.
 Other deposits keep flowing. There is no collateral, no sweep, no halt to
 recover from.
 
-There are **two trigger surfaces** that can land a deposit in
+There are **three trigger surfaces** that can land a deposit in
 `manual_review`:
 
 1. **Processor-side row-data validation** — deterministic per-row error
@@ -25,6 +25,9 @@ There are **two trigger surfaces** that can land a deposit in
    mint-init helper found the on-chain mint in a state it cannot fix by
    re-issuing `mint_to` (wrong authority on the private channel mint, or
    corrupt mint data). See **Path D** for recovery.
+3. **Processor-side allowlist gate** — the deposit's `mint` has no row
+   in the `mints` allowlist (`MintCache::assert_mint_allowlisted`). Row
+   data is fine; no `MintTo` was attempted. See **Path E**.
 
 ## Symptom
 
@@ -33,8 +36,8 @@ There are **two trigger surfaces** that can land a deposit in
 
 ## Triage
 
-`error_message` distinguishes the two trigger surfaces and dispatches to
-the right Path below.
+`error_message` distinguishes the three trigger surfaces and dispatches
+to the right Path below.
 
 ### Processor-side surface (`processor.rs::process_deposit_funds`)
 
@@ -50,6 +53,12 @@ the right Path below.
 |---|---|
 | `Mint instruction failed after JIT: mint_authority mismatch` | The on-chain mint's `mint_authority` is not the operator's admin pubkey. Two known triggers: (a) an existing mint on the private channel is owned by a different authority and `mint_to` produced one of the three classified `InstructionError` variants (rare — the most common rotated-admin case produces `OwnerMismatch` → `Custom(3)`, which routes to `Failed` instead of here); (b) post-`InitializeMint` race where another party initialized the same mint with a different authority during our send window. |
 | `Mint instruction failed after JIT: corrupt mint state` | The mint's account data does not decode as a valid SPL Mint (`COption` discriminant invalid, length mismatched). Defensive — should not occur in normal operation; investigate before any recovery. |
+
+### Processor-side allowlist surface (`processor.rs::process_deposit_funds`)
+
+| `error_message` contains | Cause |
+|---|---|
+| `is not in the allow-listed mints table` | The deposit's `mint` has no row in `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint. Row data is fine; no on-chain mint attempted. See **Path E**. |
 
 Pull the row:
 
@@ -202,6 +211,108 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
+### Path E - mint not in `AllowMint` allowlist
+
+`error_message`: `is not in the allow-listed mints table`. The deposit's
+mint has no row in `mints`; the operator refused to mint on the private
+channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
+apply. Steps 1–2 diagnose *why* the allowlist row is missing; Steps 3a–3c
+are the recovery branches.
+
+#### Step 1 - check whether the gap closed on its own
+
+A race is possible: the gate fired because `mints` was empty at process
+time, but the indexer may have caught up since. Confirm the current state:
+
+```sql
+SELECT id, signature, mint, slot FROM transactions WHERE id = :transaction_id;
+SELECT * FROM mints WHERE mint_address = :mint;
+```
+
+If the second query now returns a row, the gap closed on its own. Skip to
+**Step 3a** re-arm — no backfill needed.
+
+#### Step 2 - was this mint ever authorized on-chain?
+
+If the gap is real, find out whether an `AllowMint` instruction was ever
+emitted. `mints` is populated by the indexer from `AllowMint` on the
+escrow program, scoped to the configured `escrow_instance_id`. Search
+the operator-admin's mainnet signature history:
+
+```bash
+solana transaction-history <operator-admin-pubkey> \
+  --url <solana-mainnet-rpc-url> --limit 1000
+```
+
+Decode candidates against the escrow program IDL. The verdict tells you
+which recovery branch to take:
+
+| Finding | Branch |
+|---|---|
+| Found, slot < deposit slot. | **3a — indexer gap.** |
+| Found, slot ≥ deposit slot. | **Escalate (Tier 1).** Retroactive allowlist; treasury policy call. |
+| Not found after a full pass. | **3b — terminal.** |
+| Found but bound to a different `instance`. | **3c — Tier 3 defect.** |
+
+#### Step 3a - backfill the missing `mints` row, then re-arm
+
+The mint *is* authorized on-chain; the indexer simply missed the event.
+Re-create the `mints` row so the operator's next attempt clears the gate.
+Either replay the indexer over the `AllowMint`'s slot (preferred — it's
+the same code path that runs in production), or insert directly. Values
+must match the on-chain mint and `AllowMint` flags:
+
+```sql
+INSERT INTO mints
+  (mint_address, decimals, token_program, is_pausable, has_permanent_delegate, created_at)
+VALUES
+  (:mint, :decimals, :token_program, :is_pausable, :has_permanent_delegate, NOW());
+
+UPDATE transactions SET status = 'pending', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+#### Step 3b - investigate why this happened, refund if needed, then delete
+
+The indexer wrote a deposit row for a mint that has no `AllowMint` —
+**this should not happen**. The deposit-side gate caught the symptom, but
+something upstream wrote the row in the first place. Identify the cause
+before clearing it:
+
+```bash
+solana confirm -v <signature> --url <solana-mainnet-rpc-url>
+```
+
+Decode the instruction against the escrow program IDL. Classify:
+
+- **User error** (depositor sent the wrong mint).
+  [Escalate](_escalation.md) (Tier 1) for refund coordination — manual
+  `release_funds` to the depositor.
+- **Indexer / instance-filtering defect** (row written from a
+  foreign-instance instruction or a non-`Deposit` instruction).
+  [Escalate](_escalation.md) (Tier 3) **first**; do not delete until
+  engineering confirms root cause and can reproduce against the live row.
+- **Manual DB insert.** [Escalate](_escalation.md) (Tier 3), capture
+  the offender, then delete.
+
+Once root cause is known and any refund is coordinated, capture the
+row's full content in the incident record and delete it. The
+reconciliation orphan alert has no status filter, so a `failed` row
+keeps firing it forever; removal is the only way to silence the noise:
+
+```sql
+DELETE FROM transactions WHERE id = :transaction_id;
+```
+
+**Do not re-arm** — the next tick fails the gate identically.
+
+#### Step 3c - foreign-instance `AllowMint`, stop and escalate
+
+The `AllowMint` exists but binds to a different escrow instance than
+ours. The operator should never see foreign-instance rows — this is the
+SOLA2-27 attack surface, not an operations recovery.
+[Escalate](_escalation.md) (Tier 3). No SQL.
+
 ## Post-incident artifacts
 
 - Transaction id, originating Solana `signature`, `recipient`, `mint`.
@@ -211,4 +322,7 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
 - For Path D: on-chain `mint_authority` before/after, the
   `spl-token authorize` signature (if applicable), and the engineering
   ticket for any mint-replacement coordination.
-
+- For Path E: which branch (3a/3b/3c), the `AllowMint` signature if
+  found, any backfill SQL, refund ticket, and — for 3b — the full
+  deleted row contents and the classified root cause (user error /
+  indexer defect / manual insert).
