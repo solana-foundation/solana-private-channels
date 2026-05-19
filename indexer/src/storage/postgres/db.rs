@@ -1046,6 +1046,25 @@ impl PostgresDb {
         .await
     }
 
+    /// `transactions.id` for every `deposit` row whose `mint` has no row
+    /// in `mints`. Returning IDs (not distinct mints) lets reconciliation
+    /// dedup per deposit row, so additional stuck deposits on an
+    /// already-known orphan mint still alert.
+    pub async fn get_orphan_deposit_ids_internal(&self) -> Result<Vec<i64>, sqlx::Error> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT t.id
+            FROM transactions t
+            LEFT JOIN mints m ON m.mint_address = t.mint
+            WHERE t.transaction_type = 'deposit'
+              AND m.mint_address IS NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     pub async fn close(&self) -> Result<(), sqlx::Error> {
         info!("Closing database connection pool...");
         self.pool.close().await;

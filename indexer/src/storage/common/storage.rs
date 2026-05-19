@@ -10,6 +10,7 @@ pub mod get_completed_withdrawal_nonces;
 pub mod get_escrow_balances_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
+pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod init_schema;
@@ -174,6 +175,18 @@ impl Storage {
     /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
+    }
+
+    /// `transactions.id` for every `deposit` row whose `mint` has no entry
+    /// in `mints` (the allowlist populated from on-chain `AllowMint`).
+    ///
+    /// A non-empty result means the indexer recorded a deposit for a mint
+    /// that was never allowlisted, a trust-boundary leak. Reconciliation
+    /// queries this to alert on any such rows; they describe the same
+    /// condition the deposit-side gate (`assert_mint_allowlisted`)
+    /// refuses at process time. So, this is a second line of defense.
+    pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {
+        get_orphan_deposit_ids::get_orphan_deposit_ids(self).await
     }
 
     /// Close the storage connection pool gracefully

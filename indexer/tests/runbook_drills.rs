@@ -282,6 +282,14 @@ fn drill_1_error_message_contracts_present_in_source() {
             "private_channel:mint-idempotency:",
             "indexer/src/operator/constants.rs",
         ),
+        // Deposit — processor-side allowlist gate (Path E). The runbook
+        // dispatches on the user-visible portion of
+        // `OperatorError::MintNotAllowed`'s `#[error(...)]` template; if
+        // that string is refactored, the triage table desyncs silently.
+        (
+            "is not in the allow-listed mints table",
+            "indexer/src/error/operator.rs",
+        ),
     ];
 
     // The integration test runs from the indexer crate root.
@@ -1053,6 +1061,158 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
     );
 
     eprintln!("Path D recovery flows verified end-to-end.");
+    Ok(())
+}
+
+// ── Drill 15: deposit_manual_review.md § Path E recovery flows ─────────────
+//
+// `deposit_manual_review.md` § Path E documents recovery for the
+// processor-side allowlist gate (`require_known_mint` rejects a deposit
+// whose mint has no row in `mints`). This drill pins:
+//
+//   1. The dispatch substring exists in source — `OperatorError::MintNotAllowed`'s
+//      `#[error(...)]` template lives in `error/operator.rs`, and is also
+//      anchored globally by drill_1.
+//   2. The classifier routes `MintNotAllowed` to a quarantine reason of
+//      `mint_not_allowed`, and the call to `require_known_mint` is
+//      still wired into `process_deposit_funds`. A future refactor that
+//      drops either of these breaks Path E silently.
+//   3. Path E recovery SQL is fungible across sub-branches: 3a re-arms
+//      to `pending`, 3b marks `failed`. Both are id-targeted, both
+//      coexist with unrelated rows.
+//   4. The reconciliation cross-signal contract — the runbook references
+//      `orphan_deposit_mint` and that payload kind exists in
+//      `reconciliation.rs`.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
+) -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "deposit_manual_review.md",
+        "Path E — processor-side allowlist gate",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+
+    // ── Step 1: dispatch substring + variant present in operator.rs ──
+    let operator_err_path = workspace_root.join("indexer/src/error/operator.rs");
+    let operator_err = std::fs::read_to_string(&operator_err_path)
+        .unwrap_or_else(|e| panic!("read {operator_err_path:?}: {e}"));
+    assert!(
+        operator_err.contains("MintNotAllowed"),
+        "Path E depends on OperatorError::MintNotAllowed — variant missing from operator.rs",
+    );
+    assert!(
+        operator_err.contains("is not in the allow-listed mints table"),
+        "Path E triage dispatches on this substring — missing from operator.rs",
+    );
+    eprintln!("OK   error/operator.rs: MintNotAllowed + dispatch substring");
+
+    // ── Step 2: classifier label + processor wiring ──────────────────
+    let processor_path = workspace_root.join("indexer/src/operator/processor.rs");
+    let processor = std::fs::read_to_string(&processor_path)
+        .unwrap_or_else(|e| panic!("read {processor_path:?}: {e}"));
+    assert!(
+        processor.contains("mint_not_allowed"),
+        "Classifier must label MintNotAllowed quarantines as \"mint_not_allowed\" — \
+         drives the OPERATOR_TRANSACTION_QUARANTINED metric the runbook references",
+    );
+    assert!(
+        processor.contains("assert_mint_allowlisted"),
+        "process_deposit_funds must call assert_mint_allowlisted — Path E's \
+         entire trigger surface depends on this gate firing before the sender path",
+    );
+    eprintln!("OK   processor.rs: \"mint_not_allowed\" label + assert_mint_allowlisted call");
+
+    // ── Step 3: cross-signal contract with reconciliation ────────────
+    // Path E's recovery for the terminal branch tells the on-call that
+    // the reconciliation orphan alert is the same incident — so the
+    // runbook must reference that alert, and reconciliation must
+    // actually run the orphan-mint check. Anchor each side concretely.
+    let reconciliation_path = workspace_root.join("indexer/src/operator/reconciliation.rs");
+    let reconciliation = std::fs::read_to_string(&reconciliation_path)
+        .unwrap_or_else(|e| panic!("read {reconciliation_path:?}: {e}"));
+    assert!(
+        reconciliation.contains("check_orphan_deposit_mints"),
+        "Reconciliation must run `check_orphan_deposit_mints` — the orphan \
+         alert Path E's recovery refers to",
+    );
+    let runbook_path = workspace_root.join("docs/runbooks/deposit_manual_review.md");
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
+    assert!(
+        runbook.contains("reconciliation orphan alert"),
+        "deposit_manual_review.md Path E must reference the reconciliation \
+         orphan alert — without it, on-call triages the same incident twice",
+    );
+    eprintln!("OK   reconciliation.rs + runbook: orphan-alert cross-link");
+
+    // ── Step 4: recovery SQL fungibility (3a re-arm, 3b mark-failed) ─
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    // Three deposits: one for each sub-branch we exercise, plus a
+    // terminal control to confirm the recovery SQL is targeted by id
+    // and never sweeps unrelated rows.
+    let branch_3a_id = seed_deposit(&pool, "manual_review").await?;
+    let branch_3b_id = seed_deposit(&pool, "manual_review").await?;
+    let control_id = seed_deposit(&pool, "completed").await?;
+
+    // 3a — indexer-gap branch: after the operator backfills `mints`,
+    // re-arm the row to `pending`. SQL must be id-targeted and not
+    // reference `error_message` (drill_14's fungibility contract).
+    sqlx::query("UPDATE transactions SET status='pending', updated_at=NOW() WHERE id=$1")
+        .bind(branch_3a_id)
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        status_of(&pool, branch_3a_id).await?,
+        "pending",
+        "Path E branch 3a re-arm must flip manual_review → pending",
+    );
+
+    // 3b — not-allowlisted branch: terminal `failed`, refund out-of-band.
+    sqlx::query("UPDATE transactions SET status='failed', updated_at=NOW() WHERE id=$1")
+        .bind(branch_3b_id)
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        status_of(&pool, branch_3b_id).await?,
+        "failed",
+        "Path E branch 3b must terminate the row as failed",
+    );
+
+    // Control: a completed row must be untouched by either recovery.
+    assert_eq!(
+        status_of(&pool, control_id).await?,
+        "completed",
+        "unrelated terminal rows must be untouched by Path E recovery",
+    );
+
+    // 3c — foreign-instance branch: documented as escalate-only, no
+    // recovery SQL. The contract here is the absence of any mutating
+    // SQL after the Step 3c heading; mirror drill_13's "no mutating
+    // SQL" check rather than execute anything against the pool.
+    let step_3c_idx = runbook
+        .find("Step 3c")
+        .expect("Path E Step 3c heading must exist");
+    let step_3c_section = &runbook[step_3c_idx..];
+    let next_section_idx = step_3c_section[1..]
+        .find("\n## ")
+        .map(|i| i + 1)
+        .unwrap_or(step_3c_section.len());
+    let step_3c_body = &step_3c_section[..next_section_idx];
+    assert!(
+        !step_3c_body.contains("UPDATE transactions") && !step_3c_body.contains("INSERT INTO"),
+        "Path E Step 3c (foreign-instance) must contain no mutating SQL — \
+         escalate-only per the runbook",
+    );
+    eprintln!("OK   Step 3c body contains no mutating SQL");
+
+    eprintln!("Path E recovery flows verified end-to-end.");
     Ok(())
 }
 

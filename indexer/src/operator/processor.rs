@@ -127,6 +127,7 @@ enum ErrorDisposition {
 fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
     match err {
         OperatorError::InvalidPubkey { .. } => ErrorDisposition::Quarantine("invalid_pubkey"),
+        OperatorError::MintNotAllowed { .. } => ErrorDisposition::Quarantine("mint_not_allowed"),
         OperatorError::Program(ProgramError::InvalidBuilder { .. }) => {
             ErrorDisposition::Quarantine("invalid_builder")
         }
@@ -659,6 +660,18 @@ pub async fn process_deposit_funds(
                 }
             })?;
 
+            // Refuse to mint when the mint has no row in the `mints`
+            // allowlist. If we minted anyway, two things would break:
+            //   1. We'd issue PrivateChannel tokens with no Mainnet escrow
+            //      backing them.
+            //   2. Reconciliation wouldn't catch it: the balance check
+            //      only scans mints listed in `mints`, so the mismatch
+            //      never fires.
+            processor_state
+                .mint_cache
+                .assert_mint_allowlisted(&mint, transaction.id)
+                .await?;
+
             let token_program = processor_state
                 .mint_cache
                 .get_private_channel_token_program();
@@ -739,6 +752,7 @@ mod tests {
     use super::*;
     use crate::error::{AccountError, StorageError, TransactionError};
     use crate::operator::find_allowed_mint_pda;
+    use crate::storage::common::models::DbMint;
     use crate::storage::common::models::TransactionType;
     use crate::storage::common::storage::mock::MockStorage;
 
@@ -807,6 +821,25 @@ mod tests {
             state.get_instance_ata(&mint_b, &tp)
         );
         assert_eq!(state.instance_atas.len(), 2);
+    }
+
+    /// Insert a minimal `mints` row so `assert_mint_allowlisted` accepts the mint.
+    fn insert_mint_row(storage: &Arc<Storage>, mint: &Pubkey) {
+        let mock_storage = match storage.as_ref() {
+            Storage::Mock(m) => m,
+            _ => unreachable!("test helper expects Storage::Mock"),
+        };
+        mock_storage.mints.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: spl_token::id().to_string(),
+                created_at: chrono::Utc::now(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(false),
+            },
+        );
     }
 
     fn make_db_transaction(
@@ -1083,6 +1116,7 @@ mod tests {
 
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
+        insert_mint_row(&storage, &mint_pubkey);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -1798,7 +1832,7 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
@@ -1806,10 +1840,12 @@ mod tests {
         let (storage_tx, _storage_rx) = mpsc::channel(16);
 
         for id in 1..=3 {
+            let mint = Pubkey::new_unique();
+            insert_mint_row(&storage, &mint);
             fetcher_tx
                 .send(make_db_transaction(
                     id,
-                    &Pubkey::new_unique().to_string(),
+                    &mint.to_string(),
                     &Pubkey::new_unique().to_string(),
                     None,
                     crate::storage::common::models::TransactionType::Deposit,
@@ -1850,12 +1886,17 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: None,
-            mint_cache: crate::operator::MintCache::new(storage),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(16);
         let (storage_tx, mut storage_rx) = mpsc::channel(16);
+
+        let valid_mint_2 = Pubkey::new_unique();
+        let valid_mint_4 = Pubkey::new_unique();
+        insert_mint_row(&storage, &valid_mint_2);
+        insert_mint_row(&storage, &valid_mint_4);
 
         // poison, valid, poison, valid
         fetcher_tx
@@ -1871,7 +1912,7 @@ mod tests {
         fetcher_tx
             .send(make_db_transaction(
                 2,
-                &Pubkey::new_unique().to_string(),
+                &valid_mint_2.to_string(),
                 &Pubkey::new_unique().to_string(),
                 None,
                 crate::storage::common::models::TransactionType::Deposit,
@@ -1891,7 +1932,7 @@ mod tests {
         fetcher_tx
             .send(make_db_transaction(
                 4,
-                &Pubkey::new_unique().to_string(),
+                &valid_mint_4.to_string(),
                 &Pubkey::new_unique().to_string(),
                 None,
                 crate::storage::common::models::TransactionType::Deposit,
@@ -2263,6 +2304,140 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "no ManualReview update should have been sent",
+        );
+    }
+
+    /// A deposit whose mint has no `mints` row is quarantined for manual
+    /// review, the quarantine reason mentions the allow-list, and no
+    /// `Mint` builder is forwarded to the sender.
+    #[tokio::test]
+    async fn process_deposit_funds_quarantines_when_mint_not_in_db() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        // Mint pubkey is valid base58 but is NOT inserted into `mints`.
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let txn = make_db_transaction(
+            99,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            None,
+            crate::storage::common::models::TransactionType::Deposit,
+        );
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            ProgramType::Escrow,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "quarantine must not propagate as an error, got: {:?}",
+            result
+        );
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a quarantine update must be sent");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(update.transaction_id, 99);
+        let reason = update
+            .error_message
+            .as_deref()
+            .expect("quarantine update must include a reason");
+        assert!(
+            reason.contains("allow-listed") || reason.contains("not in the allow"),
+            "expected reason to mention the mint allow-list, got: {reason}",
+        );
+
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "no Mint builder should be forwarded for an unknown mint",
+        );
+    }
+
+    /// Happy-path guard: a deposit whose mint IS registered in `mints`
+    /// produces a `Mint` builder with the expected recipient/amount.
+    /// Protects against a future regression that accidentally always
+    /// quarantines the deposit path.
+    #[tokio::test]
+    async fn process_deposit_funds_forwards_mint_when_mint_present() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        // Seed the allowlist row so `assert_mint_allowlisted` accepts this mint, so the
+        // mint must be present for the deposit to forward to the sender.
+        insert_mint_row(&storage, &mint_pubkey);
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let txn = make_db_transaction(
+            7,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            None,
+            crate::storage::common::models::TransactionType::Deposit,
+        );
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            ProgramType::Escrow,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let msg = sender_rx.recv().await.expect("Mint builder should be sent");
+        let TransactionBuilder::Mint(b) = msg else {
+            panic!("expected Mint, got a different variant");
+        };
+        assert_eq!(b.txn_id, 7);
+        // `amount` comes from make_db_transaction (1000).
+        assert_eq!(b.builder.get_amount(), Some(1000));
+        assert_eq!(b.builder.get_mint(), Some(mint_pubkey));
+        // The processor wraps the SPL recipient as an ATA derived from
+        // (recipient, mint) — verify the derivation matches.
+        let expected_ata = get_associated_token_address_with_program_id(
+            &recipient,
+            &mint_pubkey,
+            &spl_token::id(),
+        );
+        assert_eq!(b.builder.get_recipient_ata(), Some(expected_ata));
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "happy-path deposit must not emit a quarantine update",
         );
     }
 }
