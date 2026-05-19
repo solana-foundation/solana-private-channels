@@ -267,6 +267,12 @@ pub async fn run(
     // 8. Start transaction processor
     let mut transaction_processor =
         TransactionProcessor::new(storage.clone(), checkpoint_tx.clone());
+    // Wire the escrow instance scope. Config validation guarantees Some for the
+    // Escrow program; None here means the Withdraw program, where no instance
+    // scoping applies.
+    if let Some(instance_id) = common_config.escrow_instance_id {
+        transaction_processor = transaction_processor.with_escrow_instance_id(instance_id);
+    }
     if let Some(h) = health.clone() {
         transaction_processor = transaction_processor.with_health(h);
     }

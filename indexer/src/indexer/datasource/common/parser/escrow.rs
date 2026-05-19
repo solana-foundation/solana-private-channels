@@ -209,6 +209,17 @@ pub struct DepositEvent {
 // ******************************************************************************************
 // Parse instructions
 // ******************************************************************************************
+/// Return the `accounts.instance` carried by any escrow instruction variant.
+pub fn escrow_instance_of(ix: &EscrowInstruction) -> Pubkey {
+    match ix {
+        EscrowInstruction::CreateInstance { accounts, .. } => accounts.instance,
+        EscrowInstruction::AllowMint { accounts, .. } => accounts.instance,
+        EscrowInstruction::Deposit { accounts, .. } => accounts.instance,
+        EscrowInstruction::ReleaseFunds { accounts, .. } => accounts.instance,
+        EscrowInstruction::ResetSmtRoot { accounts, .. } => accounts.instance,
+    }
+}
+
 /// Parse a single PrivateChannel Escrow instruction
 pub fn parse_escrow_instruction(
     instruction: &CompiledInstruction,

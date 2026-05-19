@@ -6,7 +6,7 @@ use crate::{
     indexer::{
         checkpoint::CheckpointUpdate,
         datasource::common::{
-            parser::{EscrowInstruction, WithdrawInstruction},
+            parser::{escrow_instance_of, EscrowInstruction, WithdrawInstruction},
             types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
         },
     },
@@ -16,6 +16,7 @@ use crate::{
     },
 };
 use private_channel_metrics::{HealthState, MetricLabel};
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -36,6 +37,8 @@ pub struct TransactionProcessor {
     // Optional health state — bumped on each SlotComplete so /health knows the
     // indexer pipeline is making progress. None in tests / standalone uses.
     health: Option<Arc<HealthState>>,
+
+    configured_escrow_instance_id: Option<Pubkey>,
 }
 
 impl TransactionProcessor {
@@ -47,11 +50,17 @@ impl TransactionProcessor {
             current_program_type: None,
             current_slot_instructions: Vec::new(),
             health: None,
+            configured_escrow_instance_id: None,
         }
     }
 
     pub fn with_health(mut self, health: Arc<HealthState>) -> Self {
         self.health = Some(health);
+        self
+    }
+
+    pub fn with_escrow_instance_id(mut self, escrow_instance_id: Pubkey) -> Self {
+        self.configured_escrow_instance_id = Some(escrow_instance_id);
         self
     }
 
@@ -94,7 +103,10 @@ impl TransactionProcessor {
         let mut transactions = Vec::new();
 
         for instruction_meta in &self.current_slot_instructions {
-            let (mint_opt, transaction_opt) = convert_to_db_models(instruction_meta);
+            let (mint_opt, transaction_opt) = convert_to_db_models(
+                instruction_meta,
+                self.configured_escrow_instance_id.as_ref(),
+            );
 
             if let Some(mint) = mint_opt {
                 mints.push(mint);
@@ -211,9 +223,13 @@ impl TransactionProcessor {
 
 /// Convert an instruction to either a DbMint or DbTransaction model
 ///
-/// Returns None for instructions that shouldn't be tracked in the database
+/// Returns None for instructions that shouldn't be tracked in the database.
+/// Escrow instructions whose `accounts.instance` does not equal the configured
+/// escrow instance are dropped here; this is the per-instruction scoping that
+/// keeps a foreign instance from being persisted via this processor.
 fn convert_to_db_models(
     instruction_meta: &InstructionWithMetadata,
+    configured_escrow_instance_id: Option<&Pubkey>,
 ) -> (Option<DbMint>, Option<DbTransaction>) {
     let signature = match instruction_meta.signature.as_ref() {
         Some(sig) => sig,
@@ -221,45 +237,52 @@ fn convert_to_db_models(
     };
 
     match &instruction_meta.instruction {
-        ProgramInstruction::Escrow(escrow_ix) => match escrow_ix.as_ref() {
-            EscrowInstruction::Deposit {
-                accounts,
-                data,
-                event,
-            } => {
-                let recipient = data
-                    .recipient
-                    .map(|r| r.to_string())
-                    .unwrap_or_else(|| accounts.user.to_string());
-
-                (
-                    None,
-                    Some(
-                        DbTransactionBuilder::new(
-                            signature.clone(),
-                            instruction_meta.slot,
-                            accounts.mint.to_string(),
-                            event.amount,
-                        )
-                        .initiator(accounts.user.to_string())
-                        .recipient(recipient)
-                        .transaction_type(TransactionType::Deposit)
-                        .build(),
-                    ),
-                )
+        ProgramInstruction::Escrow(escrow_ix) => {
+            // Drop any escrow ix not scoped to the configured instance.
+            // `None` configured => drop all (fail-closed).
+            if configured_escrow_instance_id != Some(&escrow_instance_of(escrow_ix)) {
+                return (None, None);
             }
-            EscrowInstruction::AllowMint {
-                accounts, event, ..
-            } => (
-                Some(DbMint::new(
-                    accounts.mint.to_string(),
-                    event.decimals as i16,
-                    accounts.token_program.to_string(),
-                )),
-                None,
-            ),
-            _ => (None, None),
-        },
+            match escrow_ix.as_ref() {
+                EscrowInstruction::Deposit {
+                    accounts,
+                    data,
+                    event,
+                } => {
+                    let recipient = data
+                        .recipient
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| accounts.user.to_string());
+
+                    (
+                        None,
+                        Some(
+                            DbTransactionBuilder::new(
+                                signature.clone(),
+                                instruction_meta.slot,
+                                accounts.mint.to_string(),
+                                event.amount,
+                            )
+                            .initiator(accounts.user.to_string())
+                            .recipient(recipient)
+                            .transaction_type(TransactionType::Deposit)
+                            .build(),
+                        ),
+                    )
+                }
+                EscrowInstruction::AllowMint {
+                    accounts, event, ..
+                } => (
+                    Some(DbMint::new(
+                        accounts.mint.to_string(),
+                        event.decimals as i16,
+                        accounts.token_program.to_string(),
+                    )),
+                    None,
+                ),
+                _ => (None, None),
+            }
+        }
 
         ProgramInstruction::Withdraw(withdraw_ix) => match withdraw_ix.as_ref() {
             WithdrawInstruction::WithdrawFunds { accounts, data } => {
@@ -301,6 +324,21 @@ mod tests {
         Pubkey::new_from_array(bytes)
     }
 
+    /// Instance pubkey hardcoded by `make_deposit_instruction`.
+    fn deposit_instance() -> Pubkey {
+        make_pubkey(11)
+    }
+
+    /// Instance pubkey hardcoded by `make_allow_mint_instruction`.
+    fn allow_mint_instance() -> Pubkey {
+        make_pubkey(12)
+    }
+
+    /// Instance pubkey hardcoded by `make_reset_smt_root_instruction`.
+    fn reset_smt_instance() -> Pubkey {
+        make_pubkey(12)
+    }
+
     fn make_deposit_instruction(
         slot: u64,
         sig: Option<String>,
@@ -313,7 +351,7 @@ mod tests {
                 accounts: DepositAccounts {
                     payer: make_pubkey(10),
                     user,
-                    instance: make_pubkey(11),
+                    instance: deposit_instance(),
                     mint,
                     allowed_mint: make_pubkey(12),
                     user_ata: make_pubkey(13),
@@ -345,7 +383,7 @@ mod tests {
                 accounts: AllowMintAccounts {
                     payer: make_pubkey(10),
                     admin: make_pubkey(11),
-                    instance: make_pubkey(12),
+                    instance: allow_mint_instance(),
                     mint: make_pubkey(2),
                     allowed_mint: make_pubkey(13),
                     instance_ata: make_pubkey(14),
@@ -393,7 +431,7 @@ mod tests {
                 accounts: ResetSmtRootAccounts {
                     payer: make_pubkey(10),
                     operator: make_pubkey(11),
-                    instance: make_pubkey(12),
+                    instance: reset_smt_instance(),
                     operator_pda: make_pubkey(13),
                     event_authority: make_pubkey(14),
                     private_channel_escrow_program: make_pubkey(15),
@@ -413,7 +451,7 @@ mod tests {
     fn convert_deposit_with_explicit_recipient() {
         let recipient = make_pubkey(99);
         let ix = make_deposit_instruction(100, Some("sig1".to_string()), Some(recipient));
-        let (mint, txn) = convert_to_db_models(&ix);
+        let (mint, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
         assert!(mint.is_none());
         let txn = txn.unwrap();
         assert_eq!(txn.signature, "sig1");
@@ -429,7 +467,7 @@ mod tests {
     #[test]
     fn convert_deposit_none_recipient_defaults_to_user() {
         let ix = make_deposit_instruction(50, Some("sig2".to_string()), None);
-        let (_, txn) = convert_to_db_models(&ix);
+        let (_, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
         let txn = txn.unwrap();
         // recipient should default to accounts.user
         assert_eq!(txn.recipient, make_pubkey(1).to_string());
@@ -438,7 +476,7 @@ mod tests {
     #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
         let ix = make_allow_mint_instruction(200, Some("sig3".to_string()));
-        let (mint, txn) = convert_to_db_models(&ix);
+        let (mint, txn) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         assert!(txn.is_none());
         let mint = mint.unwrap();
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
@@ -452,7 +490,7 @@ mod tests {
     #[test]
     fn convert_withdraw_funds() {
         let ix = make_withdraw_instruction(300, Some("sig4".to_string()));
-        let (mint, txn) = convert_to_db_models(&ix);
+        let (mint, txn) = convert_to_db_models(&ix, None);
         assert!(mint.is_none());
         let txn = txn.unwrap();
         assert_eq!(txn.amount, 500);
@@ -463,7 +501,7 @@ mod tests {
     #[test]
     fn convert_no_signature_returns_none() {
         let ix = make_deposit_instruction(100, None, None);
-        let (mint, txn) = convert_to_db_models(&ix);
+        let (mint, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
         assert!(mint.is_none());
         assert!(txn.is_none());
     }
@@ -471,7 +509,77 @@ mod tests {
     #[test]
     fn convert_catchall_escrow_variant_returns_none() {
         let ix = make_reset_smt_root_instruction(100, Some("sig5".to_string()));
-        let (mint, txn) = convert_to_db_models(&ix);
+        let (mint, txn) = convert_to_db_models(&ix, Some(&reset_smt_instance()));
+        assert!(mint.is_none());
+        assert!(txn.is_none());
+    }
+
+    #[test]
+    fn convert_drops_deposit_targeting_foreign_instance() {
+        let watched = deposit_instance();
+        let foreign = make_pubkey(99);
+
+        let ix = InstructionWithMetadata {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::Deposit {
+                accounts: DepositAccounts {
+                    payer: make_pubkey(10),
+                    user: make_pubkey(1),
+                    instance: foreign,
+                    mint: make_pubkey(2),
+                    allowed_mint: make_pubkey(12),
+                    user_ata: make_pubkey(13),
+                    instance_ata: make_pubkey(14),
+                    system_program: make_pubkey(15),
+                    token_program: make_pubkey(16),
+                    associated_token_program: make_pubkey(17),
+                    event_authority: make_pubkey(18),
+                    private_channel_escrow_program: make_pubkey(19),
+                },
+                data: DepositData {
+                    amount: 1000,
+                    recipient: None,
+                },
+                event: DepositEvent { amount: 1000 },
+            })),
+            slot: 100,
+            program_type: ProgramType::Escrow,
+            signature: Some("sig_exploit".to_string()),
+        };
+
+        let (mint, txn) = convert_to_db_models(&ix, Some(&watched));
+        assert!(mint.is_none());
+        assert!(txn.is_none());
+    }
+
+    #[test]
+    fn convert_drops_allow_mint_targeting_foreign_instance() {
+        let watched = allow_mint_instance();
+        let foreign = make_pubkey(99);
+
+        let ix = InstructionWithMetadata {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::AllowMint {
+                accounts: AllowMintAccounts {
+                    payer: make_pubkey(10),
+                    admin: make_pubkey(11),
+                    instance: foreign,
+                    mint: make_pubkey(2),
+                    allowed_mint: make_pubkey(13),
+                    instance_ata: make_pubkey(14),
+                    system_program: make_pubkey(15),
+                    token_program: make_pubkey(16),
+                    associated_token_program: make_pubkey(17),
+                    event_authority: make_pubkey(18),
+                    private_channel_escrow_program: make_pubkey(19),
+                },
+                data: AllowMintData { bump: 255 },
+                event: AllowMintEvent { decimals: 6 },
+            })),
+            slot: 200,
+            program_type: ProgramType::Escrow,
+            signature: Some("sig_exploit".to_string()),
+        };
+
+        let (mint, txn) = convert_to_db_models(&ix, Some(&watched));
         assert!(mint.is_none());
         assert!(txn.is_none());
     }
@@ -480,18 +588,23 @@ mod tests {
     // TransactionProcessor tests
     // ========================================================================
 
-    fn make_processor_and_rx() -> (
+    fn make_processor_and_rx(
+        escrow_instance_id: Pubkey,
+    ) -> (
         TransactionProcessor,
         tokio::sync::mpsc::Receiver<CheckpointUpdate>,
     ) {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let (checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::channel(100);
-        let processor = TransactionProcessor::new(storage, checkpoint_tx);
+        let processor = TransactionProcessor::new(storage, checkpoint_tx)
+            .with_escrow_instance_id(escrow_instance_id);
         (processor, checkpoint_rx)
     }
 
-    fn make_processor_with_mock() -> (
+    fn make_processor_with_mock(
+        escrow_instance_id: Pubkey,
+    ) -> (
         TransactionProcessor,
         tokio::sync::mpsc::Receiver<CheckpointUpdate>,
         MockStorage,
@@ -499,13 +612,14 @@ mod tests {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let (checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::channel(100);
-        let processor = TransactionProcessor::new(storage, checkpoint_tx);
+        let processor = TransactionProcessor::new(storage, checkpoint_tx)
+            .with_escrow_instance_id(escrow_instance_id);
         (processor, checkpoint_rx, mock)
     }
 
     #[tokio::test]
     async fn finalize_empty_slot_sends_checkpoint() {
-        let (mut processor, mut checkpoint_rx) = make_processor_and_rx();
+        let (mut processor, mut checkpoint_rx) = make_processor_and_rx(deposit_instance());
         processor
             .finalize_and_checkpoint(42, ProgramType::Escrow)
             .await;
@@ -517,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_with_deposits_inserts_batch() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
         processor
             .current_slot_instructions
             .push(make_deposit_instruction(100, Some("s1".to_string()), None));
@@ -537,7 +651,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_with_mints_upserts_first() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         processor
             .current_slot_instructions
             .push(make_allow_mint_instruction(200, Some("s2".to_string())));
@@ -557,7 +672,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_upsert_mints_failure_skips_checkpoint() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("upsert_mints_batch", true);
         processor
             .current_slot_instructions
@@ -572,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_insert_batch_failure_skips_checkpoint() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
         mock.set_should_fail("insert_db_transactions_batch", true);
         processor
             .current_slot_instructions
@@ -586,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_processes_instruction_then_slot_complete() {
-        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
         let (tx, rx) = tokio::sync::mpsc::channel(10);
 
         let ix = make_deposit_instruction(500, Some("s5".to_string()), None);
@@ -613,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_channel_close_exits_ok() {
-        let (processor, _checkpoint_rx) = make_processor_and_rx();
+        let (processor, _checkpoint_rx) = make_processor_and_rx(deposit_instance());
         let (_tx, rx) = tokio::sync::mpsc::channel(10);
         drop(_tx);
 
