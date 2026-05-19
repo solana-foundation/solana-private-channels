@@ -1,6 +1,6 @@
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     error::StorageError,
@@ -800,13 +800,16 @@ impl PostgresDb {
         Ok(transactions)
     }
 
+    /// Returns `Ok(true)` if the row was updated, `Ok(false)` if it was
+    /// skipped (no longer in `Processing`). Callers branch on the bool to
+    /// avoid counting no-op writes as successful DB updates.
     pub async fn update_transaction_status_internal(
         &self,
         transaction_id: i64,
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         // The `status = 'processing'` filter protects against this race:
         // recovery has already moved a stuck row off `Processing`, but a
         // late confirmation from the original (now-crashed) sender is
@@ -830,14 +833,7 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
-        if result.rows_affected() == 0 {
-            warn!(
-                transaction_id,
-                "terminal write skipped: row no longer in processing"
-            );
-        }
-
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// Rows stuck in `Processing` whose `updated_at` is older than the

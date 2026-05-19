@@ -96,6 +96,7 @@ pub async fn run_recovery_worker(
                     admin_pubkey,
                     program_type,
                     &storage_tx,
+                    &cancellation_token,
                 )
                 .await
                 {
@@ -116,6 +117,7 @@ async fn recover_once(
     admin_pubkey: Pubkey,
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
     let stale = storage
         .get_stale_processing_transactions(STALE_THRESHOLD, RECOVERY_BATCH_LIMIT)
@@ -131,6 +133,16 @@ async fn recover_once(
     );
 
     for row in stale {
+        // Cooperate with shutdown between rows. With a batch of up to 100
+        // rows and sequential RPC calls per deposit, a tick can run long
+        // enough to overshoot the shutdown drain budget. Drop the
+        // remaining batch and let the next boot pick up where we left off.
+        if cancellation_token.is_cancelled() {
+            info!(
+                "Recovery sweep interrupted by cancellation; remaining rows deferred to next boot"
+            );
+            return Ok(());
+        }
         // Read `updated_at` now, before the (possibly slow) RPC call. We
         // pass it to the write below as a "this row hasn't changed since I
         // looked" check, if anyone else touches the row in between, the
@@ -340,7 +352,19 @@ async fn route_outcome(
                         remint_signature: None,
                         remint_attempted: false,
                     };
-                    let _ = send_guaranteed(storage_tx, update, "recovery manual review").await;
+                    // The webhook + alert log are how on-call learns about
+                    // this quarantine. If the storage channel is closed
+                    // (e.g. mid-shutdown the writer exited first), the row
+                    // is still correctly quarantined in the DB, but the
+                    // alert is lost — flag it so the gap is visible.
+                    if let Err(e) =
+                        send_guaranteed(storage_tx, update, "recovery manual review").await
+                    {
+                        warn!(
+                            transaction_id = row.id,
+                            "Recovery quarantined row but failed to deliver alert webhook: {}", e
+                        );
+                    }
                 }
                 Ok(false) => {
                     debug!(
@@ -366,7 +390,18 @@ pub mod test_hooks {
         program_type: ProgramType,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
-        recover_once(storage, rpc_client, admin_pubkey, program_type, storage_tx).await
+        // Tests don't exercise cancellation here — pass a fresh, never-cancelled
+        // token so the sweep runs to completion deterministically.
+        let token = CancellationToken::new();
+        recover_once(
+            storage,
+            rpc_client,
+            admin_pubkey,
+            program_type,
+            storage_tx,
+            &token,
+        )
+        .await
     }
 }
 

@@ -184,15 +184,36 @@ impl MockStorage {
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: DateTime<Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.check_should_fail("update_transaction_status")?;
+        // Mirror the Postgres `WHERE status = 'processing'` filter so
+        // tests exercise the same no-op-when-already-moved behavior as
+        // production. A row that's already off Processing is not written.
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
+            if txn.status == TransactionStatus::Processing {
+                txn.status = status;
+                if counterpart_signature.is_some() {
+                    txn.counterpart_signature = counterpart_signature.clone();
+                }
+                txn.processed_at = Some(processed_at);
+                txn.updated_at = Utc::now();
+                true
+            } else {
+                false
+            }
+        } else {
+            // Unknown id — record the attempt anyway (tests assert on
+            // `status_updates`), but report no row updated.
+            false
+        };
         self.status_updates.lock().unwrap().push((
             transaction_id,
             status,
             counterpart_signature,
             processed_at,
         ));
-        Ok(())
+        Ok(updated)
     }
 
     pub async fn upsert_mints_batch(&self, mints: &[DbMint]) -> Result<(), StorageError> {

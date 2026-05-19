@@ -120,14 +120,16 @@ impl Storage {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
     }
 
-    /// Update transaction status after processing
+    /// Update transaction status after processing. Returns `Ok(true)` if
+    /// the row was updated; `Ok(false)` if the write was skipped because
+    /// the row was no longer in `Processing` (recovery already moved it).
     pub async fn update_transaction_status(
         &self,
         transaction_id: i64,
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         update_transaction_status::update_transaction_status(
             self,
             transaction_id,
