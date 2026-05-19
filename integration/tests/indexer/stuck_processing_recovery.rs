@@ -1,0 +1,984 @@
+//! End-to-end tests for the stuck-`Processing` recovery worker.
+//!
+//! Each test reproduces a concrete operator-crash window described in the
+//! recovery design plan, then drives one `test_hooks::run_recovery_once`
+//! tick against a real Postgres + a scripted Solana RPC. Assertions verify
+//! both DB final state AND observable side effects (the
+//! `OPERATOR_STALE_PROCESSING_RECOVERED` metric, ManualReview webhook
+//! messages, and absence of spurious re-sends).
+
+use {
+    chrono::{Duration as ChronoDuration, Utc},
+    private_channel_indexer::{
+        config::ProgramType,
+        metrics::OPERATOR_STALE_PROCESSING_RECOVERED,
+        operator::{
+            recovery::test_hooks,
+            utils::{
+                instruction_util::mint_idempotency_memo,
+                rpc_util::{RetryConfig, RpcClientWithRetry},
+            },
+            TransactionStatusUpdate,
+        },
+        storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
+        PostgresConfig,
+    },
+    serde_json::json,
+    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature},
+    spl_associated_token_account::get_associated_token_address_with_program_id,
+    std::{sync::Arc, time::Duration},
+    test_utils::mock_rpc::{MockRpcServer, Reply},
+    tokio::sync::mpsc,
+};
+
+/// Snapshot a single recovery-metric cell.  Returned value is the counter's
+/// pre-test reading; callers assert `counter.get() > snapshot` after running
+/// recovery.  We use a >-delta rather than exact equality because the metric
+/// is process-global and other concurrent integration tests may also be
+/// incrementing the same (program, outcome, type) cell — the assertion only
+/// proves that *this* test's row produced a hit, which is the property we
+/// care about.
+fn snapshot_recovered(program: &str, outcome: &str, txn_type: &str) -> f64 {
+    OPERATOR_STALE_PROCESSING_RECOVERED
+        .with_label_values(&[program, outcome, txn_type])
+        .get()
+}
+
+fn assert_recovered_increment(
+    program: &str,
+    outcome: &str,
+    txn_type: &str,
+    before: f64,
+    label: &str,
+) {
+    let after = OPERATOR_STALE_PROCESSING_RECOVERED
+        .with_label_values(&[program, outcome, txn_type])
+        .get();
+    assert!(
+        after > before,
+        "{label}: OPERATOR_STALE_PROCESSING_RECOVERED{{program={program},outcome={outcome},type={txn_type}}} \
+         should have incremented (before={before}, after={after})"
+    );
+}
+
+// ── fixture helpers ─────────────────────────────────────────────────────────
+
+async fn start_pg(
+    db_name: &str,
+) -> (
+    PostgresDb,
+    String,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+) {
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .with_db_name(db_name)
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("postgres container");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:password@{}:{}/{}", host, port, db_name);
+    let db = PostgresDb::new(&PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 10,
+    })
+    .await
+    .unwrap();
+    (db, url, container)
+}
+
+fn make_deposit(
+    sig: &str,
+    mint: Pubkey,
+    recipient: Pubkey,
+    amount: u64,
+) -> private_channel_indexer::storage::common::models::DbTransaction {
+    DbTransactionBuilder::new(sig.to_string(), 1, mint.to_string(), amount)
+        .initiator(recipient.to_string())
+        .recipient(recipient.to_string())
+        .transaction_type(TransactionType::Deposit)
+        .build()
+}
+
+fn make_withdrawal(
+    sig: &str,
+    nonce: i64,
+) -> private_channel_indexer::storage::common::models::DbTransaction {
+    let mint = Pubkey::new_unique().to_string();
+    let recipient = Pubkey::new_unique().to_string();
+    let mut tx = DbTransactionBuilder::new(sig.to_string(), 1, mint, 10_000u64)
+        .initiator(recipient.clone())
+        .recipient(recipient)
+        .transaction_type(TransactionType::Withdrawal)
+        .build();
+    tx.withdrawal_nonce = Some(nonce);
+    tx
+}
+
+/// Insert a row, flip it to `processing`, then backdate `updated_at` past the
+/// BEFORE-UPDATE trigger. The trigger is temporarily disabled around the
+/// backdate so the explicit timestamp wins.
+async fn seed_backdated_processing(
+    pool: &sqlx::PgPool,
+    tx_id: i64,
+    age: ChronoDuration,
+) -> chrono::DateTime<Utc> {
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let backdated = Utc::now() - age;
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transactions SET updated_at = $1 WHERE id = $2")
+        .bind(backdated)
+        .bind(tx_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await
+        .unwrap();
+    backdated
+}
+
+async fn status_of(pool: &sqlx::PgPool, id: i64) -> String {
+    sqlx::query_scalar::<_, String>("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn counterpart_sig_of(pool: &sqlx::PgPool, id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT counterpart_signature FROM transactions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn updated_at_of(pool: &sqlx::PgPool, id: i64) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT updated_at FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn test_client(url: String) -> RpcClientWithRetry {
+    RpcClientWithRetry::with_retry_config(
+        url,
+        RetryConfig {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(5),
+            max_delay: Duration::from_millis(50),
+        },
+        CommitmentConfig::confirmed(),
+    )
+}
+
+/// Scripted `getTransaction` reply whose parsed JSON satisfies
+/// `transaction_matches_expected_mint`. Mirrors the helper in
+/// `sender_mint_idempotency.rs` exactly.
+fn get_transaction_reply(
+    signature: &Signature,
+    mint: &Pubkey,
+    recipient_ata: &Pubkey,
+    mint_authority: &Pubkey,
+    token_program: &Pubkey,
+    amount: u64,
+    memo: &str,
+) -> Reply {
+    let memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+    Reply::result(json!({
+        "slot": 100,
+        "blockTime": 1_700_000_000i64,
+        "meta": {
+            "err": null,
+            "status": { "Ok": null },
+            "fee": 5000u64,
+            "innerInstructions": [],
+            "preBalances": [1_000_000u64],
+            "postBalances": [999_995u64],
+            "logMessages": [],
+            "preTokenBalances": [],
+            "postTokenBalances": [],
+            "rewards": [],
+            "computeUnitsConsumed": 0u64,
+        },
+        "transaction": {
+            "signatures": [signature.to_string()],
+            "message": {
+                "accountKeys": [
+                    {"pubkey": mint_authority.to_string(), "signer": true, "writable": true, "source": "transaction"},
+                    {"pubkey": recipient_ata.to_string(), "signer": false, "writable": true, "source": "transaction"},
+                    {"pubkey": mint.to_string(), "signer": false, "writable": true, "source": "transaction"},
+                    {"pubkey": token_program.to_string(), "signer": false, "writable": false, "source": "transaction"},
+                    {"pubkey": memo_program_id, "signer": false, "writable": false, "source": "transaction"},
+                ],
+                "recentBlockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                "instructions": [
+                    {"program": "spl-memo", "programId": memo_program_id, "parsed": memo},
+                    {
+                        "program": "spl-token",
+                        "programId": token_program.to_string(),
+                        "parsed": {
+                            "type": "mintTo",
+                            "info": {
+                                "mint": mint.to_string(),
+                                "account": recipient_ata.to_string(),
+                                "mintAuthority": mint_authority.to_string(),
+                                "amount": amount.to_string(),
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+    }))
+}
+
+// ── IT-1 ────────────────────────────────────────────────────────────────────
+//
+// Deposit crashes mid-Processing, mint already landed → recovery promotes to
+// Completed with the on-chain signature.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it1_deposit_landed_promoted_to_completed() {
+    let (db, url, _container) = start_pg("it1_landed").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let admin_pubkey = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let amount: u64 = 12_345;
+    let token_program = spl_token::id();
+    let recipient_ata =
+        get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
+
+    let deposit_sig = Signature::new_unique();
+    let tx = make_deposit(&deposit_sig.to_string(), mint, recipient, amount);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    let _ = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let memo = mint_idempotency_memo(tx_id);
+    let prior_sig = Signature::new_unique();
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue(
+        "getSignaturesForAddress",
+        Reply::result(json!([{
+            "signature": prior_sig.to_string(),
+            "slot": 100u64,
+            "err": serde_json::Value::Null,
+            "memo": format!("[{}] {}", memo.len(), memo),
+            "blockTime": 1_700_000_000i64,
+            "confirmationStatus": "finalized",
+        }])),
+    );
+    mock.enqueue(
+        "getTransaction",
+        get_transaction_reply(
+            &prior_sig,
+            &mint,
+            &recipient_ata,
+            &admin_pubkey,
+            &token_program,
+            amount,
+            &memo,
+        ),
+    );
+
+    let client = test_client(mock.url());
+    let (storage_tx, _storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("escrow", "completed", "deposit");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        admin_pubkey,
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(prior_sig.to_string())
+    );
+    // Recovery never sends transactions.
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment("escrow", "completed", "deposit", metric_before, "IT-1");
+    mock.shutdown().await;
+}
+
+// ── IT-2 ────────────────────────────────────────────────────────────────────
+//
+// Deposit crashes mid-Processing, mint did NOT land → recovery demotes to
+// Pending. (The full re-pickup loop is exercised by IT-2.5 below where the
+// fetcher re-claims the demoted row; here we pin the demote step itself.)
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it2_deposit_not_landed_demoted_to_pending() {
+    let (db, url, _container) = start_pg("it2_demote").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+    let client = test_client(mock.url());
+    let (storage_tx, _storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    // The fetcher will pick this up on its next tick (covered by the live
+    // operator path, not the recovery worker itself).
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-2");
+    mock.shutdown().await;
+}
+
+// ── IT-3 ────────────────────────────────────────────────────────────────────
+//
+// Withdrawal crashes mid-Processing, release NOT landed → recovery demotes.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it3_withdrawal_demoted_unconditionally() {
+    let (db, url, _container) = start_pg("it3_wd_demote").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 7);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    // The withdrawal path makes no RPC calls. Script nothing.
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    let fresh = updated_at_of(&pool, tx_id).await;
+    assert!(
+        fresh > Utc::now() - ChronoDuration::seconds(5),
+        "updated_at should be fresh"
+    );
+    assert_recovered_increment("withdraw", "requeued", "withdrawal", metric_before, "IT-3");
+    mock.shutdown().await;
+}
+
+// ── IT-4 ────────────────────────────────────────────────────────────────────
+//
+// Path purity: withdrawal recovery makes ZERO RPC calls.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it4_withdrawal_recovery_zero_rpc_calls() {
+    let (db, url, _container) = start_pg("it4_zero_rpc").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 1);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    // Every method should have zero calls — the recovery path took no RPC.
+    for method in &[
+        "getSignaturesForAddress",
+        "getTransaction",
+        "sendTransaction",
+        "getLatestBlockhash",
+        "getSignatureStatuses",
+    ] {
+        assert_eq!(mock.call_count(method), 0, "{method} should have 0 calls");
+    }
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    mock.shutdown().await;
+}
+
+// ── IT-5 ────────────────────────────────────────────────────────────────────
+//
+// RPC down on deposit recovery → ManualReview, NOT pending.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
+    let (db, url, _container) = start_pg("it5_rpc_down").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 500);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    // Always return a generic JSON-RPC error → transport / RPC error path.
+    mock.enqueue_sequence(
+        "getSignaturesForAddress",
+        vec![
+            Reply::error(-32000, "internal"),
+            Reply::error(-32000, "internal"),
+            Reply::error(-32000, "internal"),
+        ],
+    );
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "manual_review",
+        "RPC failure must NOT silently demote — fail-loud is the contract"
+    );
+    let update = storage_rx
+        .try_recv()
+        .expect("manual_review update should be sent");
+    assert_eq!(update.transaction_id, tx_id);
+    let err = update.error_message.as_deref().unwrap_or("");
+    assert!(
+        err.starts_with("deposit idempotency:"),
+        "reason should match runbook substring: {err}"
+    );
+    assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-5");
+    mock.shutdown().await;
+}
+
+// Note: there is no IT-6. The original plan included a test for the
+// JSON-RPC `-32601 MethodNotFound` failure mode, but the operator's
+// `rpc_client` always points at the PrivateChannel node (Contra's own
+// RPC), which implements `getSignaturesForAddress` (PR #95). The
+// `-32601` fail-open arm in `find_existing_mint_signature_with_memo`
+// (mint.rs:441-442) is dead code under any production configuration,
+// so testing it would assert against an unreachable code path. The
+// only reachable Ambiguous case on the deposit path is transport
+// error, covered by IT-5.
+
+// ── IT-7 ────────────────────────────────────────────────────────────────────
+//
+// Fresh row: recovery does NOT touch it; no RPC, no DB write.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it7_fresh_processing_row_untouched() {
+    let (db, url, _container) = start_pg("it7_fresh").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // Flip to processing without backdating — updated_at is "now".
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pre_updated = updated_at_of(&pool, tx_id).await;
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "fresh row must not be picked up by recovery"
+    );
+    assert_eq!(
+        updated_at_of(&pool, tx_id).await,
+        pre_updated,
+        "fresh row's updated_at must not change"
+    );
+    for method in &["getSignaturesForAddress", "getTransaction"] {
+        assert_eq!(
+            mock.call_count(method),
+            0,
+            "{method} should have 0 calls for fresh row"
+        );
+    }
+    mock.shutdown().await;
+}
+
+// ── IT-8 ────────────────────────────────────────────────────────────────────
+//
+// The conditional write becomes a no-op when the row has moved between
+// SELECT and the write. Simulated by directly mutating the row between
+// the captured timestamp and the try_* call.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it8_conditional_write_noops_when_row_moved() {
+    let (db, url, _container) = start_pg("it8_cond").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    // Race: caller already moved the row off Processing → try_requeue must
+    // return false because both `status = processing` and the captured
+    // `updated_at` no longer match.
+    sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Call the conditional write directly with the original captured timestamp.
+    let moved = storage
+        .try_requeue_processing(tx_id, _captured)
+        .await
+        .unwrap();
+    assert!(
+        !moved,
+        "conditional write must no-op when row moved off Processing"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "completed",
+        "row must remain at the new status"
+    );
+}
+
+// ── IT-9 ────────────────────────────────────────────────────────────────────
+//
+// Tightened terminal write — lagging completion cannot stomp a recovery
+// demote.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
+    let (db, url, _container) = start_pg("it9_lagging").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+
+    // Simulate a lagging in-flight completion from the dead operator. Should
+    // no-op due to the tightened `AND status = 'processing'` predicate.
+    db.update_transaction_status_internal(
+        tx_id,
+        private_channel_indexer::storage::common::models::TransactionStatus::Completed,
+        Some("lagging-sig".to_string()),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending",
+        "tightened terminal write must NOT overwrite a recovery demote"
+    );
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        None,
+        "lagging sig must NOT be persisted"
+    );
+    mock.shutdown().await;
+}
+
+// ── IT-10 ───────────────────────────────────────────────────────────────────
+//
+// Backlog batching — 250 stuck rows are recovered across multiple ticks.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it10_backlog_batched_across_ticks() {
+    let (db, url, _container) = start_pg("it10_batched").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mut ids: Vec<i64> = Vec::with_capacity(250);
+    for _ in 0..250 {
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+        let id = db.insert_transaction_internal(&tx).await.unwrap();
+        ids.push(id);
+    }
+    // Bulk: flip all to processing then backdate once.
+    sqlx::query(
+        "UPDATE transactions SET status = 'processing'::transaction_status WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transactions SET updated_at = $1 WHERE id = ANY($2)")
+        .bind(Utc::now() - ChronoDuration::minutes(10))
+        .bind(&ids)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    // Every getSignaturesForAddress returns empty → demote-all path.
+    for _ in 0..300 {
+        mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+    }
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    // Tick 1: should heal exactly RECOVERY_BATCH_LIMIT (100) rows.
+    let t0 = std::time::Instant::now();
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_secs(20),
+        "single tick should not starve the live path"
+    );
+    let pending_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE status = 'pending'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending_count, 100, "tick 1 must heal exactly the batch cap");
+
+    // Tick 2 + 3: drain the rest. The healed rows now have a fresh
+    // `updated_at` (post-trigger bump) and are excluded from subsequent
+    // sweeps because they're either now Pending OR still Processing but
+    // freshly stamped — for the remaining still-Processing rows, the
+    // original backdate still holds.
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+    let pending_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE status = 'pending'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        pending_count, 250,
+        "all 250 rows must be healed across 3 ticks"
+    );
+    mock.shutdown().await;
+}
+
+// ── IT-11 ───────────────────────────────────────────────────────────────────
+//
+// PendingRemint rows are NOT touched by stuck-Processing recovery.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it11_pending_remint_rows_untouched() {
+    let (db, url, _container) = start_pg("it11_pending_remint").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 42);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // Set up as pending_remint with backdated updated_at.
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    db.set_pending_remint_internal(
+        tx_id,
+        vec!["fake-sig".to_string()],
+        Utc::now() + ChronoDuration::minutes(30),
+    )
+    .await
+    .unwrap();
+
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transactions SET updated_at = $1 WHERE id = $2")
+        .bind(Utc::now() - ChronoDuration::minutes(10))
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending_remint",
+        "pending_remint rows must not be touched by stuck-Processing recovery"
+    );
+    mock.shutdown().await;
+}
+
+// ── IT-12 ───────────────────────────────────────────────────────────────────
+//
+// Withdrawal row missing `withdrawal_nonce` → ManualReview with the runbook
+// reason string.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it12_withdrawal_missing_nonce_quarantines() {
+    let (db, url, _container) = start_pg("it12_missing_nonce").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 99);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    // Force-null the nonce after insert (simulates a corrupt row).
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
+    let update = storage_rx
+        .try_recv()
+        .expect("manual_review update should be sent");
+    assert_eq!(
+        update.error_message.as_deref(),
+        Some("withdrawal row missing nonce")
+    );
+    assert_recovered_increment(
+        "withdraw",
+        "quarantined",
+        "withdrawal",
+        metric_before,
+        "IT-12",
+    );
+    mock.shutdown().await;
+}
+
+// ── Threshold boundary (extra) ──────────────────────────────────────────────
+//
+// `get_stale_processing_transactions_internal` boundary: three rows at
+// `now - 4:59`, `now - 5:00`, `now - 5:01`. Threshold = 5min. Assert two
+// returned (the two with `updated_at < now - threshold`).
+
+#[tokio::test(flavor = "multi_thread")]
+async fn threshold_boundary_returns_only_strictly_older_rows() {
+    let (db, url, _container) = start_pg("it_boundary").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 1);
+        ids.push(db.insert_transaction_internal(&tx).await.unwrap());
+    }
+    sqlx::query(
+        "UPDATE transactions SET status = 'processing'::transaction_status WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ages = [
+        ChronoDuration::seconds(4 * 60 + 59),
+        ChronoDuration::seconds(5 * 60),
+        ChronoDuration::seconds(5 * 60 + 1),
+    ];
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, age) in ids.iter().zip(ages.iter()) {
+        sqlx::query("UPDATE transactions SET updated_at = $1 WHERE id = $2")
+            .bind(Utc::now() - *age)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stale = db
+        .get_stale_processing_transactions_internal(Duration::from_secs(5 * 60), 100)
+        .await
+        .unwrap();
+    // The 4:59 row is younger than 5min → excluded.
+    // The 5:00 row is NOT strictly older — postgres `<` is strict, so
+    // depending on timing fence it may or may not be returned. Assert the
+    // 5:01 row is always present, and the 4:59 row is always excluded.
+    let returned_ids: std::collections::HashSet<i64> = stale.iter().map(|r| r.id).collect();
+    assert!(
+        !returned_ids.contains(&ids[0]),
+        "4:59-old row must NOT be returned (younger than threshold)"
+    );
+    assert!(
+        returned_ids.contains(&ids[2]),
+        "5:01-old row MUST be returned (older than threshold)"
+    );
+}

@@ -12,12 +12,16 @@ pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
+pub mod get_stale_processing_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod quarantine_all_active_withdrawals;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
+pub mod try_complete_processing;
+pub mod try_quarantine_processing;
+pub mod try_requeue_processing;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -232,6 +236,66 @@ impl Storage {
         exclude_id: Option<i64>,
     ) -> Result<u64, StorageError> {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
+    }
+
+    /// Rows stuck in `Processing` whose `updated_at` is older than the
+    /// safety threshold. Used by the recovery worker.
+    pub async fn get_stale_processing_transactions(
+        &self,
+        threshold: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_stale_processing_transactions::get_stale_processing_transactions(self, threshold, limit)
+            .await
+    }
+
+    /// Move a stuck row from `Processing` back to `Pending` if its
+    /// `updated_at` still matches. Returns `true` if the write happened,
+    /// `false` if another writer touched the row first (which is fine).
+    pub async fn try_requeue_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
+            .await
+    }
+
+    /// Mark a stuck row as `Completed` if its `updated_at` still matches.
+    /// Returns `true` if the write happened, `false` if another writer
+    /// touched the row first.
+    pub async fn try_complete_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        try_complete_processing::try_complete_processing(
+            self,
+            transaction_id,
+            expected_updated_at,
+            counterpart_signature,
+        )
+        .await
+    }
+
+    /// Mark a stuck row as `ManualReview` if its `updated_at` still
+    /// matches. Returns `true` if the write happened, `false` if another
+    /// writer touched the row first. `reason` is carried only on the
+    /// caller's alert webhook payload; we don't store it.
+    pub async fn try_quarantine_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    ) -> Result<bool, StorageError> {
+        try_quarantine_processing::try_quarantine_processing(
+            self,
+            transaction_id,
+            expected_updated_at,
+            reason,
+        )
+        .await
     }
 }
 

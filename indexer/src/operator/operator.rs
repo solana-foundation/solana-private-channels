@@ -2,8 +2,8 @@ use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::metrics;
 use crate::operator::{
-    feepayer_monitor, fetcher, processor, reconciliation, sender, DbTransactionWriter, RetryConfig,
-    RpcClientWithRetry,
+    feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
+    RetryConfig, RpcClientWithRetry, SignerUtil,
 };
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
@@ -123,6 +123,7 @@ pub async fn run(
     let sender_commitment = config.rpc_commitment;
     let sender_source_rpc = source_rpc_client.clone();
     let sender_common_config = common_config.clone();
+    let recovery_storage_tx = storage_tx.clone();
     let sender_handle = tokio::spawn(async move {
         if let Err(e) = sender::run_sender(
             &sender_common_config,
@@ -171,6 +172,35 @@ pub async fn run(
         }
     } else {
         tokio::spawn(async {})
+    };
+
+    // Recovery worker. If the operator crashes between claiming a row
+    // (Pending → Processing) and writing its final status, the row would
+    // sit stuck in Processing forever. This worker periodically finds
+    // those stuck rows and resolves them. Runs on every operator since
+    // every operator has the same crash window.
+    let recovery_handle = {
+        let recovery_storage = storage.clone();
+        let recovery_rpc = source_rpc_client
+            .clone()
+            .unwrap_or_else(|| rpc_client.clone());
+        let recovery_program_type = common_config.program_type;
+        let recovery_token = cancellation_token.clone();
+        let admin_pubkey = SignerUtil::get_admin_pubkey();
+        tokio::spawn(async move {
+            if let Err(e) = recovery::run_recovery_worker(
+                recovery_storage,
+                recovery_rpc,
+                admin_pubkey,
+                recovery_program_type,
+                recovery_storage_tx,
+                recovery_token,
+            )
+            .await
+            {
+                tracing::error!("Recovery worker error: {}", e);
+            }
+        })
     };
 
     // Start feepayer balance monitor for escrow operators only.
@@ -254,6 +284,7 @@ pub async fn run(
         storage_writer_handle,
         reconciliation_handle,
         feepayer_monitor_handle,
+        recovery_handle,
         config.batch_size,
         config.db_poll_interval,
     )

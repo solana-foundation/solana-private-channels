@@ -52,6 +52,7 @@ integration-test:
 	@cargo test --test mock_rpc_retry -- --nocapture
 	@cargo test --test checkpoint_partial_flush -- --nocapture
 	@cargo test --test remint_recovery -- --nocapture
+	@cargo test --test stuck_processing_recovery -- --nocapture
 	@cargo test --test bootstrap_validation -- --nocapture
 	@cargo test --test yellowstone_wiring -- --nocapture
 	@cargo test --test malformed_yellowstone_update -- --nocapture
@@ -250,6 +251,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test checkpoint_partial_flush -- --nocapture
 	@echo "Running remint recovery tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test remint_recovery -- --nocapture
+	@echo "Running stuck-Processing recovery tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test stuck_processing_recovery -- --nocapture
 	@echo "Running indexer bootstrap validation tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test bootstrap_validation -- --nocapture
 	@echo "Running Yellowstone wiring tests with coverage instrumentation..."

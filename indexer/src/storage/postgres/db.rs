@@ -1,5 +1,6 @@
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use tracing::info;
+use std::time::Duration;
+use tracing::{info, warn};
 
 use crate::{
     error::StorageError,
@@ -806,15 +807,20 @@ impl PostgresDb {
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        // The `status = 'processing'` filter protects against this race:
+        // recovery has already moved a stuck row off `Processing`, but a
+        // late confirmation from the original (now-crashed) sender is
+        // still trying to mark it `Completed`. Without the filter, the
+        // late write would overwrite recovery's decision.
+        let result = sqlx::query(
             r#"
             UPDATE transactions
             SET
                 status = $2,
                 counterpart_signature = $3,
-                processed_at = $4,
-                updated_at = NOW()
+                processed_at = $4
             WHERE id = $1
+              AND status = 'processing'
             "#,
         )
         .bind(transaction_id)
@@ -824,7 +830,152 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        if result.rows_affected() == 0 {
+            warn!(
+                transaction_id,
+                "terminal write skipped: row no longer in processing"
+            );
+        }
+
         Ok(())
+    }
+
+    /// Rows stuck in `Processing` whose `updated_at` is older than the
+    /// safety threshold. Oldest-first so longest-stuck rows are healed first.
+    pub async fn get_stale_processing_transactions_internal(
+        &self,
+        threshold: Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        let threshold_secs = threshold.as_secs() as f64;
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'processing'
+              AND {} < NOW() - make_interval(secs => $1)
+            ORDER BY {} ASC
+            LIMIT $2
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            // Filters
+            transaction_cols::STATUS,
+            transaction_cols::UPDATED_AT,
+            // Ordering (FIFO over stale)
+            transaction_cols::UPDATED_AT,
+        ))
+        .bind(threshold_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Move a stuck row from `Processing` back to `Pending` so the fetcher
+    /// can pick it up again. The `updated_at = $2` condition is what makes
+    /// this safe to call: it only succeeds if nothing else has touched the
+    /// row since the caller read it. Anyone else writing to the row bumps
+    /// `updated_at` via the trigger, so our condition fails and the write
+    /// becomes a no-op.
+    pub async fn try_requeue_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Move a stuck row from `Processing` to `Completed` after recovery
+    /// confirmed the action already happened on-chain. The
+    /// `updated_at = $2` condition makes this a no-op if anyone else has
+    /// touched the row in the meantime. `counterpart_signature` may be
+    /// `None` — withdrawal recovery doesn't always know the exact signature
+    /// that landed, and the on-chain escrow program prevents duplicates
+    /// regardless.
+    pub async fn try_complete_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'completed',
+                counterpart_signature = COALESCE($3, counterpart_signature),
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(counterpart_signature)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Move a stuck row from `Processing` to `ManualReview` when recovery
+    /// can't tell whether the on-chain action happened — a human needs to
+    /// look. The reason is only carried on the caller's alert webhook
+    /// payload; we don't add a DB column for it.
+    pub async fn try_quarantine_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        _reason: String,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'manual_review',
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     /// Transitions a withdrawal to PendingRemint status, storing the

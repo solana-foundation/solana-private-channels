@@ -16,7 +16,7 @@ Practically: a single deposit `manual_review` is a single row in trouble.
 Other deposits keep flowing. There is no collateral, no sweep, no halt to
 recover from.
 
-There are **two trigger surfaces** that can land a deposit in
+There are **three trigger surfaces** that can land a deposit in
 `manual_review`:
 
 1. **Processor-side row-data validation** — deterministic per-row error
@@ -25,6 +25,11 @@ There are **two trigger surfaces** that can land a deposit in
    mint-init helper found the on-chain mint in a state it cannot fix by
    re-issuing `mint_to` (wrong authority on the private channel mint, or
    corrupt mint data). See **Path D** for recovery.
+3. **Recovery-worker idempotency lookup failed** — the periodic
+   stuck-row recovery worker found a stale `Processing` deposit, tried
+   the idempotency memo lookup against the PrivateChannel RPC, and the
+   RPC was unreachable. Row data is fine; no on-chain mint attempted.
+   See **Path E**.
 
 ## Symptom
 
@@ -33,8 +38,8 @@ There are **two trigger surfaces** that can land a deposit in
 
 ## Triage
 
-`error_message` distinguishes the two trigger surfaces and dispatches to
-the right Path below.
+`error_message` distinguishes the three trigger surfaces and dispatches
+to the right Path below.
 
 ### Processor-side surface (`processor.rs::process_deposit_funds`)
 
@@ -43,6 +48,7 @@ the right Path below.
 | `invalid_pubkey` | `mint` or `recipient` field is not a valid base58 pubkey. |
 | `invalid_builder` | Builder rejected the row's data (e.g. negative amount). |
 | `program_error` | Generic builder error not covered by the specific variants. |
+| `deposit idempotency:` | The recovery worker could not authoritatively decide whether the deposit's mint already landed. Row was quarantined on uncertainty rather than risk a double-mint. Indicates RPC health, not a row defect. See **Path E**. |
 
 ### Sender-side post-JIT surface (`sender/mint.rs`)
 
@@ -202,6 +208,55 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
+### Path E - recovery-worker idempotency lookup failed
+
+`error_message` starts with `deposit idempotency:`. The recovery worker
+intentionally refuses to demote on RPC failure (the live mint path
+fails-open on the same condition; recovery cannot, because recovery has
+no second chance to catch a duplicate).
+
+#### Step 1 - check RPC health
+
+Inspect the suffix of `error_message` to identify the underlying RPC
+transport failure (timeout, connection refused, HTTP 5xx, etc.).
+Confirm against the operator's current PrivateChannel RPC endpoint:
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+  <private-channel-rpc-url>
+```
+
+If RPC is unhealthy, address that first. If RPC is healthy now,
+proceed.
+
+#### Step 2 - verify on-chain
+
+Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). The row was
+quarantined because the recovery worker could not answer this question
+itself; resolving the runbook requires the same answer.
+
+#### Step 3 - branch on verdict
+
+##### `LANDED <signature>` — mint already succeeded
+
+Mark `completed` with the observed signature (same SQL as
+[`deposit_failed.md`](deposit_failed.md) Path B).
+
+##### `NOT_LANDED` — re-arm
+
+The mint did not land. Re-arm to `pending`; the idempotency memo
+prevents duplicate mint on the next attempt.
+
+```sql
+UPDATE transactions SET status = 'pending', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+##### `AMBIGUOUS`
+
+Stop. [Escalate](_escalation.md) (Tier 2). Do not act.
+
 ## Post-incident artifacts
 
 - Transaction id, originating Solana `signature`, `recipient`, `mint`.
@@ -211,4 +266,6 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
 - For Path D: on-chain `mint_authority` before/after, the
   `spl-token authorize` signature (if applicable), and the engineering
   ticket for any mint-replacement coordination.
+- For Path E: RPC endpoint health snapshot and the
+  `getHealth` / verification responses captured at triage time.
 
