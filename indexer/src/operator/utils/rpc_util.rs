@@ -210,6 +210,32 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Like `get_signature_statuses`, but sets `searchTransactionHistory: true` so the
+    /// validator consults long-term ledger storage when the recent status cache misses.
+    /// Use for authoritative finality checks where the signature may have aged out of
+    /// cache (e.g. recovery after operator downtime); an `Ok` response with all `None`
+    /// means the signature is genuinely not on-chain.
+    pub async fn get_signature_statuses_with_history(
+        &self,
+        signatures: &[Signature],
+    ) -> Result<
+        solana_client::rpc_response::Response<
+            Vec<Option<solana_transaction_status::TransactionStatus>>,
+        >,
+        Box<client_error::Error>,
+    > {
+        self.with_retry(
+            "get_signature_statuses_with_history",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .get_signature_statuses_with_history(signatures)
+                    .await
+            },
+        )
+        .await
+    }
+
     /// Get recent signatures that touched an address (read-only, safe to retry)
     pub async fn get_signatures_for_address(
         &self,
