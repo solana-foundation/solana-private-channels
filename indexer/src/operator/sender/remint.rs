@@ -207,7 +207,7 @@ pub async fn process_pending_remints(
 
         match state
             .rpc_client
-            .get_signature_statuses(&entry.signatures)
+            .get_signature_statuses_with_history(&entry.signatures)
             .await
         {
             Ok(response) => {
@@ -582,6 +582,10 @@ mod tests {
 
         let _mock = rpc_server
             .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignatureStatuses""#.into()),
+                mockito::Matcher::Regex(r#""searchTransactionHistory"\s*:\s*true"#.into()),
+            ]))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -656,6 +660,10 @@ mod tests {
         // Finality check: null means the tx was dropped — proceed to remint.
         let _mock = rpc_server
             .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignatureStatuses""#.into()),
+                mockito::Matcher::Regex(r#""searchTransactionHistory"\s*:\s*true"#.into()),
+            ]))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
