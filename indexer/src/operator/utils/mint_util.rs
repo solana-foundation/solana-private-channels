@@ -313,11 +313,29 @@ impl MintCache {
     pub fn get_private_channel_token_program(&self) -> Pubkey {
         TOKEN_PROGRAM_ID
     }
+
+    /// Allowlist gate: `Ok(())` only if the mint has a row in `mints`
+    /// (the on-chain `AllowMint` index).
+    pub async fn assert_mint_allowlisted(
+        &self,
+        mint: &Pubkey,
+        transaction_id: i64,
+    ) -> Result<(), OperatorError> {
+        let mint_str = mint.to_string();
+        match self.storage.get_mint(&mint_str).await? {
+            Some(_) => Ok(()),
+            None => Err(OperatorError::MintNotAllowed {
+                transaction_id,
+                mint: mint_str,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::OperatorError;
     use crate::operator::rpc_util::RpcClientWithRetry;
     use crate::operator::RetryConfig;
     use crate::storage::common::models::DbMint;
@@ -710,6 +728,43 @@ mod tests {
             matches!(err, crate::error::OperatorError::RpcError(_)),
             "expected RpcError, got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn assert_mint_allowlisted_returns_ok_when_mint_is_in_db() {
+        let mint = create_test_mint();
+        let storage = create_test_storage_with_mint(&mint, &TOKEN_PROGRAM_ID, 6);
+
+        let cache = MintCache::new(storage);
+
+        cache
+            .assert_mint_allowlisted(&mint, 1)
+            .await
+            .expect("known mint should pass strict allow-list check");
+    }
+
+    #[tokio::test]
+    async fn assert_mint_allowlisted_errors_when_mint_absent() {
+        let mint = create_test_mint();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+
+        let cache = MintCache::new(storage);
+
+        let err = cache
+            .assert_mint_allowlisted(&mint, 42)
+            .await
+            .expect_err("unknown mint must be rejected");
+
+        match err {
+            OperatorError::MintNotAllowed {
+                transaction_id,
+                mint: m,
+            } => {
+                assert_eq!(transaction_id, 42);
+                assert_eq!(m, mint.to_string());
+            }
+            other => panic!("expected MintNotAllowed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

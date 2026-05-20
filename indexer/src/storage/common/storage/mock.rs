@@ -265,6 +265,21 @@ impl MockStorage {
         Ok(self.mint_balances.lock().unwrap().clone())
     }
 
+    pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {
+        self.check_should_fail("get_orphan_deposit_ids")?;
+        let mints = self.mints.lock().unwrap();
+        let txs = self.pending_transactions.lock().unwrap();
+        let mut ids: Vec<i64> = txs
+            .iter()
+            .filter(|t| {
+                t.transaction_type == TransactionType::Deposit && !mints.contains_key(&t.mint)
+            })
+            .map(|t| t.id)
+            .collect();
+        ids.sort();
+        Ok(ids)
+    }
+
     pub async fn close(&self) -> Result<(), StorageError> {
         Ok(())
     }

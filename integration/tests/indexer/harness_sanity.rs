@@ -31,7 +31,7 @@
 
 use {
     private_channel_indexer::storage::common::models::{
-        DbTransaction, TransactionStatus, TransactionType,
+        DbMint, DbTransaction, TransactionStatus, TransactionType,
     },
     serde_json::json,
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
@@ -158,6 +158,14 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     //    dequeued within a few ticks.
     let mint_pk = Pubkey::new_unique();
     let recipient_pk = Pubkey::new_unique();
+    // operator gate: a `mints` row must exist for the deposit's mint
+    // or `assert_mint_allowlisted` quarantines the row before the
+    // sender ever runs.
+    harness.storage.mints.lock().unwrap().insert(
+        mint_pk.to_string(),
+        DbMint::new(mint_pk.to_string(), 6, spl_token::id().to_string()),
+    );
+
     harness
         .storage
         .pending_transactions

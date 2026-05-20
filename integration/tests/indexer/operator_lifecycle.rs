@@ -253,6 +253,18 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
 
+    // deposit gate refuses to mint unless `mints` has a row
+    // for the deposit's mint. This test bypasses the indexer, so no
+    // `AllowMint` event is ingested, seed the row manually to mirror
+    // what `convert_to_db_models` would have produced in production.
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
+
     // 2. Insert 1 pending deposit directly via storage.insert_db_transaction()
     let signature = Signature::new_unique().to_string();
     let recipient = env.users[0].pubkey().to_string();
@@ -330,6 +342,17 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     let user_pubkey = env.users[0].pubkey();
+
+    // deposit gate requires a `mints` row for any mint we issue
+    // private channel tokens for; the test bypasses the indexer so seed
+    // the row directly. See `test_deposit_operator_processes_single_mint`.
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
 
     let signature = Signature::new_unique().to_string();
     let recipient = user_pubkey.to_string();
@@ -662,6 +685,17 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
 
     // Create 5 users with 0 initial balance so we can verify the exact deposit amount.
     let env = TestEnvironment::setup(&client, &faucet_keypair, NUM_USERS, 0, None).await?;
+
+    // deposit gate requires a `mints` row for any mint we issue
+    // private channel tokens for; the test bypasses the indexer so seed
+    // the row directly. See `test_deposit_operator_processes_single_mint`.
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
 
     // Insert one pending deposit per user, each with a unique on-chain signature.
     let mut signatures = Vec::with_capacity(NUM_USERS);
