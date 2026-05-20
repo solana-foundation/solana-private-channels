@@ -248,7 +248,11 @@ mod tests {
             .create()
     }
 
-    fn mock_get_block_success(server: &mut Server, slot: u64, expect_at_least: usize) -> mockito::Mock {
+    fn mock_get_block_success(
+        server: &mut Server,
+        slot: u64,
+        expect_at_least: usize,
+    ) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -272,7 +276,11 @@ mod tests {
             .create()
     }
 
-    fn mock_get_block_error(server: &mut Server, slot: u64, expect_at_least: usize) -> mockito::Mock {
+    fn mock_get_block_error(
+        server: &mut Server,
+        slot: u64,
+        expect_at_least: usize,
+    ) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -374,14 +382,10 @@ mod tests {
 
         // Collect SlotCompletes until we see 100,101,102 or time out.
         let mut seen = std::collections::HashSet::new();
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
         while seen.len() < 3 && tokio::time::Instant::now() < deadline {
-            if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                rx.recv(),
-            )
-            .await
+            if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
             {
                 seen.insert(slot);
             }

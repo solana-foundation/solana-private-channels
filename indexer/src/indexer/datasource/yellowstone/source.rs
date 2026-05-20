@@ -107,7 +107,7 @@ impl YellowstoneSource {
 
 #[cfg(feature = "datasource-rpc")]
 async fn try_fill_reconnect_gap(
-    last_seen_slot: u64,
+    checkpoint: u64,
     rpc_poller: &RpcPoller,
     max_gap_slots: u64,
     batch_size: usize,
@@ -123,22 +123,25 @@ async fn try_fill_reconnect_gap(
                 reason: format!("Failed to get latest slot: {}", e),
             })?;
 
-    match validate_gap(current_slot, last_seen_slot, max_gap_slots) {
+    // Validate against the real checkpoint distance; the boundary slot is
+    // included only when handing off to fill_slot_range below.
+    match validate_gap(current_slot, checkpoint, max_gap_slots) {
         Ok(None) => {
             info!(
-                "No gap detected on reconnect. Current slot: {}, last seen: {}",
-                current_slot, last_seen_slot
+                "No gap detected on reconnect. Current slot: {}, checkpoint: {}",
+                current_slot, checkpoint
             );
             Ok(0)
         }
         Ok(Some(gap)) => {
+            let replay_anchor = checkpoint.saturating_sub(1);
             info!(
-                "Gap detected on reconnect: {} slots (from {} to {}). Backfilling...",
-                gap, last_seen_slot, current_slot
+                "Gap detected on reconnect: {} slots (replaying from {} to {}). Backfilling...",
+                gap, replay_anchor, current_slot
             );
             fill_slot_range(
                 rpc_poller,
-                last_seen_slot,
+                replay_anchor,
                 current_slot,
                 batch_size,
                 program_type,
@@ -235,7 +238,7 @@ impl DataSource for YellowstoneSource {
                 #[cfg(feature = "datasource-rpc")]
                 {
                     // Anchor on the durable checkpoint, not an in-memory watermark.
-                    // BlockMeta(S) can race partial tx delivery, so replay must include S itself
+                    // BlockMeta(S) can race partial tx delivery, so replay must include S itself.
                     // Tx/mint inserts are idempotent, so replaying the boundary slot is safe.
                     if let (Some(ref poller), Some(ref storage)) = (&rpc_poller, &storage) {
                         let checkpoint = match get_last_checkpoint(storage, program_type).await {
@@ -245,6 +248,9 @@ impl DataSource for YellowstoneSource {
                                     "Reconnect gap-fill skipped: failed to read checkpoint: {}",
                                     e
                                 );
+                                // Backoff so a persistent storage outage paired with a
+                                // fast-failing Yellowstone endpoint can't spin the loop.
+                                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                                 continue;
                             }
                         };
@@ -254,9 +260,8 @@ impl DataSource for YellowstoneSource {
                             continue;
                         }
 
-                        let anchor = checkpoint.saturating_sub(1);
                         match try_fill_reconnect_gap(
-                            anchor,
+                            checkpoint,
                             poller,
                             max_gap_slots,
                             batch_size,
@@ -574,7 +579,10 @@ mod tests {
     async fn try_fill_reconnect_gap_fills_gap() {
         let mut server = Server::new_async().await;
 
+        // checkpoint = 100, current_slot = 103 → replay anchor = 99,
+        // fill_slot_range emits slots 100..=103 (boundary slot included).
         let _m_slot = mock_get_slot(&mut server, 103);
+        let _m0 = mock_get_block_success(&mut server, 100);
         let _m1 = mock_get_block_success(&mut server, 101);
         let _m2 = mock_get_block_success(&mut server, 102);
         let _m3 = mock_get_block_success(&mut server, 103);
@@ -589,7 +597,7 @@ mod tests {
         let result =
             try_fill_reconnect_gap(100, &poller, 1000, 10, ProgramType::Escrow, None, &tx).await;
 
-        assert_eq!(result.unwrap(), 3);
+        assert_eq!(result.unwrap(), 4);
         drop(tx);
 
         let mut slots = vec![];
@@ -599,7 +607,7 @@ mod tests {
             }
         }
 
-        assert_eq!(slots, vec![101, 102, 103]);
+        assert_eq!(slots, vec![100, 101, 102, 103]);
     }
 
     #[tokio::test]
