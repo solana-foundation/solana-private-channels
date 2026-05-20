@@ -109,10 +109,11 @@ pub async fn run_reconciliation(
 /// Performs a single reconciliation check
 ///
 /// This function orchestrates the complete reconciliation flow:
-/// 1. Fetch on-chain balances for all mints held by the escrow
-/// 2. Query database for sum of completed deposits minus withdrawals per mint
-/// 3. Compare balances with tolerance threshold
-/// 4. Send webhook alert if mismatch exceeds tolerance
+/// 1. Surface orphan deposit rows
+/// 2. Fetch on-chain balances for all mints held by the escrow
+/// 3. Query database for sum of completed deposits minus withdrawals per mint
+/// 4. Compare balances with tolerance threshold
+/// 5. Send webhook alert if mismatch exceeds tolerance
 async fn perform_reconciliation_check(
     storage: &Arc<Storage>,
     config: &OperatorConfig,
@@ -121,10 +122,12 @@ async fn perform_reconciliation_check(
     webhook_client: &WebhookClient,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
 ) -> Result<(), OperatorError> {
-    // Step 1: Fetch on-chain balances from Solana RPC
+    check_orphan_deposit_rows(storage, previously_alerted_orphans).await;
+
+    // Step 2: Fetch on-chain balances from Solana RPC
     let on_chain_balances = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
 
-    // Step 2: Query database for completed transaction balances per mint
+    // Step 3: Query database for completed transaction balances per mint
     let db_balance_results = storage
         .get_escrow_balances_by_mint()
         .await
@@ -158,14 +161,14 @@ async fn perform_reconciliation_check(
         db_balances.insert(mint, net_balance);
     }
 
-    // Step 3: Compare balances with tolerance threshold
+    // Step 4: Compare balances with tolerance threshold
     let mismatches = compare_balances(
         &on_chain_balances,
         &db_balances,
         config.reconciliation_tolerance_bps,
     );
 
-    // Step 4: Send webhook alert if mismatches found
+    // Step 5: Send webhook alert if mismatches found
     if !mismatches.is_empty() {
         error!(
             "Balance reconciliation failed: found {} mismatch(es) exceeding tolerance of {} bps",
@@ -189,11 +192,6 @@ async fn perform_reconciliation_check(
     } else {
         info!("Balance reconciliation successful: all mints within tolerance");
     }
-
-    // Balance reconciliation iterates `mints`, so deposit rows whose mint
-    // has no `mints` entry never show up as a mismatch. Surface them
-    // explicitly here, with dedup so we don't re-log on every tick.
-    check_orphan_deposit_rows(storage, previously_alerted_orphans).await;
 
     Ok(())
 }
@@ -256,6 +254,7 @@ async fn check_orphan_deposit_rows(
 
             error!(
                 new_row_count = new_orphans.len(),
+                new_orphan_ids = ?new_orphans,
                 "Reconciliation found {} new orphan deposit row(s) (deposit rows with no AllowMint record)",
                 new_orphans.len()
             );
