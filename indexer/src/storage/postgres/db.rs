@@ -711,13 +711,15 @@ impl PostgresDb {
         program_type: &str,
         slot: u64,
     ) -> Result<(), sqlx::Error> {
+        // Monotonic guard: GREATEST() prevents a lower slot (e.g. backfill
+        // replay after a flushed Yellowstone update) from regressing the cursor.
         sqlx::query(
             r#"
             INSERT INTO indexer_state (program_type, last_committed_slot, updated_at)
             VALUES ($1, $2, NOW())
             ON CONFLICT (program_type)
             DO UPDATE SET
-                last_committed_slot = EXCLUDED.last_committed_slot,
+                last_committed_slot = GREATEST(indexer_state.last_committed_slot, EXCLUDED.last_committed_slot),
                 updated_at = NOW()
             "#,
         )

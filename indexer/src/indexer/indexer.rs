@@ -227,11 +227,13 @@ pub async fn run(
                     indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
                 );
 
-                source.with_gap_detection(
-                    gap_rpc_poller,
-                    indexer_config.backfill.max_gap_slots,
-                    indexer_config.backfill.batch_size,
-                )
+                source
+                    .with_gap_detection(
+                        gap_rpc_poller,
+                        indexer_config.backfill.max_gap_slots,
+                        indexer_config.backfill.batch_size,
+                    )
+                    .with_storage(storage.clone())
             };
 
             let source = if let Some(h) = health.clone() {

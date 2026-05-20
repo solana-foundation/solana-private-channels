@@ -171,10 +171,16 @@ impl MockStorage {
         slot: u64,
     ) -> Result<(), StorageError> {
         self.check_should_fail(program_type)?;
-        self.committed_checkpoints
-            .lock()
-            .unwrap()
-            .insert(program_type.to_string(), slot);
+        // Mirrors postgres GREATEST(): monotonic, lower writes are ignored.
+        // Use `set_checkpoint` to seed arbitrary values in tests.
+        let mut map = self.committed_checkpoints.lock().unwrap();
+        map.entry(program_type.to_string())
+            .and_modify(|existing| {
+                if slot > *existing {
+                    *existing = slot;
+                }
+            })
+            .or_insert(slot);
         Ok(())
     }
 

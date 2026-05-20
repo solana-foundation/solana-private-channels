@@ -387,6 +387,23 @@ async fn checkpoint_update_higher_slot() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Monotonic guard: lower slot never overwrites a higher one.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_update_lower_slot_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage.update_committed_checkpoint("prog", 500).await?;
+    storage.update_committed_checkpoint("prog", 100).await?;
+
+    let cp = storage.get_committed_checkpoint("prog").await?;
+    assert_eq!(
+        cp,
+        Some(500),
+        "lower-slot write must not regress the persisted checkpoint"
+    );
+    Ok(())
+}
+
 // ── 8. Mint operations ───────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
