@@ -60,6 +60,10 @@ name = "remint_recovery"
 path = "tests/indexer/remint_recovery.rs"
 
 [[test]]
+name = "stuck_processing_recovery"
+path = "tests/indexer/stuck_processing_recovery.rs"
+
+[[test]]
 name = "test_rpc_http_malformed"
 path = "tests/private-channel/rpc/test_rpc_http_malformed.rs"
 

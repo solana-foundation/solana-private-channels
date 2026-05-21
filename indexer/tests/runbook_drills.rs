@@ -1458,3 +1458,109 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+// Drill 15: pins Path E triage substring + row-scoped re-arm SQL.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_15_deposit_manual_review_recovery_idempotency_failure_flow(
+) -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "deposit_manual_review.md",
+        "Path E — recovery-worker idempotency lookup failed",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let recovery_path = workspace_root.join("indexer/src/operator/recovery.rs");
+    let recovery = std::fs::read_to_string(&recovery_path)
+        .unwrap_or_else(|e| panic!("read {recovery_path:?}: {e}"));
+    assert!(
+        recovery.contains("deposit idempotency:"),
+        "Path E dispatch substring missing from recovery.rs"
+    );
+    eprintln!("OK   recovery.rs: \"deposit idempotency:\"");
+
+    // ── Re-arm SQL is row-scoped and fungible across Path-E substrings ──
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    let trigger_id = seed_deposit(&pool, "manual_review").await?;
+    let collateral_id = seed_deposit(&pool, "manual_review").await?;
+
+    sqlx::query("UPDATE transactions SET status='pending', updated_at=NOW() WHERE id=$1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, trigger_id).await?,
+        "pending",
+        "Path E re-arm must flip the trigger row to pending"
+    );
+    assert_eq!(
+        status_of(&pool, collateral_id).await?,
+        "manual_review",
+        "Path E re-arm must NOT touch sibling manual_review rows"
+    );
+
+    eprintln!("Path E triage substring + re-arm SQL verified.");
+    Ok(())
+}
+
+// Drill 16: pins Path F triage substring + row-scoped terminal SQL.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_16_withdrawal_manual_review_recovery_missing_nonce_flow(
+) -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "withdrawal_manual_review.md",
+        "Path F — corrupt withdrawal row (missing nonce)",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let recovery_path = workspace_root.join("indexer/src/operator/recovery.rs");
+    let recovery = std::fs::read_to_string(&recovery_path)
+        .unwrap_or_else(|e| panic!("read {recovery_path:?}: {e}"));
+    assert!(
+        recovery.contains("withdrawal row missing nonce"),
+        "Path F dispatch substring missing from recovery.rs"
+    );
+    eprintln!("OK   recovery.rs: \"withdrawal row missing nonce\"");
+
+    // ── Terminal SQL is row-scoped, ManualReview → Failed ──
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    let trigger_id = seed_withdrawal(&pool, "manual_review", 1, None).await?;
+    // Force-null the nonce to mirror the recovery-worker quarantine condition.
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+    let sibling_id = seed_withdrawal(&pool, "manual_review", 2, None).await?;
+
+    // Step 3 → Burn landed → mark failed (terminal).
+    sqlx::query("UPDATE transactions SET status='failed', updated_at=NOW() WHERE id=$1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, trigger_id).await?,
+        "failed",
+        "Path F § Step 3 burn-landed branch must terminalize the row to failed"
+    );
+    assert_eq!(
+        status_of(&pool, sibling_id).await?,
+        "manual_review",
+        "Path F terminal SQL must NOT touch sibling manual_review rows"
+    );
+
+    eprintln!("Path F triage substring + terminal SQL verified.");
+    Ok(())
+}

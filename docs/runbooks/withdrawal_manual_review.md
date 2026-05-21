@@ -43,6 +43,7 @@ have prefixes.
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `failed to persist pending remint:` | C - ambiguous (DB lost the sig) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
+| `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 
 ## Path A.halting - build error that halted the pipeline
 
@@ -216,6 +217,65 @@ committing the row to manual review. Three sub-triggers; same recovery.
    - Not burned → no user impact; close the alert and re-arm.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
+
+## Path F - corrupt withdrawal row (missing nonce)
+
+`error_message`: `withdrawal row missing nonce`. The recovery worker
+found a stale `Processing` withdrawal whose `withdrawal_nonce` is
+`NULL`. The indexer always populates this column for withdrawal rows,
+so a NULL on this row indicates either a manual DB edit, a partial
+schema migration, or a defect in the indexer write path. **Do not
+re-arm.** The processor would reject the row identically on every tick.
+
+### Step 1 - confirm the corruption
+
+```sql
+SELECT id, signature, withdrawal_nonce, mint, amount, recipient,
+       created_at, updated_at
+  FROM transactions
+ WHERE id = :transaction_id;
+```
+
+If `withdrawal_nonce IS NOT NULL`, the row was repaired between
+quarantine and triage. Re-arm to `pending`:
+
+```sql
+UPDATE transactions SET status = 'pending', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+Otherwise proceed.
+
+### Step 2 - check whether the burn landed on the PrivateChannel side
+
+`signature` is the originating PrivateChannel burn signature.
+
+```bash
+solana confirm -v <signature> --url <private-channel-rpc>
+```
+
+### Step 3 - branch on burn verdict
+
+#### Burn landed
+
+The user already burned. Escalate (Tier 1) for refund coordination —
+either a manual `release_funds` to the depositor or a manual remint of
+the burned tokens. Then mark the row terminal:
+
+```sql
+UPDATE transactions SET status = 'failed', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+#### Burn did not land
+
+The indexer wrote a withdrawal row for an instruction that did not
+finalize. [Escalate](_escalation.md) (Tier 3) — the indexer
+write-or-classify path has a defect. Capture the row, then delete:
+
+```sql
+DELETE FROM transactions WHERE id = :transaction_id;
+```
 
 ## Post-incident artifacts (required)
 

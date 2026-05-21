@@ -190,15 +190,37 @@ impl MockStorage {
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: DateTime<Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         self.check_should_fail("update_transaction_status")?;
+        // Mirror the Postgres status filter (Processing or PendingRemint only).
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
+            if matches!(
+                txn.status,
+                TransactionStatus::Processing | TransactionStatus::PendingRemint
+            ) {
+                txn.status = status;
+                if counterpart_signature.is_some() {
+                    txn.counterpart_signature = counterpart_signature.clone();
+                }
+                txn.processed_at = Some(processed_at);
+                txn.updated_at = Utc::now();
+                true
+            } else {
+                false
+            }
+        } else {
+            // Unknown id — record the attempt anyway (tests assert on
+            // `status_updates`), but report no row updated.
+            false
+        };
         self.status_updates.lock().unwrap().push((
             transaction_id,
             status,
             counterpart_signature,
             processed_at,
         ));
-        Ok(())
+        Ok(updated)
     }
 
     pub async fn upsert_mints_batch(&self, mints: &[DbMint]) -> Result<(), StorageError> {
@@ -358,5 +380,95 @@ impl MockStorage {
             }
         }
         Ok(affected)
+    }
+
+    pub async fn get_stale_processing_transactions(
+        &self,
+        threshold: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_stale_processing_transactions")?;
+        let threshold_chrono = chrono::Duration::from_std(threshold)
+            // Defensive: an overflowing Duration falls back to a 1-day cutoff.
+            .unwrap_or_else(|_| chrono::Duration::days(1));
+        let cutoff = Utc::now() - threshold_chrono;
+        let pending = self.pending_transactions.lock().unwrap();
+        let mut matched: Vec<DbTransaction> = pending
+            .iter()
+            .filter(|t| t.status == TransactionStatus::Processing && t.updated_at < cutoff)
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        matched.truncate(limit as usize);
+        Ok(matched)
+    }
+
+    pub async fn try_requeue_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_requeue_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Pending;
+                txn.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn try_complete_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_complete_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Completed;
+                if counterpart_signature.is_some() {
+                    txn.counterpart_signature = counterpart_signature;
+                }
+                let now = Utc::now();
+                txn.processed_at = Some(now);
+                txn.updated_at = now;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn try_quarantine_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        _reason: String,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_quarantine_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Processing
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::ManualReview;
+                let now = Utc::now();
+                txn.processed_at = Some(now);
+                txn.updated_at = now;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }

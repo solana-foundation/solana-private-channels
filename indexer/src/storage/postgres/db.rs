@@ -1,4 +1,5 @@
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::time::Duration;
 use tracing::info;
 
 use crate::{
@@ -801,22 +802,24 @@ impl PostgresDb {
         Ok(transactions)
     }
 
+    /// Returns true if the row was updated; false if already terminal.
     pub async fn update_transaction_status_internal(
         &self,
         transaction_id: i64,
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        // Only write non-terminal source states — blocks late writes after recovery.
+        let result = sqlx::query(
             r#"
             UPDATE transactions
             SET
                 status = $2,
                 counterpart_signature = $3,
-                processed_at = $4,
-                updated_at = NOW()
+                processed_at = $4
             WHERE id = $1
+              AND status IN ('processing', 'pending_remint')
             "#,
         )
         .bind(transaction_id)
@@ -826,7 +829,130 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Stale `Processing` rows older than the threshold, oldest-first.
+    pub async fn get_stale_processing_transactions_internal(
+        &self,
+        threshold: Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        let threshold_secs = threshold.as_secs() as f64;
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'processing'
+              AND {} < NOW() - make_interval(secs => $1)
+            ORDER BY {} ASC
+            LIMIT $2
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            // Filters
+            transaction_cols::STATUS,
+            transaction_cols::UPDATED_AT,
+            // Ordering (FIFO over stale)
+            transaction_cols::UPDATED_AT,
+        ))
+        .bind(threshold_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// CAS `Processing` → `Pending` keyed on `updated_at`; no-op if stale.
+    pub async fn try_requeue_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// CAS `Processing` → `Completed` keyed on `updated_at`; sig may be `None`.
+    pub async fn try_complete_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'completed',
+                counterpart_signature = COALESCE($3, counterpart_signature),
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(counterpart_signature)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// CAS `Processing` → `ManualReview`; reason carried on webhook, not DB.
+    pub async fn try_quarantine_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        _reason: String,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'manual_review',
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     /// Transitions a withdrawal to PendingRemint status, storing the

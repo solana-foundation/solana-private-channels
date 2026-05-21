@@ -156,6 +156,17 @@ counter_vec!(
     &["program_type", "task"]
 );
 
+// Recovery worker outcome: a stuck-`Processing` row was healed by the
+// stuck-row recovery worker.  `outcome` ∈ {completed, requeued, quarantined};
+// `type` ∈ {deposit, withdrawal}.  All values 0 in steady state — any
+// sustained nonzero is concrete evidence of operator crash-window activity.
+counter_vec!(
+    OPERATOR_STALE_PROCESSING_RECOVERED,
+    "private_channel_operator_stale_processing_recovered_total",
+    "Stale Processing rows healed by the recovery worker",
+    &["program_type", "outcome", "type"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -216,8 +227,21 @@ pub fn init_labels(program_type: &str) {
         "storage_writer",
         "reconciliation",
         "feepayer_monitor",
+        "recovery",
     ] {
         OPERATOR_TASK_EXIT.with_label_values(&[program_type, task]);
+    }
+
+    // Pre-register every (outcome, type) combination so dashboards see the
+    // full label space immediately rather than only after the first hit.
+    for outcome in &["completed", "requeued", "quarantined"] {
+        for txn_type in &["deposit", "withdrawal"] {
+            OPERATOR_STALE_PROCESSING_RECOVERED.with_label_values(&[
+                program_type,
+                outcome,
+                txn_type,
+            ]);
+        }
     }
 }
 
@@ -243,6 +267,7 @@ pub fn init() {
         FEEPAYER_BALANCE_LAMPORTS,
         OPERATOR_TRANSACTION_QUARANTINED,
         OPERATOR_TASK_EXIT,
+        OPERATOR_STALE_PROCESSING_RECOVERED,
     );
 }
 
@@ -329,6 +354,7 @@ mod tests {
             "private_channel_feepayer_balance_lamports",
             "private_channel_operator_transaction_quarantined_total",
             "private_channel_operator_task_exit_total",
+            "private_channel_operator_stale_processing_recovered_total",
         ];
 
         let families = prometheus::gather();
