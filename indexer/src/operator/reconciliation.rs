@@ -205,9 +205,8 @@ async fn perform_reconciliation_check(
 /// log line into the central log pipeline is enough for triage.
 ///
 /// Dedup contract (`previously_alerted_orphans`):
-/// - `None` on entry: this is the baseline tick. Log the full current set
-///   at `info!`, then store the set so subsequent ticks can diff against
-///   it.
+/// - `None` on entry: this is the baseline tick. Empty set logs at
+///   `info!`; non-empty set logs at `error!`.
 /// - `Some(seen)` on entry: only orphans NOT in `seen` are "new". New
 ///   orphans get an `error!` log; everything else is silent.
 ///
