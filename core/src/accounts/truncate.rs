@@ -1,5 +1,6 @@
 use {
     super::{postgres::PostgresAccountsDB, traits::BlockInfo},
+    crate::accounts::address_index_watermark::ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
     anyhow::{anyhow, Context, Result},
     sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row},
     std::{
@@ -350,6 +351,12 @@ async fn set_first_available_block_metadata(
                 .execute(pool)
                 .await
                 .context("Failed to clear first_available_block metadata")?;
+            // Wiped DB must not look consistent to repair.
+            sqlx::query("DELETE FROM metadata WHERE key = $1")
+                .bind(ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY)
+                .execute(pool)
+                .await
+                .context("Failed to clear address_signatures_flushed_slot metadata")?;
             Ok(None)
         }
     }

@@ -1,6 +1,6 @@
 use {
     crate::{
-        accounts::AccountsDB,
+        accounts::{address_index_repair::repair_address_signatures, AccountsDB},
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps, WriteDeps,
@@ -163,6 +163,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // Failure here is fatal: starting with an empty cache could allow
             // duplicate transactions to execute after a restart.
             let db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
             let (initial_live_blockhashes, initial_dedup_cache) =
                 load_dedup_state(&db, config.max_blockhashes()).await?;
 
@@ -284,20 +285,25 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             (None, Arc::new(RwLock::new(LinkedList::new())))
         };
 
-    // Start RPC service based on node mode
+    let read_deps = match config.mode {
+        NodeMode::Read | NodeMode::Aio => {
+            let accounts_db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            if matches!(config.mode, NodeMode::Read) {
+                repair_address_signatures(&accounts_db, Arc::clone(&config.metrics)).await?;
+            }
+            Some(ReadDeps {
+                admin_keys: config.admin_keys,
+                accounts_db,
+                live_blockhashes: live_blockhashes_arc,
+            })
+        }
+        NodeMode::Write => None,
+    };
+
     let rpc_config = RpcServiceConfig {
         port: config.port,
         max_connections: config.max_connections,
-        read_deps: match config.mode {
-            NodeMode::Read | NodeMode::Aio => Some(ReadDeps {
-                admin_keys: config.admin_keys,
-                accounts_db: AccountsDB::new(&config.accountsdb_connection_url, true)
-                    .await
-                    .unwrap(),
-                live_blockhashes: live_blockhashes_arc,
-            }),
-            NodeMode::Write => None,
-        },
+        read_deps,
         write_deps,
         heartbeats,
         shutdown_token: shutdown_token.clone(),

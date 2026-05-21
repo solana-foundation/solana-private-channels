@@ -47,6 +47,29 @@ struct SettleResult {
     account_settlements: Vec<(Pubkey, AccountSettlement)>,
 }
 
+#[derive(Debug)]
+enum SettleError {
+    AddressIndexWriterGone,
+    Other(String),
+}
+
+impl std::fmt::Display for SettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressIndexWriterGone => f.write_str("address_signatures writer dropped"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for SettleError {}
+
+impl From<String> for SettleError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
 #[derive(Clone)]
 struct LastBlock {
     slot: u64,
@@ -309,8 +332,13 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     break;
                                 }
                             }
-                            Err(_) => {
-                                error!("Failed to settle transactions");
+                            Err(SettleError::AddressIndexWriterGone) => {
+                                anyhow::bail!(
+                                    "address_signatures writer dropped, aborting settler"
+                                );
+                            }
+                            Err(SettleError::Other(msg)) => {
+                                error!("Failed to settle transactions: {}", msg);
                                 break;
                             }
                         }
@@ -432,7 +460,7 @@ async fn settle_transactions(
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
     metrics: &crate::stage_metrics::SharedMetrics,
     address_signatures_tx: Option<&mpsc::Sender<Vec<AddressSignatureRow>>>,
-) -> Result<SettleResult, Box<dyn std::error::Error>> {
+) -> Result<SettleResult, SettleError> {
     let t_total = tokio::time::Instant::now();
     // Preallocate per-tick collections from the known result count so the hot
     // path doesn't pay the geometric-growth realloc tax on every tick. The 4×
@@ -563,16 +591,7 @@ async fn settle_transactions(
         .await?;
     let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Send-after-commit: address_signatures rows are durable in
-    // `transactions` already; the index writer fills in the read view with
-    // an eventually-consistent gap of <1 writer-flush interval. .send().await
-    // applies backpressure when the bounded channel fills.
-    //
-    // A closed channel (writer task exited) is logged and tolerated: the
-    // atomic commit has already succeeded, so the only consequence is that
-    // `address_signatures` is missing this tick's entries. That's the same
-    // eventually-consistent contract `getSignaturesForAddress` already
-    // tolerates — not a reason to tear down the settler.
+    // Closed channel = writer gone; escalate to exit.
     if let Some(tx) = address_signatures_tx {
         if !addr_sig_rows.is_empty() {
             let send_t0 = tokio::time::Instant::now();
@@ -583,9 +602,7 @@ async fn settle_transactions(
                     );
                 }
                 Err(_) => {
-                    warn!(
-                        "address_signatures writer dropped; index entries for this tick will not be written"
-                    );
+                    return Err(SettleError::AddressIndexWriterGone);
                 }
             }
         }
@@ -1609,5 +1626,58 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         shutdown.cancel();
+    }
+
+    /// Writer-dropped must exit settler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_aborts_when_address_index_writer_dropped() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, address_signatures_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+
+        let handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 50,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // Simulate the writer task exiting.
+        drop(address_signatures_rx);
+
+        // Tick triggers send-Err.
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let pk = Pubkey::new_unique();
+        let executed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(executed)],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        exec_tx.send((output, vec![tx])).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "settle worker must exit when address-index writer is gone"
+        );
     }
 }
