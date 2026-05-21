@@ -27,6 +27,30 @@ pub struct AddressSignatureRow {
     pub signature: Vec<u8>,
 }
 
+/// Bulk-insert into address_signatures inside an active PG tx.
+pub(crate) async fn upsert_address_signature_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    rows: &[AddressSignatureRow],
+) -> Result<(), sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let addresses: Vec<&[u8]> = rows.iter().map(|r| r.address.as_slice()).collect();
+    let slots: Vec<i64> = rows.iter().map(|r| r.slot).collect();
+    let sigs: Vec<&[u8]> = rows.iter().map(|r| r.signature.as_slice()).collect();
+    sqlx::query(
+        "INSERT INTO address_signatures (address, slot, signature)
+         SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::bytea[])
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&addresses)
+    .bind(&slots)
+    .bind(&sigs)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+}
+
 pub async fn write_batch(
     db: &mut AccountsDB,
     account_settlements: &[(Pubkey, AccountSettlement)],
