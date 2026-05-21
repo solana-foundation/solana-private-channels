@@ -227,12 +227,13 @@ async fn check_orphan_deposit_rows(
 
     match previously_alerted_orphans {
         None => {
-            // Baseline pass, informational log only.
+            // Baseline pass
             if orphans.is_empty() {
                 info!("Reconciliation baseline: no orphan deposit rows detected");
             } else {
-                info!(
+                error!(
                     row_count = orphans.len(),
+                    orphan_ids = ?orphans,
                     "Reconciliation baseline: {} orphan deposit row(s) currently present \
                      (no AllowMint record); subsequent ticks will only log on new entries",
                     orphans.len()

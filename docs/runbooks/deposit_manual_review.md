@@ -285,9 +285,6 @@ solana confirm -v <signature> --url <solana-mainnet-rpc-url>
 
 Decode the instruction against the escrow program IDL. Classify:
 
-- **User error** (depositor sent the wrong mint).
-  [Escalate](_escalation.md) (Tier 1) for refund coordination — manual
-  `release_funds` to the depositor.
 - **Indexer / instance-filtering defect** (row written from a
   foreign-instance instruction or a non-`Deposit` instruction).
   [Escalate](_escalation.md) (Tier 3) **first**; do not delete until
@@ -295,8 +292,8 @@ Decode the instruction against the escrow program IDL. Classify:
 - **Manual DB insert.** [Escalate](_escalation.md) (Tier 3), capture
   the offender, then delete.
 
-Once root cause is known and any refund is coordinated, capture the
-row's full content in the incident record and delete it. The
+Once root cause is known, capture the row's full content in the
+incident record and delete it. The
 reconciliation orphan check has no status filter and runs with in-memory
 per-id dedup, so a `failed` row stays silent in steady state but
 re-appears in the orphan log on every operator restart (logs only — no
