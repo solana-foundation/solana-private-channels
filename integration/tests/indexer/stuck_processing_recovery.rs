@@ -1,11 +1,4 @@
-//! End-to-end tests for the stuck-`Processing` recovery worker.
-//!
-//! Each test reproduces a concrete operator-crash window described in the
-//! recovery design plan, then drives one `test_hooks::run_recovery_once`
-//! tick against a real Postgres + a scripted Solana RPC. Assertions verify
-//! both DB final state AND observable side effects (the
-//! `OPERATOR_STALE_PROCESSING_RECOVERED` metric, ManualReview webhook
-//! messages, and absence of spurious re-sends).
+//! E2E tests for the stuck-`Processing` recovery worker.
 
 use {
     chrono::{Duration as ChronoDuration, Utc},
@@ -31,13 +24,7 @@ use {
     tokio::sync::mpsc,
 };
 
-/// Snapshot a single recovery-metric cell.  Returned value is the counter's
-/// pre-test reading; callers assert `counter.get() > snapshot` after running
-/// recovery.  We use a >-delta rather than exact equality because the metric
-/// is process-global and other concurrent integration tests may also be
-/// incrementing the same (program, outcome, type) cell — the assertion only
-/// proves that *this* test's row produced a hit, which is the property we
-/// care about.
+/// Pre-test reading of a recovery-metric cell; assert `>snapshot` after.
 fn snapshot_recovered(program: &str, outcome: &str, txn_type: &str) -> f64 {
     OPERATOR_STALE_PROCESSING_RECOVERED
         .with_label_values(&[program, outcome, txn_type])
@@ -120,9 +107,7 @@ fn make_withdrawal(
     tx
 }
 
-/// Insert a row, flip it to `processing`, then backdate `updated_at` past the
-/// BEFORE-UPDATE trigger. The trigger is temporarily disabled around the
-/// backdate so the explicit timestamp wins.
+/// Insert + flip to `processing` + backdate `updated_at` past the trigger.
 async fn seed_backdated_processing(
     pool: &sqlx::PgPool,
     tx_id: i64,
@@ -190,9 +175,7 @@ fn test_client(url: String) -> RpcClientWithRetry {
     )
 }
 
-/// Scripted `getTransaction` reply whose parsed JSON satisfies
-/// `transaction_matches_expected_mint`. Mirrors the helper in
-/// `sender_mint_idempotency.rs` exactly.
+/// Scripted `getTransaction` reply satisfying `transaction_matches_expected_mint`.
 fn get_transaction_reply(
     signature: &Signature,
     mint: &Pubkey,
@@ -251,10 +234,7 @@ fn get_transaction_reply(
     }))
 }
 
-// ── IT-1 ────────────────────────────────────────────────────────────────────
-//
-// Deposit crashes mid-Processing, mint already landed → recovery promotes to
-// Completed with the on-chain signature.
+// IT-1: deposit landed → Completed (with on-chain sig).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it1_deposit_landed_promoted_to_completed() {
@@ -330,11 +310,7 @@ async fn it1_deposit_landed_promoted_to_completed() {
     mock.shutdown().await;
 }
 
-// ── IT-2 ────────────────────────────────────────────────────────────────────
-//
-// Deposit crashes mid-Processing, mint did NOT land → recovery demotes to
-// Pending. (The full re-pickup loop is exercised by IT-2.5 below where the
-// fetcher re-claims the demoted row; here we pin the demote step itself.)
+// IT-2: deposit not landed → Pending (demote step).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it2_deposit_not_landed_demoted_to_pending() {
@@ -367,16 +343,13 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
     .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
-    // The fetcher will pick this up on its next tick (covered by the live
-    // operator path, not the recovery worker itself).
+    // Live fetcher picks it up on the next tick (out of scope here).
     assert_eq!(mock.call_count("sendTransaction"), 0);
     assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-2");
     mock.shutdown().await;
 }
 
-// ── IT-3 ────────────────────────────────────────────────────────────────────
-//
-// Withdrawal crashes mid-Processing, release NOT landed → recovery demotes.
+// IT-3: withdrawal not landed → demote.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it3_withdrawal_demoted_unconditionally() {
@@ -416,9 +389,7 @@ async fn it3_withdrawal_demoted_unconditionally() {
     mock.shutdown().await;
 }
 
-// ── IT-4 ────────────────────────────────────────────────────────────────────
-//
-// Path purity: withdrawal recovery makes ZERO RPC calls.
+// IT-4: withdrawal recovery makes ZERO RPC calls.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it4_withdrawal_recovery_zero_rpc_calls() {
@@ -459,9 +430,7 @@ async fn it4_withdrawal_recovery_zero_rpc_calls() {
     mock.shutdown().await;
 }
 
-// ── IT-5 ────────────────────────────────────────────────────────────────────
-//
-// RPC down on deposit recovery → ManualReview, NOT pending.
+// IT-5: deposit RPC failure → ManualReview (never silent demote).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
@@ -519,19 +488,9 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     mock.shutdown().await;
 }
 
-// Note: there is no IT-6. The original plan included a test for the
-// JSON-RPC `-32601 MethodNotFound` failure mode, but the operator's
-// `rpc_client` always points at the PrivateChannel node (Contra's own
-// RPC), which implements `getSignaturesForAddress` (PR #95). The
-// `-32601` fail-open arm in `find_existing_mint_signature_with_memo`
-// (mint.rs:441-442) is dead code under any production configuration,
-// so testing it would assert against an unreachable code path. The
-// only reachable Ambiguous case on the deposit path is transport
-// error, covered by IT-5.
+// IT-6 omitted: -32601 arm is unreachable on the PrivateChannel RPC (PR #95).
 
-// ── IT-7 ────────────────────────────────────────────────────────────────────
-//
-// Fresh row: recovery does NOT touch it; no RPC, no DB write.
+// IT-7: fresh row is untouched (no RPC, no DB write).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it7_fresh_processing_row_untouched() {
@@ -586,11 +545,7 @@ async fn it7_fresh_processing_row_untouched() {
     mock.shutdown().await;
 }
 
-// ── IT-8 ────────────────────────────────────────────────────────────────────
-//
-// The conditional write becomes a no-op when the row has moved between
-// SELECT and the write. Simulated by directly mutating the row between
-// the captured timestamp and the try_* call.
+// IT-8: conditional write is a no-op if the row moved between SELECT and write.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it8_conditional_write_noops_when_row_moved() {
@@ -605,9 +560,7 @@ async fn it8_conditional_write_noops_when_row_moved() {
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
     let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
-    // Race: caller already moved the row off Processing → try_requeue must
-    // return false because both `status = processing` and the captured
-    // `updated_at` no longer match.
+    // Race: row already moved off Processing → try_requeue returns false.
     sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
         .bind(tx_id)
         .execute(&pool)
@@ -630,10 +583,7 @@ async fn it8_conditional_write_noops_when_row_moved() {
     );
 }
 
-// ── IT-9 ────────────────────────────────────────────────────────────────────
-//
-// Tightened terminal write — lagging completion cannot stomp a recovery
-// demote.
+// IT-9: lagging terminal write cannot stomp a recovery demote.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
@@ -664,8 +614,7 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
 
-    // Simulate a lagging in-flight completion from the dead operator. Should
-    // no-op due to the tightened `AND status = 'processing'` predicate.
+    // Lagging in-flight write from dead operator — must no-op.
     db.update_transaction_status_internal(
         tx_id,
         private_channel_indexer::storage::common::models::TransactionStatus::Completed,
@@ -687,9 +636,7 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     mock.shutdown().await;
 }
 
-// ── IT-10 ───────────────────────────────────────────────────────────────────
-//
-// Backlog batching — 250 stuck rows are recovered across multiple ticks.
+// IT-10: 250-row backlog drained across multiple ticks.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it10_backlog_batched_across_ticks() {
@@ -759,11 +706,7 @@ async fn it10_backlog_batched_across_ticks() {
             .unwrap();
     assert_eq!(pending_count, 100, "tick 1 must heal exactly the batch cap");
 
-    // Tick 2 + 3: drain the rest. The healed rows now have a fresh
-    // `updated_at` (post-trigger bump) and are excluded from subsequent
-    // sweeps because they're either now Pending OR still Processing but
-    // freshly stamped — for the remaining still-Processing rows, the
-    // original backdate still holds.
+    // Ticks 2-3: drain the rest. Healed rows are excluded (trigger bumped updated_at).
     test_hooks::run_recovery_once(
         &storage,
         &client,
@@ -794,9 +737,7 @@ async fn it10_backlog_batched_across_ticks() {
     mock.shutdown().await;
 }
 
-// ── IT-11 ───────────────────────────────────────────────────────────────────
-//
-// PendingRemint rows are NOT touched by stuck-Processing recovery.
+// IT-11: PendingRemint rows are NOT touched by recovery.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it11_pending_remint_rows_untouched() {
@@ -858,10 +799,7 @@ async fn it11_pending_remint_rows_untouched() {
     mock.shutdown().await;
 }
 
-// ── IT-12 ───────────────────────────────────────────────────────────────────
-//
-// Withdrawal row missing `withdrawal_nonce` → ManualReview with the runbook
-// reason string.
+// IT-12: withdrawal with NULL nonce → ManualReview (runbook reason string).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it12_withdrawal_missing_nonce_quarantines() {
@@ -914,11 +852,7 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
     mock.shutdown().await;
 }
 
-// ── Threshold boundary (extra) ──────────────────────────────────────────────
-//
-// `get_stale_processing_transactions_internal` boundary: three rows at
-// `now - 4:59`, `now - 5:00`, `now - 5:01`. Threshold = 5min. Assert two
-// returned (the two with `updated_at < now - threshold`).
+// Threshold boundary: three rows at -4:59 / -5:00 / -5:01, expect the two older returned.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn threshold_boundary_returns_only_strictly_older_rows() {
@@ -968,10 +902,7 @@ async fn threshold_boundary_returns_only_strictly_older_rows() {
         .get_stale_processing_transactions_internal(Duration::from_secs(5 * 60), 100)
         .await
         .unwrap();
-    // The 4:59 row is younger than 5min → excluded.
-    // The 5:00 row is NOT strictly older — postgres `<` is strict, so
-    // depending on timing fence it may or may not be returned. Assert the
-    // 5:01 row is always present, and the 4:59 row is always excluded.
+    // 4:59 excluded; 5:00 is timing-dependent (Postgres `<` is strict).
     let returned_ids: std::collections::HashSet<i64> = stale.iter().map(|r| r.id).collect();
     assert!(
         !returned_ids.contains(&ids[0]),

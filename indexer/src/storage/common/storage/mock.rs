@@ -186,9 +186,7 @@ impl MockStorage {
         processed_at: DateTime<Utc>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("update_transaction_status")?;
-        // Mirror the Postgres status filter so tests exercise the same
-        // no-op-when-row-is-terminal behavior as production. Only rows
-        // currently in `Processing` or `PendingRemint` accept writes.
+        // Mirror the Postgres status filter (Processing or PendingRemint only).
         let mut pending = self.pending_transactions.lock().unwrap();
         let updated = if let Some(txn) = pending.iter_mut().find(|t| t.id == transaction_id) {
             if matches!(
@@ -384,11 +382,9 @@ impl MockStorage {
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stale_processing_transactions")?;
-        let threshold_chrono = chrono::Duration::from_std(threshold).unwrap_or_else(|_| {
-            // Defensive: an overflowing Duration falls back to a 1-day cutoff
-            // which is effectively never-stale for any sane test fixture.
-            chrono::Duration::days(1)
-        });
+        let threshold_chrono = chrono::Duration::from_std(threshold)
+            // Defensive: an overflowing Duration falls back to a 1-day cutoff.
+            .unwrap_or_else(|_| chrono::Duration::days(1));
         let cutoff = Utc::now() - threshold_chrono;
         let pending = self.pending_transactions.lock().unwrap();
         let mut matched: Vec<DbTransaction> = pending

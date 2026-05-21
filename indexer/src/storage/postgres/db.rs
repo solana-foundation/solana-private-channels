@@ -800,10 +800,7 @@ impl PostgresDb {
         Ok(transactions)
     }
 
-    /// Returns `Ok(true)` if the row was updated, `Ok(false)` if it was
-    /// skipped because the row is already in a terminal state (recovery
-    /// or another writer moved it first). Callers branch on the bool to
-    /// avoid counting no-op writes as successful DB updates.
+    /// Returns true if the row was updated; false if already terminal.
     pub async fn update_transaction_status_internal(
         &self,
         transaction_id: i64,
@@ -811,17 +808,7 @@ impl PostgresDb {
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, sqlx::Error> {
-        // The status filter protects against this race: recovery has
-        // already moved a stuck row off `Processing`, but a late
-        // confirmation from the original (now-crashed) sender is still
-        // trying to mark it `Completed`. Without the filter, the late
-        // write would overwrite recovery's decision.
-        //
-        // Both `processing` and `pending_remint` are allowed because the
-        // remint flow writes terminal states (`Completed`,
-        // `FailedReminted`, `ManualReview`) from `pending_remint` —
-        // recovery doesn't touch that status, so there's no race window
-        // to worry about there.
+        // Only write non-terminal source states — blocks late writes after recovery.
         let result = sqlx::query(
             r#"
             UPDATE transactions
@@ -843,8 +830,7 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Rows stuck in `Processing` whose `updated_at` is older than the
-    /// safety threshold. Oldest-first so longest-stuck rows are healed first.
+    /// Stale `Processing` rows older than the threshold, oldest-first.
     pub async fn get_stale_processing_transactions_internal(
         &self,
         threshold: Duration,
@@ -892,12 +878,7 @@ impl PostgresDb {
         .await
     }
 
-    /// Move a stuck row from `Processing` back to `Pending` so the fetcher
-    /// can pick it up again. The `updated_at = $2` condition is what makes
-    /// this safe to call: it only succeeds if nothing else has touched the
-    /// row since the caller read it. Anyone else writing to the row bumps
-    /// `updated_at` via the trigger, so our condition fails and the write
-    /// becomes a no-op.
+    /// CAS `Processing` → `Pending` keyed on `updated_at`; no-op if stale.
     pub async fn try_requeue_processing_internal(
         &self,
         transaction_id: i64,
@@ -920,13 +901,7 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Move a stuck row from `Processing` to `Completed` after recovery
-    /// confirmed the action already happened on-chain. The
-    /// `updated_at = $2` condition makes this a no-op if anyone else has
-    /// touched the row in the meantime. `counterpart_signature` may be
-    /// `None` — withdrawal recovery doesn't always know the exact signature
-    /// that landed, and the on-chain escrow program prevents duplicates
-    /// regardless.
+    /// CAS `Processing` → `Completed` keyed on `updated_at`; sig may be `None`.
     pub async fn try_complete_processing_internal(
         &self,
         transaction_id: i64,
@@ -953,10 +928,7 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Move a stuck row from `Processing` to `ManualReview` when recovery
-    /// can't tell whether the on-chain action happened — a human needs to
-    /// look. The reason is only carried on the caller's alert webhook
-    /// payload; we don't add a DB column for it.
+    /// CAS `Processing` → `ManualReview`; reason carried on webhook, not DB.
     pub async fn try_quarantine_processing_internal(
         &self,
         transaction_id: i64,

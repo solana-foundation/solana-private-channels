@@ -1,11 +1,4 @@
-//! Recovers transaction rows that got stuck in `Processing` because the
-//! operator crashed before writing their final status.
-//!
-//! Runs alongside the fetcher / processor / sender. On boot and once per
-//! minute, it picks up rows that have been in `Processing` for too long,
-//! asks the chain whether the operator's intended action already happened,
-//! and updates each row to its true state: `Completed`, `Pending` (so the
-//! fetcher will retry it), or `ManualReview` (so a human can investigate).
+//! Recovers rows stuck in `Processing` after an operator crash.
 
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
@@ -28,51 +21,36 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// How often the recovery loop runs. With the 5-minute age cutoff below,
-/// a stuck row gets resolved within ~6 minutes of getting stuck.
+/// How often the recovery loop runs.
 pub(crate) const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How long a row must sit in `Processing` before we consider it stuck.
-/// Must be safely longer than any legitimate in-flight send (the sender's
-/// shutdown drain is capped at 30s, plus retry headroom). Set too low,
-/// recovery would interfere with a slow but still-alive send. Set too
-/// high, real stuck rows take longer to heal.
+/// Age cutoff for "stuck"; must exceed the sender's 30s drain + retries.
 pub(crate) const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
-/// Maximum rows handled per loop iteration. Keeps a big backlog from
-/// blocking everything else; remaining rows are picked up on the next tick.
+/// Per-tick batch cap; leftovers are picked up next tick.
 pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 
-/// Outcome of checking whether a stuck deposit's mint already landed
-/// on-chain. Three variants are needed (not two), because if we can't tell
-/// for sure, treating that as "didn't land" risks minting a second time.
+/// Three-way outcome: uncertainty must NOT demote (double-mint risk).
 enum DepositOutcome {
     Landed { signature: String },
     NotLanded,
     Ambiguous { reason: String },
 }
 
-/// Outcome of looking at a stuck withdrawal. Only two variants because
-/// the on-chain escrow program won't accept a duplicate release anyway,
-/// so unconditionally retrying is safe — we just refuse if the row itself
-/// is malformed.
+/// Two-way outcome: on-chain SMT prevents duplicate release anyway.
 enum WithdrawalAction {
     Demote,
     Quarantine { reason: String },
 }
 
-/// What recovery should do with a stuck row, regardless of type. The
-/// type-specific outcomes above are mapped into this for the actual write.
+/// Unified action for the storage router.
 enum RecoveryAction {
     Complete { signature: String },
     Demote,
     Quarantine { reason: String },
 }
 
-/// The recovery loop. The first iteration runs immediately on boot,
-/// because boot right after a crash is the moment stuck rows are most
-/// likely to exist. After that it ticks once a minute to catch rows
-/// orphaned by missed shutdowns or rolling deploys.
+/// Recovery loop. First tick runs on boot (the prime crash-recovery moment).
 pub async fn run_recovery_worker(
     storage: Arc<Storage>,
     rpc_client: Arc<RpcClientWithRetry>,
@@ -100,9 +78,7 @@ pub async fn run_recovery_worker(
                 )
                 .await
                 {
-                    // A single failed tick is fine — each row write is
-                    // independent and conditional, so partial failure can't
-                    // leave the DB inconsistent. Retry next minute.
+                    // Per-row writes are independent; retry next tick.
                     warn!("Recovery tick failed: {}", e);
                 }
             }
@@ -133,20 +109,12 @@ async fn recover_once(
     );
 
     for row in stale {
-        // Cooperate with shutdown between rows. With a batch of up to 100
-        // rows and sequential RPC calls per deposit, a tick can run long
-        // enough to overshoot the shutdown drain budget. Drop the
-        // remaining batch and let the next boot pick up where we left off.
+        // Cooperate with shutdown between rows so long batches exit cleanly.
         if cancellation_token.is_cancelled() {
-            info!(
-                "Recovery sweep interrupted by cancellation; remaining rows deferred to next boot"
-            );
+            info!("Recovery sweep cancelled; remaining rows deferred");
             return Ok(());
         }
-        // Read `updated_at` now, before the (possibly slow) RPC call. We
-        // pass it to the write below as a "this row hasn't changed since I
-        // looked" check, if anyone else touches the row in between, the
-        // DB trigger bumps updated_at and our write becomes a no-op.
+        // Capture `updated_at` before the RPC so the write below CAS-checks it.
         let captured = row.updated_at;
         let action = decide_action(&row, rpc_client, admin_pubkey).await;
         route_outcome(storage, &row, captured, action, program_type, storage_tx).await;
@@ -191,16 +159,9 @@ async fn check_deposit_idempotency(
         Ok(Some(sig)) => DepositOutcome::Landed {
             signature: sig.to_string(),
         },
-        // `find_existing_mint_signature` also returns Ok(None) when the RPC
-        // responds with -32601 MethodNotFound (fail-open at mint.rs:441-442).
-        // That arm is unreachable here because the operator's RPC is the
-        // PrivateChannel node, which implements `getSignaturesForAddress`
-        // (PR #95). So Ok(None) in production means "no prior mint found"
-        // — safe to demote.
+        // PrivateChannel RPC supports getSignaturesForAddress; None = not minted.
         Ok(None) => DepositOutcome::NotLanded,
-        // Transport / other RPC error. Recovery cannot demote on
-        // uncertainty (a row whose mint already landed would be re-minted
-        // on the next pickup); route to ManualReview instead.
+        // Never demote on uncertainty — risks a double-mint on re-pickup.
         Err(e) => DepositOutcome::Ambiguous {
             reason: format!("deposit idempotency: {e}"),
         },
@@ -216,10 +177,7 @@ fn check_withdrawal(row: &DbTransaction) -> WithdrawalAction {
     }
 }
 
-/// Rebuild the same mint-builder shape the processor would have produced
-/// for this row (`process_deposit_funds` in processor.rs). We don't send
-/// it — we only need its fields (recipient ATA, memo) so the idempotency
-/// lookup searches the same place the original mint would have targeted.
+/// Rebuild the processor's mint builder so idempotency lookup keys match.
 fn reconstruct_mint_builder_for_lookup(
     row: &DbTransaction,
     admin_pubkey: Pubkey,
@@ -227,9 +185,7 @@ fn reconstruct_mint_builder_for_lookup(
     let mint = Pubkey::from_str(&row.mint).map_err(|e| format!("invalid mint pubkey: {e}"))?;
     let recipient =
         Pubkey::from_str(&row.recipient).map_err(|e| format!("invalid recipient pubkey: {e}"))?;
-    // PrivateChannel is SPL-Token-only today. Hard-coding the program ID
-    // here avoids dragging the MintCache into recovery just to read a
-    // constant. If Token-2022 lands, this and `mint_util.rs` move together.
+    // PrivateChannel is SPL-Token-only today (mirror `mint_util.rs`).
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
@@ -296,9 +252,7 @@ async fn route_outcome(
             }
         }
         RecoveryAction::Demote => {
-            // The write itself bumps `updated_at` (via the DB trigger), so
-            // the row no longer looks stuck to the next recovery tick. The
-            // fetcher picks it up as a fresh `Pending` job on its next poll.
+            // Trigger bumps `updated_at`; the next sweep skips it.
             match storage
                 .try_requeue_processing(row.id, captured_updated_at)
                 .await
@@ -322,8 +276,7 @@ async fn route_outcome(
             }
         }
         RecoveryAction::Quarantine { reason } => {
-            // Deliberately noisy. We'd rather page on-call for a row we're
-            // unsure about than quietly demote it and risk a double-mint.
+            // Noisy by design — page on uncertainty, never silently demote.
             match storage
                 .try_quarantine_processing(row.id, captured_updated_at, reason.clone())
                 .await
@@ -337,11 +290,7 @@ async fn route_outcome(
                     OPERATOR_STALE_PROCESSING_RECOVERED
                         .with_label_values(&[pt_label, "quarantined", type_label])
                         .inc();
-                    // Send the same status-update message the rest of the
-                    // operator sends, so the existing webhook + alert log
-                    // fire and on-call gets the reason string the runbook
-                    // expects. Same pattern as `send_recovery_manual_review`
-                    // in sender/state.rs.
+                    // Fire the existing webhook + alert log (see sender/state.rs).
                     let update = TransactionStatusUpdate {
                         transaction_id: row.id,
                         trace_id: Some(row.trace_id.clone()),
@@ -352,11 +301,7 @@ async fn route_outcome(
                         remint_signature: None,
                         remint_attempted: false,
                     };
-                    // The webhook + alert log are how on-call learns about
-                    // this quarantine. If the storage channel is closed
-                    // (e.g. mid-shutdown the writer exited first), the row
-                    // is still correctly quarantined in the DB, but the
-                    // alert is lost — flag it so the gap is visible.
+                    // Closed channel = on-call alert lost; surface it loudly.
                     if let Err(e) =
                         send_guaranteed(storage_tx, update, "recovery manual review").await
                     {
@@ -390,8 +335,7 @@ pub mod test_hooks {
         program_type: ProgramType,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
-        // Tests don't exercise cancellation here — pass a fresh, never-cancelled
-        // token so the sweep runs to completion deterministically.
+        // Fresh, never-cancelled token; tests run to completion.
         let token = CancellationToken::new();
         recover_once(
             storage,
@@ -459,9 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_deposit_idempotency_landed_when_rpc_returns_match() {
-        // Script `getSignaturesForAddress` + `getTransaction` so the helper
-        // finds a confirmed mint with the expected memo. Mirrors the
-        // integration-level fixture but with mockito for unit-scope use.
+        // Scripted mock with memo-matching mint; unit equivalent of the IT fixture.
         let mut server = mockito::Server::new_async().await;
 
         let row = make_deposit_row(7_777);

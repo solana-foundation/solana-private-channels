@@ -1,10 +1,6 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
 
-/// Move a stuck row from `Processing` back to `Pending` so the fetcher
-/// will retry it. Only writes if the row's `updated_at` still matches
-/// what the caller read — i.e., nobody else has touched the row since.
-/// Returns `true` if the write happened, `false` if someone else got
-/// there first (which is fine, nothing to do).
+/// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
 pub async fn try_requeue_processing(
     storage: &Storage,
     transaction_id: i64,

@@ -1459,17 +1459,7 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-// ── Drill 15: deposit_manual_review.md § Path E ────────────────────────────
-//
-// Pins three contracts for the recovery-worker idempotency-failure path:
-//   1. The triage substring `deposit idempotency:` is present in
-//      `indexer/src/operator/recovery.rs` so future contributors cannot
-//      silently rename it.
-//   2. The re-arm SQL flips a single `manual_review` deposit to `pending`
-//      and is targeted by id (not by error_message), so it is fungible
-//      across any future Path-E substring variants.
-//   3. A `manual_review` row that was never armed cannot be re-armed by
-//      mistake into another row's identity (the SQL is single-row).
+// Drill 15: pins Path E triage substring + row-scoped re-arm SQL.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1519,15 +1509,7 @@ async fn drill_15_deposit_manual_review_recovery_idempotency_failure_flow(
     Ok(())
 }
 
-// ── Drill 16: withdrawal_manual_review.md § Path F ─────────────────────────
-//
-// Pins three contracts for the recovery-worker missing-nonce path:
-//   1. Triage substring `withdrawal row missing nonce` is present in
-//      `indexer/src/operator/recovery.rs`.
-//   2. The runbook has zero "re-arm to pending" SQL for Path F — the
-//      `manual_review` row stays `manual_review` until a human resolves
-//      it (the row is structurally corrupt).
-//   3. The terminal-write SQL is row-scoped by id.
+// Drill 16: pins Path F triage substring + row-scoped terminal SQL.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]

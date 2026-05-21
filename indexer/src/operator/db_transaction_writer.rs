@@ -86,12 +86,7 @@ impl DbTransactionWriter {
                     .inc();
             }
             Ok(false) => {
-                // Storage skipped the write: the row was already off
-                // `Processing` (typically the recovery worker moved it
-                // first). Don't count this as a successful DB update,
-                // but DO let the alert webhook below still fire — the
-                // upstream caller deliberately asked us to surface this
-                // status transition.
+                // Row off Processing (recovery moved it); webhook still fires.
                 info!(
                     trace_id = trace_id,
                     "Transaction {} already past Processing; status write skipped",

@@ -174,16 +174,10 @@ pub async fn run(
         tokio::spawn(async {})
     };
 
-    // Recovery worker. If the operator crashes between claiming a row
-    // (Pending → Processing) and writing its final status, the row would
-    // sit stuck in Processing forever. This worker periodically finds
-    // those stuck rows and resolves them. Runs on every operator since
-    // every operator has the same crash window.
+    // Recovery worker: resolves rows stuck in Processing after a crash.
     let recovery_handle = {
         let recovery_storage = storage.clone();
-        let recovery_rpc = source_rpc_client
-            .clone()
-            .unwrap_or_else(|| rpc_client.clone());
+        let recovery_rpc = rpc_client.clone();
         let recovery_program_type = common_config.program_type;
         let recovery_token = cancellation_token.clone();
         let admin_pubkey = SignerUtil::get_admin_pubkey();

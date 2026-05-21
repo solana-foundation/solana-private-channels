@@ -1,9 +1,6 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
 
-/// Mark a stuck row as `Completed` after recovery has confirmed the
-/// on-chain action already happened. Only writes if the row's
-/// `updated_at` still matches what the caller read. Returns `true` if
-/// the write happened, `false` if someone else got there first.
+/// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.
 pub async fn try_complete_processing(
     storage: &Storage,
     transaction_id: i64,

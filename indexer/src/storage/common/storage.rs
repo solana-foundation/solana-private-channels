@@ -120,9 +120,7 @@ impl Storage {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
     }
 
-    /// Update transaction status after processing. Returns `Ok(true)` if
-    /// the row was updated; `Ok(false)` if the write was skipped because
-    /// the row was no longer in `Processing` (recovery already moved it).
+    /// Terminal status write; `Ok(false)` if row already off Processing.
     pub async fn update_transaction_status(
         &self,
         transaction_id: i64,
@@ -240,8 +238,7 @@ impl Storage {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
 
-    /// Rows stuck in `Processing` whose `updated_at` is older than the
-    /// safety threshold. Used by the recovery worker.
+    /// Stale `Processing` rows past the threshold (used by recovery).
     pub async fn get_stale_processing_transactions(
         &self,
         threshold: std::time::Duration,
@@ -251,9 +248,7 @@ impl Storage {
             .await
     }
 
-    /// Move a stuck row from `Processing` back to `Pending` if its
-    /// `updated_at` still matches. Returns `true` if the write happened,
-    /// `false` if another writer touched the row first (which is fine).
+    /// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
     pub async fn try_requeue_processing(
         &self,
         transaction_id: i64,
@@ -263,9 +258,7 @@ impl Storage {
             .await
     }
 
-    /// Mark a stuck row as `Completed` if its `updated_at` still matches.
-    /// Returns `true` if the write happened, `false` if another writer
-    /// touched the row first.
+    /// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.
     pub async fn try_complete_processing(
         &self,
         transaction_id: i64,
@@ -281,10 +274,7 @@ impl Storage {
         .await
     }
 
-    /// Mark a stuck row as `ManualReview` if its `updated_at` still
-    /// matches. Returns `true` if the write happened, `false` if another
-    /// writer touched the row first. `reason` is carried only on the
-    /// caller's alert webhook payload; we don't store it.
+    /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,

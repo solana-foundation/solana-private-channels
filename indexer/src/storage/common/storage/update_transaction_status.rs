@@ -4,10 +4,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 
-/// Returns `Ok(true)` if the row was updated, `Ok(false)` if the
-/// underlying write was skipped because the row was no longer in
-/// `Processing` (a benign race with recovery — caller should not count
-/// this as a successful DB update).
+/// Terminal status write; `Ok(false)` if row already off Processing.
 pub async fn update_transaction_status(
     storage: &Storage,
     transaction_id: i64,

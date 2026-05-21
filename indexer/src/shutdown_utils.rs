@@ -423,7 +423,26 @@ async fn perform_operator_shutdown_stages(
         }
     }
 
-    // Stage 5: Drain storage writer
+    // Stage 4b: drain recovery before the storage writer (it's a producer on storage_tx).
+    info!("Stage 4b: Waiting for recovery worker to drain...");
+    let recovery_result = tokio::time::timeout(
+        Duration::from_secs(config.storage_writer_drain_timeout_secs),
+        recovery_handle,
+    )
+    .await;
+
+    match recovery_result {
+        Ok(Ok(_)) => info!("Recovery worker drained successfully"),
+        Ok(Err(e)) => warn!("Recovery worker error: {:?}", e),
+        Err(_) => {
+            warn!(
+                "Recovery worker drain timed out after {}s",
+                config.storage_writer_drain_timeout_secs
+            );
+        }
+    }
+
+    // Stage 5: drain storage writer (consumer); all producers have exited.
     info!("Stage 5: Waiting for storage writer to drain (writing final status updates)...");
     let storage_writer_result = tokio::time::timeout(
         Duration::from_secs(config.storage_writer_drain_timeout_secs),
@@ -474,24 +493,6 @@ async fn perform_operator_shutdown_stages(
         Err(_) => {
             warn!(
                 "Feepayer monitor drain timed out after {}s",
-                config.storage_writer_drain_timeout_secs
-            );
-        }
-    }
-
-    info!("Stage 6c: Waiting for recovery worker to drain...");
-    let recovery_result = tokio::time::timeout(
-        Duration::from_secs(config.storage_writer_drain_timeout_secs),
-        recovery_handle,
-    )
-    .await;
-
-    match recovery_result {
-        Ok(Ok(_)) => info!("Recovery worker drained successfully"),
-        Ok(Err(e)) => warn!("Recovery worker error: {:?}", e),
-        Err(_) => {
-            warn!(
-                "Recovery worker drain timed out after {}s",
                 config.storage_writer_drain_timeout_secs
             );
         }

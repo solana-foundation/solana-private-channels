@@ -332,10 +332,7 @@ async fn update_transaction_status_updates_fields() -> Result<(), Box<dyn std::e
     let txn = make_db_transaction("upd_status", TransactionType::Deposit);
     let id = storage.insert_db_transaction(&txn).await?;
 
-    // Mirror the production lifecycle: a row only reaches the terminal
-    // writer after the fetcher has claimed it (`pending` → `processing`).
-    // `update_transaction_status` refuses to write rows still in
-    // `pending` to guard against late writes after recovery moves a row.
+    // Production lifecycle: fetcher must flip to `processing` first.
     sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
         .bind(id)
         .execute(&pool)
