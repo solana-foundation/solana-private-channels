@@ -5,6 +5,7 @@ use {
                 get_address_signatures_flushed_slot, upsert_address_signatures_flushed_slot_in_tx,
                 ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
             },
+            get_latest_slot::get_latest_slot,
             traits::{AccountsDB, BlockInfo},
             types::StoredTransaction,
             write_batch::{upsert_address_signature_rows, AddressSignatureRow},
@@ -35,15 +36,14 @@ pub async fn repair_address_signatures(db: &AccountsDB, _metrics: SharedMetrics)
         .context("Failed to read address_signatures watermark")?
         .unwrap_or(-1);
 
-    let max_block: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
-        .fetch_one(pool.as_ref())
+    let Some(max_block_u64) = get_latest_slot(db)
         .await
-        .context("Failed to query max block slot")?;
-
-    let Some(max_block) = max_block else {
+        .context("Failed to query max block slot")?
+    else {
         info!("address_signatures repair: no blocks present, nothing to do");
         return Ok(());
     };
+    let max_block = max_block_u64 as i64;
 
     if max_block <= watermark {
         info!(

@@ -21,7 +21,8 @@ use {
 /// just headroom for sqlx's own bookkeeping connection-resets.
 const WRITER_POOL_SIZE: u32 = 2;
 
-const FLUSH_RETRY_BACKOFF_MS: [u64; 3] = [100, 500, 2000];
+/// Sleep before each next attempt; total attempts = len + 1.
+const FLUSH_RETRY_BACKOFF_MS: [u64; 2] = [100, 500];
 
 pub struct AddressIndexWriterArgs {
     pub rows_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
@@ -158,22 +159,16 @@ async fn flush_chunk_with_retry(
     watermark: Option<i64>,
     metrics: &SharedMetrics,
 ) -> Result<(), sqlx::Error> {
-    let mut last_err: Option<sqlx::Error> = None;
     for (i, ms) in FLUSH_RETRY_BACKOFF_MS.iter().enumerate() {
         match flush_chunk_once(pool, rows, watermark, metrics).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if i + 1 < FLUSH_RETRY_BACKOFF_MS.len() {
-                    warn!(error = %e, attempt = i, "address_signatures flush retry");
-                    tokio::time::sleep(Duration::from_millis(*ms)).await;
-                    last_err = Some(e);
-                } else {
-                    return Err(e);
-                }
+                warn!(error = %e, attempt = i, "address_signatures flush retry");
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
             }
         }
     }
-    Err(last_err.expect("retry loop must have observed at least one error"))
+    flush_chunk_once(pool, rows, watermark, metrics).await
 }
 
 async fn flush_chunk_once(
