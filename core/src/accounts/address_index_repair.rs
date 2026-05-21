@@ -173,8 +173,16 @@ async fn derive_rows_for_block(
             }
         };
 
-        let keys = stored.transaction.message.static_account_keys();
-        for pk in keys {
+        let tx_with_meta = stored.transaction_with_status_meta();
+        let solana_transaction_status::TransactionWithStatusMeta::Complete(versioned) =
+            tx_with_meta
+        else {
+            return Err(anyhow!(
+                "Repair: transaction_with_status_meta returned non-Complete at slot {}",
+                slot
+            ));
+        };
+        for pk in versioned.account_keys().iter() {
             out.push(AddressSignatureRow {
                 address: pk.to_bytes().to_vec(),
                 slot,
