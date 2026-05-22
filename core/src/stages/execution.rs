@@ -929,6 +929,53 @@ mod tests {
         );
     }
 
+    /// Plumbing check: the live_blockhashes Arc is read each call, not snapshotted
+    /// at deps construction. Mutating the Arc (what dedup does when the window
+    /// advances) must flip the filter's verdict on subsequent execute_batch calls.
+    /// Guards against a refactor that copies the LinkedList instead of cloning the Arc.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_reads_live_window_each_call() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+
+        let bh = Hash::new_unique();
+        let live = Arc::new(RwLock::new(LinkedList::from([bh])));
+        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let batch_with = |payer: &Keypair| ConflictFreeBatch {
+            transactions: (0..3)
+                .map(|i| crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(sanitize_transfer(payer, bh)),
+                    index: i,
+                })
+                .collect(),
+        };
+
+        // Pass 1: bh is in the live window — all 3 must execute.
+        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        assert_eq!(
+            r1.regular_transactions.len(),
+            3,
+            "all live txs must execute"
+        );
+
+        // Evict bh from the shared Arc (the operation dedup performs on eviction).
+        live.write().unwrap().clear();
+
+        // Pass 2: same blockhash, now expired — all 3 must be filtered.
+        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        assert_eq!(
+            r2.regular_transactions.len(),
+            0,
+            "evicted-bh txs must be filtered"
+        );
+        assert!(
+            r2.regular_results.is_none(),
+            "no SVM run when batch is fully filtered"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execution_worker_shutdown_exits_cleanly() {
         let (_accounts_db, _pg) = start_test_postgres().await;
