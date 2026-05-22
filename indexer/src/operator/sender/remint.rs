@@ -294,8 +294,10 @@ pub async fn process_pending_remints(
 
         // Walk the sigs to see if any could still land. Exit early on the
         // first one that isn't dead. Index-aligned with response.value
-        // (length equality enforced above).
-        let mut any_still_live = false;
+        // (length equality enforced above). Captures a reason describing
+        // why the broadcast could still land so the defer/ManualReview
+        // message can guide operator triage.
+        let mut live_reason: Option<String> = None;
         for (index, pending_sig) in entry.signatures.iter().enumerate() {
             let signature_status = &response.value[index];
 
@@ -306,9 +308,12 @@ pub async fn process_pending_remints(
                 if status.satisfies_commitment(CommitmentConfig::finalized()) {
                     continue;
                 }
-                // `confirmed` or `processed` — already included in a block,
+                // `confirmed` or `processed`: already included in a block,
                 // will finalize regardless of blockhash validity.
-                any_still_live = true;
+                live_reason = Some(
+                    "signature is on-chain (confirmed/processed) and awaiting finalization"
+                        .to_string(),
+                );
                 break;
             }
 
@@ -316,23 +321,16 @@ pub async fn process_pending_remints(
             if current_height > pending_sig.last_valid_block_height {
                 continue;
             }
-            any_still_live = true;
+            live_reason = Some(format!(
+                "signatures still within blockhash validity (current_height={})",
+                current_height
+            ));
             break;
         }
 
         // Case 2: at least one broadcast could still land, defer rather than remint.
-        if any_still_live {
-            defer_or_escalate(
-                &mut remaining,
-                entry,
-                &nonce_label,
-                &format!(
-                    "signatures still within blockhash validity (current_height={})",
-                    current_height
-                ),
-                storage_tx,
-            )
-            .await;
+        if let Some(reason) = live_reason {
+            defer_or_escalate(&mut remaining, entry, &nonce_label, &reason, storage_tx).await;
             continue;
         }
 

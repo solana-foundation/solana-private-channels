@@ -284,9 +284,11 @@ impl SenderState {
                     .map(|(sig_string, &lvbh)| {
                         let signature = Signature::from_str(sig_string)
                             .map_err(|e| format!("invalid withdrawal signature: {e}"))?;
+                        let last_valid_block_height = u64::try_from(lvbh)
+                            .map_err(|_| format!("negative last_valid_block_height: {lvbh}"))?;
                         Ok(PendingSig {
                             signature,
-                            last_valid_block_height: lvbh as u64,
+                            last_valid_block_height,
                         })
                     })
                     .collect()
