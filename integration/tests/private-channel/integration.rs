@@ -86,7 +86,11 @@ async fn test_with_postgres() {
         shutdown(test_context).await;
 
         // Dedup persistence test runs with its own node instance against the same DB
-        run_dedup_persistence_test(node_db_url).await;
+        run_dedup_persistence_test(node_db_url.clone()).await;
+
+        // Blockhash-expiry-after-admission test, uses its own node
+        // with short expiry + tiny queues to exercise the executor-stage filter.
+        run_blockhash_expiry_after_admission_test(node_db_url).await;
     })
     .await
     .unwrap();

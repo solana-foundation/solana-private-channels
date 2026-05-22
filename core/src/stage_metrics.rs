@@ -21,6 +21,7 @@ pub trait StageMetrics: Send + Sync {
     fn executor_results_sent(&self, tx_count: usize);
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
+    fn executor_dropped_expired_blockhash(&self, count: usize);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -83,6 +84,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_missing_results(&self, kind: &'static str) {
         debug!("executor: missing results kind={}", kind);
+    }
+    fn executor_dropped_expired_blockhash(&self, count: usize) {
+        debug!("executor: dropped {} expired blockhash txs", count);
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -197,6 +201,12 @@ counter_vec!(
     "private_channel_executor_missing_results_total",
     "Missing execution results",
     &["kind"]
+);
+counter_vec!(
+    EXECUTOR_DROPPED_EXPIRED_BH,
+    "private_channel_executor_dropped_expired_bh_total",
+    "Transactions dropped at execution due to expired blockhash",
+    &[]
 );
 counter_vec!(
     SETTLER_TXS_SETTLED,
@@ -329,6 +339,11 @@ impl StageMetrics for PrometheusMetrics {
     fn executor_missing_results(&self, kind: &'static str) {
         EXECUTOR_MISSING_RESULTS.with_label_values(&[kind]).inc();
     }
+    fn executor_dropped_expired_blockhash(&self, count: usize) {
+        EXECUTOR_DROPPED_EXPIRED_BH
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -408,6 +423,7 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_RESULTS_SENT,
         EXECUTOR_RESULTS_SEND_FAILED,
         EXECUTOR_MISSING_RESULTS,
+        EXECUTOR_DROPPED_EXPIRED_BH,
         SETTLER_TXS_SETTLED,
         // Executor latency histograms
         EXECUTOR_BATCH_DURATION,

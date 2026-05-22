@@ -1,10 +1,19 @@
 use {
     anyhow::Result,
-    private_channel_core::nodes::node::{run_node, NodeConfig, NodeHandles},
+    private_channel_core::{
+        nodes::node::{run_node, NodeConfig, NodeHandles},
+        stage_metrics::StageMetrics,
+    },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::Transaction},
     solana_transaction_status::UiTransactionEncoding,
-    std::{sync::Once, time::Duration},
+    std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Once,
+        },
+        time::Duration,
+    },
     tokio::time::sleep,
     tracing::warn,
 };
@@ -94,4 +103,56 @@ pub async fn restart_private_channel(
     // Brief pause to allow the OS to release the port
     sleep(Duration::from_millis(200)).await;
     start_private_channel(config).await
+}
+
+// Test-double `StageMetrics` that tracks only the counters individual tests
+// need to assert on. Add new fields here as more tests need coverage; keep
+// the unused methods as empty bodies so adding the field is a one-line change.
+#[derive(Default)]
+pub struct CountingMetrics {
+    pub executor_dropped_expired: AtomicUsize,
+    pub dedup_dropped_unknown_blockhash: AtomicUsize,
+}
+
+impl CountingMetrics {
+    pub fn executor_dropped_expired(&self) -> usize {
+        self.executor_dropped_expired.load(Ordering::Relaxed)
+    }
+    pub fn dedup_dropped_unknown_blockhash(&self) -> usize {
+        self.dedup_dropped_unknown_blockhash.load(Ordering::Relaxed)
+    }
+}
+
+impl StageMetrics for CountingMetrics {
+    fn executor_dropped_expired_blockhash(&self, count: usize) {
+        self.executor_dropped_expired
+            .fetch_add(count, Ordering::Relaxed);
+    }
+    fn dedup_dropped_unknown_blockhash(&self) {
+        self.dedup_dropped_unknown_blockhash
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    fn dedup_received(&self) {}
+    fn dedup_forwarded(&self) {}
+    fn dedup_dropped_duplicate(&self) {}
+    fn sigverify_forwarded(&self) {}
+    fn sigverify_rejected(&self, _: &'static str) {}
+    fn sequencer_collected(&self, _: usize) {}
+    fn sequencer_transactions_emitted(&self, _: usize) {}
+    fn executor_results_sent(&self, _: usize) {}
+    fn executor_results_send_failed(&self, _: &'static str) {}
+    fn executor_missing_results(&self, _: &'static str) {}
+    fn executor_batch_duration_ms(&self, _: f64) {}
+    fn executor_preload_duration_ms(&self, _: f64) {}
+    fn executor_svm_duration_ms(&self, _: &'static str, _: f64) {}
+    fn executor_bob_update_duration_ms(&self, _: &'static str, _: f64) {}
+    fn settler_txs_settled(&self, _: usize) {}
+    fn settler_settle_duration_ms(&self, _: f64) {}
+    fn settler_db_write_duration_ms(&self, _: f64) {}
+    fn settler_processing_duration_ms(&self, _: f64) {}
+    fn address_signatures_queue_depth(&self, _: usize) {}
+    fn address_signatures_send_blocked_ms(&self, _: f64) {}
+    fn address_signatures_flush_duration_ms(&self, _: f64) {}
+    fn address_signatures_rows_flushed(&self, _: usize) {}
+    fn address_signatures_flush_errors_total(&self) {}
 }

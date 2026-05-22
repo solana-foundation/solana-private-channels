@@ -230,6 +230,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 metrics: Arc::clone(&config.metrics),
                 max_svm_workers: config.max_svm_workers,
                 heartbeat: executor_hb,
+                live_blockhashes: Arc::clone(&live_blockhashes),
             })
             .await;
             write_workers.push(execution);
