@@ -265,13 +265,11 @@ pub async fn process_pending_remints(
 
         // Case 1: if any sig finalized successfully, the withdrawal landed.
         // Mark Completed and drop the entry.
-        let finalized_success_index =
-            response.value.iter().position(|signature_status| {
-                signature_status.as_ref().is_some_and(|status| {
-                    status.satisfies_commitment(CommitmentConfig::finalized())
-                        && status.err.is_none()
-                })
-            });
+        let finalized_success_index = response.value.iter().position(|signature_status| {
+            signature_status.as_ref().is_some_and(|status| {
+                status.satisfies_commitment(CommitmentConfig::finalized()) && status.err.is_none()
+            })
+        });
         if let Some(index) = finalized_success_index {
             send_completed(storage_tx, &entry, &nonce_label, sigs[index]).await;
             continue;
@@ -535,11 +533,7 @@ mod tests {
     }
 
     /// Register a mockito response for a specific Solana RPC method.
-    async fn mock_rpc(
-        server: &mut mockito::Server,
-        method: &str,
-        body: &str,
-    ) -> mockito::Mock {
+    async fn mock_rpc(server: &mut mockito::Server, method: &str, body: &str) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(format!(
@@ -566,7 +560,10 @@ mod tests {
                 trace_id: Some("trace-20".to_string()),
             },
             remint_info: make_remint_info(20),
-            signatures: vec![PendingSig { signature: Signature::new_unique(), last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
             original_error: "max retries".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
@@ -600,7 +597,10 @@ mod tests {
                 trace_id: Some("trace-20".to_string()),
             },
             remint_info: make_remint_info(20),
-            signatures: vec![PendingSig { signature: Signature::new_unique(), last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
             original_error: "max retries".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 2, // MAX_FINALITY_CHECK_ATTEMPTS - 1
@@ -660,7 +660,10 @@ mod tests {
                 trace_id: Some("trace-10".to_string()),
             },
             remint_info: make_remint_info(10),
-            signatures: vec![PendingSig { signature: Signature::new_unique(), last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
@@ -674,7 +677,10 @@ mod tests {
                 trace_id: Some("trace-20".to_string()),
             },
             remint_info: make_remint_info(20),
-            signatures: vec![PendingSig { signature: Signature::new_unique(), last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
             original_error: "release_funds failed".to_string(),
             deadline: future_deadline,
             finality_check_attempts: 0,
@@ -767,7 +773,10 @@ mod tests {
                 trace_id: Some("trace-99".to_string()),
             },
             remint_info: make_remint_info(99),
-            signatures: vec![PendingSig { signature: sig, last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+            }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
@@ -841,7 +850,10 @@ mod tests {
                 trace_id: Some("trace-77".to_string()),
             },
             remint_info: make_remint_info(77),
-            signatures: vec![PendingSig { signature: sig, last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+            }],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
@@ -914,7 +926,10 @@ mod tests {
                 trace_id: Some("trace-88".to_string()),
             },
             remint_info: make_remint_info(88),
-            signatures: vec![PendingSig { signature: sig, last_valid_block_height: 0 }],
+            signatures: vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+            }],
             original_error: "timeout".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
             finality_check_attempts: 0,
@@ -979,8 +994,14 @@ mod tests {
             },
             remint_info: make_remint_info(55),
             signatures: vec![
-                PendingSig { signature: sig1, last_valid_block_height: 0 },
-                PendingSig { signature: sig2, last_valid_block_height: 0 },
+                PendingSig {
+                    signature: sig1,
+                    last_valid_block_height: 0,
+                },
+                PendingSig {
+                    signature: sig2,
+                    last_valid_block_height: 0,
+                },
             ],
             original_error: "release_funds failed".to_string(),
             deadline: Utc::now() - chrono::Duration::seconds(1),
