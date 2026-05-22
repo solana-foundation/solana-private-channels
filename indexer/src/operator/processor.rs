@@ -834,6 +834,7 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
+            remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
         }
     }
@@ -2137,6 +2138,7 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
+            remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
         };
 
@@ -2238,6 +2240,7 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
+            remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
         };
 

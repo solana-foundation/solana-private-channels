@@ -27,6 +27,7 @@ mod transaction_cols {
     pub const COUNTERPART_SIGNATURE: &str = "counterpart_signature";
     pub const TRACE_ID: &str = "trace_id";
     pub const REMINT_SIGNATURES: &str = "remint_signatures";
+    pub const REMINT_LAST_VALID_BLOCK_HEIGHTS: &str = "remint_last_valid_block_heights";
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
 }
 
@@ -175,15 +176,30 @@ impl PostgresDb {
         info!("Running pending_remint_deadline_at migration if needed...");
         sqlx::query(
             r#"
-            DO $$ BEGIN                                                                         
-                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pending_remint_deadline_at    
-        TIMESTAMPTZ;                                                                            
-            END $$;                                                                             
+            DO $$ BEGIN
+                ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pending_remint_deadline_at
+        TIMESTAMPTZ;
+            END $$;
             "#,
         )
         .execute(&self.pool)
         .await?;
         info!("pending_remint_deadline_at migration complete");
+
+        // Parallel array to remint_signatures: last_valid_block_height per stored
+        // signature so the remint gate can prove a broadcast can no longer land.
+        info!("Running remint_last_valid_block_heights migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS remint_last_valid_block_heights BIGINT[];
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("remint_last_valid_block_heights migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -613,7 +629,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -635,6 +651,7 @@ impl PostgresDb {
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
             transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filters
             transaction_cols::STATUS,
@@ -835,6 +852,7 @@ impl PostgresDb {
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
+        remint_last_valid_block_heights: Vec<i64>,
         deadline_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), sqlx::Error> {
         let result = sqlx::query(
@@ -843,7 +861,8 @@ impl PostgresDb {
             SET
                 status = $2,
                 remint_signatures = $3,
-                pending_remint_deadline_at = $4,
+                remint_last_valid_block_heights = $4,
+                pending_remint_deadline_at = $5,
                 updated_at = NOW()
             WHERE id = $1
                 AND status = 'processing'
@@ -852,6 +871,7 @@ impl PostgresDb {
         .bind(transaction_id)
         .bind(TransactionStatus::PendingRemint)
         .bind(remint_signatures)
+        .bind(remint_last_valid_block_heights)
         .bind(deadline_at)
         .execute(&self.pool)
         .await?;

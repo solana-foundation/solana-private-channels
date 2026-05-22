@@ -25,8 +25,8 @@ use super::mint::{
 };
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
-    InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PollTaskResult, SenderState,
-    TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
+    InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
+    SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
 };
 
 use std::sync::Arc;
@@ -302,7 +302,7 @@ pub(super) async fn send_and_confirm(
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
         .await
     {
-        Ok(signature) => {
+        Ok((signature, last_valid_block_height)) => {
             info!("Transaction sent with signature: {}", signature);
 
             // Stash signature for finality check on withdrawal failure path
@@ -311,7 +311,10 @@ pub(super) async fn send_and_confirm(
                     .pending_signatures
                     .entry(nonce)
                     .or_default()
-                    .push(signature);
+                    .push(PendingSig {
+                        signature,
+                        last_valid_block_height,
+                    });
             }
 
             let commitment_config = CommitmentConfig::confirmed();
@@ -684,11 +687,18 @@ pub(super) async fn handle_permanent_failure(
     // keeping status as Processing until the remint resolves avoids partial state
     // if the operator crashes during the finality window.
     if let Some(transaction_id) = ctx.transaction_id {
-        let sig_strings: Vec<String> = signatures.iter().map(|sig| sig.to_string()).collect();
+        let sig_strings: Vec<String> = signatures
+            .iter()
+            .map(|pending_sig| pending_sig.signature.to_string())
+            .collect();
+        let lvbhs: Vec<i64> = signatures
+            .iter()
+            .map(|pending_sig| pending_sig.last_valid_block_height as i64)
+            .collect();
 
         if let Err(e) = state
             .storage
-            .set_pending_remint(transaction_id, sig_strings, deadline)
+            .set_pending_remint(transaction_id, sig_strings, lvbhs, deadline)
             .await
         {
             error!(
@@ -776,7 +786,7 @@ pub(super) async fn fire_and_store(
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
         .await
     {
-        Ok(signature) => {
+        Ok((signature, _last_valid_block_height)) => {
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, "in_flight"])
                 .observe(send_start.elapsed().as_secs_f64());
@@ -850,7 +860,7 @@ pub(super) fn spawn_fire_and_store(
     tokio::spawn(async move {
         let send_start = std::time::Instant::now();
         match sign_and_send_transaction(rpc_client, instruction.clone(), retry_policy).await {
-            Ok(signature) => {
+            Ok((signature, _last_valid_block_height)) => {
                 metrics::OPERATOR_RPC_SEND_DURATION
                     .with_label_values(&[program_type.as_label(), "in_flight"])
                     .observe(send_start.elapsed().as_secs_f64());
@@ -1376,7 +1386,13 @@ mod tests {
         // Populate remint cache and some pending signatures
         state.remint_cache.insert(5, make_remint_info(10));
         let sig = Signature::new_unique();
-        state.pending_signatures.insert(5, vec![sig]);
+        state.pending_signatures.insert(
+            5,
+            vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+            }],
+        );
 
         let ctx = TransactionContext {
             transaction_id: Some(10),
@@ -1398,7 +1414,7 @@ mod tests {
         let entry = &state.pending_remints[0];
         assert_eq!(entry.ctx.transaction_id, Some(10));
         assert_eq!(entry.signatures.len(), 1);
-        assert_eq!(entry.signatures[0], sig);
+        assert_eq!(entry.signatures[0].signature, sig);
         assert_eq!(entry.original_error, "release_funds failed");
         assert_eq!(entry.finality_check_attempts, 0);
 
@@ -1465,9 +1481,13 @@ mod tests {
         state.smt_state = Some(smt);
         state.retry_counts.insert(3, 2);
         state.remint_cache.insert(3, make_remint_info(50));
-        state
-            .pending_signatures
-            .insert(3, vec![Signature::new_unique()]);
+        state.pending_signatures.insert(
+            3,
+            vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+        );
 
         let sig = solana_sdk::signature::Signature::new_unique();
         handle_success(&mut state, &ctx, sig, &storage_tx).await;
@@ -1498,11 +1518,18 @@ mod tests {
 
         // Simulate what send_and_confirm does: stash a signature
         let sig = Signature::new_unique();
-        state.pending_signatures.entry(nonce).or_default().push(sig);
+        state
+            .pending_signatures
+            .entry(nonce)
+            .or_default()
+            .push(PendingSig {
+                signature: sig,
+                last_valid_block_height: 0,
+            });
 
         assert!(state.pending_signatures.contains_key(&nonce));
         assert_eq!(state.pending_signatures[&nonce].len(), 1);
-        assert_eq!(state.pending_signatures[&nonce][0], sig);
+        assert_eq!(state.pending_signatures[&nonce][0].signature, sig);
 
         // Stash another (simulating a retry)
         let sig2 = Signature::new_unique();
@@ -1510,7 +1537,10 @@ mod tests {
             .pending_signatures
             .entry(nonce)
             .or_default()
-            .push(sig2);
+            .push(PendingSig {
+                signature: sig2,
+                last_valid_block_height: 0,
+            });
         assert_eq!(state.pending_signatures[&nonce].len(), 2);
     }
 
@@ -1536,7 +1566,19 @@ mod tests {
         let sig1 = Signature::new_unique();
         let sig2 = Signature::new_unique();
         state.remint_cache.insert(5, make_remint_info(10));
-        state.pending_signatures.insert(5, vec![sig1, sig2]);
+        state.pending_signatures.insert(
+            5,
+            vec![
+                PendingSig {
+                    signature: sig1,
+                    last_valid_block_height: 100,
+                },
+                PendingSig {
+                    signature: sig2,
+                    last_valid_block_height: 200,
+                },
+            ],
+        );
 
         let ctx = TransactionContext {
             transaction_id: Some(10),
@@ -1560,7 +1602,7 @@ mod tests {
             "set_pending_remint should be called exactly once"
         );
 
-        let (stored_id, stored_sigs, stored_deadline) = &calls[0];
+        let (stored_id, stored_sigs, stored_lvbhs, stored_deadline) = &calls[0];
         assert_eq!(*stored_id, 10, "wrong transaction_id persisted");
 
         assert_eq!(
@@ -1576,6 +1618,25 @@ mod tests {
             stored_sigs.contains(&sig2.to_string()),
             "sig2 must be persisted"
         );
+
+        // lvbh array must be index-paired with sig array and carry the values
+        // we stashed at send time. Otherwise the remint gate can't tell a still-
+        // live broadcast from a dead one.
+        assert_eq!(
+            stored_sigs.len(),
+            stored_lvbhs.len(),
+            "sig array and lvbh array must be the same length"
+        );
+        let sig1_idx = stored_sigs
+            .iter()
+            .position(|stored_sig| stored_sig == &sig1.to_string())
+            .unwrap();
+        let sig2_idx = stored_sigs
+            .iter()
+            .position(|stored_sig| stored_sig == &sig2.to_string())
+            .unwrap();
+        assert_eq!(stored_lvbhs[sig1_idx], 100, "sig1's lvbh must be persisted");
+        assert_eq!(stored_lvbhs[sig2_idx], 200, "sig2's lvbh must be persisted");
 
         // Deadline must be ~FINALITY_SAFETY_DELAY (32s) from now.
         // We allow a ±3s window to absorb test execution time.
@@ -1608,9 +1669,13 @@ mod tests {
         mock.set_should_fail("set_pending_remint", true);
 
         state.remint_cache.insert(5, make_remint_info(10));
-        state
-            .pending_signatures
-            .insert(5, vec![Signature::new_unique()]);
+        state.pending_signatures.insert(
+            5,
+            vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+        );
 
         let ctx = TransactionContext {
             transaction_id: Some(10),

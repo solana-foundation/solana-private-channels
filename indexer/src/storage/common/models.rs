@@ -68,8 +68,10 @@ pub struct DbTransaction {
     /// PendingRemint. Used on restart to verify whether the original withdrawal
     /// finalized before attempting to remint.
     pub remint_signatures: Option<Vec<String>>,
-    /// UTC timestamp of when the finality check deadline expires for PendingRemint transactions.                                                                           
-    /// Set when transitioning to PendingRemint, used to restore the exact wait time on restart.                                                                            
+    /// `last_valid_block_height` per stored signature, index-paired with `remint_signatures`.
+    pub remint_last_valid_block_heights: Option<Vec<i64>>,
+    /// UTC timestamp of when the finality check deadline expires for PendingRemint transactions.
+    /// Set when transitioning to PendingRemint, used to restore the exact wait time on restart.
     pub pending_remint_deadline_at: Option<DateTime<Utc>>,
 }
 
@@ -189,6 +191,7 @@ impl DbTransactionBuilder {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
+            remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
         }
     }

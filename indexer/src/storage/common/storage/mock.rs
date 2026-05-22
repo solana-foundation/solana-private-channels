@@ -9,8 +9,8 @@ use std::sync::Mutex;
 /// Recorded status update from `update_transaction_status`.
 pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<Utc>);
 
-/// Tuple of (transaction_id, withdrawal_signature_strings, deadline) — the data persisted when a withdrawal transitions to PendingRemint status.
-pub type PendingRemintRecord = (i64, Vec<String>, DateTime<Utc>);
+/// (transaction_id, signatures, last_valid_block_heights, deadline) persisted on PendingRemint transition.
+pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>);
 
 #[derive(Clone, Default)]
 pub struct MockStorage {
@@ -310,6 +310,7 @@ impl MockStorage {
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
+        remint_last_valid_block_heights: Vec<i64>,
         deadline_at: DateTime<Utc>,
     ) -> Result<(), StorageError> {
         if self
@@ -327,6 +328,7 @@ impl MockStorage {
         self.pending_remint_signatures.lock().unwrap().push((
             transaction_id,
             remint_signatures,
+            remint_last_valid_block_heights,
             deadline_at,
         ));
         Ok(())

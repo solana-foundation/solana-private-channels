@@ -1,7 +1,7 @@
 use crate::channel_utils::send_guaranteed;
 use crate::error::account::AccountError;
 use crate::error::OperatorError;
-use crate::operator::sender::types::{PendingRemint, TransactionContext};
+use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::utils::smt_util::SmtState;
 use crate::operator::{parse_instance, RetryConfig, RpcClientWithRetry};
@@ -262,22 +262,38 @@ impl SenderState {
                 continue;
             };
 
-            // Parse all stored withdrawal signatures. These are passed to
-            // get_signature_statuses_with_history() by process_pending_remints to verify
-            // the withdrawal did not finalize before we remint. A single bad entry means
-            // we cannot safely do that check — escalate to ManualReview.
+            // Pair each stored signature with its last_valid_block_height. The
+            // remint gate needs both to verify the withdrawal cannot still land.
+            // An empty array, a bad signature, or an array-length mismatch means
+            // we cannot safely run that check, so we escalate to ManualReview.
             let sig_strings = tx.remint_signatures.unwrap_or_default();
-            let Some(signatures) = Self::or_manual_review(
+            let lvbhs = tx.remint_last_valid_block_heights.unwrap_or_default();
+
+            let parsed: Result<Vec<PendingSig>, String> = if sig_strings.is_empty() {
+                Err("no withdrawal signatures stored; cannot verify finality".to_string())
+            } else if sig_strings.len() != lvbhs.len() {
+                Err(format!(
+                    "lvbh length {} != signatures length {}",
+                    lvbhs.len(),
+                    sig_strings.len()
+                ))
+            } else {
                 sig_strings
                     .iter()
-                    .map(|s| Signature::from_str(s))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("invalid withdrawal signature: {e}")),
-                storage_tx,
-                tx.id,
-                &tx.trace_id,
-            )
-            .await
+                    .zip(&lvbhs)
+                    .map(|(sig_string, &lvbh)| {
+                        let signature = Signature::from_str(sig_string)
+                            .map_err(|e| format!("invalid withdrawal signature: {e}"))?;
+                        Ok(PendingSig {
+                            signature,
+                            last_valid_block_height: lvbh as u64,
+                        })
+                    })
+                    .collect()
+            };
+
+            let Some(signatures) =
+                Self::or_manual_review(parsed, storage_tx, tx.id, &tx.trace_id).await
             else {
                 continue;
             };
@@ -397,6 +413,7 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: Some(vec![sig.to_string()]),
+            remint_last_valid_block_heights: Some(vec![12_345]),
             pending_remint_deadline_at: Some(deadline),
         }
     }
@@ -453,8 +470,11 @@ mod tests {
         assert_eq!(entry.remint_info.user, recipient);
 
         // Signatures must be parsed back — they drive the finality check.
+        // lvbh must round-trip too: the gate needs it to prove a broadcast
+        // can no longer land.
         assert_eq!(entry.signatures.len(), 1);
-        assert_eq!(entry.signatures[0], sig);
+        assert_eq!(entry.signatures[0].signature, sig);
+        assert_eq!(entry.signatures[0].last_valid_block_height, 12_345);
 
         // Deadline must be the stored one, not a fresh window.
         // Allows up to 1s of clock skew between DB write and assertion.
@@ -668,6 +688,55 @@ mod tests {
         assert!(
             state.pending_remints.is_empty(),
             "row with invalid signature must not be queued"
+        );
+        assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// A PendingRemint row whose `remint_signatures` and
+    /// `remint_last_valid_block_heights` arrays have different lengths cannot
+    /// be turned into a coherent `Vec<PendingSig>`. Index-pairing would be
+    /// undefined, so the remint gate cannot reliably check liveness.
+    ///
+    /// Escalate to ManualReview rather than guessing which sig got which lvbh.
+    #[tokio::test]
+    async fn recover_pending_remints_escalates_lvbh_length_mismatch_to_manual_review() {
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let deadline = Utc::now() + chrono::Duration::seconds(20);
+
+        let mut bad_row =
+            make_pending_remint_row(50, &mint, &recipient, &Signature::new_unique(), deadline);
+        bad_row.remint_signatures = Some(vec![
+            Signature::new_unique().to_string(),
+            Signature::new_unique().to_string(),
+        ]);
+        bad_row.remint_last_valid_block_heights = Some(vec![100]);
+
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(bad_row);
+
+        let mut state = make_sender_state(mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive ManualReview for length mismatch");
+        assert_eq!(update.transaction_id, 50);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("lvbh length"),
+            "error message should describe the length mismatch: {err}"
+        );
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "row with mismatched array lengths must not be queued"
         );
         assert!(storage_rx.try_recv().is_err());
     }
