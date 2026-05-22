@@ -37,6 +37,10 @@ use crate::setup;
 pub async fn run_blockhash_expiry_after_admission_test(db_url: String) {
     println!("\n=== Blockhash Expiry After Admission Test ===");
 
+    // Coupled: the expiry sleep must outrun the configured window. Single
+    // const so config + sleep can never drift apart.
+    const EXPIRY_MS: u64 = 500;
+
     let operator = Keypair::new();
     let alice = Keypair::new();
     let bob = Keypair::new();
@@ -54,16 +58,18 @@ pub async fn run_blockhash_expiry_after_admission_test(db_url: String) {
         // the target ends up parked on a bounded send().await.
         sigverify_queue_size: 1,
         sigverify_workers: 1,
-        max_connections: 50,
+        // Must exceed BURST_N + target + setup ops; the burst fires concurrently
+        // and would otherwise be rejected at the RPC server before reaching dedup.
+        max_connections: 1000,
         max_tx_per_batch: 1,
         batch_deadline_ms: 5,
         batch_channel_capacity: 1,
         max_svm_workers: 4,
         accountsdb_connection_url: db_url,
         admin_keys: vec![operator.pubkey()],
-        // 500ms expiry × 50ms blocktime → 10-slot window. After sleep(1s)
-        // blockhash_A is guaranteed expired.
-        transaction_expiration_ms: 500,
+        // EXPIRY_MS expiry × 50ms blocktime → 10-slot window. After
+        // sleep(2 × EXPIRY_MS) blockhash_A is guaranteed expired.
+        transaction_expiration_ms: EXPIRY_MS,
         blocktime_ms: 50,
         perf_sample_period_secs: 10,
         metrics: metrics_for_node,
@@ -161,20 +167,20 @@ pub async fn run_blockhash_expiry_after_admission_test(db_url: String) {
         blockhash_a,
     );
     let target_sig = target_tx.signatures[0];
-    // The send itself may succeed (RPC admission) or be rejected upstream if
-    // the queue is full, either is fine. The assertion is on landing.
+    // The target must reach dedup for the test to exercise the parked-tx race.
+    // RPC-server rejection (e.g. max_connections too low) would otherwise
+    // surface as a "race not reproduced" failure with no clear cause.
     let send_outcome = burst_client.send_transaction(&target_tx).await;
-    println!(
-        "  target send outcome: {:?}",
-        send_outcome
-            .as_ref()
-            .map(|s| s.to_string())
-            .map_err(|e| format!("{e}"))
-    );
+    println!("  target send outcome: {:?}", send_outcome);
     println!("  target_sig: {}", target_sig);
+    assert!(
+        send_outcome.is_ok(),
+        "target tx submission failed at RPC: {:?} — bump max_connections or reduce BURST_N",
+        send_outcome.err()
+    );
 
     // --- Sleep past expiry so blockhash_A ages out of the live window ---
-    sleep(Duration::from_millis(2 * 500)).await;
+    sleep(Duration::from_millis(2 * EXPIRY_MS)).await;
 
     // --- Wait for burst to drain (best-effort) and pipeline to catch up ---
     for t in burst_tasks {
@@ -191,12 +197,12 @@ pub async fn run_blockhash_expiry_after_admission_test(db_url: String) {
     );
 
     // 1. Executor must have dropped at least one tx for blockhash expiry.
-    //    Zero here means the race window closed before the target reached
-    //    execute_batch (pipeline drained faster than expiry), not a fix
-    //    regression, but a test-setup failure. Bump BURST_N if this fires.
+    //    Zero here means the pipeline drained the burst faster than expiry
+    //    so the target never sat past its blockhash window — not a fix
+    //    regression, but a test-tuning failure. Bump BURST_N if this fires.
     assert!(
         dropped_at_execution >= 1,
-        "expected ≥1 tx dropped at execution for expired blockhash, got 0 — burst drained before expiry, race not reproduced"
+        "expected ≥1 tx dropped at execution for expired blockhash, got 0 — pipeline drained before expiry, race not reproduced; consider raising BURST_N"
     );
 
     // 2. Dedup must NOT have rejected the target at admission. blockhash_A
