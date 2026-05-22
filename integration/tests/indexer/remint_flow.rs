@@ -27,8 +27,18 @@
 //!       incremented; no status update.
 //!
 //!   (d) **Finality-check RPC error, attempts == MAX-1** — next failure
-//!       trips the cap and emits `ManualReview` with a "finality check
-//!       failed" error message.
+//!       trips the cap and emits `ManualReview` whose error message
+//!       names the underlying RPC failure.
+//!
+//!   (d.1) **Liveness gate, sig dropped + lvbh valid**: gate defers
+//!         rather than reminting because the broadcast could still land.
+//!
+//!   (d.2) **Liveness gate, sig confirmed-not-finalized + lvbh expired**:
+//!         regression guard. A confirmed tx will finalize regardless of
+//!         lvbh, so the gate must defer (not remint).
+//!
+//!   (d.3) **Liveness gate at cap**: `ManualReview` whose error message
+//!         names the liveness cause (distinct from RPC failure).
 
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
@@ -39,7 +49,7 @@ use {
         operator::{
             sender::{
                 test_hooks,
-                types::{PendingRemint, SenderState, TransactionStatusUpdate},
+                types::{PendingRemint, PendingSig, SenderState, TransactionStatusUpdate},
             },
             utils::instruction_util::{remint_idempotency_memo, WithdrawalRemintInfo},
             SignerUtil,
@@ -90,13 +100,43 @@ fn make_pending_remint(
     finality_check_attempts: u32,
     info: WithdrawalRemintInfo,
 ) -> PendingRemint {
+    let pending_sigs = signatures
+        .into_iter()
+        .map(|signature| PendingSig {
+            signature,
+            last_valid_block_height: 0,
+        })
+        .collect();
     PendingRemint {
         ctx: withdrawal_ctx(transaction_id, nonce),
         remint_info: info,
-        signatures,
+        signatures: pending_sigs,
         original_error: "release_funds failed".to_string(),
         // Past deadline so `process_pending_remints` treats the entry
         // as matured and processes it on the first tick.
+        deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
+        finality_check_attempts,
+    }
+}
+
+/// Build a PendingRemint with one signature whose `last_valid_block_height`
+/// the caller controls. Use when the test needs to exercise the gate's
+/// liveness comparison (`current_height > lvbh`).
+fn make_pending_remint_with_lvbh(
+    transaction_id: i64,
+    nonce: u64,
+    signature: Signature,
+    last_valid_block_height: u64,
+    finality_check_attempts: u32,
+) -> PendingRemint {
+    PendingRemint {
+        ctx: withdrawal_ctx(transaction_id, nonce),
+        remint_info: make_remint_info(transaction_id),
+        signatures: vec![PendingSig {
+            signature,
+            last_valid_block_height,
+        }],
+        original_error: "release_funds failed".to_string(),
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
     }
@@ -363,8 +403,12 @@ async fn process_pending_remints_routes_to_manual_review_at_max_attempts() {
     assert_eq!(update.status, TransactionStatus::ManualReview);
     let msg = update.error_message.unwrap_or_default();
     assert!(
-        msg.contains("finality check failed"),
-        "ManualReview at MAX must surface the 'finality check failed' label; got {msg:?}"
+        msg.contains("escalated to ManualReview"),
+        "ManualReview at MAX must surface the escalation label; got {msg:?}"
+    );
+    assert!(
+        msg.contains("signature status RPC failed"),
+        "ManualReview must surface the underlying RPC failure; got {msg:?}"
     );
     assert!(
         msg.contains("release_funds failed"),
@@ -374,6 +418,138 @@ async fn process_pending_remints_routes_to_manual_review_at_max_attempts() {
         state.pending_remints.is_empty(),
         "entry must NOT be re-queued past the cap"
     );
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// (d.1) Liveness gate, sig dropped but lvbh still valid → defer.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Cluster has no record of the broadcast (null status). The blockhash
+// is still within its validity window, so a re-broadcast could land.
+// The gate must defer rather than remint.
+#[tokio::test]
+async fn process_pending_remints_defers_when_sig_within_blockhash_validity() {
+    let mock = MockRpcServer::start().await;
+    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+
+    let sig = Signature::new_unique();
+    state
+        .pending_remints
+        .push(make_pending_remint_with_lvbh(94, 6, sig, 1_000, 0));
+
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": { "slot": 200 },
+            "value": [null]
+        })),
+    );
+    // current_height (50) <= lvbh (1_000): sig still within validity.
+    mock.enqueue("getBlockHeight", Reply::result(json!(50)));
+
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "row must stay PendingRemint while the broadcast could still land"
+    );
+    assert_eq!(state.pending_remints.len(), 1, "entry must be re-queued");
+    assert_eq!(
+        state.pending_remints[0].finality_check_attempts, 1,
+        "deferral counter must increment by 1"
+    );
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// (d.2) Liveness gate, sig confirmed-not-finalized past lvbh → defer.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Regression guard for the case where a low-fee broadcast lands late in
+// its validity window: status is `confirmed` (already in a block) and
+// the cluster has moved past lvbh, but finalization is still pending.
+// The tx will finalize regardless of lvbh, so the gate must defer.
+// Reminting here would double-pay when the tx finalizes a few slots later.
+#[tokio::test]
+async fn process_pending_remints_defers_when_sig_confirmed_not_finalized() {
+    let mock = MockRpcServer::start().await;
+    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+
+    let sig = Signature::new_unique();
+    state
+        .pending_remints
+        .push(make_pending_remint_with_lvbh(95, 7, sig, 100, 0));
+
+    // Status: confirmed (in a block) but not yet finalized, no error.
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": { "slot": 200 },
+            "value": [{
+                "slot": 100,
+                "confirmations": 1,
+                "err": null,
+                "status": { "Ok": null },
+                "confirmationStatus": "confirmed"
+            }]
+        })),
+    );
+    // current_height (1_000) > lvbh (100). The old buggy gate would
+    // treat the sig as expired here and remint.
+    mock.enqueue("getBlockHeight", Reply::result(json!(1_000)));
+
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "a confirmed-but-not-finalized sig must defer the remint"
+    );
+    assert_eq!(state.pending_remints.len(), 1);
+    assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// (d.3) Liveness gate at cap → ManualReview with liveness reason.
+// ─────────────────────────────────────────────────────────────────────
+//
+// Entry already at MAX-1 attempts. On this tick the sig is still live,
+// so the cap fires. The escalation message must identify the cause as
+// liveness, not an RPC failure, so operators can triage correctly.
+#[tokio::test]
+async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
+    let mock = MockRpcServer::start().await;
+    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+
+    let sig = Signature::new_unique();
+    state
+        .pending_remints
+        .push(make_pending_remint_with_lvbh(96, 8, sig, 1_000, 2));
+
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": { "slot": 200 },
+            "value": [null]
+        })),
+    );
+    mock.enqueue("getBlockHeight", Reply::result(json!(50)));
+
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    let update = storage_rx
+        .recv()
+        .await
+        .expect("cap must emit a ManualReview update");
+    assert_eq!(update.transaction_id, 96);
+    assert_eq!(update.status, TransactionStatus::ManualReview);
+    let msg = update.error_message.unwrap_or_default();
+    assert!(
+        msg.contains("signatures still within blockhash validity"),
+        "escalation must name the liveness cause; got {msg:?}"
+    );
+    assert!(state.pending_remints.is_empty(), "entry must not re-queue");
     mock.shutdown().await;
 }
 

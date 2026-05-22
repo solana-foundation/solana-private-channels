@@ -51,6 +51,7 @@ fn make_bad_deposit(id: i64) -> DbTransaction {
         processed_at: None,
         counterpart_signature: None,
         remint_signatures: None,
+        remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
     }
 }

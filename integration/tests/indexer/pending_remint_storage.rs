@@ -97,7 +97,8 @@ async fn test_pending_remint_round_trip_preserves_signatures_and_deadline() {
     ];
     let deadline = Utc::now() + ChronoDuration::minutes(30);
 
-    db.set_pending_remint_internal(tx_id, remint_sigs.clone(), deadline)
+    let remint_lvbhs = vec![0; remint_sigs.len()];
+    db.set_pending_remint_internal(tx_id, remint_sigs.clone(), remint_lvbhs, deadline)
         .await
         .expect("set_pending_remint must succeed");
 
@@ -157,6 +158,7 @@ async fn test_pending_remint_query_filters_by_status() {
     db.set_pending_remint_internal(
         ids[0],
         vec!["fake".to_string()],
+        vec![0],
         Utc::now() + ChronoDuration::minutes(10),
     )
     .await

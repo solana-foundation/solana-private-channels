@@ -44,6 +44,7 @@ fn make_row(
     deadline: DateTime<Utc>,
 ) -> DbTransaction {
     let now = Utc::now();
+    let lvbhs = vec![0; sig_strings.len()];
     DbTransaction {
         id,
         signature: Signature::new_unique().to_string(),
@@ -62,6 +63,7 @@ fn make_row(
         processed_at: None,
         counterpart_signature: None,
         remint_signatures: Some(sig_strings),
+        remint_last_valid_block_heights: Some(lvbhs),
         pending_remint_deadline_at: Some(deadline),
     }
 }
@@ -180,7 +182,8 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
     assert_eq!(entry.ctx.transaction_id, Some(14));
     assert_eq!(entry.remint_info.mint, good_mint);
     assert_eq!(entry.remint_info.user, good_recipient);
-    assert_eq!(entry.signatures, vec![good_sig]);
+    assert_eq!(entry.signatures.len(), 1);
+    assert_eq!(entry.signatures[0].signature, good_sig);
 
     // All four bad rows must have emitted ManualReview updates.
     let mut escalated_ids: Vec<i64> = Vec::new();

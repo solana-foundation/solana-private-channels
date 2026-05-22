@@ -583,7 +583,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -606,6 +606,7 @@ impl PostgresDb {
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
             transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filters
             transaction_cols::STATUS,
@@ -674,7 +675,7 @@ impl PostgresDb {
         sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
-                {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
@@ -698,6 +699,7 @@ impl PostgresDb {
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
             transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
@@ -761,7 +763,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -785,6 +787,7 @@ impl PostgresDb {
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
             transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             // Filters
             transaction_cols::STATUS,
