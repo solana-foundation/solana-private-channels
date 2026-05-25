@@ -237,6 +237,7 @@ pub async fn process_pending_remints(
                     entry,
                     &nonce_label,
                     &format!("signature status RPC failed: {}", e),
+                    &state.storage,
                     storage_tx,
                 )
                 .await;
@@ -257,6 +258,7 @@ pub async fn process_pending_remints(
                     response.value.len(),
                     sigs.len()
                 ),
+                &state.storage,
                 storage_tx,
             )
             .await;
@@ -285,6 +287,7 @@ pub async fn process_pending_remints(
                     entry,
                     &nonce_label,
                     &format!("block height RPC failed: {}", e),
+                    &state.storage,
                     storage_tx,
                 )
                 .await;
@@ -330,7 +333,15 @@ pub async fn process_pending_remints(
 
         // Case 2: at least one broadcast could still land, defer rather than remint.
         if let Some(reason) = live_reason {
-            defer_or_escalate(&mut remaining, entry, &nonce_label, &reason, storage_tx).await;
+            defer_or_escalate(
+                &mut remaining,
+                entry,
+                &nonce_label,
+                &reason,
+                &state.storage,
+                storage_tx,
+            )
+            .await;
             continue;
         }
 
@@ -387,6 +398,7 @@ async fn defer_or_escalate(
     entry: PendingRemint,
     nonce_label: &str,
     reason: &str,
+    storage: &crate::storage::Storage,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
     let attempt = entry.finality_check_attempts + 1;
@@ -420,13 +432,50 @@ async fn defer_or_escalate(
         return;
     }
 
+    let new_deadline = Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap();
+
+    // Fail-closed: an inability to persist the bumped counter is itself
+    // ambiguity. Escalate to ManualReview rather than continue deferring with
+    // a counter we can't trust to survive a restart.
+    if let Some(transaction_id) = entry.ctx.transaction_id {
+        if let Err(persist_err) = storage
+            .bump_pending_remint_finality_attempt(transaction_id, attempt as i32, new_deadline)
+            .await
+        {
+            error!(
+                "Pending remint for nonce {} counter persist failed, escalating to ManualReview: {}",
+                nonce_label, persist_err
+            );
+            send_guaranteed(
+                storage_tx,
+                TransactionStatusUpdate {
+                    transaction_id,
+                    trace_id: entry.ctx.trace_id.clone(),
+                    status: TransactionStatus::ManualReview,
+                    counterpart_signature: None,
+                    processed_at: Some(Utc::now()),
+                    error_message: Some(format!(
+                        "{} | counter persist failed at attempt {}: {}",
+                        entry.original_error, attempt, persist_err
+                    )),
+                    remint_signature: None,
+                    remint_attempted: false,
+                },
+                "transaction status update",
+            )
+            .await
+            .ok();
+            return;
+        }
+    }
+
     warn!(
         "Pending remint for nonce {} deferred (attempt {}/{}): {}",
         nonce_label, attempt, MAX_FINALITY_CHECK_ATTEMPTS, reason
     );
     remaining.push(PendingRemint {
         finality_check_attempts: attempt,
-        deadline: Utc::now() + chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap(),
+        deadline: new_deadline,
         ..entry
     });
 }
@@ -441,6 +490,7 @@ mod tests {
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Once;
@@ -456,15 +506,15 @@ mod tests {
         });
     }
 
-    fn make_sender_state() -> SenderState {
+    fn make_sender_state() -> (SenderState, MockStorage) {
         let mock = MockStorage::new();
-        let storage = Arc::new(Storage::Mock(mock));
+        let storage = Arc::new(Storage::Mock(mock.clone()));
         let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
             "http://localhost:8899".to_string(),
             crate::operator::RetryConfig::default(),
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ));
-        SenderState {
+        let state = SenderState {
             rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
@@ -482,7 +532,41 @@ mod tests {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-        }
+        };
+        (state, mock)
+    }
+
+    /// Push a stub PendingRemint row into the mock so a subsequent
+    /// `bump_pending_remint_finality_attempt(id, ...)` can find a row to update.
+    /// Only the id and attempts fields matter for the bump path.
+    fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
+        use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+        let now = Utc::now();
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(DbTransaction {
+                id,
+                signature: Signature::new_unique().to_string(),
+                trace_id: format!("trace-{id}"),
+                slot: 0,
+                initiator: Pubkey::new_unique().to_string(),
+                recipient: Pubkey::new_unique().to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                amount: 0,
+                memo: None,
+                transaction_type: TransactionType::Withdrawal,
+                withdrawal_nonce: Some(id),
+                status: TransactionStatus::PendingRemint,
+                created_at: now,
+                updated_at: now,
+                processed_at: None,
+                counterpart_signature: None,
+                remint_signatures: None,
+                remint_last_valid_block_heights: None,
+                pending_remint_deadline_at: Some(now),
+                finality_check_attempts: attempts,
+            });
     }
 
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
@@ -497,9 +581,9 @@ mod tests {
         }
     }
 
-    fn make_sender_state_with_rpc(rpc_url: &str) -> SenderState {
+    fn make_sender_state_with_rpc(rpc_url: &str) -> (SenderState, MockStorage) {
         let mock = MockStorage::new();
-        let storage = Arc::new(Storage::Mock(mock));
+        let storage = Arc::new(Storage::Mock(mock.clone()));
         let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
             rpc_url.to_string(),
             crate::operator::RetryConfig {
@@ -509,7 +593,7 @@ mod tests {
             },
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ));
-        SenderState {
+        let state = SenderState {
             rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
@@ -527,7 +611,8 @@ mod tests {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-        }
+        };
+        (state, mock)
     }
 
     /// Register a mockito response for a specific Solana RPC method.
@@ -547,8 +632,12 @@ mod tests {
 
     #[tokio::test]
     async fn process_pending_remints_requeues_on_rpc_error() {
-        let mut state = make_sender_state();
+        let (mut state, mock) = make_sender_state();
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The defer path persists the bumped counter; the row must exist in the
+        // mock for that write to succeed (otherwise the counter is held).
+        seed_pending_remint_row(&mock, 20, 0);
 
         // Push a matured entry — RPC will fail (no real endpoint)
         state.pending_remints.push(PendingRemint {
@@ -580,11 +669,74 @@ mod tests {
             "should re-queue entry after RPC error"
         );
         assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+
+        // The bumped counter must also be persisted so it survives a restart.
+        let persisted = mock
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == 20)
+            .map(|t| t.finality_check_attempts);
+        assert_eq!(persisted, Some(1));
+    }
+
+    /// Fail-closed on persist failure: if the counter bump can't be written,
+    /// the safety fuse is no longer trustworthy, so the entry must escalate
+    /// to ManualReview rather than continue deferring on shaky state.
+    #[tokio::test]
+    async fn process_pending_remints_escalates_when_bump_persist_fails() {
+        let (mut state, mock) = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        seed_pending_remint_row(&mock, 30, 1);
+        mock.set_should_fail("bump_pending_remint_finality_attempt", true);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(30),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-30".to_string()),
+            },
+            remint_info: make_remint_info(30),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 1,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Entry dropped from in-memory queue, not re-queued.
+        assert!(state.pending_remints.is_empty());
+
+        // ManualReview update was sent with the persist error in the message.
+        let update = storage_rx
+            .try_recv()
+            .expect("persist failure must produce a ManualReview update");
+        assert_eq!(update.transaction_id, 30);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap();
+        assert!(err.contains("counter persist failed"), "got: {err}");
+        assert!(err.contains("release_funds failed"), "got: {err}");
+
+        // DB row was not modified by the failed bump.
+        let persisted = mock
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == 30)
+            .map(|t| t.finality_check_attempts);
+        assert_eq!(persisted, Some(1));
     }
 
     #[tokio::test]
     async fn process_pending_remints_manual_review_after_max_rpc_failures() {
-        let mut state = make_sender_state();
+        let (mut state, _mock) = make_sender_state();
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         // Push entry already at max attempts — next RPC failure triggers ManualReview
@@ -643,8 +795,11 @@ mod tests {
     /// the finality window guarantee that prevents double-minting.
     #[tokio::test]
     async fn process_pending_remints_handles_mixed_matured_and_immature() {
-        let mut state = make_sender_state();
+        let (mut state, mock) = make_sender_state();
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // The matured entry (id 10) defers, which now persists the bump.
+        seed_pending_remint_row(&mock, 10, 0);
 
         let future_deadline = Utc::now() + chrono::Duration::seconds(600);
 
@@ -732,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn process_pending_remints_marks_completed_when_withdrawal_finalized() {
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -812,7 +967,7 @@ mod tests {
     async fn process_pending_remints_not_finalized_remint_fails_sends_manual_review() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -883,7 +1038,7 @@ mod tests {
     async fn process_pending_remints_finalized_with_onchain_error_proceeds_to_remint() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -952,7 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn process_pending_remints_second_of_two_sigs_finalized_marks_completed() {
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig1 = Signature::new_unique(); // first attempt — dropped
@@ -1032,7 +1187,7 @@ mod tests {
     async fn process_pending_remints_all_sigs_expired_proceeds_to_remint() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -1095,8 +1250,10 @@ mod tests {
     #[tokio::test]
     async fn process_pending_remints_one_sig_still_live_defers() {
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        seed_pending_remint_row(&mock, 101, 0);
 
         let sig = Signature::new_unique();
 
@@ -1150,7 +1307,7 @@ mod tests {
     #[tokio::test]
     async fn process_pending_remints_live_sig_at_cap_escalates_to_manual_review() {
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let sig = Signature::new_unique();
@@ -1207,8 +1364,10 @@ mod tests {
     #[tokio::test]
     async fn process_pending_remints_block_height_rpc_failure_defers() {
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        seed_pending_remint_row(&mock, 103, 0);
 
         let sig = Signature::new_unique();
 
@@ -1262,8 +1421,10 @@ mod tests {
     async fn process_pending_remints_confirmed_not_finalized_past_lvbh_defers() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let mut state = make_sender_state_with_rpc(&rpc_server.url());
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        seed_pending_remint_row(&mock, 105, 0);
 
         let sig = Signature::new_unique();
 

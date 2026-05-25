@@ -29,6 +29,7 @@ mod transaction_cols {
     pub const REMINT_SIGNATURES: &str = "remint_signatures";
     pub const REMINT_LAST_VALID_BLOCK_HEIGHTS: &str = "remint_last_valid_block_heights";
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
+    pub const FINALITY_CHECK_ATTEMPTS: &str = "finality_check_attempts";
 }
 
 #[derive(Clone)]
@@ -200,6 +201,21 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("remint_last_valid_block_heights migration complete");
+
+        // Persisted defer-counter for pending remints so the
+        // MAX_FINALITY_CHECK_ATTEMPTS budget survives operator restarts.
+        info!("Running finality_check_attempts migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS finality_check_attempts INTEGER NOT NULL DEFAULT 0;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("finality_check_attempts migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -583,7 +599,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -608,6 +624,7 @@ impl PostgresDb {
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -630,7 +647,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -654,6 +671,7 @@ impl PostgresDb {
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -676,7 +694,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -701,6 +719,7 @@ impl PostgresDb {
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -763,7 +782,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -789,6 +808,7 @@ impl PostgresDb {
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -876,6 +896,39 @@ impl PostgresDb {
         .bind(remint_signatures)
         .bind(remint_last_valid_block_heights)
         .bind(deadline_at)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        Ok(())
+    }
+
+    /// Persists an incremented defer counter and the extended deadline for an
+    /// already-PendingRemint row. The status guard prevents resurrecting a
+    /// terminal row (Completed / FailedReminted / ManualReview).
+    pub async fn bump_pending_remint_finality_attempt_internal(
+        &self,
+        transaction_id: i64,
+        attempts: i32,
+        new_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET
+                finality_check_attempts = $2,
+                pending_remint_deadline_at = $3,
+                updated_at = NOW()
+            WHERE id = $1
+                AND status = 'pending_remint'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(attempts)
+        .bind(new_deadline)
         .execute(&self.pool)
         .await?;
 

@@ -62,7 +62,7 @@ use {
     },
     serde_json::json,
     solana_keychain::SolanaSigner,
-    solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
+    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
     std::{str::FromStr, sync::Arc},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -74,9 +74,11 @@ async fn build_state(
     SenderState,
     mpsc::Receiver<TransactionStatusUpdate>,
     mpsc::Sender<TransactionStatusUpdate>,
+    MockStorage,
 ) {
     ensure_admin_signer_env();
-    let storage = Arc::new(Storage::Mock(MockStorage::new()));
+    let mock = MockStorage::new();
+    let storage = Arc::new(Storage::Mock(mock.clone()));
     let state = test_hooks::new_sender_state(
         &make_config(rpc_url, ProgramType::Withdraw),
         CommitmentLevel::Confirmed,
@@ -90,7 +92,43 @@ async fn build_state(
     )
     .expect("SenderState construction must succeed under Mock storage");
     let (storage_tx, storage_rx) = mpsc::channel(8);
-    (state, storage_rx, storage_tx)
+    (state, storage_rx, storage_tx, mock)
+}
+
+/// Push a stub PendingRemint row into the mock so
+/// `bump_pending_remint_finality_attempt(id, ...)` finds a row to update.
+/// Defer-path tests need this; without a row the bump returns RowNotFound
+/// and the fail-closed handler escalates to ManualReview.
+fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
+    use private_channel_indexer::storage::common::models::{
+        DbTransaction, TransactionStatus, TransactionType,
+    };
+    let now = chrono::Utc::now();
+    mock.pending_remint_transactions
+        .lock()
+        .unwrap()
+        .push(DbTransaction {
+            id,
+            signature: Signature::new_unique().to_string(),
+            trace_id: format!("trace-{id}"),
+            slot: 0,
+            initiator: Pubkey::new_unique().to_string(),
+            recipient: Pubkey::new_unique().to_string(),
+            mint: Pubkey::new_unique().to_string(),
+            amount: 0,
+            memo: None,
+            transaction_type: TransactionType::Withdrawal,
+            withdrawal_nonce: Some(id),
+            status: TransactionStatus::PendingRemint,
+            created_at: now,
+            updated_at: now,
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: Some(now),
+            finality_check_attempts: attempts,
+        });
 }
 
 fn make_pending_remint(
@@ -155,7 +193,7 @@ fn make_pending_remint_with_lvbh(
 #[tokio::test]
 async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
     let mock = MockRpcServer::start().await;
-    let (state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
 
     let txn_id: i64 = 7_777;
     let info = make_remint_info(txn_id);
@@ -270,7 +308,7 @@ async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
 #[tokio::test]
 async fn process_pending_remints_skips_remint_when_withdrawal_finalized() {
     let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (mut state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
 
     let withdrawal_sig = Signature::new_unique();
     state.pending_remints.push(make_pending_remint(
@@ -320,7 +358,9 @@ async fn process_pending_remints_skips_remint_when_withdrawal_finalized() {
 #[tokio::test]
 async fn process_pending_remints_requeues_on_finality_check_rpc_error() {
     let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (mut state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
+
+    seed_pending_remint_row(&storage_mock, 92, 0);
 
     state.pending_remints.push(make_pending_remint(
         92,
@@ -372,7 +412,7 @@ async fn process_pending_remints_requeues_on_finality_check_rpc_error() {
 #[tokio::test]
 async fn process_pending_remints_routes_to_manual_review_at_max_attempts() {
     let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (mut state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
 
     state.pending_remints.push(make_pending_remint(
         93,
@@ -431,7 +471,9 @@ async fn process_pending_remints_routes_to_manual_review_at_max_attempts() {
 #[tokio::test]
 async fn process_pending_remints_defers_when_sig_within_blockhash_validity() {
     let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (mut state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
+
+    seed_pending_remint_row(&storage_mock, 94, 0);
 
     let sig = Signature::new_unique();
     state
@@ -474,7 +516,9 @@ async fn process_pending_remints_defers_when_sig_within_blockhash_validity() {
 #[tokio::test]
 async fn process_pending_remints_defers_when_sig_confirmed_not_finalized() {
     let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (mut state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
+
+    seed_pending_remint_row(&storage_mock, 95, 0);
 
     let sig = Signature::new_unique();
     state
@@ -520,7 +564,7 @@ async fn process_pending_remints_defers_when_sig_confirmed_not_finalized() {
 #[tokio::test]
 async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
     let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (mut state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
 
     let sig = Signature::new_unique();
     state
@@ -566,7 +610,7 @@ async fn process_pending_remints_liveness_cap_escalates_with_liveness_reason() {
 #[tokio::test]
 async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
     let mock = MockRpcServer::start().await;
-    let (state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
 
     let txn_id: i64 = 7_001;
     let info = make_remint_info(txn_id);
@@ -613,7 +657,7 @@ async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
 #[tokio::test]
 async fn execute_deferred_remint_emits_manual_review_when_send_fails() {
     let mock = MockRpcServer::start().await;
-    let (state, mut storage_rx, storage_tx) = build_state(mock.url()).await;
+    let (state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
 
     let txn_id: i64 = 7_002;
     let info = make_remint_info(txn_id);

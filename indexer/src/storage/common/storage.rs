@@ -1,5 +1,6 @@
 pub use super::models::*;
 
+pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
 pub mod drop_tables;
@@ -218,6 +219,25 @@ impl Storage {
         .await
     }
 
+    /// Persist an incremented defer counter and extended deadline for a
+    /// PendingRemint row. Called from the sender loop each time
+    /// `process_pending_remints` defers an entry, so the
+    /// `MAX_FINALITY_CHECK_ATTEMPTS` budget survives restarts.
+    pub async fn bump_pending_remint_finality_attempt(
+        &self,
+        transaction_id: i64,
+        attempts: i32,
+        new_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), StorageError> {
+        bump_pending_remint_finality_attempt::bump_pending_remint_finality_attempt(
+            self,
+            transaction_id,
+            attempts,
+            new_deadline,
+        )
+        .await
+    }
+
     /// Returns all withdrawal transactions in PendingRemint status.
     /// Called on startup to re-hydrate the remint queue after a crash.
     pub async fn get_pending_remint_transactions(
@@ -280,6 +300,7 @@ mod tests {
             remint_signatures: None,
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
         }
     }
 

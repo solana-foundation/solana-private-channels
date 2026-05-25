@@ -65,6 +65,7 @@ fn make_row(
         remint_signatures: Some(sig_strings),
         remint_last_valid_block_heights: Some(lvbhs),
         pending_remint_deadline_at: Some(deadline),
+        finality_check_attempts: 0,
     }
 }
 

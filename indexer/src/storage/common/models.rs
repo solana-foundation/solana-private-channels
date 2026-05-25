@@ -73,6 +73,11 @@ pub struct DbTransaction {
     /// UTC timestamp of when the finality check deadline expires for PendingRemint transactions.
     /// Set when transitioning to PendingRemint, used to restore the exact wait time on restart.
     pub pending_remint_deadline_at: Option<DateTime<Utc>>,
+    /// Persisted defer counter for PendingRemint rows. Each finality-check
+    /// failure or liveness deferral bumps this; restoring it on restart is
+    /// what keeps the `MAX_FINALITY_CHECK_ATTEMPTS` budget honest across
+    /// crashes. Non-PendingRemint rows always carry 0 (column DEFAULT).
+    pub finality_check_attempts: i32,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -193,6 +198,7 @@ impl DbTransactionBuilder {
             remint_signatures: None,
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
         }
     }
 }

@@ -330,6 +330,24 @@ impl SenderState {
                 deadline,
             );
 
+            // A corrupt negative value would wrap to a huge u32 and skip the
+            // attempt cap, defeating the whole point of persisting it.
+            let Some(finality_check_attempts) = Self::or_manual_review(
+                u32::try_from(tx.finality_check_attempts).map_err(|_| {
+                    format!(
+                        "negative finality_check_attempts: {}",
+                        tx.finality_check_attempts
+                    )
+                }),
+                storage_tx,
+                tx.id,
+                &tx.trace_id,
+            )
+            .await
+            else {
+                continue;
+            };
+
             self.pending_remints.push(PendingRemint {
                 ctx,
                 remint_info,
@@ -338,7 +356,7 @@ impl SenderState {
                 // combined error messages if the remint itself also fails.
                 original_error: "recovered from persistent storage".to_string(),
                 deadline,
-                finality_check_attempts: 0,
+                finality_check_attempts,
             });
         }
 
@@ -417,6 +435,7 @@ mod tests {
             remint_signatures: Some(vec![sig.to_string()]),
             remint_last_valid_block_heights: Some(vec![12_345]),
             pending_remint_deadline_at: Some(deadline),
+            finality_check_attempts: 0,
         }
     }
 
@@ -431,7 +450,8 @@ mod tests {
     /// - withdrawal signatures (needed for the finality check)
     /// - the original deadline (not a fresh 32s window — the clock keeps
     ///   ticking across restarts)
-    /// - finality_check_attempts reset to 0 (not stored in DB)
+    /// - finality_check_attempts round-trips from the DB so the
+    ///   MAX_FINALITY_CHECK_ATTEMPTS budget survives restarts
     ///
     /// No channel messages should be sent — there is nothing wrong with
     /// these rows, they just need to be re-queued.
@@ -443,13 +463,12 @@ mod tests {
         let sig = Signature::new_unique();
         let deadline = Utc::now() + chrono::Duration::seconds(20);
 
-        // Simulate the row that would exist in the DB after a crash.
-        mock.pending_remint_transactions
-            .lock()
-            .unwrap()
-            .push(make_pending_remint_row(
-                42, &mint, &recipient, &sig, deadline,
-            ));
+        // Mid-budget value so the round-trip assertion is meaningful: a reset
+        // to 0 on recovery would re-arm the cap and let an ambiguous row
+        // outlive the intended ManualReview escalation.
+        let mut row = make_pending_remint_row(42, &mint, &recipient, &sig, deadline);
+        row.finality_check_attempts = 2;
+        mock.pending_remint_transactions.lock().unwrap().push(row);
 
         let mut state = make_sender_state(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -486,8 +505,9 @@ mod tests {
             entry.deadline
         );
 
-        // Attempt counter always resets — it is in-memory only.
-        assert_eq!(entry.finality_check_attempts, 0);
+        // The counter must survive the round-trip. A reset would re-arm the
+        // attempt cap on every restart.
+        assert_eq!(entry.finality_check_attempts, 2);
 
         // Standard recovery marker so combined error messages are meaningful.
         assert_eq!(entry.original_error, "recovered from persistent storage");
@@ -497,6 +517,35 @@ mod tests {
             storage_rx.try_recv().is_err(),
             "no channel message expected for a valid recovery row"
         );
+    }
+
+    /// A negative `finality_check_attempts` should never appear (the column is
+    /// `INTEGER NOT NULL DEFAULT 0`, only ever written to non-negative values),
+    /// but a corrupt row must escalate rather than wrap silently into a huge
+    /// `u32` that bypasses the attempt cap.
+    #[tokio::test]
+    async fn recover_pending_remints_escalates_negative_attempt_counter() {
+        let mock = MockStorage::new();
+        let mint = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        let deadline = Utc::now() + chrono::Duration::seconds(20);
+
+        let mut row = make_pending_remint_row(7, &mint, &recipient, &sig, deadline);
+        row.finality_check_attempts = -1;
+        mock.pending_remint_transactions.lock().unwrap().push(row);
+
+        let mut state = make_sender_state(mock);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        assert!(state.pending_remints.is_empty());
+        let update = storage_rx
+            .try_recv()
+            .expect("corrupt row must produce a ManualReview update");
+        assert_eq!(update.transaction_id, 7);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
     }
 
     // ── recover_pending_remints: parse error escalations ─────────────

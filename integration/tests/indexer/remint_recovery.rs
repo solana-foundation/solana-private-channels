@@ -69,6 +69,7 @@ fn make_row(
         remint_signatures: Some(vec![sig.to_string()]),
         remint_last_valid_block_heights: Some(vec![0]),
         pending_remint_deadline_at: Some(deadline),
+        finality_check_attempts: 0,
     }
 }
 

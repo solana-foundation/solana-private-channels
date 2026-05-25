@@ -334,6 +334,29 @@ impl MockStorage {
         Ok(())
     }
 
+    /// Update the in-memory pending_remint row for `transaction_id` with the
+    /// new attempt counter and deadline. Returns `RowNotFound` if no row
+    /// exists, matching the Postgres semantics so a test can observe a
+    /// missing-row failure. Honors `should_fail("bump_pending_remint_finality_attempt")`.
+    pub async fn bump_pending_remint_finality_attempt(
+        &self,
+        transaction_id: i64,
+        attempts: i32,
+        new_deadline: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("bump_pending_remint_finality_attempt")?;
+        let mut rows = self.pending_remint_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|t| t.id == transaction_id)
+            .ok_or_else(|| StorageError::DatabaseError {
+                message: format!("no PendingRemint row for id {transaction_id}"),
+            })?;
+        row.finality_check_attempts = attempts;
+        row.pending_remint_deadline_at = Some(new_deadline);
+        Ok(())
+    }
+
     pub async fn get_pending_remint_transactions(
         &self,
     ) -> Result<Vec<DbTransaction>, StorageError> {
