@@ -51,6 +51,11 @@ pub enum DvpSwapProgramError {
     /// scaled UI amount). Checked only at CreateDvp.
     #[error("Mint carries an unsupported Token-2022 extension")]
     BlockedMintExtension,
+
+    /// (11) `settlement_authority` equals `user_a` or `user_b`: it must be
+    /// a third party, per the documented role.
+    #[error("settlement_authority must not be user_a or user_b")]
+    SettlementAuthorityIsParty,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {

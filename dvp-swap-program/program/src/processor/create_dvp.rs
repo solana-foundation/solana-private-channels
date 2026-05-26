@@ -270,6 +270,10 @@ fn validate_args(
         );
     }
     require!(args.user_a != args.user_b, DvpSwapProgramError::SelfDvp);
+    require!(
+        args.settlement_authority != args.user_a && args.settlement_authority != args.user_b,
+        DvpSwapProgramError::SettlementAuthorityIsParty
+    );
     require!(mint_a != mint_b, DvpSwapProgramError::SameMint);
     require!(
         args.amount_a != 0 && args.amount_b != 0,
@@ -357,6 +361,22 @@ mod tests {
         a.user_b = a.user_a;
         let err = validate_args(&a, &mint_a(), &mint_b(), NOW).unwrap_err();
         assert_custom(err, DvpSwapProgramError::SelfDvp);
+    }
+
+    #[test]
+    fn validate_args_rejects_settlement_authority_equal_to_user_a() {
+        let mut a = args();
+        a.settlement_authority = a.user_a;
+        let err = validate_args(&a, &mint_a(), &mint_b(), NOW).unwrap_err();
+        assert_custom(err, DvpSwapProgramError::SettlementAuthorityIsParty);
+    }
+
+    #[test]
+    fn validate_args_rejects_settlement_authority_equal_to_user_b() {
+        let mut a = args();
+        a.settlement_authority = a.user_b;
+        let err = validate_args(&a, &mint_a(), &mint_b(), NOW).unwrap_err();
+        assert_custom(err, DvpSwapProgramError::SettlementAuthorityIsParty);
     }
 
     #[test]
