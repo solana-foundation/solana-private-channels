@@ -14,11 +14,9 @@ pub fn create_pda_account<const N: usize>(
     owner: &Address,
     new_pda_account: &AccountView,
     new_pda_signer_seeds: [Seed; N],
-    min_rent_space: Option<usize>,
 ) -> ProgramResult {
     let signers = [Signer::from(&new_pda_signer_seeds)];
-    let rent_space = min_rent_space.map_or(space, |min| min.max(space));
-    let required_lamports = rent.try_minimum_balance(rent_space)?.max(1);
+    let required_lamports = rent.try_minimum_balance(space)?.max(1);
 
     if new_pda_account.lamports() > 0 {
         let required_lamports = required_lamports.saturating_sub(new_pda_account.lamports());

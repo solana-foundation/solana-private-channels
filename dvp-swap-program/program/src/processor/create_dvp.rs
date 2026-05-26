@@ -133,7 +133,6 @@ pub fn process_create_dvp(
         program_id,
         swap_dvp_info,
         swap_dvp_seeds,
-        None,
     )?;
 
     CreateAtaIdempotent {
