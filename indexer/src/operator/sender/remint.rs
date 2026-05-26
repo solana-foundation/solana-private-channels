@@ -277,22 +277,30 @@ pub async fn process_pending_remints(
             continue;
         }
 
-        // Case 2 setup: fetch the cluster's current block height for the liveness check.
-        let current_height = match state.rpc_client.get_block_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                // Same handling as the sig-status RPC failure above.
-                defer_or_escalate(
-                    &mut remaining,
-                    entry,
-                    &nonce_label,
-                    &format!("block height RPC failed: {}", e),
-                    &state.storage,
-                    storage_tx,
-                )
-                .await;
-                continue;
+        // Block height is only needed for the lvbh check on null-status sigs.
+        // If every sig has a status, the liveness decision is already implied
+        // and we skip the RPC; a transient getBlockHeight outage shouldn't
+        // burn defer attempts when no sig actually needs the height.
+        let current_height = if response.value.iter().any(|s| s.is_none()) {
+            match state.rpc_client.get_block_height().await {
+                Ok(h) => h,
+                Err(e) => {
+                    defer_or_escalate(
+                        &mut remaining,
+                        entry,
+                        &nonce_label,
+                        &format!("block height RPC failed: {}", e),
+                        &state.storage,
+                        storage_tx,
+                    )
+                    .await;
+                    continue;
+                }
             }
+        } else {
+            // Unreachable below: the null-status branch only fires when at
+            // least one status is None, which we just ruled out.
+            0
         };
 
         // Walk the sigs to see if any could still land. Exit early on the
@@ -1099,6 +1107,76 @@ mod tests {
             "finalized-with-error must NOT produce Completed — funds never left escrow"
         );
         assert_eq!(update.transaction_id, 88);
+    }
+
+    /// Regression: when every stored signature already has a status entry, the
+    /// liveness decision is already implied (finalized-failed) and no block
+    /// height RPC is needed. A transient `getBlockHeight` outage in that
+    /// scenario must NOT consume defer attempts.
+    #[tokio::test]
+    async fn process_pending_remints_skips_block_height_when_all_sigs_classifiable() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let sig = Signature::new_unique();
+
+        // Finalized-failed: status present, finalized commitment, error set.
+        let _status_mock = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{
+                "jsonrpc": "2.0",
+                "result": {
+                    "context": {"slot": 200},
+                    "value": [{
+                        "slot": 100,
+                        "confirmations": null,
+                        "err": {"InstructionError": [0, {"Custom": 1}]},
+                        "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                        "confirmationStatus": "finalized"
+                    }]
+                },
+                "id": 0
+            }"#,
+        )
+        .await;
+
+        // Deliberately NOT mocking getBlockHeight: if the code reaches that
+        // call mockito returns 501, the call errors, and defer_or_escalate
+        // fires with "block height RPC failed" instead of execute_deferred_remint.
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(89),
+                withdrawal_nonce: Some(13),
+                trace_id: Some("trace-89".to_string()),
+            },
+            remint_info: make_remint_info(89),
+            signatures: vec![PendingSig {
+                signature: sig,
+                last_valid_block_height: 100,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("should receive a status update");
+        assert_eq!(update.transaction_id, 89);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            err.contains("remint failed"),
+            "must reach execute_deferred_remint; if this contains 'block height' \
+             the pre-check regressed: {err}"
+        );
+        assert!(state.pending_remints.is_empty());
     }
 
     /// When a withdrawal was retried and produced multiple signatures, one of the
