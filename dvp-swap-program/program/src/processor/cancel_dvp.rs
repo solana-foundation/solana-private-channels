@@ -1,6 +1,6 @@
 use crate::{
     error::DvpSwapProgramError,
-    processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
+    processor::shared::account_check::{verify_account_owner, verify_signer},
     processor::shared::refund::refund_and_close_dvp,
     processor::shared::utils::split_leg_remaining_accounts,
     require,
@@ -55,15 +55,11 @@ pub fn process_cancel_dvp(
 ) -> ProgramResult {
     let (fixed, leg_a_extras, leg_b_extras) =
         split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
-    let [settlement_authority_info, swap_dvp_info, .., token_program_a_info, token_program_b_info] =
-        fixed
-    else {
+    let [settlement_authority_info, swap_dvp_info, ..] = fixed else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
     verify_signer(settlement_authority_info, true)?;
-    verify_token_program(token_program_a_info)?;
-    verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
