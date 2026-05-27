@@ -57,7 +57,7 @@ pub async fn sign_and_send_transaction(
     }
 
     let (recent_blockhash, last_valid_block_height) = rpc_client
-        .get_latest_blockhash_with_lvbh()
+        .get_latest_blockhash_with_commitment()
         .await
         .map_err(TransactionError::Rpc)?;
 

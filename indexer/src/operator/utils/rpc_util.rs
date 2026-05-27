@@ -137,14 +137,18 @@ impl RpcClientWithRetry {
     }
 
     /// Get recent blockhash + last_valid_block_height with retry.
-    pub async fn get_latest_blockhash_with_lvbh(
+    pub async fn get_latest_blockhash_with_commitment(
         &self,
     ) -> Result<(Hash, u64), Box<client_error::Error>> {
-        self.with_retry("get_latest_blockhash", RetryPolicy::Idempotent, || async {
-            self.rpc_client
-                .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
-                .await
-        })
+        self.with_retry(
+            "get_latest_blockhash_with_commitment",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
+                    .await
+            },
+        )
         .await
     }
 
