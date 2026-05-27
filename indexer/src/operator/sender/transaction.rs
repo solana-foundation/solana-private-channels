@@ -1565,17 +1565,19 @@ mod tests {
         // failing permanently. Both must be persisted for a complete finality check.
         let sig1 = Signature::new_unique();
         let sig2 = Signature::new_unique();
+        let sig1_lvbh: u64 = 100;
+        let sig2_lvbh: u64 = 200;
         state.remint_cache.insert(5, make_remint_info(10));
         state.pending_signatures.insert(
             5,
             vec![
                 PendingSig {
                     signature: sig1,
-                    last_valid_block_height: 100,
+                    last_valid_block_height: sig1_lvbh,
                 },
                 PendingSig {
                     signature: sig2,
-                    last_valid_block_height: 200,
+                    last_valid_block_height: sig2_lvbh,
                 },
             ],
         );
@@ -1635,8 +1637,14 @@ mod tests {
             .iter()
             .position(|stored_sig| stored_sig == &sig2.to_string())
             .unwrap();
-        assert_eq!(stored_lvbhs[sig1_idx], 100, "sig1's lvbh must be persisted");
-        assert_eq!(stored_lvbhs[sig2_idx], 200, "sig2's lvbh must be persisted");
+        assert_eq!(
+            stored_lvbhs[sig1_idx], sig1_lvbh as i64,
+            "sig1's lvbh must be persisted"
+        );
+        assert_eq!(
+            stored_lvbhs[sig2_idx], sig2_lvbh as i64,
+            "sig2's lvbh must be persisted"
+        );
 
         // Deadline must be ~FINALITY_SAFETY_DELAY (32s) from now.
         // We allow a ±3s window to absorb test execution time.
