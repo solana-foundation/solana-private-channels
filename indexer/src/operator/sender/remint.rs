@@ -366,7 +366,7 @@ pub async fn process_pending_remints(
 }
 
 /// Report a pending-remint entry as Completed because one of its withdrawal
-/// signatures landed on Solana.
+/// signatures finalized on Solana.
 async fn send_completed(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     entry: &PendingRemint,
