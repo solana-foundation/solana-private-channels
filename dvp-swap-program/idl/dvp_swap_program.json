@@ -183,6 +183,12 @@
         "kind": "errorNode",
         "message": "settlement_authority must not be user_a or user_b",
         "name": "settlementAuthorityIsParty"
+      },
+      {
+        "code": 12,
+        "kind": "errorNode",
+        "message": "settlement_authority must not be executable",
+        "name": "settlementAuthorityExecutable"
       }
     ],
     "instructions": [
@@ -205,6 +211,15 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
+          },
+          {
+            "docs": [
+              "Third-party authority allowed to settle/cancel; must not be executable so it can receive closed-account rent"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "settlementAuthority"
           },
           {
             "docs": [
@@ -304,13 +319,6 @@
           {
             "kind": "instructionArgumentNode",
             "name": "userB",
-            "type": {
-              "kind": "publicKeyTypeNode"
-            }
-          },
-          {
-            "kind": "instructionArgumentNode",
-            "name": "settlementAuthority",
             "type": {
               "kind": "publicKeyTypeNode"
             }

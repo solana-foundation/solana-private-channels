@@ -56,6 +56,11 @@ pub enum DvpSwapProgramError {
     /// a third party, per the documented role.
     #[error("settlement_authority must not be user_a or user_b")]
     SettlementAuthorityIsParty,
+
+    /// (12) `settlement_authority` is an executable account, which can't be
+    /// credited the closed-account rent at Settle/Cancel.
+    #[error("settlement_authority must not be executable")]
+    SettlementAuthorityExecutable,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {
