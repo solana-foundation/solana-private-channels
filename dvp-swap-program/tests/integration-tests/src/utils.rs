@@ -58,6 +58,8 @@ pub const ZERO_AMOUNT: u32 = DvpSwapProgramError::ZeroAmount as u32;
 pub const BLOCKED_MINT_EXTENSION: u32 = DvpSwapProgramError::BlockedMintExtension as u32;
 pub const SETTLEMENT_AUTHORITY_EXECUTABLE: u32 =
     DvpSwapProgramError::SettlementAuthorityExecutable as u32;
+pub const SETTLEMENT_AUTHORITY_IS_PARTY: u32 =
+    DvpSwapProgramError::SettlementAuthorityIsParty as u32;
 
 const MIN_LAMPORTS: u64 = 500_000_000;
 

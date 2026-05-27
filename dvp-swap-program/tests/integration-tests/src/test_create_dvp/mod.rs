@@ -7,7 +7,7 @@ use crate::{
     utils::{
         assert_program_error, get_token_balance, TestContext, EARLIEST_AFTER_EXPIRY,
         EXPIRY_NOT_IN_FUTURE, SAME_MINT, SELF_DVP, SETTLEMENT_AUTHORITY_EXECUTABLE,
-        SWAP_PROGRAM_ID, ZERO_AMOUNT,
+        SETTLEMENT_AUTHORITY_IS_PARTY, SWAP_PROGRAM_ID, ZERO_AMOUNT,
     },
 };
 
@@ -224,6 +224,37 @@ fn test_create_dvp_rejects_executable_settlement_authority() {
         .instruction();
 
     assert_program_error(context.send(ix, &[]), SETTLEMENT_AUTHORITY_EXECUTABLE);
+}
+
+#[test]
+fn test_create_dvp_rejects_settlement_authority_as_party() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    // settlement_authority must be a neutral third party. Pointing it at
+    // either swap counterparty would let a party settle its own trade, so
+    // CreateDvp must reject both user_a and user_b up front.
+    for party in [fixture.user_a.pubkey(), fixture.user_b.pubkey()] {
+        let ix = CreateDvpBuilder::new()
+            .payer(context.payer.pubkey())
+            .swap_dvp(fixture.swap_dvp)
+            .mint_a(fixture.mint_a)
+            .mint_b(fixture.mint_b)
+            .dvp_ata_a(fixture.dvp_ata_a)
+            .dvp_ata_b(fixture.dvp_ata_b)
+            .token_program_a(fixture.token_program_a)
+            .token_program_b(fixture.token_program_b)
+            .user_a(fixture.user_a.pubkey())
+            .user_b(fixture.user_b.pubkey())
+            .settlement_authority(party)
+            .amount_a(AMOUNT_A)
+            .amount_b(AMOUNT_B)
+            .expiry_timestamp(fixture.expiry)
+            .nonce(fixture.nonce)
+            .instruction();
+
+        assert_program_error(context.send(ix, &[]), SETTLEMENT_AUTHORITY_IS_PARTY);
+    }
 }
 
 /// A front-runner pre-creates the canonical asset escrow ATA before

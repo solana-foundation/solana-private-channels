@@ -21,8 +21,8 @@ const FIXED_ACCOUNTS_LEN: usize = 10;
 ///
 /// Closed-account rent goes to `signer`, not `dvp.settlement_authority`.
 /// Reject is the safety valve and must work even if the configured
-/// settlement authority is unreachable (e.g. a sysvar or executable
-/// the runtime refuses to pass as writable). Settle and Cancel still
+/// settlement authority is unreachable (e.g. a sysvar the runtime
+/// refuses to pass as writable). Settle and Cancel still
 /// pay rent to the settlement authority — it's their signer there, so
 /// it's already required to be usable.
 ///
