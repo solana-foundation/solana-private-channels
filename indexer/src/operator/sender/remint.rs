@@ -377,7 +377,14 @@ async fn send_completed(
         "Withdrawal nonce {} finalized on-chain (sig: {}); skipping remint",
         nonce_label, sig
     );
+    // Always Some in practice: entries are only queued for withdrawals, which
+    // carry a DB id. A None here drops a finalized withdrawal with no DB trace,
+    // so log it instead of returning silently.
     let Some(transaction_id) = entry.ctx.transaction_id else {
+        error!(
+            "send_completed for nonce {} has no transaction_id; finalized withdrawal (sig: {}) cannot be marked Completed",
+            nonce_label, sig
+        );
         return;
     };
     send_guaranteed(
