@@ -278,7 +278,7 @@ async fn route_outcome(
         RecoveryAction::Quarantine { reason } => {
             // Noisy by design — page on uncertainty, never silently demote.
             match storage
-                .try_quarantine_processing(row.id, captured_updated_at, reason.clone())
+                .try_quarantine_processing(row.id, captured_updated_at)
                 .await
             {
                 Ok(true) => {

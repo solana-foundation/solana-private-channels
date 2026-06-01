@@ -453,7 +453,6 @@ impl MockStorage {
         &self,
         transaction_id: i64,
         expected_updated_at: DateTime<Utc>,
-        _reason: String,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_quarantine_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();

@@ -488,11 +488,68 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     mock.shutdown().await;
 }
 
-// IT-6: fresh row is untouched (no RPC, no DB write).
+// IT-6: idempotency RPC -32601 → not-minted → demote
+// Locks mint.rs's defensive branch; unreachable in prod.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it6_fresh_processing_row_untouched() {
-    let (db, url, _container) = start_pg("it6_fresh").await;
+async fn it6_method_not_found_demotes_deposit_to_pending() {
+    let (db, url, _container) = start_pg("it6_method_not_found").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 700);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    // -32601 is permanent (no retry) → mint.rs returns Ok(None) → NotLanded.
+    mock.enqueue(
+        "getSignaturesForAddress",
+        Reply::error(-32601, "Method not found"),
+    );
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    // Proves the RPC was actually reached (not a pre-RPC bail)
+    assert_eq!(
+        mock.call_count("getSignaturesForAddress"),
+        1,
+        "the -32601 branch must be reached via exactly one RPC call"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "pending",
+        "method-not-found is treated as not-landed → demote, not quarantine"
+    );
+    // Demote is a direct DB CAS — no manual_review webhook update is emitted.
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "demote must not emit a status update"
+    );
+    assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-6");
+    mock.shutdown().await;
+}
+
+// IT-7: fresh row is untouched (no RPC, no DB write).
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it7_fresh_processing_row_untouched() {
+    let (db, url, _container) = start_pg("it7_fresh").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -543,11 +600,11 @@ async fn it6_fresh_processing_row_untouched() {
     mock.shutdown().await;
 }
 
-// IT-7: conditional write is a no-op if the row moved between SELECT and write.
+// IT-8: conditional write is a no-op if the row moved between SELECT and write.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it7_conditional_write_noops_when_row_moved() {
-    let (db, url, _container) = start_pg("it7_cond").await;
+async fn it8_conditional_write_noops_when_row_moved() {
+    let (db, url, _container) = start_pg("it8_cond").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
 
@@ -581,11 +638,11 @@ async fn it7_conditional_write_noops_when_row_moved() {
     );
 }
 
-// IT-8: lagging terminal write cannot stomp a recovery demote.
+// IT-9: lagging terminal write cannot stomp a recovery demote.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it8_lagging_terminal_write_no_ops_after_recovery_demote() {
-    let (db, url, _container) = start_pg("it8_lagging").await;
+async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
+    let (db, url, _container) = start_pg("it9_lagging").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -634,11 +691,11 @@ async fn it8_lagging_terminal_write_no_ops_after_recovery_demote() {
     mock.shutdown().await;
 }
 
-// IT-9: 250-row backlog drained across multiple ticks.
+// IT-10: 250-row backlog drained across multiple ticks.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it9_backlog_batched_across_ticks() {
-    let (db, url, _container) = start_pg("it9_batched").await;
+async fn it10_backlog_batched_across_ticks() {
+    let (db, url, _container) = start_pg("it10_batched").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -735,11 +792,11 @@ async fn it9_backlog_batched_across_ticks() {
     mock.shutdown().await;
 }
 
-// IT-10: PendingRemint rows are NOT touched by recovery.
+// IT-11: PendingRemint rows are NOT touched by recovery.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it10_pending_remint_rows_untouched() {
-    let (db, url, _container) = start_pg("it10_pending_remint").await;
+async fn it11_pending_remint_rows_untouched() {
+    let (db, url, _container) = start_pg("it11_pending_remint").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -797,11 +854,11 @@ async fn it10_pending_remint_rows_untouched() {
     mock.shutdown().await;
 }
 
-// IT-11: withdrawal with NULL nonce → ManualReview (runbook reason string).
+// IT-12: withdrawal with NULL nonce → ManualReview (runbook reason string).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it11_withdrawal_missing_nonce_quarantines() {
-    let (db, url, _container) = start_pg("it11_missing_nonce").await;
+async fn it12_withdrawal_missing_nonce_quarantines() {
+    let (db, url, _container) = start_pg("it12_missing_nonce").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -845,7 +902,7 @@ async fn it11_withdrawal_missing_nonce_quarantines() {
         "quarantined",
         "withdrawal",
         metric_before,
-        "IT-11",
+        "IT-12",
     );
     mock.shutdown().await;
 }

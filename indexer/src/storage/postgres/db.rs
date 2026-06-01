@@ -930,12 +930,11 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// CAS `Processing` → `ManualReview`; reason carried on webhook, not DB.
+    /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
     pub async fn try_quarantine_processing_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
-        _reason: String,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"

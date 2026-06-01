@@ -279,13 +279,11 @@ impl Storage {
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
-        reason: String,
     ) -> Result<bool, StorageError> {
         try_quarantine_processing::try_quarantine_processing(
             self,
             transaction_id,
             expected_updated_at,
-            reason,
         )
         .await
     }
