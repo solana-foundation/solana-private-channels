@@ -159,7 +159,6 @@ async fn check_deposit_idempotency(
         Ok(Some(sig)) => DepositOutcome::Landed {
             signature: sig.to_string(),
         },
-        // PrivateChannel RPC supports getSignaturesForAddress; None = not minted.
         Ok(None) => DepositOutcome::NotLanded,
         // Never demote on uncertainty — risks a double-mint on re-pickup.
         Err(e) => DepositOutcome::Ambiguous {
@@ -553,6 +552,35 @@ mod tests {
             }
             _ => panic!("expected Ambiguous"),
         }
+    }
+
+    #[tokio::test]
+    async fn check_deposit_idempotency_ambiguous_on_method_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        // -32601 must NOT collapse to NotLanded → would demote + double-mint.
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignaturesForAddress"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32601, "message": "Method not found" }
+                })
+                .to_string(),
+            )
+            .create();
+        let client = make_rpc_client(&server.url());
+        let row = make_deposit_row(1);
+        let admin_pubkey = Pubkey::new_unique();
+        let outcome = check_deposit_idempotency(&row, &client, admin_pubkey).await;
+        assert!(
+            matches!(outcome, DepositOutcome::Ambiguous { .. }),
+            "method-not-found must be Ambiguous, never NotLanded"
+        );
     }
 
     // ── check_withdrawal outcome matrix ───────────────────────────────

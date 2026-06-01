@@ -488,11 +488,11 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     mock.shutdown().await;
 }
 
-// IT-6: idempotency RPC -32601 → not-minted → demote
-// Locks mint.rs's defensive branch; unreachable in prod.
+// IT-6: idempotency RPC -32601 (method not found) → Ambiguous → quarantine,
+// NOT demote. A demote would re-mint a deposit we couldn't verify (double-mint).
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it6_method_not_found_demotes_deposit_to_pending() {
+async fn it6_method_not_found_quarantines_deposit() {
     let (db, url, _container) = start_pg("it6_method_not_found").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
@@ -505,7 +505,7 @@ async fn it6_method_not_found_demotes_deposit_to_pending() {
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
     let mock = MockRpcServer::start().await;
-    // -32601 is permanent (no retry) → mint.rs returns Ok(None) → NotLanded.
+    // -32601 is permanent (no retry) → strict lookup returns Err → Ambiguous.
     mock.enqueue(
         "getSignaturesForAddress",
         Reply::error(-32601, "Method not found"),
@@ -513,7 +513,7 @@ async fn it6_method_not_found_demotes_deposit_to_pending() {
     let client = test_client(mock.url());
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
+    let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
     test_hooks::run_recovery_once(
         &storage,
@@ -525,7 +525,7 @@ async fn it6_method_not_found_demotes_deposit_to_pending() {
     .await
     .unwrap();
 
-    // Proves the RPC was actually reached (not a pre-RPC bail)
+    // Proves the RPC was actually reached (not a pre-RPC bail) and not retried.
     assert_eq!(
         mock.call_count("getSignaturesForAddress"),
         1,
@@ -533,15 +533,19 @@ async fn it6_method_not_found_demotes_deposit_to_pending() {
     );
     assert_eq!(
         status_of(&pool, tx_id).await,
-        "pending",
-        "method-not-found is treated as not-landed → demote, not quarantine"
+        "manual_review",
+        "method-not-found is uncertainty → quarantine, never silent demote"
     );
-    // Demote is a direct DB CAS — no manual_review webhook update is emitted.
+    let update = storage_rx
+        .try_recv()
+        .expect("manual_review update should be sent");
+    assert_eq!(update.transaction_id, tx_id);
+    let err = update.error_message.as_deref().unwrap_or("");
     assert!(
-        storage_rx.try_recv().is_err(),
-        "demote must not emit a status update"
+        err.starts_with("deposit idempotency:"),
+        "reason should match runbook substring: {err}"
     );
-    assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-6");
+    assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-6");
     mock.shutdown().await;
 }
 
