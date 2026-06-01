@@ -97,7 +97,8 @@ async fn test_pending_remint_round_trip_preserves_signatures_and_deadline() {
     ];
     let deadline = Utc::now() + ChronoDuration::minutes(30);
 
-    db.set_pending_remint_internal(tx_id, remint_sigs.clone(), deadline)
+    let remint_lvbhs = vec![0; remint_sigs.len()];
+    db.set_pending_remint_internal(tx_id, remint_sigs.clone(), remint_lvbhs, deadline)
         .await
         .expect("set_pending_remint must succeed");
 
@@ -157,6 +158,7 @@ async fn test_pending_remint_query_filters_by_status() {
     db.set_pending_remint_internal(
         ids[0],
         vec!["fake".to_string()],
+        vec![0],
         Utc::now() + ChronoDuration::minutes(10),
     )
     .await
@@ -179,4 +181,73 @@ async fn test_pending_remint_query_filters_by_status() {
     let rows = db.get_pending_remint_transactions_internal().await.unwrap();
     assert_eq!(rows.len(), 1, "only the pending_remint row must return");
     assert_eq!(rows[0].id, ids[0]);
+}
+
+// ── Case D ──────────────────────────────────────────────────────────────────
+/// `finality_check_attempts` must persist and round-trip so the safety cap
+/// survives operator restarts. A row written with `attempts = 0` and then
+/// bumped twice must read back as 2; the WHERE-clause on the bump must reject
+/// non-PendingRemint rows so a terminal row can't be silently resurrected.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_finality_check_attempts_persisted_across_restart() {
+    let (db, url, _container) = start_pg("t12_attempts").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let sig = Signature::new_unique().to_string();
+    let tx = make_withdrawal(&sig, 0);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+
+    // Move to processing so set_pending_remint_internal's status guard passes.
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let initial_deadline = Utc::now() + ChronoDuration::seconds(32);
+    db.set_pending_remint_internal(
+        tx_id,
+        vec![Signature::new_unique().to_string()],
+        vec![0],
+        initial_deadline,
+    )
+    .await
+    .unwrap();
+
+    // Fresh PendingRemint rows start at 0.
+    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    assert_eq!(rows[0].finality_check_attempts, 0);
+
+    // Two consecutive bumps mirror the defer path advancing through the cap.
+    let bumped_deadline_1 = Utc::now() + ChronoDuration::seconds(64);
+    db.bump_pending_remint_finality_attempt_internal(tx_id, 1, bumped_deadline_1)
+        .await
+        .unwrap();
+    let bumped_deadline_2 = Utc::now() + ChronoDuration::seconds(96);
+    db.bump_pending_remint_finality_attempt_internal(tx_id, 2, bumped_deadline_2)
+        .await
+        .unwrap();
+
+    // Restart-equivalent read sees the persisted counter, not 0.
+    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].finality_check_attempts, 2);
+
+    // Status guard: a terminal row must not be resurrectable by bump.
+    sqlx::query(
+        "UPDATE transactions SET status = 'manual_review'::transaction_status WHERE id = $1",
+    )
+    .bind(tx_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result = db
+        .bump_pending_remint_finality_attempt_internal(tx_id, 3, Utc::now())
+        .await;
+    assert!(
+        matches!(result, Err(sqlx::Error::RowNotFound)),
+        "bump must reject non-PendingRemint rows, got {result:?}"
+    );
 }

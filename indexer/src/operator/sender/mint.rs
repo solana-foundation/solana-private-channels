@@ -233,7 +233,7 @@ pub(super) async fn try_jit_mint_initialization(
     )
     .await
     {
-        Ok(s) => s,
+        Ok((s, _)) => s,
         Err(e) => {
             error!("Failed to send InitializeMint transaction: {}", e);
             return JitOutcome::PermanentFailure(format!(

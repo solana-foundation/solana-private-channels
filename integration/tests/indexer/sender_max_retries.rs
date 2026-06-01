@@ -27,7 +27,7 @@ use {
         operator::{
             sender::{
                 test_hooks,
-                types::{SenderState, TransactionStatusUpdate},
+                types::{PendingSig, SenderState, TransactionStatusUpdate},
             },
             utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
         },
@@ -298,9 +298,13 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
     let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(602, 22);
     seed_remint_cache(&mut state, 602, 22);
-    state
-        .pending_signatures
-        .insert(22, vec![Signature::new_unique()]);
+    state.pending_signatures.insert(
+        22,
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 0,
+        }],
+    );
 
     enqueue_failing_send(&mock, "permanent send error");
 
@@ -350,9 +354,13 @@ async fn deferral_set_pending_remint_storage_failure_routes_to_manual_review() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(603, 23);
     seed_remint_cache(&mut state, 603, 23);
-    state
-        .pending_signatures
-        .insert(23, vec![Signature::new_unique()]);
+    state.pending_signatures.insert(
+        23,
+        vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 0,
+        }],
+    );
     mock_storage.set_should_fail("set_pending_remint", true);
 
     enqueue_failing_send(&mock, "permanent send error");

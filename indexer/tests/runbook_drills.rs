@@ -645,20 +645,20 @@ async fn drill_6_recovery_query_skips_terminal_statuses() -> Result<(), Box<dyn 
     // resolved by recovery actions per the runbook.
     let to_completed = seed_withdrawal(&pool, "processing", 100, None).await?;
     storage
-        .set_pending_remint(to_completed, vec![sig.clone()], deadline)
+        .set_pending_remint(to_completed, vec![sig.clone()], vec![0], deadline)
         .await?;
     let to_failed_reminted = seed_withdrawal(&pool, "processing", 101, None).await?;
     storage
-        .set_pending_remint(to_failed_reminted, vec![sig.clone()], deadline)
+        .set_pending_remint(to_failed_reminted, vec![sig.clone()], vec![0], deadline)
         .await?;
     let to_manual_review = seed_withdrawal(&pool, "processing", 102, None).await?;
     storage
-        .set_pending_remint(to_manual_review, vec![sig.clone()], deadline)
+        .set_pending_remint(to_manual_review, vec![sig.clone()], vec![0], deadline)
         .await?;
     // Plus one that stays in pending_remint — the only one recovery should return.
     let still_pending = seed_withdrawal(&pool, "processing", 103, None).await?;
     storage
-        .set_pending_remint(still_pending, vec![sig.clone()], deadline)
+        .set_pending_remint(still_pending, vec![sig.clone()], vec![0], deadline)
         .await?;
 
     // Apply the recovery actions the runbook prescribes.

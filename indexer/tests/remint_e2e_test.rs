@@ -147,9 +147,17 @@ async fn test_pending_remint_persisted_and_recovered() -> Result<(), Box<dyn std
 
     // Simulate handle_permanent_failure persisting the remint state.
     // Deadline is 32s from now — the finality safety window.
+    // Distinct lvbh values per sig so we can verify index-aligned roundtrip.
+    let lvbh_sig1: i64 = 1_000;
+    let lvbh_sig2: i64 = 2_000;
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     storage
-        .set_pending_remint(tx_id, vec![sig1.to_string(), sig2.to_string()], deadline)
+        .set_pending_remint(
+            tx_id,
+            vec![sig1.to_string(), sig2.to_string()],
+            vec![lvbh_sig1, lvbh_sig2],
+            deadline,
+        )
         .await?;
 
     // Simulate restart: fetch all PendingRemint rows as recover_pending_remints would.
@@ -181,6 +189,35 @@ async fn test_pending_remint_persisted_and_recovered() -> Result<(), Box<dyn std
     assert!(
         stored_sigs.contains(&sig2.to_string()),
         "sig2 must be stored"
+    );
+
+    // last_valid_block_height per sig must be stored index-aligned with the
+    // sig array. The gate uses this to determine whether a broadcast can
+    // still land, so reordering or losing it would re-open the audit hole.
+    let stored_lvbhs = row
+        .remint_last_valid_block_heights
+        .as_ref()
+        .expect("last_valid_block_heights must be stored");
+    assert_eq!(
+        stored_lvbhs.len(),
+        stored_sigs.len(),
+        "lvbh array must be the same length as the signature array"
+    );
+    let sig1_index = stored_sigs
+        .iter()
+        .position(|stored_sig| stored_sig == &sig1.to_string())
+        .expect("sig1 must be in stored array");
+    let sig2_index = stored_sigs
+        .iter()
+        .position(|stored_sig| stored_sig == &sig2.to_string())
+        .expect("sig2 must be in stored array");
+    assert_eq!(
+        stored_lvbhs[sig1_index], lvbh_sig1,
+        "sig1's lvbh must round-trip in the same slot as sig1"
+    );
+    assert_eq!(
+        stored_lvbhs[sig2_index], lvbh_sig2,
+        "sig2's lvbh must round-trip in the same slot as sig2"
     );
 
     // Deadline must be stored and within 2s of what we wrote (Postgres
@@ -221,7 +258,7 @@ async fn test_resolved_remint_not_returned_by_recovery_query(
     // Insert and transition to PendingRemint.
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, 5_000).await?;
     storage
-        .set_pending_remint(tx_id, vec![sig.to_string()], deadline)
+        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline)
         .await?;
 
     // Confirm it shows up in recovery before resolution.
@@ -267,7 +304,7 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
     // 1. Insert withdrawal and transition to PendingRemint.
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, 5_000).await?;
     storage
-        .set_pending_remint(tx_id, vec![sig.to_string()], deadline)
+        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline)
         .await?;
 
     // Confirm it appears in recovery before resolution.
@@ -331,7 +368,7 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, withdrawal_amount).await?;
     storage
-        .set_pending_remint(tx_id, vec![withdrawal_sig.to_string()], deadline)
+        .set_pending_remint(tx_id, vec![withdrawal_sig.to_string()], vec![0], deadline)
         .await?;
 
     // Step 3: while the row is in PendingRemint the balance must reflect the
@@ -409,7 +446,12 @@ async fn test_multiple_pending_remints_excluded_from_balance(
     for amount in [10_000i64, 8_000, 12_000] {
         let tx_id = insert_withdrawal(&pool, &mint, &Pubkey::new_unique(), amount).await?;
         storage
-            .set_pending_remint(tx_id, vec![Signature::new_unique().to_string()], deadline)
+            .set_pending_remint(
+                tx_id,
+                vec![Signature::new_unique().to_string()],
+                vec![0],
+                deadline,
+            )
             .await?;
     }
 
@@ -456,7 +498,7 @@ async fn test_manual_review_not_returned_by_recovery_query(
 
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, 5_000).await?;
     storage
-        .set_pending_remint(tx_id, vec![sig.to_string()], deadline)
+        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline)
         .await?;
 
     // Confirm it appears before resolution.
