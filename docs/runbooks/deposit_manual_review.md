@@ -296,9 +296,10 @@ Once root cause is known, capture the row's full content in the
 incident record and delete it. The
 reconciliation orphan check has no status filter and runs with in-memory
 per-id dedup, so a `failed` row stays silent in steady state but
-re-appears in the orphan log on every operator restart (logs only — no
-webhook). Deleting the row is the only way to remove that recurring
-boot-time noise:
+re-appears in the orphan log — and re-posts a webhook alert via
+`reconciliation_webhook_url` (payload: `orphan_ids`, `row_count`,
+`timestamp`) — on every operator restart. Deleting the row is the only
+way to remove that recurring boot-time noise:
 
 ```sql
 DELETE FROM transactions WHERE id = :transaction_id;

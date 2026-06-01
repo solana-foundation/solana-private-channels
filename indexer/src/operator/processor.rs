@@ -660,8 +660,9 @@ pub async fn process_deposit_funds(
                 }
             })?;
 
-            // Refuse to mint when the mint has no row in the `mints`
-            // allowlist. If we minted anyway, two things would break:
+            // Refuse to mint when the mint was not in `allowed` status at
+            // the deposit's slot, per `mint_status_history`. If we minted
+            // anyway, two things would break:
             //   1. We'd issue PrivateChannel tokens with no Mainnet escrow
             //      backing them.
             //   2. Reconciliation wouldn't catch it: the balance check
@@ -669,7 +670,7 @@ pub async fn process_deposit_funds(
             //      never fires.
             processor_state
                 .mint_cache
-                .assert_mint_allowlisted(&mint, transaction.id)
+                .assert_mint_allowed_at_slot(&mint, transaction.slot, transaction.id)
                 .await?;
 
             let token_program = processor_state
@@ -823,7 +824,8 @@ mod tests {
         assert_eq!(state.instance_atas.len(), 2);
     }
 
-    /// Insert a minimal `mints` row so `assert_mint_allowlisted` accepts the mint.
+    /// Insert a minimal `mints` row AND a slot-0 `allowed` status history
+    /// entry so `assert_mint_allowed_at_slot` accepts the mint at any slot.
     fn insert_mint_row(storage: &Arc<Storage>, mint: &Pubkey) {
         let mock_storage = match storage.as_ref() {
             Storage::Mock(m) => m,
@@ -838,6 +840,15 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 is_pausable: Some(false),
                 has_permanent_delegate: Some(false),
+            },
+        );
+        mock_storage.mint_status_history.lock().unwrap().push(
+            crate::storage::common::models::DbMintStatus {
+                mint_address: mint.to_string(),
+                status: "allowed".to_string(),
+                effective_slot: 0,
+                signature: format!("test-seed-{mint}"),
+                created_at: chrono::Utc::now(),
             },
         );
     }
@@ -1416,6 +1427,15 @@ mod tests {
         assert!(matches!(
             classify_processor_error(&other_program),
             ErrorDisposition::Quarantine("program_error")
+        ));
+
+        let mint_not_allowed = OperatorError::MintNotAllowed {
+            transaction_id: 1,
+            mint: "mint_a".into(),
+        };
+        assert!(matches!(
+            classify_processor_error(&mint_not_allowed),
+            ErrorDisposition::Quarantine("mint_not_allowed")
         ));
 
         // Fatal variants — processor is misconfigured or downstream is dead.

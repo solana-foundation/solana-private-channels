@@ -146,19 +146,17 @@ pub async fn run_startup_reconciliation(
     classify_and_report(config, &results)
 }
 
-/// Log every deposit row whose mint has no entry in `mints` (the on-chain
-/// `AllowMint` allowlist). Informational only — these orphans are
-/// surfaced at boot but never fail startup. A storage-query failure is
-/// logged as a warn and swallowed: the orphan check is a diagnostic, not
-/// a precondition.
+/// Log deposit rows whose mint was not allowed at the deposit's slot.
+/// Diagnostic only, surfaced at boot, never fails startup, and a query
+/// failure is logged at `warn` and swallowed rather than propagated.
 async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
     match storage.get_orphan_deposit_ids().await {
         Ok(orphans) if !orphans.is_empty() => {
-            info!(
+            error!(
                 row_count = orphans.len(),
                 orphan_ids = ?orphans,
                 "Startup reconciliation: orphan deposit row(s) present (deposit rows with \
-                 no AllowMint record) — surfaced for visibility, does not fail startup"
+                 no allowed mint status at the deposit's slot) — surfaced for visibility, does not fail startup"
             );
         }
         Ok(_) => {

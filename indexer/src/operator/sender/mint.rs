@@ -200,10 +200,10 @@ pub(super) async fn try_jit_mint_initialization(
     // user's account.
     //
     // It's safe in this position because the deposit processor
-    // already refuses to forward a deposit whose mint has no row in
-    // the `mints` allowlist (see `assert_mint_allowlisted` in
-    // `process_deposit_funds`). By the time execution reaches this
-    // point, the row is guaranteed to exist.
+    // already refuses to forward a deposit whose mint was not in
+    // allowed status at the deposit's slot (see
+    // `assert_mint_allowed_at_slot` in `process_deposit_funds`). By the
+    // time execution reaches this point, the mint is known-allowed.
     let Ok(mint_metadata) = state.mint_cache.get_mint_metadata(&mint).await else {
         error!("Mint {} not found in mint cache", mint);
         return JitOutcome::PermanentFailure(format!("mint not in mint cache: {}", mint));

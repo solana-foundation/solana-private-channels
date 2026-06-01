@@ -122,7 +122,13 @@ async fn perform_reconciliation_check(
     webhook_client: &WebhookClient,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
 ) -> Result<(), OperatorError> {
-    check_orphan_deposit_rows(storage, previously_alerted_orphans).await;
+    check_orphan_deposit_rows(
+        storage,
+        previously_alerted_orphans,
+        webhook_client,
+        &config.reconciliation_webhook_url,
+    )
+    .await;
 
     // Step 2: Fetch on-chain balances from Solana RPC
     let on_chain_balances = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
@@ -196,25 +202,20 @@ async fn perform_reconciliation_check(
     Ok(())
 }
 
-/// Surface orphan deposit rows (deposits whose `mint` has no row in
-/// `mints`) via logs only — dedup is per `transactions.id`, so a single
-/// orphan mint with N stuck rows produces N independent alerts the first
-/// time each is observed and silence thereafter.
-/// Orphans are a softer signal: the deposit-side gate
-/// (`assert_mint_allowlisted`) has already refused to mint for them, so a
-/// log line into the central log pipeline is enough for triage.
+/// Surface orphan deposit rows (deposits whose mint was not `allowed` at the
+/// deposit's slot) via `error!` log and a webhook alert. Dedup is per
+/// `transactions.id` (in `previously_alerted_orphans`): each id alerts once
+/// then stays silent.
 ///
-/// Dedup contract (`previously_alerted_orphans`):
-/// - `None` on entry: this is the baseline tick. Empty set logs at
-///   `info!`; non-empty set logs at `error!`.
-/// - `Some(seen)` on entry: only orphans NOT in `seen` are "new". New
-///   orphans get an `error!` log; everything else is silent.
-///
-/// Storage-query failures are logged at `warn!` and leave the dedup state
-/// untouched.
+/// - `None` (baseline tick): empty set logs `info!`; non-empty logs `error!`
+///   and posts the full set.
+/// - `Some(seen)`: only ids not in `seen` are new, they log `error!` and post.
+/// - Storage-query failure logs `warn!` and leaves dedup state untouched.
 async fn check_orphan_deposit_rows(
     storage: &Arc<Storage>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
+    webhook_client: &WebhookClient,
+    webhook_url: &Option<String>,
 ) {
     let orphans = match storage.get_orphan_deposit_ids().await {
         Ok(orphans) => orphans,
@@ -234,9 +235,16 @@ async fn check_orphan_deposit_rows(
                     row_count = orphans.len(),
                     orphan_ids = ?orphans,
                     "Reconciliation baseline: {} orphan deposit row(s) currently present \
-                     (no AllowMint record); subsequent ticks will only log on new entries",
+                     (no allowed mint status at the deposit's slot); subsequent ticks will only log on new entries",
                     orphans.len()
                 );
+
+                // Post the full current orphan set so restarts re-surface unresolved orphans.
+                if let Err(e) =
+                    send_orphan_deposit_alert(webhook_url, &orphans, webhook_client).await
+                {
+                    error!("Failed to send orphan deposit webhook alert: {}", e);
+                }
             }
             *previously_alerted_orphans = Some(orphans.into_iter().collect());
         }
@@ -255,9 +263,18 @@ async fn check_orphan_deposit_rows(
             error!(
                 new_row_count = new_orphans.len(),
                 new_orphan_ids = ?new_orphans,
-                "Reconciliation found {} new orphan deposit row(s) (deposit rows with no AllowMint record)",
+                "Reconciliation found {} new orphan deposit row(s) (no allowed mint status at the deposit's slot)",
                 new_orphans.len()
             );
+
+            // Alert on the newly-arrived orphans only. Webhook failures are
+            // logged inside the helper but must not abort the tick.
+            if let Err(e) =
+                send_orphan_deposit_alert(webhook_url, &new_orphans, webhook_client).await
+            {
+                error!("Failed to send orphan deposit webhook alert: {}", e);
+            }
+
             seen.extend(new_orphans);
         }
     }
@@ -529,6 +546,64 @@ pub async fn send_webhook_alert(
             mismatch.mint, mismatch.delta_bps
         );
     }
+
+    Ok(())
+}
+
+/// Posts orphan deposit transaction ids to `webhook_url` as a single JSON
+/// payload `{ orphan_ids, row_count, timestamp }` (ids only — operators resolve
+/// mint/amount/signature via `docs/runbooks/deposit_manual_review.md`).
+///
+/// Retries up to 3 times with exponential backoff on transient HTTP errors.
+/// `None` URL with ids present logs a `warn!` and returns `Ok`. Returns
+/// `Err(OperatorError::WebhookError)` if delivery fails after retries.
+pub async fn send_orphan_deposit_alert(
+    webhook_url: &Option<String>,
+    orphan_ids: &[i64],
+    webhook_client: &WebhookClient,
+) -> Result<(), OperatorError> {
+    // If no webhook URL configured, log and return early
+    let url = match webhook_url {
+        Some(url) => url,
+        None => {
+            if !orphan_ids.is_empty() {
+                warn!(
+                    "Orphan deposit rows detected but no webhook URL configured (found {} row(s))",
+                    orphan_ids.len()
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    let payload = serde_json::json!({
+        "row_count": orphan_ids.len(),
+        "orphan_ids": orphan_ids,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    let context = format!("orphan deposits: {} row(s)", orphan_ids.len());
+
+    webhook_client
+        .post_json(url, &payload, &context)
+        .await
+        .map_err(|error| {
+            error!(
+                "Failed to send orphan deposit webhook alert after {} attempts: {}",
+                error.attempts(),
+                error.message()
+            );
+            OperatorError::WebhookError(format!(
+                "Failed to send orphan deposit webhook alert after {} attempts: {}",
+                error.attempts(),
+                error.message()
+            ))
+        })?;
+
+    info!(
+        "Orphan deposit webhook alert sent for {} row(s)",
+        orphan_ids.len()
+    );
 
     Ok(())
 }
@@ -1023,6 +1098,163 @@ mod tests {
         mock.assert_async().await;
     }
 
+    // ── orphan-deposit webhook alert tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_send_orphan_deposit_alert_no_url() {
+        // No webhook URL configured with orphan ids present -> no-op Ok(())
+        let orphan_ids = vec![123_i64, 456];
+
+        let client = test_webhook_client();
+        let result = send_orphan_deposit_alert(&None, &orphan_ids, &client).await;
+        assert!(
+            result.is_ok(),
+            "Should succeed when no webhook URL configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_orphan_deposit_alert_success() {
+        // Successful single POST of the orphan id payload
+        let mut server = mockito::Server::new_async().await;
+        // Assert the received alert carries the expected payload. The
+        // timestamp is dynamic, so match only the stable fields via partial
+        // JSON.
+        let mock = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "row_count": 2,
+                "orphan_ids": [123, 456],
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let orphan_ids = vec![123_i64, 456];
+
+        let client = test_webhook_client();
+        let result = send_orphan_deposit_alert(&webhook_url, &orphan_ids, &client).await;
+        assert!(result.is_ok(), "Should successfully send orphan webhook");
+
+        // Verifies the request was received AND its body matched the payload.
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_orphan_deposit_alert_max_retries_exceeded() {
+        // All requests fail -> returns WebhookError after exhausting retries
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(500)
+            .expect(3) // Should retry 3 times
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let orphan_ids = vec![123_i64];
+
+        let client = test_webhook_client();
+        let result = send_orphan_deposit_alert(&webhook_url, &orphan_ids, &client).await;
+        assert!(result.is_err(), "Should fail after max retries");
+        assert!(
+            matches!(result.unwrap_err(), OperatorError::WebhookError(_)),
+            "Should return WebhookError"
+        );
+
+        mock.assert_async().await;
+    }
+
+    /// Baseline tick posts the full orphan set once; a steady-state tick with the same orphans posts nothing more.
+    #[tokio::test]
+    async fn check_orphan_deposit_rows_webhook_posts_baseline_once_then_silent() {
+        let mut server = mockito::Server::new_async().await;
+        // Exactly one POST is expected across both ticks: the baseline.
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let client = test_webhook_client();
+
+        let mock_storage = MockStorage::new();
+        seed_orphan_deposit(&mock_storage, "mint_a");
+        seed_orphan_deposit(&mock_storage, "mint_b");
+        let storage = Arc::new(Storage::Mock(mock_storage));
+
+        let mut state: Option<HashSet<i64>> = None;
+
+        // Baseline tick: posts the full current orphan set.
+        check_orphan_deposit_rows(&storage, &mut state, &client, &webhook_url).await;
+        assert_eq!(
+            state.as_ref().map(|s| s.len()),
+            Some(2),
+            "baseline should capture every current orphan"
+        );
+
+        // Steady-state tick: same orphans, no new ids -> no additional POST.
+        check_orphan_deposit_rows(&storage, &mut state, &client, &webhook_url).await;
+        assert_eq!(
+            state.as_ref().map(|s| s.len()),
+            Some(2),
+            "steady-state tick must leave the dedup set unchanged"
+        );
+
+        mock.assert_async().await;
+    }
+
+    /// A newly-arrived orphan in a delta tick posts exactly once for the new
+    /// id (not the already-seen ones).
+    #[tokio::test]
+    async fn check_orphan_deposit_rows_webhook_posts_new_orphan_once() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let webhook_url = Some(server.url());
+        let client = test_webhook_client();
+
+        let mock_storage = MockStorage::new();
+        let id_a = seed_orphan_deposit(&mock_storage, "mint_a");
+        let id_b = seed_orphan_deposit(&mock_storage, "mint_b");
+        let storage = Arc::new(Storage::Mock(mock_storage));
+
+        // Pre-seed dedup state as if `id_a` had already been alerted; only
+        // `id_b` is new and should drive a single webhook POST.
+        let mut state: Option<HashSet<i64>> = Some([id_a].into_iter().collect());
+
+        check_orphan_deposit_rows(&storage, &mut state, &client, &webhook_url).await;
+
+        let seen = state.expect("state should remain Some after delta tick");
+        assert_eq!(
+            seen.len(),
+            2,
+            "dedup set should now hold both the pre-seen and the new orphan"
+        );
+        assert!(
+            seen.contains(&id_a),
+            "already-seen orphan must stay in the dedup set"
+        );
+        assert!(
+            seen.contains(&id_b),
+            "newly-arrived orphan must be added to the dedup set"
+        );
+
+        // Exactly one POST: only the new id (`id_b`) is alerted; the
+        // already-seen `id_a` does not re-post.
+        mock.assert_async().await;
+    }
+
     // Additional edge case tests for basis points calculation
 
     #[test]
@@ -1388,7 +1620,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let mut state: Option<HashSet<i64>> = None;
 
-        check_orphan_deposit_rows(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state, &test_webhook_client(), &None).await;
 
         let seen = state.expect("baseline tick must populate dedup cache");
         assert_eq!(
@@ -1407,7 +1639,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mut state: Option<HashSet<i64>> = None;
 
-        check_orphan_deposit_rows(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state, &test_webhook_client(), &None).await;
 
         let seen = state.expect("baseline must seed state even when empty");
         assert!(seen.is_empty());
@@ -1426,7 +1658,7 @@ mod tests {
         // as far as state is concerned.
         let mut state: Option<HashSet<i64>> = Some([id_a].into_iter().collect());
 
-        check_orphan_deposit_rows(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state, &test_webhook_client(), &None).await;
 
         let seen = state.expect("state should remain Some after delta tick");
         assert_eq!(seen.len(), 1, "stable orphan must not grow the cache");
@@ -1449,7 +1681,7 @@ mod tests {
         // trigger the error log even though the mint is already "known".
         let mut state: Option<HashSet<i64>> = Some([id_a].into_iter().collect());
 
-        check_orphan_deposit_rows(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state, &test_webhook_client(), &None).await;
 
         let seen = state.expect("state should remain Some after delta tick");
         assert_eq!(seen.len(), 2, "cache should grow by exactly the new row");
@@ -1466,7 +1698,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let mut state: Option<HashSet<i64>> = None;
 
-        check_orphan_deposit_rows(&storage, &mut state).await;
+        check_orphan_deposit_rows(&storage, &mut state, &test_webhook_client(), &None).await;
 
         assert!(
             state.is_none(),

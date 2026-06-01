@@ -1067,16 +1067,17 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
 // ── Drill 15: deposit_manual_review.md § Path E recovery flows ─────────────
 //
 // `deposit_manual_review.md` § Path E documents recovery for the
-// processor-side allowlist gate (`assert_mint_allowlisted` rejects a
-// deposit whose mint has no row in `mints`). This drill pins:
+// processor-side allowlist gate (`assert_mint_allowed_at_slot` rejects a
+// deposit whose mint was not in `allowed` status at the deposit's slot).
+// This drill pins:
 //
 //   1. The dispatch substring exists in source — `OperatorError::MintNotAllowed`'s
 //      `#[error(...)]` template lives in `error/operator.rs`, and is also
 //      anchored globally by drill_1.
 //   2. The classifier routes `MintNotAllowed` to a quarantine reason of
-//      `mint_not_allowed`, and the call to `assert_mint_allowlisted` is
-//      still wired into `process_deposit_funds`. A future refactor that
-//      drops either of these breaks Path E silently.
+//      `mint_not_allowed`, and the call to `assert_mint_allowed_at_slot`
+//      is still wired into `process_deposit_funds`. A future refactor
+//      that drops either of these breaks Path E silently.
 //   3. Path E recovery SQL: 3a re-arms to `pending`; 3b `DELETE`s the
 //      row (the orphan reconciliation query has no status filter, so
 //      DELETE is the only way to silence it). Both are id-targeted and
@@ -1123,11 +1124,11 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
          drives the OPERATOR_TRANSACTION_QUARANTINED metric the runbook references",
     );
     assert!(
-        processor.contains("assert_mint_allowlisted"),
-        "process_deposit_funds must call assert_mint_allowlisted — Path E's \
+        processor.contains("assert_mint_allowed_at_slot"),
+        "process_deposit_funds must call assert_mint_allowed_at_slot — Path E's \
          entire trigger surface depends on this gate firing before the sender path",
     );
-    eprintln!("OK   processor.rs: \"mint_not_allowed\" label + assert_mint_allowlisted call");
+    eprintln!("OK   processor.rs: \"mint_not_allowed\" label + assert_mint_allowed_at_slot call");
 
     // ── Step 3: cross-signal contract with reconciliation ────────────
     // Path E's recovery for the terminal branch tells the on-call that

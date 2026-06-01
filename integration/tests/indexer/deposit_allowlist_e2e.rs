@@ -3,7 +3,7 @@
 //!
 //! Two changes are exercised here:
 //!
-//! 1. **Deposit-operator allowlist gate** — `MintCache::assert_mint_allowlisted`
+//! 1. **Deposit-operator allowlist gate** — `MintCache::assert_mint_allowed_at_slot`
 //!    must reject mints with no row in `mints` and accept those that do,
 //!    using the public `Storage::Postgres` backend.
 //!
@@ -68,8 +68,19 @@ async fn start_postgres(
 /// means any future schema migration breaks here in the same way it
 /// would break the real ingest path.
 async fn insert_mint_row(storage: &Storage, mint: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mint = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
-    storage.upsert_mints_batch(&[mint]).await?;
+    let mint_row = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_row]).await?;
+    storage
+        .insert_mint_statuses_batch(&[
+            private_channel_indexer::storage::common::models::DbMintStatus {
+                mint_address: mint.to_string(),
+                status: "allowed".to_string(),
+                effective_slot: 0,
+                signature: format!("test-seed-{mint}"),
+                created_at: chrono::Utc::now(),
+            },
+        ])
+        .await?;
     Ok(())
 }
 
@@ -274,7 +285,8 @@ async fn orphan_query_clears_when_allowmint_arrives_late() -> Result<(), Box<dyn
 ///     production).
 ///   • Same mint after AllowMint lands → gate passes.
 #[tokio::test(flavor = "multi_thread")]
-async fn assert_mint_allowlisted_against_real_postgres() -> Result<(), Box<dyn std::error::Error>> {
+async fn assert_mint_allowed_at_slot_against_real_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique();
@@ -284,7 +296,7 @@ async fn assert_mint_allowlisted_against_real_postgres() -> Result<(), Box<dyn s
     // covered by the unit tests; here we only need to confirm the call
     // errors when the row is absent.
     let err = cache
-        .assert_mint_allowlisted(&mint, 42)
+        .assert_mint_allowed_at_slot(&mint, 100, 42)
         .await
         .expect_err("unknown mint must not pass the gate");
     let _ = err;
@@ -296,7 +308,7 @@ async fn assert_mint_allowlisted_against_real_postgres() -> Result<(), Box<dyn s
     // out any in-memory shortcut — every call must consult the DB.
     let cache = MintCache::new(storage.clone());
     cache
-        .assert_mint_allowlisted(&mint, 42)
+        .assert_mint_allowed_at_slot(&mint, 100, 42)
         .await
         .expect("allowlisted mint must pass the gate");
 
@@ -309,11 +321,11 @@ async fn assert_mint_allowlisted_against_real_postgres() -> Result<(), Box<dyn s
 /// permanently refuse a legitimate mint until restart.
 ///
 /// Regression-guard for the cache-bypass property documented on
-/// `assert_mint_allowlisted` — unit tests prove the in-memory layer is
+/// `assert_mint_allowed_at_slot` — unit tests prove the in-memory layer is
 /// bypassed; this proves the property holds when the underlying store
 /// is Postgres rather than the mock.
 #[tokio::test(flavor = "multi_thread")]
-async fn assert_mint_allowlisted_does_not_cache_negative_result(
+async fn assert_mint_allowed_at_slot_does_not_cache_negative_result(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (storage, _pg) = start_postgres().await?;
 
@@ -324,7 +336,7 @@ async fn assert_mint_allowlisted_does_not_cache_negative_result(
 
     // First call: mint absent → gate refuses.
     cache
-        .assert_mint_allowlisted(&mint, 1)
+        .assert_mint_allowed_at_slot(&mint, 100, 1)
         .await
         .expect_err("first call must refuse the unknown mint");
 
@@ -335,7 +347,7 @@ async fn assert_mint_allowlisted_does_not_cache_negative_result(
     // and accept. A cached "not allowlisted" answer here would be a
     // bug — the deposit operator would never recover.
     cache
-        .assert_mint_allowlisted(&mint, 1)
+        .assert_mint_allowed_at_slot(&mint, 100, 1)
         .await
         .expect("second call must consult the DB and accept the newly-allowlisted mint");
 
@@ -377,7 +389,7 @@ async fn gate_and_orphan_query_agree_on_same_row() -> Result<(), Box<dyn std::er
 
     // ── Pre-AllowMint state ──────────────────────────────────────────────
     cache
-        .assert_mint_allowlisted(&mint, orphan_id)
+        .assert_mint_allowed_at_slot(&mint, 1, orphan_id)
         .await
         .expect_err("gate must refuse the mint before AllowMint lands");
 
@@ -393,7 +405,7 @@ async fn gate_and_orphan_query_agree_on_same_row() -> Result<(), Box<dyn std::er
 
     // ── Post-AllowMint state ─────────────────────────────────────────────
     cache
-        .assert_mint_allowlisted(&mint, orphan_id)
+        .assert_mint_allowed_at_slot(&mint, 1, orphan_id)
         .await
         .expect("gate must accept the mint once AllowMint lands");
 

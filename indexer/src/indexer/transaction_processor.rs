@@ -11,7 +11,9 @@ use crate::{
         },
     },
     storage::{
-        common::models::{DbMint, DbTransaction, DbTransactionBuilder, TransactionType},
+        common::models::{
+            DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionType,
+        },
         Storage,
     },
 };
@@ -91,12 +93,22 @@ impl TransactionProcessor {
     /// Saves any buffered transactions and always sends checkpoint (even if empty)
     async fn finalize_and_checkpoint(&mut self, slot: u64, program_type: ProgramType) {
         let mut mints = Vec::new();
+        let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
         let mut transactions = Vec::new();
 
         for instruction_meta in &self.current_slot_instructions {
             let (mint_opt, transaction_opt) = convert_to_db_models(instruction_meta);
 
             if let Some(mint) = mint_opt {
+                if let Some(sig) = instruction_meta.signature.clone() {
+                    mint_statuses.push(DbMintStatus {
+                        mint_address: mint.mint_address.clone(),
+                        status: "allowed".to_string(),
+                        effective_slot: slot as i64,
+                        signature: sig,
+                        created_at: chrono::Utc::now(),
+                    });
+                }
                 mints.push(mint);
             }
 
@@ -124,6 +136,32 @@ impl TransactionProcessor {
                 }
                 Err(e) => {
                     error!("Failed to save mints from slot {}: {}", slot, e);
+                    metrics::INDEXER_SLOT_SAVE_ERRORS
+                        .with_label_values(&[program_type.as_label()])
+                        .inc();
+                    send_checkpoint = false;
+                }
+            }
+        }
+
+        if !mint_statuses.is_empty() {
+            match self
+                .storage
+                .insert_mint_statuses_batch(&mint_statuses)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "Successfully saved {} mint status row(s) from slot {}",
+                        mint_statuses.len(),
+                        slot,
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to save mint status history from slot {}: {}",
+                        slot, e
+                    );
                     metrics::INDEXER_SLOT_SAVE_ERRORS
                         .with_label_values(&[program_type.as_label()])
                         .inc();
@@ -543,6 +581,49 @@ mod tests {
 
         let cp = checkpoint_rx.recv().await.unwrap();
         assert_eq!(cp.slot, 200);
+    }
+
+    #[tokio::test]
+    async fn finalize_writes_mint_status_history_on_allow_mint() {
+        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        processor
+            .current_slot_instructions
+            .push(make_allow_mint_instruction(
+                200,
+                Some("sig-allow-1".to_string()),
+            ));
+        processor
+            .finalize_and_checkpoint(200, ProgramType::Escrow)
+            .await;
+
+        {
+            let rows = mock.mint_status_history.lock().unwrap();
+            assert_eq!(rows.len(), 1, "exactly one status row should be written");
+            assert_eq!(rows[0].mint_address, make_pubkey(2).to_string());
+            assert_eq!(rows[0].status, "allowed");
+            assert_eq!(rows[0].effective_slot, 200);
+            assert_eq!(rows[0].signature, "sig-allow-1");
+        }
+
+        let cp = checkpoint_rx.recv().await.unwrap();
+        assert_eq!(cp.slot, 200);
+    }
+
+    #[tokio::test]
+    async fn finalize_insert_mint_statuses_failure_skips_checkpoint() {
+        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        mock.set_should_fail("insert_mint_statuses_batch", true);
+        processor
+            .current_slot_instructions
+            .push(make_allow_mint_instruction(
+                201,
+                Some("sig-allow-2".to_string()),
+            ));
+        processor
+            .finalize_and_checkpoint(201, ProgramType::Escrow)
+            .await;
+
+        assert!(checkpoint_rx.try_recv().is_err());
     }
 
     #[tokio::test]
