@@ -397,6 +397,17 @@ mod tests {
         sig: Option<String>,
         recipient: Option<Pubkey>,
     ) -> InstructionWithMetadata {
+        make_deposit_instruction_on_instance(slot, sig, recipient, deposit_instance())
+    }
+
+    /// Like `make_deposit_instruction` but on a caller-chosen instance, so a
+    /// deposit can share a slot with an AllowMint on the same instance.
+    fn make_deposit_instruction_on_instance(
+        slot: u64,
+        sig: Option<String>,
+        recipient: Option<Pubkey>,
+        instance: Pubkey,
+    ) -> InstructionWithMetadata {
         let user = make_pubkey(1);
         let mint = make_pubkey(2);
         InstructionWithMetadata {
@@ -404,7 +415,7 @@ mod tests {
                 accounts: DepositAccounts {
                     payer: make_pubkey(10),
                     user,
-                    instance: deposit_instance(),
+                    instance,
                     mint,
                     allowed_mint: make_pubkey(12),
                     user_ata: make_pubkey(13),
@@ -725,7 +736,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_writes_mint_status_history_on_allow_mint() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         processor
             .current_slot_instructions
             .push(make_allow_mint_instruction(
@@ -751,7 +763,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_insert_mint_statuses_failure_skips_checkpoint() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("insert_mint_statuses_batch", true);
         processor
             .current_slot_instructions
@@ -771,7 +784,10 @@ mod tests {
     /// quarantine it) and the slot replays.
     #[tokio::test]
     async fn finalize_mint_status_failure_withholds_deposit_in_same_slot() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        // Both instructions must target the configured instance, or the
+        // instance filter would drop one and defeat the test's intent.
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("insert_mint_statuses_batch", true);
         processor
             .current_slot_instructions
@@ -781,10 +797,11 @@ mod tests {
             ));
         processor
             .current_slot_instructions
-            .push(make_deposit_instruction(
+            .push(make_deposit_instruction_on_instance(
                 202,
                 Some("sig-deposit-3".to_string()),
                 None,
+                allow_mint_instance(),
             ));
         processor
             .finalize_and_checkpoint(202, ProgramType::Escrow)
