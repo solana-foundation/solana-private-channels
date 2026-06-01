@@ -816,6 +816,7 @@ async fn it11_pending_remint_rows_untouched() {
     db.set_pending_remint_internal(
         tx_id,
         vec!["fake-sig".to_string()],
+        vec![1],
         Utc::now() + ChronoDuration::minutes(30),
     )
     .await

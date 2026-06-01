@@ -883,7 +883,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -907,7 +907,9 @@ impl PostgresDb {
             transaction_cols::PROCESSED_AT,
             transaction_cols::COUNTERPART_SIGNATURE,
             transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
