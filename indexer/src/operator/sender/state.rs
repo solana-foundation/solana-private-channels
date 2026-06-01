@@ -263,9 +263,9 @@ impl SenderState {
             };
 
             // Parse all stored withdrawal signatures. These are passed to
-            // get_signature_statuses() by process_pending_remints to verify the
-            // withdrawal did not finalize before we remint. A single bad entry
-            // means we cannot safely do that check — escalate to ManualReview.
+            // get_signature_statuses_with_history() by process_pending_remints to verify
+            // the withdrawal did not finalize before we remint. A single bad entry means
+            // we cannot safely do that check — escalate to ManualReview.
             let sig_strings = tx.remint_signatures.unwrap_or_default();
             let Some(signatures) = Self::or_manual_review(
                 sig_strings

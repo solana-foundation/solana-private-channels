@@ -1,17 +1,12 @@
 use crate::{
     error::DvpSwapProgramError,
-    processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
-    processor::shared::token_utils::{
-        get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
-    },
+    processor::shared::account_check::{verify_account_owner, verify_signer},
+    processor::shared::refund::refund_and_close_dvp,
     processor::shared::utils::split_leg_remaining_accounts,
     require,
     state::swap_dvp::SwapDvp,
 };
-use pinocchio::{
-    account::AccountView, address::Address, cpi::Signer, error::ProgramError, ProgramResult,
-};
-use pinocchio_token_2022::instructions::CloseAccount;
+use pinocchio::{account::AccountView, address::Address, error::ProgramError, ProgramResult};
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts split between the two legs.
@@ -26,8 +21,8 @@ const FIXED_ACCOUNTS_LEN: usize = 10;
 ///
 /// Closed-account rent goes to `signer`, not `dvp.settlement_authority`.
 /// Reject is the safety valve and must work even if the configured
-/// settlement authority is unreachable (e.g. a sysvar or executable
-/// the runtime refuses to pass as writable). Settle and Cancel still
+/// settlement authority is unreachable (e.g. a sysvar the runtime
+/// refuses to pass as writable). Settle and Cancel still
 /// pay rent to the settlement authority — it's their signer there, so
 /// it's already required to be usable.
 ///
@@ -63,15 +58,11 @@ pub fn process_reject_dvp(
 ) -> ProgramResult {
     let (fixed, leg_a_extras, leg_b_extras) =
         split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
-    let [signer_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
-        fixed
-    else {
+    let [signer_info, swap_dvp_info, ..] = fixed else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
     verify_signer(signer_info, true)?;
-    verify_token_program(token_program_a_info)?;
-    verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
@@ -84,112 +75,7 @@ pub fn process_reject_dvp(
         DvpSwapProgramError::SignerNotParty
     );
 
-    require!(
-        mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
-        ProgramError::InvalidAccountData
-    );
-    verify_account_owner(mint_a_info, token_program_a_info.address())?;
-    verify_account_owner(mint_b_info, token_program_b_info.address())?;
-
-    // Address-only validation: an unfunded leg's user ATA can be
-    // uninitialized; the canonical pubkey is well-defined regardless.
-    // Note: refund pairing — each user gets their *own* mint back (not
-    // the cross used at Settle).
-    // dvp_ata_a: DvP PDA's escrow for mint_a (asset escrow).
-    verify_canonical_ata(
-        dvp_ata_a_info,
-        swap_dvp_info.address(),
-        &dvp.mint_a,
-        token_program_a_info,
-    )?;
-    // dvp_ata_b: DvP PDA's escrow for mint_b (cash escrow).
-    verify_canonical_ata(
-        dvp_ata_b_info,
-        swap_dvp_info.address(),
-        &dvp.mint_b,
-        token_program_b_info,
-    )?;
-    // user_a_ata_a: seller's ATA for mint_a — refund destination if asset leg was funded.
-    verify_canonical_ata(
-        user_a_ata_a_info,
-        &dvp.user_a,
-        &dvp.mint_a,
-        token_program_a_info,
-    )?;
-    // user_b_ata_b: buyer's ATA for mint_b — refund destination if cash leg was funded.
-    verify_canonical_ata(
-        user_b_ata_b_info,
-        &dvp.user_b,
-        &dvp.mint_b,
-        token_program_b_info,
-    )?;
-
-    let (nonce_bytes, bump_bytes) = dvp.seed_buffers();
-    let swap_dvp_seeds = dvp.signing_seeds(&nonce_bytes, &bump_bytes);
-    let signer_seeds = [Signer::from(&swap_dvp_seeds)];
-
-    // Snapshot both balances before any CPI runs, so a hook drain of
-    // one leg during the other leg's refund forces InsufficientFunds
-    // on the second transfer instead of being silently skipped.
-    let leg_a_amount = get_token_account_balance(dvp_ata_a_info)?;
-    let leg_b_amount = get_token_account_balance(dvp_ata_b_info)?;
-
-    if leg_a_amount > 0 {
-        transfer_checked_cpi(
-            dvp_ata_a_info,
-            mint_a_info,
-            user_a_ata_a_info,
-            swap_dvp_info,
-            leg_a_amount,
-            get_mint_decimals(mint_a_info)?,
-            token_program_a_info.address(),
-            leg_a_extras,
-            &signer_seeds,
-        )?;
-    }
-
-    if leg_b_amount > 0 {
-        transfer_checked_cpi(
-            dvp_ata_b_info,
-            mint_b_info,
-            user_b_ata_b_info,
-            swap_dvp_info,
-            leg_b_amount,
-            get_mint_decimals(mint_b_info)?,
-            token_program_b_info.address(),
-            leg_b_extras,
-            &signer_seeds,
-        )?;
-    }
-
-    // Rent recipient is the signer, not `dvp.settlement_authority`.
-    // Reject must remain callable even if the settlement authority is
-    // unreachable (e.g. sysvar/executable address that the runtime
-    // refuses to pass as writable); see the doc comment above.
-    CloseAccount {
-        account: dvp_ata_a_info,
-        destination: signer_info,
-        authority: swap_dvp_info,
-        token_program: token_program_a_info.address(),
-    }
-    .invoke_signed(&signer_seeds)?;
-
-    CloseAccount {
-        account: dvp_ata_b_info,
-        destination: signer_info,
-        authority: swap_dvp_info,
-        token_program: token_program_b_info.address(),
-    }
-    .invoke_signed(&signer_seeds)?;
-
-    let signer_lamports = signer_info.lamports();
-    signer_info.set_lamports(
-        signer_lamports
-            .checked_add(swap_dvp_info.lamports())
-            .ok_or(ProgramError::ArithmeticOverflow)?,
-    );
-    swap_dvp_info.set_lamports(0);
-    swap_dvp_info.close()?;
-
-    Ok(())
+    // Rent is swept to `fixed[0]` (the signer here), not the settlement
+    // authority — see the doc comment above for why.
+    refund_and_close_dvp(fixed, &dvp, leg_a_extras, leg_b_extras)
 }

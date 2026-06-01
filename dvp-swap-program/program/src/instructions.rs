@@ -42,6 +42,10 @@ pub enum DvpSwapProgramInstruction {
         writable
     ))]
     #[codama(account(name = "swap_dvp", docs = "SwapDvp PDA to be created", writable))]
+    #[codama(account(
+        name = "settlement_authority",
+        docs = "Third-party authority allowed to settle/cancel; must not be executable so it can receive closed-account rent"
+    ))]
     #[codama(account(name = "mint_a", docs = "Mint of the asset leg (seller delivers)"))]
     #[codama(account(name = "mint_b", docs = "Mint of the cash leg (buyer delivers)"))]
     #[codama(account(
@@ -72,8 +76,6 @@ pub enum DvpSwapProgramInstruction {
         user_a: Pubkey,
         /// Buyer; delivers `amount_b` of `mint_b`.
         user_b: Pubkey,
-        /// Only party allowed to settle. Also signs Cancel.
-        settlement_authority: Pubkey,
         /// Asset leg size.
         amount_a: u64,
         /// Cash leg size.

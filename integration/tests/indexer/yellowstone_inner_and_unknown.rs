@@ -63,8 +63,8 @@ fn block_meta(slot: u64) -> SubscribeUpdate {
 }
 
 /// Build an escrow Deposit transaction carrying one `meta.inner_instructions`
-/// entry. The inner frame only needs to parse shape-wise — its contents are
-/// not validated by the outer branch we're covering.
+/// entry. The inner frame is a valid DepositEvent CPI — required by the
+/// parser, which reads the authoritative received amount from the event.
 fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
     let program_id =
         solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap();
@@ -104,13 +104,21 @@ fn deposit_with_inner_instructions(slot: u64) -> SubscribeUpdate {
         message: Some(message),
     };
 
-    // Attach a `meta` with one inner-instruction set. The inner frame
-    // references program_id_index 12 (same as outer) with arbitrary
-    // data — the branch we're covering just shape-maps whatever arrives.
+    // Attach a `meta` with one inner-instruction set carrying a valid
+    // DepositEvent CPI: EVENT_IX_TAG(8) + disc=6 + instance_seed(32)
+    // + user(32) + amount=1000 LE(8) + recipient(32) + mint(32) = 145 bytes.
+    let mut event_data = vec![];
+    event_data.extend_from_slice(&0x1d9acb512ea545e4u64.to_le_bytes());
+    event_data.push(6);
+    event_data.extend_from_slice(&[0u8; 32]);
+    event_data.extend_from_slice(&[0u8; 32]);
+    event_data.extend_from_slice(&1_000u64.to_le_bytes());
+    event_data.extend_from_slice(&[0u8; 32]);
+    event_data.extend_from_slice(&[0u8; 32]);
     let inner_ix = ProtoInnerInstruction {
         program_id_index: 12,
         accounts: vec![0u8, 1, 2],
-        data: vec![0xAA, 0xBB],
+        data: event_data,
         stack_height: Some(2),
     };
     let inner_set = ProtoInnerInstructions {

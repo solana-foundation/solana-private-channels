@@ -90,8 +90,14 @@ impl ResyncService {
         info!("CheckpointWriter service started");
 
         // Start transaction processor as separate tokio task
-        let transaction_processor =
+        let mut transaction_processor =
             TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone());
+        // Wire the escrow instance scope. Config validation guarantees Some for the
+        // Escrow program; None here means the Withdraw program, where no instance
+        // scoping applies.
+        if let Some(instance_id) = self.escrow_instance_id {
+            transaction_processor = transaction_processor.with_escrow_instance_id(instance_id);
+        }
         let processor_handle =
             tokio::spawn(async move { transaction_processor.start(instruction_rx).await });
         info!("TransactionProcessor task spawned");

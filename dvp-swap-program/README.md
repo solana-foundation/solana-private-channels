@@ -93,6 +93,8 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
 | 8    | `SameMint`                    | Create with `mint_a == mint_b`                                                                                                       |
 | 9    | `ZeroAmount`                  | Create with `amount_a == 0` or `amount_b == 0`                                                                                       |
 | 10   | `BlockedMintExtension`        | Create with a Token-2022 mint carrying an unsupported extension (TransferFee, InterestBearing, ScaledUiAmount, ConfidentialTransfer) |
+| 11   | `SettlementAuthorityIsParty`  | Create with `settlement_authority` equal to `user_a` or `user_b`                                                                    |
+| 12   | `SettlementAuthorityExecutable` | Create with an executable `settlement_authority` (can't be credited closed-account rent)                                          |
 
 ## Build & test
 

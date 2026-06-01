@@ -112,10 +112,17 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
 ///
 /// Called only at CreateDvp. Unwind paths skip this check so funds
 /// remain recoverable if extension parameters change post-Create.
-/// No-op for legacy SPL Token mints.
+/// Legacy SPL Token mints only get a mint-size check.
 #[inline(always)]
 pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
     if !mint_info.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        // Legacy SPL Token mint: no extensions, but confirm it's a real
+        // mint (exact size) rather than trusting the owner check alone.
+        let data = mint_info.try_borrow()?;
+        require!(
+            data.len() == TokenMint::LEN,
+            ProgramError::InvalidAccountData
+        );
         return Ok(());
     }
 
