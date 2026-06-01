@@ -31,12 +31,16 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
 };
 use yellowstone_grpc_proto::solana::storage::confirmed_block::{
-    CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage, MessageHeader,
-    Transaction as ProtoTransaction,
+    CompiledInstruction as ProtoCompiledInstruction, InnerInstruction as ProtoInnerInstruction,
+    InnerInstructions as ProtoInnerInstructions, Message as ProtoMessage, MessageHeader,
+    Transaction as ProtoTransaction, TransactionStatusMeta,
 };
 
 /// Build a well-formed `SubscribeUpdate` carrying a single escrow Deposit
-/// instruction (discriminator 6 + 8-byte amount + 1-byte `Option::None`).
+/// instruction (discriminator 6 + 8-byte amount + 1-byte `Option::None`)
+/// plus a `meta.inner_instructions` entry carrying the matching DepositEvent
+/// CPI — required by the parser, which reads the authoritative received
+/// amount from the event rather than the instruction args.
 ///
 /// The account list is padded with deterministic junk pubkeys so parsing the
 /// Deposit accounts (12 required) succeeds.
@@ -84,11 +88,35 @@ fn deposit_tx_update(slot: u64) -> SubscribeUpdate {
         message: Some(message),
     };
 
+    // DepositEvent payload: EVENT_IX_TAG(8) + disc=6 + instance_seed(32)
+    // + user(32) + amount=1000 LE(8) + recipient(32) + mint(32) = 145 bytes.
+    let mut event_data = vec![];
+    event_data.extend_from_slice(&0x1d9acb512ea545e4u64.to_le_bytes());
+    event_data.push(6);
+    event_data.extend_from_slice(&[0u8; 32]);
+    event_data.extend_from_slice(&[0u8; 32]);
+    event_data.extend_from_slice(&1_000u64.to_le_bytes());
+    event_data.extend_from_slice(&[0u8; 32]);
+    event_data.extend_from_slice(&[0u8; 32]);
+
+    let meta = TransactionStatusMeta {
+        inner_instructions: vec![ProtoInnerInstructions {
+            index: 0,
+            instructions: vec![ProtoInnerInstruction {
+                program_id_index: 12,
+                accounts: vec![],
+                data: event_data,
+                stack_height: Some(2),
+            }],
+        }],
+        ..Default::default()
+    };
+
     let tx_info = SubscribeUpdateTransactionInfo {
         signature: vec![7u8; 64],
         is_vote: false,
         transaction: Some(transaction),
-        meta: None,
+        meta: Some(meta),
         index: 0,
     };
 
