@@ -299,10 +299,19 @@ impl MockStorage {
 
     pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {
         self.check_should_fail("get_orphan_deposit_ids")?;
+        // Mirror Postgres, which scans the whole `transactions` table regardless
+        // of status: union every transaction store the mock holds, deduped by id.
         let deposits: Vec<DbTransaction> = {
-            let txs = self.pending_transactions.lock().unwrap();
-            txs.iter()
+            let pending = self.pending_transactions.lock().unwrap();
+            let singles = self.inserted_single_transactions.lock().unwrap();
+            let batches = self.inserted_transactions.lock().unwrap();
+            let mut seen_ids = std::collections::HashSet::new();
+            pending
+                .iter()
+                .chain(singles.iter())
+                .chain(batches.iter().flatten())
                 .filter(|t| t.transaction_type == TransactionType::Deposit)
+                .filter(|t| seen_ids.insert(t.id))
                 .cloned()
                 .collect()
         };

@@ -20,7 +20,7 @@ use crate::{
 use private_channel_metrics::{HealthState, MetricLabel};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Transaction processor that converts instructions to transactions and saves to DB
 /// Tracks slot-level success/failure and emits committed checkpoints
@@ -170,7 +170,20 @@ impl TransactionProcessor {
             }
         }
 
-        if !transactions.is_empty() {
+        if transactions.is_empty() {
+            // Empty slot, just checkpoint it
+            debug!("Finalizing empty slot {}", slot);
+        } else if !send_checkpoint {
+            // A prerequisite write (mints/statuses) failed; skip the deposit
+            // rows so we don't commit a deposit with no backing row. The slot
+            // isn't checkpointed, so it replays atomically.
+            warn!(
+                "Skipping transaction insert for slot {} ({} row(s)) because an earlier \
+                 write failed; slot will be reprocessed",
+                slot,
+                transactions.len()
+            );
+        } else {
             info!(
                 "Finalizing slot {} with {} transactions",
                 slot,
@@ -200,9 +213,6 @@ impl TransactionProcessor {
                     send_checkpoint = false;
                 }
             }
-        } else {
-            // Empty slot, just checkpoint it
-            debug!("Finalizing empty slot {}", slot);
         }
 
         if send_checkpoint {
@@ -624,6 +634,39 @@ mod tests {
             .await;
 
         assert!(checkpoint_rx.try_recv().is_err());
+    }
+
+    /// AllowMint + Deposit for the same mint in one slot: if the mint-status
+    /// write fails, the deposit row must be withheld (else the gate would
+    /// quarantine it) and the slot replays.
+    #[tokio::test]
+    async fn finalize_mint_status_failure_withholds_deposit_in_same_slot() {
+        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        mock.set_should_fail("insert_mint_statuses_batch", true);
+        processor
+            .current_slot_instructions
+            .push(make_allow_mint_instruction(
+                202,
+                Some("sig-allow-3".to_string()),
+            ));
+        processor
+            .current_slot_instructions
+            .push(make_deposit_instruction(
+                202,
+                Some("sig-deposit-3".to_string()),
+                None,
+            ));
+        processor
+            .finalize_and_checkpoint(202, ProgramType::Escrow)
+            .await;
+
+        // Checkpoint withheld so the slot replays.
+        assert!(checkpoint_rx.try_recv().is_err());
+        // Deposit row must not be committed without its backing status row.
+        assert!(
+            mock.inserted_transactions.lock().unwrap().is_empty(),
+            "deposit must be withheld when the mint-status write failed"
+        );
     }
 
     #[tokio::test]

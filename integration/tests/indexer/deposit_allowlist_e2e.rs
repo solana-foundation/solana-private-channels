@@ -68,6 +68,16 @@ async fn start_postgres(
 /// means any future schema migration breaks here in the same way it
 /// would break the real ingest path.
 async fn insert_mint_row(storage: &Storage, mint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    insert_mint_row_at_slot(storage, mint, 0).await
+}
+
+/// Like [`insert_mint_row`] but records the `allowed` status at an explicit
+/// `effective_slot` (the slot the AllowMint took effect on-chain).
+async fn insert_mint_row_at_slot(
+    storage: &Storage,
+    mint: &str,
+    effective_slot: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mint_row = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_row]).await?;
     storage
@@ -75,8 +85,8 @@ async fn insert_mint_row(storage: &Storage, mint: &str) -> Result<(), Box<dyn st
             private_channel_indexer::storage::common::models::DbMintStatus {
                 mint_address: mint.to_string(),
                 status: "allowed".to_string(),
-                effective_slot: 0,
-                signature: format!("test-seed-{mint}"),
+                effective_slot,
+                signature: format!("test-seed-{mint}-{effective_slot}"),
                 created_at: chrono::Utc::now(),
             },
         ])
@@ -94,7 +104,18 @@ async fn insert_deposit_row(
     signature: &str,
     mint: &str,
 ) -> Result<i64, Box<dyn std::error::Error>> {
-    let tx = DbTransactionBuilder::new(signature.to_string(), 1, mint.to_string(), 100)
+    insert_deposit_row_at_slot(storage, signature, mint, 1).await
+}
+
+/// Like [`insert_deposit_row`] but at an explicit slot (the orphan query
+/// compares deposit slot against each mint-status `effective_slot`).
+async fn insert_deposit_row_at_slot(
+    storage: &Storage,
+    signature: &str,
+    mint: &str,
+    slot: u64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let tx = DbTransactionBuilder::new(signature.to_string(), slot, mint.to_string(), 100)
         .initiator("init".to_string())
         .recipient("recip".to_string())
         .transaction_type(TransactionType::Deposit)
@@ -241,22 +262,21 @@ async fn orphan_query_isolates_orphans_in_mixed_state() -> Result<(), Box<dyn st
     Ok(())
 }
 
-// ── Orphan query: late-arriving AllowMint ─────────────────────────────────────
+// ── Orphan query: late-INGESTED AllowMint (effective at/before deposit) ───────
 
-/// A deposit arrives before its `AllowMint` is indexed (slot-ordering
-/// race). On the first reconciliation tick the row is orphaned; once
-/// `AllowMint` lands the query no longer flags it. This is the benign
-/// case that justifies the dedup helper's design over a hard
-/// halt-on-orphan.
+/// Benign slot-ordering race: an `AllowMint` effective at/before the deposit's
+/// slot (3 <= 5) but ingested after it. The deposit is orphaned on the first
+/// tick, then clears once the AllowMint lands. ("Late" = ingested late, not
+/// effective late; the opposite case is the `_effective_after_deposit` test.)
 #[tokio::test(flavor = "multi_thread")]
-async fn orphan_query_clears_when_allowmint_arrives_late() -> Result<(), Box<dyn std::error::Error>>
+async fn orphan_query_clears_when_allowmint_ingested_late() -> Result<(), Box<dyn std::error::Error>>
 {
     let (storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique().to_string();
-    let orphan_id = insert_deposit_row(&storage, "sig_late", &mint).await?;
+    let orphan_id = insert_deposit_row_at_slot(&storage, "sig_late", &mint, 5).await?;
 
-    // Tick 1: row is orphaned because mints is empty.
+    // Tick 1: row is orphaned because no status row exists yet.
     let ids_before = storage.get_orphan_deposit_ids().await?;
     assert_eq!(
         ids_before,
@@ -264,15 +284,40 @@ async fn orphan_query_clears_when_allowmint_arrives_late() -> Result<(), Box<dyn
         "row must be orphaned before AllowMint lands",
     );
 
-    // AllowMint arrives.
-    insert_mint_row(&storage, &mint).await?;
+    // AllowMint lands, effective at slot 3 (<= the deposit slot 5).
+    insert_mint_row_at_slot(&storage, &mint, 3).await?;
 
     // Tick 2: same row is no longer orphaned.
     let ids_after = storage.get_orphan_deposit_ids().await?;
     assert!(
         ids_after.is_empty(),
-        "AllowMint landing must clear the orphan, got {:?}",
+        "AllowMint effective before the deposit must clear the orphan, got {:?}",
         ids_after,
+    );
+
+    Ok(())
+}
+
+/// An `AllowMint` effective *after* the deposit (5 > 3) must NOT clear the
+/// orphan — the deposit landed before the mint was allowed. Pins the
+/// `effective_slot <= deposit.slot` gating against retroactive legitimization.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_persists_when_allowmint_effective_after_deposit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, _pg) = start_postgres().await?;
+
+    let mint = Pubkey::new_unique().to_string();
+    let orphan_id = insert_deposit_row_at_slot(&storage, "sig_pre_allow", &mint, 3).await?;
+
+    // AllowMint becomes effective at slot 5 — strictly after the deposit.
+    insert_mint_row_at_slot(&storage, &mint, 5).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert_eq!(
+        ids,
+        vec![orphan_id],
+        "deposit before the mint's allowed slot must remain an orphan, got {:?}",
+        ids,
     );
 
     Ok(())
