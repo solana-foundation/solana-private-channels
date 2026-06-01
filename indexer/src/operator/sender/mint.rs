@@ -845,10 +845,9 @@ mod tests {
     use super::{
         accounts_and_amount_match, decode_and_check_authority, expected_mint_instruction,
         instruction_has_expected_mint, instruction_has_memo, memo_matches,
-        parse_token_instruction_mint_amount,
-        partially_decoded_instruction_has_expected_mint, raw_instruction_has_expected_mint,
-        strip_memo_length_prefix, transaction_matches_expected_mint, AuthorityCheck,
-        ExpectedMintInstruction,
+        parse_token_instruction_mint_amount, partially_decoded_instruction_has_expected_mint,
+        raw_instruction_has_expected_mint, strip_memo_length_prefix,
+        transaction_matches_expected_mint, AuthorityCheck, ExpectedMintInstruction,
     };
     use crate::operator::utils::instruction_util::{MintToBuilder, MintToBuilderWithTxnId};
     use solana_sdk::pubkey::Pubkey;
