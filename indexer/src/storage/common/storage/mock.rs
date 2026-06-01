@@ -9,8 +9,8 @@ use std::sync::Mutex;
 /// Recorded status update from `update_transaction_status`.
 pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<Utc>);
 
-/// Tuple of (transaction_id, withdrawal_signature_strings, deadline) — the data persisted when a withdrawal transitions to PendingRemint status.
-pub type PendingRemintRecord = (i64, Vec<String>, DateTime<Utc>);
+/// (transaction_id, signatures, last_valid_block_heights, deadline) persisted on PendingRemint transition.
+pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>);
 
 #[derive(Clone, Default)]
 pub struct MockStorage {
@@ -310,6 +310,7 @@ impl MockStorage {
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
+        remint_last_valid_block_heights: Vec<i64>,
         deadline_at: DateTime<Utc>,
     ) -> Result<(), StorageError> {
         if self
@@ -327,8 +328,32 @@ impl MockStorage {
         self.pending_remint_signatures.lock().unwrap().push((
             transaction_id,
             remint_signatures,
+            remint_last_valid_block_heights,
             deadline_at,
         ));
+        Ok(())
+    }
+
+    /// Update the in-memory pending_remint row for `transaction_id` with the
+    /// new attempt counter and deadline. Returns `RowNotFound` if no row
+    /// exists, matching the Postgres semantics so a test can observe a
+    /// missing-row failure. Honors `should_fail("bump_pending_remint_finality_attempt")`.
+    pub async fn bump_pending_remint_finality_attempt(
+        &self,
+        transaction_id: i64,
+        attempts: i32,
+        new_deadline: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("bump_pending_remint_finality_attempt")?;
+        let mut rows = self.pending_remint_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|t| t.id == transaction_id)
+            .ok_or_else(|| StorageError::DatabaseError {
+                message: format!("no PendingRemint row for id {transaction_id}"),
+            })?;
+        row.finality_check_attempts = attempts;
+        row.pending_remint_deadline_at = Some(new_deadline);
         Ok(())
     }
 

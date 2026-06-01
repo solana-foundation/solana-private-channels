@@ -67,7 +67,9 @@ fn make_row(
         processed_at: None,
         counterpart_signature: None,
         remint_signatures: Some(vec![sig.to_string()]),
+        remint_last_valid_block_heights: Some(vec![0]),
         pending_remint_deadline_at: Some(deadline),
+        finality_check_attempts: 0,
     }
 }
 
@@ -129,7 +131,8 @@ async fn recover_rehydrates_valid_pending_remint_row() {
     assert_eq!(entry.remint_info.mint, mint);
     assert_eq!(entry.remint_info.user, recipient);
     assert_eq!(entry.remint_info.amount, 5_000u64);
-    assert_eq!(entry.signatures, vec![sig]);
+    assert_eq!(entry.signatures.len(), 1);
+    assert_eq!(entry.signatures[0].signature, sig);
     assert_eq!(entry.finality_check_attempts, 0);
     assert_eq!(entry.original_error, "recovered from persistent storage");
 

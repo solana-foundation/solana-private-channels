@@ -157,8 +157,8 @@ pub struct SenderState {
     /// Cached remint info for withdrawal transactions, keyed by nonce.
     /// Extracted before cleanup_failed_transaction removes builder from SMT cache.
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
-    /// Signatures sent per withdrawal nonce, used for finality checks before reminting.
-    pub pending_signatures: HashMap<u64, Vec<Signature>>,
+    /// Signatures sent per withdrawal nonce (with lvbh), used for finality checks before reminting.
+    pub pending_signatures: HashMap<u64, Vec<PendingSig>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.
@@ -172,12 +172,20 @@ pub struct SenderState {
     pub semaphore: Arc<Semaphore>,
 }
 
+/// Withdrawal signature + its blockhash's `last_valid_block_height`, so the
+/// remint gate can prove the signature can no longer land.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingSig {
+    pub signature: Signature,
+    pub last_valid_block_height: u64,
+}
+
 /// A remint deferred until Solana finality window passes, allowing us to verify
 /// that the original withdrawal definitively did not land before reminting.
 pub struct PendingRemint {
     pub ctx: TransactionContext,
     pub remint_info: WithdrawalRemintInfo,
-    pub signatures: Vec<Signature>,
+    pub signatures: Vec<PendingSig>,
     pub original_error: String,
     /// UTC timestamp after which the finality check runs. Using DateTime<Utc> instead of
     /// Instant allows the deadline to be persisted to the database and restored on restart.

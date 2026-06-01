@@ -65,7 +65,9 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         processed_at: None,
         counterpart_signature: None,
         remint_signatures: None,
+        remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
+        finality_check_attempts: 0,
     }
 }
 
@@ -553,7 +555,7 @@ async fn set_pending_remint_succeeds_when_processing() -> Result<(), Box<dyn std
 
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     storage
-        .set_pending_remint(id, vec!["sig1".to_string()], deadline)
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline)
         .await?;
 
     Ok(())
@@ -573,7 +575,7 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
 
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     let result = storage
-        .set_pending_remint(id, vec!["sig1".to_string()], deadline)
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline)
         .await;
 
     assert!(result.is_err(), "should fail when status is not processing");

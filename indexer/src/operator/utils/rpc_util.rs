@@ -136,6 +136,32 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get recent blockhash + last_valid_block_height with retry.
+    pub async fn get_latest_blockhash_with_commitment(
+        &self,
+    ) -> Result<(Hash, u64), Box<client_error::Error>> {
+        self.with_retry(
+            "get_latest_blockhash_with_commitment",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Get the current block height with retry. Used by the pending-remint gate
+    /// to compare against each stored signature's `last_valid_block_height` and
+    /// decide whether a broadcast can still land.
+    pub async fn get_block_height(&self) -> Result<u64, Box<client_error::Error>> {
+        self.with_retry("get_block_height", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_block_height().await
+        })
+        .await
+    }
+
     /// Send transaction with configurable retry policy
     ///
     /// # Arguments
