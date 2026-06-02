@@ -8,8 +8,8 @@
 use chrono::Utc;
 use private_channel_indexer::{
     storage::{
-        common::models::DbMint, DbTransaction, PostgresDb, Storage, TransactionStatus,
-        TransactionType,
+        common::models::{DbMint, DbMintStatus, MintStatusAtSlot},
+        DbTransaction, PostgresDb, Storage, TransactionStatus, TransactionType,
     },
     PostgresConfig,
 };
@@ -620,5 +620,116 @@ async fn set_mint_extension_flags_fails_when_no_row() -> Result<(), Box<dyn std:
         .await;
 
     assert!(result.is_err(), "should fail when mints row doesn't exist");
+    Ok(())
+}
+
+// ── mint_status_history ──────────────────────────────────────────────────────
+
+fn mk_status(mint: &str, status: &str, slot: i64, sig: &str) -> DbMintStatus {
+    DbMintStatus {
+        mint_address: mint.to_string(),
+        status: status.to_string(),
+        effective_slot: slot,
+        signature: sig.to_string(),
+        created_at: Utc::now(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_mint_statuses_batch_persists_rows_pg() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_mint_statuses_batch(&[mk_status("mint_pg1", "allowed", 100, "sig-1")])
+        .await?;
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mint_status_history WHERE mint_address = $1")
+            .bind("mint_pg1")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_mint_statuses_batch_idempotent_on_pk_conflict_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let row = mk_status("mint_pg2", "allowed", 100, "sig-1");
+    storage
+        .insert_mint_statuses_batch(std::slice::from_ref(&row))
+        .await?;
+    storage.insert_mint_statuses_batch(&[row]).await?;
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mint_status_history WHERE mint_address = $1")
+            .bind("mint_pg2")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_mint_statuses_batch_empty_input_is_noop_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    storage.insert_mint_statuses_batch(&[]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_blocked_in_window_between_block_and_reallow(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_cycle1", "allowed", 10, "sig-a"),
+            mk_status("mint_cycle1", "blocked", 20, "sig-b"),
+            mk_status("mint_cycle1", "allowed", 30, "sig-c"),
+        ])
+        .await?;
+
+    let res = storage.get_mint_status_at_slot("mint_cycle1", 25).await?;
+    assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_allowed_after_reallow_in_cycle(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_cycle2", "allowed", 10, "sig-a"),
+            mk_status("mint_cycle2", "blocked", 20, "sig-b"),
+            mk_status("mint_cycle2", "allowed", 30, "sig-c"),
+        ])
+        .await?;
+
+    let res = storage.get_mint_status_at_slot("mint_cycle2", 35).await?;
+    assert_eq!(res, MintStatusAtSlot::Allowed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_never_allowed_when_no_history(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let res = storage.get_mint_status_at_slot("mint_absent", 100).await?;
+    assert_eq!(res, MintStatusAtSlot::NeverAllowed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_blocked_after_block_entry(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_blk", "allowed", 10, "sig-a"),
+            mk_status("mint_blk", "blocked", 20, "sig-b"),
+        ])
+        .await?;
+    let res = storage.get_mint_status_at_slot("mint_blk", 25).await?;
+    assert_eq!(res, MintStatusAtSlot::Blocked);
     Ok(())
 }

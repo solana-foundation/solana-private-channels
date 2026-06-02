@@ -11,11 +11,14 @@ pub mod get_completed_withdrawal_nonces;
 pub mod get_escrow_balances_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
+pub mod get_mint_status_at_slot;
+pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
+pub mod insert_mint_statuses_batch;
 pub mod quarantine_all_active_withdrawals;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
@@ -140,6 +143,24 @@ impl Storage {
         upsert_mints_batch::upsert_mints_batch(self, mints).await
     }
 
+    /// Append Allow/Block transition rows to `mint_status_history`.
+    /// Idempotent on (mint_address, effective_slot)
+    pub async fn insert_mint_statuses_batch(
+        &self,
+        statuses: &[DbMintStatus],
+    ) -> Result<(), StorageError> {
+        insert_mint_statuses_batch::insert_mint_statuses_batch(self, statuses).await
+    }
+
+    /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
+    pub async fn get_mint_status_at_slot(
+        &self,
+        mint_address: &str,
+        slot: i64,
+    ) -> Result<MintStatusAtSlot, StorageError> {
+        get_mint_status_at_slot::get_mint_status_at_slot(self, mint_address, slot).await
+    }
+
     /// Get mint metadata by address
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
         get_mint::get_mint(self, mint_address).await
@@ -175,6 +196,19 @@ impl Storage {
     /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
+    }
+
+    /// `transactions.id` for every `deposit` row whose mint was not in
+    /// `allowed` status at the deposit's slot, per `mint_status_history`.
+    ///
+    /// A non-empty result means the indexer recorded a deposit for a mint
+    /// that was either never allowlisted or was blocked at the time of the
+    /// deposit — a trust-boundary leak. Reconciliation queries this to
+    /// alert on any such rows; they describe the same condition the
+    /// deposit-side gate (`assert_mint_allowed_at_slot`) refuses at process
+    /// time. So, this is a second line of defense.
+    pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {
+        get_orphan_deposit_ids::get_orphan_deposit_ids(self).await
     }
 
     /// Close the storage connection pool gracefully
@@ -816,6 +850,278 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(affected, 0);
+    }
+
+    // ── insert_mint_statuses_batch ────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_mint_statuses_batch_persists_rows() {
+        use std::sync::Arc;
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+        storage
+            .insert_mint_statuses_batch(&[DbMintStatus {
+                mint_address: mint.clone(),
+                status: "allowed".to_string(),
+                effective_slot: 100,
+                signature: "sig-1".to_string(),
+                created_at: Utc::now(),
+            }])
+            .await
+            .unwrap();
+        let rows = match storage.as_ref() {
+            Storage::Mock(m) => m.mint_status_history.lock().unwrap().clone(),
+            _ => panic!("expected mock"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mint_address, mint);
+    }
+
+    #[tokio::test]
+    async fn insert_mint_statuses_batch_idempotent_on_pk_conflict() {
+        use std::sync::Arc;
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+        let row = DbMintStatus {
+            mint_address: mint.clone(),
+            status: "allowed".to_string(),
+            effective_slot: 100,
+            signature: "sig-1".to_string(),
+            created_at: Utc::now(),
+        };
+        storage
+            .insert_mint_statuses_batch(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        storage.insert_mint_statuses_batch(&[row]).await.unwrap();
+        let rows = match storage.as_ref() {
+            Storage::Mock(m) => m.mint_status_history.lock().unwrap().clone(),
+            _ => panic!("expected mock"),
+        };
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_mint_statuses_batch_empty_input_is_noop() {
+        let (storage, mock) = make_mock_storage();
+
+        let result = storage.insert_mint_statuses_batch(&[]).await;
+
+        assert!(result.is_ok(), "empty batch should succeed");
+        assert_eq!(
+            mock.mint_status_history.lock().unwrap().len(),
+            0,
+            "empty batch must not write any mint status rows"
+        );
+    }
+
+    // ── get_mint_status_at_slot ──────────────────────────────────────
+
+    fn status_row(mint: &str, status: &str, slot: i64) -> DbMintStatus {
+        DbMintStatus {
+            mint_address: mint.to_string(),
+            status: status.to_string(),
+            effective_slot: slot,
+            signature: format!("sig-{mint}-{slot}"),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_never_allowed_when_no_history() {
+        let (storage, _mock) = make_mock_storage();
+        let res = storage
+            .get_mint_status_at_slot("mint_a", 100)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::NeverAllowed);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_never_allowed_when_only_future_entry_exists() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 5).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::NeverAllowed);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_allowed_at_exact_effective_slot() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_allowed_after_allow_entry() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
+            .await
+            .unwrap();
+        let res = storage
+            .get_mint_status_at_slot("mint_a", 100)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_allowed_in_window_between_allow_and_block() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 15).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_blocked_after_block_entry() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 25).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::Blocked);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_blocked_in_window_between_block_and_reallow() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 20),
+                status_row("mint_a", "allowed", 30),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 25).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::Blocked);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_allowed_after_reallow_in_cycle() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 20),
+                status_row("mint_a", "allowed", 30),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 35).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    // ── orphan query against status history ──────────────────────────
+
+    fn seed_deposit(mock: &MockStorage, id: i64, mint: &str, slot: i64) {
+        let mut pending = mock.pending_transactions.lock().unwrap();
+        pending.push(DbTransaction {
+            id,
+            signature: format!("sig-orphan-{id}"),
+            trace_id: format!("trace-orphan-{id}"),
+            slot,
+            initiator: "init".to_string(),
+            recipient: "recip".to_string(),
+            mint: mint.to_string(),
+            amount: 1,
+            memo: None,
+            transaction_type: TransactionType::Deposit,
+            withdrawal_nonce: None,
+            status: TransactionStatus::Pending,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            processed_at: None,
+            counterpart_signature: None,
+            remint_signatures: None,
+            pending_remint_deadline_at: None,
+        });
+    }
+
+    #[tokio::test]
+    async fn orphan_query_flags_deposit_before_mint_allowed() {
+        let (storage, mock) = make_mock_storage();
+        seed_deposit(&mock, 1, "mint_a", 5);
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
+            .await
+            .unwrap();
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn orphan_query_passes_deposit_at_or_after_allow() {
+        let (storage, mock) = make_mock_storage();
+        seed_deposit(&mock, 1, "mint_a", 10);
+        seed_deposit(&mock, 2, "mint_a", 15);
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
+            .await
+            .unwrap();
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn orphan_query_flags_deposit_during_blocked_window() {
+        let (storage, mock) = make_mock_storage();
+        seed_deposit(&mock, 7, "mint_a", 25);
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        let ids = storage.get_orphan_deposit_ids().await.unwrap();
+        assert_eq!(ids, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_unrecognized_status_fails_closed_to_blocked() {
+        let (storage, _mock) = make_mock_storage();
+        // A status value that is neither "allowed" nor "blocked" is data
+        // corruption — it must resolve to a not-allowed variant, never Allowed.
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "bogus", 10)])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 15).await.unwrap();
+        assert_eq!(res, MintStatusAtSlot::Blocked);
+    }
+
+    #[tokio::test]
+    async fn get_mint_status_at_slot_distinguishes_status_across_two_mints() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[status_row("mint_a", "allowed", 10)])
+            .await
+            .unwrap();
+        let res = storage
+            .get_mint_status_at_slot("mint_b", 100)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::NeverAllowed);
     }
 
     /// `exclude_id` must skip the poison row so it is not flipped twice —

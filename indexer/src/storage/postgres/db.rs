@@ -1,10 +1,11 @@
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     error::StorageError,
     storage::common::models::{
-        DbMint, DbTransaction, MintDbBalance, TransactionStatus, TransactionType,
+        DbMint, DbMintStatus, DbTransaction, MintDbBalance, MintStatusAtSlot, TransactionStatus,
+        TransactionType,
     },
     PostgresConfig,
 };
@@ -396,6 +397,28 @@ impl PostgresDb {
             r#"
             ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'pending_remint';
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS mint_status_history (
+                mint_address    TEXT       NOT NULL,
+                status          TEXT       NOT NULL CHECK (status IN ('allowed','blocked')),
+                effective_slot  BIGINT     NOT NULL,
+                signature       TEXT       NOT NULL,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (mint_address, effective_slot)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_mint_status_history_lookup
+             ON mint_status_history (mint_address, effective_slot DESC)",
         )
         .execute(&self.pool)
         .await?;
@@ -1011,6 +1034,72 @@ impl PostgresDb {
         Ok(())
     }
 
+    pub async fn insert_mint_statuses_batch_internal(
+        &self,
+        statuses: &[DbMintStatus],
+    ) -> Result<(), StorageError> {
+        if statuses.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        for status in statuses {
+            sqlx::query(
+                r#"
+                INSERT INTO mint_status_history
+                    (mint_address, status, effective_slot, signature)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (mint_address, effective_slot) DO NOTHING
+                "#,
+            )
+            .bind(&status.mint_address)
+            .bind(&status.status)
+            .bind(status.effective_slot)
+            .bind(&status.signature)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_mint_status_at_slot_internal(
+        &self,
+        mint_address: &str,
+        slot: i64,
+    ) -> Result<MintStatusAtSlot, StorageError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT status FROM mint_status_history
+            WHERE mint_address = $1 AND effective_slot <= $2
+            ORDER BY effective_slot DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(mint_address)
+        .bind(slot)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((s,)) if s == "allowed" => Ok(MintStatusAtSlot::Allowed),
+            Some((s,)) if s == "blocked" => Ok(MintStatusAtSlot::Blocked),
+            // Unrecognized status is data corruption; fail closed to `Blocked` and log loudly.
+            Some((other,)) => {
+                warn!(
+                    mint_address,
+                    slot,
+                    status = %other,
+                    "Unrecognized mint status in mint_status_history; treating as Blocked"
+                );
+                Ok(MintStatusAtSlot::Blocked)
+            }
+            None => Ok(MintStatusAtSlot::NeverAllowed),
+        }
+    }
+
     /// Write-back from the operator's MintCache after it resolves whether
     /// the on-chain mint carries the Token-2022 PausableConfig and
     /// PermanentDelegate extensions. Both flags are always resolved in the
@@ -1122,6 +1211,31 @@ impl PostgresDb {
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// `transactions.id` for every `deposit` row whose mint was not in
+    /// `allowed` status at the deposit's slot, per `mint_status_history`.
+    pub async fn get_orphan_deposit_ids_internal(&self) -> Result<Vec<i64>, sqlx::Error> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT t.id
+            FROM transactions t
+            LEFT JOIN LATERAL (
+                SELECT status
+                FROM mint_status_history h
+                WHERE h.mint_address = t.mint
+                  AND h.effective_slot <= t.slot
+                ORDER BY h.effective_slot DESC
+                LIMIT 1
+            ) latest ON true
+            WHERE t.transaction_type = 'deposit'
+              AND (latest.status IS NULL OR latest.status = 'blocked')
+            ORDER BY t.id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     pub async fn close(&self) -> Result<(), sqlx::Error> {

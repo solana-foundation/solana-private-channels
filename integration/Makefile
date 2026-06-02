@@ -53,6 +53,7 @@ integration-test:
 	@cargo test --test checkpoint_partial_flush -- --nocapture
 	@cargo test --test remint_recovery -- --nocapture
 	@cargo test --test bootstrap_validation -- --nocapture
+	@cargo test --test deposit_allowlist_e2e -- --nocapture
 	@cargo test --test yellowstone_wiring -- --nocapture
 	@cargo test --test malformed_yellowstone_update -- --nocapture
 	@cargo test --test yellowstone_reconnect_gap -- --nocapture
@@ -252,6 +253,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test remint_recovery -- --nocapture
 	@echo "Running indexer bootstrap validation tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test bootstrap_validation -- --nocapture
+	@echo "Running deposit-allowlist e2e tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test deposit_allowlist_e2e -- --nocapture
 	@echo "Running Yellowstone wiring tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_wiring -- --nocapture
 	@echo "Running malformed Yellowstone update tests with coverage instrumentation..."
