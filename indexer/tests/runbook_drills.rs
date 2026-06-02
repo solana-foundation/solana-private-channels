@@ -1166,9 +1166,10 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
     let branch_3b_id = seed_deposit(&pool, "manual_review").await?;
     let control_id = seed_deposit(&pool, "completed").await?;
 
-    // 3a — indexer-gap branch: after the operator backfills `mints`,
-    // re-arm the row to `pending`. SQL must be id-targeted and not
-    // reference `error_message` (drill_14's fungibility contract).
+    // 3a — indexer-gap branch: after the operator backfills `mints` AND
+    // `mint_status_history` (the slot-aware gate reads the latter), re-arm
+    // the row to `pending`. SQL must be id-targeted and not reference
+    // `error_message` (drill_14's fungibility contract).
     sqlx::query("UPDATE transactions SET status='pending', updated_at=NOW() WHERE id=$1")
         .bind(branch_3a_id)
         .execute(&pool)

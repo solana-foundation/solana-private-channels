@@ -21,7 +21,7 @@ use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Transaction processor that converts instructions to transactions and saves to DB
 /// Tracks slot-level success/failure and emits committed checkpoints
@@ -182,7 +182,20 @@ impl TransactionProcessor {
             }
         }
 
-        if !transactions.is_empty() {
+        if transactions.is_empty() {
+            // Empty slot, just checkpoint it
+            debug!("Finalizing empty slot {}", slot);
+        } else if !send_checkpoint {
+            // A prerequisite write (mints/statuses) failed; skip the deposit
+            // rows so we don't commit a deposit with no backing row. The slot
+            // isn't checkpointed, so it replays atomically.
+            warn!(
+                "Skipping transaction insert for slot {} ({} row(s)) because an earlier \
+                 write failed; slot will be reprocessed",
+                slot,
+                transactions.len()
+            );
+        } else {
             info!(
                 "Finalizing slot {} with {} transactions",
                 slot,
@@ -212,9 +225,6 @@ impl TransactionProcessor {
                     send_checkpoint = false;
                 }
             }
-        } else {
-            // Empty slot, just checkpoint it
-            debug!("Finalizing empty slot {}", slot);
         }
 
         if send_checkpoint {
@@ -387,6 +397,17 @@ mod tests {
         sig: Option<String>,
         recipient: Option<Pubkey>,
     ) -> InstructionWithMetadata {
+        make_deposit_instruction_on_instance(slot, sig, recipient, deposit_instance())
+    }
+
+    /// Like `make_deposit_instruction` but on a caller-chosen instance, so a
+    /// deposit can share a slot with an AllowMint on the same instance.
+    fn make_deposit_instruction_on_instance(
+        slot: u64,
+        sig: Option<String>,
+        recipient: Option<Pubkey>,
+        instance: Pubkey,
+    ) -> InstructionWithMetadata {
         let user = make_pubkey(1);
         let mint = make_pubkey(2);
         InstructionWithMetadata {
@@ -394,7 +415,7 @@ mod tests {
                 accounts: DepositAccounts {
                     payer: make_pubkey(10),
                     user,
-                    instance: deposit_instance(),
+                    instance,
                     mint,
                     allowed_mint: make_pubkey(12),
                     user_ata: make_pubkey(13),
@@ -715,7 +736,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_writes_mint_status_history_on_allow_mint() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         processor
             .current_slot_instructions
             .push(make_allow_mint_instruction(
@@ -741,7 +763,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_insert_mint_statuses_failure_skips_checkpoint() {
-        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock();
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("insert_mint_statuses_batch", true);
         processor
             .current_slot_instructions
@@ -754,6 +777,43 @@ mod tests {
             .await;
 
         assert!(checkpoint_rx.try_recv().is_err());
+    }
+
+    /// AllowMint + Deposit for the same mint in one slot: if the mint-status
+    /// write fails, the deposit row must be withheld (else the gate would
+    /// quarantine it) and the slot replays.
+    #[tokio::test]
+    async fn finalize_mint_status_failure_withholds_deposit_in_same_slot() {
+        // Both instructions must target the configured instance, or the
+        // instance filter would drop one and defeat the test's intent.
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
+        mock.set_should_fail("insert_mint_statuses_batch", true);
+        processor
+            .current_slot_instructions
+            .push(make_allow_mint_instruction(
+                202,
+                Some("sig-allow-3".to_string()),
+            ));
+        processor
+            .current_slot_instructions
+            .push(make_deposit_instruction_on_instance(
+                202,
+                Some("sig-deposit-3".to_string()),
+                None,
+                allow_mint_instance(),
+            ));
+        processor
+            .finalize_and_checkpoint(202, ProgramType::Escrow)
+            .await;
+
+        // Checkpoint withheld so the slot replays.
+        assert!(checkpoint_rx.try_recv().is_err());
+        // Deposit row must not be committed without its backing status row.
+        assert!(
+            mock.inserted_transactions.lock().unwrap().is_empty(),
+            "deposit must be withheld when the mint-status write failed"
+        );
     }
 
     #[tokio::test]

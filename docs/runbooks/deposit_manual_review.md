@@ -257,16 +257,24 @@ which recovery branch to take:
 #### Step 3a - backfill the missing `mints` row, then re-arm
 
 The mint *is* authorized on-chain; the indexer simply missed the event.
-Re-create the `mints` row so the operator's next attempt clears the gate.
-Either replay the indexer over the `AllowMint`'s slot (preferred — it's
-the same code path that runs in production), or insert directly. Values
-must match the on-chain mint and `AllowMint` flags:
+Replay the indexer over the `AllowMint`'s slot (preferred — same code path
+as production), or insert directly. The gate (`assert_mint_allowed_at_slot`)
+reads **`mint_status_history`**, so backfilling only `mints` loops
+`pending` → `manual_review` forever — both rows are required. Values must
+match the on-chain mint and `AllowMint` flags:
 
 ```sql
 INSERT INTO mints
   (mint_address, decimals, token_program, is_pausable, has_permanent_delegate, created_at)
 VALUES
   (:mint, :decimals, :token_program, :is_pausable, :has_permanent_delegate, NOW());
+
+-- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
+INSERT INTO mint_status_history
+  (mint_address, status, effective_slot, signature, created_at)
+VALUES
+  (:mint, 'allowed', :allow_mint_slot, :allow_mint_signature, NOW())
+ON CONFLICT (mint_address, effective_slot) DO NOTHING;
 
 UPDATE transactions SET status = 'pending', updated_at = NOW()
  WHERE id = :transaction_id;
