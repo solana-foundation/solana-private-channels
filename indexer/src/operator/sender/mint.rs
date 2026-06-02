@@ -189,21 +189,7 @@ pub(super) async fn try_jit_mint_initialization(
         }
     }
 
-    // Look up the mint's decimals. This is a pure metadata read,
-    // only `decimals` is used.
-    //
-    // `get_mint_metadata` checks the in-memory cache first, then the
-    // DB, and finally falls back to a source-chain RPC fetch if
-    // neither has the mint. That last fallback would be dangerous on
-    // its own: it would let any source-chain mint be resolved
-    // here, initialized on the private channel, and minted into a
-    // user's account.
-    //
-    // It's safe in this position because the deposit processor
-    // already refuses to forward a deposit whose mint was not in
-    // allowed status at the deposit's slot (see
-    // `assert_mint_allowed_at_slot` in `process_deposit_funds`). By the
-    // time execution reaches this point, the mint is known-allowed.
+    // 3. Look up mint decimals from mint cache.
     let Ok(mint_metadata) = state.mint_cache.get_mint_metadata(&mint).await else {
         error!("Mint {} not found in mint cache", mint);
         return JitOutcome::PermanentFailure(format!("mint not in mint cache: {}", mint));

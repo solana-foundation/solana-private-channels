@@ -1,6 +1,5 @@
 use crate::error::{AccountError, OperatorError};
 use crate::operator::RpcClientWithRetry;
-use crate::storage::common::models::MintStatusAtSlot;
 use crate::storage::Storage;
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
@@ -314,38 +313,14 @@ impl MintCache {
     pub fn get_private_channel_token_program(&self) -> Pubkey {
         TOKEN_PROGRAM_ID
     }
-
-    /// Operator gate: refuses deposits whose mint was not in `allowed`
-    /// status at the deposit's slot, per `mint_status_history`.
-    pub async fn assert_mint_allowed_at_slot(
-        &self,
-        mint: &Pubkey,
-        deposit_slot: i64,
-        transaction_id: i64,
-    ) -> Result<(), OperatorError> {
-        let mint_str = mint.to_string();
-        let status = self
-            .storage
-            .get_mint_status_at_slot(&mint_str, deposit_slot)
-            .await?;
-        match status {
-            MintStatusAtSlot::Allowed => Ok(()),
-            _ => Err(OperatorError::MintNotAllowed {
-                transaction_id,
-                mint: mint_str,
-            }),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::OperatorError;
     use crate::operator::rpc_util::RpcClientWithRetry;
     use crate::operator::RetryConfig;
     use crate::storage::common::models::DbMint;
-    use crate::storage::common::models::DbMintStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -420,13 +395,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             is_pausable: Some(false),
             has_permanent_delegate: Some(false),
-        });
-        mock.mint_status_history.lock().unwrap().push(DbMintStatus {
-            mint_address: mint.to_string(),
-            status: "allowed".to_string(),
-            effective_slot: 0,
-            signature: format!("test-seed-{mint}"),
-            created_at: chrono::Utc::now(),
         });
 
         Arc::new(Storage::Mock(mock))
@@ -742,100 +710,6 @@ mod tests {
             matches!(err, crate::error::OperatorError::RpcError(_)),
             "expected RpcError, got {err:?}",
         );
-    }
-
-    fn seed_status(mock: &MockStorage, mint: &Pubkey, status: &str, slot: i64) {
-        mock.mint_status_history.lock().unwrap().push(DbMintStatus {
-            mint_address: mint.to_string(),
-            status: status.to_string(),
-            effective_slot: slot,
-            signature: format!("test-seed-{mint}-{slot}"),
-            created_at: chrono::Utc::now(),
-        });
-    }
-
-    #[tokio::test]
-    async fn assert_mint_allowed_at_slot_passes_when_allowed_before_deposit() {
-        let mint = create_test_mint();
-        let mock = MockStorage::new();
-        seed_status(&mock, &mint, "allowed", 10);
-        let storage = Arc::new(Storage::Mock(mock));
-
-        let cache = MintCache::new(storage);
-
-        cache
-            .assert_mint_allowed_at_slot(&mint, 50, 1)
-            .await
-            .expect("status allowed at slot 10 must apply at deposit slot 50");
-    }
-
-    #[tokio::test]
-    async fn assert_mint_allowed_at_slot_rejects_deposit_before_allow() {
-        let mint = create_test_mint();
-        let mock = MockStorage::new();
-        seed_status(&mock, &mint, "allowed", 50);
-        let storage = Arc::new(Storage::Mock(mock));
-
-        let cache = MintCache::new(storage);
-
-        let err = cache
-            .assert_mint_allowed_at_slot(&mint, 10, 7)
-            .await
-            .expect_err("deposit before allow must be rejected");
-        match err {
-            OperatorError::MintNotAllowed {
-                transaction_id,
-                mint: m,
-            } => {
-                assert_eq!(transaction_id, 7);
-                assert_eq!(m, mint.to_string());
-            }
-            other => panic!("expected MintNotAllowed, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn assert_mint_allowed_at_slot_rejects_during_blocked_window() {
-        let mint = create_test_mint();
-        let mock = MockStorage::new();
-        seed_status(&mock, &mint, "allowed", 10);
-        seed_status(&mock, &mint, "blocked", 20);
-        let storage = Arc::new(Storage::Mock(mock));
-
-        let cache = MintCache::new(storage);
-
-        let err = cache
-            .assert_mint_allowed_at_slot(&mint, 25, 9)
-            .await
-            .expect_err("deposit during blocked window must be rejected");
-        assert!(
-            matches!(err, OperatorError::MintNotAllowed { .. }),
-            "expected MintNotAllowed, got {err:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn assert_mint_allowed_at_slot_rejects_when_no_history() {
-        let mint = create_test_mint();
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-
-        let cache = MintCache::new(storage);
-
-        let err = cache
-            .assert_mint_allowed_at_slot(&mint, 100, 42)
-            .await
-            .expect_err("mint with no history must be rejected");
-
-        match err {
-            OperatorError::MintNotAllowed {
-                transaction_id,
-                mint: m,
-            } => {
-                assert_eq!(transaction_id, 42);
-                assert_eq!(m, mint.to_string());
-            }
-            other => panic!("expected MintNotAllowed, got {other:?}"),
-        }
     }
 
     #[tokio::test]

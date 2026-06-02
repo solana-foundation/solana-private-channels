@@ -265,8 +265,7 @@ pub struct OperatorConfig {
     /// Tolerance threshold in basis points (100 bps = 1%)
     #[serde(default = "default_reconciliation_tolerance")]
     pub reconciliation_tolerance_bps: u16,
-    /// Webhook URL for reconciliation alerts (optional). Carries both balance
-    /// mismatch alerts and orphan deposit alerts.
+    /// Webhook URL for reconciliation alerts (optional)
     pub reconciliation_webhook_url: Option<String>,
     /// How often to check the feepayer SOL balance (escrow operators only)
     #[serde(default = "default_feepayer_monitor_interval")]

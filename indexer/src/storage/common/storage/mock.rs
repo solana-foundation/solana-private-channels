@@ -1,11 +1,10 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    DbMint, DbMintStatus, DbTransaction, MintDbBalance, MintStatusAtSlot, TransactionStatus,
-    TransactionType,
+    DbMint, DbTransaction, MintDbBalance, TransactionStatus, TransactionType,
 };
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Recorded status update from `update_transaction_status`.
 pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<Utc>);
@@ -28,7 +27,6 @@ pub struct MockStorage {
     pub pending_remint_signatures: std::sync::Arc<Mutex<Vec<PendingRemintRecord>>>,
     /// Transactions currently in PendingRemint status, used in tests to simulate startup recovery.
     pub pending_remint_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
-    pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
 }
 
 impl MockStorage {
@@ -233,42 +231,6 @@ impl MockStorage {
         Ok(self.mints.lock().unwrap().get(mint_address).cloned())
     }
 
-    pub async fn insert_mint_statuses_batch(
-        &self,
-        statuses: &[DbMintStatus],
-    ) -> Result<(), StorageError> {
-        self.check_should_fail("insert_mint_statuses_batch")?;
-        let mut store = self.mint_status_history.lock().unwrap();
-        for s in statuses {
-            let exists = store
-                .iter()
-                .any(|r| r.mint_address == s.mint_address && r.effective_slot == s.effective_slot);
-            if !exists {
-                store.push(s.clone());
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn get_mint_status_at_slot(
-        &self,
-        mint_address: &str,
-        slot: i64,
-    ) -> Result<MintStatusAtSlot, StorageError> {
-        let store = self.mint_status_history.lock().unwrap();
-        let latest = store
-            .iter()
-            .filter(|r| r.mint_address == mint_address && r.effective_slot <= slot)
-            .max_by_key(|r| r.effective_slot);
-        match latest {
-            Some(r) if r.status == "allowed" => Ok(MintStatusAtSlot::Allowed),
-            Some(r) if r.status == "blocked" => Ok(MintStatusAtSlot::Blocked),
-            // Mirror the postgres path: an unrecognized status fails closed to Blocked.
-            Some(_) => Ok(MintStatusAtSlot::Blocked),
-            None => Ok(MintStatusAtSlot::NeverAllowed),
-        }
-    }
-
     pub async fn set_mint_extension_flags(
         &self,
         mint_address: &str,
@@ -301,35 +263,6 @@ impl MockStorage {
 
     pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
         Ok(self.mint_balances.lock().unwrap().clone())
-    }
-
-    pub async fn get_orphan_deposit_ids(&self) -> Result<Vec<i64>, StorageError> {
-        self.check_should_fail("get_orphan_deposit_ids")?;
-        // Mirror Postgres, which scans the whole `transactions` table regardless
-        // of status: union every transaction store the mock holds, deduped by id.
-        let deposits: Vec<DbTransaction> = {
-            let pending = self.pending_transactions.lock().unwrap();
-            let singles = self.inserted_single_transactions.lock().unwrap();
-            let batches = self.inserted_transactions.lock().unwrap();
-            let mut seen_ids = std::collections::HashSet::new();
-            pending
-                .iter()
-                .chain(singles.iter())
-                .chain(batches.iter().flatten())
-                .filter(|t| t.transaction_type == TransactionType::Deposit)
-                .filter(|t| seen_ids.insert(t.id))
-                .cloned()
-                .collect()
-        };
-        let mut ids = Vec::new();
-        for t in deposits {
-            let status = self.get_mint_status_at_slot(&t.mint, t.slot).await?;
-            if !matches!(status, MintStatusAtSlot::Allowed) {
-                ids.push(t.id);
-            }
-        }
-        ids.sort();
-        Ok(ids)
     }
 
     pub async fn close(&self) -> Result<(), StorageError> {

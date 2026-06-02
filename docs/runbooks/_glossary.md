@@ -18,7 +18,7 @@ DB type `transaction_status`.
 | `completed` | yes | no | Withdrawal release or deposit mint confirmed on-chain. |
 | `failed` | yes | yes | Terminal failure with no on-chain proof. **Primary alert for deposits** (sender-side failures terminate here since there is no remint path). Rare for withdrawals - those go through `pending_remint`. |
 | `failed_reminted` | yes | yes | **Withdrawal-only.** Original withdrawal failed, remint of burned private channel tokens succeeded. Deposits do not have a remint path. |
-| `manual_review` | yes | yes | Operator stopped acting on this row. Requires human triage. Withdrawals: six triggers (build error → halt, pre-flight bail → no halt, four sender-side ambiguities). Deposits: build error, sender-side post-JIT mint failure, or processor-side allowlist-gate rejection (no halt, no sweep). |
+| `manual_review` | yes | yes | Operator stopped acting on this row. Requires human triage. Withdrawals: six triggers (build error → halt, pre-flight bail → no halt, four sender-side ambiguities). Deposits: build error only (no halt, no sweep). |
 
 Webhook receivers should treat `failed`, `failed_reminted`, `manual_review` as
 the alertable set. Source: `indexer/src/operator/db_transaction_writer.rs`,

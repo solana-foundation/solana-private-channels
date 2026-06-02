@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 bs58.workspace = true
-chrono.workspace = true
 private-channel-escrow-program-client.workspace = true
 private-channel-withdraw-program-client.workspace = true
 private-channel-indexer = { path = "../indexer" }
