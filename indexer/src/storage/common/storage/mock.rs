@@ -242,15 +242,34 @@ impl MockStorage {
             // restart, retry) must preserve those flags, otherwise the next
             // withdrawal wastes an RPC round-trip re-resolving them. A
             // blanket `insert` here would silently disagree with prod and
-            // let tests lock in the wrong behavior.
+            // let tests lock in the wrong behavior. `status` follows prod's
+            // `SET status = EXCLUDED.status`, so a re-allow flips a blocked
+            // mint back to allowed.
             match store.get_mut(&mint.mint_address) {
                 Some(existing) => {
                     existing.decimals = mint.decimals;
                     existing.token_program = mint.token_program.clone();
+                    existing.status = mint.status.clone();
                 }
                 None => {
                     store.insert(mint.mint_address.clone(), mint.clone());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mirrors `mark_mints_blocked_internal`: flip existing rows to `"blocked"`;
+    /// a missing row is a no-op.
+    pub async fn mark_mints_blocked(
+        &self,
+        mint_addresses: &[String],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("mark_mints_blocked")?;
+        let mut store = self.mints.lock().unwrap();
+        for addr in mint_addresses {
+            if let Some(existing) = store.get_mut(addr) {
+                existing.status = "blocked".to_string();
             }
         }
         Ok(())

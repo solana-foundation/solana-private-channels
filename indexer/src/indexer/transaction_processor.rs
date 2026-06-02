@@ -100,25 +100,34 @@ impl TransactionProcessor {
     async fn finalize_and_checkpoint(&mut self, slot: u64, program_type: ProgramType) {
         let mut mints = Vec::new();
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
+        let mut mint_blocks: Vec<String> = Vec::new();
         let mut transactions = Vec::new();
 
         let slot_instructions = self.slot_buffers.remove(&slot).unwrap_or_default();
         for instruction_meta in &slot_instructions {
-            let (mint_opt, transaction_opt) = convert_to_db_models(
+            let (mint_opt, status_opt, transaction_opt) = convert_to_db_models(
                 instruction_meta,
                 self.configured_escrow_instance_id.as_ref(),
             );
 
-            if let Some(mint) = mint_opt {
+            if let Some(change) = status_opt {
+                // Block flips `mints.status` directly; allow carries its status
+                // on the DbMint upserted below.
+                if change.status == MintStatus::Blocked {
+                    mint_blocks.push(change.mint_address.clone());
+                }
                 if let Some(sig) = instruction_meta.signature.clone() {
                     mint_statuses.push(DbMintStatus {
-                        mint_address: mint.mint_address.clone(),
-                        status: "allowed".to_string(),
+                        mint_address: change.mint_address,
+                        status: change.status.as_str().to_string(),
                         effective_slot: slot as i64,
                         signature: sig,
                         created_at: chrono::Utc::now(),
                     });
                 }
+            }
+
+            if let Some(mint) = mint_opt {
                 mints.push(mint);
             }
 
@@ -172,6 +181,27 @@ impl TransactionProcessor {
                         "Failed to save mint status history from slot {}: {}",
                         slot, e
                     );
+                    metrics::INDEXER_SLOT_SAVE_ERRORS
+                        .with_label_values(&[program_type.as_label()])
+                        .inc();
+                    send_checkpoint = false;
+                }
+            }
+        }
+
+        // Mirror blocks onto the `mints.status` flag (the authoritative timeline
+        // is the mint_status_history rows written above).
+        if !mint_blocks.is_empty() {
+            match self.storage.mark_mints_blocked(&mint_blocks).await {
+                Ok(_) => {
+                    info!(
+                        "Marked {} mint(s) blocked from slot {}",
+                        mint_blocks.len(),
+                        slot
+                    );
+                }
+                Err(e) => {
+                    error!("Failed to mark mints blocked from slot {}: {}", slot, e);
                     metrics::INDEXER_SLOT_SAVE_ERRORS
                         .with_label_values(&[program_type.as_label()])
                         .inc();
@@ -268,19 +298,48 @@ impl TransactionProcessor {
     }
 }
 
-/// Convert an instruction to either a DbMint or DbTransaction model
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MintStatus {
+    Allowed,
+    Blocked,
+}
+
+impl MintStatus {
+    /// The string stored in the `status` columns.
+    fn as_str(self) -> &'static str {
+        match self {
+            MintStatus::Allowed => "allowed",
+            MintStatus::Blocked => "blocked",
+        }
+    }
+}
+
+/// A mint allow/block transition to record in `mint_status_history`.
+struct MintStatusChange {
+    mint_address: String,
+    status: MintStatus,
+}
+
+/// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction)` triple,
+/// each element independently optional:
+/// - `AllowMint` → mints-row upsert + `"allowed"` transition.
+/// - `BlockMint` → `"blocked"` transition only (mints row already exists).
+/// - `Deposit` / `WithdrawFunds` → transaction row only.
 ///
-/// Returns None for instructions that shouldn't be tracked in the database.
-/// Escrow instructions whose `accounts.instance` does not equal the configured
-/// escrow instance are dropped here; this is the per-instruction scoping that
-/// keeps a foreign instance from being persisted via this processor.
+/// Returns all-`None` for untracked instructions and for escrow instructions
+/// whose `accounts.instance` doesn't match the configured instance — the
+/// per-instruction scoping that keeps a foreign instance from being persisted.
 fn convert_to_db_models(
     instruction_meta: &InstructionWithMetadata,
     configured_escrow_instance_id: Option<&Pubkey>,
-) -> (Option<DbMint>, Option<DbTransaction>) {
+) -> (
+    Option<DbMint>,
+    Option<MintStatusChange>,
+    Option<DbTransaction>,
+) {
     let signature = match instruction_meta.signature.as_ref() {
         Some(sig) => sig,
-        None => return (None, None),
+        None => return (None, None, None),
     };
 
     match &instruction_meta.instruction {
@@ -293,7 +352,7 @@ fn convert_to_db_models(
                     configured = ?configured_escrow_instance_id,
                     "dropping escrow instruction: instance mismatch"
                 );
-                return (None, None);
+                return (None, None, None);
             }
             match escrow_ix.as_ref() {
                 EscrowInstruction::Deposit {
@@ -307,6 +366,7 @@ fn convert_to_db_models(
                         .unwrap_or_else(|| accounts.user.to_string());
 
                     (
+                        None,
                         None,
                         Some(
                             DbTransactionBuilder::new(
@@ -325,15 +385,30 @@ fn convert_to_db_models(
                 }
                 EscrowInstruction::AllowMint {
                     accounts, event, ..
-                } => (
-                    Some(DbMint::new(
-                        accounts.mint.to_string(),
-                        event.decimals as i16,
-                        accounts.token_program.to_string(),
-                    )),
+                } => {
+                    let mint_address = accounts.mint.to_string();
+                    (
+                        Some(DbMint::new(
+                            mint_address.clone(),
+                            event.decimals as i16,
+                            accounts.token_program.to_string(),
+                        )),
+                        Some(MintStatusChange {
+                            mint_address,
+                            status: MintStatus::Allowed,
+                        }),
+                        None,
+                    )
+                }
+                EscrowInstruction::BlockMint { accounts } => (
+                    None,
+                    Some(MintStatusChange {
+                        mint_address: accounts.mint.to_string(),
+                        status: MintStatus::Blocked,
+                    }),
                     None,
                 ),
-                _ => (None, None),
+                _ => (None, None, None),
             }
         }
 
@@ -342,6 +417,7 @@ fn convert_to_db_models(
                 let recipient = data.destination.to_string();
 
                 (
+                    None,
                     None,
                     Some(
                         DbTransactionBuilder::new(
@@ -367,8 +443,8 @@ mod tests {
     use super::*;
     use crate::indexer::checkpoint::CheckpointWriter;
     use crate::indexer::datasource::common::parser::{
-        AllowMintAccounts, AllowMintData, AllowMintEvent, DepositAccounts, DepositData,
-        DepositEvent, ResetSmtRootAccounts, WithdrawFundsAccounts, WithdrawFundsData,
+        AllowMintAccounts, AllowMintData, AllowMintEvent, BlockMintAccounts, DepositAccounts,
+        DepositData, DepositEvent, ResetSmtRootAccounts, WithdrawFundsAccounts, WithdrawFundsData,
     };
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
@@ -471,6 +547,29 @@ mod tests {
         }
     }
 
+    /// BlockMint scoped to `allow_mint_instance()` so it follows an AllowMint on
+    /// the same watched instance, mirroring the on-chain allow-then-block order.
+    fn make_block_mint_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
+        InstructionWithMetadata {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::BlockMint {
+                accounts: BlockMintAccounts {
+                    payer: make_pubkey(10),
+                    admin: make_pubkey(11),
+                    instance: allow_mint_instance(),
+                    mint: make_pubkey(2),
+                    allowed_mint: make_pubkey(13),
+                    system_program: make_pubkey(15),
+                    event_authority: make_pubkey(18),
+                    private_channel_escrow_program: make_pubkey(19),
+                },
+            })),
+            slot,
+            program_type: ProgramType::Escrow,
+            signature: sig,
+            instruction_index: 0,
+        }
+    }
+
     fn make_withdraw_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
         InstructionWithMetadata {
             instruction: ProgramInstruction::Withdraw(Box::new(
@@ -522,8 +621,9 @@ mod tests {
     fn convert_deposit_with_explicit_recipient() {
         let recipient = make_pubkey(99);
         let ix = make_deposit_instruction(100, Some("sig1".to_string()), Some(recipient));
-        let (mint, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
         assert!(mint.is_none());
+        assert!(status.is_none());
         let txn = txn.unwrap();
         assert_eq!(txn.signature, "sig1");
         assert_eq!(txn.slot, 100);
@@ -538,7 +638,7 @@ mod tests {
     #[test]
     fn convert_deposit_none_recipient_defaults_to_user() {
         let ix = make_deposit_instruction(50, Some("sig2".to_string()), None);
-        let (_, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        let (_, _, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
         let txn = txn.unwrap();
         // recipient should default to accounts.user
         assert_eq!(txn.recipient, make_pubkey(1).to_string());
@@ -547,11 +647,15 @@ mod tests {
     #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
         let ix = make_allow_mint_instruction(200, Some("sig3".to_string()));
-        let (mint, txn) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         assert!(txn.is_none());
+        let status = status.expect("AllowMint must emit a status change");
+        assert_eq!(status.status, MintStatus::Allowed);
+        assert_eq!(status.mint_address, make_pubkey(2).to_string());
         let mint = mint.unwrap();
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
+        assert_eq!(mint.status, "allowed");
         // The indexer leaves Token-2022 extension resolution to the operator —
         // both flags must stay None at AllowMint time.
         assert_eq!(mint.is_pausable, None);
@@ -559,10 +663,24 @@ mod tests {
     }
 
     #[test]
+    fn convert_block_mint_returns_blocked_status_no_mint_no_txn() {
+        let ix = make_block_mint_instruction(210, Some("sig-block-1".to_string()));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
+        // Block never upserts a mints row and never produces a transaction —
+        // only a "blocked" status transition for the already-allowed mint.
+        assert!(mint.is_none());
+        assert!(txn.is_none());
+        let status = status.expect("BlockMint must emit a status change");
+        assert_eq!(status.status, MintStatus::Blocked);
+        assert_eq!(status.mint_address, make_pubkey(2).to_string());
+    }
+
+    #[test]
     fn convert_withdraw_funds() {
         let ix = make_withdraw_instruction(300, Some("sig4".to_string()));
-        let (mint, txn) = convert_to_db_models(&ix, None);
+        let (mint, status, txn) = convert_to_db_models(&ix, None);
         assert!(mint.is_none());
+        assert!(status.is_none());
         let txn = txn.unwrap();
         assert_eq!(txn.amount, TokenAmount(500));
         assert_eq!(txn.recipient, make_pubkey(20).to_string());
@@ -578,8 +696,8 @@ mod tests {
         let mut ix1 = make_deposit_instruction(100, Some(sig.clone()), None);
         ix1.instruction_index = 1;
 
-        let (_, txn0) = convert_to_db_models(&ix0, Some(&deposit_instance()));
-        let (_, txn1) = convert_to_db_models(&ix1, Some(&deposit_instance()));
+        let (_, _, txn0) = convert_to_db_models(&ix0, Some(&deposit_instance()));
+        let (_, _, txn1) = convert_to_db_models(&ix1, Some(&deposit_instance()));
 
         let txn0 = txn0.unwrap();
         let txn1 = txn1.unwrap();
@@ -592,16 +710,18 @@ mod tests {
     #[test]
     fn convert_no_signature_returns_none() {
         let ix = make_deposit_instruction(100, None, None);
-        let (mint, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
         assert!(mint.is_none());
+        assert!(status.is_none());
         assert!(txn.is_none());
     }
 
     #[test]
     fn convert_catchall_escrow_variant_returns_none() {
         let ix = make_reset_smt_root_instruction(100, Some("sig5".to_string()));
-        let (mint, txn) = convert_to_db_models(&ix, Some(&reset_smt_instance()));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&reset_smt_instance()));
         assert!(mint.is_none());
+        assert!(status.is_none());
         assert!(txn.is_none());
     }
 
@@ -638,8 +758,9 @@ mod tests {
             instruction_index: 0,
         };
 
-        let (mint, txn) = convert_to_db_models(&ix, Some(&watched));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&watched));
         assert!(mint.is_none());
+        assert!(status.is_none());
         assert!(txn.is_none());
     }
 
@@ -672,8 +793,9 @@ mod tests {
             instruction_index: 0,
         };
 
-        let (mint, txn) = convert_to_db_models(&ix, Some(&watched));
+        let (mint, status, txn) = convert_to_db_models(&ix, Some(&watched));
         assert!(mint.is_none());
+        assert!(status.is_none());
         assert!(txn.is_none());
     }
 
@@ -782,6 +904,45 @@ mod tests {
 
         let cp = checkpoint_rx.recv().await.unwrap();
         assert_eq!(cp.slot, 200);
+    }
+
+    #[tokio::test]
+    async fn finalize_writes_blocked_status_on_block_mint() {
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(allow_mint_instance());
+        // Seed the allowed mints row the prior AllowMint would have created.
+        mock.mints.lock().unwrap().insert(
+            make_pubkey(2).to_string(),
+            DbMint::new(make_pubkey(2).to_string(), 6, spl_token::id().to_string()),
+        );
+        processor.buffer(make_block_mint_instruction(
+            250,
+            Some("sig-block-2".to_string()),
+        ));
+        processor
+            .finalize_and_checkpoint(250, ProgramType::Escrow)
+            .await;
+
+        {
+            let rows = mock.mint_status_history.lock().unwrap();
+            assert_eq!(rows.len(), 1, "exactly one status row should be written");
+            assert_eq!(rows[0].mint_address, make_pubkey(2).to_string());
+            assert_eq!(rows[0].status, "blocked");
+            assert_eq!(rows[0].effective_slot, 250);
+            assert_eq!(rows[0].signature, "sig-block-2");
+        }
+        {
+            // Block flips the existing row to "blocked" without creating a new one.
+            let mints = mock.mints.lock().unwrap();
+            assert_eq!(mints.len(), 1, "BlockMint must not create a new mints row");
+            assert_eq!(
+                mints.get(&make_pubkey(2).to_string()).unwrap().status,
+                "blocked"
+            );
+        }
+
+        let cp = checkpoint_rx.recv().await.unwrap();
+        assert_eq!(cp.slot, 250);
     }
 
     #[tokio::test]

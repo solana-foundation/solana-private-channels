@@ -593,6 +593,34 @@ async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_mints_blocked_flips_status_against_postgres() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage
+        .upsert_mints_batch(&[DbMint::new("blk_mint".to_string(), 6, "TokenkegQ".to_string())])
+        .await?;
+    assert_eq!(storage.get_mint("blk_mint").await?.unwrap().status, "allowed");
+
+    // Block flips status to "blocked" and leaves metadata intact.
+    storage.mark_mints_blocked(&["blk_mint".to_string()]).await?;
+    let got = storage.get_mint("blk_mint").await?.unwrap();
+    assert_eq!(got.status, "blocked");
+    assert_eq!(got.decimals, 6);
+    assert_eq!(got.token_program, "TokenkegQ");
+
+    // Re-allow flips it back via the upsert's `SET status = EXCLUDED.status`.
+    storage
+        .upsert_mints_batch(&[DbMint::new("blk_mint".to_string(), 6, "TokenkegQ".to_string())])
+        .await?;
+    assert_eq!(storage.get_mint("blk_mint").await?.unwrap().status, "allowed");
+
+    // Blocking a mint with no row is a no-op (no error).
+    storage.mark_mints_blocked(&["no_such_mint".to_string()]).await?;
+    Ok(())
+}
+
 // ── 9. Reconciliation balance ────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
