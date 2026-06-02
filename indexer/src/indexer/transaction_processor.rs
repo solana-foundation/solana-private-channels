@@ -100,7 +100,6 @@ impl TransactionProcessor {
     async fn finalize_and_checkpoint(&mut self, slot: u64, program_type: ProgramType) {
         let mut mints = Vec::new();
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
-        let mut mint_blocks: Vec<String> = Vec::new();
         let mut transactions = Vec::new();
 
         let slot_instructions = self.slot_buffers.remove(&slot).unwrap_or_default();
@@ -111,11 +110,6 @@ impl TransactionProcessor {
             );
 
             if let Some(change) = status_opt {
-                // Block flips `mints.status` directly; allow carries its status
-                // on the DbMint upserted below.
-                if change.status == MintStatus::Blocked {
-                    mint_blocks.push(change.mint_address.clone());
-                }
                 if let Some(sig) = instruction_meta.signature.clone() {
                     mint_statuses.push(DbMintStatus {
                         mint_address: change.mint_address,
@@ -189,24 +183,19 @@ impl TransactionProcessor {
             }
         }
 
-        // Mirror blocks onto the `mints.status` flag (the authoritative timeline
-        // is the mint_status_history rows written above).
-        if !mint_blocks.is_empty() {
-            match self.storage.mark_mints_blocked(&mint_blocks).await {
-                Ok(_) => {
-                    info!(
-                        "Marked {} mint(s) blocked from slot {}",
-                        mint_blocks.len(),
-                        slot
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to mark mints blocked from slot {}: {}", slot, e);
-                    metrics::INDEXER_SLOT_SAVE_ERRORS
-                        .with_label_values(&[program_type.as_label()])
-                        .inc();
-                    send_checkpoint = false;
-                }
+        // Derive the `mints.status` mirror for each touched mint from history.
+        // Gated on the writes above, so the mirror never leads the timeline.
+        if send_checkpoint && !mint_statuses.is_empty() {
+            let touched: Vec<String> = mint_statuses
+                .iter()
+                .map(|s| s.mint_address.clone())
+                .collect();
+            if let Err(e) = self.storage.sync_mint_status(&touched).await {
+                error!("Failed to sync mint status mirror for slot {}: {}", slot, e);
+                metrics::INDEXER_SLOT_SAVE_ERRORS
+                    .with_label_values(&[program_type.as_label()])
+                    .inc();
+                send_checkpoint = false;
             }
         }
 

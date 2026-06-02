@@ -594,30 +594,53 @@ async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mark_mints_blocked_flips_status_against_postgres() -> Result<(), Box<dyn std::error::Error>>
-{
+async fn sync_mint_status_mirrors_history_against_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
     storage
-        .upsert_mints_batch(&[DbMint::new("blk_mint".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
         .await?;
-    assert_eq!(storage.get_mint("blk_mint").await?.unwrap().status, "allowed");
+    assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
 
-    // Block flips status to "blocked" and leaves metadata intact.
-    storage.mark_mints_blocked(&["blk_mint".to_string()]).await?;
-    let got = storage.get_mint("blk_mint").await?.unwrap();
+    // allowed@10 then blocked@20 → mirror resolves to the latest (blocked),
+    // metadata untouched.
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("sm", "allowed", 10, "sig-a"),
+            mk_status("sm", "blocked", 20, "sig-b"),
+        ])
+        .await?;
+    storage.sync_mint_status(&["sm".to_string()]).await?;
+    let got = storage.get_mint("sm").await?.unwrap();
     assert_eq!(got.status, "blocked");
     assert_eq!(got.decimals, 6);
     assert_eq!(got.token_program, "TokenkegQ");
 
-    // Re-allow flips it back via the upsert's `SET status = EXCLUDED.status`.
+    // Re-allow at a later slot → mirror flips back.
     storage
-        .upsert_mints_batch(&[DbMint::new("blk_mint".to_string(), 6, "TokenkegQ".to_string())])
+        .insert_mint_statuses_batch(&[mk_status("sm", "allowed", 30, "sig-c")])
         .await?;
-    assert_eq!(storage.get_mint("blk_mint").await?.unwrap().status, "allowed");
+    storage.sync_mint_status(&["sm".to_string()]).await?;
+    assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
 
-    // Blocking a mint with no row is a no-op (no error).
-    storage.mark_mints_blocked(&["no_such_mint".to_string()]).await?;
+    // Re-running the upsert (slot replay) must not clobber a later block: block
+    // it again, re-upsert, and confirm the mirror still reflects history.
+    storage
+        .insert_mint_statuses_batch(&[mk_status("sm", "blocked", 40, "sig-d")])
+        .await?;
+    storage.sync_mint_status(&["sm".to_string()]).await?;
+    storage
+        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .await?;
+    assert_eq!(
+        storage.get_mint("sm").await?.unwrap().status,
+        "blocked",
+        "upsert (re-allow ingest / replay) must not touch status"
+    );
+
+    // Syncing a mint with no row is a no-op (no error).
+    storage.sync_mint_status(&["no_such_mint".to_string()]).await?;
     Ok(())
 }
 

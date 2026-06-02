@@ -24,11 +24,11 @@ pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
-pub mod mark_mints_blocked;
 pub mod quarantine_all_active_withdrawals;
 pub mod record_remint_result;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
+pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_processing;
@@ -162,9 +162,10 @@ impl Storage {
         insert_mint_statuses_batch::insert_mint_statuses_batch(self, statuses).await
     }
 
-    /// Flip the given mints' `status` to `'blocked'`. No-op for missing rows.
-    pub async fn mark_mints_blocked(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
-        mark_mints_blocked::mark_mints_blocked(self, mint_addresses).await
+    /// Refresh the `mints.status` mirror for the given mints from their latest
+    /// `mint_status_history` transition. No-op for mints without a row.
+    pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
+        sync_mint_status::sync_mint_status(self, mint_addresses).await
     }
 
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
@@ -792,35 +793,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_mints_blocked_flips_status_and_preserves_metadata() {
+    async fn sync_mint_status_mirrors_latest_history_and_preserves_metadata() {
         let (storage, _mock) = make_mock_storage();
         storage
             .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
             .await
             .unwrap();
-        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
 
-        storage.mark_mints_blocked(&["m1".to_string()]).await.unwrap();
+        // allowed@10 then blocked@20 → mirror resolves to the latest: blocked.
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
 
         let m = storage.get_mint("m1").await.unwrap().unwrap();
         assert_eq!(m.status, "blocked");
-        // Metadata is untouched by a block.
+        // Metadata is untouched by the mirror sync.
         assert_eq!(m.decimals, 6);
         assert_eq!(m.token_program, TOKEN_PROGRAM);
 
-        // Re-allow flips it back via the upsert path.
+        // Re-allow at a later slot → mirror flips back to allowed.
+        storage
+            .insert_mint_statuses_batch(&[status_row("m1", "allowed", 30)])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
+    }
+
+    /// A stale replay (older slot than the current head) must not move the mirror.
+    #[tokio::test]
+    async fn sync_mint_status_ignores_older_history_after_block() {
+        let (storage, _mock) = make_mock_storage();
         storage
             .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
             .await
             .unwrap();
-        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        // Replaying the slot-10 allow re-syncs, but the latest transition is still
+        // blocked@20, so the mirror stays blocked.
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "blocked");
     }
 
     #[tokio::test]
-    async fn mark_mints_blocked_missing_row_is_noop() {
+    async fn sync_mint_status_missing_row_is_noop() {
         let (storage, _mock) = make_mock_storage();
         // No row for "ghost" — must not error.
-        storage.mark_mints_blocked(&["ghost".to_string()]).await.unwrap();
+        storage.sync_mint_status(&["ghost".to_string()]).await.unwrap();
         assert!(storage.get_mint("ghost").await.unwrap().is_none());
     }
 
