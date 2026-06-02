@@ -424,6 +424,34 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Broadcast release signatures written at send time; recovery reads
+        // them to verify a release landed before demoting (avoids double-payout).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_release_signatures (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+                signature TEXT NOT NULL,
+                last_valid_block_height BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_prs_transaction_id ON pending_release_signatures(transaction_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_prs_signature ON pending_release_signatures(signature)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -432,6 +460,10 @@ impl PostgresDb {
         info!("Dropping database tables...");
 
         // Drop tables with CASCADE to handle dependencies
+        sqlx::query("DROP TABLE IF EXISTS pending_release_signatures CASCADE")
+            .execute(&self.pool)
+            .await?;
+
         sqlx::query("DROP TABLE IF EXISTS transactions CASCADE")
             .execute(&self.pool)
             .await?;
@@ -1087,6 +1119,76 @@ impl PostgresDb {
         }
 
         Ok(())
+    }
+
+    /// Persist a broadcast release signature so recovery can verify finality
+    /// before demoting. Idempotent on `signature`.
+    pub async fn insert_release_signature_internal(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_release_signatures
+                (transaction_id, signature, last_valid_block_height)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (signature) DO NOTHING
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .bind(last_valid_block_height)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return a transaction's release signatures as (signature, lvbh).
+    pub async fn get_release_signatures_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT signature, last_valid_block_height
+            FROM pending_release_signatures
+            WHERE transaction_id = $1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(transaction_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Delete all stored release signatures for a transaction.
+    pub async fn delete_release_signatures_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM pending_release_signatures WHERE transaction_id = $1")
+            .bind(transaction_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drop release signatures whose parent transaction is no longer
+    /// `processing`. Returns the number of rows removed.
+    pub async fn gc_stale_release_signatures_internal(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM pending_release_signatures
+            WHERE transaction_id IN (
+                SELECT id FROM transactions WHERE status <> 'processing'
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.

@@ -743,3 +743,125 @@ async fn get_mint_status_at_slot_returns_blocked_after_block_entry(
     assert_eq!(res, MintStatusAtSlot::Blocked);
     Ok(())
 }
+
+// ── pending_release_signatures (verify-before-demote) ─────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_insert_get_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_roundtrip", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "sig-a".to_string(), 100)
+        .await?;
+    storage
+        .insert_release_signature(id, "sig-b".to_string(), 200)
+        .await?;
+
+    let rows = storage.get_release_signatures(id).await?;
+    assert_eq!(
+        rows,
+        vec![("sig-a".to_string(), 100), ("sig-b".to_string(), 200)]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_insert_is_idempotent_on_signature(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_idem", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "dup-sig".to_string(), 100)
+        .await?;
+    // Same signature again is a no-op (ON CONFLICT DO NOTHING).
+    storage
+        .insert_release_signature(id, "dup-sig".to_string(), 999)
+        .await?;
+
+    let rows = storage.get_release_signatures(id).await?;
+    assert_eq!(rows.len(), 1, "duplicate signature must not double-insert");
+    assert_eq!(rows[0], ("dup-sig".to_string(), 100), "first write wins");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_delete_removes_all_for_txn() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_delete", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "sig-x".to_string(), 1)
+        .await?;
+    storage
+        .insert_release_signature(id, "sig-y".to_string(), 2)
+        .await?;
+    storage.delete_release_signatures(id).await?;
+    assert!(storage.get_release_signatures(id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_gc_only_drops_non_processing() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let proc_txn = make_db_transaction("rel_gc_proc", TransactionType::Withdrawal);
+    let proc_id = storage.insert_db_transaction(&proc_txn).await?;
+    let done_txn = make_db_transaction("rel_gc_done", TransactionType::Withdrawal);
+    let done_id = storage.insert_db_transaction(&done_txn).await?;
+
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(proc_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
+        .bind(done_id)
+        .execute(&pool)
+        .await?;
+
+    storage
+        .insert_release_signature(proc_id, "sig-proc".to_string(), 1)
+        .await?;
+    storage
+        .insert_release_signature(done_id, "sig-done".to_string(), 2)
+        .await?;
+
+    let removed = storage.gc_stale_release_signatures().await?;
+    assert_eq!(
+        removed, 1,
+        "GC must drop exactly the non-processing row's sig"
+    );
+    assert_eq!(storage.get_release_signatures(proc_id).await?.len(), 1);
+    assert!(storage.get_release_signatures(done_id).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_cascade_on_transaction_delete() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_cascade", TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .insert_release_signature(id, "sig-cascade".to_string(), 1)
+        .await?;
+
+    sqlx::query("DELETE FROM transactions WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count, 0, "ON DELETE CASCADE must remove orphaned sigs");
+    Ok(())
+}

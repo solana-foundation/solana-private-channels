@@ -44,6 +44,8 @@ have prefixes.
 | `failed to persist pending remint:` | C - ambiguous (DB lost the sig) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
+| `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
+| `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 
 ## Path A.halting - build error that halted the pipeline
 
@@ -195,7 +197,21 @@ release and the channel-side remint may have left partial state.
 ## Path C - ambiguous on-chain state
 
 The withdrawal *may* have landed; the operator could not verify before
-committing the row to manual review. Three sub-triggers; same recovery.
+committing the row to manual review. Sub-triggers below; same recovery.
+
+> **Recovery now verifies on-chain before demoting.** The crash-recovery
+> worker persists every broadcast release signature to
+> `pending_release_signatures` at send time and, for a stale `Processing`
+> withdrawal, classifies those signatures on-chain (the same finality check
+> the remint flow uses) *before* deciding. A finalized-success signature is
+> promoted to `Completed` (never re-sent); a dead/expired signature is
+> demoted to `Pending`; a still-live signature is left in `Processing` for
+> the next sweep. It only quarantines when it cannot prove the outcome:
+> either **no broadcast signatures were recorded** (`no broadcast signatures
+> recorded; cannot verify release landed`) or **the RPC could not classify
+> them** (`could not verify release landed (...)`, with the signature list
+> appended). Both land here in Path C — verify on-chain and act on the
+> verdict; never blindly re-arm a row whose release may already be on-chain.
 
 1. **Verify on-chain.** Run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). This is

@@ -4,7 +4,10 @@ use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::OperatorError;
 use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
-use crate::operator::sender::find_existing_mint_signature;
+use crate::operator::sender::types::PendingSig;
+use crate::operator::sender::{
+    classify_release_signatures, find_existing_mint_signature, SigFinality,
+};
 use crate::operator::utils::instruction_util::{MintToBuilder, MintToBuilderWithTxnId};
 use crate::operator::utils::mint_idempotency_memo;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
@@ -13,6 +16,7 @@ use crate::storage::common::models::{DbTransaction, TransactionStatus, Transacti
 use crate::storage::common::storage::Storage;
 use chrono::{DateTime, Utc};
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -37,17 +41,32 @@ enum DepositOutcome {
     Ambiguous { reason: String },
 }
 
-/// Two-way outcome: on-chain SMT prevents duplicate release anyway.
+/// Withdrawal recovery outcome. We verify on-chain finality before demoting so
+/// a release that already landed is never re-sent.
 enum WithdrawalAction {
+    /// Release finalized on-chain → mark Completed with that signature.
+    Complete { signature: String },
+    /// Every recorded signature is dead → safe to requeue.
     Demote,
+    /// A recorded signature could still land → re-evaluate next sweep.
+    LeaveProcessing { reason: String },
+    /// Uncertain (no signatures, or RPC could not classify) → page.
     Quarantine { reason: String },
 }
 
 /// Unified action for the storage router.
 enum RecoveryAction {
-    Complete { signature: String },
+    Complete {
+        signature: String,
+    },
     Demote,
-    Quarantine { reason: String },
+    /// Leave the row in Processing this tick (no CAS write).
+    NoAction {
+        reason: String,
+    },
+    Quarantine {
+        reason: String,
+    },
 }
 
 /// Recovery loop. First tick runs on boot (the prime crash-recovery moment).
@@ -95,6 +114,13 @@ async fn recover_once(
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
+    // Best-effort GC of release signatures whose parent is no longer Processing;
+    // a failure here must not block recovery.
+    match storage.gc_stale_release_signatures().await {
+        Ok(removed) => debug!(removed, "Recovery GC'd stale release signatures"),
+        Err(e) => warn!("Recovery release-signature GC failed: {}", e),
+    }
+
     let stale = storage
         .get_stale_processing_transactions(STALE_THRESHOLD, RECOVERY_BATCH_LIMIT)
         .await?;
@@ -116,7 +142,7 @@ async fn recover_once(
         }
         // Capture `updated_at` before the RPC so the write below CAS-checks it.
         let captured = row.updated_at;
-        let action = decide_action(&row, rpc_client, admin_pubkey).await;
+        let action = decide_action(&row, storage, rpc_client, admin_pubkey).await;
         route_outcome(storage, &row, captured, action, program_type, storage_tx).await;
     }
     Ok(())
@@ -124,6 +150,7 @@ async fn recover_once(
 
 async fn decide_action(
     row: &DbTransaction,
+    storage: &Storage,
     rpc_client: &RpcClientWithRetry,
     admin_pubkey: Pubkey,
 ) -> RecoveryAction {
@@ -135,8 +162,10 @@ async fn decide_action(
                 DepositOutcome::Ambiguous { reason } => RecoveryAction::Quarantine { reason },
             }
         }
-        TransactionType::Withdrawal => match check_withdrawal(row) {
+        TransactionType::Withdrawal => match check_withdrawal(row, storage, rpc_client).await {
+            WithdrawalAction::Complete { signature } => RecoveryAction::Complete { signature },
             WithdrawalAction::Demote => RecoveryAction::Demote,
+            WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
             WithdrawalAction::Quarantine { reason } => RecoveryAction::Quarantine { reason },
         },
     }
@@ -167,11 +196,69 @@ async fn check_deposit_idempotency(
     }
 }
 
-fn check_withdrawal(row: &DbTransaction) -> WithdrawalAction {
-    match row.withdrawal_nonce {
-        Some(_) => WithdrawalAction::Demote,
-        None => WithdrawalAction::Quarantine {
+/// Decide a stuck Processing withdrawal's fate by verifying on-chain finality
+/// of the persisted release signatures; never demote one whose release landed.
+async fn check_withdrawal(
+    row: &DbTransaction,
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+) -> WithdrawalAction {
+    if row.withdrawal_nonce.is_none() {
+        return WithdrawalAction::Quarantine {
             reason: "withdrawal row missing nonce".to_string(),
+        };
+    }
+
+    let stored = match storage.get_release_signatures(row.id).await {
+        Ok(s) => s,
+        // Can't read the durable record → can't prove the release didn't land.
+        Err(e) => {
+            return WithdrawalAction::Quarantine {
+                reason: format!("release signature lookup failed: {e}"),
+            };
+        }
+    };
+
+    // No recorded signatures → can't verify a release landed; demoting risks a
+    // double-payout, so page instead.
+    if stored.is_empty() {
+        return WithdrawalAction::Quarantine {
+            reason: "no broadcast signatures recorded; cannot verify release landed".to_string(),
+        };
+    }
+
+    // Reconstruct PendingSigs for the classifier; a malformed stored signature
+    // is uncertainty, not "dead".
+    let mut pending = Vec::with_capacity(stored.len());
+    for (sig_str, lvbh) in &stored {
+        match Signature::from_str(sig_str) {
+            Ok(signature) => pending.push(PendingSig {
+                signature,
+                last_valid_block_height: *lvbh as u64,
+            }),
+            Err(e) => {
+                return WithdrawalAction::Quarantine {
+                    reason: format!("malformed stored release signature {sig_str}: {e}"),
+                };
+            }
+        }
+    }
+
+    match classify_release_signatures(rpc_client, &pending).await {
+        SigFinality::Landed(sig) => WithdrawalAction::Complete {
+            signature: sig.to_string(),
+        },
+        SigFinality::Dead => WithdrawalAction::Demote,
+        SigFinality::Live(reason) => WithdrawalAction::LeaveProcessing { reason },
+        SigFinality::Uncertain(reason) => WithdrawalAction::Quarantine {
+            reason: format!(
+                "could not verify release landed ({reason}); signatures: {}",
+                stored
+                    .iter()
+                    .map(|(s, _)| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
         },
     }
 }
@@ -273,6 +360,14 @@ async fn route_outcome(
                 }
                 Err(e) => warn!(id = row.id, "recovery write error: {}", e),
             }
+        }
+        RecoveryAction::NoAction { reason } => {
+            // Release could still land; leave Processing untouched (no CAS write).
+            debug!(
+                transaction_id = row.id,
+                reason = %reason,
+                "Recovery left stale Processing withdrawal untouched — release may still land"
+            );
         }
         RecoveryAction::Quarantine { reason } => {
             // Noisy by design — page on uncertainty, never silently demote.
@@ -587,20 +682,182 @@ mod tests {
 
     // ── check_withdrawal outcome matrix ───────────────────────────────
 
-    #[test]
-    fn check_withdrawal_demotes_when_nonce_present() {
-        let row = make_withdrawal_row(1, Some(42));
-        let action = check_withdrawal(&row);
-        assert!(matches!(action, WithdrawalAction::Demote));
-    }
-
-    #[test]
-    fn check_withdrawal_quarantines_when_nonce_missing() {
+    /// Missing nonce → quarantine before any RPC/storage read.
+    #[tokio::test]
+    async fn check_withdrawal_quarantines_when_nonce_missing() {
+        let mock = MockStorage::new();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, None);
-        let action = check_withdrawal(&row);
+        let action = check_withdrawal(&row, &storage, &client).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(reason.contains("withdrawal row missing nonce"));
+            }
+            _ => panic!("expected Quarantine"),
+        }
+    }
+
+    /// No recorded signatures → quarantine, not demote (double-payout risk).
+    #[tokio::test]
+    async fn check_withdrawal_quarantines_when_no_signatures_recorded() {
+        let mock = MockStorage::new();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client("http://localhost:1");
+        let row = make_withdrawal_row(1, Some(42));
+        let action = check_withdrawal(&row, &storage, &client).await;
+        match action {
+            WithdrawalAction::Quarantine { reason } => {
+                assert!(
+                    reason.contains("no broadcast signatures recorded"),
+                    "reason: {reason}"
+                );
+            }
+            _ => panic!("expected Quarantine"),
+        }
+    }
+
+    /// Null-status signature past blockhash validity is dead → demote.
+    #[tokio::test]
+    async fn check_withdrawal_demotes_when_signature_dead() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
+            )
+            .create();
+        let _height = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":1000,"id":1}"#)
+            .create();
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(42));
+        // current_height (1000) > lvbh (100) → expired/dead.
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(&row, &storage, &client).await;
+        assert!(
+            matches!(action, WithdrawalAction::Demote),
+            "expected Demote"
+        );
+    }
+
+    /// Finalized-success signature → Complete with that sig.
+    #[tokio::test]
+    async fn check_withdrawal_completes_when_signature_landed() {
+        let landed_sig = Signature::new_unique();
+        let mut server = mockito::Server::new_async().await;
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .create();
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(42));
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(&row, &storage, &client).await;
+        match action {
+            WithdrawalAction::Complete { signature } => {
+                assert_eq!(signature, landed_sig.to_string());
+            }
+            _ => panic!("expected Complete"),
+        }
+    }
+
+    /// Signature still within blockhash validity → leave in Processing.
+    #[tokio::test]
+    async fn check_withdrawal_leaves_processing_when_signature_live() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
+            )
+            .create();
+        let _height = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":50,"id":1}"#)
+            .create();
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(42));
+        // current_height (50) <= lvbh (1000) → still live.
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(&row, &storage, &client).await;
+        assert!(
+            matches!(action, WithdrawalAction::LeaveProcessing { .. }),
+            "expected LeaveProcessing"
+        );
+    }
+
+    /// RPC failure during classification is uncertainty → quarantine, never demote.
+    #[tokio::test]
+    async fn check_withdrawal_quarantines_on_rpc_uncertainty() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = server
+            .mock("POST", "/")
+            .with_status(500)
+            .with_body("internal server error")
+            .create();
+
+        let mock = MockStorage::new();
+        let row = make_withdrawal_row(1, Some(42));
+        let recorded_sig = Signature::new_unique().to_string();
+        mock.insert_release_signature(row.id, recorded_sig.clone(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock);
+        let client = make_rpc_client(&server.url());
+
+        let action = check_withdrawal(&row, &storage, &client).await;
+        match action {
+            WithdrawalAction::Quarantine { reason } => {
+                assert!(
+                    reason.contains("could not verify release landed"),
+                    "reason: {reason}"
+                );
+                assert!(
+                    reason.contains(&recorded_sig),
+                    "sig should be in reason: {reason}"
+                );
             }
             _ => panic!("expected Quarantine"),
         }

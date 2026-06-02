@@ -13,6 +13,9 @@ pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<
 /// (transaction_id, signatures, last_valid_block_heights, deadline) persisted on PendingRemint transition.
 pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>);
 
+/// In-memory mirror of `pending_release_signatures`: txn_id → (signature, lvbh).
+pub type ReleaseSignatureMap = HashMap<i64, Vec<(String, i64)>>;
+
 #[derive(Clone, Default)]
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
@@ -29,6 +32,8 @@ pub struct MockStorage {
     /// Transactions currently in PendingRemint status, used in tests to simulate startup recovery.
     pub pending_remint_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
+    /// Mirrors the `pending_release_signatures` table for verify-before-demote.
+    pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
 }
 
 impl MockStorage {
@@ -562,4 +567,76 @@ impl MockStorage {
         }
         Ok(false)
     }
+
+    pub async fn insert_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("insert_release_signature")?;
+        let mut map = self.release_signatures.lock().unwrap();
+        // Mirror Postgres `ON CONFLICT (signature) DO NOTHING`.
+        if map_contains_signature(&map, &signature) {
+            return Ok(());
+        }
+        map.entry(transaction_id)
+            .or_default()
+            .push((signature, last_valid_block_height));
+        Ok(())
+    }
+
+    pub async fn get_release_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        self.check_should_fail("get_release_signatures")?;
+        Ok(self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn delete_release_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        self.check_should_fail("delete_release_signatures")?;
+        self.release_signatures
+            .lock()
+            .unwrap()
+            .remove(&transaction_id);
+        Ok(())
+    }
+
+    pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
+        self.check_should_fail("gc_stale_release_signatures")?;
+        // Mirror the Postgres predicate: drop sigs whose parent is not
+        // `Processing`; an unknown transaction id counts as non-processing.
+        let processing_ids: std::collections::HashSet<i64> = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.status == TransactionStatus::Processing)
+            .map(|t| t.id)
+            .collect();
+        let mut map = self.release_signatures.lock().unwrap();
+        let mut removed = 0u64;
+        map.retain(|txn_id, sigs| {
+            if processing_ids.contains(txn_id) {
+                true
+            } else {
+                removed += sigs.len() as u64;
+                false
+            }
+        });
+        Ok(removed)
+    }
+}
+
+/// True if `signature` is already recorded for any transaction in the map.
+fn map_contains_signature(map: &ReleaseSignatureMap, signature: &str) -> bool {
+    map.values()
+        .any(|sigs| sigs.iter().any(|(s, _)| s == signature))
 }

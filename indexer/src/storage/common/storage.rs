@@ -3,7 +3,9 @@ pub use super::models::*;
 pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
+pub mod delete_release_signatures;
 pub mod drop_tables;
+pub mod gc_stale_release_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
@@ -15,11 +17,13 @@ pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
+pub mod get_release_signatures;
 pub mod get_stale_processing_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
+pub mod insert_release_signature;
 pub mod quarantine_all_active_withdrawals;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
@@ -347,6 +351,42 @@ impl Storage {
             expected_updated_at,
         )
         .await
+    }
+
+    /// Record a broadcast release signature so recovery can verify finality
+    /// before demoting. Idempotent on `signature`.
+    pub async fn insert_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), StorageError> {
+        insert_release_signature::insert_release_signature(
+            self,
+            transaction_id,
+            signature,
+            last_valid_block_height,
+        )
+        .await
+    }
+
+    /// Stored release signatures for a transaction as (signature, lvbh).
+    pub async fn get_release_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        get_release_signatures::get_release_signatures(self, transaction_id).await
+    }
+
+    /// Delete all stored release signatures for a transaction.
+    pub async fn delete_release_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        delete_release_signatures::delete_release_signatures(self, transaction_id).await
+    }
+
+    /// Drop release signatures whose parent transaction is no longer
+    /// `Processing`. Returns the number of rows removed.
+    pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
+        gc_stale_release_signatures::gc_stale_release_signatures(self).await
     }
 }
 
@@ -1107,7 +1147,9 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
+            remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
         });
     }
 

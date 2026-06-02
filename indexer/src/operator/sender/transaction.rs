@@ -315,6 +315,23 @@ pub(super) async fn send_and_confirm(
                         signature,
                         last_valid_block_height,
                     });
+
+                // Record the broadcast signature so recovery can verify finality
+                // before demoting. Best-effort: a failed
+                // insert only makes recovery quarantine later, so never fail the send.
+                if let Some(txid) = ctx.transaction_id {
+                    if let Err(e) = state
+                        .storage
+                        .insert_release_signature(
+                            txid,
+                            signature.to_string(),
+                            last_valid_block_height as i64,
+                        )
+                        .await
+                    {
+                        warn!("failed to persist release signature for tx {txid}: {e}");
+                    }
+                }
             }
 
             let commitment_config = CommitmentConfig::confirmed();

@@ -349,10 +349,10 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
     mock.shutdown().await;
 }
 
-// IT-3: withdrawal not landed → demote.
+// IT-3: withdrawal whose recorded release signature is dead (null status, blockhash expired) → demote.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it3_withdrawal_demoted_unconditionally() {
+async fn it3_withdrawal_dead_signature_demoted() {
     let (db, url, _container) = start_pg("it3_wd_demote").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
@@ -361,9 +361,17 @@ async fn it3_withdrawal_demoted_unconditionally() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 7);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+        .await
+        .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // The withdrawal path makes no RPC calls. Script nothing.
+    // Status null + current height (1000) > lvbh (100) → expired/dead.
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+    );
+    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -385,15 +393,16 @@ async fn it3_withdrawal_demoted_unconditionally() {
         fresh > Utc::now() - ChronoDuration::seconds(5),
         "updated_at should be fresh"
     );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
     assert_recovered_increment("withdraw", "requeued", "withdrawal", metric_before, "IT-3");
     mock.shutdown().await;
 }
 
-// IT-4: withdrawal recovery makes ZERO RPC calls.
+// IT-4: withdrawal whose recorded release signature finalized → Completed, no re-send.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it4_withdrawal_recovery_zero_rpc_calls() {
-    let (db, url, _container) = start_pg("it4_zero_rpc").await;
+async fn it4_withdrawal_landed_signature_completed_no_resend() {
+    let (db, url, _container) = start_pg("it4_landed").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -401,8 +410,73 @@ async fn it4_withdrawal_recovery_zero_rpc_calls() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 1);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    let landed_sig = Signature::new_unique();
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+        .await
+        .unwrap();
 
     let mock = MockRpcServer::start().await;
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
+    );
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("withdraw", "completed", "withdrawal");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, tx_id).await,
+        Some(landed_sig.to_string())
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment("withdraw", "completed", "withdrawal", metric_before, "IT-4");
+    mock.shutdown().await;
+}
+
+// IT-4b: withdrawal whose recorded signature is still live → left in Processing (no CAS write).
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it4b_withdrawal_live_signature_left_processing() {
+    let (db, url, _container) = start_pg("it4b_live").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 2);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    // Status null + current height (50) <= lvbh (1000) → still live.
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+    );
+    mock.enqueue("getBlockHeight", Reply::result(json!(50)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -416,17 +490,198 @@ async fn it4_withdrawal_recovery_zero_rpc_calls() {
     .await
     .unwrap();
 
-    // Every method should have zero calls — the recovery path took no RPC.
-    for method in &[
-        "getSignaturesForAddress",
-        "getTransaction",
-        "sendTransaction",
-        "getLatestBlockhash",
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "live signature must leave the row in Processing for the next sweep"
+    );
+    // No CAS write → updated_at stays backdated, not refreshed to "now".
+    assert!(
+        updated_at_of(&pool, tx_id).await < Utc::now() - ChronoDuration::minutes(5),
+        "no CAS write means updated_at must stay backdated, not refreshed"
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    mock.shutdown().await;
+}
+
+// IT-4c: withdrawal with no recorded signatures → quarantine (can't verify, double-payout risk).
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it4c_withdrawal_no_signatures_quarantined() {
+    let (db, url, _container) = start_pg("it4c_no_sigs").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 3);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
+    // No RPC needed — empty signature set short-circuits before classification.
+    assert_eq!(mock.call_count("getSignatureStatuses"), 0);
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    let update = storage_rx
+        .try_recv()
+        .expect("manual_review update should be sent");
+    let err = update.error_message.as_deref().unwrap_or("");
+    assert!(
+        err.contains("no broadcast signatures recorded"),
+        "reason: {err}"
+    );
+    assert_recovered_increment(
+        "withdraw",
+        "quarantined",
+        "withdrawal",
+        metric_before,
+        "IT-4c",
+    );
+    mock.shutdown().await;
+}
+
+// IT-4d: RPC uncertainty during classification → quarantine, never demote.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it4d_withdrawal_rpc_uncertain_quarantined() {
+    let (db, url, _container) = start_pg("it4d_uncertain").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), 4);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    // getSignatureStatuses fails on every retry → Uncertain.
+    mock.enqueue_sequence(
         "getSignatureStatuses",
-    ] {
-        assert_eq!(mock.call_count(method), 0, "{method} should have 0 calls");
-    }
-    assert_eq!(status_of(&pool, tx_id).await, "pending");
+        vec![
+            Reply::error(-32000, "internal"),
+            Reply::error(-32000, "internal"),
+            Reply::error(-32000, "internal"),
+        ],
+    );
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "manual_review",
+        "RPC uncertainty must quarantine, never silently demote"
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    let update = storage_rx
+        .try_recv()
+        .expect("manual_review update should be sent");
+    let err = update.error_message.as_deref().unwrap_or("");
+    assert!(
+        err.contains("could not verify release landed"),
+        "reason: {err}"
+    );
+    assert_recovered_increment(
+        "withdraw",
+        "quarantined",
+        "withdrawal",
+        metric_before,
+        "IT-4d",
+    );
+    mock.shutdown().await;
+}
+
+// IT-4e: GC backstop reclaims release sigs whose parent left Processing.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it4e_gc_reclaims_non_processing_release_sigs() {
+    let (db, url, _container) = start_pg("it4e_gc").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    // One processing withdrawal (sig retained) and one completed (sig GC'd).
+    let proc = make_withdrawal(&Signature::new_unique().to_string(), 10);
+    let proc_id = db.insert_transaction_internal(&proc).await.unwrap();
+    let done = make_withdrawal(&Signature::new_unique().to_string(), 11);
+    let done_id = db.insert_transaction_internal(&done).await.unwrap();
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(proc_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
+        .bind(done_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1)
+        .await
+        .unwrap();
+    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    // recover_once runs gc_stale_release_signatures at the top of the sweep.
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Withdraw,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    let remaining_done: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1",
+    )
+    .bind(done_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_done, 0, "completed txn's sig must be GC'd");
+    let remaining_proc: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1",
+    )
+    .bind(proc_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_proc, 1, "processing txn's sig must be retained");
     mock.shutdown().await;
 }
 
