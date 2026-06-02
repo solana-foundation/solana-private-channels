@@ -40,7 +40,7 @@ pub enum OperatorError {
     WebhookError(String),
 
     #[error(
-        "Mint {mint} is not in the allow-listed mints table (transaction {transaction_id}); refusing to mint"
+        "Mint {mint} has no allowed status in mint_status_history at the deposit's slot (transaction {transaction_id}); refusing to mint"
     )]
     MintNotAllowed { transaction_id: i64, mint: String },
 }

@@ -58,7 +58,7 @@ to the right Path below.
 
 | `error_message` contains | Cause |
 |---|---|
-| `is not in the allow-listed mints table` | The deposit's `mint` has no row in `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint. Row data is fine; no on-chain mint attempted. See **Path E**. |
+| `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path E**. |
 
 Pull the row:
 
@@ -213,9 +213,9 @@ UPDATE transactions SET status = 'pending', updated_at = NOW()
 
 ### Path E - mint not in `AllowMint` allowlist
 
-`error_message`: `is not in the allow-listed mints table`. The deposit's
-mint has no row in `mints`; the operator refused to mint on the private
-channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
+`error_message`: `has no allowed status in mint_status_history`. The deposit's
+mint has no `allowed` entry in `mint_status_history` at the deposit's slot (the
+`mints` row may exist); the operator refused to mint on the private channel. **No `MintTo` was built** therefore `_verify_onchain_mint.md` does not
 apply. Steps 1–2 diagnose *why* the allowlist row is missing; Steps 3a–3c
 are the recovery branches.
 
