@@ -1673,6 +1673,8 @@ mod tests {
             counterpart_signature: None,
             remint_signatures: None,
             pending_remint_deadline_at: None,
+            remint_last_valid_block_heights: None,
+            finality_check_attempts: 0,
         });
         id
     }

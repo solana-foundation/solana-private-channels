@@ -19,6 +19,7 @@ pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
+pub mod mark_mints_blocked;
 pub mod quarantine_all_active_withdrawals;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
@@ -150,6 +151,11 @@ impl Storage {
         statuses: &[DbMintStatus],
     ) -> Result<(), StorageError> {
         insert_mint_statuses_batch::insert_mint_statuses_batch(self, statuses).await
+    }
+
+    /// Flip the given mints' `status` to `'blocked'`. No-op for missing rows.
+    pub async fn mark_mints_blocked(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
+        mark_mints_blocked::mark_mints_blocked(self, mint_addresses).await
     }
 
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
@@ -675,6 +681,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_mints_blocked_flips_status_and_preserves_metadata() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
+
+        storage.mark_mints_blocked(&["m1".to_string()]).await.unwrap();
+
+        let m = storage.get_mint("m1").await.unwrap().unwrap();
+        assert_eq!(m.status, "blocked");
+        // Metadata is untouched by a block.
+        assert_eq!(m.decimals, 6);
+        assert_eq!(m.token_program, TOKEN_PROGRAM);
+
+        // Re-allow flips it back via the upsert path.
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
+    }
+
+    #[tokio::test]
+    async fn mark_mints_blocked_missing_row_is_noop() {
+        let (storage, _mock) = make_mock_storage();
+        // No row for "ghost" — must not error.
+        storage.mark_mints_blocked(&["ghost".to_string()]).await.unwrap();
+        assert!(storage.get_mint("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn dispatch_get_mint_via_mock() {
         let (storage, _mock) = make_mock_storage();
         // Populate with mints
@@ -1031,6 +1070,28 @@ mod tests {
         assert_eq!(res, MintStatusAtSlot::Allowed);
     }
 
+    /// Accepted limitation: a same-slot allow + block can't both be stored — PK
+    /// `(mint_address, effective_slot)` with `ON CONFLICT DO NOTHING` and no
+    /// intra-slot tiebreak, so the first inserted wins. Rare (admin-only); pinned
+    /// here so it can't change silently. Allow inserted first → block dropped.
+    #[tokio::test]
+    async fn get_mint_status_at_slot_same_slot_allow_then_block_keeps_first_inserted() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 10),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
+        assert_eq!(
+            res,
+            MintStatusAtSlot::Allowed,
+            "first-inserted row wins on a same-slot conflict; the block is dropped",
+        );
+    }
+
     // ── orphan query against status history ──────────────────────────
 
     fn seed_deposit(mock: &MockStorage, id: i64, mint: &str, slot: i64) {
@@ -1054,6 +1115,8 @@ mod tests {
             counterpart_signature: None,
             remint_signatures: None,
             pending_remint_deadline_at: None,
+            remint_last_valid_block_heights: None,
+            finality_check_attempts: 0,
         });
     }
 

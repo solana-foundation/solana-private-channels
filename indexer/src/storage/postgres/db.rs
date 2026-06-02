@@ -374,6 +374,14 @@ impl PostgresDb {
             .execute(&self.pool)
             .await?;
 
+        // Current allow/block state. Existing rows backfill to 'allowed' via the
+        // default; the point-in-time history lives in mint_status_history.
+        sqlx::query(
+            "ALTER TABLE mints ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'allowed'",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -1016,21 +1024,41 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program)
-                VALUES ($1, $2, $3)
+                INSERT INTO mints (mint_address, decimals, token_program, status)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
-                    token_program = EXCLUDED.token_program
+                    token_program = EXCLUDED.token_program,
+                    status = EXCLUDED.status
                 "#,
             )
             .bind(&mint.mint_address)
             .bind(mint.decimals)
             .bind(&mint.token_program)
+            .bind(&mint.status)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Flip the given mints' `status` to `'blocked'`, leaving metadata untouched.
+    /// A missing row is a no-op.
+    pub async fn mark_mints_blocked_internal(
+        &self,
+        mint_addresses: &[String],
+    ) -> Result<(), StorageError> {
+        if mint_addresses.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query("UPDATE mints SET status = 'blocked' WHERE mint_address = ANY($1)")
+            .bind(mint_addresses)
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 
