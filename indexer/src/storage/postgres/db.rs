@@ -1028,8 +1028,7 @@ impl PostgresDb {
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
-                    token_program = EXCLUDED.token_program,
-                    status = EXCLUDED.status
+                    token_program = EXCLUDED.token_program
                 "#,
             )
             .bind(&mint.mint_address)
@@ -1044,9 +1043,9 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Flip the given mints' `status` to `'blocked'`, leaving metadata untouched.
-    /// A missing row is a no-op.
-    pub async fn mark_mints_blocked_internal(
+    /// Set each mint's `status` mirror to its latest `mint_status_history`
+    /// transition (highest `effective_slot`); a mint with no row is untouched.
+    pub async fn sync_mint_status_internal(
         &self,
         mint_addresses: &[String],
     ) -> Result<(), StorageError> {
@@ -1054,10 +1053,22 @@ impl PostgresDb {
             return Ok(());
         }
 
-        sqlx::query("UPDATE mints SET status = 'blocked' WHERE mint_address = ANY($1)")
-            .bind(mint_addresses)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            r#"
+            UPDATE mints m
+            SET status = h.status
+            FROM (
+                SELECT DISTINCT ON (mint_address) mint_address, status
+                FROM mint_status_history
+                WHERE mint_address = ANY($1)
+                ORDER BY mint_address, effective_slot DESC
+            ) h
+            WHERE m.mint_address = h.mint_address
+            "#,
+        )
+        .bind(mint_addresses)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }

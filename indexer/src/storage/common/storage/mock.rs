@@ -215,14 +215,12 @@ impl MockStorage {
             // restart, retry) must preserve those flags, otherwise the next
             // withdrawal wastes an RPC round-trip re-resolving them. A
             // blanket `insert` here would silently disagree with prod and
-            // let tests lock in the wrong behavior. `status` follows prod's
-            // `SET status = EXCLUDED.status`, so a re-allow flips a blocked
-            // mint back to allowed.
+            // let tests lock in the wrong behavior. `status` is NOT touched on
+            // conflict — `sync_mint_status` is the sole writer of the mirror.
             match store.get_mut(&mint.mint_address) {
                 Some(existing) => {
                     existing.decimals = mint.decimals;
                     existing.token_program = mint.token_program.clone();
-                    existing.status = mint.status.clone();
                 }
                 None => {
                     store.insert(mint.mint_address.clone(), mint.clone());
@@ -232,17 +230,31 @@ impl MockStorage {
         Ok(())
     }
 
-    /// Mirrors `mark_mints_blocked_internal`: flip existing rows to `"blocked"`;
-    /// a missing row is a no-op.
-    pub async fn mark_mints_blocked(
+    /// Mirrors `sync_mint_status_internal`: set each mint's `status` to its
+    /// latest `mint_status_history` transition; a missing row is a no-op.
+    pub async fn sync_mint_status(
         &self,
         mint_addresses: &[String],
     ) -> Result<(), StorageError> {
-        self.check_should_fail("mark_mints_blocked")?;
+        self.check_should_fail("sync_mint_status")?;
+        // Resolve the latest status per address without holding both locks.
+        let latest: std::collections::HashMap<String, String> = {
+            let history = self.mint_status_history.lock().unwrap();
+            mint_addresses
+                .iter()
+                .filter_map(|addr| {
+                    history
+                        .iter()
+                        .filter(|r| &r.mint_address == addr)
+                        .max_by_key(|r| r.effective_slot)
+                        .map(|r| (addr.clone(), r.status.clone()))
+                })
+                .collect()
+        };
         let mut store = self.mints.lock().unwrap();
-        for addr in mint_addresses {
-            if let Some(existing) = store.get_mut(addr) {
-                existing.status = "blocked".to_string();
+        for (addr, status) in latest {
+            if let Some(existing) = store.get_mut(&addr) {
+                existing.status = status;
             }
         }
         Ok(())
