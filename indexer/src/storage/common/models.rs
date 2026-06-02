@@ -123,6 +123,24 @@ impl DbMint {
     }
 }
 
+/// Status transition row recording an Allow/Block decision for a mint at a slot.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DbMintStatus {
+    pub mint_address: String,
+    pub status: String,
+    pub effective_slot: i64,
+    pub signature: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Resolved mint status at a particular slot, derived from `mint_status_history`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintStatusAtSlot {
+    Allowed,
+    Blocked,
+    NeverAllowed,
+}
+
 /// Builder for DbTransaction
 pub struct DbTransactionBuilder {
     signature: String,

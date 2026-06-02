@@ -82,6 +82,11 @@ pub async fn run_startup_reconciliation(
         "Running startup reconciliation"
     );
 
+    // Snapshot of any deposit rows whose mint never had an `AllowMint` row.
+    // The log here gives a complete boot-time snapshot before runtime
+    // dedup hides anything they haven't already seen.
+    log_orphan_deposit_rows_at_startup(storage).await;
+
     let rpc_client = RpcClientWithRetry::with_retry_config(
         rpc_url.to_string(),
         RetryConfig::default(),
@@ -139,6 +144,31 @@ pub async fn run_startup_reconciliation(
     }
 
     classify_and_report(config, &results)
+}
+
+/// Log deposit rows whose mint was not allowed at the deposit's slot.
+/// Diagnostic only, surfaced at boot, never fails startup, and a query
+/// failure is logged at `warn` and swallowed rather than propagated.
+async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
+    match storage.get_orphan_deposit_ids().await {
+        Ok(orphans) if !orphans.is_empty() => {
+            error!(
+                row_count = orphans.len(),
+                orphan_ids = ?orphans,
+                "Startup reconciliation: orphan deposit row(s) present (deposit rows with \
+                 no allowed mint status at the deposit's slot) — surfaced for visibility, does not fail startup"
+            );
+        }
+        Ok(_) => {
+            info!("Startup reconciliation: no orphan deposit rows");
+        }
+        Err(e) => {
+            warn!(
+                "Startup reconciliation: failed to query orphan deposit ids: {}",
+                e
+            );
+        }
+    }
 }
 
 /// Fetch the raw token balance for an ATA.

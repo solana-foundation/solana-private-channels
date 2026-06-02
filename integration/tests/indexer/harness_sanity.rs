@@ -31,7 +31,7 @@
 
 use {
     private_channel_indexer::storage::common::models::{
-        DbTransaction, TransactionStatus, TransactionType,
+        DbMint, DbMintStatus, DbTransaction, TransactionStatus, TransactionType,
     },
     serde_json::json,
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
@@ -160,6 +160,28 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
     //    dequeued within a few ticks.
     let mint_pk = Pubkey::new_unique();
     let recipient_pk = Pubkey::new_unique();
+    // operator gate: a `mint_status_history` row with status=allowed at
+    // or before the deposit's slot must exist or
+    // `assert_mint_allowed_at_slot` quarantines the row before the
+    // sender ever runs. We seed the `mints` row in parallel to mirror the
+    // production AllowMint dual-write.
+    harness.storage.mints.lock().unwrap().insert(
+        mint_pk.to_string(),
+        DbMint::new(mint_pk.to_string(), 6, spl_token::id().to_string()),
+    );
+    harness
+        .storage
+        .mint_status_history
+        .lock()
+        .unwrap()
+        .push(DbMintStatus {
+            mint_address: mint_pk.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{mint_pk}"),
+            created_at: chrono::Utc::now(),
+        });
+
     harness
         .storage
         .pending_transactions
