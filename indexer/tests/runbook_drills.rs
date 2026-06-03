@@ -287,7 +287,7 @@ fn drill_1_error_message_contracts_present_in_source() {
         // `OperatorError::MintNotAllowed`'s `#[error(...)]` template; if
         // that string is refactored, the triage table desyncs silently.
         (
-            "is not in the allow-listed mints table",
+            "has no allowed status in mint_status_history",
             "indexer/src/error/operator.rs",
         ),
     ];
@@ -1109,7 +1109,7 @@ async fn drill_17_deposit_manual_review_allowlist_gate_recovery_flows(
         "Path F depends on OperatorError::MintNotAllowed — variant missing from operator.rs",
     );
     assert!(
-        operator_err.contains("is not in the allow-listed mints table"),
+        operator_err.contains("has no allowed status in mint_status_history"),
         "Path F triage dispatches on this substring — missing from operator.rs",
     );
     eprintln!("OK   error/operator.rs: MintNotAllowed + dispatch substring");

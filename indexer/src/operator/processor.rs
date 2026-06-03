@@ -2389,8 +2389,8 @@ mod tests {
             .as_deref()
             .expect("quarantine update must include a reason");
         assert!(
-            reason.contains("allow-listed") || reason.contains("not in the allow"),
-            "expected reason to mention the mint allow-list, got: {reason}",
+            reason.contains("mint_status_history"),
+            "expected reason to mention the mint status history gate, got: {reason}",
         );
 
         assert!(
