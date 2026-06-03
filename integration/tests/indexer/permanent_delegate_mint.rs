@@ -34,7 +34,7 @@ use private_channel_escrow_program_client::{
     instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_indexer::storage::common::models::{
-    DbMint, DbTransaction, TransactionStatus, TransactionType,
+    DbMint, DbMintStatus, DbTransaction, TransactionStatus, TransactionType,
 };
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
@@ -419,6 +419,15 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         TOKEN_2022_PROGRAM_ID.to_string(),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            mint_address: mint_pubkey.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{mint_pubkey}"),
+            created_at: Utc::now(),
+        }])
+        .await?;
     let pre = storage
         .get_mint(&mint_pubkey.to_string())
         .await?
@@ -582,6 +591,15 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
         TOKEN_2022_PROGRAM_ID.to_string(),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            mint_address: mint_pubkey.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{mint_pubkey}"),
+            created_at: Utc::now(),
+        }])
+        .await?;
 
     let withdraw_amount: u64 = 50_000;
     let withdrawal_sig = Signature::new_unique().to_string();

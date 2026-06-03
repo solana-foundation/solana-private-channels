@@ -34,7 +34,7 @@ use private_channel_indexer::operator;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
 use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
 use private_channel_indexer::storage::common::models::{
-    DbMint, DbTransaction, DbTransactionBuilder, TransactionStatus,
+    DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionStatus,
 };
 use private_channel_indexer::storage::{PostgresDb, Storage, TransactionType};
 use private_channel_indexer::PostgresConfig;
@@ -53,6 +53,22 @@ use testcontainers_modules::postgres::Postgres;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+async fn seed_mint_status_allowed(
+    storage: &Storage,
+    mint_address: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            mint_address: mint_address.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{mint_address}"),
+            created_at: Utc::now(),
+        }])
+        .await?;
+    Ok(())
+}
 
 fn default_operator_config(alert_url: Option<String>) -> OperatorConfig {
     OperatorConfig {
@@ -255,6 +271,20 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
 
+    // deposit gate refuses to mint unless the mint was in `allowed`
+    // status at the deposit's slot. This test bypasses the indexer, so no
+    // `AllowMint` event is ingested, seed both rows manually to mirror
+    // what `convert_to_db_models` + `finalize_and_checkpoint` would have
+    // produced in production.
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+
     // 2. Insert 1 pending deposit directly via storage.insert_db_transaction()
     let signature = Signature::new_unique().to_string();
     let recipient = env.users[0].pubkey().to_string();
@@ -332,6 +362,18 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     let user_pubkey = env.users[0].pubkey();
+
+    // deposit gate requires an allowed status row for any mint we issue
+    // private channel tokens for; the test bypasses the indexer so seed
+    // the rows directly. See `test_deposit_operator_processes_single_mint`.
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
     let signature = Signature::new_unique().to_string();
     let recipient = user_pubkey.to_string();
@@ -413,6 +455,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     // Seed mint metadata so the withdrawal operator can build the instruction.
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
     // Ensure escrow ATA has funds to withdraw.
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
@@ -548,6 +591,7 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
         spl_token::id().to_string(),
     );
     storage.upsert_mints_batch(&[bad_mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &bad_mint.pubkey().to_string()).await?;
 
     let mint_fail_sig = Signature::new_unique().to_string();
     let recipient = env.users[0].pubkey().to_string();
@@ -570,6 +614,7 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     let bad_mint_pubkey = generate_mint(&client, &admin, &admin, &bad_withdraw_mint).await?;
     let mint_meta = DbMint::new(bad_mint_pubkey.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &bad_mint_pubkey.to_string()).await?;
     mint_to_owner(
         &client,
         &admin,
@@ -664,6 +709,18 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
 
     // Create 5 users with 0 initial balance so we can verify the exact deposit amount.
     let env = TestEnvironment::setup(&client, &faucet_keypair, NUM_USERS, 0, None).await?;
+
+    // deposit gate requires an allowed status row for any mint we issue
+    // private channel tokens for; the test bypasses the indexer so seed
+    // the rows directly. See `test_deposit_operator_processes_single_mint`.
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
     // Insert one pending deposit per user, each with a unique on-chain signature.
     let mut signatures = Vec::with_capacity(NUM_USERS);
@@ -828,6 +885,7 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
     // Register the mint in the indexer DB so the reconciliation query includes it.
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
     // Insert a deposit and mark it completed: DB now shows SEEDED_AMOUNT deposited,
     // while on-chain remains 0 — a guaranteed mismatch with tolerance_bps = 0.
@@ -965,6 +1023,7 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
     // Register the mint so the withdrawal processor can build the instruction.
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
     // Fund the escrow ATA with enough tokens to cover both withdrawals.
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
@@ -1101,6 +1160,7 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
     // Step 1: seed the DB with a COMPLETED withdrawal at nonce 0 — this
     // poisons the SMT state: when the operator rebuilds the SMT locally
