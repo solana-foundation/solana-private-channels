@@ -52,6 +52,20 @@
             },
             {
               "kind": "structFieldTypeNode",
+              "name": "tokenProgramA",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "tokenProgramB",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
               "name": "amountA",
               "type": {
                 "endian": "le",

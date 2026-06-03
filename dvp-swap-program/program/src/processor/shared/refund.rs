@@ -2,7 +2,6 @@ use pinocchio::{account::AccountView, cpi::Signer, error::ProgramError, ProgramR
 use pinocchio_token_2022::instructions::CloseAccount;
 
 use crate::{
-    processor::shared::account_check::{verify_account_owner, verify_token_program},
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
@@ -40,10 +39,13 @@ pub fn refund_and_close_dvp(
         mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
         ProgramError::InvalidAccountData
     );
-    verify_token_program(token_program_a_info)?;
-    verify_token_program(token_program_b_info)?;
-    verify_account_owner(mint_a_info, token_program_a_info.address())?;
-    verify_account_owner(mint_b_info, token_program_b_info.address())?;
+    // Token program from state, not the mint owner: an unfunded leg's
+    // mint may have been closed.
+    require!(
+        token_program_a_info.address() == &dvp.token_program_a
+            && token_program_b_info.address() == &dvp.token_program_b,
+        ProgramError::IncorrectProgramId
+    );
 
     // Address-only validation: an unfunded leg's user ATA can be
     // uninitialized; the canonical pubkey is well-defined regardless.

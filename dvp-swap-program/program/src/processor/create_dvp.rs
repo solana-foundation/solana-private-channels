@@ -129,6 +129,8 @@ pub fn process_create_dvp(
         mint_a: *mint_a_info.address(),
         mint_b: *mint_b_info.address(),
         settlement_authority: *settlement_authority_info.address(),
+        token_program_a: *token_program_a_info.address(),
+        token_program_b: *token_program_b_info.address(),
         amount_a: args.amount_a,
         amount_b: args.amount_b,
         expiry_timestamp: args.expiry_timestamp,

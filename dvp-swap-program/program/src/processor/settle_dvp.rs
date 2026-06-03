@@ -1,6 +1,6 @@
 use crate::{
     error::DvpSwapProgramError,
-    processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
+    processor::shared::account_check::{verify_account_owner, verify_signer},
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
@@ -78,8 +78,6 @@ pub fn process_settle_dvp(
     };
 
     verify_signer(settlement_authority_info, true)?;
-    verify_token_program(token_program_a_info)?;
-    verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
@@ -92,13 +90,16 @@ pub fn process_settle_dvp(
         DvpSwapProgramError::SettlementAuthorityMismatch
     );
 
-    // Bind each mint account to state and to its declared token program.
+    // Bind mints and token programs to state.
     require!(
         mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
         ProgramError::InvalidAccountData
     );
-    verify_account_owner(mint_a_info, token_program_a_info.address())?;
-    verify_account_owner(mint_b_info, token_program_b_info.address())?;
+    require!(
+        token_program_a_info.address() == &dvp.token_program_a
+            && token_program_b_info.address() == &dvp.token_program_b,
+        ProgramError::IncorrectProgramId
+    );
 
     let now = Clock::get()?.unix_timestamp;
     require!(now <= dvp.expiry_timestamp, DvpSwapProgramError::DvpExpired);

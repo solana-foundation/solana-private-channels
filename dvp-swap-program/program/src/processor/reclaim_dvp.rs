@@ -1,6 +1,6 @@
 use crate::{
     error::DvpSwapProgramError,
-    processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
+    processor::shared::account_check::{verify_account_owner, verify_signer},
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
@@ -72,7 +72,6 @@ pub fn process_reclaim_dvp(
     };
 
     verify_signer(signer_info, false)?;
-    verify_token_program(token_program_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
@@ -81,21 +80,23 @@ pub fn process_reclaim_dvp(
     };
 
     // Leg selection by signer identity.
-    let leg_mint = if signer_info.address() == &dvp.user_a {
-        &dvp.mint_a
+    let (leg_mint, leg_token_program) = if signer_info.address() == &dvp.user_a {
+        (&dvp.mint_a, &dvp.token_program_a)
     } else if signer_info.address() == &dvp.user_b {
-        &dvp.mint_b
+        (&dvp.mint_b, &dvp.token_program_b)
     } else {
         return Err(DvpSwapProgramError::SignerNotParty.into());
     };
 
-    // Bind the passed mint account to the state's mint pubkey and to the
-    // token program that owns it.
+    // Bind the passed mint and token program to state.
     require!(
         mint_info.address() == leg_mint,
         ProgramError::InvalidAccountData
     );
-    verify_account_owner(mint_info, token_program_info.address())?;
+    require!(
+        token_program_info.address() == leg_token_program,
+        ProgramError::IncorrectProgramId
+    );
 
     // Reclaim only works pre-expiry. After expiry, Cancel or Reject
     // is the way to drain a funded leg.

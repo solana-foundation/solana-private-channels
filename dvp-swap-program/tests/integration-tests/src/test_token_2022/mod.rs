@@ -18,12 +18,12 @@
 use dvp_swap_program_client::instructions::{
     CancelDvpBuilder, CreateDvpBuilder, ReclaimDvpBuilder, RejectDvpBuilder, SettleDvpBuilder,
 };
-use solana_sdk::signature::Signer;
+use solana_sdk::{account::Account, signature::Signer};
 
 use crate::{
     state_utils::{
-        assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp, assert_settle_dvp,
-        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        assert_cancel_dvp, assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp,
+        assert_settle_dvp, setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
     },
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, hook_extras_for_mint,
@@ -849,4 +849,85 @@ fn test_settle_rejects_extras_count_overrun() {
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_instruction_error(result, "InvalidInstructionData");
+}
+
+// Closed-mint recovery: a closed leg mint must not block refunding the
+// other leg.
+
+/// Overwrite `mint` as an empty System-owned account (a closed mint).
+fn close_mint(context: &mut TestContext, mint: &solana_sdk::pubkey::Pubkey) {
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+}
+
+/// leg A unfunded with its mint closed, leg B funded; Cancel refunds B.
+#[test]
+fn test_cancel_recovers_funded_leg_when_other_legs_mint_closed() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    close_mint(&mut context, &fixture.mint_a);
+
+    // Past expiry, so Reclaim is no longer an option.
+    let advance = fixture.expiry - context.now() + 1;
+    context.advance_clock(advance);
+
+    assert_cancel_dvp(&mut context, &fixture);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_b_ata_b),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_a).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_b).is_none());
+}
+
+/// Symmetric: leg B unfunded with its mint closed, leg A funded; Reject refunds A.
+#[test]
+fn test_reject_recovers_funded_leg_when_other_legs_mint_closed() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+
+    close_mint(&mut context, &fixture.mint_b);
+
+    let advance = fixture.expiry - context.now() + 1;
+    context.advance_clock(advance);
+
+    assert_reject_dvp(&mut context, &fixture, &fixture.user_a);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_a).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_b).is_none());
 }
