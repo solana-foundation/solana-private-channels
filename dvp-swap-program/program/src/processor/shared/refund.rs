@@ -29,7 +29,7 @@ pub fn refund_and_close_dvp(
     leg_a_extras: &[AccountView],
     leg_b_extras: &[AccountView],
 ) -> ProgramResult {
-    let [rent_destination_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
+    let [rent_destination_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -100,6 +100,7 @@ pub fn refund_and_close_dvp(
             leg_a_amount,
             get_mint_decimals(mint_a_info)?,
             token_program_a_info.address(),
+            memo_program_info,
             leg_a_extras,
             &signer_seeds,
         )?;
@@ -114,6 +115,7 @@ pub fn refund_and_close_dvp(
             leg_b_amount,
             get_mint_decimals(mint_b_info)?,
             token_program_b_info.address(),
+            memo_program_info,
             leg_b_extras,
             &signer_seeds,
         )?;

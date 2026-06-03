@@ -17,15 +17,24 @@ use pinocchio_token_2022::{
 use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferMint,
     confidential_transfer_fee::ConfidentialTransferFeeConfig,
-    interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
-    transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions,
+    interest_bearing_mint::InterestBearingConfig, memo_transfer::memo_required,
+    scaled_ui_amount::ScaledUiAmountConfig, transfer_fee::TransferFeeConfig,
+    BaseStateWithExtensions, StateWithExtensions,
 };
-use spl_token_2022::state::Mint as Token2022MintState;
+use spl_token_2022::state::{Account as Token2022AccountState, Mint as Token2022MintState};
 
 use crate::{error::DvpSwapProgramError, require};
 
 /// SPL Token / Token-2022 `TransferChecked` instruction discriminator.
 const TRANSFER_CHECKED_DISCRIMINATOR: u8 = 12;
+
+/// SPL Memo program.
+const MEMO_PROGRAM_ID: Address =
+    Address::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
+/// Memo emitted before a memo-required transfer. Token-2022 only checks
+/// the preceding sibling is the Memo program; the content is arbitrary.
+const MEMO_TEXT: &[u8] = b"memo required";
 
 /// Verify that `ata_info` is the canonical Associated Token Account for
 /// the given wallet/mint/token-program tuple. Address-only — does not
@@ -161,6 +170,36 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
 pub const MAX_HOOK_REMAINING_ACCOUNTS: usize = 32;
 const MAX_TRANSFER_CHECKED_ACCOUNTS: usize = 4 + MAX_HOOK_REMAINING_ACCOUNTS;
 
+/// True if `to` is a Token-2022 account requiring an incoming-transfer memo.
+#[inline(always)]
+pub fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
+    if !to.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        return Ok(false);
+    }
+    let data = to.try_borrow()?;
+    let account = StateWithExtensions::<Token2022AccountState>::unpack(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    Ok(memo_required(&account))
+}
+
+/// CPI the Memo program so it is the immediately preceding sibling of the
+/// next transfer, satisfying a memo-required destination. Validates the
+/// passed account only here — callers without a memo destination can pass
+/// any account in the slot.
+#[inline(always)]
+fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
+    require!(
+        memo_program.address() == &MEMO_PROGRAM_ID,
+        ProgramError::IncorrectProgramId
+    );
+    let instruction = InstructionView {
+        program_id: &MEMO_PROGRAM_ID,
+        accounts: &[],
+        data: MEMO_TEXT,
+    };
+    invoke_signed_with_bounds::<0>(&instruction, &[], &[])
+}
+
 /// `TransferChecked` CPI on SPL Token or Token-2022 with a trailing
 /// slice of accounts forwarded to the token program. The trailing
 /// accounts are the transfer-hook extras (hook program, validation PDA,
@@ -186,9 +225,16 @@ pub fn transfer_checked_cpi(
     amount: u64,
     decimals: u8,
     token_program: &Address,
+    memo_program: &AccountView,
     remaining: &[AccountView],
     signers: &[Signer],
 ) -> ProgramResult {
+    // A memo-required destination needs a Memo CPI as its immediately
+    // preceding sibling; emit it here so the adjacency can't be broken.
+    if requires_memo(to)? {
+        invoke_memo(memo_program)?;
+    }
+
     require!(
         remaining.len() <= MAX_HOOK_REMAINING_ACCOUNTS,
         ProgramError::InvalidArgument

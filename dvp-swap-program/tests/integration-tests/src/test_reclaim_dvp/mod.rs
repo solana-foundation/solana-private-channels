@@ -7,7 +7,10 @@ use crate::{
         assert_create_dvp, assert_fund_a, assert_fund_b, assert_reclaim_a, assert_settle_dvp,
         setup_dvp, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
     },
-    utils::{assert_program_error, get_token_balance, TestContext, DVP_EXPIRED, SIGNER_NOT_PARTY},
+    utils::{
+        assert_program_error, get_token_balance, TestContext, DVP_EXPIRED, MEMO_PROGRAM_ID,
+        SIGNER_NOT_PARTY,
+    },
 };
 
 #[test]
@@ -53,6 +56,7 @@ fn test_reclaim_dvp_b_success() {
         .dvp_source_ata(fixture.dvp_ata_b)
         .signer_dest_ata(fixture.user_b_ata_b)
         .token_program(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .instruction();
     context
         .send(ix, &[&fixture.user_b])
@@ -86,6 +90,7 @@ fn test_reclaim_dvp_rejects_settlement_authority() {
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(auth_ata_a)
         .token_program(fixture.token_program_a)
+        .memo_program(MEMO_PROGRAM_ID)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_program_error(result, SIGNER_NOT_PARTY);
@@ -113,6 +118,7 @@ fn test_reclaim_dvp_rejects_third_party() {
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(outsider_ata_a)
         .token_program(fixture.token_program_a)
+        .memo_program(MEMO_PROGRAM_ID)
         .instruction();
     let result = context.send(ix, &[&outsider]);
     assert_program_error(result, SIGNER_NOT_PARTY);
@@ -138,6 +144,7 @@ fn test_reclaim_dvp_rejects_post_expiry() {
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(fixture.user_a_ata_a)
         .token_program(fixture.token_program_a)
+        .memo_program(MEMO_PROGRAM_ID)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
     assert_program_error(result, DVP_EXPIRED);

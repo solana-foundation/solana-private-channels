@@ -35,6 +35,7 @@ pub use spl_token::ID as TOKEN_PROGRAM_ID;
 pub use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
 pub const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+pub const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 pub const SWAP_PROGRAM_ID: Pubkey = DVP_SWAP_PROGRAM_ID;
 
 /// Program ID of the no-op transfer-hook fixture loaded into LiteSVM
@@ -474,6 +475,41 @@ pub fn set_token_2022_with_hook_account(
     let mut state =
         PodStateWithExtensionsMut::<PodAccount>::unpack_uninitialized(&mut data).unwrap();
     state.init_extension::<TransferHookAccount>(true).unwrap();
+    *state.base = PodAccount {
+        mint: *mint,
+        owner: *owner,
+        amount: amount.into(),
+        delegate: PodCOption::none(),
+        state: AccountState::Initialized as u8,
+        is_native: PodCOption::none(),
+        delegated_amount: 0u64.into(),
+        close_authority: PodCOption::none(),
+    };
+    state.init_account_type().unwrap();
+    write_account(context, ata, data, TOKEN_2022_PROGRAM_ID, 2_039_280);
+}
+
+/// Writes a Token-2022 token account with MemoTransfer enabled. Incoming
+/// transfers then require a preceding Memo-program instruction.
+pub fn set_token_2022_with_memo_required(
+    context: &mut TestContext,
+    ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) {
+    use spl_token_2022::extension::memo_transfer::MemoTransfer;
+    use spl_token_2022::pod::PodCOption;
+
+    let space = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+        ExtensionType::MemoTransfer,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; space];
+    let mut state =
+        PodStateWithExtensionsMut::<PodAccount>::unpack_uninitialized(&mut data).unwrap();
+    let ext = state.init_extension::<MemoTransfer>(true).unwrap();
+    ext.require_incoming_transfer_memos = true.into();
     *state.base = PodAccount {
         mint: *mint,
         owner: *owner,

@@ -8,7 +8,7 @@ use crate::{
     },
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, TestContext,
-        SETTLEMENT_AUTHORITY_MISMATCH,
+        MEMO_PROGRAM_ID, SETTLEMENT_AUTHORITY_MISMATCH,
     },
 };
 
@@ -142,6 +142,7 @@ fn test_cancel_dvp_rejects_user_signer() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
@@ -170,6 +171,7 @@ fn test_cancel_dvp_rejects_substituted_mint_a() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
@@ -198,6 +200,7 @@ fn test_cancel_dvp_rejects_third_party() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&outsider]);

@@ -118,6 +118,10 @@ pub enum DvpSwapProgramInstruction {
         name = "token_program",
         docs = "SPL Token or Token-2022 program; must own mint"
     ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used if signer_dest_ata requires a memo"
+    ))]
     ReclaimDvp {} = 1,
 
     /// Permissioned: signer must be `dvp.settlement_authority`. Atomic
@@ -176,6 +180,10 @@ pub enum DvpSwapProgramInstruction {
         name = "token_program_b",
         docs = "SPL Token or Token-2022 program; must own mint_b"
     ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used for destinations that require a memo"
+    ))]
     SettleDvp {
         /// Splits the trailing remaining accounts between the two
         /// legs' `TransferChecked` CPIs. The first
@@ -229,6 +237,10 @@ pub enum DvpSwapProgramInstruction {
     #[codama(account(
         name = "token_program_b",
         docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used for destinations that require a memo"
     ))]
     CancelDvp {
         /// Splits the trailing remaining accounts between the two
@@ -285,6 +297,10 @@ pub enum DvpSwapProgramInstruction {
     #[codama(account(
         name = "token_program_b",
         docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used for destinations that require a memo"
     ))]
     RejectDvp {
         /// Splits the trailing remaining accounts between the two

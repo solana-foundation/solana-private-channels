@@ -18,7 +18,7 @@ use pinocchio::{
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts for the single refund CPI.
-const FIXED_ACCOUNTS_LEN: usize = 6;
+const FIXED_ACCOUNTS_LEN: usize = 7;
 
 /// Processes the ReclaimDvp instruction.
 ///
@@ -50,6 +50,7 @@ const FIXED_ACCOUNTS_LEN: usize = 6;
 /// 3. `[writable]`  dvp_source_ata  - DvP's escrow ATA for the leg's mint
 /// 4. `[writable]`  signer_dest_ata - Signer's canonical ATA for the leg's mint (caller must pre-initialize if the leg has a non-zero balance)
 /// 5. `[]`          token_program   - SPL Token or Token-2022; must own `mint`
+/// 6. `[]`          memo_program    - SPL Memo program; only used if signer_dest_ata requires a memo
 ///
 /// Trailing accounts (variable): transfer-hook extras forwarded to the
 /// refund `TransferChecked` CPI (hook program, validation PDA, and any
@@ -65,7 +66,7 @@ pub fn process_reclaim_dvp(
         ProgramError::NotEnoughAccountKeys
     );
     let (fixed, remaining) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [signer_info, swap_dvp_info, mint_info, dvp_source_ata_info, signer_dest_ata_info, token_program_info] =
+    let [signer_info, swap_dvp_info, mint_info, dvp_source_ata_info, signer_dest_ata_info, token_program_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -140,6 +141,7 @@ pub fn process_reclaim_dvp(
         escrow_balance,
         get_mint_decimals(mint_info)?,
         token_program_info.address(),
+        memo_program_info,
         remaining,
         &[Signer::from(&swap_dvp_seeds)],
     )?;

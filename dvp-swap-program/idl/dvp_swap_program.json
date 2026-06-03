@@ -456,6 +456,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgram"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used if signer_dest_ata requires a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -593,6 +602,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -721,6 +739,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -849,6 +876,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [

@@ -20,7 +20,7 @@ use pinocchio_token_2022::instructions::CloseAccount;
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts split between the two legs.
-const FIXED_ACCOUNTS_LEN: usize = 12;
+const FIXED_ACCOUNTS_LEN: usize = 13;
 
 /// Processes the SettleDvp instruction.
 ///
@@ -54,6 +54,7 @@ const FIXED_ACCOUNTS_LEN: usize = 12;
 /// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
 /// 10. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 11. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 12. `[]` memo_program - SPL Memo program; only used for destinations that require a memo
 ///
 /// Trailing accounts (variable):
 /// - First `leg_a_extras_count` go to leg A's `TransferChecked` CPI
@@ -71,7 +72,7 @@ pub fn process_settle_dvp(
 ) -> ProgramResult {
     let (fixed, leg_a_extras, leg_b_extras) =
         split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
-    let [settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
+    let [settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -190,6 +191,7 @@ pub fn process_settle_dvp(
         dvp.amount_b,
         decimals_b,
         token_program_b_info.address(),
+        memo_program_info,
         leg_b_extras,
         &signer_seeds,
     )?;
@@ -202,6 +204,7 @@ pub fn process_settle_dvp(
         dvp.amount_a,
         decimals_a,
         token_program_a_info.address(),
+        memo_program_info,
         leg_a_extras,
         &signer_seeds,
     )?;
@@ -226,6 +229,7 @@ pub fn process_settle_dvp(
             asset_surplus,
             decimals_a,
             token_program_a_info.address(),
+            memo_program_info,
             leg_a_extras,
             &signer_seeds,
         )?;
@@ -241,6 +245,7 @@ pub fn process_settle_dvp(
             cash_surplus,
             decimals_b,
             token_program_b_info.address(),
+            memo_program_info,
             leg_b_extras,
             &signer_seeds,
         )?;

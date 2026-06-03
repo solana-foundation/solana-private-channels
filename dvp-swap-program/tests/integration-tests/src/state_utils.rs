@@ -9,7 +9,8 @@ use solana_sdk::{
 use spl_token_2022::instruction::transfer_checked;
 
 use crate::utils::{
-    create_ata, dvp_ata, fund_wallet_ata, set_mint, swap_dvp_pda, TestContext, TOKEN_PROGRAM_ID,
+    create_ata, dvp_ata, fund_wallet_ata, set_mint, swap_dvp_pda, TestContext, MEMO_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
 };
 
 pub const AMOUNT_A: u64 = 75_000;
@@ -202,6 +203,7 @@ pub fn assert_reclaim_a(context: &mut TestContext, fixture: &DvpFixture) -> Tran
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(fixture.user_a_ata_a)
         .token_program(fixture.token_program_a)
+        .memo_program(MEMO_PROGRAM_ID)
         .instruction();
     context.send(ix, &[&fixture.user_a]).expect("ReclaimDvp A")
 }
@@ -220,6 +222,7 @@ pub fn assert_settle_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     context
@@ -239,6 +242,7 @@ pub fn assert_cancel_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     context
@@ -262,6 +266,7 @@ pub fn assert_reject_dvp(
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     context.send(ix, &[signer]).expect("RejectDvp")

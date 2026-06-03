@@ -13,7 +13,8 @@ use crate::{
     },
     utils::{
         assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
-        get_token_balance, set_mint, swap_dvp_pda, TestContext, SIGNER_NOT_PARTY, TOKEN_PROGRAM_ID,
+        get_token_balance, set_mint, swap_dvp_pda, TestContext, MEMO_PROGRAM_ID, SIGNER_NOT_PARTY,
+        TOKEN_PROGRAM_ID,
     },
 };
 
@@ -124,6 +125,7 @@ fn test_reject_dvp_rejects_settlement_authority_as_signer() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
@@ -151,6 +153,7 @@ fn test_reject_dvp_rejects_substituted_mint_a() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
@@ -178,6 +181,7 @@ fn test_reject_dvp_rejects_third_party() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&outsider]);
@@ -273,6 +277,7 @@ fn test_reject_dvp_works_when_settlement_authority_is_unreachable() {
         .user_b_ata_b(user_b_ata_b)
         .token_program_a(TOKEN_PROGRAM_ID)
         .token_program_b(TOKEN_PROGRAM_ID)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     context
