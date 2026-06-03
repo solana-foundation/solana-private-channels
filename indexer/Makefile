@@ -18,7 +18,9 @@ PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vB
 PRIVATE_CHANNEL_ESCROW_PROGRAM_SO ?= ../target/deploy/private_channel_escrow_program.so
 PRIVATE_CHANNEL_WITHDRAW_PROGRAM_SO ?= ../target/deploy/private_channel_withdraw_program.so
 GEYSER_CONFIG ?= src/indexer/datasource/common/yellowstone_grpc/config.json
-DATABASE_URL ?= postgres://private_channel:private_channel_password@localhost:5432/indexer
+# No default credential shipped. Set DATABASE_URL when running, e.g.
+# DATABASE_URL=postgres://user:pass@localhost:5434/indexer (loopback/internal-only).
+DATABASE_URL ?=
 ESCROW_INSTANCE_ID ?=
 
 # Yellowstone gRPC plugin configuration
@@ -73,6 +75,11 @@ run-yellowstone:
 		echo "Usage: make run-yellowstone ESCROW_INSTANCE_ID=<your_instance_pubkey>"; \
 		exit 1; \
 	fi
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "ERROR: DATABASE_URL is required (no default credential shipped)"; \
+		echo "Usage: make run-yellowstone DATABASE_URL=postgres://user:pass@localhost:5434/indexer ..."; \
+		exit 1; \
+	fi
 	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
 		DATABASE_URL=$(DATABASE_URL) \
 		cargo run --bin private-channel-indexer -- \
@@ -86,6 +93,11 @@ run-rpc:
 	@if [ -z "$(ESCROW_INSTANCE_ID)" ]; then \
 		echo "ERROR: ESCROW_INSTANCE_ID is required for escrow program"; \
 		echo "Usage: make run-rpc ESCROW_INSTANCE_ID=<your_instance_pubkey>"; \
+		exit 1; \
+	fi
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "ERROR: DATABASE_URL is required (no default credential shipped)"; \
+		echo "Usage: make run-rpc DATABASE_URL=postgres://user:pass@localhost:5434/indexer ..."; \
 		exit 1; \
 	fi
 	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \
@@ -106,6 +118,11 @@ run-operator:
 	@if [ -z "$(ADMIN_PRIVATE_KEY)" ]; then \
 		echo "ERROR: ADMIN_PRIVATE_KEY is required"; \
 		echo "Usage: make run-operator ADMIN_PRIVATE_KEY=<key> [OPERATOR_PRIVATE_KEY=<key>]"; \
+		exit 1; \
+	fi
+	@if [ -z "$(DATABASE_URL)" ]; then \
+		echo "ERROR: DATABASE_URL is required (no default credential shipped)"; \
+		echo "Usage: make run-operator DATABASE_URL=postgres://user:pass@localhost:5434/indexer ..."; \
 		exit 1; \
 	fi
 	@COMMON_ESCROW_INSTANCE_ID=$(ESCROW_INSTANCE_ID) \

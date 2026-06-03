@@ -108,6 +108,13 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
             let private_key = env::var(private_key_var).map_err(|_| {
                 SignerError::InvalidPrivateKey(format!("{} not set", private_key_var))
             })?;
+            // Reject a set-but-empty value: env::var returns Ok("") for a blank var.
+            if private_key.trim().is_empty() {
+                return Err(SignerError::InvalidPrivateKey(format!(
+                    "{} is set but empty",
+                    private_key_var
+                )));
+            }
 
             Signer::from_memory(&private_key)?
         }

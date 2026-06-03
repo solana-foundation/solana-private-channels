@@ -38,8 +38,36 @@ pub struct PostgresDb {
     pool: PgPool,
 }
 
+// Returns true when the database URL carries a non-empty password component.
+// Handles the no-password form (user@host) and the empty-password form (user:@host),
+// both of which must be rejected as a missing credential.
+fn database_url_has_password(database_url: &str) -> bool {
+    // Strip the scheme so we can isolate the authority (userinfo@host) section.
+    let after_scheme = database_url.split_once("://").map_or(database_url, |(_, rest)| rest);
+    // The userinfo ends at the first '@'; without one there is no password.
+    let userinfo = match after_scheme.split_once('@') {
+        Some((userinfo, _)) => userinfo,
+        None => return false,
+    };
+    // Password is the part after the first ':' in the userinfo; empty means missing.
+    match userinfo.split_once(':') {
+        Some((_, password)) => !password.is_empty(),
+        None => false,
+    }
+}
+
 impl PostgresDb {
     pub async fn new(config: &PostgresConfig) -> Result<Self, sqlx::Error> {
+        // Fail closed: reject a set-but-empty password before opening a connection.
+        // Blanked env templates interpolate an empty ${POSTGRES_PASSWORD}, yielding a
+        // passwordless URL that must never be accepted.
+        if !database_url_has_password(&config.database_url) {
+            return Err(sqlx::Error::Configuration(
+                "database_url password component is empty; set a non-empty POSTGRES_PASSWORD"
+                    .into(),
+            ));
+        }
+
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.database_url)
@@ -1283,5 +1311,20 @@ impl PostgresDb {
         .await?;
 
         Ok(nonces.into_iter().map(|(n,)| n).collect())
+    }
+}
+
+#[cfg(test)]
+mod password_guard_tests {
+    use super::database_url_has_password;
+
+    #[test]
+    fn rejects_empty_and_missing_password() {
+        // Set-but-empty password (blanked template) must be rejected.
+        assert!(!database_url_has_password("postgres://user:@host:5434/indexer"));
+        // No password at all must be rejected.
+        assert!(!database_url_has_password("postgres://user@host:5434/indexer"));
+        // A real password must be accepted.
+        assert!(database_url_has_password("postgres://user:secret@host:5434/indexer"));
     }
 }

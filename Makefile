@@ -21,6 +21,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
 .PHONY: install-buildkit-cache check-buildkit-cache
+.PHONY: check-env-local check-env-devnet
 .PHONY: docker-build docker-up docker-rebuild docker-restart docker-down docker-clean docker-logs docker-ps
 .PHONY: docker-devnet-build docker-devnet-up docker-devnet-rebuild docker-devnet-restart docker-devnet-down docker-devnet-clean docker-devnet-logs docker-devnet-ps
 
@@ -522,8 +523,7 @@ check-buildkit-cache:
 #############
 # These targets save users from remembering the env-file chain on every invocation.
 # Load order: versions.env first (toolchain pins), then the env-specific overrides.
-# `.env.local` is the developer's machine config (gitignored — copy from .env.example
-# and fill in secrets); `.env.devnet` is the tracked devnet preset.
+# `.env.local` is a tracked template; fill in secrets locally and do not commit real values. `.env.devnet` is the tracked devnet preset.
 #
 # Override the env file chain by passing ENV_FILES_LOCAL / ENV_FILES_DEVNET on the
 # command line, e.g. `make docker-up ENV_FILES_LOCAL="--env-file versions.env --env-file .env.staging"`.
@@ -539,13 +539,21 @@ COMPOSE_DEVNET   := docker-compose.devnet.yml
 ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local
 ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet
 
+# Fail closed before starting the stack if required secrets are blank. The
+# check script takes plain file paths, so pass the raw chain (no --env-file).
+check-env-local:
+	@./scripts/check-required-env.sh versions.env .env.local
+
+check-env-devnet:
+	@./scripts/check-required-env.sh versions.env .env.devnet
+
 # --- Local stack (local validator) ---
 
 docker-build: check-docker check-buildkit-cache
 	@echo "Building all images ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) build
 
-docker-up: check-docker check-buildkit-cache
+docker-up: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
 
@@ -553,11 +561,11 @@ docker-up: check-docker check-buildkit-cache
 # on-chain state stays consistent with Postgres rows. Caveat: after changing
 # escrow/withdraw program code, run `make docker-clean` first or the validator
 # will keep running stale bytecode.
-docker-up-persist: check-docker check-buildkit-cache
+docker-up-persist: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack with validator persistence ($(COMPOSE_LOCAL))..."
 	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
 
-docker-rebuild: check-docker check-buildkit-cache
+docker-rebuild: check-env-local check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --build
 
@@ -585,11 +593,11 @@ docker-devnet-build: check-docker check-buildkit-cache
 	@echo "Building all images ($(COMPOSE_DEVNET))..."
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) build
 
-docker-devnet-up: check-docker check-buildkit-cache
+docker-devnet-up: check-env-devnet check-docker check-buildkit-cache
 	@echo "Starting devnet stack ($(COMPOSE_DEVNET))..."
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d
 
-docker-devnet-rebuild: check-docker check-buildkit-cache
+docker-devnet-rebuild: check-env-devnet check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting devnet stack ($(COMPOSE_DEVNET))..."
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --build
 
