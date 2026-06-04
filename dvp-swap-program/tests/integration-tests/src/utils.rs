@@ -20,6 +20,7 @@ use spl_token_2022::{
     extension::{
         confidential_transfer::ConfidentialTransferMint,
         interest_bearing_mint::InterestBearingConfig,
+        non_transferable::NonTransferable,
         pausable::PausableConfig,
         permanent_delegate::PermanentDelegate,
         scaled_ui_amount::ScaledUiAmountConfig,
@@ -648,6 +649,15 @@ pub fn set_mint_2022_with_scaled_ui_amount(
         ext.multiplier = 1.0f64.into();
         ext.new_multiplier_effective_timestamp = 0i64.into();
         ext.new_multiplier = 1.0f64.into();
+    });
+    write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
+}
+
+/// NonTransferable — blocked; used in negative tests. A balance reaching
+/// a non-transferable escrow can never be drained, so Create rejects it.
+pub fn set_mint_2022_with_non_transferable(context: &mut TestContext, mint: &Pubkey) {
+    let data = build_mint_2022_with_extensions(&[ExtensionType::NonTransferable], |state| {
+        state.init_extension::<NonTransferable>(true).unwrap();
     });
     write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
 }

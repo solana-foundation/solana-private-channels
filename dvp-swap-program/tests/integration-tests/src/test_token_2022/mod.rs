@@ -8,7 +8,7 @@
 //!   topologies are exercised.
 //! - **CreateDvp negative** for every *blocked* extension on either leg
 //!   (TransferFeeConfig, InterestBearingConfig, ScaledUiAmount,
-//!   ConfidentialTransferMint).
+//!   ConfidentialTransferMint, NonTransferable).
 //! - **Owner mismatch**: legacy SPL mint paired with T22 token program.
 //! - **Post-Create extension activation**: a mint is swapped to a
 //!   blocked-extension layout *after* CreateDvp, and Settle/Reject must
@@ -29,11 +29,12 @@ use crate::{
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, hook_extras_for_mint,
         set_mint_2022_with_confidential_transfer, set_mint_2022_with_interest_bearing,
-        set_mint_2022_with_pausable, set_mint_2022_with_permanent_delegate,
-        set_mint_2022_with_scaled_ui_amount, set_mint_2022_with_transfer_fee,
-        set_mint_2022_with_transfer_hook, set_token_2022_with_hook_account,
-        set_token_2022_with_memo_required, setup_hook_mint, TestContext, BLOCKED_MINT_EXTENSION,
-        MEMO_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
+        set_mint_2022_with_non_transferable, set_mint_2022_with_pausable,
+        set_mint_2022_with_permanent_delegate, set_mint_2022_with_scaled_ui_amount,
+        set_mint_2022_with_transfer_fee, set_mint_2022_with_transfer_hook,
+        set_token_2022_with_hook_account, set_token_2022_with_memo_required, setup_hook_mint,
+        TestContext, BLOCKED_MINT_EXTENSION, MEMO_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        TOKEN_PROGRAM_ID,
     },
 };
 
@@ -286,6 +287,25 @@ fn test_create_rejects_scaled_ui_amount_on_mint_b() {
         &fixture.mint_b,
         &fixture.settlement_authority.pubkey(),
     );
+
+    let ix = build_create_dvp_ix(&context, &fixture);
+    assert_program_error(context.send(ix, &[]), BLOCKED_MINT_EXTENSION);
+}
+
+/// `NonTransferable` permanently blocks transfers out of any escrow, so
+/// a balance reaching it could never be settled, refunded, or reclaimed.
+/// Create must reject the mint up front.
+#[test]
+fn test_create_rejects_non_transferable_on_mint_a() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    set_mint_2022_with_non_transferable(&mut context, &fixture.mint_a);
 
     let ix = build_create_dvp_ix(&context, &fixture);
     assert_program_error(context.send(ix, &[]), BLOCKED_MINT_EXTENSION);

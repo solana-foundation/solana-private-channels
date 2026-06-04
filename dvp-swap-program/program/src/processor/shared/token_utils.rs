@@ -18,8 +18,8 @@ use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferMint,
     confidential_transfer_fee::ConfidentialTransferFeeConfig,
     interest_bearing_mint::InterestBearingConfig, memo_transfer::memo_required,
-    scaled_ui_amount::ScaledUiAmountConfig, transfer_fee::TransferFeeConfig,
-    BaseStateWithExtensions, StateWithExtensions,
+    non_transferable::NonTransferable, scaled_ui_amount::ScaledUiAmountConfig,
+    transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::{Account as Token2022AccountState, Mint as Token2022MintState};
 
@@ -96,19 +96,23 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(ProgramError::InvalidAccountOwner)
 }
 
-/// Reject Token-2022 mints whose extensions silently break the
-/// "escrow balance == sum of deposits" invariant: `ConfidentialTransfer`(+Fee),
-/// `TransferFee`, `InterestBearing`, `ScaledUiAmount`. These cause the
-/// credited amount to drift from the debited amount, so the program
-/// would settle "successfully" while a leg comes up short.
+/// Reject Token-2022 mints carrying either:
+/// - an amount-mutating extension that silently breaks the "escrow
+///   balance == sum of deposits" invariant (`ConfidentialTransfer`(+Fee),
+///   `TransferFee`, `InterestBearing`, `ScaledUiAmount`): the credited
+///   amount drifts from the debited amount, so the program would settle
+///   "successfully" while a leg comes up short; or
+/// - `NonTransferable`, which permanently blocks transfers out of the
+///   escrow. Unlike everything else this never recovers — if a balance
+///   reaches the escrow (e.g. the authority mints straight to it), no
+///   settle/refund/reclaim can drain it, stranding both legs.
 ///
 /// Everything else is allowed, including `Pausable`, `PermanentDelegate`,
-/// `NonTransferable`, `DefaultAccountState`, `TransferHook`, etc.
-/// These fail *loudly* (reverted CPI, atomic rollback) rather than
-/// silently — funds stay in escrow and recover once the blocking
-/// condition lifts. `PermanentDelegate` is a deliberate carve-out for
-/// regulated RWA tokens (issuer/transfer-agent clawback is an
-/// intrinsic property of the asset).
+/// `DefaultAccountState`, `TransferHook`, etc. These fail *loudly*
+/// (reverted CPI, atomic rollback) rather than silently — funds stay in
+/// escrow and recover once the blocking condition lifts.
+/// `PermanentDelegate` is a deliberate carve-out for regulated RWA tokens
+/// (issuer/transfer-agent clawback is an intrinsic property of the asset).
 ///
 /// Residual griefing/clawback surface the program does not defend
 /// against on-chain: a `Pausable` authority can pause mid-trade, a
@@ -146,6 +150,7 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
         || mint.get_extension::<TransferFeeConfig>().is_ok()
         || mint.get_extension::<InterestBearingConfig>().is_ok()
         || mint.get_extension::<ScaledUiAmountConfig>().is_ok()
+        || mint.get_extension::<NonTransferable>().is_ok()
     {
         return Err(DvpSwapProgramError::BlockedMintExtension.into());
     }
