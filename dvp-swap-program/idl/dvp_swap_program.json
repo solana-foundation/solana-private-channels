@@ -584,7 +584,7 @@
           },
           {
             "docs": [
-              "user_a's ATA for mint_a; receives any asset-leg surplus refund"
+              "user_a's ATA for mint_a; receives any asset-leg surplus refund. Required and must be pre-initialized: anyone can dust the escrow, forcing a surplus refund, and a missing ATA reverts the whole Settle"
             ],
             "isSigner": false,
             "isWritable": true,
@@ -593,7 +593,7 @@
           },
           {
             "docs": [
-              "user_b's ATA for mint_b; receives any cash-leg surplus refund"
+              "user_b's ATA for mint_b; receives any cash-leg surplus refund. Required and must be pre-initialized, same as user_a_ata_a"
             ],
             "isSigner": false,
             "isWritable": true,

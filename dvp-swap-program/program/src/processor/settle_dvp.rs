@@ -50,8 +50,8 @@ const FIXED_ACCOUNTS_LEN: usize = 13;
 /// 5.  `[writable]` dvp_ata_b - Escrow for the cash leg (drained, then closed)
 /// 6.  `[writable]` user_a_ata_b - user_a's ATA for mint_b; receives the cash leg (caller must pre-initialize)
 /// 7.  `[writable]` user_b_ata_a - user_b's ATA for mint_a; receives the asset leg (caller must pre-initialize)
-/// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
-/// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
+/// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund. Required: anyone can dust the escrow, so a surplus refund can always fire — a missing ATA reverts the whole Settle. Pre-initialize it.
+/// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund. Required: same as user_a_ata_a — pre-initialize it.
 /// 10. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 11. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
 /// 12. `[]` memo_program - SPL Memo program; only used for destinations that require a memo

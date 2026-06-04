@@ -169,12 +169,12 @@ pub enum DvpSwapProgramInstruction {
     ))]
     #[codama(account(
         name = "user_a_ata_a",
-        docs = "user_a's ATA for mint_a; receives any asset-leg surplus refund",
+        docs = "user_a's ATA for mint_a; receives any asset-leg surplus refund. Required and must be pre-initialized: anyone can dust the escrow, forcing a surplus refund, and a missing ATA reverts the whole Settle",
         writable
     ))]
     #[codama(account(
         name = "user_b_ata_b",
-        docs = "user_b's ATA for mint_b; receives any cash-leg surplus refund",
+        docs = "user_b's ATA for mint_b; receives any cash-leg surplus refund. Required and must be pre-initialized, same as user_a_ata_a",
         writable
     ))]
     #[codama(account(
