@@ -9,11 +9,12 @@ use crate::{
     processor::shared::pda_utils::create_pda_account,
     processor::shared::token_utils::{validate_mint_extensions, verify_canonical_ata},
     require, require_len,
-    state::swap_dvp::{SwapDvp, SWAP_DVP_SEED},
+    state::swap_dvp::{SwapDvp, NONCE_TOMBSTONE_SEED, SWAP_DVP_SEED},
 };
 use pinocchio::{
     account::AccountView,
     address::Address,
+    cpi::Seed,
     error::ProgramError,
     sysvars::{clock::Clock, rent::Rent, Sysvar},
     ProgramResult,
@@ -30,15 +31,16 @@ use pinocchio_associated_token_account::instructions::CreateIdempotent as Create
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Funds account/ATA creation rent
 /// 1. `[writable]` swap_dvp - SwapDvp PDA to be created
-/// 2. `[]` settlement_authority - Third party allowed to settle/cancel; must not be executable
-/// 3. `[]` mint_a - Mint of the asset leg (seller delivers)
-/// 4. `[]` mint_b - Mint of the cash leg (buyer delivers)
-/// 5. `[writable]` dvp_ata_a - swap_dvp's ATA for mint_a (created here)
-/// 6. `[writable]` dvp_ata_b - swap_dvp's ATA for mint_b (created here)
-/// 7. `[]` system_program
-/// 8. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
-/// 9. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
-/// 10. `[]` associated_token_program
+/// 2. `[writable]` nonce_tombstone - Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse
+/// 3. `[]` settlement_authority - Third party allowed to settle/cancel; must not be executable
+/// 4. `[]` mint_a - Mint of the asset leg (seller delivers)
+/// 5. `[]` mint_b - Mint of the cash leg (buyer delivers)
+/// 6. `[writable]` dvp_ata_a - swap_dvp's ATA for mint_a (created here)
+/// 7. `[writable]` dvp_ata_b - swap_dvp's ATA for mint_b (created here)
+/// 8. `[]` system_program
+/// 9. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
+/// 10. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 11. `[]` associated_token_program
 ///
 /// # Instruction Data
 /// * `user_a` (Pubkey) - Seller
@@ -56,7 +58,7 @@ pub fn process_create_dvp(
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
-    let [payer_info, swap_dvp_info, settlement_authority_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, system_program_info, token_program_a_info, token_program_b_info, associated_token_program_info] =
+    let [payer_info, swap_dvp_info, nonce_tombstone_info, settlement_authority_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, system_program_info, token_program_a_info, token_program_b_info, associated_token_program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -107,6 +109,23 @@ pub fn process_create_dvp(
         ProgramError::InvalidSeeds
     );
 
+    // Nonce tombstone, derived from the SwapDvp address so it's 1:1 with
+    // this trade's seeds. It's created below and never closed, so a
+    // non-system owner here means the nonce was already used — reject
+    // before re-creating the (closed) SwapDvp at the same address.
+    let (expected_tombstone, tombstone_bump) = Address::find_program_address(
+        &[NONCE_TOMBSTONE_SEED, expected_swap_dvp.as_ref()],
+        program_id,
+    );
+    require!(
+        nonce_tombstone_info.address() == &expected_tombstone,
+        ProgramError::InvalidSeeds
+    );
+    require!(
+        nonce_tombstone_info.owned_by(&pinocchio_system::ID),
+        DvpSwapProgramError::NonceAlreadyUsed
+    );
+
     // dvp_ata_a is the DvP PDA's ATA for mint_a (asset escrow).
     verify_canonical_ata(
         dvp_ata_a_info,
@@ -148,6 +167,23 @@ pub fn process_create_dvp(
         program_id,
         swap_dvp_info,
         swap_dvp_seeds,
+    )?;
+
+    // Mark this nonce used. The tombstone holds no data — its mere
+    // existence (program-owned) is the signal — and is never closed.
+    let tombstone_bump_bytes = [tombstone_bump];
+    let tombstone_seeds = [
+        Seed::from(NONCE_TOMBSTONE_SEED),
+        Seed::from(expected_swap_dvp.as_ref()),
+        Seed::from(&tombstone_bump_bytes),
+    ];
+    create_pda_account(
+        payer_info,
+        &rent,
+        0,
+        program_id,
+        nonce_tombstone_info,
+        tombstone_seeds,
     )?;
 
     CreateAtaIdempotent {

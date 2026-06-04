@@ -3,11 +3,12 @@ use solana_sdk::signature::{Keypair, Signer};
 use spl_associated_token_account::instruction::create_associated_token_account;
 
 use crate::{
-    state_utils::{assert_create_dvp, setup_dvp, AMOUNT_A, AMOUNT_B},
+    state_utils::{assert_cancel_dvp, assert_create_dvp, setup_dvp, AMOUNT_A, AMOUNT_B},
     utils::{
         assert_program_error, get_token_balance, TestContext, EARLIEST_AFTER_EXPIRY,
-        EXPIRY_NOT_IN_FUTURE, SAME_MINT, SELF_DVP, SETTLEMENT_AUTHORITY_EXECUTABLE,
-        SETTLEMENT_AUTHORITY_IS_PARTY, SWAP_PROGRAM_ID, ZERO_AMOUNT,
+        EXPIRY_NOT_IN_FUTURE, NONCE_ALREADY_USED, SAME_MINT, SELF_DVP,
+        SETTLEMENT_AUTHORITY_EXECUTABLE, SETTLEMENT_AUTHORITY_IS_PARTY, SWAP_PROGRAM_ID,
+        ZERO_AMOUNT,
     },
 };
 
@@ -48,6 +49,7 @@ fn test_create_dvp_rejects_expiry_at_now() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -74,6 +76,7 @@ fn test_create_dvp_rejects_earliest_after_expiry() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -101,6 +104,7 @@ fn test_create_dvp_rejects_self_dvp() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -127,6 +131,7 @@ fn test_create_dvp_rejects_same_mint() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_a)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -153,6 +158,7 @@ fn test_create_dvp_rejects_zero_amount_a() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -179,6 +185,7 @@ fn test_create_dvp_rejects_zero_amount_b() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -208,6 +215,7 @@ fn test_create_dvp_rejects_executable_settlement_authority() {
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -238,6 +246,7 @@ fn test_create_dvp_rejects_settlement_authority_as_party() {
         let ix = CreateDvpBuilder::new()
             .payer(context.payer.pubkey())
             .swap_dvp(fixture.swap_dvp)
+            .nonce_tombstone(fixture.nonce_tombstone)
             .mint_a(fixture.mint_a)
             .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
@@ -255,6 +264,45 @@ fn test_create_dvp_rejects_settlement_authority_as_party() {
 
         assert_program_error(context.send(ix, &[]), SETTLEMENT_AUTHORITY_IS_PARTY);
     }
+}
+
+/// Once a DvP is closed, its `(seeds, nonce)` PDA address can never be
+/// re-instantiated: the nonce tombstone outlives the trade. This blocks
+/// the stale-deposit capture attack — an attacker can't recreate the
+/// same address with predatory terms to drain a deposit the victim
+/// queued against the old escrow.
+#[test]
+fn test_create_dvp_rejects_reused_nonce_after_close() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+    assert_create_dvp(&mut context, &fixture);
+
+    // Close the trade: the SwapDvp PDA and escrows go away, but the
+    // nonce tombstone remains.
+    assert_cancel_dvp(&mut context, &fixture);
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+
+    // Re-creating the same nonce — even with predatory terms — must fail.
+    let ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(1)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .instruction();
+
+    assert_program_error(context.send(ix, &[]), NONCE_ALREADY_USED);
 }
 
 /// A front-runner pre-creates the canonical asset escrow ATA before

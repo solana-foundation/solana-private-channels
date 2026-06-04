@@ -61,6 +61,11 @@ pub enum DvpSwapProgramError {
     /// credited the closed-account rent at Settle/Cancel.
     #[error("settlement_authority must not be executable")]
     SettlementAuthorityExecutable,
+
+    /// (13) A DvP with these seeds was already created; the nonce
+    /// tombstone outlives the closed trade so the PDA can't be reused.
+    #[error("nonce already used for these DvP seeds")]
+    NonceAlreadyUsed,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {

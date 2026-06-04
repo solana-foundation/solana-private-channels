@@ -44,6 +44,7 @@ pub const SWAP_PROGRAM_ID: Pubkey = DVP_SWAP_PROGRAM_ID;
 pub const HOOK_FIXTURE_PROGRAM_ID: Pubkey = pubkey!("HookqJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC");
 
 pub const SWAP_DVP_SEED: &[u8] = b"dvp";
+pub const NONCE_TOMBSTONE_SEED: &[u8] = b"nonce";
 
 pub const SIGNER_NOT_PARTY: u32 = DvpSwapProgramError::SignerNotParty as u32;
 pub const DVP_EXPIRED: u32 = DvpSwapProgramError::DvpExpired as u32;
@@ -61,6 +62,7 @@ pub const SETTLEMENT_AUTHORITY_EXECUTABLE: u32 =
     DvpSwapProgramError::SettlementAuthorityExecutable as u32;
 pub const SETTLEMENT_AUTHORITY_IS_PARTY: u32 =
     DvpSwapProgramError::SettlementAuthorityIsParty as u32;
+pub const NONCE_ALREADY_USED: u32 = DvpSwapProgramError::NonceAlreadyUsed as u32;
 
 const MIN_LAMPORTS: u64 = 500_000_000;
 
@@ -309,6 +311,10 @@ pub fn swap_dvp_pda(
         ],
         &SWAP_PROGRAM_ID,
     )
+}
+
+pub fn nonce_tombstone_pda(swap_dvp: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[NONCE_TOMBSTONE_SEED, swap_dvp.as_ref()], &SWAP_PROGRAM_ID)
 }
 
 pub fn dvp_ata(swap_dvp: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {

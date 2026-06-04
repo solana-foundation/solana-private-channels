@@ -9,8 +9,8 @@ use crate::{
     },
     utils::{
         assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
-        get_token_balance, swap_dvp_pda, TestContext, DVP_EXPIRED, LEG_NOT_FUNDED, MEMO_PROGRAM_ID,
-        SETTLEMENT_AUTHORITY_MISMATCH, SETTLEMENT_TOO_EARLY,
+        get_token_balance, nonce_tombstone_pda, swap_dvp_pda, TestContext, DVP_EXPIRED,
+        LEG_NOT_FUNDED, MEMO_PROGRAM_ID, SETTLEMENT_AUTHORITY_MISMATCH, SETTLEMENT_TOO_EARLY,
     },
 };
 
@@ -357,6 +357,7 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
     let create_ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -508,6 +509,7 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
     let create_second = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(second_swap_dvp)
+        .nonce_tombstone(nonce_tombstone_pda(&second_swap_dvp).0)
         .mint_a(first_dvp.mint_a)
         .mint_b(first_dvp.mint_b)
         .dvp_ata_a(second_dvp_ata_a)

@@ -203,6 +203,12 @@
         "kind": "errorNode",
         "message": "settlement_authority must not be executable",
         "name": "settlementAuthorityExecutable"
+      },
+      {
+        "code": 13,
+        "kind": "errorNode",
+        "message": "nonce already used for these DvP seeds",
+        "name": "nonceAlreadyUsed"
       }
     ],
     "instructions": [
@@ -225,6 +231,15 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
+          },
+          {
+            "docs": [
+              "Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "nonceTombstone"
           },
           {
             "docs": [

@@ -190,6 +190,7 @@ fn build_create_dvp_ix(
     CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)

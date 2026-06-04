@@ -43,6 +43,11 @@ pub enum DvpSwapProgramInstruction {
     ))]
     #[codama(account(name = "swap_dvp", docs = "SwapDvp PDA to be created", writable))]
     #[codama(account(
+        name = "nonce_tombstone",
+        docs = "Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse",
+        writable
+    ))]
+    #[codama(account(
         name = "settlement_authority",
         docs = "Third-party authority allowed to settle/cancel; must not be executable so it can receive closed-account rent"
     ))]

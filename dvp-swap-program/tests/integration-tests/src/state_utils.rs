@@ -9,8 +9,8 @@ use solana_sdk::{
 use spl_token_2022::instruction::transfer_checked;
 
 use crate::utils::{
-    create_ata, dvp_ata, fund_wallet_ata, set_mint, swap_dvp_pda, TestContext, MEMO_PROGRAM_ID,
-    TOKEN_PROGRAM_ID,
+    create_ata, dvp_ata, fund_wallet_ata, nonce_tombstone_pda, set_mint, swap_dvp_pda, TestContext,
+    MEMO_PROGRAM_ID, TOKEN_PROGRAM_ID,
 };
 
 pub const AMOUNT_A: u64 = 75_000;
@@ -31,6 +31,7 @@ pub struct DvpFixture {
     pub token_program_a: Pubkey,
     pub token_program_b: Pubkey,
     pub swap_dvp: Pubkey,
+    pub nonce_tombstone: Pubkey,
     pub user_a_ata_a: Pubkey,
     pub user_a_ata_b: Pubkey,
     pub user_b_ata_a: Pubkey,
@@ -86,6 +87,7 @@ pub fn setup_dvp_with_programs(
     DvpFixture {
         dvp_ata_a: dvp_ata(&swap_dvp, &mint_a, &token_program_a),
         dvp_ata_b: dvp_ata(&swap_dvp, &mint_b, &token_program_b),
+        nonce_tombstone: nonce_tombstone_pda(&swap_dvp).0,
         user_a,
         user_b,
         settlement_authority,
@@ -112,6 +114,7 @@ pub fn assert_create_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
     let ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)

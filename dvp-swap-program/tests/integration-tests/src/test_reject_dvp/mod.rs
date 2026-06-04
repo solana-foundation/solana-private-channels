@@ -13,8 +13,8 @@ use crate::{
     },
     utils::{
         assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
-        get_token_balance, set_mint, swap_dvp_pda, TestContext, MEMO_PROGRAM_ID, SIGNER_NOT_PARTY,
-        TOKEN_PROGRAM_ID,
+        get_token_balance, nonce_tombstone_pda, set_mint, swap_dvp_pda, TestContext,
+        MEMO_PROGRAM_ID, SIGNER_NOT_PARTY, TOKEN_PROGRAM_ID,
     },
 };
 
@@ -237,6 +237,7 @@ fn test_reject_dvp_works_when_settlement_authority_is_unreachable() {
     let create_ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(swap_dvp)
+        .nonce_tombstone(nonce_tombstone_pda(&swap_dvp).0)
         .mint_a(mint_a)
         .mint_b(mint_b)
         .dvp_ata_a(dvp_ata_a)

@@ -6,6 +6,12 @@ use pinocchio::{cpi::Seed, error::ProgramError, Address as Pubkey};
 
 pub const SWAP_DVP_SEED: &[u8] = b"dvp";
 
+/// Seed prefix for the per-DvP nonce tombstone. The tombstone PDA is
+/// derived from `[NONCE_TOMBSTONE_SEED, swap_dvp_pubkey]`, created at
+/// CreateDvp, and never closed — its existence permanently marks a
+/// `(seeds, nonce)` PDA address as used so it can't be re-instantiated.
+pub const NONCE_TOMBSTONE_SEED: &[u8] = b"nonce";
+
 /// Atomic DvP escrow for a P2P token swap.
 ///
 /// `user_a` (seller) delivers `amount_a` of `mint_a` (the asset);

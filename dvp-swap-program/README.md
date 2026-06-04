@@ -60,7 +60,7 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
 
 | #   | Name       | Signer                 | Effect                                                                                                                       |
 | --- | ---------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| 0   | CreateDvp  | any                    | Allocates the SwapDvp PDA + both escrow ATAs. No funding.                                                                    |
+| 0   | CreateDvp  | any                    | Allocates the SwapDvp PDA, its nonce tombstone, and both escrow ATAs. No funding.                                           |
 | 1   | ReclaimDvp | `user_a` or `user_b`   | Drains signer's leg back to them. DvP stays open.                                                                            |
 | 2   | SettleDvp  | `settlement_authority` | Transfers `amount_x` of each leg to recipients (cross), refunds any over-deposit to the depositor, closes SwapDvp + escrows. |
 | 3   | CancelDvp  | `settlement_authority` | Refunds any funded legs to depositors, closes SwapDvp + escrows.                                                             |
@@ -73,6 +73,7 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
 - **Reclaim/Cancel/Reject drain the escrow.** These instructions transfer the escrow's _actual_ balance back to the depositor, leaving a 0-balance escrow that `CloseAccount` accepts.
 - **Expiry.** Only `Settle` rejects after `expiry_timestamp`. `Reclaim`, `Cancel`, and `Reject` always work — otherwise an expired-but-funded DvP would strand funds. Reclaim is per-leg recovery: each party can pull their own leg back at any time, so a problem with the counterparty's leg can't lock a healthy leg behind the all-or-nothing Cancel/Reject path. Funding via raw SPL Transfer is unauthenticated by the program; clients must avoid funding past expiry, but any tokens that do land are still recoverable via Reclaim/Cancel/Reject.
 - **Earliest settlement.** If `earliest_settlement_timestamp` is set, `Settle` additionally rejects when `now < earliest`.
+- **Nonces are single-use forever.** `CreateDvp` also creates a small nonce-tombstone PDA (seeds `[b"nonce", swap_dvp]`) that is never closed. A `(seeds, nonce)` combination can therefore only ever map to one trade: after a DvP closes, its PDA address can't be re-instantiated with new terms, so a deposit queued against the old escrow can't be captured by a recreated instance. Use a fresh nonce for each new DvP between the same parties + mints.
 - **Token-2022.** Each leg carries its own `token_program` account, so a single DvP can mix legacy SPL and Token-2022 mints. `CreateDvp` rejects mints carrying amount-mutating extensions (`TransferFee`, `InterestBearing`, `ScaledUiAmount`, `ConfidentialTransfer`) — only checked at Create, so funds remain recoverable if a mint's extensions change later. `PermanentDelegate` and `Pausable` are accepted as-is.
 - **TransferHook.** Settle/Cancel/Reject/Reclaim issue `TransferChecked` CPIs and forward any trailing accounts to the token program as transfer-hook extras. Settle/Cancel/Reject split the trailing slice between the two legs via the `leg_a_extras_count: u8` data field (first `leg_a_extras_count` accounts go to leg A, rest to leg B); Reclaim has a single leg so all trailing accounts feed its one CPI. The client must resolve the hook's `ExtraAccountMetaList` off-chain.
 - **User ATAs are caller-managed.** The program creates escrow ATAs at `CreateDvp` but never creates user-side ATAs. Settle/Cancel/Reject/Reclaim assume the user destination ATAs already exist for any leg whose balance will be transferred; uninitialized destinations cause the `TransferChecked` CPI to fail and revert the instruction. Callers should add `CreateIdempotent` pre-instructions as needed.
@@ -95,6 +96,7 @@ PDA seeds: `[b"dvp", settlement_authority, user_a, user_b, mint_a, mint_b, nonce
 | 10   | `BlockedMintExtension`        | Create with a Token-2022 mint carrying an unsupported extension (TransferFee, InterestBearing, ScaledUiAmount, ConfidentialTransfer) |
 | 11   | `SettlementAuthorityIsParty`  | Create with `settlement_authority` equal to `user_a` or `user_b`                                                                    |
 | 12   | `SettlementAuthorityExecutable` | Create with an executable `settlement_authority` (can't be credited closed-account rent)                                          |
+| 13   | `NonceAlreadyUsed`            | Create reusing a `(seeds, nonce)` that already has a nonce tombstone (the address was used by a prior DvP)                          |
 
 ## Build & test
 
