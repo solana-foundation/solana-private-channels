@@ -79,6 +79,10 @@ COPY private-channel-escrow-program/clients/rust/Cargo.toml ./private-channel-es
 COPY private-channel-withdraw-program/program/Cargo.toml ./private-channel-withdraw-program/program/
 COPY private-channel-withdraw-program/tests/integration-tests/Cargo.toml ./private-channel-withdraw-program/tests/integration-tests/
 COPY private-channel-withdraw-program/clients/rust/Cargo.toml ./private-channel-withdraw-program/clients/rust/
+COPY dvp-swap-program/program/Cargo.toml ./dvp-swap-program/program/
+COPY dvp-swap-program/tests/integration-tests/Cargo.toml ./dvp-swap-program/tests/integration-tests/
+COPY dvp-swap-program/tests/transfer-hook-fixture/Cargo.toml ./dvp-swap-program/tests/transfer-hook-fixture/
+COPY dvp-swap-program/clients/rust/Cargo.toml ./dvp-swap-program/clients/rust/
 COPY integration/Cargo.toml ./integration/
 COPY test_utils/Cargo.toml ./test_utils/
 COPY scripts/devnet/Cargo.toml ./scripts/devnet/
@@ -89,12 +93,16 @@ COPY bench-tps/Cargo.toml ./bench-tps/
 RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-program/tests/integration-tests/src \
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/program/src \
     private-channel-withdraw-program/tests/integration-tests/src \
+    dvp-swap-program/program/src dvp-swap-program/tests/integration-tests/src \
+    dvp-swap-program/tests/transfer-hook-fixture/src dvp-swap-program/clients/rust/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/clients/rust/src \
     core/src metrics/src auth/src bench-tps/src
 RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escrow-program/tests/integration-tests/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/program/src/lib.rs \
     private-channel-withdraw-program/tests/integration-tests/src/lib.rs \
+    dvp-swap-program/program/src/lib.rs dvp-swap-program/tests/integration-tests/src/lib.rs \
+    dvp-swap-program/tests/transfer-hook-fixture/src/lib.rs dvp-swap-program/clients/rust/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/clients/rust/src/lib.rs \
@@ -111,18 +119,28 @@ RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release
 
+# Codama's Rust renderer invokes cargo-fmt when generating clients below.
+RUN rustup component add rustfmt
+
 # First, do the real build for the programs
 COPY Makefile ./Makefile
 COPY private-channel-escrow-program ./private-channel-escrow-program
 COPY private-channel-withdraw-program ./private-channel-withdraw-program
+COPY dvp-swap-program ./dvp-swap-program
 RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     make -C private-channel-escrow-program install build \
     && make -C private-channel-withdraw-program install build \
+    && make -C dvp-swap-program install build \
+    && if ! grep -Fq 'pub use generated::programs::*;' dvp-swap-program/clients/rust/src/lib.rs; then \
+        printf '\npub use generated::programs::*;\n' >> dvp-swap-program/clients/rust/src/lib.rs; \
+        touch /tmp/dvp-swap-program-client-patched; \
+    fi \
     && mkdir -p /out/deploy \
     && cp target/deploy/private_channel_escrow_program.so /out/deploy/ \
-    && cp target/deploy/private_channel_withdraw_program.so /out/deploy/
+    && cp target/deploy/private_channel_withdraw_program.so /out/deploy/ \
+    && cp target/deploy/dvp_swap_program.so /out/deploy/
 
 # Next, do the real build for the other components
 COPY core ./core
@@ -136,13 +154,16 @@ COPY auth ./auth
 # build, so swap the symlink for the real .so. rm first — otherwise cp follows the symlink
 # and writes to the wrong place.
 RUN rm -f core/precompiles/private_channel_withdraw_program.so \
-    && cp /out/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so
+    && cp /out/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so \
+    && rm -f core/precompiles/dvp_swap_program.so \
+    && cp /out/deploy/dvp_swap_program.so core/precompiles/dvp_swap_program.so
 
 # Final build — binaries are copied to /out/ per the convention noted above.
 RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release \
+    if [ -f /tmp/dvp-swap-program-client-patched ]; then cargo clean -p dvp-swap-program-client; fi \
+    && cargo build --release \
         -p private-channel-core \
         -p private-channel-gateway \
         -p private-channel-indexer \
