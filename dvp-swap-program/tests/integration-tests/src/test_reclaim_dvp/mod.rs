@@ -8,8 +8,7 @@ use crate::{
         setup_dvp, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
     },
     utils::{
-        assert_program_error, get_token_balance, TestContext, DVP_EXPIRED, MEMO_PROGRAM_ID,
-        SIGNER_NOT_PARTY,
+        assert_program_error, get_token_balance, TestContext, MEMO_PROGRAM_ID, SIGNER_NOT_PARTY,
     },
 };
 
@@ -124,30 +123,30 @@ fn test_reclaim_dvp_rejects_third_party() {
     assert_program_error(result, SIGNER_NOT_PARTY);
 }
 
+/// Reclaim has no expiry gate: each party can recover their own leg
+/// post-expiry, independent of the counterparty's leg. Settle is still
+/// blocked after expiry (see test_settle_dvp_rejects_post_expiry), so
+/// this can't enable a one-sided settlement.
 #[test]
-fn test_reclaim_dvp_rejects_post_expiry() {
+fn test_reclaim_dvp_post_expiry_recovers_leg() {
     let mut context = TestContext::new();
     let fixture = setup_dvp(&mut context, 0);
     assert_create_dvp(&mut context, &fixture);
     assert_fund_a(&mut context, &fixture);
 
-    // Step the clock past expiry. After this, Reclaim must reject so
-    // that an expired-but-funded DvP can only be drained via Cancel /
-    // Reject — the load-bearing reason those instructions exist.
     let advance = fixture.expiry - context.now() + 1;
     context.advance_clock(advance);
 
-    let ix = ReclaimDvpBuilder::new()
-        .signer(fixture.user_a.pubkey())
-        .swap_dvp(fixture.swap_dvp)
-        .mint(fixture.mint_a)
-        .dvp_source_ata(fixture.dvp_ata_a)
-        .signer_dest_ata(fixture.user_a_ata_a)
-        .token_program(fixture.token_program_a)
-        .memo_program(MEMO_PROGRAM_ID)
-        .instruction();
-    let result = context.send(ix, &[&fixture.user_a]);
-    assert_program_error(result, DVP_EXPIRED);
+    assert_reclaim_a(&mut context, &fixture);
+
+    // Funds restored to user_a; DvP itself stays open for Cancel/Reject.
+    assert_eq!(get_token_balance(&context, &fixture.dvp_ata_a), 0);
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_some());
+    assert!(context.get_account(&fixture.dvp_ata_a).is_some());
 }
 
 /// Reclaiming a never-funded leg is a documented no-op (skips the

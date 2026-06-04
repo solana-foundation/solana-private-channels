@@ -8,12 +8,7 @@ use crate::{
     state::swap_dvp::SwapDvp,
 };
 use pinocchio::{
-    account::AccountView,
-    address::Address,
-    cpi::Signer,
-    error::ProgramError,
-    sysvars::{clock::Clock, Sysvar},
-    ProgramResult,
+    account::AccountView, address::Address, cpi::Signer, error::ProgramError, ProgramResult,
 };
 
 /// Length of the fixed account prefix; anything beyond this is treated
@@ -34,9 +29,9 @@ const FIXED_ACCOUNTS_LEN: usize = 7;
 /// is a no-op.
 ///
 /// The DvP itself stays open after a reclaim — the caller can re-fund
-/// the leg later, or either party can abort the trade. Reclaim only
-/// drains a single leg, so it only takes the mint and token program for
-/// that leg (not both).
+/// the leg later (pre-expiry, to still settle), or either party can
+/// abort the trade. Reclaim only drains a single leg, so it only takes
+/// the mint and token program for that leg (not both).
 ///
 /// Extension validation is **not** performed here — Create is the
 /// consent point. Reclaim must remain available even if a mint's
@@ -99,10 +94,8 @@ pub fn process_reclaim_dvp(
         ProgramError::IncorrectProgramId
     );
 
-    // Reclaim only works pre-expiry. After expiry, Cancel or Reject
-    // is the way to drain a funded leg.
-    let now = Clock::get()?.unix_timestamp;
-    require!(now <= dvp.expiry_timestamp, DvpSwapProgramError::DvpExpired);
+    // No expiry gate: per-leg recovery stays open at all times. Safe
+    // because Settle is gated on `now <= expiry` and both legs funded.
 
     // Both ATAs must be canonical for the leg's token program.
     // dvp_source_ata is the DvP PDA's escrow for the leg's mint
