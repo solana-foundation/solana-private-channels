@@ -28,6 +28,12 @@ use pinocchio_associated_token_account::instructions::CreateIdempotent as Create
 /// a raw SPL Transfer (the canonical funding path so that custodian
 /// integrations need no custom program call).
 ///
+/// The parties do not sign, and terms aren't bound to the PDA address, so
+/// a record here is not proof the named parties agreed to its terms.
+/// Clients must use a random `nonce` (anti-squat) and verify the stored
+/// terms before funding or settling. See README "CreateDvp is
+/// permissionless".
+///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Funds account/ATA creation rent
 /// 1. `[writable]` swap_dvp - SwapDvp PDA to be created
