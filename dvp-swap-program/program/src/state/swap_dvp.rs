@@ -38,6 +38,7 @@ pub struct SwapDvp {
     pub token_program_b: Pubkey,
     pub amount_a: u64,
     pub amount_b: u64,
+    /// Cluster time (`Clock::unix_timestamp`), not wall-clock. See README.
     pub expiry_timestamp: i64,
     pub nonce: u64,
     /// `None` = settlement allowed any time before `expiry_timestamp`.
