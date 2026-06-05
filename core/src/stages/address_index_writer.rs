@@ -21,8 +21,10 @@ use {
 /// just headroom for sqlx's own bookkeeping connection-resets.
 const WRITER_POOL_SIZE: u32 = 2;
 
-/// Sleep before each next attempt; total attempts = len + 1.
-const FLUSH_RETRY_BACKOFF_MS: [u64; 2] = [100, 500];
+/// Delays (ms) before each retry; total attempts = len + 1. Sized to ride out a
+/// typical managed-Postgres failover / replica promotion (a few seconds) rather
+/// than tearing the node down on a transient blip.
+const FLUSH_RETRY_BACKOFF_MS: [u64; 4] = [250, 1000, 3000, 5000];
 
 pub struct AddressIndexWriterArgs {
     pub rows_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
@@ -148,7 +150,11 @@ fn pick_watermark(chunk: &[AddressSignatureRow], remaining: &[AddressSignatureRo
         return None;
     }
     match remaining.first() {
-        Some(r) => Some(r.slot - 1),
+        // Slots below `remaining`'s first are fully flushed. Guard slot 0: a
+        // negative watermark sorts above all positives under big-endian bytea
+        // compare and would pin it permanently.
+        Some(r) if r.slot > 0 => Some(r.slot - 1),
+        Some(_) => None,
         None => chunk.last().map(|r| r.slot),
     }
 }

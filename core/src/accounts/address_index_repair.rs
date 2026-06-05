@@ -31,10 +31,9 @@ pub async fn repair_address_signatures(db: &AccountsDB, _metrics: SharedMetrics)
 
     let pool = Arc::clone(&postgres_db.pool);
 
-    let watermark = get_address_signatures_flushed_slot(&pool)
+    let watermark_opt = get_address_signatures_flushed_slot(&pool)
         .await
-        .context("Failed to read address_signatures watermark")?
-        .unwrap_or(-1);
+        .context("Failed to read address_signatures watermark")?;
 
     let Some(max_block_u64) = get_latest_slot(db)
         .await
@@ -43,7 +42,31 @@ pub async fn repair_address_signatures(db: &AccountsDB, _metrics: SharedMetrics)
         info!("address_signatures repair: no blocks present, nothing to do");
         return Ok(());
     };
-    let max_block = max_block_u64 as i64;
+    let max_block = i64::try_from(max_block_u64).context("max block slot exceeds i64::MAX")?;
+
+    // No watermark row yet: first run against an existing DB. Re-deriving the
+    // entire block history would block startup for the full slot range, so
+    // instead trust the existing index up to the current tip and seed the
+    // watermark. Every later crash is then bounded to (watermark, max_block] by
+    // the watermark the live writer advances.
+    let Some(watermark) = watermark_opt else {
+        info!(
+            max_block,
+            "address_signatures repair: no watermark, seeding to current tip"
+        );
+        let mut pg_tx = pool
+            .begin()
+            .await
+            .context("Failed to begin watermark seed transaction")?;
+        upsert_address_signatures_flushed_slot_in_tx(&mut pg_tx, max_block)
+            .await
+            .context("Failed to seed address_signatures watermark")?;
+        pg_tx
+            .commit()
+            .await
+            .context("Failed to commit watermark seed")?;
+        return Ok(());
+    };
 
     if max_block <= watermark {
         info!(
@@ -274,6 +297,20 @@ mod tests {
             .unwrap();
     }
 
+    /// Seed the watermark below the gap, simulating a writer that crashed after
+    /// progressing to `slot`. Repair only scans `(watermark, max_block]`.
+    async fn set_watermark(db: &AccountsDB, slot: i64) {
+        let pg = match db {
+            AccountsDB::Postgres(p) => p,
+            _ => panic!("expected Postgres"),
+        };
+        let mut tx = pg.pool.begin().await.unwrap();
+        upsert_address_signatures_flushed_slot_in_tx(&mut tx, slot)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     fn make_processed() -> ProcessedTransaction {
         ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
             loaded_transaction: LoadedTransaction {
@@ -340,9 +377,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Simulate the crash gap.
+        // Simulate the crash gap: writer had flushed through slot 99, then
+        // crashed leaving slots 100-101 unindexed.
         clear_address_signatures(&db).await;
         assert_eq!(count_addr_sig_rows(&db).await, 0);
+        set_watermark(&db, 99).await;
 
         repair_address_signatures(&db, Arc::new(NoopMetrics) as SharedMetrics)
             .await
@@ -401,6 +440,7 @@ mod tests {
             .unwrap();
 
         clear_address_signatures(&db).await;
+        set_watermark(&db, 49).await;
 
         let expected = expected_rows_for(&tx, 50);
         assert!(!expected.is_empty(), "test setup produced no expected rows");
@@ -432,5 +472,61 @@ mod tests {
             "rerun must not add, remove, or alter any row"
         );
         assert_eq!(wm_second, wm_first, "rerun must not change the watermark");
+    }
+
+    /// First run against an existing DB (no watermark) seeds to the tip and does
+    /// NOT re-derive history — avoids an unbounded startup scan over all blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repair_seeds_watermark_to_tip_when_unset() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let to = solana_sdk::pubkey::Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 1);
+        let sig = *tx.signature();
+
+        db.write_batch(
+            &[],
+            vec![(sig, &tx, 70, 1_700_000_000, &make_processed())],
+            Some(create_test_block_info(70, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let pg = match &db {
+            AccountsDB::Postgres(p) => p.pool.clone(),
+            _ => panic!("expected Postgres"),
+        };
+        let mut block = create_test_block_info(70, Hash::new_unique());
+        block.transaction_signatures = vec![sig];
+        let data = bincode::serialize(&block).unwrap();
+        sqlx::query("UPDATE blocks SET data = $1 WHERE slot = $2")
+            .bind(&data)
+            .bind(70i64)
+            .execute(pg.as_ref())
+            .await
+            .unwrap();
+
+        // No watermark set, address_signatures empty: simulates first run against
+        // a pre-existing DB rather than a crash gap.
+        clear_address_signatures(&db).await;
+        assert_eq!(count_addr_sig_rows(&db).await, 0);
+        assert_eq!(get_address_signatures_flushed_slot(&pg).await.unwrap(), None);
+
+        repair_address_signatures(&db, Arc::new(NoopMetrics) as SharedMetrics)
+            .await
+            .unwrap();
+
+        // Must NOT backfill history; must seed the watermark to the current tip.
+        assert_eq!(
+            count_addr_sig_rows(&db).await,
+            0,
+            "unset watermark must not trigger a full-history backfill"
+        );
+        assert_eq!(
+            get_address_signatures_flushed_slot(&pg).await.unwrap(),
+            Some(70),
+            "watermark must be seeded to the current tip"
+        );
     }
 }

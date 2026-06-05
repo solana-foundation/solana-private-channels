@@ -28,6 +28,10 @@ pub async fn upsert_address_signatures_flushed_slot_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     slot: i64,
 ) -> sqlx::Result<()> {
+    debug_assert!(
+        slot >= 0,
+        "watermark slot must be non-negative; a negative slot breaks the big-endian bytea monotonic compare"
+    );
     sqlx::query(
         "INSERT INTO metadata (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE
