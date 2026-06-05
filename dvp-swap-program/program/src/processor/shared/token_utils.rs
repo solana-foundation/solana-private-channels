@@ -117,7 +117,8 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
 /// Residual griefing/clawback surface the program does not defend
 /// against on-chain: a `Pausable` authority can pause mid-trade, a
 /// `PermanentDelegate` can drain or claw back, a `FreezeAuthority` can
-/// freeze the escrow ATA, a `TransferHook` EAML can be updated to
+/// freeze the escrow ATA (or a frozen `DefaultAccountState` can make
+/// future ATAs start frozen), a `TransferHook` EAML can be updated to
 /// exceed the per-CPI account cap (`MAX_HOOK_REMAINING_ACCOUNTS`) or
 /// to error unconditionally, and a `MintCloseAuthority` can close a
 /// zero-supply mint and recreate it at the same address with a
