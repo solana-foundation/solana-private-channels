@@ -119,9 +119,13 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
 /// `PermanentDelegate` can drain or claw back, a `FreezeAuthority` can
 /// freeze the escrow ATA, a `TransferHook` EAML can be updated to
 /// exceed the per-CPI account cap (`MAX_HOOK_REMAINING_ACCOUNTS`) or
-/// to error unconditionally. Traders are expected to vet the mints
-/// they agree to transact in; mint-authority trust is not a problem
-/// the program can solve.
+/// to error unconditionally, and a `MintCloseAuthority` can close a
+/// zero-supply mint and recreate it at the same address with a
+/// different extension set (e.g. a transfer fee), changing transfer
+/// behavior after Create since terminal paths bind only the mint
+/// address and token program, not the extension set. Traders are
+/// expected to vet the mints they agree to transact in; mint-authority
+/// trust is not a problem the program can solve.
 ///
 /// Called only at CreateDvp. Unwind paths skip this check so funds
 /// remain recoverable if extension parameters change post-Create.
