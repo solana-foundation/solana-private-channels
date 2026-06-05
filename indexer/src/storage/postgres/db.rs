@@ -32,6 +32,7 @@ mod transaction_cols {
     pub const REMINT_LAST_VALID_BLOCK_HEIGHTS: &str = "remint_last_valid_block_heights";
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
     pub const FINALITY_CHECK_ATTEMPTS: &str = "finality_check_attempts";
+    pub const RECOVERY_REQUEUE_ATTEMPTS: &str = "recovery_requeue_attempts";
 }
 
 #[derive(Clone)]
@@ -218,6 +219,21 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("finality_check_attempts migration complete");
+
+        // Durable recovery requeue counter so the MAX_RECOVERY_REQUEUE_ATTEMPTS
+        // cap survives operator restarts.
+        info!("Running recovery_requeue_attempts migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS recovery_requeue_attempts INTEGER NOT NULL DEFAULT 0;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("recovery_requeue_attempts migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -655,7 +671,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -681,6 +697,7 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -703,7 +720,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -728,6 +745,7 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -750,7 +768,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -776,6 +794,7 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -838,7 +857,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -865,6 +884,7 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -938,7 +958,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -965,6 +985,7 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -986,7 +1007,8 @@ impl PostgresDb {
         let result = sqlx::query(
             r#"
             UPDATE transactions
-            SET status = 'pending'
+            SET status = 'pending',
+                recovery_requeue_attempts = recovery_requeue_attempts + 1
             WHERE id = $1
               AND status = 'processing'
               AND updated_at = $2

@@ -52,6 +52,7 @@ to the right Path below.
 | `invalid_builder` | Builder rejected the row's data (e.g. negative amount). |
 | `program_error` | Generic builder error not covered by the specific variants. |
 | `deposit idempotency:` | The recovery worker could not authoritatively decide whether the deposit's mint already landed. Row was quarantined on uncertainty rather than risk a double-mint. Indicates RPC health, not a row defect. See **Path E**. |
+| `recovery requeues without progress` | The recovery worker demoted this `processing` deposit 3 times (mint never landed each cycle) and quarantined rather than loop forever. Row data is fine; the mint keeps failing to land. See **Path G**. |
 
 ### Sender-side post-JIT surface (`sender/mint.rs`)
 
@@ -117,6 +118,7 @@ Correct the columns and re-arm:
 ```sql
 UPDATE transactions
    SET status = 'pending',
+       recovery_requeue_attempts = 0,
        mint = :corrected_mint,
        recipient = :corrected_recipient,
        updated_at = NOW()
@@ -142,7 +144,7 @@ extended to classify this error variant explicitly. Do not patch
 in-place.
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
@@ -213,16 +215,19 @@ Only for the recoverable authority case after the underlying authority
 correction has been performed:
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
 ### Path E - recovery-worker idempotency lookup failed
 
 `error_message` starts with `deposit idempotency:`. The recovery worker
-intentionally refuses to demote on RPC failure (the live mint path
-fails-open on the same condition; recovery cannot, because recovery has
-no second chance to catch a duplicate).
+quarantines rather than demote when the idempotency lookup fails on RPC
+error, because demoting would re-pick the row and risk a double-mint. This
+is the same fail-closed stance as the live mint path, which on the same RPC
+failure also stops without minting (it routes to a terminal failure via
+`send_fatal_error` rather than minting unverified). Both paths refuse to
+proceed on uncertainty; they differ only in terminal state.
 
 #### Step 1 - check RPC health
 
@@ -258,7 +263,7 @@ The mint did not land. Re-arm to `pending`; the idempotency memo
 prevents duplicate mint on the next attempt.
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
@@ -331,7 +336,7 @@ VALUES
   (:mint, 'allowed', :allow_mint_slot, :allow_mint_signature, NOW())
 ON CONFLICT (mint_address, effective_slot) DO NOTHING;
 
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
@@ -376,6 +381,50 @@ The `AllowMint` exists but binds to a different escrow instance than
 ours. The operator should never see foreign-instance rows — this is the
 SOLA2-27 attack surface, not an operations recovery.
 [Escalate](_escalation.md) (Tier 3). No SQL.
+
+### Path G - requeue cap exhausted (mint never landed)
+
+`error_message` contains `recovery requeues without progress`. Each
+recovery pass whose idempotency scan finds no existing mint (`NotLanded`)
+demotes the stuck `processing` deposit back to `pending` for a fresh
+mint. After `MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with the
+mint still never landing, recovery quarantines instead of looping. So the
+mint was retried 3 times and never landed. The lookup *succeeded* each
+time and said not-landed (distinct from Path E, where the lookup itself
+*failed* on RPC error); the row data is valid (distinct from Path A).
+
+#### Step 1 - verify on-chain
+
+Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). Expected
+verdict: `NOT_LANDED`. If `LANDED` -> the idempotency scan missed a landed
+mint; mark `completed` per **Path E** (`LANDED` branch) and
+[escalate](_escalation.md) (Tier 2) - the scan has a defect (e.g. the sig
+is past its lookback window).
+
+#### Step 2 - find why the mint never lands
+
+The deposit mint is fire-and-forget (`spawn_fire_and_store`), so a
+repeating failure points at a deterministic mint rejection (paused/frozen
+mint, `mint_authority` mismatch, compute) or the sender never
+broadcasting. Read the operator logs for this `transaction_id`'s mint send
+error. A deterministic cause means re-arming will loop again ->
+[escalate](_escalation.md) (Tier 2) to engineering.
+
+#### Step 3 - resolve, then re-arm
+
+Fix the root cause first. Then re-arm to `pending` **and reset the requeue
+counter** - re-arming without the reset re-quarantines on the next stall,
+since the counter is already at the cap. The idempotency memo still guards
+against a double-mint on retry:
+
+```sql
+UPDATE transactions
+   SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+If the mint can never land (unrecoverable), mark `failed` and
+[escalate](_escalation.md) (Tier 1) for refund coordination.
 
 ## Post-incident artifacts
 

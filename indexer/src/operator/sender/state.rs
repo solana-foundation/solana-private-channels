@@ -371,6 +371,11 @@ mod tests {
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use borsh::BorshSerialize;
+    use private_channel_escrow_program_client::Instance;
+    use solana_client::rpc_request::RpcRequest;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
     use std::collections::HashMap;
@@ -436,6 +441,7 @@ mod tests {
             remint_last_valid_block_heights: Some(vec![12_345]),
             pending_remint_deadline_at: Some(deadline),
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
         }
     }
 
@@ -1023,5 +1029,90 @@ mod tests {
         let state = result.unwrap();
         assert_eq!(state.instance_pda, Some(instance_pda));
         assert_eq!(state.retry_max_attempts, 5);
+    }
+
+    /// Pins the SmtRootMismatch wedge (see
+    /// `docs/runbooks/withdrawal_pipeline_halt_runbook.md`): a landed release
+    /// whose nonce never reaches `Completed` leaves the DB one nonce behind the
+    /// chain, so next-boot `initialize_smt_state` MUST diverge and halt with
+    /// `Err(SmtRootMismatch)`. A change that silently absorbs it breaks here.
+    #[tokio::test]
+    async fn initialize_smt_state_halts_on_consumed_but_unrecorded_nonce() {
+        let landed_nonce: u64 = 1;
+        let tree_index: u64 = 0;
+
+        // On-chain root = root of an SMT that DOES include the landed nonce.
+        let mut onchain_tree = SmtState::new(tree_index);
+        onchain_tree.insert_nonce(landed_nonce);
+        let onchain_root = onchain_tree.current_root();
+
+        // Craft the Instance account the operator will fetch on boot, carrying
+        // the advanced on-chain root.
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: onchain_root,
+            current_tree_index: tree_index,
+        };
+        let mut instance_bytes = Vec::new();
+        instance.serialize(&mut instance_bytes).unwrap();
+
+        // Mock getAccountInfo to return that crafted Instance account.
+        let account_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&instance_bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+        let mock_rpc = RpcClientWithRetry {
+            rpc_client: Arc::new(
+                solana_client::nonblocking::rpc_client::RpcClient::new_mock_with_mocks(
+                    "http://127.0.0.1:8899".to_string(),
+                    mocks,
+                ),
+            ),
+            retry_config: RetryConfig::default(),
+        };
+
+        // DB returns NO completed nonces — the landed nonce was never recorded.
+        // This is the divergence: chain has the nonce, DB does not.
+        let mut state = make_sender_state_with_pda(Some(Pubkey::new_unique()));
+        state.rpc_client = Arc::new(mock_rpc);
+
+        let err = state.initialize_smt_state().await.unwrap_err();
+
+        match err {
+            OperatorError::Program(crate::error::ProgramError::SmtRootMismatch {
+                local_root,
+                onchain_root: reported_onchain,
+            }) => {
+                // The local (DB-derived, empty) root must differ from the
+                // advanced on-chain root, and the reported on-chain root must
+                // be the one carrying the consumed nonce.
+                assert_ne!(
+                    local_root, reported_onchain,
+                    "mismatch must show diverging roots"
+                );
+                assert_eq!(
+                    reported_onchain, onchain_root,
+                    "on-chain root must be the one that included the landed nonce"
+                );
+                assert_eq!(
+                    local_root,
+                    SmtState::new(tree_index).current_root(),
+                    "local root must be the empty-tree root (nonce never recorded)"
+                );
+            }
+            other => panic!("expected SmtRootMismatch, got: {other}"),
+        }
     }
 }

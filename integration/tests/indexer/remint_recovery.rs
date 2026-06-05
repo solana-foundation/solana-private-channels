@@ -70,6 +70,7 @@ fn make_row(
         remint_last_valid_block_heights: Some(vec![0]),
         pending_remint_deadline_at: Some(deadline),
         finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
     }
 }
 

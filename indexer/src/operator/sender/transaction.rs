@@ -171,6 +171,8 @@ pub async fn handle_transaction_submission(
                     return;
                 }
                 Ok(None) => {}
+                // Deliberately fail-closed: an unverifiable lookup halts to
+                // manual review rather than risk a blind double-mint. 
                 Err(e) => {
                     error!(
                         "Mint idempotency lookup failed for transaction_id {}: {}",
@@ -316,9 +318,11 @@ pub(super) async fn send_and_confirm(
                         last_valid_block_height,
                     });
 
-                // Record the broadcast signature so recovery can verify finality
-                // before demoting. Best-effort: a failed
-                // insert only makes recovery quarantine later, so never fail the send.
+                // Record the broadcast signature for recovery's finality check.
+                // Best-effort: a failed insert only quarantines later, so never fail
+                // the send. Accepted tradeoff: if the release already landed and we
+                // crash before the Completed write, that gap triggers a next-boot
+                // SmtRootMismatch halt. See docs/runbooks/withdrawal_pipeline_halt_runbook.md.
                 if let Some(txid) = ctx.transaction_id {
                     if let Err(e) = state
                         .storage

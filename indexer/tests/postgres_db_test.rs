@@ -68,6 +68,7 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
     }
 }
 
@@ -863,5 +864,95 @@ async fn release_signature_cascade_on_transaction_delete() -> Result<(), Box<dyn
     .fetch_one(&pool)
     .await?;
     assert_eq!(count, 0, "ON DELETE CASCADE must remove orphaned sigs");
+    Ok(())
+}
+
+// ── recovery requeue counter ─────────────────────────────────────────────────
+
+async fn status_of(pool: &PgPool, id: i64) -> String {
+    sqlx::query_scalar::<_, String>("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn updated_at_of(pool: &PgPool, id: i64) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT updated_at FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn requeue_attempts_of(pool: &PgPool, id: i64) -> i32 {
+    sqlx::query_scalar("SELECT recovery_requeue_attempts FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_processing_increments_recovery_counter(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("requeue_counter", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    // Lock flips Pending → Processing (and bumps updated_at via trigger).
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        0,
+        "starts at default 0"
+    );
+
+    let captured = updated_at_of(&pool, id).await;
+    let requeued = storage.try_requeue_processing(id, captured).await?;
+    assert!(
+        requeued,
+        "CAS requeue must succeed for the captured timestamp"
+    );
+
+    assert_eq!(
+        status_of(&pool, id).await,
+        "pending",
+        "requeue must demote back to pending"
+    );
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        1,
+        "successful requeue must increment the durable counter by exactly 1"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("requeue_stale", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+
+    // A timestamp that does NOT match the row's updated_at → CAS no-op.
+    let stale = updated_at_of(&pool, id).await - chrono::Duration::seconds(60);
+    let requeued = storage.try_requeue_processing(id, stale).await?;
+    assert!(!requeued, "stale CAS must no-op");
+
+    assert_eq!(
+        status_of(&pool, id).await,
+        "processing",
+        "no-op CAS must leave status untouched"
+    );
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        0,
+        "no-op CAS must NOT bump the counter"
+    );
     Ok(())
 }

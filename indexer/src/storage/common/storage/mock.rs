@@ -513,6 +513,7 @@ impl MockStorage {
                 && txn.updated_at == expected_updated_at
             {
                 txn.status = TransactionStatus::Pending;
+                txn.recovery_requeue_attempts += 1;
                 txn.updated_at = Utc::now();
                 return Ok(true);
             }

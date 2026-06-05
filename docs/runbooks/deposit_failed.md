@@ -67,7 +67,7 @@ if a previous attempt did broadcast: the operator's pre-send memo scan
 short-circuits to `Completed` if it finds a memo'd signature.
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 

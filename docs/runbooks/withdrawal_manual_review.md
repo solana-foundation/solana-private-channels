@@ -46,6 +46,7 @@ have prefixes.
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
+| `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
 
 ## Path A.halting - build error that halted the pipeline
 
@@ -88,7 +89,7 @@ collateral.
 4. **Re-arm sweep rows:**
    ```sql
    UPDATE transactions
-      SET status = 'pending', updated_at = NOW()
+      SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE transaction_type = 'withdrawal'
       AND status = 'manual_review'
       AND id <> :poison_id;
@@ -127,7 +128,7 @@ withdrawals are unaffected.
 3. **If the condition has cleared, re-arm just this row:**
    ```sql
    UPDATE transactions
-      SET status = 'pending', updated_at = NOW()
+      SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE id = :transaction_id;
    ```
 4. **No operator restart is needed.** The processor did not halt; the
@@ -234,6 +235,15 @@ committing the row to manual review. Sub-triggers below; same recovery.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
 
+> **If the quarantined release actually landed** (verdict `LANDED`, but
+> the row was quarantined with `no broadcast signatures recorded; cannot
+> verify release landed` and never written `Completed`), expect an
+> `SmtRootMismatch` halt on the next operator boot - the consumed nonce
+> is missing from the DB. See
+> [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+> Marking the row `Completed` per Step 2 above also resolves
+> that halt by re-recording the nonce.
+
 ## Path F - corrupt withdrawal row (missing nonce)
 
 `error_message`: `withdrawal row missing nonce`. The recovery worker
@@ -256,7 +266,7 @@ If `withdrawal_nonce IS NOT NULL`, the row was repaired between
 quarantine and triage. Re-arm to `pending`:
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
@@ -291,6 +301,66 @@ write-or-classify path has a defect. Capture the row, then delete:
 
 ```sql
 DELETE FROM transactions WHERE id = :transaction_id;
+```
+
+## Path G - requeue cap exhausted (release never landed)
+
+`error_message` contains `recovery requeues without progress`. Each
+recovery pass that finds the row's release signatures all
+finalized-failed or expired (`SigFinality::Dead`) demotes the stuck
+`processing` row back to `pending` for a fresh send. After
+`MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with no release ever
+landing, recovery quarantines instead of looping forever. So the
+release-funds transaction was rebroadcast 3 times and every attempt died
+on-chain or expired - none finalized. The row data is valid (distinct
+from Path A/F) and the signatures are conclusively Dead each cycle
+(distinct from Path C's ambiguity).
+
+### Step 1 - verify on-chain
+
+Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
+verdict: `NOT_LANDED` (every attempt died). If `LANDED` -> a landed
+signature was misclassified as Dead; switch to Path C reconciliation and
+[escalate](_escalation.md) (Tier 2) - the classifier has a defect.
+
+### Step 2 - find why every release died
+
+Pull the recorded release signatures (keyed by `transaction_id`) and read
+each on-chain failure:
+
+```sql
+SELECT signature, last_valid_block_height, created_at
+  FROM pending_release_signatures
+ WHERE transaction_id = :transaction_id
+ ORDER BY created_at;
+```
+
+For each, `solana confirm -v <signature> --url <solana-rpc-url>` to read
+the `InstructionError`. A repeating deterministic error (escrow
+underfunded, SMT/proof rejection, account state) means re-sending will not
+help - [escalate](_escalation.md) (Tier 2/3) to engineering. A transient
+cause (blockhash expiry under load, RPC outage during the send window)
+may already have cleared.
+
+### Step 3 - resolve, then re-arm
+
+Fix the root cause first. Then re-arm to `pending` **and reset the requeue
+counter** - re-arming without the reset re-quarantines the row on its next
+stall, since the counter is already at the cap:
+
+```sql
+UPDATE transactions
+   SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+If the release can never land (unrecoverable on-chain rejection), mark the
+row terminal and [escalate](_escalation.md) (Tier 1) for refund
+coordination:
+
+```sql
+UPDATE transactions SET status = 'failed', updated_at = NOW()
+ WHERE id = :transaction_id;
 ```
 
 ## Post-incident artifacts (required)

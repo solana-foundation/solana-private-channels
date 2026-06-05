@@ -1167,6 +1167,76 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
     mock.shutdown().await;
 }
 
+// IT-13: a deposit that keeps coming back NotLanded is quarantined once it hits
+// the requeue cap instead of looping pending→processing→pending forever.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it13_recovery_requeue_cap_quarantines_after_max() {
+    let (db, url, _container) = start_pg("it13_requeue_cap").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+
+    // Seed the durable counter to MAX_RECOVERY_REQUEUE_ATTEMPTS - 1 (= 2); the
+    // next would-be demote crosses the cap → quarantine, not requeue.
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 2 WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    // Empty signatures → NotLanded → would Demote, but the cap intercepts it.
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
+
+    test_hooks::run_recovery_once(
+        &storage,
+        &client,
+        Pubkey::new_unique(),
+        ProgramType::Escrow,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "manual_review",
+        "row at the requeue cap must quarantine, not loop back to pending"
+    );
+    let update = storage_rx
+        .try_recv()
+        .expect("cap must fire the manual_review alert webhook");
+    assert_eq!(update.transaction_id, tx_id);
+    let err = update.error_message.as_deref().unwrap_or("");
+    // Count tracks MAX_RECOVERY_REQUEUE_ATTEMPTS (= 3, see the seed above); pin it to catch an off-by-one cap.
+    assert!(
+        err.contains("3 recovery requeues"),
+        "alert must name the requeue cap and its count: {err}"
+    );
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-13");
+    mock.shutdown().await;
+}
+
 // Threshold boundary: three rows at -4:59 / -5:00 / -5:01, expect the two older returned.
 
 #[tokio::test(flavor = "multi_thread")]

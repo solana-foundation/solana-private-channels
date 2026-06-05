@@ -34,6 +34,9 @@ pub(crate) const STALE_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// Per-tick batch cap; leftovers are picked up next tick.
 pub(crate) const RECOVERY_BATCH_LIMIT: i64 = 100;
 
+/// Max durable Demote requeues before a stuck row is quarantined (paged).
+const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
+
 /// Three-way outcome: uncertainty must NOT demote (double-mint risk).
 enum DepositOutcome {
     Landed { signature: String },
@@ -154,7 +157,7 @@ async fn decide_action(
     rpc_client: &RpcClientWithRetry,
     admin_pubkey: Pubkey,
 ) -> RecoveryAction {
-    match row.transaction_type {
+    let action = match row.transaction_type {
         TransactionType::Deposit => {
             match check_deposit_idempotency(row, rpc_client, admin_pubkey).await {
                 DepositOutcome::Landed { signature } => RecoveryAction::Complete { signature },
@@ -168,7 +171,20 @@ async fn decide_action(
             WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
             WithdrawalAction::Quarantine { reason } => RecoveryAction::Quarantine { reason },
         },
+    };
+    // Cap recovery requeue attempts. Rows that fail to make progress after
+    // MAX_RECOVERY_REQUEUE_ATTEMPTS are quarantined (and paged) rather than
+    // looping between Pending and Processing indefinitely.
+    if matches!(action, RecoveryAction::Demote)
+        && row.recovery_requeue_attempts + 1 >= MAX_RECOVERY_REQUEUE_ATTEMPTS
+    {
+        return RecoveryAction::Quarantine {
+            reason: format!(
+                "exceeded {MAX_RECOVERY_REQUEUE_ATTEMPTS} recovery requeues without progress"
+            ),
+        };
     }
+    action
 }
 
 async fn check_deposit_idempotency(
@@ -473,6 +489,7 @@ mod tests {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
         }
     }
 
@@ -953,6 +970,137 @@ mod tests {
         assert_eq!(
             update.error_message.as_deref(),
             Some("withdrawal row missing nonce")
+        );
+    }
+
+    // ── recovery requeue cap ─────────────────────────────────────────
+
+    /// Under the cap: a NotLanded deposit is requeued AND its durable
+    /// counter increments, so the next stale sweep sees the higher count.
+    #[tokio::test]
+    async fn requeue_under_cap_increments_counter_and_requeues() {
+        let mut server = mockito::Server::new_async().await;
+        // Empty signatures → NotLanded → Demote.
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignaturesForAddress"
+            })))
+            .with_status(200)
+            .with_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":[]}).to_string())
+            .create();
+
+        let mock = MockStorage::new();
+        let mut row = make_deposit_row(50);
+        row.status = TransactionStatus::Processing;
+        row.recovery_requeue_attempts = 0;
+        // Backdate past STALE_THRESHOLD so the sweep actually selects it.
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(
+            &storage,
+            &client,
+            Pubkey::new_unique(),
+            ProgramType::Escrow,
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Pending,
+            "under cap → requeued"
+        );
+        assert_eq!(
+            after[0].recovery_requeue_attempts, 1,
+            "durable requeue counter must increment on demote"
+        );
+    }
+
+    /// At the cap: a row that would otherwise Demote is quarantined to
+    /// ManualReview and the alert webhook is sent.
+    #[tokio::test]
+    async fn requeue_at_cap_quarantines_and_alerts() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignaturesForAddress"
+            })))
+            .with_status(200)
+            .with_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":[]}).to_string())
+            .create();
+
+        let mock = MockStorage::new();
+        let mut row = make_deposit_row(51);
+        row.status = TransactionStatus::Processing;
+        // One short of the cap → the next requeue would exceed it.
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
+        // Backdate past STALE_THRESHOLD so the sweep actually selects it.
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(
+            &storage,
+            &client,
+            Pubkey::new_unique(),
+            ProgramType::Escrow,
+            &storage_tx,
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::ManualReview,
+            "at cap → quarantined, not requeued"
+        );
+        drop(after);
+
+        let update = storage_rx
+            .try_recv()
+            .expect("cap must fire the manual-review alert webhook");
+        assert_eq!(update.transaction_id, 51);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let reason = update.error_message.as_deref().unwrap_or("");
+        assert!(
+            reason.contains("recovery requeues")
+                && reason.contains(&MAX_RECOVERY_REQUEUE_ATTEMPTS.to_string()),
+            "alert must name the requeue cap and its count: {reason}"
+        );
+    }
+
+    /// `decide_action` caps the Demote arm uniformly regardless of type.
+    #[tokio::test]
+    async fn decide_action_caps_demote_at_threshold() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignaturesForAddress"
+            })))
+            .with_status(200)
+            .with_body(serde_json::json!({"jsonrpc":"2.0","id":1,"result":[]}).to_string())
+            .create();
+        let storage = Storage::Mock(MockStorage::new());
+        let client = make_rpc_client(&server.url());
+
+        let mut row = make_deposit_row(52);
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
+        let action = decide_action(&row, &storage, &client, Pubkey::new_unique()).await;
+        assert!(
+            matches!(action, RecoveryAction::Quarantine { .. }),
+            "demote at the cap must become Quarantine"
         );
     }
 

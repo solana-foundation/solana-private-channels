@@ -128,6 +128,7 @@ fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: Some(now),
             finality_check_attempts: attempts,
+            recovery_requeue_attempts: 0,
         });
 }
 

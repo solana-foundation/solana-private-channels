@@ -477,8 +477,11 @@ mod tests {
     };
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
     use crate::operator::MintCache;
+    use crate::operator::RetryConfig;
+    use crate::operator::RpcClientWithRetry;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
+    use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -555,6 +558,7 @@ mod tests {
                 remint_last_valid_block_heights: None,
                 pending_remint_deadline_at: Some(now),
                 finality_check_attempts: attempts,
+                recovery_requeue_attempts: 0,
             });
     }
 
@@ -1235,6 +1239,173 @@ mod tests {
         assert!(
             state.pending_remints.is_empty(),
             "entry consumed after Completed"
+        );
+    }
+
+    // ── classify_release_signatures (multi-sig) ─────────────────
+
+    /// Bare RPC client (1 attempt, fast) for direct classifier tests.
+    fn make_rpc(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    /// Finalized success after an earlier finalized failure must win (full-list scan, not first-match).
+    #[tokio::test]
+    async fn classify_release_signatures_finalized_success_wins_over_earlier_failure() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        let failed = Signature::new_unique();
+        let success = Signature::new_unique();
+
+        // value[0] finalized-failed, value[1] finalized-success (positional).
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[
+                {"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"},
+                {"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}
+            ]},"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: failed,
+                last_valid_block_height: 0,
+            },
+            PendingSig {
+                signature: success,
+                last_valid_block_height: 0,
+            },
+        ];
+
+        match classify_release_signatures(&rpc, &sigs).await {
+            SigFinality::Landed(s) => assert_eq!(
+                s, success,
+                "must return the finalized-success sig, not the failed one"
+            ),
+            _ => panic!("expected Landed(success sig), got a different verdict"),
+        }
+    }
+
+    /// Confirmed success behind a finalized failure must stay Live, never Dead.
+    #[tokio::test]
+    async fn classify_release_signatures_confirmed_success_after_failure_is_live_not_dead() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        // value[0] finalized-failed, value[1] confirmed-success (in a block,
+        // will finalize).
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[
+                {"slot":100,"confirmations":null,"err":{"InstructionError":[0,{"Custom":1}]},"status":{"Err":{"InstructionError":[0,{"Custom":1}]}},"confirmationStatus":"finalized"},
+                {"slot":100,"confirmations":10,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}
+            ]},"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+        ];
+
+        assert!(
+            matches!(
+                classify_release_signatures(&rpc, &sigs).await,
+                SigFinality::Live(_)
+            ),
+            "confirmed success behind a finalized failure must be Live, not Dead"
+        );
+    }
+
+    /// A still-valid null after an expired null must be Live: nulls are walked fully, not cut at the first.
+    #[tokio::test]
+    async fn classify_release_signatures_live_null_after_expired_null_is_live() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null,null]},"id":0}"#,
+        )
+        .await;
+        // current_height 1000: sig[0] lvbh 100 expired, sig[1] lvbh 2000 live.
+        let _height = mock_rpc(
+            &mut rpc_server,
+            "getBlockHeight",
+            r#"{"jsonrpc":"2.0","result":1000,"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 100,
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 2000,
+            },
+        ];
+
+        assert!(
+            matches!(
+                classify_release_signatures(&rpc, &sigs).await,
+                SigFinality::Live(_)
+            ),
+            "a still-valid null after an expired null must be Live, not Dead"
+        );
+    }
+
+    /// A truncated status list (fewer statuses than sigs) must be Uncertain, never read as "missing = dead".
+    #[tokio::test]
+    async fn classify_release_signatures_status_length_mismatch_is_uncertain() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let rpc = make_rpc(&rpc_server.url());
+
+        // Two sigs requested, one status returned.
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
+        )
+        .await;
+
+        let sigs = vec![
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+            PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            },
+        ];
+
+        assert!(
+            matches!(
+                classify_release_signatures(&rpc, &sigs).await,
+                SigFinality::Uncertain(_)
+            ),
+            "length mismatch must be Uncertain"
         );
     }
 

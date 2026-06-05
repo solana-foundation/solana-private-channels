@@ -8,6 +8,14 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
+> **One halt has no dedicated alert.** The **SMT-root-mismatch startup
+> halt** fires no "pipeline halted" event - it surfaces as repeated
+> per-row `failed` webhooks whose `error_message` carries `SMT root
+> mismatch` (plus `SMT root mismatch detected` in the operator logs).
+> Recognize it by that pattern, not a single alert, and not via this
+> dispatch table. See
+> [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+
 ## Alert dispatch
 
 The **alert webhook** in `db_transaction_writer.rs` is the only
@@ -72,6 +80,8 @@ The runbooks call this out at every relevant site.
   on-chain check (private channel chain).
 - [`_escalation.md`](_escalation.md) - escalation tiers and contacts.
   Every "escalate" call-site in the recovery runbooks links here.
+- [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
+  the SMT-root-mismatch startup halt (log-discovered, not paged).
 
 ## Drills
 

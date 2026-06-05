@@ -78,6 +78,10 @@ pub struct DbTransaction {
     /// what keeps the `MAX_FINALITY_CHECK_ATTEMPTS` budget honest across
     /// crashes. Non-PendingRemint rows always carry 0 (column DEFAULT).
     pub finality_check_attempts: i32,
+    /// Durable recovery requeue counter. Each `Demote` (stale
+    /// `processing` -> `pending`) bumps this; the cap quarantines a row that
+    /// can never progress instead of looping forever.
+    pub recovery_requeue_attempts: i32,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -217,6 +221,7 @@ impl DbTransactionBuilder {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
         }
     }
 }

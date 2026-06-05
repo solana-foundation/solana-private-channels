@@ -241,6 +241,7 @@ fn make_withdrawal_transaction(
         remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
     }
 }
 
