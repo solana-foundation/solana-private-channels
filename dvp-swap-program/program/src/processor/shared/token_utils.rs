@@ -11,8 +11,8 @@ use pinocchio::{
 };
 use pinocchio_token::{state::Mint as TokenMint, state::TokenAccount, ID as TOKEN_PROGRAM_ID};
 use pinocchio_token_2022::{
-    state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
-    ID as TOKEN_2022_PROGRAM_ID,
+    instructions::SyncNative, state::Mint as Token2022Mint,
+    state::TokenAccount as Token2022Account, ID as TOKEN_2022_PROGRAM_ID,
 };
 use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferMint,
@@ -64,17 +64,46 @@ pub fn verify_canonical_ata(
 /// Read the `amount` field of a token account owned by either legacy
 /// SPL Token or Token-2022. The two share an identical first-165-byte
 /// account layout, so the only branch is on the owner program ID.
+///
+/// For a wrapped-SOL (native) account, `SyncNative` is issued first so
+/// `amount` reflects lamports sent via a raw system transfer (which don't
+/// update `amount` on their own). The synced `amount` must be re-read
+/// after the CPI; non-native accounts read once and return.
 #[inline(always)]
 pub fn get_token_account_balance(info: &AccountView) -> Result<u64, ProgramError> {
     if info.owned_by(&TOKEN_PROGRAM_ID) {
+        let (amount, is_native) = {
+            let data = info.try_borrow()?;
+            let account = unsafe { TokenAccount::from_bytes_unchecked(&data) };
+            (account.amount(), account.is_native())
+        };
+        if !is_native {
+            return Ok(amount);
+        }
+        SyncNative {
+            native_token: info,
+            token_program: &TOKEN_PROGRAM_ID,
+        }
+        .invoke()?;
         let data = info.try_borrow()?;
-        let account = unsafe { TokenAccount::from_bytes_unchecked(&data) };
-        return Ok(account.amount());
+        return Ok(unsafe { TokenAccount::from_bytes_unchecked(&data) }.amount());
     }
     if info.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        let (amount, is_native) = {
+            let data = info.try_borrow()?;
+            let account = unsafe { Token2022Account::from_bytes_unchecked(&data) };
+            (account.amount(), account.is_native())
+        };
+        if !is_native {
+            return Ok(amount);
+        }
+        SyncNative {
+            native_token: info,
+            token_program: &TOKEN_2022_PROGRAM_ID,
+        }
+        .invoke()?;
         let data = info.try_borrow()?;
-        let account = unsafe { Token2022Account::from_bytes_unchecked(&data) };
-        return Ok(account.amount());
+        return Ok(unsafe { Token2022Account::from_bytes_unchecked(&data) }.amount());
     }
     Err(ProgramError::InvalidAccountOwner)
 }

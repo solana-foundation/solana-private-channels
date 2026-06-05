@@ -161,6 +161,25 @@ impl Default for TestContext {
     }
 }
 
+/// The wrapped-SOL (native) mint, owned by legacy SPL Token. LiteSVM does
+/// not seed this account, so tests must write it with `set_native_mint`.
+pub const NATIVE_MINT: Pubkey = spl_token::native_mint::ID;
+
+/// Write the wrapped-SOL mint (decimals 9, SPL Token) at its canonical
+/// address so WSOL legs can be exercised.
+pub fn set_native_mint(context: &mut TestContext) {
+    let mint_state = Mint {
+        decimals: 9,
+        is_initialized: true,
+        freeze_authority: COption::None,
+        mint_authority: COption::None,
+        supply: 0,
+    };
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(mint_state, &mut data).unwrap();
+    write_account(context, &NATIVE_MINT, data, TOKEN_PROGRAM_ID, 1_000_000_000);
+}
+
 /// Write a bare mint (no Token-2022 extensions) owned by `token_program`.
 /// For Token-2022 mints with extensions use one of the
 /// `set_mint_2022_with_*` builders below — they pack a proper TLV layout

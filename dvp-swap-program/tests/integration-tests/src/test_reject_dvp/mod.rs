@@ -12,11 +12,12 @@ use crate::{
         AMOUNT_B, INITIAL_BALANCE,
     },
     utils::{
-        assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
-        get_token_balance, nonce_tombstone_pda, set_mint, swap_dvp_pda, TestContext,
-        MEMO_PROGRAM_ID, SIGNER_NOT_PARTY, TOKEN_PROGRAM_ID,
+        assert_instruction_error, assert_program_error, create_ata, dvp_ata, fund_wallet_ata,
+        get_token_balance, nonce_tombstone_pda, set_mint, set_native_mint, swap_dvp_pda,
+        TestContext, MEMO_PROGRAM_ID, NATIVE_MINT, SIGNER_NOT_PARTY, TOKEN_PROGRAM_ID,
     },
 };
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 
 #[test]
 fn test_reject_dvp_success_signed_by_user_b() {
@@ -289,4 +290,93 @@ fn test_reject_dvp_works_when_settlement_authority_is_unreachable() {
     assert!(context.get_account(&swap_dvp).is_none());
     assert!(context.get_account(&dvp_ata_a).is_none());
     assert!(context.get_account(&dvp_ata_b).is_none());
+}
+
+/// A wrapped-SOL escrow funded with raw, unsynced lamports must still be
+/// refunded in full. The program `SyncNative`s the escrow before reading
+/// its balance, so the deposit is recovered to the depositor instead of
+/// leaking to the close recipient. Reject is signed by the counterparty
+/// (user_b) here, so a leaked balance would land with them, not user_a,
+/// making the refund the only path by which user_a ends up with it.
+#[test]
+fn test_reject_dvp_syncs_native_escrow_before_refund() {
+    let mut context = TestContext::new();
+    set_native_mint(&mut context);
+
+    let user_a = Keypair::new();
+    let user_b = Keypair::new();
+    let settlement_authority = Keypair::new();
+    context.airdrop_if_required(&user_b.pubkey(), 1_000_000_000);
+
+    let mint_a = NATIVE_MINT; // WSOL leg
+    let mint_b = Keypair::new().pubkey();
+    set_mint(&mut context, &mint_b, &TOKEN_PROGRAM_ID);
+
+    // user_a's WSOL refund ATA must exist for the refund transfer; leg B
+    // stays unfunded so its ATA is only address-validated.
+    let user_a_ata_a = create_ata(&mut context, &user_a.pubkey(), &mint_a, &TOKEN_PROGRAM_ID);
+    let user_b_ata_b =
+        get_associated_token_address_with_program_id(&user_b.pubkey(), &mint_b, &TOKEN_PROGRAM_ID);
+
+    let nonce: u64 = 0;
+    let (swap_dvp, _) = swap_dvp_pda(
+        &settlement_authority.pubkey(),
+        &user_a.pubkey(),
+        &user_b.pubkey(),
+        &mint_a,
+        &mint_b,
+        nonce,
+    );
+    let dvp_ata_a = dvp_ata(&swap_dvp, &mint_a, &TOKEN_PROGRAM_ID);
+    let dvp_ata_b = dvp_ata(&swap_dvp, &mint_b, &TOKEN_PROGRAM_ID);
+
+    let deposit: u64 = 5_000_000; // WSOL base units (9 decimals)
+    let create_ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(swap_dvp)
+        .nonce_tombstone(nonce_tombstone_pda(&swap_dvp).0)
+        .mint_a(mint_a)
+        .mint_b(mint_b)
+        .dvp_ata_a(dvp_ata_a)
+        .dvp_ata_b(dvp_ata_b)
+        .token_program_a(TOKEN_PROGRAM_ID)
+        .token_program_b(TOKEN_PROGRAM_ID)
+        .user_a(user_a.pubkey())
+        .user_b(user_b.pubkey())
+        .settlement_authority(settlement_authority.pubkey())
+        .amount_a(deposit)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(context.now() + 3600)
+        .nonce(nonce)
+        .instruction();
+    context.send(create_ix, &[]).expect("CreateDvp");
+
+    // Simulate a raw-lamport deposit into the WSOL escrow: bump its
+    // lamports without calling SyncNative, so `amount` stays 0 (the exact
+    // condition the finding describes).
+    assert_eq!(get_token_balance(&context, &dvp_ata_a), 0);
+    let mut escrow = context.get_account(&dvp_ata_a).expect("escrow exists");
+    escrow.lamports += deposit;
+    context.svm.set_account(dvp_ata_a, escrow).unwrap();
+
+    let reject_ix = RejectDvpBuilder::new()
+        .signer(user_b.pubkey())
+        .swap_dvp(swap_dvp)
+        .mint_a(mint_a)
+        .mint_b(mint_b)
+        .dvp_ata_a(dvp_ata_a)
+        .dvp_ata_b(dvp_ata_b)
+        .user_a_ata_a(user_a_ata_a)
+        .user_b_ata_b(user_b_ata_b)
+        .token_program_a(TOKEN_PROGRAM_ID)
+        .token_program_b(TOKEN_PROGRAM_ID)
+        .memo_program(MEMO_PROGRAM_ID)
+        .leg_a_extras_count(0)
+        .instruction();
+    context.send(reject_ix, &[&user_b]).expect("RejectDvp");
+
+    // The unsynced deposit was synced and refunded to user_a, not leaked
+    // to the close recipient (user_b).
+    assert_eq!(get_token_balance(&context, &user_a_ata_a), deposit);
+    assert!(context.get_account(&dvp_ata_a).is_none());
 }
