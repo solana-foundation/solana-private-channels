@@ -511,7 +511,10 @@ mod tests {
         // a pre-existing DB rather than a crash gap.
         clear_address_signatures(&db).await;
         assert_eq!(count_addr_sig_rows(&db).await, 0);
-        assert_eq!(get_address_signatures_flushed_slot(&pg).await.unwrap(), None);
+        assert_eq!(
+            get_address_signatures_flushed_slot(&pg).await.unwrap(),
+            None
+        );
 
         repair_address_signatures(&db, Arc::new(NoopMetrics) as SharedMetrics)
             .await
