@@ -30,7 +30,7 @@ use private_channel_escrow_program_client::{
     instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_indexer::storage::common::models::{
-    DbMint, DbTransaction, TransactionStatus, TransactionType,
+    DbMint, DbMintStatus, DbTransaction, TransactionStatus, TransactionType,
 };
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
@@ -238,7 +238,9 @@ fn make_withdrawal_transaction(
         processed_at: None,
         counterpart_signature: None,
         remint_signatures: None,
+        remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
+        finality_check_attempts: 0,
     }
 }
 
@@ -346,6 +348,15 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
         TOKEN_2022_PROGRAM_ID.to_string(),
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            mint_address: mint_pubkey.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{mint_pubkey}"),
+            created_at: Utc::now(),
+        }])
+        .await?;
     assert!(
         storage
             .get_mint(&mint_pubkey.to_string())

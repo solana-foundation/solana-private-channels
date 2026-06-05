@@ -31,7 +31,7 @@ use {
     private_channel_indexer::{
         config::{OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator,
-        storage::common::models::{DbMint, DbTransaction, TransactionStatus},
+        storage::common::models::{DbMint, DbMintStatus, DbTransaction, TransactionStatus},
         storage::{PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
@@ -172,6 +172,15 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            mint_address: env.mint.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{}", env.mint),
+            created_at: Utc::now(),
+        }])
+        .await?;
 
     // Escrow ATA needs funds (not that a successful withdrawal is expected — we
     // just want the non-NULL-nonce path to not kick in first).
@@ -200,7 +209,9 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
         processed_at: None,
         counterpart_signature: None,
         remint_signatures: None,
+        remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
+        finality_check_attempts: 0,
     };
     storage.insert_db_transaction(&withdrawal).await?;
 

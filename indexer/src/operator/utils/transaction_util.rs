@@ -43,7 +43,7 @@ pub async fn sign_and_send_transaction(
     rpc_client: Arc<RpcClientWithRetry>,
     mut ix_with_signers: InstructionWithSigners,
     retry_policy: RetryPolicy,
-) -> Result<Signature, TransactionError> {
+) -> Result<(Signature, u64), TransactionError> {
     if let Some(compute_unit_price) = ix_with_signers.compute_unit_price {
         let compute_budget_ix =
             ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
@@ -56,8 +56,8 @@ pub async fn sign_and_send_transaction(
         ix_with_signers.instructions.insert(0, compute_budget_ix);
     }
 
-    let recent_blockhash = rpc_client
-        .get_latest_blockhash()
+    let (recent_blockhash, last_valid_block_height) = rpc_client
+        .get_latest_blockhash_with_commitment()
         .await
         .map_err(TransactionError::Rpc)?;
 
@@ -81,7 +81,7 @@ pub async fn sign_and_send_transaction(
         .await
         .map_err(TransactionError::Rpc)?;
 
-    Ok(signature)
+    Ok((signature, last_valid_block_height))
 }
 
 /// Check transaction status with polling.
@@ -547,7 +547,7 @@ mod tests {
 
         let result = sign_and_send_transaction(rpc_client, ix, RetryPolicy::None).await;
 
-        let sig = result.unwrap();
+        let (sig, _) = result.unwrap();
         assert_eq!(sig.to_string(), expected_sig);
     }
 

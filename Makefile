@@ -192,6 +192,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
 	@cd integration && cargo test --test remint_recovery -- --nocapture
 	@cd integration && cargo test --test bootstrap_validation -- --nocapture
+	@cd integration && cargo test --test deposit_allowlist_e2e -- --nocapture
 	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
 	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
 	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
@@ -239,6 +240,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
 	@cd integration && cargo test --test remint_recovery -- --nocapture
 	@cd integration && cargo test --test bootstrap_validation -- --nocapture
+	@cd integration && cargo test --test deposit_allowlist_e2e -- --nocapture
 	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
 	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
 	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture

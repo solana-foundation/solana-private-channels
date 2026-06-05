@@ -68,9 +68,16 @@ pub struct DbTransaction {
     /// PendingRemint. Used on restart to verify whether the original withdrawal
     /// finalized before attempting to remint.
     pub remint_signatures: Option<Vec<String>>,
-    /// UTC timestamp of when the finality check deadline expires for PendingRemint transactions.                                                                           
-    /// Set when transitioning to PendingRemint, used to restore the exact wait time on restart.                                                                            
+    /// `last_valid_block_height` per stored signature, index-paired with `remint_signatures`.
+    pub remint_last_valid_block_heights: Option<Vec<i64>>,
+    /// UTC timestamp of when the finality check deadline expires for PendingRemint transactions.
+    /// Set when transitioning to PendingRemint, used to restore the exact wait time on restart.
     pub pending_remint_deadline_at: Option<DateTime<Utc>>,
+    /// Persisted defer counter for PendingRemint rows. Each finality-check
+    /// failure or liveness deferral bumps this; restoring it on restart is
+    /// what keeps the `MAX_FINALITY_CHECK_ATTEMPTS` budget honest across
+    /// crashes. Non-PendingRemint rows always carry 0 (column DEFAULT).
+    pub finality_check_attempts: i32,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -114,6 +121,24 @@ impl DbMint {
             has_permanent_delegate: None,
         }
     }
+}
+
+/// Status transition row recording an Allow/Block decision for a mint at a slot.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DbMintStatus {
+    pub mint_address: String,
+    pub status: String,
+    pub effective_slot: i64,
+    pub signature: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Resolved mint status at a particular slot, derived from `mint_status_history`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintStatusAtSlot {
+    Allowed,
+    Blocked,
+    NeverAllowed,
 }
 
 /// Builder for DbTransaction
@@ -189,7 +214,9 @@ impl DbTransactionBuilder {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
+            remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
+            finality_check_attempts: 0,
         }
     }
 }
