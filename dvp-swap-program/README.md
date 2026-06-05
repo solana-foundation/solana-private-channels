@@ -110,9 +110,21 @@ make build              # generate clients + cargo-build-sbf
 make unit-test          # program crate's #[cfg(test)] modules + JS client tests
 make integration-test   # build + LiteSVM integration tests
 make fmt                # cargo fmt + clippy + pnpm format
+make verify-program-id  # pre-deploy: deploy keypair matches the declared program ID
 ```
 
 The integration tests live in `tests/integration-tests/` and run against the compiled `.so` via [LiteSVM](https://github.com/LiteSVM/litesvm). See `tests/integration-tests/src/` for one directory per instruction.
+
+### Deploying
+
+The address in `declare_id!` (and therefore the IDL and generated clients) is a temporary placeholder. Its keypair is not available, so the program has not been deployed to it and that ID is not the program's real address. A real deployment must:
+
+1. Generate a fresh program keypair (`solana-keygen new -o target/deploy/dvp_swap_program-keypair.json`).
+2. Set `declare_id!` to its pubkey and regenerate the IDL and clients (`make build`).
+3. Run `make verify-program-id` to confirm the deploy keypair matches the declared ID.
+4. `solana program deploy --program-id target/deploy/dvp_swap_program-keypair.json target/deploy/dvp_swap_program.so`.
+
+`cargo-build-sbf` writes a random deploy keypair that does not match `declare_id!`, so deploying without these steps (or without an explicit `--program-id`) publishes to the wrong address.
 
 ## Layout
 

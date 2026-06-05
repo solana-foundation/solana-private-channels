@@ -4,7 +4,7 @@ SHELL := /usr/bin/env bash
 
 .PHONY: install build build-hook-fixture fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
-.PHONY: unit-coverage coverage-html all-coverage
+.PHONY: unit-coverage coverage-html all-coverage verify-program-id
 
 # Install JS deps (codama renderers, tsx, etc.)
 install:
@@ -19,6 +19,21 @@ build:
 	$(MAKE) generate-clients
 	cd program && cargo-build-sbf
 	$(MAKE) build-hook-fixture
+
+# Pre-deploy guard: cargo-build-sbf writes a random target/deploy/*-keypair.json
+# that does NOT match declare_id!, so deploying with it (or without an explicit
+# --program-id) publishes to the wrong address. Run this before `solana program
+# deploy` with the real deploy keypair in place. Not wired into `build`/CI: there
+# the keypair is a throwaway and would never match. Expected ID is read from the
+# generated IDL (single source of truth, derived from declare_id!).
+verify-program-id:
+	@expected=$$(grep -o '"publicKey": *"[^"]*"' idl/dvp_swap_program.json | head -1 | sed 's/.*"\([^"]*\)"$$/\1/'); \
+	actual=$$(solana-keygen pubkey ../target/deploy/dvp_swap_program-keypair.json); \
+	if [ "$$expected" != "$$actual" ]; then \
+		echo "ERROR: deploy keypair $$actual does not match program ID $$expected"; \
+		exit 1; \
+	fi; \
+	echo "OK: deploy keypair matches program ID $$expected"
 
 # Build the no-op transfer-hook program used only by integration tests.
 # Loaded into LiteSVM so hook-bearing Token-2022 mints can be exercised
