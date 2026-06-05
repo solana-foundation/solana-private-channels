@@ -8,7 +8,9 @@
 //!   topologies are exercised.
 //! - **CreateDvp negative** for every *blocked* extension on either leg
 //!   (TransferFeeConfig, InterestBearingConfig, ScaledUiAmount,
-//!   ConfidentialTransferMint, NonTransferable).
+//!   ConfidentialTransferMint, NonTransferable). `ConfidentialTransferFeeConfig`
+//!   is also blocked but can't exist without `ConfidentialTransferMint`, so the
+//!   ConfidentialTransferMint test covers that path.
 //! - **Owner mismatch**: legacy SPL mint paired with T22 token program.
 //! - **Post-Create extension activation**: a mint is swapped to a
 //!   blocked-extension layout *after* CreateDvp, and Settle/Reject must
