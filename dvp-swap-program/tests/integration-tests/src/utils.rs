@@ -54,6 +54,7 @@ pub const SETTLEMENT_AUTHORITY_MISMATCH: u32 =
 pub const SETTLEMENT_TOO_EARLY: u32 = DvpSwapProgramError::SettlementTooEarly as u32;
 pub const LEG_NOT_FUNDED: u32 = DvpSwapProgramError::LegNotFunded as u32;
 pub const EXPIRY_NOT_IN_FUTURE: u32 = DvpSwapProgramError::ExpiryNotInFuture as u32;
+pub const EXPIRY_TOO_FAR_IN_FUTURE: u32 = DvpSwapProgramError::ExpiryTooFarInFuture as u32;
 pub const EARLIEST_AFTER_EXPIRY: u32 = DvpSwapProgramError::EarliestAfterExpiry as u32;
 pub const SELF_DVP: u32 = DvpSwapProgramError::SelfDvp as u32;
 pub const SAME_MINT: u32 = DvpSwapProgramError::SameMint as u32;

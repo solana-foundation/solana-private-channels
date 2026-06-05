@@ -21,6 +21,9 @@ use pinocchio::{
 };
 use pinocchio_associated_token_account::instructions::CreateIdempotent as CreateAtaIdempotent;
 
+/// Max DvP lifetime (one year) as a duration from creation. Caps escrow rent lock-up.
+const MAX_DVP_DURATION_SECS: i64 = 365 * 24 * 60 * 60;
+
 /// Processes the CreateDvp instruction.
 ///
 /// Permissionless: any signer can pay the rent. The DvP starts empty;
@@ -315,6 +318,10 @@ fn validate_args(
         args.expiry_timestamp > now,
         DvpSwapProgramError::ExpiryNotInFuture
     );
+    require!(
+        args.expiry_timestamp <= now.saturating_add(MAX_DVP_DURATION_SECS),
+        DvpSwapProgramError::ExpiryTooFarInFuture
+    );
     if let Some(earliest) = args.earliest_settlement_timestamp {
         require!(
             earliest <= args.expiry_timestamp,
@@ -405,6 +412,23 @@ mod tests {
         let err =
             validate_args(&a, &settlement_authority(), &mint_a(), &mint_b(), NOW).unwrap_err();
         assert_custom(err, DvpSwapProgramError::ExpiryNotInFuture);
+    }
+
+    #[test]
+    fn validate_args_accepts_expiry_at_max_horizon() {
+        let mut a = args();
+        a.expiry_timestamp = NOW + MAX_DVP_DURATION_SECS;
+        validate_args(&a, &settlement_authority(), &mint_a(), &mint_b(), NOW)
+            .expect("expiry exactly at the cap is allowed");
+    }
+
+    #[test]
+    fn validate_args_rejects_expiry_beyond_max_horizon() {
+        let mut a = args();
+        a.expiry_timestamp = NOW + MAX_DVP_DURATION_SECS + 1;
+        let err =
+            validate_args(&a, &settlement_authority(), &mint_a(), &mint_b(), NOW).unwrap_err();
+        assert_custom(err, DvpSwapProgramError::ExpiryTooFarInFuture);
     }
 
     #[test]

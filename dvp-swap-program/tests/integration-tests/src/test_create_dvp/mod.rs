@@ -6,7 +6,7 @@ use crate::{
     state_utils::{assert_cancel_dvp, assert_create_dvp, setup_dvp, AMOUNT_A, AMOUNT_B},
     utils::{
         assert_program_error, get_token_balance, TestContext, EARLIEST_AFTER_EXPIRY,
-        EXPIRY_NOT_IN_FUTURE, NONCE_ALREADY_USED, SAME_MINT, SELF_DVP,
+        EXPIRY_NOT_IN_FUTURE, EXPIRY_TOO_FAR_IN_FUTURE, NONCE_ALREADY_USED, SAME_MINT, SELF_DVP,
         SETTLEMENT_AUTHORITY_EXECUTABLE, SETTLEMENT_AUTHORITY_IS_PARTY, SWAP_PROGRAM_ID,
         ZERO_AMOUNT,
     },
@@ -66,6 +66,35 @@ fn test_create_dvp_rejects_expiry_at_now() {
         .instruction();
 
     assert_program_error(context.send(ix, &[]), EXPIRY_NOT_IN_FUTURE);
+}
+
+#[test]
+fn test_create_dvp_rejects_expiry_too_far_in_future() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    // One year + 1s past now exceeds the MAX_DVP_DURATION_SECS cap.
+    let one_year_plus_one = context.now() + 365 * 24 * 60 * 60 + 1;
+    let ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(one_year_plus_one)
+        .nonce(fixture.nonce)
+        .instruction();
+
+    assert_program_error(context.send(ix, &[]), EXPIRY_TOO_FAR_IN_FUTURE);
 }
 
 #[test]

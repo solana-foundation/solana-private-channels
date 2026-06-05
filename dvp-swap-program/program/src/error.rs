@@ -67,6 +67,11 @@ pub enum DvpSwapProgramError {
     /// tombstone outlives the closed trade so the PDA can't be reused.
     #[error("nonce already used for these DvP seeds")]
     NonceAlreadyUsed,
+
+    /// (14) `expiry_timestamp` is more than `MAX_DVP_DURATION_SECS` past
+    /// creation time, which would lock escrow rent for an unbounded term.
+    #[error("DvP expiry is too far in the future")]
+    ExpiryTooFarInFuture,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {

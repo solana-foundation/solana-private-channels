@@ -209,6 +209,12 @@
         "kind": "errorNode",
         "message": "nonce already used for these DvP seeds",
         "name": "nonceAlreadyUsed"
+      },
+      {
+        "code": 14,
+        "kind": "errorNode",
+        "message": "DvP expiry is too far in the future",
+        "name": "expiryTooFarInFuture"
       }
     ],
     "instructions": [
