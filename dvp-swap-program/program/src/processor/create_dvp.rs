@@ -128,7 +128,7 @@ pub fn process_create_dvp(
     );
     require!(
         nonce_tombstone_info.address() == &expected_tombstone,
-        ProgramError::InvalidSeeds
+        ProgramError::InvalidAccountData
     );
     require!(
         nonce_tombstone_info.owned_by(&pinocchio_system::ID),

@@ -61,49 +61,50 @@ pub fn verify_canonical_ata(
     Ok(())
 }
 
+/// Read the token balance, issuing a `SyncNative` CPI first if the account
+/// holds wrapped SOL. `parse` returns `(amount, is_native)` from the
+/// account's bytes; it is called once for non-native accounts, and a
+/// second time after the sync CPI for native ones (the synced `amount`
+/// must be re-read).
+fn read_balance_synced(
+    info: &AccountView,
+    token_program: &Address,
+    parse: impl Fn(&[u8]) -> (u64, bool),
+) -> Result<u64, ProgramError> {
+    let (amount, is_native) = {
+        let data = info.try_borrow()?;
+        parse(&data)
+    };
+    if !is_native {
+        return Ok(amount);
+    }
+    SyncNative {
+        native_token: info,
+        token_program,
+    }
+    .invoke()?;
+    let data = info.try_borrow()?;
+    Ok(parse(&data).0)
+}
+
 /// Read the `amount` field of a token account owned by either legacy
-/// SPL Token or Token-2022. The two share an identical first-165-byte
-/// account layout, so the only branch is on the owner program ID.
-///
-/// For a wrapped-SOL (native) account, `SyncNative` is issued first so
-/// `amount` reflects lamports sent via a raw system transfer (which don't
-/// update `amount` on their own). The synced `amount` must be re-read
-/// after the CPI; non-native accounts read once and return.
+/// SPL Token or Token-2022, decoding with that program's own account
+/// type. Wrapped-SOL accounts are `SyncNative`d first so `amount`
+/// reflects lamports sent via a raw system transfer (which don't update
+/// `amount` on their own).
 #[inline(always)]
 pub fn get_token_account_balance(info: &AccountView) -> Result<u64, ProgramError> {
     if info.owned_by(&TOKEN_PROGRAM_ID) {
-        let (amount, is_native) = {
-            let data = info.try_borrow()?;
-            let account = unsafe { TokenAccount::from_bytes_unchecked(&data) };
+        return read_balance_synced(info, &TOKEN_PROGRAM_ID, |data| {
+            let account = unsafe { TokenAccount::from_bytes_unchecked(data) };
             (account.amount(), account.is_native())
-        };
-        if !is_native {
-            return Ok(amount);
-        }
-        SyncNative {
-            native_token: info,
-            token_program: &TOKEN_PROGRAM_ID,
-        }
-        .invoke()?;
-        let data = info.try_borrow()?;
-        return Ok(unsafe { TokenAccount::from_bytes_unchecked(&data) }.amount());
+        });
     }
     if info.owned_by(&TOKEN_2022_PROGRAM_ID) {
-        let (amount, is_native) = {
-            let data = info.try_borrow()?;
-            let account = unsafe { Token2022Account::from_bytes_unchecked(&data) };
+        return read_balance_synced(info, &TOKEN_2022_PROGRAM_ID, |data| {
+            let account = unsafe { Token2022Account::from_bytes_unchecked(data) };
             (account.amount(), account.is_native())
-        };
-        if !is_native {
-            return Ok(amount);
-        }
-        SyncNative {
-            native_token: info,
-            token_program: &TOKEN_2022_PROGRAM_ID,
-        }
-        .invoke()?;
-        let data = info.try_borrow()?;
-        return Ok(unsafe { Token2022Account::from_bytes_unchecked(&data) }.amount());
+        });
     }
     Err(ProgramError::InvalidAccountOwner)
 }
