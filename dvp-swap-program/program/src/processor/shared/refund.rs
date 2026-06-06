@@ -20,7 +20,7 @@ use crate::{
 /// point, and the refund path must stay available even if a mint's
 /// extension parameters change post-Create so funds are never stranded.
 ///
-/// `fixed` is the 10-account prefix from `split_leg_remaining_accounts`;
+/// `fixed` is the 11-account prefix from `split_leg_remaining_accounts`;
 /// `leg_a_extras`/`leg_b_extras` are the per-leg transfer-hook accounts.
 #[inline(always)]
 pub fn refund_and_close_dvp(
