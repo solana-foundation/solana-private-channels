@@ -22,6 +22,7 @@ pub trait StageMetrics: Send + Sync {
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
     fn executor_dropped_expired_blockhash(&self, count: usize);
+    fn synthetic_fee_payer_sanitized(&self, outcome: &'static str);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -87,6 +88,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_dropped_expired_blockhash(&self, count: usize) {
         debug!("executor: dropped {} expired blockhash txs", count);
+    }
+    fn synthetic_fee_payer_sanitized(&self, outcome: &'static str) {
+        debug!(
+            "executor: synthetic fee payer sanitized outcome={}",
+            outcome
+        );
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -207,6 +214,12 @@ counter_vec!(
     "private_channel_executor_dropped_expired_bh_total",
     "Transactions dropped at execution due to expired blockhash",
     &[]
+);
+counter_vec!(
+    EXECUTOR_SYNTHETIC_FEE_PAYER_SANITIZED,
+    "private_channel_executor_synthetic_fee_payer_sanitized_total",
+    "Synthetic (fabricated) fee payers neutralized post-execution; a nonzero rejected rate signals active probing",
+    &["outcome"]
 );
 counter_vec!(
     SETTLER_TXS_SETTLED,
@@ -344,6 +357,11 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc_by(count as f64);
     }
+    fn synthetic_fee_payer_sanitized(&self, outcome: &'static str) {
+        EXECUTOR_SYNTHETIC_FEE_PAYER_SANITIZED
+            .with_label_values(&[outcome])
+            .inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -424,6 +442,7 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_RESULTS_SEND_FAILED,
         EXECUTOR_MISSING_RESULTS,
         EXECUTOR_DROPPED_EXPIRED_BH,
+        EXECUTOR_SYNTHETIC_FEE_PAYER_SANITIZED,
         SETTLER_TXS_SETTLED,
         // Executor latency histograms
         EXECUTOR_BATCH_DURATION,

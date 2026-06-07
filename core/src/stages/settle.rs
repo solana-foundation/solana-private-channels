@@ -861,6 +861,74 @@ mod tests {
         assert!(result.account_settlements.is_empty());
     }
 
+    /// The durable settler is a separate consumer of the sanitized output from
+    /// BOB's in-memory map: in one batch it must skip a sanitizer-rejected `Err`
+    /// tx entirely (no settlement, no stored tx, signature still recorded) while
+    /// emitting the dropped (zeroed-payer) `Ok` tx as a `deleted` settlement.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_skips_rejected_and_tombstones_dropped() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        // Transfer amounts are immaterial: both verdicts are hand-crafted, not executed.
+
+        // Verdict 1 — rejected: the sanitizer flips the result to Err, which carries no accounts.
+        let rejected_from = Keypair::new();
+        let rejected_tx =
+            create_test_sanitized_transaction(&rejected_from, &Pubkey::new_unique(), 7);
+        let rejected_sig = *rejected_tx.signature();
+
+        // Verdict 2 — dropped: the sanitizer zeroes the synthetic payer in place.
+        let dropped_from = Keypair::new();
+        let dropped_tx = create_test_sanitized_transaction(&dropped_from, &Pubkey::new_unique(), 0);
+        let dropped_payer = dropped_from.pubkey();
+        let zeroed = make_executed(vec![(dropped_payer, AccountSharedData::default())]);
+
+        let results: Vec<(TransactionProcessingResult, _)> = vec![
+            (
+                Err(solana_transaction_error::TransactionError::InvalidAccountForFee),
+                rejected_tx,
+            ),
+            (Ok(zeroed), dropped_tx),
+        ];
+
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Rejected tx: contributes no account write and no stored transaction.
+        let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
+        assert!(
+            !settlement_keys.contains(&rejected_from.pubkey()),
+            "rejected tx must contribute no account settlement"
+        );
+        assert!(
+            db.get_transaction(&rejected_sig).await.is_none(),
+            "rejected tx must not be stored"
+        );
+
+        // Dropped tx: the zeroed payer is emitted as a delete tombstone.
+        let dropped = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == dropped_payer)
+            .expect("dropped payer must be emitted as a settlement");
+        assert!(dropped.1.deleted, "zeroed payer must settle as deleted");
+
+        // The rejected tx is still recorded as a block signature (failed txs stay in blocks).
+        let block = db.get_block(result.slot).await.unwrap();
+        assert!(
+            block.transaction_signatures.contains(&rejected_sig),
+            "rejected tx signature is still recorded in the block"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_multiple_sequential_batches() {
         let (mut db, _pg) = start_test_postgres().await;

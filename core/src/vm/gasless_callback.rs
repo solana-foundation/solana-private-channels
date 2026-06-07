@@ -6,7 +6,7 @@ use solana_sdk::{
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use std::collections::{HashMap, HashSet};
 
-const DEFAULT_FEE_PAYER_LAMPORTS: u64 = 10;
+pub(crate) const DEFAULT_FEE_PAYER_LAMPORTS: u64 = 10;
 
 /// A read-only, thread-safe snapshot of account state for parallel SVM execution.
 ///

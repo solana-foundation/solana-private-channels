@@ -13,22 +13,30 @@ use {
         vm::{
             admin::AdminVm,
             clock::set_clock_now,
-            gasless_callback::{GaslessCallback, SnapshotCallback},
+            gasless_callback::{GaslessCallback, SnapshotCallback, DEFAULT_FEE_PAYER_LAMPORTS},
             gasless_rent_collector::GaslessRentCollector,
         },
     },
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
-    solana_sdk::{hash::Hash, pubkey::Pubkey, transaction::SanitizedTransaction},
+    solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        hash::Hash,
+        pubkey::Pubkey,
+        transaction::SanitizedTransaction,
+    },
     solana_svm::{
         transaction_error_metrics::TransactionErrorMetrics,
+        transaction_processing_result::ProcessedTransaction,
         transaction_processor::{
             LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
             TransactionProcessingConfig, TransactionProcessingEnvironment,
         },
     },
+    solana_svm_callback::TransactionProcessingCallback,
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_timings::ExecuteTimings,
+    solana_transaction_error::TransactionError,
     std::{
         collections::{HashSet, LinkedList},
         sync::{Arc, RwLock},
@@ -360,6 +368,63 @@ fn execute_parallel(
     merge_svm_outputs(chunk_outputs)
 }
 
+/// Neutralize fabricated (synthetic) fee payers so a caller can neither spend
+/// from nor persist the 10 lamports the gasless callbacks invent on a BOB miss.
+///
+/// Per `Ok(Executed)` tx whose fee payer is synthetic: if still pristine (the
+/// fabricated balance never moved) zero it in place to a tombstone; otherwise
+/// (lamports left, an inflow landed, or owner/data changed) reject the tx so
+/// BOB and settle discard every write, including any recipient it credited.
+///
+/// Regular path only: the admin VM reads BOB directly and never fabricates.
+fn sanitize_synthetic_fee_payers(
+    output: &mut LoadAndExecuteSanitizedTransactionsOutput,
+    transactions: &[SanitizedTransaction],
+    synthetic: &HashSet<Pubkey>,
+    metrics: &SharedMetrics,
+) {
+    if synthetic.is_empty() {
+        return;
+    }
+    for (result, tx) in output
+        .processing_results
+        .iter_mut()
+        .zip(transactions.iter())
+    {
+        let fee_payer = *tx.fee_payer();
+        if !synthetic.contains(&fee_payer) {
+            continue;
+        }
+        let Ok(ProcessedTransaction::Executed(executed)) = result else {
+            continue;
+        };
+
+        let Some(payer_acct) = executed
+            .loaded_transaction
+            .accounts
+            .iter_mut()
+            .find(|(pk, _)| *pk == fee_payer)
+            .map(|(_, acct)| acct)
+        else {
+            continue;
+        };
+
+        let pristine = payer_acct.lamports() == DEFAULT_FEE_PAYER_LAMPORTS
+            && payer_acct.data().is_empty()
+            && payer_acct.owner() == &solana_sdk_ids::system_program::ID;
+
+        if pristine {
+            // Zero in place (not Vec::remove) so the `is_writable(index)`
+            // alignment is preserved.
+            *payer_acct = AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::ID);
+            metrics.synthetic_fee_payer_sanitized("dropped");
+        } else {
+            *result = Err(TransactionError::InvalidAccountForFee);
+            metrics.synthetic_fee_payer_sanitized("rejected");
+        }
+    }
+}
+
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
@@ -467,6 +532,14 @@ pub async fn execute_batch(
     );
     metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
 
+    // A fee payer that BOB has never seen is exactly what the gasless callbacks
+    // fabricate 10 lamports for. Pin this set now, before any update_accounts.
+    let synthetic_fee_payers: HashSet<Pubkey> = fee_payers
+        .iter()
+        .filter(|fp| execution_deps.bob.get_account_shared_data(fp).is_none())
+        .copied()
+        .collect();
+
     // Refresh the SVM's cached Clock sysvar from wall time. Contra has no
     // real Clock source (see `crate::vm::clock`); without this, programs
     // calling `Clock::get()` would read `unix_timestamp = 0`. Must run
@@ -557,7 +630,7 @@ pub async fn execute_batch(
             .saturating_mul(MIN_PARALLEL_BATCH_FACTOR);
         let use_parallel =
             execution_deps.max_svm_workers >= 2 && regular_transactions.len() >= parallel_min;
-        let regular_results = if use_parallel {
+        let mut regular_results = if use_parallel {
             // Parallel path: snapshot BOB + spawn workers.
             // `accounts_to_preload` covers admin+regular keys; harmless
             // over-inclusion — admin keys in the snapshot just add a few
@@ -601,6 +674,16 @@ pub async fn execute_batch(
         );
         metrics.executor_svm_duration_ms("regular", t_svm_reg.as_secs_f64() * 1000.0);
 
+        // Neutralize fabricated fee payers before either consumer reads the
+        // shared output: the in-memory BOB update below and the durable settler
+        // downstream. One mutation covers both consumers and both exec paths.
+        sanitize_synthetic_fee_payers(
+            &mut regular_results,
+            &regular_transactions,
+            &synthetic_fee_payers,
+            metrics,
+        );
+
         // Update BOB's in-memory accounts with the execution results
         let t_op = Instant::now();
         execution_deps
@@ -643,7 +726,9 @@ pub async fn execute_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{stage_metrics::NoopMetrics, test_helpers::start_test_postgres};
+    use crate::{
+        accounts::bob::BOB, stage_metrics::NoopMetrics, test_helpers::start_test_postgres,
+    };
     use solana_sdk::{
         hash::Hash,
         message::Message,
@@ -679,6 +764,361 @@ mod tests {
         let tx = Transaction::new(&[payer], msg, blockhash);
         SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
             .expect("failed to create test transaction")
+    }
+
+    // ── Synthetic-fee-payer sanitation helpers ──
+
+    /// Transfer `amount` from `from` to `to`, paid for (and signed) by `from`.
+    fn transfer(from: &Keypair, to: &Pubkey, amount: u64) -> SanitizedTransaction {
+        let ix = solana_system_interface::instruction::transfer(&from.pubkey(), to, amount);
+        let msg = Message::new(&[ix], Some(&from.pubkey()));
+        let tx = Transaction::new(&[from], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to build transfer tx")
+    }
+
+    /// Transfer from `from` to `to`, but signed/fee-paid by a separate `payer`.
+    fn sponsored_transfer(
+        payer: &Keypair,
+        from: &Keypair,
+        to: &Pubkey,
+        amount: u64,
+    ) -> SanitizedTransaction {
+        let ix = solana_system_interface::instruction::transfer(&from.pubkey(), to, amount);
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[payer, from], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to build sponsored transfer tx")
+    }
+
+    /// Assign `payer`'s (synthetic) account to a new owner without moving lamports.
+    fn assign(payer: &Keypair, owner: &Pubkey) -> SanitizedTransaction {
+        let ix = solana_system_interface::instruction::assign(&payer.pubkey(), owner);
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[payer], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to build assign tx")
+    }
+
+    /// Insert a real, funded, system-owned account directly into BOB.
+    fn fund(bob: &mut BOB, pubkey: &Pubkey, lamports: u64) {
+        bob.insert_account_for_test(
+            *pubkey,
+            AccountSharedData::new(lamports, 0, &solana_sdk_ids::system_program::ID),
+        );
+    }
+
+    fn bob_balance(bob: &BOB, pubkey: &Pubkey) -> Option<u64> {
+        bob.get_account_shared_data(pubkey).map(|a| a.lamports())
+    }
+
+    /// Wrap `txs` into a `ConflictFreeBatch` and run `execute_batch`.
+    async fn run_batch(
+        deps: &mut ExecutionDeps,
+        metrics: &SharedMetrics,
+        txs: Vec<SanitizedTransaction>,
+    ) -> ExecutionResult {
+        let transactions = txs
+            .into_iter()
+            .enumerate()
+            .map(|(i, tx)| crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(tx),
+                index: i,
+            })
+            .collect();
+        execute_batch(ConflictFreeBatch { transactions }, deps, metrics).await
+    }
+
+    fn regular_result(
+        result: &ExecutionResult,
+        i: usize,
+    ) -> &solana_svm::transaction_processing_result::TransactionProcessingResult {
+        &result
+            .regular_results
+            .as_ref()
+            .expect("regular results present")
+            .processing_results[i]
+    }
+
+    fn is_executed(
+        r: &solana_svm::transaction_processing_result::TransactionProcessingResult,
+    ) -> bool {
+        matches!(r, Ok(ProcessedTransaction::Executed(_)))
+    }
+
+    // ── Core exploit + traps ──
+
+    /// 1-step spend: fresh `A` transfers its fabricated 10 lamports to `R`. The
+    /// tx must be rejected and `R` must never be credited.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthetic_one_step_spend_rejected() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+
+        let a = Keypair::new();
+        let r = Pubkey::new_unique();
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 10)]).await;
+
+        assert!(
+            matches!(
+                regular_result(&result, 0),
+                Err(TransactionError::InvalidAccountForFee)
+            ),
+            "synthetic 1-step spend must be rejected"
+        );
+        assert!(
+            bob_balance(&deps.bob, &r).is_none(),
+            "R must not be credited"
+        );
+        assert!(
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
+            "synthetic payer must not be persisted"
+        );
+    }
+
+    /// 2-step graduation: batch 1 makes `A` a value-neutral fee payer (a
+    /// self-transfer of 0 lamports; fee = 0, so A stays pristine 10). It must be
+    /// dropped, never persisted — so batch 2 still sees A as synthetic and
+    /// rejects its spend. This is the trap a naive `< 10` post-exec check misses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthetic_two_step_setup_dropped_then_blocked() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let a = Keypair::new();
+        // Self-transfer of 0 lamports: A is fee payer, value-neutral, stays at 10.
+        let setup = run_batch(&mut deps, &metrics, vec![transfer(&a, &a.pubkey(), 0)]).await;
+        assert!(
+            is_executed(regular_result(&setup, 0)),
+            "value-neutral setup tx executes"
+        );
+        assert!(
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
+            "synthetic payer must not graduate into BOB"
+        );
+
+        let r = Pubkey::new_unique();
+        let spend = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 10)]).await;
+        assert!(
+            matches!(
+                regular_result(&spend, 0),
+                Err(TransactionError::InvalidAccountForFee)
+            ),
+            "re-used synthetic payer must still be rejected in a later batch"
+        );
+        assert!(bob_balance(&deps.bob, &r).is_none());
+    }
+
+    /// Partial spend ending at 5: still minted lamports out of nothing → reject.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthetic_partial_spend_rejected() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let a = Keypair::new();
+        let r = Pubkey::new_unique();
+        let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 5)]).await;
+        assert!(matches!(
+            regular_result(&result, 0),
+            Err(TransactionError::InvalidAccountForFee)
+        ));
+        assert!(
+            bob_balance(&deps.bob, &r).is_none(),
+            "R must not be credited"
+        );
+    }
+
+    /// Inflow trap: synthetic `A` receives 1000 from a real `B` in the same tx
+    /// (A ends > 10). Rejecting (not dropping) keeps `B` whole — dropping would
+    /// persist B's debit while discarding the credit, destroying real value.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthetic_inflow_rejected_preserves_funding_source() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let b = Keypair::new();
+        fund(&mut deps.bob, &b.pubkey(), 5000);
+        let a = Keypair::new(); // synthetic fee payer + transfer recipient
+        let result = run_batch(
+            &mut deps,
+            &metrics,
+            vec![sponsored_transfer(&a, &b, &a.pubkey(), 1000)],
+        )
+        .await;
+
+        assert!(matches!(
+            regular_result(&result, 0),
+            Err(TransactionError::InvalidAccountForFee)
+        ));
+        assert_eq!(
+            bob_balance(&deps.bob, &b.pubkey()),
+            Some(5000),
+            "funding source debit must be reverted"
+        );
+        assert!(
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
+            "synthetic payer must not be persisted"
+        );
+    }
+
+    /// Owner change: `Assign` leaves lamports at 10 but reassigns the account.
+    /// A `< 10` balance check would miss this; the predicate rejects it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthetic_owner_change_rejected() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let a = Keypair::new();
+        let prog = Pubkey::new_unique();
+        let result = run_batch(&mut deps, &metrics, vec![assign(&a, &prog)]).await;
+        assert!(matches!(
+            regular_result(&result, 0),
+            Err(TransactionError::InvalidAccountForFee)
+        ));
+        assert!(
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
+            "reassigned synthetic account must not persist"
+        );
+    }
+
+    /// Failed overspend: `Transfer{A→R,100}` exceeds the synthetic 10. SVM
+    /// returns `Ok(Executed)` with a failed inner status and rolls A back to
+    /// pristine 10 — so it is dropped (not rejected), and R is never credited.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_overspend_drops_not_rejects() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let a = Keypair::new();
+        let r = Pubkey::new_unique();
+        let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 100)]).await;
+
+        assert!(
+            is_executed(regular_result(&result, 0)),
+            "rolled-back overspend stays Ok(Executed)"
+        );
+        assert!(
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
+            "synthetic payer must not be persisted"
+        );
+        assert!(
+            bob_balance(&deps.bob, &r).is_none(),
+            "R must not be credited"
+        );
+    }
+
+    // ── Legitimate flows still work ──
+
+    /// Legit gasless sponsorship: a fresh `A` pays for a real `B`'s transfer
+    /// without sending or receiving value. The tx settles, `B→R` lands, and the
+    /// fabricated sponsor account is dropped (never materialized).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legit_gasless_sponsor_succeeds_and_payer_dropped() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let b = Keypair::new();
+        fund(&mut deps.bob, &b.pubkey(), 5000);
+        let a = Keypair::new(); // synthetic sponsor: neither sends nor receives
+        let r = Pubkey::new_unique();
+        let result = run_batch(
+            &mut deps,
+            &metrics,
+            vec![sponsored_transfer(&a, &b, &r, 1000)],
+        )
+        .await;
+
+        assert!(
+            is_executed(regular_result(&result, 0)),
+            "legit sponsored transfer must succeed"
+        );
+        assert_eq!(bob_balance(&deps.bob, &r), Some(1000), "R credited");
+        assert_eq!(bob_balance(&deps.bob, &b.pubkey()), Some(4000), "B debited");
+        assert!(
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
+            "sponsor must not be persisted"
+        );
+    }
+
+    /// A pre-funded real payer is not in the synthetic set and settles normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_prefunded_payer_unaffected() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let b = Keypair::new();
+        fund(&mut deps.bob, &b.pubkey(), 5000);
+        let r = Pubkey::new_unique();
+        let result = run_batch(&mut deps, &metrics, vec![transfer(&b, &r, 1000)]).await;
+
+        assert!(is_executed(regular_result(&result, 0)));
+        assert_eq!(bob_balance(&deps.bob, &r), Some(1000));
+        assert_eq!(bob_balance(&deps.bob, &b.pubkey()), Some(4000));
+    }
+
+    // ── Path parity & invariants ──
+
+    /// Parallel path (SnapshotCallback) must reach the same verdicts as the
+    /// sequential path for a mix of a 1-step spend and a value-neutral setup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn synthetic_parallel_path_parity() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let workers = 4;
+        let mut deps =
+            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        // Above the parallel threshold so SnapshotCallback fabricates the payers.
+        let n = workers * MIN_PARALLEL_BATCH_FACTOR * 2;
+        let mut txs = Vec::with_capacity(n);
+        let mut spenders = Vec::with_capacity(n / 2);
+        let mut neutrals = Vec::with_capacity(n / 2);
+        for i in 0..n {
+            let a = Keypair::new();
+            if i % 2 == 0 {
+                txs.push(transfer(&a, &Pubkey::new_unique(), 10)); // 1-step spend → reject
+                spenders.push(a);
+            } else {
+                txs.push(transfer(&a, &a.pubkey(), 0)); // value-neutral → drop
+                neutrals.push(a);
+            }
+        }
+        let result = run_batch(&mut deps, &metrics, txs).await;
+
+        for i in 0..n {
+            let r = regular_result(&result, i);
+            if i % 2 == 0 {
+                assert!(
+                    matches!(r, Err(TransactionError::InvalidAccountForFee)),
+                    "spend at {i} must reject on the parallel path"
+                );
+            } else {
+                assert!(is_executed(r), "neutral at {i} must stay Ok");
+            }
+        }
+        for a in &spenders {
+            assert!(bob_balance(&deps.bob, &a.pubkey()).is_none());
+        }
+        for a in &neutrals {
+            assert!(bob_balance(&deps.bob, &a.pubkey()).is_none());
+        }
     }
 
     /// Trigger the parallel path: enough txs to give every configured worker
