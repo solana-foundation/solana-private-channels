@@ -30,13 +30,13 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_timings::ExecuteTimings,
     std::{
-        collections::HashSet,
+        collections::{HashSet, LinkedList},
         sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,
-    tracing::{debug, error, info},
+    tracing::{debug, error, info, warn},
 };
 
 /// Minimum transactions per worker to justify taking the parallel path.
@@ -61,6 +61,9 @@ pub struct ExecutionArgs {
     /// to give each worker ≥ MIN_PARALLEL_BATCH_FACTOR transactions.
     pub max_svm_workers: usize,
     pub heartbeat: Arc<crate::health::StageHeartbeat>,
+    /// Shared live-blockhash window (same Arc advanced by dedup). Used at
+    /// execute_batch entry to drop txs whose recent_blockhash expired.
+    pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 }
 
 pub struct ExecutionDeps {
@@ -70,6 +73,8 @@ pub struct ExecutionDeps {
     /// Effective parallel-worker cap used by `execute_parallel`. Captured at
     /// worker startup so hot-path batch execution never touches shared config.
     pub max_svm_workers: usize,
+    /// Shared live-blockhash window
+    pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 
     // Must prevent this from being dropped
     _fork_graph: Arc<RwLock<PrivateChannelForkGraph>>,
@@ -92,6 +97,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         metrics,
         max_svm_workers,
         heartbeat,
+        live_blockhashes,
     } = args;
     let handle = tokio::spawn(async move {
         info!(
@@ -102,8 +108,13 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         let accounts_db = AccountsDB::new(&accountsdb_connection_url, true)
             .await
             .unwrap();
-        let mut execution_deps =
-            get_execution_deps(accounts_db, settled_accounts_rx, max_svm_workers).await;
+        let mut execution_deps = get_execution_deps(
+            accounts_db,
+            settled_accounts_rx,
+            max_svm_workers,
+            live_blockhashes,
+        )
+        .await;
 
         let mut total_transactions_executed = 0u64;
         let mut total_batches_processed = 0u64;
@@ -190,6 +201,7 @@ pub async fn get_execution_deps(
     accounts_db: AccountsDB,
     settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
     max_svm_workers: usize,
+    live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 ) -> ExecutionDeps {
     let bob = BOB::new(accounts_db, settled_accounts_rx).await;
     let feature_set = SVMFeatureSet::all_enabled();
@@ -202,6 +214,7 @@ pub async fn get_execution_deps(
         vm,
         admin_vm,
         max_svm_workers,
+        live_blockhashes,
         _fork_graph,
     }
 }
@@ -362,6 +375,29 @@ pub async fn execute_batch(
         .into_iter()
         .map(|tx| tx.transaction.as_ref().clone())
         .collect();
+
+    // Drop txs whose recent_blockhash expired while parked in an upstream
+    // bounded queue. Snapshot the window once per batch to keep contains() O(1).
+    let live: HashSet<Hash> = execution_deps
+        .live_blockhashes
+        .read()
+        .expect("blockhash lock poisoned")
+        .iter()
+        .copied()
+        .collect();
+    let (all_transactions, expired): (Vec<_>, Vec<_>) = all_transactions
+        .into_iter()
+        .partition(|tx| live.contains(tx.message().recent_blockhash()));
+    if !expired.is_empty() {
+        for tx in &expired {
+            warn!(
+                sig = %tx.signature(),
+                bh = %tx.message().recent_blockhash(),
+                "execution: dropping tx whose recent blockhash expired during pipeline wait"
+            );
+        }
+        metrics.executor_dropped_expired_blockhash(expired.len());
+    }
 
     // TODO: ConflictFree scheduling should do the admin/non-admin/ATA partitioning
     // This would allow better parallelization and cleaner separation of concerns
@@ -616,20 +652,31 @@ mod tests {
         transaction::Transaction,
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::{HashSet, LinkedList};
+    use std::sync::{Arc, RwLock};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
+    /// Helper: live-blockhash window containing only `Hash::default()` so the
+    /// canned test transactions (built with `Hash::default()` as their recent
+    /// blockhash) survive the expiry filter in `execute_batch`.
+    fn default_live_blockhashes() -> Arc<RwLock<LinkedList<Hash>>> {
+        Arc::new(RwLock::new(LinkedList::from([Hash::default()])))
+    }
+
     fn create_test_transaction() -> SanitizedTransaction {
-        let payer = Keypair::new();
-        let instruction = solana_system_interface::instruction::transfer(
+        sanitize_transfer(&Keypair::new(), Hash::default())
+    }
+
+    /// Build a sanitized transfer tx signed by `payer` against `blockhash`.
+    fn sanitize_transfer(payer: &Keypair, blockhash: Hash) -> SanitizedTransaction {
+        let ix = solana_system_interface::instruction::transfer(
             &payer.pubkey(),
             &Pubkey::new_unique(),
             100,
         );
-        let message = Message::new(&[instruction], Some(&payer.pubkey()));
-        let tx = Transaction::new(&[&payer], message, Hash::default());
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[payer], msg, blockhash);
         SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
             .expect("failed to create test transaction")
     }
@@ -641,7 +688,8 @@ mod tests {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let workers = 4;
-        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+        let mut deps =
+            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so each worker gets 2× MIN_PARALLEL_BATCH_FACTOR
         // transactions — comfortably inside the parallel regime.
@@ -673,7 +721,8 @@ mod tests {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let workers = 4;
-        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+        let mut deps =
+            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
 
         let n = workers * MIN_PARALLEL_BATCH_FACTOR;
         let transactions: Vec<_> = (0..n)
@@ -750,7 +799,7 @@ mod tests {
     async fn test_execute_batch_empty_batch() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
         let empty_batch = ConflictFreeBatch {
             transactions: vec![],
@@ -768,7 +817,7 @@ mod tests {
     async fn test_execute_batch_single_normal_transaction() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
         let tx = create_test_transaction();
         let batch = ConflictFreeBatch {
@@ -796,7 +845,7 @@ mod tests {
     async fn test_execute_batch_multiple_normal_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
         let tx1 = create_test_transaction();
         let tx2 = create_test_transaction();
@@ -821,6 +870,112 @@ mod tests {
         assert_eq!(results.processing_results.len(), 2);
     }
 
+    /// Txs whose recent_blockhash is not in the live window must be dropped
+    /// before SVM dispatch. Settler invariant `processing_results.len() ==
+    /// transactions.len()` must still hold over the filtered vec.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_drops_expired_transactions() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+
+        let known = Hash::new_unique();
+        let live = Arc::new(RwLock::new(LinkedList::from([known])));
+        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+
+        // Two txs using the known (live) hash + one tx using an expired hash.
+        let payer = Keypair::new();
+        let live_tx_1 = sanitize_transfer(&payer, known);
+        let live_tx_2 = sanitize_transfer(&payer, known);
+        let expired_tx = sanitize_transfer(&payer, Hash::new_unique());
+        let expired_sig = *expired_tx.signature();
+
+        let batch = ConflictFreeBatch {
+            transactions: vec![
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(live_tx_1),
+                    index: 0,
+                },
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(expired_tx),
+                    index: 1,
+                },
+                crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(live_tx_2),
+                    index: 2,
+                },
+            ],
+        };
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        assert_eq!(
+            result.regular_transactions.len(),
+            2,
+            "expired tx must be dropped"
+        );
+        assert!(
+            !result
+                .regular_transactions
+                .iter()
+                .any(|tx| *tx.signature() == expired_sig),
+            "expired tx must not appear in regular_transactions"
+        );
+        let results = result.regular_results.unwrap();
+        assert_eq!(
+            results.processing_results.len(),
+            2,
+            "settler invariant: processing_results.len() == transactions.len()"
+        );
+    }
+
+    /// Plumbing check: the live_blockhashes Arc is read each call, not snapshotted
+    /// at deps construction. Mutating the Arc (what dedup does when the window
+    /// advances) must flip the filter's verdict on subsequent execute_batch calls.
+    /// Guards against a refactor that copies the LinkedList instead of cloning the Arc.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_batch_reads_live_window_each_call() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+
+        let bh = Hash::new_unique();
+        let live = Arc::new(RwLock::new(LinkedList::from([bh])));
+        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let batch_with = |payer: &Keypair| ConflictFreeBatch {
+            transactions: (0..3)
+                .map(|i| crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(sanitize_transfer(payer, bh)),
+                    index: i,
+                })
+                .collect(),
+        };
+
+        // Pass 1: bh is in the live window — all 3 must execute.
+        let r1 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        assert_eq!(
+            r1.regular_transactions.len(),
+            3,
+            "all live txs must execute"
+        );
+
+        // Evict bh from the shared Arc (the operation dedup performs on eviction).
+        live.write().unwrap().clear();
+
+        // Pass 2: same blockhash, now expired — all 3 must be filtered.
+        let r2 = execute_batch(batch_with(&Keypair::new()), &mut deps, &noop).await;
+        assert_eq!(
+            r2.regular_transactions.len(),
+            0,
+            "evicted-bh txs must be filtered"
+        );
+        assert!(
+            r2.regular_results.is_none(),
+            "no SVM run when batch is fully filtered"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execution_worker_shutdown_exits_cleanly() {
         let (_accounts_db, _pg) = start_test_postgres().await;
@@ -843,6 +998,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
+            live_blockhashes: default_live_blockhashes(),
         })
         .await;
 
@@ -872,7 +1028,8 @@ mod tests {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let workers = 4;
-        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+        let mut deps =
+            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so the batch is comfortably in the
         // parallel regime and splits into multiple chunks.
@@ -922,7 +1079,8 @@ mod tests {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let workers = 4;
-        let mut deps = get_execution_deps(accounts_db, rx, workers).await;
+        let mut deps =
+            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
 
         // 17 is intentional: > threshold (16), not divisible by 4, last
         // chunk is much smaller than the others.
@@ -975,7 +1133,7 @@ mod tests {
     async fn test_max_svm_workers_one_forces_sequential() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
 
         // Deliberately well above any reasonable parallel threshold — with
         // workers=2 this size would split; with workers=1 the gate keeps
@@ -1168,6 +1326,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
+            live_blockhashes: default_live_blockhashes(),
         })
         .await;
 
@@ -1188,7 +1347,7 @@ mod tests {
         // A tx whose only instruction is an admin instruction routes to the Admin VM.
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
         let tx = create_admin_initialize_mint_tx();
         let batch = ConflictFreeBatch {
@@ -1214,7 +1373,7 @@ mod tests {
         // path stays strictly single-purpose.
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
         let tx = create_mixed_admin_and_regular_tx();
         let batch = ConflictFreeBatch {
@@ -1241,7 +1400,7 @@ mod tests {
     async fn test_execute_batch_partitions_admin_and_regular_separately() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4).await;
+        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
         let admin_tx = create_admin_initialize_mint_tx();
         let regular_tx = create_test_transaction();

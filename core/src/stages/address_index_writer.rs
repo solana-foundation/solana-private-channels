@@ -1,10 +1,15 @@
 use {
     crate::{
-        accounts::write_batch::AddressSignatureRow, health::StageHeartbeat,
-        nodes::node::WorkerHandle, stage_metrics::SharedMetrics,
+        accounts::{
+            address_index_watermark::upsert_address_signatures_flushed_slot_in_tx,
+            write_batch::{upsert_address_signature_rows, AddressSignatureRow},
+        },
+        health::StageHeartbeat,
+        nodes::node::WorkerHandle,
+        stage_metrics::SharedMetrics,
     },
     sqlx::{postgres::PgPoolOptions, PgPool},
-    std::sync::Arc,
+    std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, time::Instant},
     tokio_util::sync::CancellationToken,
     tracing::{debug, error, info, warn},
@@ -15,6 +20,11 @@ use {
 /// One connection is enough for sequential bulk inserts; the second slot is
 /// just headroom for sqlx's own bookkeeping connection-resets.
 const WRITER_POOL_SIZE: u32 = 2;
+
+/// Delays (ms) before each retry; total attempts = len + 1. Sized to ride out a
+/// typical managed-Postgres failover / replica promotion (a few seconds) rather
+/// than tearing the node down on a transient blip.
+const FLUSH_RETRY_BACKOFF_MS: [u64; 4] = [250, 1000, 3000, 5000];
 
 pub struct AddressIndexWriterArgs {
     pub rows_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
@@ -55,9 +65,7 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
             }
         };
 
-        // Buffer accumulates whatever recv_many delivers per tick. Capacity is
-        // a hint; recv_many caps at flush_chunk_size so the buffer never grows
-        // unbounded during steady state.
+        // Buffer accumulates whatever recv_many delivers per tick.
         let mut buf: Vec<Vec<AddressSignatureRow>> = Vec::with_capacity(64);
         let mut flat: Vec<AddressSignatureRow> = Vec::with_capacity(flush_chunk_size * 2);
 
@@ -85,28 +93,36 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
                         while flat.len() >= flush_chunk_size {
                             let take = flat.split_off(flush_chunk_size);
                             let chunk = std::mem::replace(&mut flat, take);
-                            flush_chunk(&pool, &chunk, &metrics).await;
-                            heartbeat.record_progress();
+                            if let Err(e) =
+                                flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await
+                            {
+                                error!(?e, "address_signatures flush failed; exiting");
+                                return;
+                            }
                         }
                     }
                     if !flat.is_empty() {
                         let chunk = std::mem::take(&mut flat);
-                        flush_chunk(&pool, &chunk, &metrics).await;
-                        heartbeat.record_progress();
+                        if let Err(e) =
+                            flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await
+                        {
+                            error!(?e, "address_signatures flush failed; exiting");
+                            return;
+                        }
                     }
                 }
             }
         }
 
-        // Drain anything still buffered after shutdown / channel close so we
-        // don't drop addr_sig rows whose transactions row is already durable.
+        // Drain anything still buffered after shutdown / channel close.
         while let Ok(batch) = rows_rx.try_recv() {
             flat.extend(batch);
         }
         if !flat.is_empty() {
-            flush_chunk(&pool, &flat, &metrics).await;
-            heartbeat.record_progress();
-            flat.clear();
+            if let Err(e) = flush_and_record(&pool, &flat, &[], &metrics, &heartbeat).await {
+                error!(?e, "address_signatures final flush failed; exiting");
+                return;
+            }
         }
 
         info!("Address-index writer stopped");
@@ -115,53 +131,104 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
     WorkerHandle::new("AddressIndexWriter".to_string(), handle)
 }
 
-async fn flush_chunk(pool: &PgPool, rows: &[AddressSignatureRow], metrics: &SharedMetrics) {
-    if rows.is_empty() {
-        return;
+async fn flush_and_record(
+    pool: &PgPool,
+    chunk: &[AddressSignatureRow],
+    remaining: &[AddressSignatureRow],
+    metrics: &SharedMetrics,
+    heartbeat: &StageHeartbeat,
+) -> Result<(), sqlx::Error> {
+    let watermark = pick_watermark(chunk, remaining);
+    flush_chunk_with_retry(pool, chunk, watermark, metrics).await?;
+    heartbeat.record_progress();
+    Ok(())
+}
+
+/// Watermark advance; assumes monotonic slots.
+fn pick_watermark(chunk: &[AddressSignatureRow], remaining: &[AddressSignatureRow]) -> Option<i64> {
+    if chunk.is_empty() {
+        return None;
+    }
+    match remaining.first() {
+        // Slots below `remaining`'s first are fully flushed. Guard slot 0: a
+        // negative watermark sorts above all positives under big-endian bytea
+        // compare and would pin it permanently.
+        Some(r) if r.slot > 0 => Some(r.slot - 1),
+        Some(_) => None,
+        None => chunk.last().map(|r| r.slot),
+    }
+}
+
+async fn flush_chunk_with_retry(
+    pool: &PgPool,
+    rows: &[AddressSignatureRow],
+    watermark: Option<i64>,
+    metrics: &SharedMetrics,
+) -> Result<(), sqlx::Error> {
+    for (i, ms) in FLUSH_RETRY_BACKOFF_MS.iter().enumerate() {
+        match flush_chunk_once(pool, rows, watermark, metrics).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!(error = %e, attempt = i, "address_signatures flush retry");
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+            }
+        }
+    }
+    flush_chunk_once(pool, rows, watermark, metrics).await
+}
+
+async fn flush_chunk_once(
+    pool: &PgPool,
+    rows: &[AddressSignatureRow],
+    watermark: Option<i64>,
+    metrics: &SharedMetrics,
+) -> Result<(), sqlx::Error> {
+    if rows.is_empty() && watermark.is_none() {
+        return Ok(());
     }
     let n = rows.len();
-    let mut addresses: Vec<&[u8]> = Vec::with_capacity(n);
-    let mut slots: Vec<i64> = Vec::with_capacity(n);
-    let mut signatures: Vec<&[u8]> = Vec::with_capacity(n);
-    for r in rows {
-        addresses.push(&r.address);
-        slots.push(r.slot);
-        signatures.push(&r.signature);
-    }
 
     let t0 = Instant::now();
-    let result = sqlx::query(
-        "INSERT INTO address_signatures (address, slot, signature)
-         SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::bytea[])
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(&addresses)
-    .bind(&slots)
-    .bind(&signatures)
-    .execute(pool)
+    let result: Result<(), sqlx::Error> = async {
+        let mut tx = pool.begin().await?;
+        upsert_address_signature_rows(&mut tx, rows).await?;
+        if let Some(slot) = watermark {
+            upsert_address_signatures_flushed_slot_in_tx(&mut tx, slot).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
     .await;
+
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     metrics.address_signatures_flush_duration_ms(elapsed_ms);
 
-    match result {
-        Ok(_) => {
+    match &result {
+        Ok(()) => {
             metrics.address_signatures_rows_flushed(n);
-            debug!(rows = n, elapsed_ms, "address_signatures flush complete");
+            debug!(
+                rows = n,
+                elapsed_ms,
+                ?watermark,
+                "address_signatures flush complete"
+            );
         }
         Err(e) => {
             metrics.address_signatures_flush_errors_total();
             warn!(
                 rows = n,
-                elapsed_ms, "address_signatures flush failed (worker continues): {}", e
+                elapsed_ms, "address_signatures flush failed: {}", e
             );
         }
     }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        accounts::address_index_watermark::get_address_signatures_flushed_slot,
         stage_metrics::NoopMetrics,
         test_helpers::{postgres_container_url, start_test_postgres},
     };
@@ -185,6 +252,16 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap()
+    }
+
+    async fn read_watermark(url: &str) -> Option<i64> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(url)
+            .await
+            .unwrap();
+        let pool = Arc::new(pool);
+        get_address_signatures_flushed_slot(&pool).await.unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -284,14 +361,12 @@ mod tests {
         assert!(join.is_ok(), "writer must not hang on bad PG URL");
     }
 
+    /// Permanent flush failure must exit the task.
     #[tokio::test(flavor = "multi_thread")]
-    async fn writer_continues_after_transient_pg_error() {
+    async fn writer_exits_when_retries_exhausted() {
         let (_db, pg) = start_test_postgres().await;
         let url = postgres_container_url(&pg, "test_db").await;
 
-        // Drop the address_signatures table out from under the writer to
-        // induce a PG error on the first flush, then recreate it. The worker
-        // must keep running and successfully flush the second batch.
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&url)
@@ -314,33 +389,13 @@ mod tests {
         })
         .await;
 
-        // First batch hits the missing table → flush error logged, worker survives.
         tx.send(vec![make_row(1, 0, 1)]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Recreate the table, send a second batch — must land.
-        sqlx::query(
-            "CREATE TABLE address_signatures (
-                address BYTEA NOT NULL,
-                slot BIGINT NOT NULL,
-                signature BYTEA NOT NULL,
-                PRIMARY KEY (address, slot, signature)
-            )",
-        )
-        .execute(&admin)
-        .await
-        .unwrap();
+        let join = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
+        assert!(join.is_ok(), "writer should exit after retries exhaust");
 
-        tx.send(vec![make_row(2, 1, 2), make_row(3, 2, 3)])
-            .await
-            .unwrap();
-        drop(tx);
-
-        let join = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
-        assert!(join.is_ok(), "writer should exit cleanly after recovery");
-
-        let n = count_rows(&url).await;
-        assert_eq!(n, 2, "rows from the second batch should be persisted");
+        let send_after = tx.send(vec![make_row(2, 1, 2)]).await;
+        assert!(send_after.is_err(), "writer receiver should be closed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -383,5 +438,75 @@ mod tests {
             "at least the in-flight buffer must be flushed on shutdown, got {}",
             n
         );
+    }
+
+    /// Watermark = max flushed slot when buffer drains.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_advances_watermark_in_same_commit() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let (tx, rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let handle = start_address_index_writer(AddressIndexWriterArgs {
+            rows_rx: rx,
+            accountsdb_connection_url: url.clone(),
+            flush_chunk_size: 100,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: StageHeartbeat::new(),
+        })
+        .await;
+
+        for slot in 10i64..=12 {
+            tx.send(vec![
+                make_row(slot as u8, slot, slot as u8),
+                make_row((slot + 100) as u8, slot, (slot + 1) as u8),
+            ])
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        let join = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(join.is_ok(), "writer should exit after channel close");
+
+        let rows = count_rows(&url).await;
+        assert_eq!(rows, 6, "expected 6 rows across slots 10..=12");
+
+        let wm = read_watermark(&url).await;
+        assert_eq!(wm, Some(12), "watermark should advance to max flushed slot");
+    }
+
+    #[test]
+    fn pick_watermark_no_remaining_returns_chunk_max() {
+        let chunk = vec![
+            AddressSignatureRow {
+                address: vec![1; 32],
+                slot: 5,
+                signature: vec![1; 64],
+            },
+            AddressSignatureRow {
+                address: vec![2; 32],
+                slot: 7,
+                signature: vec![2; 64],
+            },
+        ];
+        assert_eq!(pick_watermark(&chunk, &[]), Some(7));
+    }
+
+    #[test]
+    fn pick_watermark_with_remaining_uses_min_minus_one() {
+        let chunk = vec![AddressSignatureRow {
+            address: vec![1; 32],
+            slot: 5,
+            signature: vec![1; 64],
+        }];
+        let remaining = vec![AddressSignatureRow {
+            address: vec![3; 32],
+            slot: 8,
+            signature: vec![3; 64],
+        }];
+        assert_eq!(pick_watermark(&chunk, &remaining), Some(7));
     }
 }
