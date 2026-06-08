@@ -374,6 +374,14 @@ impl PostgresDb {
             .execute(&self.pool)
             .await?;
 
+        // Current allow/block state. Existing rows backfill to 'allowed' via the
+        // default; the point-in-time history lives in mint_status_history.
+        sqlx::query(
+            "ALTER TABLE mints ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'allowed'",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -1016,8 +1024,8 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program)
-                VALUES ($1, $2, $3)
+                INSERT INTO mints (mint_address, decimals, token_program, status)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program
@@ -1026,11 +1034,42 @@ impl PostgresDb {
             .bind(&mint.mint_address)
             .bind(mint.decimals)
             .bind(&mint.token_program)
+            .bind(&mint.status)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set each mint's `status` mirror to its latest `mint_status_history`
+    /// transition (highest `effective_slot`); a mint with no row is untouched.
+    pub async fn sync_mint_status_internal(
+        &self,
+        mint_addresses: &[String],
+    ) -> Result<(), StorageError> {
+        if mint_addresses.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE mints m
+            SET status = h.status
+            FROM (
+                SELECT DISTINCT ON (mint_address) mint_address, status
+                FROM mint_status_history
+                WHERE mint_address = ANY($1)
+                ORDER BY mint_address, effective_slot DESC
+            ) h
+            WHERE m.mint_address = h.mint_address
+            "#,
+        )
+        .bind(mint_addresses)
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 

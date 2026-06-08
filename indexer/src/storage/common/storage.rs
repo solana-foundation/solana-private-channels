@@ -22,6 +22,7 @@ pub mod insert_mint_statuses_batch;
 pub mod quarantine_all_active_withdrawals;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
+pub mod sync_mint_status;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -150,6 +151,12 @@ impl Storage {
         statuses: &[DbMintStatus],
     ) -> Result<(), StorageError> {
         insert_mint_statuses_batch::insert_mint_statuses_batch(self, statuses).await
+    }
+
+    /// Refresh the `mints.status` mirror for the given mints from their latest
+    /// `mint_status_history` transition. No-op for mints without a row.
+    pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
+        sync_mint_status::sync_mint_status(self, mint_addresses).await
     }
 
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
@@ -675,6 +682,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_mint_status_mirrors_latest_history_and_preserves_metadata() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+
+        // allowed@10 then blocked@20 → mirror resolves to the latest: blocked.
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+
+        let m = storage.get_mint("m1").await.unwrap().unwrap();
+        assert_eq!(m.status, "blocked");
+        // Metadata is untouched by the mirror sync.
+        assert_eq!(m.decimals, 6);
+        assert_eq!(m.token_program, TOKEN_PROGRAM);
+
+        // Re-allow at a later slot → mirror flips back to allowed.
+        storage
+            .insert_mint_statuses_batch(&[status_row("m1", "allowed", 30)])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
+    }
+
+    /// A stale replay (older slot than the current head) must not move the mirror.
+    #[tokio::test]
+    async fn sync_mint_status_ignores_older_history_after_block() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        // Replaying the slot-10 allow re-syncs, but the latest transition is still
+        // blocked@20, so the mirror stays blocked.
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "blocked");
+    }
+
+    #[tokio::test]
+    async fn sync_mint_status_missing_row_is_noop() {
+        let (storage, _mock) = make_mock_storage();
+        // No row for "ghost" — must not error.
+        storage.sync_mint_status(&["ghost".to_string()]).await.unwrap();
+        assert!(storage.get_mint("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn dispatch_get_mint_via_mock() {
         let (storage, _mock) = make_mock_storage();
         // Populate with mints
@@ -1029,6 +1098,28 @@ mod tests {
             .unwrap();
         let res = storage.get_mint_status_at_slot("mint_a", 35).await.unwrap();
         assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    /// Accepted limitation: a same-slot allow + block can't both be stored — PK
+    /// `(mint_address, effective_slot)` with `ON CONFLICT DO NOTHING` and no
+    /// intra-slot tiebreak, so the first inserted wins. Rare (admin-only); pinned
+    /// here so it can't change silently. Allow inserted first → block dropped.
+    #[tokio::test]
+    async fn get_mint_status_at_slot_same_slot_allow_then_block_keeps_first_inserted() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 10),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
+        assert_eq!(
+            res,
+            MintStatusAtSlot::Allowed,
+            "first-inserted row wins on a same-slot conflict; the block is dropped",
+        );
     }
 
     // ── orphan query against status history ──────────────────────────
