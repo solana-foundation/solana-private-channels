@@ -50,7 +50,8 @@ impl PostgresAccountsDB {
         // Fail closed: reject a blank password before connecting (blanked env templates interpolate an empty ${POSTGRES_PASSWORD} into a passwordless URL).
         if !database_url_has_password(database_url) {
             return Err(
-                "database_url password component is empty; set a non-empty POSTGRES_PASSWORD".into(),
+                "database_url password component is empty; set a non-empty POSTGRES_PASSWORD"
+                    .into(),
             );
         }
 
@@ -379,15 +380,23 @@ mod tests {
     #[test]
     fn password_guard_classifies_urls() {
         // Blanked secret interpolates to an empty password and must be rejected.
-        assert!(!database_url_has_password("postgres://user:@localhost:5432/db"));
+        assert!(!database_url_has_password(
+            "postgres://user:@localhost:5432/db"
+        ));
         // No password component at all must be rejected.
-        assert!(!database_url_has_password("postgres://user@localhost:5432/db"));
+        assert!(!database_url_has_password(
+            "postgres://user@localhost:5432/db"
+        ));
         // No userinfo at all must be rejected.
         assert!(!database_url_has_password("postgres://localhost:5432/db"));
         // A real password is accepted.
-        assert!(database_url_has_password("postgres://user:secret@localhost:5432/db"));
+        assert!(database_url_has_password(
+            "postgres://user:secret@localhost:5432/db"
+        ));
         // A percent-encoded password (here '@' as %40) is still a real, non-empty password.
-        assert!(database_url_has_password("postgres://user:p%40ss@localhost:5432/db"));
+        assert!(database_url_has_password(
+            "postgres://user:p%40ss@localhost:5432/db"
+        ));
         // Unparseable URLs pass the guard so sqlx surfaces the real connect error.
         assert!(database_url_has_password("not-a-valid-url"));
     }

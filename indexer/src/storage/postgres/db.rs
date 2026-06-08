@@ -43,7 +43,9 @@ pub struct PostgresDb {
 // both of which must be rejected as a missing credential.
 fn database_url_has_password(database_url: &str) -> bool {
     // Strip the scheme so we can isolate the authority (userinfo@host) section.
-    let after_scheme = database_url.split_once("://").map_or(database_url, |(_, rest)| rest);
+    let after_scheme = database_url
+        .split_once("://")
+        .map_or(database_url, |(_, rest)| rest);
     // The userinfo ends at the first '@'; without one there is no password.
     let userinfo = match after_scheme.split_once('@') {
         Some((userinfo, _)) => userinfo,
@@ -1321,14 +1323,22 @@ mod password_guard_tests {
     #[test]
     fn rejects_empty_and_missing_password() {
         // Set-but-empty password (blanked template) must be rejected.
-        assert!(!database_url_has_password("postgres://user:@host:5434/indexer"));
+        assert!(!database_url_has_password(
+            "postgres://user:@host:5434/indexer"
+        ));
         // No password at all must be rejected.
-        assert!(!database_url_has_password("postgres://user@host:5434/indexer"));
+        assert!(!database_url_has_password(
+            "postgres://user@host:5434/indexer"
+        ));
         // No userinfo at all must be rejected.
         assert!(!database_url_has_password("postgres://host:5434/indexer"));
         // A real password must be accepted.
-        assert!(database_url_has_password("postgres://user:secret@host:5434/indexer"));
+        assert!(database_url_has_password(
+            "postgres://user:secret@host:5434/indexer"
+        ));
         // A percent-encoded password is a real, non-empty credential.
-        assert!(database_url_has_password("postgres://user:p%40ss@host:5434/indexer"));
+        assert!(database_url_has_password(
+            "postgres://user:p%40ss@host:5434/indexer"
+        ));
     }
 }
