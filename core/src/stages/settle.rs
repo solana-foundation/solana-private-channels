@@ -861,35 +861,27 @@ mod tests {
         assert!(result.account_settlements.is_empty());
     }
 
-    /// The durable settler is a separate consumer of the sanitized output from
-    /// BOB's in-memory map: in one batch it must skip a sanitizer-rejected `Err`
-    /// tx entirely (no settlement, no stored tx, signature still recorded) while
-    /// emitting the dropped (zeroed-payer) `Ok` tx as a `deleted` settlement.
+    /// Under the lamport cap, the executor zeroes a dataless gainer (e.g. the
+    /// synthetic fee payer) and floors a data account to its 1-lamport existence
+    /// floor. The settler must turn a capped dataless account (0 lamports, empty
+    /// data) into a `deleted` tombstone while persisting a capped data account.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_settle_skips_rejected_and_tombstones_dropped() {
+    async fn test_settle_capped_dataless_deleted_data_persisted() {
         let (mut db, _pg) = start_test_postgres().await;
 
-        // Transfer amounts are immaterial: both verdicts are hand-crafted, not executed.
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
 
-        // Verdict 1 — rejected: the sanitizer flips the result to Err, which carries no accounts.
-        let rejected_from = Keypair::new();
-        let rejected_tx =
-            create_test_sanitized_transaction(&rejected_from, &Pubkey::new_unique(), 7);
-        let rejected_sig = *rejected_tx.signature();
-
-        // Verdict 2 — dropped: the sanitizer zeroes the synthetic payer in place.
-        let dropped_from = Keypair::new();
-        let dropped_tx = create_test_sanitized_transaction(&dropped_from, &Pubkey::new_unique(), 0);
-        let dropped_payer = dropped_from.pubkey();
-        let zeroed = make_executed(vec![(dropped_payer, AccountSharedData::default())]);
-
-        let results: Vec<(TransactionProcessingResult, _)> = vec![
-            (
-                Err(solana_transaction_error::TransactionError::InvalidAccountForFee),
-                rejected_tx,
-            ),
-            (Ok(zeroed), dropped_tx),
-        ];
+        // A capped dataless account (the zeroed synthetic payer) and a capped
+        // data account floored at its 1-lamport existence floor, both writable.
+        let dataless = from.pubkey();
+        let data_pk = Pubkey::new_unique();
+        let data_acct = AccountSharedData::new(1, 8, &spl_token::id());
+        let processed = make_executed(vec![
+            (dataless, AccountSharedData::default()),
+            (data_pk, data_acct),
+        ]);
+        let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
         let result = settle_transactions(
             None,
@@ -902,31 +894,28 @@ mod tests {
         .await
         .unwrap();
 
-        // Rejected tx: contributes no account write and no stored transaction.
-        let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
-        assert!(
-            !settlement_keys.contains(&rejected_from.pubkey()),
-            "rejected tx must contribute no account settlement"
-        );
-        assert!(
-            db.get_transaction(&rejected_sig).await.is_none(),
-            "rejected tx must not be stored"
-        );
-
-        // Dropped tx: the zeroed payer is emitted as a delete tombstone.
-        let dropped = result
+        // Dataless (0 lamports, empty data) → deleted tombstone.
+        let dataless_settlement = result
             .account_settlements
             .iter()
-            .find(|(k, _)| *k == dropped_payer)
-            .expect("dropped payer must be emitted as a settlement");
-        assert!(dropped.1.deleted, "zeroed payer must settle as deleted");
-
-        // The rejected tx is still recorded as a block signature (failed txs stay in blocks).
-        let block = db.get_block(result.slot).await.unwrap();
+            .find(|(k, _)| *k == dataless)
+            .expect("dataless account must be emitted as a settlement");
         assert!(
-            block.transaction_signatures.contains(&rejected_sig),
-            "rejected tx signature is still recorded in the block"
+            dataless_settlement.1.deleted,
+            "capped dataless account must settle as deleted"
         );
+
+        // Data account at the 1-lamport floor → persists, not deleted.
+        let data_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == data_pk)
+            .expect("data account must be emitted as a settlement");
+        assert!(
+            !data_settlement.1.deleted,
+            "capped data account at the 1-lamport floor must persist"
+        );
+        assert_eq!(data_settlement.1.account.lamports(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
