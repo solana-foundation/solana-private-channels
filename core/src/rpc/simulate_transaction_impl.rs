@@ -128,6 +128,12 @@ pub async fn simulate_transaction(
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
         .unwrap_or(0);
 
+    // Simulation must never drop the caller's tx for blockhash expiry; build
+    // a synthetic single-entry window containing the tx's own recent blockhash.
+    let sim_live_blockhashes = std::sync::Arc::new(std::sync::RwLock::new(
+        std::collections::LinkedList::from([*sanitized_tx.message().recent_blockhash()]),
+    ));
+
     let mut batch = ConflictFreeBatch::new();
     batch.add_transaction(TransactionWithIndex {
         transaction: Arc::new(sanitized_tx),
@@ -136,8 +142,13 @@ pub async fn simulate_transaction(
     let (_settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
     // Simulation runs a single transaction; intra-batch parallelism is
     // unnecessary, so disable it (max_svm_workers=1 forces sequential path).
-    let mut execution_deps =
-        get_execution_deps(read_deps.accounts_db.clone(), settled_accounts_rx, 1).await;
+    let mut execution_deps = get_execution_deps(
+        read_deps.accounts_db.clone(),
+        settled_accounts_rx,
+        1,
+        sim_live_blockhashes,
+    )
+    .await;
     let noop: SharedMetrics = std::sync::Arc::new(NoopMetrics);
     let execution_result = execute_batch(batch, &mut execution_deps, &noop).await;
 
