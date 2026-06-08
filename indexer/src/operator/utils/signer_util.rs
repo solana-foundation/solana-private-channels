@@ -320,6 +320,37 @@ mod tests {
         }
     }
 
+    /// ADMIN_SIGNER=memory with a set-but-empty ADMIN_PRIVATE_KEY (the blanked-secret case)
+    /// must fail closed; env::var returns Ok("") so only an explicit emptiness check catches it.
+    #[test]
+    #[serial]
+    fn load_signer_memory_empty_private_key_errors() {
+        let orig_type = env::var(ADMIN_SIGNER).ok();
+        let orig_key = env::var(ADMIN_PRIVATE_KEY).ok();
+        env::set_var(ADMIN_SIGNER, "memory");
+
+        for blank in ["", "   ", "\t\n"] {
+            env::set_var(ADMIN_PRIVATE_KEY, blank);
+            let err = load_signer(SignerRole::Admin)
+                .err()
+                .expect("set-but-empty private key must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ADMIN_PRIVATE_KEY") && msg.contains("is set but empty"),
+                "error should flag the empty var, got: {msg}"
+            );
+        }
+
+        env::remove_var(ADMIN_SIGNER);
+        env::remove_var(ADMIN_PRIVATE_KEY);
+        if let Some(val) = orig_type {
+            env::set_var(ADMIN_SIGNER, val);
+        }
+        if let Some(val) = orig_key {
+            env::set_var(ADMIN_PRIVATE_KEY, val);
+        }
+    }
+
     /// ADMIN_SIGNER=vault requires ADMIN_VAULT_ADDR as the first credential; the error
     /// message must identify the missing variable so misconfiguration is immediately obvious.
     #[test]

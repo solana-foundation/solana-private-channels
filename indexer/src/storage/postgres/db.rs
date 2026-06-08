@@ -1324,7 +1324,11 @@ mod password_guard_tests {
         assert!(!database_url_has_password("postgres://user:@host:5434/indexer"));
         // No password at all must be rejected.
         assert!(!database_url_has_password("postgres://user@host:5434/indexer"));
+        // No userinfo at all must be rejected.
+        assert!(!database_url_has_password("postgres://host:5434/indexer"));
         // A real password must be accepted.
         assert!(database_url_has_password("postgres://user:secret@host:5434/indexer"));
+        // A percent-encoded password is a real, non-empty credential.
+        assert!(database_url_has_password("postgres://user:p%40ss@host:5434/indexer"));
     }
 }
