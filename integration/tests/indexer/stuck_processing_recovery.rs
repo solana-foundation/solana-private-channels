@@ -1183,13 +1183,13 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
-    // Seed the durable counter to MAX_RECOVERY_REQUEUE_ATTEMPTS - 1 (= 2); the
-    // next would-be demote crosses the cap → quarantine, not requeue.
+    // Seed the durable counter to MAX_RECOVERY_REQUEUE_ATTEMPTS (= 3); the row
+    // has already used its requeue budget, so the next demote is quarantined.
     sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 2 WHERE id = $1")
+    sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 3 WHERE id = $1")
         .bind(tx_id)
         .execute(&pool)
         .await

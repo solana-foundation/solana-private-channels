@@ -232,8 +232,10 @@ pub async fn run(
     // A task exit increments the OPERATOR_TASK_EXIT metric with a task
     // label so dashboards can tell which one failed without tailing logs.
     //
-    // Non-critical tasks (reconciliation, feepayer monitor) are not watched
-    // here.
+    // The recovery worker is critical: if it dies, stuck-Processing rows stop
+    // being recovered, so an unexpected exit must page and restart like the
+    // pipeline stages. Non-critical tasks (reconciliation, feepayer monitor)
+    // are not watched here.
     //
     // Handles are polled by mutable reference so ownership stays here and
     // they can still be moved into `shutdown_operator` below — awaiting an
@@ -242,6 +244,7 @@ pub async fn run(
     let mut processor_handle = processor_handle;
     let mut sender_handle = sender_handle;
     let mut storage_writer_handle = storage_writer_handle;
+    let mut recovery_handle = recovery_handle;
     let pt_label = program_type.as_label();
 
     // `biased;` makes ctrl-c win on concurrent readiness — avoids a
@@ -263,6 +266,9 @@ pub async fn run(
         }
         _ = &mut storage_writer_handle => {
             critical_exit(pt_label, "storage_writer");
+        }
+        _ = &mut recovery_handle => {
+            critical_exit(pt_label, "recovery");
         }
     }
 

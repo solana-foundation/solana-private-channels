@@ -176,7 +176,7 @@ async fn decide_action(
     // MAX_RECOVERY_REQUEUE_ATTEMPTS are quarantined (and paged) rather than
     // looping between Pending and Processing indefinitely.
     if matches!(action, RecoveryAction::Demote)
-        && row.recovery_requeue_attempts + 1 >= MAX_RECOVERY_REQUEUE_ATTEMPTS
+        && row.recovery_requeue_attempts >= MAX_RECOVERY_REQUEUE_ATTEMPTS
     {
         return RecoveryAction::Quarantine {
             reason: format!(
@@ -1040,8 +1040,8 @@ mod tests {
         let mock = MockStorage::new();
         let mut row = make_deposit_row(51);
         row.status = TransactionStatus::Processing;
-        // One short of the cap → the next requeue would exceed it.
-        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
+        // At the cap (MAX requeues already done) → the next demote is blocked.
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
         // Backdate past STALE_THRESHOLD so the sweep actually selects it.
         row.updated_at = Utc::now() - chrono::Duration::minutes(10);
         mock.pending_transactions.lock().unwrap().push(row.clone());
@@ -1096,10 +1096,18 @@ mod tests {
         let client = make_rpc_client(&server.url());
 
         let mut row = make_deposit_row(52);
+        // One below the cap still demotes (requeues) - pins the off-by-one boundary.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
-        let action = decide_action(&row, &storage, &client, Pubkey::new_unique()).await;
+        let below = decide_action(&row, &storage, &client, Pubkey::new_unique()).await;
         assert!(
-            matches!(action, RecoveryAction::Quarantine { .. }),
+            matches!(below, RecoveryAction::Demote),
+            "one below the cap must still Demote (requeue)"
+        );
+        // At the cap, the demote is converted to Quarantine.
+        row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        let at_cap = decide_action(&row, &storage, &client, Pubkey::new_unique()).await;
+        assert!(
+            matches!(at_cap, RecoveryAction::Quarantine { .. }),
             "demote at the cap must become Quarantine"
         );
     }
