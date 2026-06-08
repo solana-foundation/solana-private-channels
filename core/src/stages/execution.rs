@@ -966,11 +966,11 @@ mod tests {
             "under the cap the exploit tx executes, it is not rejected"
         );
         assert!(
-            bob_balance(&deps.bob, &r).map_or(true, |l| l == 0),
+            bob_balance(&deps.bob, &r).is_none_or(|l| l == 0),
             "R must gain nothing durable"
         );
         assert!(
-            bob_balance(&deps.bob, &a.pubkey()).map_or(true, |l| l == 0),
+            bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "synthetic payer must not persist"
         );
     }
@@ -987,7 +987,7 @@ mod tests {
         let r = Pubkey::new_unique();
         let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 5)]).await;
         assert!(is_executed(regular_result(&result, 0)));
-        assert!(bob_balance(&deps.bob, &r).map_or(true, |l| l == 0));
+        assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
     }
 
     /// 2-step re-use: a value-neutral setup tx (self-transfer of 0) cannot
@@ -1005,14 +1005,14 @@ mod tests {
         let setup = run_batch(&mut deps, &metrics, vec![transfer(&a, &a.pubkey(), 0)]).await;
         assert!(is_executed(regular_result(&setup, 0)));
         assert!(
-            bob_balance(&deps.bob, &a.pubkey()).map_or(true, |l| l == 0),
+            bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "synthetic payer must not graduate"
         );
 
         let r = Pubkey::new_unique();
         let spend = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 10)]).await;
         assert!(is_executed(regular_result(&spend, 0)));
-        assert!(bob_balance(&deps.bob, &r).map_or(true, |l| l == 0));
+        assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
     }
 
     /// Synthetic fee payer is dropped: any synthetic-payer system transfer →
@@ -1028,7 +1028,7 @@ mod tests {
         let r = Pubkey::new_unique();
         let _ = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 1)]).await;
         assert!(
-            bob_balance(&deps.bob, &a.pubkey()).map_or(true, |l| l == 0),
+            bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "synthetic fee payer must not be persisted"
         );
     }
@@ -1067,11 +1067,11 @@ mod tests {
         // not reject for a missing fee payer) and the synthetic sponsor is not
         // graduated into BOB.
         assert!(
-            bob_balance(&deps.bob, &a.pubkey()).map_or(true, |l| l == 0),
+            bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "sponsor must not be persisted"
         );
         assert!(
-            bob_balance(&deps.bob, &r).map_or(true, |l| l == 0),
+            bob_balance(&deps.bob, &r).is_none_or(|l| l == 0),
             "dataless recipient is capped to 0"
         );
     }
@@ -1095,8 +1095,8 @@ mod tests {
         // a system-account-to-system-account transfer of plain lamports has no
         // durable representation in this channel (there is no native SOL). The
         // transfer still executes; nothing native persists.
-        assert!(bob_balance(&deps.bob, &r).map_or(true, |l| l == 0));
-        assert!(bob_balance(&deps.bob, &b.pubkey()).map_or(true, |l| l == 0));
+        assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
+        assert!(bob_balance(&deps.bob, &b.pubkey()).is_none_or(|l| l == 0));
     }
 
     // ── Path parity & invariants ──
@@ -1134,13 +1134,13 @@ mod tests {
         }
         for a in &payers {
             assert!(
-                bob_balance(&deps.bob, &a.pubkey()).map_or(true, |l| l == 0),
+                bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
                 "synthetic payer must not persist on the parallel path"
             );
         }
         for r in &recipients {
             assert!(
-                bob_balance(&deps.bob, r).map_or(true, |l| l == 0),
+                bob_balance(&deps.bob, r).is_none_or(|l| l == 0),
                 "dataless recipient must be capped on the parallel path"
             );
         }
