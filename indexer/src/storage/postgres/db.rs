@@ -39,22 +39,13 @@ pub struct PostgresDb {
 }
 
 // Returns true when the database URL carries a non-empty password component.
-// Handles the no-password form (user@host) and the empty-password form (user:@host),
-// both of which must be rejected as a missing credential.
+// Kept in sync with the identical guard in core's accounts/postgres.rs.
 fn database_url_has_password(database_url: &str) -> bool {
-    // Strip the scheme so we can isolate the authority (userinfo@host) section.
-    let after_scheme = database_url
-        .split_once("://")
-        .map_or(database_url, |(_, rest)| rest);
-    // The userinfo ends at the first '@'; without one there is no password.
-    let userinfo = match after_scheme.split_once('@') {
-        Some((userinfo, _)) => userinfo,
-        None => return false,
-    };
-    // Password is the part after the first ':' in the userinfo; empty means missing.
-    match userinfo.split_once(':') {
-        Some((_, password)) => !password.is_empty(),
-        None => false,
+    match url::Url::parse(database_url) {
+        // None (no password) and Some("") (blanked secret) are both missing credentials.
+        Ok(parsed) => parsed.password().is_some_and(|p| !p.is_empty()),
+        // Leave unparseable URLs for sqlx to reject on connect.
+        Err(_) => true,
     }
 }
 
@@ -1340,5 +1331,7 @@ mod password_guard_tests {
         assert!(database_url_has_password(
             "postgres://user:p%40ss@host:5434/indexer"
         ));
+        // Unparseable URLs pass the guard so sqlx surfaces the real connect error.
+        assert!(database_url_has_password("not-a-valid-url"));
     }
 }
