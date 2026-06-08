@@ -9,8 +9,8 @@ use crate::{
     },
     utils::{
         assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
-        get_token_balance, swap_dvp_pda, TestContext, DVP_EXPIRED, LEG_NOT_FUNDED,
-        SETTLEMENT_AUTHORITY_MISMATCH, SETTLEMENT_TOO_EARLY,
+        get_token_balance, nonce_tombstone_pda, swap_dvp_pda, TestContext, DVP_EXPIRED,
+        LEG_NOT_FUNDED, MEMO_PROGRAM_ID, SETTLEMENT_AUTHORITY_MISMATCH, SETTLEMENT_TOO_EARLY,
     },
 };
 
@@ -106,6 +106,7 @@ fn test_settle_dvp_rejects_user_as_authority() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.user_a]);
@@ -136,6 +137,7 @@ fn test_settle_dvp_rejects_third_party_as_authority() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&outsider]);
@@ -162,6 +164,7 @@ fn test_settle_dvp_rejects_when_neither_leg_funded() {
             .user_b_ata_b(fixture.user_b_ata_b)
             .token_program_a(fixture.token_program_a)
             .token_program_b(fixture.token_program_b)
+            .memo_program(MEMO_PROGRAM_ID)
             .leg_a_extras_count(0)
             .instruction(),
         &[&fixture.settlement_authority],
@@ -192,6 +195,7 @@ fn test_settle_dvp_rejects_when_only_leg_b_funded() {
             .user_b_ata_b(fixture.user_b_ata_b)
             .token_program_a(fixture.token_program_a)
             .token_program_b(fixture.token_program_b)
+            .memo_program(MEMO_PROGRAM_ID)
             .leg_a_extras_count(0)
             .instruction(),
         &[&fixture.settlement_authority],
@@ -222,6 +226,7 @@ fn test_settle_dvp_rejects_when_only_leg_a_funded() {
             .user_b_ata_b(fixture.user_b_ata_b)
             .token_program_a(fixture.token_program_a)
             .token_program_b(fixture.token_program_b)
+            .memo_program(MEMO_PROGRAM_ID)
             .leg_a_extras_count(0)
             .instruction(),
         &[&fixture.settlement_authority],
@@ -332,6 +337,7 @@ fn test_settle_dvp_rejects_post_expiry() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
@@ -351,6 +357,7 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
     let create_ix = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -387,6 +394,7 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
@@ -422,6 +430,7 @@ fn test_settle_dvp_rejects_substituted_mint_a() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
@@ -457,6 +466,7 @@ fn test_settle_dvp_rejects_swapped_cross_atas() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
@@ -499,6 +509,7 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
     let create_second = CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(second_swap_dvp)
+        .nonce_tombstone(nonce_tombstone_pda(&second_swap_dvp).0)
         .mint_a(first_dvp.mint_a)
         .mint_b(first_dvp.mint_b)
         .dvp_ata_a(second_dvp_ata_a)
@@ -542,6 +553,7 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
         .user_b_ata_b(first_dvp.user_b_ata_b)
         .token_program_a(first_dvp.token_program_a)
         .token_program_b(first_dvp.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(0)
         .instruction();
     context

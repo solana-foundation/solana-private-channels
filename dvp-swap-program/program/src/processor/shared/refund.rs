@@ -2,7 +2,6 @@ use pinocchio::{account::AccountView, cpi::Signer, error::ProgramError, ProgramR
 use pinocchio_token_2022::instructions::CloseAccount;
 
 use crate::{
-    processor::shared::account_check::{verify_account_owner, verify_token_program},
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
@@ -21,7 +20,7 @@ use crate::{
 /// point, and the refund path must stay available even if a mint's
 /// extension parameters change post-Create so funds are never stranded.
 ///
-/// `fixed` is the 10-account prefix from `split_leg_remaining_accounts`;
+/// `fixed` is the 11-account prefix from `split_leg_remaining_accounts`;
 /// `leg_a_extras`/`leg_b_extras` are the per-leg transfer-hook accounts.
 #[inline(always)]
 pub fn refund_and_close_dvp(
@@ -30,7 +29,7 @@ pub fn refund_and_close_dvp(
     leg_a_extras: &[AccountView],
     leg_b_extras: &[AccountView],
 ) -> ProgramResult {
-    let [rent_destination_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
+    let [rent_destination_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -40,10 +39,13 @@ pub fn refund_and_close_dvp(
         mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
         ProgramError::InvalidAccountData
     );
-    verify_token_program(token_program_a_info)?;
-    verify_token_program(token_program_b_info)?;
-    verify_account_owner(mint_a_info, token_program_a_info.address())?;
-    verify_account_owner(mint_b_info, token_program_b_info.address())?;
+    // Token program from state, not the mint owner: an unfunded leg's
+    // mint may have been closed.
+    require!(
+        token_program_a_info.address() == &dvp.token_program_a
+            && token_program_b_info.address() == &dvp.token_program_b,
+        ProgramError::IncorrectProgramId
+    );
 
     // Address-only validation: an unfunded leg's user ATA can be
     // uninitialized; the canonical pubkey is well-defined regardless.
@@ -98,6 +100,7 @@ pub fn refund_and_close_dvp(
             leg_a_amount,
             get_mint_decimals(mint_a_info)?,
             token_program_a_info.address(),
+            memo_program_info,
             leg_a_extras,
             &signer_seeds,
         )?;
@@ -112,6 +115,7 @@ pub fn refund_and_close_dvp(
             leg_b_amount,
             get_mint_decimals(mint_b_info)?,
             token_program_b_info.address(),
+            memo_program_info,
             leg_b_extras,
             &signer_seeds,
         )?;

@@ -1,6 +1,6 @@
 use crate::{
     error::DvpSwapProgramError,
-    processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
+    processor::shared::account_check::{verify_account_owner, verify_signer},
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
@@ -20,7 +20,7 @@ use pinocchio_token_2022::instructions::CloseAccount;
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts split between the two legs.
-const FIXED_ACCOUNTS_LEN: usize = 12;
+const FIXED_ACCOUNTS_LEN: usize = 13;
 
 /// Processes the SettleDvp instruction.
 ///
@@ -50,10 +50,11 @@ const FIXED_ACCOUNTS_LEN: usize = 12;
 /// 5.  `[writable]` dvp_ata_b - Escrow for the cash leg (drained, then closed)
 /// 6.  `[writable]` user_a_ata_b - user_a's ATA for mint_b; receives the cash leg (caller must pre-initialize)
 /// 7.  `[writable]` user_b_ata_a - user_b's ATA for mint_a; receives the asset leg (caller must pre-initialize)
-/// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
-/// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund (caller must pre-initialize if escrow may hold a surplus)
+/// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund. Required: anyone can dust the escrow, so a surplus refund can always fire — a missing ATA reverts the whole Settle. Pre-initialize it.
+/// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund. Required: same as user_a_ata_a — pre-initialize it.
 /// 10. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 11. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 12. `[]` memo_program - SPL Memo program; only used for destinations that require a memo
 ///
 /// Trailing accounts (variable):
 /// - First `leg_a_extras_count` go to leg A's `TransferChecked` CPI
@@ -71,15 +72,13 @@ pub fn process_settle_dvp(
 ) -> ProgramResult {
     let (fixed, leg_a_extras, leg_b_extras) =
         split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
-    let [settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info] =
+    let [settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
     verify_signer(settlement_authority_info, true)?;
-    verify_token_program(token_program_a_info)?;
-    verify_token_program(token_program_b_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
@@ -92,13 +91,16 @@ pub fn process_settle_dvp(
         DvpSwapProgramError::SettlementAuthorityMismatch
     );
 
-    // Bind each mint account to state and to its declared token program.
+    // Bind mints and token programs to state.
     require!(
         mint_a_info.address() == &dvp.mint_a && mint_b_info.address() == &dvp.mint_b,
         ProgramError::InvalidAccountData
     );
-    verify_account_owner(mint_a_info, token_program_a_info.address())?;
-    verify_account_owner(mint_b_info, token_program_b_info.address())?;
+    require!(
+        token_program_a_info.address() == &dvp.token_program_a
+            && token_program_b_info.address() == &dvp.token_program_b,
+        ProgramError::IncorrectProgramId
+    );
 
     let now = Clock::get()?.unix_timestamp;
     require!(now <= dvp.expiry_timestamp, DvpSwapProgramError::DvpExpired);
@@ -189,6 +191,7 @@ pub fn process_settle_dvp(
         dvp.amount_b,
         decimals_b,
         token_program_b_info.address(),
+        memo_program_info,
         leg_b_extras,
         &signer_seeds,
     )?;
@@ -201,6 +204,7 @@ pub fn process_settle_dvp(
         dvp.amount_a,
         decimals_a,
         token_program_a_info.address(),
+        memo_program_info,
         leg_a_extras,
         &signer_seeds,
     )?;
@@ -209,12 +213,12 @@ pub fn process_settle_dvp(
     // empty and over-deposits don't leak to the counterparty.
     //
     // The surplus CPI reuses the leg's hook extras but transfers to a
-    // different destination (depositor's own-mint ATA, not counterparty).
-    // Hooks whose ExtraAccountMetaList resolves accounts from the
-    // transfer destination (rare but spec-valid) will reject this CPI
-    // and revert the whole Settle. Recovery: depositor calls Reclaim,
-    // re-funds exactly amount_x, retries Settle. See README "TransferHook
-    // + over-deposit caveat".
+    // different destination and amount than the delivery. Hooks whose
+    // ExtraAccountMetaList resolves accounts from the transfer destination
+    // or amount (rare but spec-valid) will reject this CPI and revert the
+    // whole Settle. Recovery: depositor calls Reclaim, re-funds exactly
+    // amount_x, retries Settle. See README "TransferHook + over-deposit
+    // caveat".
     let asset_surplus = escrow_a_balance - dvp.amount_a;
     if asset_surplus > 0 {
         transfer_checked_cpi(
@@ -225,6 +229,7 @@ pub fn process_settle_dvp(
             asset_surplus,
             decimals_a,
             token_program_a_info.address(),
+            memo_program_info,
             leg_a_extras,
             &signer_seeds,
         )?;
@@ -240,6 +245,7 @@ pub fn process_settle_dvp(
             cash_surplus,
             decimals_b,
             token_program_b_info.address(),
+            memo_program_info,
             leg_b_extras,
             &signer_seeds,
         )?;

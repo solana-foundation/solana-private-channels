@@ -20,6 +20,7 @@ use spl_token_2022::{
     extension::{
         confidential_transfer::ConfidentialTransferMint,
         interest_bearing_mint::InterestBearingConfig,
+        non_transferable::NonTransferable,
         pausable::PausableConfig,
         permanent_delegate::PermanentDelegate,
         scaled_ui_amount::ScaledUiAmountConfig,
@@ -35,6 +36,7 @@ pub use spl_token::ID as TOKEN_PROGRAM_ID;
 pub use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
 pub const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+pub const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 pub const SWAP_PROGRAM_ID: Pubkey = DVP_SWAP_PROGRAM_ID;
 
 /// Program ID of the no-op transfer-hook fixture loaded into LiteSVM
@@ -43,6 +45,7 @@ pub const SWAP_PROGRAM_ID: Pubkey = DVP_SWAP_PROGRAM_ID;
 pub const HOOK_FIXTURE_PROGRAM_ID: Pubkey = pubkey!("HookqJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC");
 
 pub const SWAP_DVP_SEED: &[u8] = b"dvp";
+pub const NONCE_TOMBSTONE_SEED: &[u8] = b"nonce";
 
 pub const SIGNER_NOT_PARTY: u32 = DvpSwapProgramError::SignerNotParty as u32;
 pub const DVP_EXPIRED: u32 = DvpSwapProgramError::DvpExpired as u32;
@@ -51,6 +54,7 @@ pub const SETTLEMENT_AUTHORITY_MISMATCH: u32 =
 pub const SETTLEMENT_TOO_EARLY: u32 = DvpSwapProgramError::SettlementTooEarly as u32;
 pub const LEG_NOT_FUNDED: u32 = DvpSwapProgramError::LegNotFunded as u32;
 pub const EXPIRY_NOT_IN_FUTURE: u32 = DvpSwapProgramError::ExpiryNotInFuture as u32;
+pub const EXPIRY_TOO_FAR_IN_FUTURE: u32 = DvpSwapProgramError::ExpiryTooFarInFuture as u32;
 pub const EARLIEST_AFTER_EXPIRY: u32 = DvpSwapProgramError::EarliestAfterExpiry as u32;
 pub const SELF_DVP: u32 = DvpSwapProgramError::SelfDvp as u32;
 pub const SAME_MINT: u32 = DvpSwapProgramError::SameMint as u32;
@@ -60,6 +64,7 @@ pub const SETTLEMENT_AUTHORITY_EXECUTABLE: u32 =
     DvpSwapProgramError::SettlementAuthorityExecutable as u32;
 pub const SETTLEMENT_AUTHORITY_IS_PARTY: u32 =
     DvpSwapProgramError::SettlementAuthorityIsParty as u32;
+pub const NONCE_ALREADY_USED: u32 = DvpSwapProgramError::NonceAlreadyUsed as u32;
 
 const MIN_LAMPORTS: u64 = 500_000_000;
 
@@ -154,6 +159,25 @@ impl Default for TestContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The wrapped-SOL (native) mint, owned by legacy SPL Token. LiteSVM does
+/// not seed this account, so tests must write it with `set_native_mint`.
+pub const NATIVE_MINT: Pubkey = spl_token::native_mint::ID;
+
+/// Write the wrapped-SOL mint (decimals 9, SPL Token) at its canonical
+/// address so WSOL legs can be exercised.
+pub fn set_native_mint(context: &mut TestContext) {
+    let mint_state = Mint {
+        decimals: 9,
+        is_initialized: true,
+        freeze_authority: COption::None,
+        mint_authority: COption::None,
+        supply: 0,
+    };
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(mint_state, &mut data).unwrap();
+    write_account(context, &NATIVE_MINT, data, TOKEN_PROGRAM_ID, 1_000_000_000);
 }
 
 /// Write a bare mint (no Token-2022 extensions) owned by `token_program`.
@@ -308,6 +332,10 @@ pub fn swap_dvp_pda(
         ],
         &SWAP_PROGRAM_ID,
     )
+}
+
+pub fn nonce_tombstone_pda(swap_dvp: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[NONCE_TOMBSTONE_SEED, swap_dvp.as_ref()], &SWAP_PROGRAM_ID)
 }
 
 pub fn dvp_ata(swap_dvp: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
@@ -488,6 +516,41 @@ pub fn set_token_2022_with_hook_account(
     write_account(context, ata, data, TOKEN_2022_PROGRAM_ID, 2_039_280);
 }
 
+/// Writes a Token-2022 token account with MemoTransfer enabled. Incoming
+/// transfers then require a preceding Memo-program instruction.
+pub fn set_token_2022_with_memo_required(
+    context: &mut TestContext,
+    ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) {
+    use spl_token_2022::extension::memo_transfer::MemoTransfer;
+    use spl_token_2022::pod::PodCOption;
+
+    let space = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+        ExtensionType::MemoTransfer,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; space];
+    let mut state =
+        PodStateWithExtensionsMut::<PodAccount>::unpack_uninitialized(&mut data).unwrap();
+    let ext = state.init_extension::<MemoTransfer>(true).unwrap();
+    ext.require_incoming_transfer_memos = true.into();
+    *state.base = PodAccount {
+        mint: *mint,
+        owner: *owner,
+        amount: amount.into(),
+        delegate: PodCOption::none(),
+        state: AccountState::Initialized as u8,
+        is_native: PodCOption::none(),
+        delegated_amount: 0u64.into(),
+        close_authority: PodCOption::none(),
+    };
+    state.init_account_type().unwrap();
+    write_account(context, ata, data, TOKEN_2022_PROGRAM_ID, 2_039_280);
+}
+
 /// Sets up a Token-2022 mint that delegates to the test hook fixture
 /// (`HOOK_FIXTURE_PROGRAM_ID`) and creates its `ExtraAccountMetaList`
 /// validation PDA declaring **one** extra account: the system program.
@@ -606,6 +669,15 @@ pub fn set_mint_2022_with_scaled_ui_amount(
         ext.multiplier = 1.0f64.into();
         ext.new_multiplier_effective_timestamp = 0i64.into();
         ext.new_multiplier = 1.0f64.into();
+    });
+    write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
+}
+
+/// NonTransferable — blocked; used in negative tests. A balance reaching
+/// a non-transferable escrow can never be drained, so Create rejects it.
+pub fn set_mint_2022_with_non_transferable(context: &mut TestContext, mint: &Pubkey) {
+    let data = build_mint_2022_with_extensions(&[ExtensionType::NonTransferable], |state| {
+        state.init_extension::<NonTransferable>(true).unwrap();
     });
     write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
 }

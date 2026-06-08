@@ -10,7 +10,7 @@ use pinocchio::{account::AccountView, address::Address, error::ProgramError, Pro
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts split between the two legs.
-const FIXED_ACCOUNTS_LEN: usize = 10;
+const FIXED_ACCOUNTS_LEN: usize = 11;
 
 /// Processes the RejectDvp instruction.
 ///
@@ -41,6 +41,7 @@ const FIXED_ACCOUNTS_LEN: usize = 10;
 /// 7. `[writable]` user_b_ata_b - user_b's ATA for mint_b; refund destination (caller must pre-initialize if leg B is funded)
 /// 8. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
 /// 9. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 10. `[]` memo_program - SPL Memo program; only used for destinations that require a memo
 ///
 /// Trailing accounts (variable):
 /// - First `leg_a_extras_count` go to leg A's refund `TransferChecked`

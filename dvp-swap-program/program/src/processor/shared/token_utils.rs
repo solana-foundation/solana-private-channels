@@ -11,21 +11,30 @@ use pinocchio::{
 };
 use pinocchio_token::{state::Mint as TokenMint, state::TokenAccount, ID as TOKEN_PROGRAM_ID};
 use pinocchio_token_2022::{
-    state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
-    ID as TOKEN_2022_PROGRAM_ID,
+    instructions::SyncNative, state::Mint as Token2022Mint,
+    state::TokenAccount as Token2022Account, ID as TOKEN_2022_PROGRAM_ID,
 };
 use spl_token_2022::extension::{
     confidential_transfer::ConfidentialTransferMint,
     confidential_transfer_fee::ConfidentialTransferFeeConfig,
-    interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
+    interest_bearing_mint::InterestBearingConfig, memo_transfer::memo_required,
+    non_transferable::NonTransferable, scaled_ui_amount::ScaledUiAmountConfig,
     transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions,
 };
-use spl_token_2022::state::Mint as Token2022MintState;
+use spl_token_2022::state::{Account as Token2022AccountState, Mint as Token2022MintState};
 
 use crate::{error::DvpSwapProgramError, require};
 
 /// SPL Token / Token-2022 `TransferChecked` instruction discriminator.
 const TRANSFER_CHECKED_DISCRIMINATOR: u8 = 12;
+
+/// SPL Memo program.
+const MEMO_PROGRAM_ID: Address =
+    Address::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
+/// Memo emitted before a memo-required transfer. Token-2022 only checks
+/// the preceding sibling is the Memo program; the content is arbitrary.
+const MEMO_TEXT: &[u8] = b"memo required";
 
 /// Verify that `ata_info` is the canonical Associated Token Account for
 /// the given wallet/mint/token-program tuple. Address-only — does not
@@ -52,20 +61,50 @@ pub fn verify_canonical_ata(
     Ok(())
 }
 
+/// Read the token balance, issuing a `SyncNative` CPI first if the account
+/// holds wrapped SOL. `parse` returns `(amount, is_native)` from the
+/// account's bytes; it is called once for non-native accounts, and a
+/// second time after the sync CPI for native ones (the synced `amount`
+/// must be re-read).
+fn read_balance_synced(
+    info: &AccountView,
+    token_program: &Address,
+    parse: impl Fn(&[u8]) -> (u64, bool),
+) -> Result<u64, ProgramError> {
+    let (amount, is_native) = {
+        let data = info.try_borrow()?;
+        parse(&data)
+    };
+    if !is_native {
+        return Ok(amount);
+    }
+    SyncNative {
+        native_token: info,
+        token_program,
+    }
+    .invoke()?;
+    let data = info.try_borrow()?;
+    Ok(parse(&data).0)
+}
+
 /// Read the `amount` field of a token account owned by either legacy
-/// SPL Token or Token-2022. The two share an identical first-165-byte
-/// account layout, so the only branch is on the owner program ID.
+/// SPL Token or Token-2022, decoding with that program's own account
+/// type. Wrapped-SOL accounts are `SyncNative`d first so `amount`
+/// reflects lamports sent via a raw system transfer (which don't update
+/// `amount` on their own).
 #[inline(always)]
 pub fn get_token_account_balance(info: &AccountView) -> Result<u64, ProgramError> {
     if info.owned_by(&TOKEN_PROGRAM_ID) {
-        let data = info.try_borrow()?;
-        let account = unsafe { TokenAccount::from_bytes_unchecked(&data) };
-        return Ok(account.amount());
+        return read_balance_synced(info, &TOKEN_PROGRAM_ID, |data| {
+            let account = unsafe { TokenAccount::from_bytes_unchecked(data) };
+            (account.amount(), account.is_native())
+        });
     }
     if info.owned_by(&TOKEN_2022_PROGRAM_ID) {
-        let data = info.try_borrow()?;
-        let account = unsafe { Token2022Account::from_bytes_unchecked(&data) };
-        return Ok(account.amount());
+        return read_balance_synced(info, &TOKEN_2022_PROGRAM_ID, |data| {
+            let account = unsafe { Token2022Account::from_bytes_unchecked(data) };
+            (account.amount(), account.is_native())
+        });
     }
     Err(ProgramError::InvalidAccountOwner)
 }
@@ -87,28 +126,37 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(ProgramError::InvalidAccountOwner)
 }
 
-/// Reject Token-2022 mints whose extensions silently break the
-/// "escrow balance == sum of deposits" invariant: `ConfidentialTransfer`(+Fee),
-/// `TransferFee`, `InterestBearing`, `ScaledUiAmount`. These cause the
-/// credited amount to drift from the debited amount, so the program
-/// would settle "successfully" while a leg comes up short.
+/// Reject Token-2022 mints carrying either:
+/// - an amount-mutating extension that silently breaks the "escrow
+///   balance == sum of deposits" invariant (`ConfidentialTransfer`(+Fee),
+///   `TransferFee`, `InterestBearing`, `ScaledUiAmount`): the credited
+///   amount drifts from the debited amount, so the program would settle
+///   "successfully" while a leg comes up short; or
+/// - `NonTransferable`, which permanently blocks transfers out of the
+///   escrow. Unlike everything else this never recovers — if a balance
+///   reaches the escrow (e.g. the authority mints straight to it), no
+///   settle/refund/reclaim can drain it, stranding both legs.
 ///
 /// Everything else is allowed, including `Pausable`, `PermanentDelegate`,
-/// `NonTransferable`, `DefaultAccountState`, `TransferHook`, etc.
-/// These fail *loudly* (reverted CPI, atomic rollback) rather than
-/// silently — funds stay in escrow and recover once the blocking
-/// condition lifts. `PermanentDelegate` is a deliberate carve-out for
-/// regulated RWA tokens (issuer/transfer-agent clawback is an
-/// intrinsic property of the asset).
+/// `DefaultAccountState`, `TransferHook`, etc. These fail *loudly*
+/// (reverted CPI, atomic rollback) rather than silently — funds stay in
+/// escrow and recover once the blocking condition lifts.
+/// `PermanentDelegate` is a deliberate carve-out for regulated RWA tokens
+/// (issuer/transfer-agent clawback is an intrinsic property of the asset).
 ///
 /// Residual griefing/clawback surface the program does not defend
 /// against on-chain: a `Pausable` authority can pause mid-trade, a
 /// `PermanentDelegate` can drain or claw back, a `FreezeAuthority` can
-/// freeze the escrow ATA, a `TransferHook` EAML can be updated to
+/// freeze the escrow ATA (or a frozen `DefaultAccountState` can make
+/// future ATAs start frozen), a `TransferHook` EAML can be updated to
 /// exceed the per-CPI account cap (`MAX_HOOK_REMAINING_ACCOUNTS`) or
-/// to error unconditionally. Traders are expected to vet the mints
-/// they agree to transact in; mint-authority trust is not a problem
-/// the program can solve.
+/// to error unconditionally, and a `MintCloseAuthority` can close a
+/// zero-supply mint and recreate it at the same address with a
+/// different extension set (e.g. a transfer fee), changing transfer
+/// behavior after Create since terminal paths bind only the mint
+/// address and token program, not the extension set. Traders are
+/// expected to vet the mints they agree to transact in; mint-authority
+/// trust is not a problem the program can solve.
 ///
 /// Called only at CreateDvp. Unwind paths skip this check so funds
 /// remain recoverable if extension parameters change post-Create.
@@ -137,6 +185,7 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
         || mint.get_extension::<TransferFeeConfig>().is_ok()
         || mint.get_extension::<InterestBearingConfig>().is_ok()
         || mint.get_extension::<ScaledUiAmountConfig>().is_ok()
+        || mint.get_extension::<NonTransferable>().is_ok()
     {
         return Err(DvpSwapProgramError::BlockedMintExtension.into());
     }
@@ -160,6 +209,36 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
 /// counterparty risk, not a program-correctness problem.
 pub const MAX_HOOK_REMAINING_ACCOUNTS: usize = 32;
 const MAX_TRANSFER_CHECKED_ACCOUNTS: usize = 4 + MAX_HOOK_REMAINING_ACCOUNTS;
+
+/// True if `to` is a Token-2022 account requiring an incoming-transfer memo.
+#[inline(always)]
+pub fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
+    if !to.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        return Ok(false);
+    }
+    let data = to.try_borrow()?;
+    let account = StateWithExtensions::<Token2022AccountState>::unpack(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    Ok(memo_required(&account))
+}
+
+/// CPI the Memo program so it is the immediately preceding sibling of the
+/// next transfer, satisfying a memo-required destination. Validates the
+/// passed account only here — callers without a memo destination can pass
+/// any account in the slot.
+#[inline(always)]
+fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
+    require!(
+        memo_program.address() == &MEMO_PROGRAM_ID,
+        ProgramError::IncorrectProgramId
+    );
+    let instruction = InstructionView {
+        program_id: &MEMO_PROGRAM_ID,
+        accounts: &[],
+        data: MEMO_TEXT,
+    };
+    invoke_signed_with_bounds::<0>(&instruction, &[], &[])
+}
 
 /// `TransferChecked` CPI on SPL Token or Token-2022 with a trailing
 /// slice of accounts forwarded to the token program. The trailing
@@ -186,9 +265,16 @@ pub fn transfer_checked_cpi(
     amount: u64,
     decimals: u8,
     token_program: &Address,
+    memo_program: &AccountView,
     remaining: &[AccountView],
     signers: &[Signer],
 ) -> ProgramResult {
+    // A memo-required destination needs a Memo CPI as its immediately
+    // preceding sibling; emit it here so the adjacency can't be broken.
+    if requires_memo(to)? {
+        invoke_memo(memo_program)?;
+    }
+
     require!(
         remaining.len() <= MAX_HOOK_REMAINING_ACCOUNTS,
         ProgramError::InvalidArgument

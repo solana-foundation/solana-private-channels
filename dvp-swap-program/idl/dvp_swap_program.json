@@ -52,6 +52,20 @@
             },
             {
               "kind": "structFieldTypeNode",
+              "name": "tokenProgramA",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "tokenProgramB",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
               "name": "amountA",
               "type": {
                 "endian": "le",
@@ -189,6 +203,18 @@
         "kind": "errorNode",
         "message": "settlement_authority must not be executable",
         "name": "settlementAuthorityExecutable"
+      },
+      {
+        "code": 13,
+        "kind": "errorNode",
+        "message": "nonce already used for these DvP seeds",
+        "name": "nonceAlreadyUsed"
+      },
+      {
+        "code": 14,
+        "kind": "errorNode",
+        "message": "DvP expiry is too far in the future",
+        "name": "expiryTooFarInFuture"
       }
     ],
     "instructions": [
@@ -211,6 +237,15 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
+          },
+          {
+            "docs": [
+              "Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "nonceTombstone"
           },
           {
             "docs": [
@@ -442,6 +477,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgram"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used if signer_dest_ata requires a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -546,7 +590,7 @@
           },
           {
             "docs": [
-              "user_a's ATA for mint_a; receives any asset-leg surplus refund"
+              "user_a's ATA for mint_a; receives any asset-leg surplus refund. Required and must be pre-initialized: anyone can dust the escrow, forcing a surplus refund, and a missing ATA reverts the whole Settle"
             ],
             "isSigner": false,
             "isWritable": true,
@@ -555,7 +599,7 @@
           },
           {
             "docs": [
-              "user_b's ATA for mint_b; receives any cash-leg surplus refund"
+              "user_b's ATA for mint_b; receives any cash-leg surplus refund. Required and must be pre-initialized, same as user_a_ata_a"
             ],
             "isSigner": false,
             "isWritable": true,
@@ -579,6 +623,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -707,6 +760,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -835,6 +897,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [

@@ -228,11 +228,14 @@ pub fn create_dvp_transaction(
     );
     let dvp_ata_a = get_associated_token_address_with_program_id(&swap_dvp, mint_a, &spl_token::ID);
     let dvp_ata_b = get_associated_token_address_with_program_id(&swap_dvp, mint_b, &spl_token::ID);
+    let (nonce_tombstone, _) =
+        Pubkey::find_program_address(&[b"nonce", swap_dvp.as_ref()], &DVP_SWAP_PROGRAM_ID);
 
     let mut builder = CreateDvpBuilder::new();
     builder
         .payer(payer.pubkey())
         .swap_dvp(swap_dvp)
+        .nonce_tombstone(nonce_tombstone)
         .mint_a(*mint_a)
         .mint_b(*mint_b)
         .dvp_ata_a(dvp_ata_a)

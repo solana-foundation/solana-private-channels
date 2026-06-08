@@ -47,8 +47,9 @@ pub enum DvpSwapProgramError {
     ZeroAmount,
 
     /// (10) Mint carries a Token-2022 extension the swap program refuses
-    /// to support (confidential transfer, transfer fee, interest bearing,
-    /// scaled UI amount). Checked only at CreateDvp.
+    /// to support (confidential transfer, confidential transfer fee config,
+    /// transfer fee, interest bearing, scaled UI amount, non-transferable).
+    /// Checked only at CreateDvp.
     #[error("Mint carries an unsupported Token-2022 extension")]
     BlockedMintExtension,
 
@@ -61,6 +62,16 @@ pub enum DvpSwapProgramError {
     /// credited the closed-account rent at Settle/Cancel.
     #[error("settlement_authority must not be executable")]
     SettlementAuthorityExecutable,
+
+    /// (13) A DvP with these seeds was already created; the nonce
+    /// tombstone outlives the closed trade so the PDA can't be reused.
+    #[error("nonce already used for these DvP seeds")]
+    NonceAlreadyUsed,
+
+    /// (14) `expiry_timestamp` is more than `MAX_DVP_DURATION_SECS` past
+    /// creation time, which would lock escrow rent for an unbounded term.
+    #[error("DvP expiry is too far in the future")]
+    ExpiryTooFarInFuture,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {

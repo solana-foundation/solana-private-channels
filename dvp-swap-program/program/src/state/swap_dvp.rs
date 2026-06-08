@@ -6,6 +6,12 @@ use pinocchio::{cpi::Seed, error::ProgramError, Address as Pubkey};
 
 pub const SWAP_DVP_SEED: &[u8] = b"dvp";
 
+/// Seed prefix for the per-DvP nonce tombstone. The tombstone PDA is
+/// derived from `[NONCE_TOMBSTONE_SEED, swap_dvp_pubkey]`, created at
+/// CreateDvp, and never closed — its existence permanently marks a
+/// `(seeds, nonce)` PDA address as used so it can't be re-instantiated.
+pub const NONCE_TOMBSTONE_SEED: &[u8] = b"nonce";
+
 /// Atomic DvP escrow for a P2P token swap.
 ///
 /// `user_a` (seller) delivers `amount_a` of `mint_a` (the asset);
@@ -26,8 +32,13 @@ pub struct SwapDvp {
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
     pub settlement_authority: Pubkey,
+    /// Owner of `mint_a`, captured at Create.
+    pub token_program_a: Pubkey,
+    /// Owner of `mint_b`, captured at Create.
+    pub token_program_b: Pubkey,
     pub amount_a: u64,
     pub amount_b: u64,
+    /// Cluster time (`Clock::unix_timestamp`), not wall-clock. See README.
     pub expiry_timestamp: i64,
     pub nonce: u64,
     /// `None` = settlement allowed any time before `expiry_timestamp`.
@@ -37,7 +48,7 @@ pub struct SwapDvp {
 
 impl SwapDvp {
     pub const LEN: usize = 1   // bump
-        + 32 * 5               // user_a, user_b, mint_a, mint_b, settlement_authority
+        + 32 * 7               // user_a, user_b, mint_a, mint_b, settlement_authority, token_program_a, token_program_b
         + 8 * 4                // amount_a, amount_b, expiry_timestamp, nonce
         + 1 + 8; // earliest_settlement_timestamp (opt)
 
@@ -73,6 +84,8 @@ impl SwapDvp {
         data.extend_from_slice(self.mint_a.as_ref());
         data.extend_from_slice(self.mint_b.as_ref());
         data.extend_from_slice(self.settlement_authority.as_ref());
+        data.extend_from_slice(self.token_program_a.as_ref());
+        data.extend_from_slice(self.token_program_b.as_ref());
         data.extend_from_slice(&self.amount_a.to_le_bytes());
         data.extend_from_slice(&self.amount_b.to_le_bytes());
         data.extend_from_slice(&self.expiry_timestamp.to_le_bytes());
@@ -137,6 +150,20 @@ impl SwapDvp {
         );
         offset += 32;
 
+        let token_program_a = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        offset += 32;
+
+        let token_program_b = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        offset += 32;
+
         let amount_a = u64::from_le_bytes(
             data[offset..offset + 8]
                 .try_into()
@@ -184,6 +211,8 @@ impl SwapDvp {
             mint_a,
             mint_b,
             settlement_authority,
+            token_program_a,
+            token_program_b,
             amount_a,
             amount_b,
             expiry_timestamp,
@@ -210,6 +239,8 @@ mod tests {
             mint_a: Pubkey::new_from_array([3u8; 32]),
             mint_b: Pubkey::new_from_array([4u8; 32]),
             settlement_authority: Pubkey::new_from_array([5u8; 32]),
+            token_program_a: Pubkey::new_from_array([6u8; 32]),
+            token_program_b: Pubkey::new_from_array([7u8; 32]),
             amount_a: 1_000,
             amount_b: 2_500,
             expiry_timestamp: 1_780_000_000,
@@ -217,8 +248,8 @@ mod tests {
             earliest_settlement_timestamp: None,
         };
         let mut bytes = dvp.to_bytes();
-        // Tag offset = bump(1) + 5*pubkey(160) + 4*u64-or-i64(32) = 193.
-        let option_tag_offset = 1 + 32 * 5 + 8 * 4;
+        // Tag offset = bump(1) + 7*pubkey(224) + 4*u64-or-i64(32) = 257.
+        let option_tag_offset = 1 + 32 * 7 + 8 * 4;
         bytes[option_tag_offset] = 2;
         let err = SwapDvp::try_from_bytes(&bytes).expect_err("must reject invalid tag");
         assert!(matches!(err, ProgramError::InvalidAccountData));
