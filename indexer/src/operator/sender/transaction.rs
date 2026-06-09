@@ -110,12 +110,19 @@ impl SenderState {
                     compute_budget,
                 })
             }
-            TransactionBuilder::ResetSmtRoot(ref builder) => {
-                let in_flight_count = self
+            TransactionBuilder::ResetSmtRoot(mut builder) => {
+                // Bind the reset to our local tree index so the on-chain program
+                // rejects a replay. Initialize SMT state first in case a reset is
+                // the first thing we process after a restart.
+                if self.smt_state.is_none() {
+                    self.initialize_smt_state().await?;
+                }
+                let smt = self
                     .smt_state
                     .as_ref()
-                    .map(|s| s.nonce_to_builder.len())
-                    .unwrap_or(0);
+                    .ok_or(ProgramError::SmtNotInitialized)?;
+                let in_flight_count = smt.nonce_to_builder.len();
+                let expected_current_tree_index = smt.smt_state.tree_index();
 
                 if in_flight_count > 0 {
                     info!(
@@ -123,14 +130,15 @@ impl SenderState {
                         in_flight_count
                     );
 
-                    self.pending_rotation = Some(builder.clone());
+                    self.pending_rotation = Some(builder);
 
                     return Err(ProgramError::RotationPending { in_flight_count }.into());
                 }
 
                 // No in-flight transactions - process immediately
+                builder.expected_current_tree_index(expected_current_tree_index);
                 Ok(InstructionWithSigners {
-                    instructions: tx_builder.instructions()?,
+                    instructions: vec![builder.instruction()],
                     fee_payer,
                     signers,
                     compute_budget,
@@ -539,6 +547,27 @@ pub(super) fn handle_confirmation_result<'a>(
                     .await;
                 }
             },
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::UnexpectedTreeIndex,
+            ))) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "reset_tree_already_advanced"])
+                    .inc();
+                // Rejected because a reset already advanced the tree on-chain. Sync
+                // local SMT to the authoritative index. On fetch failure, leave it
+                // unchanged rather than guess; a restart re-syncs from chain.
+                match state.fetch_onchain_tree_index().await {
+                    Ok(idx) => {
+                        if let Some(ref mut smt_state) = state.smt_state {
+                            smt_state.smt_state.reset(idx);
+                        }
+                        warn!("ResetSmtRoot rejected - synced local SMT to on-chain tree_index {idx}");
+                    }
+                    Err(e) => error!(
+                        "ResetSmtRoot rejected but tree index re-fetch failed: {e} - local SMT left unchanged"
+                    ),
+                }
+            }
             Ok(ConfirmationResult::Failed(program_error)) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, "program_error"])
@@ -1264,8 +1293,14 @@ mod tests {
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::common::storage::Storage;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use borsh::BorshSerialize;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
     use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::Instance;
+    use solana_client::nonblocking::rpc_client::RpcClient;
+    use solana_client::rpc_request::RpcRequest;
     use solana_keychain::Signer;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
@@ -1918,6 +1953,151 @@ mod tests {
         let update = rx.recv().await.unwrap();
         assert_eq!(update.transaction_id, 11);
         assert_eq!(update.status, TransactionStatus::Failed);
+    }
+
+    /// A reset rejected with UnexpectedTreeIndex means a reset already landed on-chain.
+    /// The sender must re-fetch the authoritative tree index, sync local SMT to it, and
+    /// write nothing to the storage channel (a reset has no DB row).
+    #[tokio::test]
+    async fn confirmation_result_unexpected_tree_index_resyncs_local_smt() {
+        let local_index = 4u64;
+        let onchain_index = 5u64;
+
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: [0u8; 32],
+            current_tree_index: onchain_index,
+        };
+        let mut instance_bytes = Vec::new();
+        instance.serialize(&mut instance_bytes).unwrap();
+
+        let account_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&instance_bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rpc_client = Arc::new(RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        });
+        state.smt_state = Some(SenderSMTState {
+            smt_state: SmtState::new(local_index),
+            nonce_to_builder: HashMap::new(),
+        });
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::UnexpectedTreeIndex,
+            ))),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        assert_eq!(
+            state.smt_state.as_ref().unwrap().smt_state.tree_index(),
+            onchain_index
+        );
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "no status update expected for reset"
+        );
+    }
+
+    /// If the on-chain re-fetch fails (here: an undeserializable instance account), the
+    /// sender must leave local SMT unchanged (fail-closed) rather than guessing the index.
+    #[tokio::test]
+    async fn confirmation_result_unexpected_tree_index_fetch_failure_leaves_smt_unchanged() {
+        let local_index = 4u64;
+
+        // Too-short account data so parse_instance fails after a successful fetch.
+        let account_response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode([0u8; 4]), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, account_response);
+
+        let mut state = make_sender_state();
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rpc_client = Arc::new(RpcClientWithRetry {
+            rpc_client: Arc::new(RpcClient::new_mock_with_mocks(
+                "http://127.0.0.1:8899".to_string(),
+                mocks,
+            )),
+            retry_config: RetryConfig::default(),
+        });
+        state.smt_state = Some(SenderSMTState {
+            smt_state: SmtState::new(local_index),
+            nonce_to_builder: HashMap::new(),
+        });
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            transaction_id: None,
+            withdrawal_nonce: None,
+            trace_id: None,
+        };
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::Failed(Some(
+                PrivateChannelEscrowProgramError::UnexpectedTreeIndex,
+            ))),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &tx,
+        )
+        .await;
+
+        assert_eq!(
+            state.smt_state.as_ref().unwrap().smt_state.tree_index(),
+            local_index,
+            "local SMT must be unchanged when re-fetch fails"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 
     /// A `Retry` result with `RetryPolicy::None` (non-idempotent operation) cannot be safely

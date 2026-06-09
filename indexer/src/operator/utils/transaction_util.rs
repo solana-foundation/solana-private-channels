@@ -202,6 +202,7 @@ pub fn parse_program_error(
                 12 => Some(
                     PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
                 ),
+                13 => Some(PrivateChannelEscrowProgramError::UnexpectedTreeIndex),
                 _ => None, // Ignore other program errors
             }
         }
@@ -307,6 +308,16 @@ mod tests {
         assert!(matches!(
             result,
             Some(PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex)
+        ));
+    }
+
+    #[test]
+    fn parse_custom_13_unexpected_tree_index() {
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(13));
+        let result = parse_program_error(&err);
+        assert!(matches!(
+            result,
+            Some(PrivateChannelEscrowProgramError::UnexpectedTreeIndex)
         ));
     }
 

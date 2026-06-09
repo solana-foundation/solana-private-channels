@@ -151,8 +151,9 @@ impl TransactionBuilder {
     ///   verification to prevent duplicate issuance.
     /// - **ReleaseFunds**: Idempotent retry - Uses transaction nonce to prevent duplicates.
     ///   Safe to retry on transient network failures.
-    /// - **ResetSmtRoot**: Idempotent retry - tree_index increments ensure idempotency.
-    ///   Safe to retry on transient network failures.
+    /// - **ResetSmtRoot**: Idempotent retry - carries expected_current_tree_index, so a
+    ///   replay after the first reset lands is rejected on-chain (UnexpectedTreeIndex)
+    ///   rather than advancing the tree twice; the sender then syncs local SMT.
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
             Self::Mint(_) => RetryPolicy::None,

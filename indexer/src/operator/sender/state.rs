@@ -153,6 +153,26 @@ impl SenderState {
         Ok(())
     }
 
+    /// Read the authoritative current_tree_index from the on-chain instance.
+    pub(super) async fn fetch_onchain_tree_index(&self) -> Result<u64, OperatorError> {
+        let instance_pda = self.instance_pda.ok_or(AccountError::InstanceNotFound {
+            instance: Pubkey::default(),
+        })?;
+        let data = self
+            .rpc_client
+            .get_account_data(&instance_pda)
+            .await
+            .map_err(|_| AccountError::AccountNotFound {
+                pubkey: instance_pda,
+            })?;
+        let instance =
+            parse_instance(&data).map_err(|e| AccountError::AccountDeserializationFailed {
+                pubkey: instance_pda,
+                reason: e.to_string(),
+            })?;
+        Ok(instance.current_tree_index)
+    }
+
     /// Sends a ManualReview status update during startup recovery when a stored            
     /// transaction cannot be reconstructed (e.g. unparseable pubkey or signature).         
     /// Using send_guaranteed so the alert is never silently dropped.                       
