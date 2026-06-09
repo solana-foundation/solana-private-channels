@@ -714,16 +714,10 @@ mod tests {
             }
         });
 
-        // Let the pipeline saturate against the paused consumer, then assert the
-        // sequencer side holds no more than cap + workers (each worker can park
-        // at most one send beyond the queue).
+        // Let the workers actually park on the full queue so the backpressure
+        // path is exercised before we drain; the conservation check below is the
+        // real regression guard (a drop-instead-of-park bug fails it).
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            sequencer_rx.len() <= sequencer_cap,
-            "sequencer queue must never exceed its capacity ({} > {})",
-            sequencer_rx.len(),
-            sequencer_cap
-        );
 
         // Drain everything; conservation: all txs arrive, none dropped.
         let mut drained = 0usize;

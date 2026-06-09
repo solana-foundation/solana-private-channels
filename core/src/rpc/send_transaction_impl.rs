@@ -190,9 +190,9 @@ mod tests {
             .expect_err("a full ingress queue must shed");
         assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
         assert_eq!(
-            rx.max_capacity(),
+            rx.len(),
             TEST_INGRESS_CAP,
-            "receiver must never exceed the bounded capacity"
+            "every accepted tx stays buffered, so the queue is saturated at the shed point"
         );
     }
 

@@ -106,15 +106,14 @@ fn memo_tx(blockhash: solana_sdk::hash::Hash, nonce: u64) -> Transaction {
 }
 
 fn rss_kb() -> u64 {
-    // statm field 2 (resident pages) × page size, in KiB. Linux-only.
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let resident_pages: u64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let page_kb = 4; // 4 KiB pages on x86-64
-    resident_pages * page_kb
+    // VmRSS from /proc/self/status is already in kB, so it's page-size agnostic. Linux-only.
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|kb| kb.parse().ok())
+        .unwrap_or(0)
 }
 
 fn shed_total() -> f64 {
