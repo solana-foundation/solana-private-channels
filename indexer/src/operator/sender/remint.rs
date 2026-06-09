@@ -70,11 +70,13 @@ async fn attempt_remint(
             return Ok(existing_signature);
         }
         Ok(None) => {}
+        // Fail closed: an unverifiable lookup escalates to ManualReview (via the
+        // Err arm of execute_deferred_remint) instead of risking a duplicate remint.
         Err(e) => {
-            warn!(
-                "Remint idempotency lookup failed for transaction {}: {}; proceeding with send",
+            return Err(format!(
+                "idempotency lookup unavailable for transaction {}: {}; refusing to remint",
                 info.transaction_id, e
-            );
+            ));
         }
     }
 
@@ -125,33 +127,63 @@ pub async fn execute_deferred_remint(
                 "Withdrawal failed but tokens reminted successfully: {}",
                 signature
             );
-            if let Some(transaction_id) = entry.ctx.transaction_id {
-                if let Err(e) = send_guaranteed(
-                    storage_tx,
-                    TransactionStatusUpdate {
-                        transaction_id,
-                        trace_id: entry.ctx.trace_id.clone(),
-                        status: TransactionStatus::FailedReminted,
-                        counterpart_signature: None,
-                        processed_at: Some(Utc::now()),
-                        error_message: Some(entry.original_error.clone()),
-                        remint_signature: Some(signature.to_string()),
-                        remint_attempted: true,
-                    },
-                    "transaction status update",
-                )
-                .await
-                {
-                    error!(
-                        "Failed to send FailedReminted status for txn {}: {}. \
-                         Remint sig {} confirmed on-chain but not recorded.",
-                        transaction_id, e, signature
-                    );
-                }
-            } else {
+
+            // Always Some for remint entries: they are only queued for a failed
+            // withdrawal, which has a DB row. With no id there is no row to record
+            // the landed remint against and no status message to key, so the only
+            // action is a loud log. The remint already confirmed on-chain.
+            let Some(transaction_id) = entry.ctx.transaction_id else {
                 error!(
-                    "Remint succeeded (sig: {}) but no transaction_id to record status",
+                    "Remint confirmed (sig: {}) but entry has no transaction_id; \
+                     cannot record FailedReminted",
                     signature
+                );
+                return;
+            };
+
+            // Durably record the landed remint before the async channel send.
+            // This flips status to FailedReminted now, so a crash in the window
+            // before the writer runs can no longer leave the row PendingRemint
+            // for restart recovery to pick up and remint a second time.
+            //
+            // If this write fails we do not abort: the channel send below still
+            // drives the row to FailedReminted (its UPDATE accepts pending_remint),
+            // which is enough to stop replay. Only landed_remint_signature is lost.
+            if let Err(persist_err) = state
+                .storage
+                .record_remint_result(transaction_id, signature.to_string())
+                .await
+            {
+                error!(
+                    "Remint sig {} confirmed but durable persist failed for txn {}: {}; \
+                     falling back to async status writer",
+                    signature, transaction_id, persist_err
+                );
+            }
+
+            // Drives the webhook alert, and is the fallback status write when the
+            // durable persist above errored. A no-op if the row is already
+            // FailedReminted (the UPDATE guard rejects non-pending_remint rows).
+            if let Err(e) = send_guaranteed(
+                storage_tx,
+                TransactionStatusUpdate {
+                    transaction_id,
+                    trace_id: entry.ctx.trace_id.clone(),
+                    status: TransactionStatus::FailedReminted,
+                    counterpart_signature: None,
+                    processed_at: Some(Utc::now()),
+                    error_message: Some(entry.original_error.clone()),
+                    remint_signature: Some(signature.to_string()),
+                    remint_attempted: true,
+                },
+                "transaction status update",
+            )
+            .await
+            {
+                error!(
+                    "Failed to send FailedReminted status for txn {}: {}. \
+                     Remint sig {} confirmed on-chain.",
+                    transaction_id, e, signature
                 );
             }
         }
@@ -559,6 +591,7 @@ mod tests {
                 pending_remint_deadline_at: Some(now),
                 finality_check_attempts: attempts,
                 recovery_requeue_attempts: 0,
+                landed_remint_signature: None,
             });
     }
 
@@ -951,6 +984,59 @@ mod tests {
     }
 
     // ── execute_deferred_remint paths ───────────────────────────────
+
+    /// Fail-closed: when the idempotency lookup cannot run (here the backend
+    /// rejects getSignaturesForAddress), attempt_remint must refuse to mint and
+    /// escalate to ManualReview rather than risk a duplicate remint.
+    #[tokio::test]
+    async fn execute_deferred_remint_fails_closed_when_idempotency_lookup_unavailable() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // getSignaturesForAddress unavailable on this backend.
+        let _sigs = mock_rpc(
+            &mut rpc_server,
+            "getSignaturesForAddress",
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
+        )
+        .await;
+
+        let entry = PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(700),
+                withdrawal_nonce: Some(70),
+                trace_id: Some("trace-700".to_string()),
+            },
+            remint_info: make_remint_info(700),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        };
+
+        execute_deferred_remint(&state, &entry, &storage_tx).await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("unavailable lookup must emit a status update");
+        assert_eq!(update.transaction_id, 700);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let err = update.error_message.as_deref().unwrap_or("");
+        // This string only comes from the fail-closed arm, before any send.
+        assert!(
+            err.contains("refusing to remint"),
+            "must escalate with the fail-closed reason: {err}"
+        );
+        assert!(
+            err.contains("release_funds failed"),
+            "must preserve the original withdrawal error: {err}"
+        );
+    }
 
     /// When the finality check returns null for a withdrawal signature
     /// (transaction was dropped), `execute_deferred_remint` is called.

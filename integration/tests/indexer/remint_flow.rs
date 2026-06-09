@@ -129,6 +129,7 @@ fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
             pending_remint_deadline_at: Some(now),
             finality_check_attempts: attempts,
             recovery_requeue_attempts: 0,
+            landed_remint_signature: None,
         });
 }
 
@@ -647,7 +648,67 @@ async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// (f) attempt_remint send fails — ManualReview combined error.
+// (e2) Durable persist on a confirmed remint.
+// ─────────────────────────────────────────────────────────────────────
+// A confirmed remint must record its result on the transaction row itself.
+// record_remint_result is the only writer of landed_remint_signature (the
+// async status path never sets that column), so finding it on the row proves
+// the synchronous write ran. The row is then terminal, so the restart sweep
+// no longer returns it to be reminted again.
+#[tokio::test]
+async fn execute_deferred_remint_durably_records_landed_signature() {
+    let mock = MockRpcServer::start().await;
+    let (state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
+
+    let txn_id: i64 = 7_003;
+    let info = make_remint_info(txn_id);
+    // The PendingRemint row this remint resolves.
+    seed_pending_remint_row(&storage_mock, txn_id, 0);
+
+    // Idempotency lookup empty, then a clean send and confirm.
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+    mock.enqueue("getLatestBlockhash", blockhash_reply());
+    mock.enqueue("sendTransaction", send_transaction_echo_reply());
+    mock.enqueue("getSignatureStatuses", confirmed_status_reply());
+
+    let entry = make_pending_remint(txn_id, 33, vec![Signature::new_unique()], 0, info);
+    test_hooks::execute_deferred_remint(&state, &entry, &storage_tx).await;
+
+    let update = storage_rx
+        .recv()
+        .await
+        .expect("successful remint must emit a FailedReminted update");
+    assert_eq!(update.status, TransactionStatus::FailedReminted);
+    let landed = update
+        .remint_signature
+        .clone()
+        .expect("update carries the remint signature");
+
+    // landed_remint_signature is only ever written by record_remint_result.
+    {
+        let rows = storage_mock.pending_remint_transactions.lock().unwrap();
+        let row = rows.iter().find(|t| t.id == txn_id).expect("row present");
+        assert_eq!(row.status, TransactionStatus::FailedReminted);
+        assert_eq!(
+            row.landed_remint_signature.as_deref(),
+            Some(landed.as_str())
+        );
+    }
+
+    // Terminal row is not handed back to the restart sweep.
+    let still_pending = storage_mock
+        .get_pending_remint_transactions()
+        .await
+        .unwrap();
+    assert!(
+        still_pending.is_empty(),
+        "a reminted row must not re-hydrate as PendingRemint"
+    );
+    mock.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// (f) attempt_remint send fails: ManualReview combined error.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Idempotency lookup returns empty; `sendTransaction` returns a

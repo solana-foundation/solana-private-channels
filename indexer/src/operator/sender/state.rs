@@ -442,6 +442,7 @@ mod tests {
             pending_remint_deadline_at: Some(deadline),
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            landed_remint_signature: None,
         }
     }
 

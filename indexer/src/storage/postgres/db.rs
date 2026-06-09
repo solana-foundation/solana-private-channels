@@ -33,6 +33,7 @@ mod transaction_cols {
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
     pub const FINALITY_CHECK_ATTEMPTS: &str = "finality_check_attempts";
     pub const RECOVERY_REQUEUE_ATTEMPTS: &str = "recovery_requeue_attempts";
+    pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
 }
 
 #[derive(Clone)]
@@ -234,6 +235,22 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("recovery_requeue_attempts migration complete");
+
+        // Confirmed remint signature, recorded synchronously after the remint
+        // confirms so a crash before the async writer cannot leave the row at
+        // pending_remint with a landed remint (which restart recovery replays).
+        info!("Running landed_remint_signature migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS landed_remint_signature TEXT;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("landed_remint_signature migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -671,7 +688,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -698,6 +715,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -720,7 +738,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -746,6 +764,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -768,7 +787,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -795,6 +814,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -857,7 +877,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -885,6 +905,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -958,7 +979,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -986,6 +1007,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -1133,6 +1155,40 @@ impl PostgresDb {
         .bind(transaction_id)
         .bind(attempts)
         .bind(new_deadline)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        Ok(())
+    }
+
+    /// Durably record a confirmed remint: flip status to FailedReminted and
+    /// store the signature in one UPDATE, before the async writer runs. The
+    /// `pending_remint` guard makes it a no-op on an already-terminal row, so
+    /// a replayed call can never resurrect or double-record.
+    pub async fn record_remint_result_internal(
+        &self,
+        transaction_id: i64,
+        remint_signature: String,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET
+                status = $2,
+                landed_remint_signature = $3,
+                processed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+                AND status = 'pending_remint'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(TransactionStatus::FailedReminted)
+        .bind(remint_signature)
         .execute(&self.pool)
         .await?;
 
