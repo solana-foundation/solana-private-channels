@@ -1193,6 +1193,23 @@ impl PostgresDb {
         .await?;
 
         if result.rows_affected() == 0 {
+            // The guarded UPDATE matched nothing. Distinguish the two cases for
+            // on-call: a missing row is a bug (the id came from a live
+            // PendingRemint row), a non-pending_remint status is expected on an
+            // idempotent replay. Both still signal RowNotFound so the caller
+            // falls back to the async writer.
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+                    .bind(transaction_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            match current.as_deref() {
+                None => warn!("record_remint_result: transaction {transaction_id} not found"),
+                Some(status) => info!(
+                    "record_remint_result: transaction {transaction_id} not pending_remint \
+                     (status {status}); skipping"
+                ),
+            }
             return Err(sqlx::Error::RowNotFound);
         }
 

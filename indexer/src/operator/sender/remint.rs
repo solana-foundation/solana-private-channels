@@ -162,8 +162,9 @@ pub async fn execute_deferred_remint(
             }
 
             // Drives the webhook alert, and is the fallback status write when the
-            // durable persist above errored. A no-op if the row is already
-            // FailedReminted (the UPDATE guard rejects non-pending_remint rows).
+            // durable persist above errored. Its UPDATE only touches
+            // processing/pending_remint rows, so once the row is FailedReminted
+            // this is a no-op.
             if let Err(e) = send_guaranteed(
                 storage_tx,
                 TransactionStatusUpdate {
