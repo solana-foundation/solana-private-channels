@@ -135,6 +135,10 @@ DEVNET_RPC_URL=https://api.devnet.solana.com
 DEVNET_YELLOWSTONE_ENDPOINT=<your_yellowstone_grpc_endpoint>
 INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 
+# Optional auth/RBAC. Leave blank for the default unauthenticated gateway.
+# Set this only when starting Docker Compose with the auth profile.
+# JWT_SECRET=$(openssl rand -hex 32)
+
 # Optional: Grafana alert webhook (defaults to empty if not set)
 # ALERT_WEBHOOK_URL=<your_webhook_url>
 ```
@@ -148,6 +152,11 @@ Once your docker build (Step 1) is complete, run:
 ```shell
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d
 ```
+
+By default, the gateway runs without RBAC and the auth service is not started.
+To test authenticated gateway access, set `JWT_SECRET` in `.env.devnet` and add
+`--profile auth` to the Docker Compose command so the auth service runs with the
+same signing secret.
 
 You should see all services in a healthy/running state:
 
