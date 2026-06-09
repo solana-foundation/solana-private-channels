@@ -560,8 +560,10 @@ pub(super) fn handle_confirmation_result<'a>(
                     Ok(idx) => {
                         if let Some(ref mut smt_state) = state.smt_state {
                             smt_state.smt_state.reset(idx);
+                            warn!("ResetSmtRoot rejected - synced local SMT to on-chain tree_index {idx}");
+                        } else {
+                            warn!("ResetSmtRoot rejected - on-chain tree_index is {idx} but smt_state is None, sync skipped");
                         }
-                        warn!("ResetSmtRoot rejected - synced local SMT to on-chain tree_index {idx}");
                     }
                     Err(e) => error!(
                         "ResetSmtRoot rejected but tree index re-fetch failed: {e} - local SMT left unchanged"
