@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Gated ticks with no frontier advance before a stall warning fires (~15s at 5s/tick).
 const STALL_WARN_TICKS: u32 = 3;
@@ -188,17 +188,13 @@ impl CheckpointWriter {
                                 update_count += 1;
 
                                 if update_count >= self.max_batch_size {
-                                    if let Err(e) = self.flush_checkpoints(&mut states).await {
-                                        error!("Failed to flush checkpoints: {}", e);
-                                    }
+                                    self.flush_checkpoints(&mut states).await;
                                     update_count = 0;
                                 }
                             }
                             None => {
                                 info!("Checkpoint channel closed, flushing remaining checkpoints");
-                                if let Err(e) = self.flush_checkpoints(&mut states).await {
-                                    error!("Failed to flush checkpoints on shutdown: {}", e);
-                                }
+                                self.flush_checkpoints(&mut states).await;
                                 break;
                             }
                         }
@@ -206,9 +202,7 @@ impl CheckpointWriter {
 
                     _ = ticker.tick() => {
                         Self::warn_on_stall(&mut states);
-                        if let Err(e) = self.flush_checkpoints(&mut states).await {
-                            error!("Failed to flush checkpoints on timer: {}", e);
-                        }
+                        self.flush_checkpoints(&mut states).await;
                         update_count = 0;
                     }
                 }
@@ -232,7 +226,7 @@ impl CheckpointWriter {
             .set(state.lag() as f64);
     }
 
-    /// Warn once per program type whose gated frontier stays frozen `STALL_WARN_TICKS` ticks, and refresh the lag gauge so it stays live when no updates arrive.
+    /// Re-warn every `STALL_WARN_TICKS` ticks that a gated frontier stays frozen, and refresh the lag gauge so it stays live when no updates arrive.
     fn warn_on_stall(states: &mut HashMap<ProgramType, CheckpointState>) {
         for (&program_type, state) in states.iter_mut() {
             metrics::INDEXER_CHECKPOINT_FRONTIER_LAG
@@ -243,7 +237,8 @@ impl CheckpointWriter {
                 continue;
             }
             state.stalled_ticks += 1;
-            if state.stalled_ticks == STALL_WARN_TICKS {
+            // Re-fire periodically (not just once) so a hours-long stall keeps logging.
+            if state.stalled_ticks % STALL_WARN_TICKS == 0 {
                 warn!(
                     ?program_type,
                     frontier = state.frontier,
@@ -255,11 +250,9 @@ impl CheckpointWriter {
         }
     }
 
-    /// Persist each dirty program type's contiguous frontier, clearing `dirty` only on a successful write.
-    async fn flush_checkpoints(
-        &self,
-        states: &mut HashMap<ProgramType, CheckpointState>,
-    ) -> Result<(), CheckpointError> {
+    /// Persist each dirty program type's contiguous frontier, clearing `dirty` only on a
+    /// successful write. A failed write logs and leaves `dirty` set so the next tick retries.
+    async fn flush_checkpoints(&self, states: &mut HashMap<ProgramType, CheckpointState>) {
         for (&program_type, state) in states.iter_mut() {
             if !state.dirty {
                 continue;
@@ -286,8 +279,6 @@ impl CheckpointWriter {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -452,9 +443,8 @@ mod tests {
         let mut pending =
             pending_states(&[(ProgramType::Escrow, 100), (ProgramType::Withdraw, 200)]);
 
-        let result = writer.flush_checkpoints(&mut pending).await;
+        writer.flush_checkpoints(&mut pending).await;
 
-        assert!(result.is_ok());
         // Successful writes clear the dirty flag; nothing remains to flush.
         assert!(pending.values().all(|s| !s.dirty));
 
@@ -484,9 +474,7 @@ mod tests {
         let mut pending =
             pending_states(&[(ProgramType::Escrow, 100), (ProgramType::Withdraw, 200)]);
 
-        let result = writer.flush_checkpoints(&mut pending).await;
-
-        assert!(result.is_ok()); // flush_checkpoints itself succeeds
+        writer.flush_checkpoints(&mut pending).await;
 
         // Failed checkpoint stays dirty for retry; the successful one is cleared.
         assert!(pending.get(&ProgramType::Escrow).unwrap().dirty);
@@ -513,9 +501,8 @@ mod tests {
 
         let mut pending: HashMap<ProgramType, CheckpointState> = HashMap::new();
 
-        let result = writer.flush_checkpoints(&mut pending).await;
+        writer.flush_checkpoints(&mut pending).await;
 
-        assert!(result.is_ok());
         assert!(pending.is_empty());
     }
 
