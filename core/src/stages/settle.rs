@@ -878,6 +878,63 @@ mod tests {
         assert!(result.account_settlements.is_empty());
     }
 
+    /// Under the lamport cap, the executor zeroes a dataless gainer (e.g. the
+    /// synthetic fee payer) and floors a data account to its 1-lamport existence
+    /// floor. The settler must turn a capped dataless account (0 lamports, empty
+    /// data) into a `deleted` tombstone while persisting a capped data account.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_capped_dataless_deleted_data_persisted() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+
+        // A capped dataless account (the zeroed synthetic payer) and a capped
+        // data account floored at its 1-lamport existence floor, both writable.
+        let dataless = from.pubkey();
+        let data_pk = Pubkey::new_unique();
+        let data_acct = AccountSharedData::new(1, 8, &spl_token::id());
+        let processed = make_executed(vec![
+            (dataless, AccountSharedData::default()),
+            (data_pk, data_acct),
+        ]);
+        let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
+
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Dataless (0 lamports, empty data) → deleted tombstone.
+        let dataless_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == dataless)
+            .expect("dataless account must be emitted as a settlement");
+        assert!(
+            dataless_settlement.1.deleted,
+            "capped dataless account must settle as deleted"
+        );
+
+        // Data account at the 1-lamport floor → persists, not deleted.
+        let data_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == data_pk)
+            .expect("data account must be emitted as a settlement");
+        assert!(
+            !data_settlement.1.deleted,
+            "capped data account at the 1-lamport floor must persist"
+        );
+        assert_eq!(data_settlement.1.account.lamports(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_multiple_sequential_batches() {
         let (mut db, _pg) = start_test_postgres().await;
