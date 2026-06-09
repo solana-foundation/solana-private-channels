@@ -219,9 +219,15 @@ impl BackfillService {
         }
     }
 
-    /// Run the backfill process
-    /// Returns Ok(()) if no gap or backfill successful, Err if gap too large or backfill failed
-    pub async fn run(&self, instruction_tx: InstructionSender) -> Result<(), IndexerError> {
+    /// Work out which slots backfill needs to fill: `Some((from_slot, target))`, or
+    /// `None` if there's no gap. `from_slot` is exclusive (the last durable
+    /// checkpoint) and `target` is inclusive, so the range to fill is
+    /// `(from_slot, target]` — derived from the stored checkpoint, the configured
+    /// `start_slot`, the current chain tip, and the max gap size.
+    ///
+    /// The caller resolves the range once and uses it for two things — gating the
+    /// checkpoint writer and driving the fill — so both see the exact same bounds.
+    pub async fn resolve_range(&self) -> Result<Option<(u64, u64)>, IndexerError> {
         info!(
             "Checking for gaps in indexed data for {:?}...",
             self.program_type
@@ -270,20 +276,29 @@ impl BackfillService {
                     "No gap detected for {:?}. Current slot: {}, From slot: {}",
                     self.program_type, current_slot, from_slot
                 );
-                return Ok(());
+                Ok(None)
             }
             Some(gap) => {
                 info!(
                     "Gap detected for {:?}: {} slots (from {} to {}). Starting backfill...",
                     self.program_type, gap, from_slot, current_slot
                 );
+                Ok(Some((from_slot, current_slot)))
             }
         }
+    }
 
+    /// Fill the resolved range `(from_slot, to_slot]` over the instruction channel.
+    pub async fn run_range(
+        &self,
+        from_slot: u64,
+        to_slot: u64,
+        instruction_tx: InstructionSender,
+    ) -> Result<(), IndexerError> {
         fill_slot_range(
             &self.rpc_poller,
             from_slot,
-            current_slot,
+            to_slot,
             self.config.batch_size,
             self.program_type,
             self.escrow_instance_id,
@@ -293,6 +308,15 @@ impl BackfillService {
 
         info!("Backfill complete for {:?}", self.program_type);
         Ok(())
+    }
+
+    /// Run the backfill process
+    /// Returns Ok(()) if no gap or backfill successful, Err if gap too large or backfill failed
+    pub async fn run(&self, instruction_tx: InstructionSender) -> Result<(), IndexerError> {
+        match self.resolve_range().await? {
+            None => Ok(()),
+            Some((from_slot, to_slot)) => self.run_range(from_slot, to_slot, instruction_tx).await,
+        }
     }
 }
 

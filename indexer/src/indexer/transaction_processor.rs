@@ -19,6 +19,7 @@ use crate::{
 };
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -30,11 +31,9 @@ use tracing::{debug, error, info, warn};
 pub struct TransactionProcessor {
     storage: Arc<Storage>,
     checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
-    current_slot: Option<u64>,
-    current_program_type: Option<ProgramType>,
 
-    // Buffer all instructions from current slot for batch processing
-    current_slot_instructions: Vec<InstructionWithMetadata>,
+    // Per-slot instruction buffers, so a foreign SlotComplete finalizes only its own slot's rows.
+    slot_buffers: HashMap<u64, Vec<InstructionWithMetadata>>,
 
     // Optional health state — bumped on each SlotComplete so /health knows the
     // indexer pipeline is making progress. None in tests / standalone uses.
@@ -48,9 +47,7 @@ impl TransactionProcessor {
         Self {
             storage,
             checkpoint_tx,
-            current_slot: None,
-            current_program_type: None,
-            current_slot_instructions: Vec::new(),
+            slot_buffers: HashMap::new(),
             health: None,
             configured_escrow_instance_id: None,
         }
@@ -76,10 +73,10 @@ impl TransactionProcessor {
         while let Some(message) = instruction_rx.recv().await {
             match message {
                 ProcessorMessage::Instruction(instruction_meta) => {
-                    // Buffer instruction for current slot
-                    self.current_slot = Some(instruction_meta.slot);
-                    self.current_program_type = Some(instruction_meta.program_type);
-                    self.current_slot_instructions.push(instruction_meta);
+                    self.slot_buffers
+                        .entry(instruction_meta.slot)
+                        .or_default()
+                        .push(instruction_meta);
                 }
                 ProcessorMessage::SlotComplete { slot, program_type } => {
                     let start = std::time::Instant::now();
@@ -105,7 +102,8 @@ impl TransactionProcessor {
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
         let mut transactions = Vec::new();
 
-        for instruction_meta in &self.current_slot_instructions {
+        let slot_instructions = self.slot_buffers.remove(&slot).unwrap_or_default();
+        for instruction_meta in &slot_instructions {
             let (mint_opt, transaction_opt) = convert_to_db_models(
                 instruction_meta,
                 self.configured_escrow_instance_id.as_ref(),
@@ -262,10 +260,11 @@ impl TransactionProcessor {
                 }
             }
         }
+    }
 
-        self.current_slot_instructions.clear();
-        self.current_slot = None;
-        self.current_program_type = None;
+    #[cfg(test)]
+    fn buffer(&mut self, ix: InstructionWithMetadata) {
+        self.slot_buffers.entry(ix.slot).or_default().push(ix);
     }
 }
 
@@ -364,6 +363,7 @@ fn convert_to_db_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexer::checkpoint::CheckpointWriter;
     use crate::indexer::datasource::common::parser::{
         AllowMintAccounts, AllowMintData, AllowMintEvent, DepositAccounts, DepositData,
         DepositEvent, ResetSmtRootAccounts, WithdrawFundsAccounts, WithdrawFundsData,
@@ -690,15 +690,13 @@ mod tests {
         let cp = checkpoint_rx.recv().await.unwrap();
         assert_eq!(cp.slot, 42);
         assert_eq!(cp.program_type, ProgramType::Escrow);
-        assert!(processor.current_slot_instructions.is_empty());
+        assert!(processor.slot_buffers.is_empty());
     }
 
     #[tokio::test]
     async fn finalize_with_deposits_inserts_batch() {
         let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
-        processor
-            .current_slot_instructions
-            .push(make_deposit_instruction(100, Some("s1".to_string()), None));
+        processor.buffer(make_deposit_instruction(100, Some("s1".to_string()), None));
         processor
             .finalize_and_checkpoint(100, ProgramType::Escrow)
             .await;
@@ -717,9 +715,7 @@ mod tests {
     async fn finalize_with_mints_upserts_first() {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
-        processor
-            .current_slot_instructions
-            .push(make_allow_mint_instruction(200, Some("s2".to_string())));
+        processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string())));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
             .await;
@@ -738,12 +734,10 @@ mod tests {
     async fn finalize_writes_mint_status_history_on_allow_mint() {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
-        processor
-            .current_slot_instructions
-            .push(make_allow_mint_instruction(
-                200,
-                Some("sig-allow-1".to_string()),
-            ));
+        processor.buffer(make_allow_mint_instruction(
+            200,
+            Some("sig-allow-1".to_string()),
+        ));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
             .await;
@@ -766,12 +760,10 @@ mod tests {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("insert_mint_statuses_batch", true);
-        processor
-            .current_slot_instructions
-            .push(make_allow_mint_instruction(
-                201,
-                Some("sig-allow-2".to_string()),
-            ));
+        processor.buffer(make_allow_mint_instruction(
+            201,
+            Some("sig-allow-2".to_string()),
+        ));
         processor
             .finalize_and_checkpoint(201, ProgramType::Escrow)
             .await;
@@ -789,20 +781,16 @@ mod tests {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("insert_mint_statuses_batch", true);
-        processor
-            .current_slot_instructions
-            .push(make_allow_mint_instruction(
-                202,
-                Some("sig-allow-3".to_string()),
-            ));
-        processor
-            .current_slot_instructions
-            .push(make_deposit_instruction_on_instance(
-                202,
-                Some("sig-deposit-3".to_string()),
-                None,
-                allow_mint_instance(),
-            ));
+        processor.buffer(make_allow_mint_instruction(
+            202,
+            Some("sig-allow-3".to_string()),
+        ));
+        processor.buffer(make_deposit_instruction_on_instance(
+            202,
+            Some("sig-deposit-3".to_string()),
+            None,
+            allow_mint_instance(),
+        ));
         processor
             .finalize_and_checkpoint(202, ProgramType::Escrow)
             .await;
@@ -821,9 +809,7 @@ mod tests {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("upsert_mints_batch", true);
-        processor
-            .current_slot_instructions
-            .push(make_allow_mint_instruction(300, Some("s3".to_string())));
+        processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string())));
         processor
             .finalize_and_checkpoint(300, ProgramType::Escrow)
             .await;
@@ -836,9 +822,7 @@ mod tests {
     async fn finalize_insert_batch_failure_skips_checkpoint() {
         let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
         mock.set_should_fail("insert_db_transactions_batch", true);
-        processor
-            .current_slot_instructions
-            .push(make_deposit_instruction(400, Some("s4".to_string()), None));
+        processor.buffer(make_deposit_instruction(400, Some("s4".to_string()), None));
         processor
             .finalize_and_checkpoint(400, ProgramType::Escrow)
             .await;
@@ -873,6 +857,115 @@ mod tests {
         assert_eq!(cp.slot, 500);
     }
 
+    /// Finalizing slot A inserts only A's rows and leaves B buffered until B's own SlotComplete.
+    #[tokio::test]
+    async fn interleaved_slots_finalize_independently() {
+        const SLOT_A: u64 = 600;
+        const SLOT_B: u64 = 601;
+        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            SLOT_A,
+            Some("a".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            SLOT_B,
+            Some("b".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: SLOT_A,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: SLOT_B,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        processor.start(rx).await.unwrap();
+
+        let batches = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(batches.len(), 2, "each slot finalizes its own batch");
+        assert_eq!(batches[0][0].signature, "a");
+        assert_eq!(batches[0][0].slot, SLOT_A as i64);
+        assert_eq!(batches[1][0].signature, "b");
+        assert_eq!(batches[1][0].slot, SLOT_B as i64);
+        drop(batches);
+
+        let first = checkpoint_rx.recv().await.unwrap();
+        let second = checkpoint_rx.recv().await.unwrap();
+        assert_eq!(first.slot, SLOT_A);
+        assert_eq!(second.slot, SLOT_B);
+    }
+
+    /// A foreign SlotComplete between a same-slot AllowMint and Deposit must not split the
+    /// finalize: the later mint-status failure still withholds the deposit and the checkpoint.
+    #[tokio::test]
+    async fn same_slot_atomicity_survives_foreign_slotcomplete() {
+        const SLOT_S: u64 = 700;
+        const LIVE_TIP: u64 = 9_000_000;
+        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock(allow_mint_instance());
+        mock.set_should_fail("insert_mint_statuses_batch", true);
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        tx.send(ProcessorMessage::Instruction(make_allow_mint_instruction(
+            SLOT_S,
+            Some("allow".to_string()),
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: LIVE_TIP,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::Instruction(
+            make_deposit_instruction_on_instance(
+                SLOT_S,
+                Some("deposit".to_string()),
+                None,
+                allow_mint_instance(),
+            ),
+        ))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: SLOT_S,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        processor.start(rx).await.unwrap();
+
+        let mut checkpointed = Vec::new();
+        while let Ok(cp) = checkpoint_rx.try_recv() {
+            checkpointed.push(cp.slot);
+        }
+        assert_eq!(
+            checkpointed,
+            vec![LIVE_TIP],
+            "only the empty live tip checkpoints; SLOT_S is withheld"
+        );
+        assert!(
+            mock.inserted_transactions.lock().unwrap().is_empty(),
+            "deposit must be withheld when its same-slot mint-status write failed"
+        );
+    }
+
     #[tokio::test]
     async fn start_channel_close_exits_ok() {
         let (processor, _checkpoint_rx) = make_processor_and_rx(deposit_instance());
@@ -881,5 +974,138 @@ mod tests {
 
         let result = processor.start(rx).await;
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Channel-level integration: processor + checkpoint writer over real mpsc
+    // ========================================================================
+
+    /// Wire a real processor + checkpoint writer over real channels on one `MockStorage`, optionally gated, as the indexer does.
+    fn spawn_pipeline(
+        escrow_instance_id: Pubkey,
+        gate: Option<(u64, u64)>,
+    ) -> (
+        mpsc::Sender<ProcessorMessage>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        MockStorage,
+    ) {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (instruction_tx, instruction_rx) = mpsc::channel(64);
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel(64);
+
+        let mut writer = CheckpointWriter::new(storage.clone())
+            .with_batch_interval(1)
+            .with_max_batch_size(1);
+        if let Some((from_slot, target)) = gate {
+            writer = writer.with_gate(from_slot, target);
+        }
+        let checkpoint_handle = writer.start(checkpoint_rx);
+
+        let processor = TransactionProcessor::new(storage, checkpoint_tx)
+            .with_escrow_instance_id(escrow_instance_id);
+        let processor_handle = tokio::spawn(async move {
+            processor.start(instruction_rx).await.unwrap();
+        });
+
+        (instruction_tx, processor_handle, checkpoint_handle, mock)
+    }
+
+    /// A live-tip SlotComplete during backfill must not advance the checkpoint past the unfilled gap (gate `(100, 105]`, fill 101..=105).
+    #[tokio::test]
+    async fn concurrent_backfill_live_interleave_never_skips() {
+        const FROM: u64 = 100;
+        const T0: u64 = 105;
+        const DEPOSIT_SLOT: u64 = 103;
+        const LIVE_TIP: u64 = 1_000_000;
+        let (tx, processor_handle, checkpoint_handle, mock) =
+            spawn_pipeline(deposit_instance(), Some((FROM, T0)));
+
+        // A historical deposit, then the attack: a live-tip SlotComplete arrives
+        // before backfill has filled the gap.
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            DEPOSIT_SLOT,
+            Some("dep-103".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: LIVE_TIP,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+
+        // Backfill now closes the gap contiguously.
+        for slot in (FROM + 1)..=T0 {
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+
+        drop(tx);
+        processor_handle.await.unwrap();
+        checkpoint_handle.await.unwrap();
+
+        // The persisted checkpoint ends at T0 and never reached the live tip.
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed, T0,
+            "checkpoint hands off at T0, never the live tip"
+        );
+        assert!(
+            committed < LIVE_TIP,
+            "checkpoint must never cross the unfilled gap to the live tip"
+        );
+
+        // The historical deposit row exists, and a restart would re-backfill from
+        // a checkpoint at/above DEPOSIT_SLOT — the slot is not skipped.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0][0].slot, DEPOSIT_SLOT as i64);
+        assert!(committed >= DEPOSIT_SLOT);
+    }
+
+    /// A crash mid-backfill persists the contiguous frontier, not the tip, so resume re-backfills with no tail skipped.
+    #[tokio::test]
+    async fn interrupt_mid_backfill_resumes_from_frontier() {
+        const FROM: u64 = 100;
+        const T0: u64 = 110;
+        let (tx, processor_handle, checkpoint_handle, mock) =
+            spawn_pipeline(deposit_instance(), Some((FROM, T0)));
+
+        for slot in [101u64, 102] {
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Simulated crash: drop the channel before the gap is filled.
+        drop(tx);
+        processor_handle.await.unwrap();
+        checkpoint_handle.await.unwrap();
+
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed, 102, "frontier persisted, not T0");
+        assert!(
+            committed < T0,
+            "the unfilled tail (103..=110) is not skipped"
+        );
     }
 }
