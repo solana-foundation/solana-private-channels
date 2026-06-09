@@ -1,6 +1,6 @@
 use crate::rpc::{
     constants::PACKET_DATA_SIZE,
-    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+    error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     WriteDeps,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -13,6 +13,7 @@ use solana_sdk::{
     transaction::{MessageHash, VersionedTransaction},
 };
 use std::collections::HashSet;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 pub async fn send_transaction_impl(
@@ -104,23 +105,32 @@ pub async fn send_transaction_impl(
     // Get the signature before sending to channel
     let signature = sanitized_tx.signature().to_string();
 
-    // Send to dedup channel (which forwards to sigverify after deduplication)
+    // Fail fast on a full ingress queue: shedding frees the RPC connection slot
+    // immediately rather than parking it, so a memory-DoS can't become a
+    // connection-exhaustion DoS. The shed surfaces a distinct retryable code.
     info!("Sending transaction {} to dedup stage", signature);
-    write_deps.dedup_tx.send(sanitized_tx).map_err(|_| {
-        custom_error(
+    match write_deps.dedup_tx.try_send(sanitized_tx) {
+        Ok(()) => {
+            debug!("Transaction {} sent to dedup stage", signature);
+            Ok(signature)
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            write_deps.metrics.rpc_ingress_shed();
+            warn!("Shed transaction {}: ingress queue full", signature);
+            Err(node_at_capacity())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(custom_error(
             JSON_RPC_SERVER_ERROR,
             "Internal error: dedup channel closed",
-        )
-    })?;
-
-    debug!("Transaction {} sent to dedup stage", signature);
-    Ok(signature)
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::WriteDeps;
+    use crate::rpc::{error::NODE_AT_CAPACITY_CODE, WriteDeps};
+    use crate::stage_metrics::{NoopMetrics, PrometheusMetrics, SharedMetrics};
     use solana_sdk::{
         hash::Hash,
         instruction::Instruction,
@@ -128,7 +138,9 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::{SanitizedTransaction, Transaction},
     };
-    use tokio::sync::mpsc;
+    use std::sync::Arc;
+
+    const TEST_INGRESS_CAP: usize = 4;
 
     fn encode_tx(tx: &Transaction) -> String {
         let bytes = bincode::serialize(tx).unwrap();
@@ -136,9 +148,106 @@ mod tests {
     }
 
     /// Returns WriteDeps and the receiver (must be held alive for happy-path tests).
-    fn make_write_deps() -> (WriteDeps, mpsc::UnboundedReceiver<SanitizedTransaction>) {
-        let (dedup_tx, rx) = mpsc::unbounded_channel();
-        (WriteDeps { dedup_tx }, rx)
+    fn make_write_deps() -> (WriteDeps, mpsc::Receiver<SanitizedTransaction>) {
+        make_write_deps_with(Arc::new(NoopMetrics))
+    }
+
+    fn make_write_deps_with(
+        metrics: SharedMetrics,
+    ) -> (WriteDeps, mpsc::Receiver<SanitizedTransaction>) {
+        let (dedup_tx, rx) = mpsc::channel(TEST_INGRESS_CAP);
+        (WriteDeps { dedup_tx, metrics }, rx)
+    }
+
+    fn spl_tx() -> Transaction {
+        let payer = Keypair::new();
+        let from_ata = Pubkey::new_unique();
+        let to_ata = Pubkey::new_unique();
+        let ix = spl_token::instruction::transfer(
+            &spl_token::id(),
+            &from_ata,
+            &to_ata,
+            &payer.pubkey(),
+            &[],
+            1_000,
+        )
+        .unwrap();
+        Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], Hash::default())
+    }
+
+    #[tokio::test]
+    async fn ingress_sheds_when_full() {
+        let (deps, rx) = make_write_deps();
+        // Fill to capacity without draining.
+        for _ in 0..TEST_INGRESS_CAP {
+            send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+                .await
+                .expect("accept until full");
+        }
+
+        let err = send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+            .await
+            .expect_err("a full ingress queue must shed");
+        assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
+        assert_eq!(
+            rx.max_capacity(),
+            TEST_INGRESS_CAP,
+            "receiver must never exceed the bounded capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_shed_increments_metric() {
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let (deps, _rx) = make_write_deps_with(Arc::clone(&metrics));
+        for _ in 0..TEST_INGRESS_CAP {
+            send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+                .await
+                .unwrap();
+        }
+
+        let before = shed_counter_value();
+        let _ = send_transaction_impl(&deps, encode_tx(&spl_tx()), None).await;
+        assert_eq!(
+            shed_counter_value(),
+            before + 1.0,
+            "shed path must increment rpc_ingress_shed_total"
+        );
+    }
+
+    // A shed happens at ingress, before the dedup cache insert, so the identical
+    // tx can be resubmitted once capacity frees and is accepted (not rejected as
+    // a duplicate). Proves the shed-before-dedup client-retry contract.
+    #[tokio::test]
+    async fn shed_tx_can_be_resubmitted() {
+        let (deps, mut rx) = make_write_deps();
+        for _ in 0..TEST_INGRESS_CAP {
+            send_transaction_impl(&deps, encode_tx(&spl_tx()), None)
+                .await
+                .unwrap();
+        }
+
+        let tx = spl_tx();
+        let encoded = encode_tx(&tx);
+        let shed = send_transaction_impl(&deps, encoded.clone(), None).await;
+        assert_eq!(shed.unwrap_err().code(), NODE_AT_CAPACITY_CODE);
+
+        // Free capacity, then resubmit the identical tx — must be accepted.
+        rx.recv().await.expect("drain one to free capacity");
+        let resubmit = send_transaction_impl(&deps, encoded, None).await;
+        assert!(
+            resubmit.is_ok(),
+            "a shed tx must be resubmittable: {resubmit:?}"
+        );
+    }
+
+    fn shed_counter_value() -> f64 {
+        private_channel_metrics::prometheus::gather()
+            .into_iter()
+            .filter(|mf| mf.name() == "private_channel_rpc_ingress_shed_total")
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .map(|m| m.get_counter().value())
+            .sum()
     }
 
     #[tokio::test]

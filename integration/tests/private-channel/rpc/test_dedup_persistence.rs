@@ -47,6 +47,11 @@ pub async fn run_dedup_persistence_test(db_url: String) {
         max_tx_per_batch: 10,
         batch_deadline_ms: 5,
         batch_channel_capacity: 16,
+        ingress_queue_capacity: private_channel_core::nodes::node::DEFAULT_INGRESS_QUEUE_CAPACITY,
+        sequencer_queue_capacity:
+            private_channel_core::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY,
+        execution_results_capacity:
+            private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url: db_url,
         admin_keys: vec![operator.pubkey()],

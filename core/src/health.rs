@@ -196,6 +196,43 @@ mod tests {
         assert_eq!(r.first_unhealthy(), None);
     }
 
+    // Backpressure-with-progress must read healthy: every stage keeps recording
+    // input and progress in lockstep at the pipeline's drain rate, so none looks
+    // wedged. Guards against a false /health 503 (and a needless restart) when the
+    // pipeline is merely backpressured rather than stalled.
+    #[test]
+    fn health_ok_under_sustained_backpressure() {
+        let mut r = HeartbeatRegistry::new();
+        r.dedup = Some(StageHeartbeat::new());
+        r.sigverify = Some(StageHeartbeat::new());
+        r.sequencer = Some(StageHeartbeat::new());
+        r.executor = Some(StageHeartbeat::new());
+        r.settler = Some(StageHeartbeat::new());
+
+        // Simulate several drain cycles: each stage records input then progress,
+        // mirroring a backpressured-but-advancing pipeline.
+        for _ in 0..5 {
+            for hb in [
+                &r.dedup,
+                &r.sigverify,
+                &r.sequencer,
+                &r.executor,
+                &r.settler,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                hb.record_input();
+                hb.record_progress();
+            }
+            assert_eq!(
+                r.first_unhealthy(),
+                None,
+                "backpressure with progress must never report a stage unhealthy"
+            );
+        }
+    }
+
     #[test]
     fn registry_attributes_to_correct_stage() {
         // Only the executor is unhealthy — the registry must name "executor".

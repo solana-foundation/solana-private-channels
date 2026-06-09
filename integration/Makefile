@@ -31,6 +31,8 @@ integration-test:
 	@cargo test --test test_sequencer_zero_deadline -- --nocapture
 	@cargo test --test test_signatures_corruption_guard -- --nocapture
 	@cargo test --test test_node_config_validation -- --nocapture
+	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
+	@cargo test --test ingress_backpressure -- --nocapture
 	@cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== Building escrow with test-tree for test-tree-feature group ==="
 	@$(MAKE) -C ../private-channel-escrow-program build-test
@@ -184,6 +186,8 @@ integration-coverage-private-channel:
 	@cargo llvm-cov test --no-report --workspace --test test_signatures_corruption_guard -- --nocapture
 	@echo "Running run_node config-validation tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test test_node_config_validation -- --nocapture
+	@# Kept in sync with the integration-test group; runs the backpressure CI guards (RSS test stays #[ignore]).
+	@cargo llvm-cov test --no-report --workspace --test ingress_backpressure -- --nocapture
 
 # Redis-backend warm-cache + read-path coverage.
 # Runs a Postgres+Redis node and a Redis-only node to exercise settle.rs's

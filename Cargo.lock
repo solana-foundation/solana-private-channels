@@ -6570,6 +6570,7 @@ dependencies = [
  "private-channel-core",
  "private-channel-escrow-program-client",
  "private-channel-indexer",
+ "private-channel-metrics",
  "private-channel-withdraw-program-client",
  "redis",
  "serde_json",

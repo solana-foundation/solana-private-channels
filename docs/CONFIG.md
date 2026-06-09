@@ -18,6 +18,9 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--port` | `PRIVATE_CHANNEL_PORT` | `8899` | RPC listen port |
 | `--sigverify-workers` | `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | `4` | Parallel signature verification threads |
 | `--sigverify-queue-size` | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded queue between dedup and sigverify |
+| `--ingress-queue-capacity` | `PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY` | `10000` | Bounded RPC→dedup queue; a full queue sheds (`sendTransaction` returns `-32003`, retryable) and increments `rpc_ingress_shed_total` |
+| `--sequencer-queue-capacity` | `PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY` | `1000` | Bounded sigverify→sequencer queue; a full queue applies upstream backpressure |
+| `--execution-results-capacity` | `PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY` | `1000` | Bounded executor→settler queue; a full queue applies upstream backpressure |
 | `--max-tx-per-batch` | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
 | `--max-connections` | `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
 | `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Settlement interval (ms) |
@@ -140,4 +143,3 @@ private-channel-admin truncate --keep-slots 100000 --dry-run
 | `scripts/update-admin-env.sh` | Update `.env` with admin pubkey |
 | `scripts/reconcile-escrow-balance.sh` | Reconcile on-chain vs DB escrow balances (supports alert webhooks) |
 | `scripts/devnet/devnet-test.sh` | Full E2E test: instance creation through deposit/withdrawal/backfill validation |
-

@@ -104,7 +104,7 @@ pub struct SigverifyArgs {
     pub num_workers: usize,
     pub admin_keys: Vec<Pubkey>,
     pub rx: async_channel::Receiver<SanitizedTransaction>,
-    pub sequencer_tx: mpsc::UnboundedSender<SanitizedTransaction>,
+    pub sequencer_tx: mpsc::Sender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<crate::health::StageHeartbeat>,
@@ -175,16 +175,25 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
                                 match result {
                                     SigverifyResult::Valid(_) => {
                                         metrics.sigverify_forwarded();
-                                        // Send to sequencer (unbounded, no await needed)
-                                        match tx.send(transaction) {
-                                            Ok(_) => {
-                                                debug!("Worker {} sent transaction to sequencer", worker_id);
+                                        // Bounded send applies backpressure; race shutdown so a
+                                        // full sequencer queue never wedges worker exit.
+                                        tokio::select! {
+                                            send_result = tx.send(transaction) => {
+                                                match send_result {
+                                                    Ok(_) => {
+                                                        debug!("Worker {} sent transaction to sequencer", worker_id);
+                                                    }
+                                                    Err(_) => {
+                                                        warn!(
+                                                            "Worker {} failed to send to sequencer - channel closed",
+                                                            worker_id
+                                                        );
+                                                        break;
+                                                    }
+                                                }
                                             }
-                                            Err(_) => {
-                                                warn!(
-                                                    "Worker {} failed to send to sequencer - channel closed",
-                                                    worker_id
-                                                );
+                                            _ = shutdown.cancelled() => {
+                                                debug!("Worker {} shutdown while sending to sequencer", worker_id);
                                                 break;
                                             }
                                         }
@@ -241,6 +250,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY as SEQ_CAP;
     use crate::stage_metrics::NoopMetrics;
     use solana_sdk::{
         hash::Hash,
@@ -408,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn worker_forwards_valid_tx_to_sequencer() {
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
-        let (sequencer_tx, mut sequencer_rx) = mpsc::unbounded_channel();
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(SEQ_CAP);
         let shutdown = CancellationToken::new();
 
         let payer = Keypair::new();
@@ -447,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn worker_drops_invalid_tx() {
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
-        let (sequencer_tx, mut sequencer_rx) = mpsc::unbounded_channel();
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(SEQ_CAP);
         let shutdown = CancellationToken::new();
 
         // empty transaction → InvalidTransaction(Empty)
@@ -513,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn worker_shutdown_signal_stops_worker() {
         let (_sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
-        let (sequencer_tx, _sequencer_rx) = mpsc::unbounded_channel();
+        let (sequencer_tx, _sequencer_rx) = mpsc::channel(SEQ_CAP);
         let shutdown = CancellationToken::new();
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
@@ -639,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn worker_exits_when_input_channel_closed() {
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
-        let (sequencer_tx, _sequencer_rx) = mpsc::unbounded_channel();
+        let (sequencer_tx, _sequencer_rx) = mpsc::channel(SEQ_CAP);
         let shutdown = CancellationToken::new();
 
         let mut handles = start_sigverify_workerpool(SigverifyArgs {
@@ -665,18 +675,20 @@ mod tests {
         );
     }
 
-    // End-to-end drain test: pushes a large burst through the pool and asserts
-    // every tx makes it to the sequencer. This proves no items are dropped or
-    // stuck under sustained load. It does NOT prove per-worker fairness — see
-    // `cloned_receivers_consume_concurrently` for that.
+    // Backpressure conservation: with a bounded sequencer queue and an
+    // initially-paused consumer, pushing more than `cap` valid txs must block
+    // (never drop) and, once drained, every tx must arrive exactly once. Also
+    // asserts the worker never holds more than `cap + workers` in flight on the
+    // sequencer side (queue capacity plus one parked send per worker).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pipeline_drains_under_sustained_pressure() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(256);
-        let (sequencer_tx, mut sequencer_rx) = mpsc::unbounded_channel();
-        let shutdown = CancellationToken::new();
+    async fn sigverify_blocks_not_drops_when_sequencer_full() {
+        let sequencer_cap = SEQ_CAP;
         let num_workers = 4usize;
-        let total_txs = 4_000usize;
+        let total_txs = sequencer_cap * 3;
+
+        let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(256);
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(sequencer_cap);
+        let shutdown = CancellationToken::new();
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers,
@@ -689,6 +701,8 @@ mod tests {
         })
         .await;
 
+        // Producer pushes all txs; backpressure makes it block once the
+        // sequencer queue (and the parked per-worker sends) fill up.
         let producer = tokio::spawn(async move {
             for _ in 0..total_txs {
                 let payer = Keypair::new();
@@ -700,29 +714,79 @@ mod tests {
             }
         });
 
-        let drained = Arc::new(AtomicUsize::new(0));
-        let drained_clone = Arc::clone(&drained);
-        let drainer = tokio::spawn(async move {
-            while sequencer_rx.recv().await.is_some() {
-                drained_clone.fetch_add(1, Ordering::Relaxed);
-                if drained_clone.load(Ordering::Relaxed) >= total_txs {
-                    break;
-                }
+        // Let the pipeline saturate against the paused consumer, then assert the
+        // sequencer side holds no more than cap + workers (each worker can park
+        // at most one send beyond the queue).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            sequencer_rx.len() <= sequencer_cap,
+            "sequencer queue must never exceed its capacity ({} > {})",
+            sequencer_rx.len(),
+            sequencer_cap
+        );
+
+        // Drain everything; conservation: all txs arrive, none dropped.
+        let mut drained = 0usize;
+        while drained < total_txs {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), sequencer_rx.recv())
+                .await
+            {
+                Ok(Some(_)) => drained += 1,
+                _ => break,
             }
-        });
-
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), producer).await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drainer).await;
-
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), producer).await;
         assert_eq!(
-            drained.load(Ordering::Relaxed),
-            total_txs,
-            "all txs should reach the sequencer"
+            drained, total_txs,
+            "every tx must reach the sequencer under backpressure (no drops)"
         );
 
         shutdown.cancel();
         for h in handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+        }
+    }
+
+    // A full sequencer queue with no consumer must not wedge worker shutdown:
+    // the worker's send is raced against the shutdown token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sigverify_worker_exits_on_shutdown_with_full_sequencer() {
+        let sequencer_cap = SEQ_CAP;
+        let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(256);
+        let (sequencer_tx, _sequencer_rx) = mpsc::channel(sequencer_cap);
+        let shutdown = CancellationToken::new();
+
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            sequencer_tx,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // Fill the sequencer queue so the worker's next send blocks. Never drain.
+        for _ in 0..(sequencer_cap + 4) {
+            let payer = Keypair::new();
+            let from_ata = Pubkey::new_unique();
+            let to_ata = Pubkey::new_unique();
+            let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
+            sigverify_tx
+                .send(sanitize(&[ix], &payer, &[&payer]))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        shutdown.cancel();
+        for h in handles {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+            assert!(
+                result.is_ok(),
+                "worker must exit promptly even with a full sequencer queue"
+            );
         }
     }
 
