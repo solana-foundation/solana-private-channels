@@ -493,9 +493,10 @@ pub mod test_hooks {
         admin_pubkey: Pubkey,
         program_type: ProgramType,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-        threshold: Duration,
     ) -> Result<(), OperatorError> {
-        // Fresh, never-cancelled token; tests run to completion.
+        // Fresh, never-cancelled token; tests run to completion. Uses the periodic
+        // worker's STALE_THRESHOLD; the ZERO boot threshold is exercised by calling
+        // recover_once directly.
         let token = CancellationToken::new();
         recover_once(
             storage,
@@ -504,7 +505,7 @@ pub mod test_hooks {
             program_type,
             storage_tx,
             &token,
-            threshold,
+            STALE_THRESHOLD,
         )
         .await
     }
@@ -1058,7 +1059,6 @@ mod tests {
             Pubkey::new_unique(),
             ProgramType::Escrow,
             &storage_tx,
-            STALE_THRESHOLD,
         )
         .await
         .unwrap();
@@ -1107,7 +1107,6 @@ mod tests {
             Pubkey::new_unique(),
             ProgramType::Escrow,
             &storage_tx,
-            STALE_THRESHOLD,
         )
         .await
         .unwrap();
@@ -1277,12 +1276,13 @@ mod tests {
         let client = make_rpc_client(&server.url());
         let (storage_tx, _rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(
+        recover_once(
             &storage,
             &client,
             Pubkey::new_unique(),
             ProgramType::Withdraw,
             &storage_tx,
+            &CancellationToken::new(),
             Duration::ZERO,
         )
         .await
