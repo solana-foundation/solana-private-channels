@@ -58,6 +58,63 @@ pub async fn run(
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
     let (storage_tx, storage_rx) = mpsc::channel::<sender::TransactionStatusUpdate>(100);
 
+    let program_type = common_config.program_type;
+    let instance_pda = common_config.escrow_instance_id;
+
+    // Started first so the boot pre-flight's reconcile can drain its quarantine sends.
+    let writer_storage = storage.clone();
+    let storage_writer = DbTransactionWriter::new(
+        writer_storage,
+        storage_rx,
+        config.alert_webhook_url.clone(),
+        common_config.program_type,
+    );
+    let storage_writer_handle = tokio::spawn(async move {
+        if let Err(e) = storage_writer.start().await {
+            tracing::error!("Storage writer error: {}", e);
+        }
+    });
+
+    // Boot pre-flight for withdraw operators: reconcile in-flight releases, then
+    // validate the local SMT against the on-chain root BEFORE any row is fetched,
+    // locked, or processed. A residual mismatch the reconcile cannot resolve is a
+    // fail-closed refuse-to-start; it should never fire once the write-ahead
+    // signatures and this reconcile have run, and guards an unforeseen divergence.
+    if program_type == crate::config::ProgramType::Withdraw {
+        if let Some(preflight_instance) = instance_pda {
+            let admin_pubkey = SignerUtil::get_admin_pubkey();
+            // The main rpc_client is the chain where the instance and releases live.
+            let preflight = run_withdraw_preflight(
+                &storage,
+                &rpc_client,
+                admin_pubkey,
+                preflight_instance,
+                &storage_tx,
+                &cancellation_token,
+            )
+            .await;
+
+            if let Err(e) = preflight {
+                error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
+                // Drop the sole storage_tx so the writer's recv() returns None and
+                // the task exits, then await it so the reconcile's queued
+                // ManualReview alerts are flushed before we return. The writer
+                // watches only its channel, not the cancellation token, so without
+                // this drop the await would block forever. No storage_tx clones
+                // exist yet: the processor/sender/recovery senders are created
+                // after this block.
+                cancellation_token.cancel();
+                drop(storage_tx);
+                if let Err(join_err) = storage_writer_handle.await {
+                    error!("Storage writer join error during refuse-to-start: {}", join_err);
+                }
+                return Err(e);
+            }
+        } else {
+            warn!("Withdraw operator has no escrow_instance_id; skipping boot pre-flight");
+        }
+    }
+
     // Start fetcher task
     let fetcher_storage = storage.clone();
     let fetcher_config = config.clone();
@@ -83,8 +140,6 @@ pub async fn run(
     // storage_tx is cloned into the processor so per-transaction quarantine
     // updates (ManualReview) flow through the same DbTransactionWriter path
     // the sender uses for status updates.
-    let program_type = common_config.program_type;
-    let instance_pda = common_config.escrow_instance_id;
     let processor_storage = storage.clone();
     let processor_rpc = rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
@@ -101,20 +156,6 @@ pub async fn run(
             processor_source_rpc,
         )
         .await;
-    });
-
-    // Start storage writer task (receives updates from sender + processor)
-    let writer_storage = storage.clone();
-    let storage_writer = DbTransactionWriter::new(
-        writer_storage,
-        storage_rx,
-        config.alert_webhook_url.clone(),
-        common_config.program_type,
-    );
-    let storage_writer_handle = tokio::spawn(async move {
-        if let Err(e) = storage_writer.start().await {
-            tracing::error!("Storage writer error: {}", e);
-        }
     });
 
     // Start sender task
@@ -292,6 +333,33 @@ pub async fn run(
     .map_err(|_| OperatorError::ShutdownChannelSend)?;
 
     info!("Operator shutdown complete");
+    Ok(())
+}
+
+/// Reconcile in-flight releases, then assert the local SMT matches the on-chain root; `Err` refuses to start.
+async fn run_withdraw_preflight(
+    storage: &Arc<Storage>,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    admin_pubkey: solana_sdk::pubkey::Pubkey,
+    instance_pda: solana_sdk::pubkey::Pubkey,
+    storage_tx: &mpsc::Sender<sender::TransactionStatusUpdate>,
+    cancellation_token: &CancellationToken,
+) -> Result<(), OperatorError> {
+    // Idempotent passes absorb rows that flip Processing to terminal across iterations.
+    const MAX_RECONCILE_PASSES: u32 = 8;
+
+    recovery::boot_reconcile_processing(
+        storage,
+        rpc_client,
+        admin_pubkey,
+        crate::config::ProgramType::Withdraw,
+        storage_tx,
+        cancellation_token,
+        MAX_RECONCILE_PASSES,
+    )
+    .await?;
+
+    sender::validate_smt_root(storage, rpc_client, Some(instance_pda)).await?;
     Ok(())
 }
 
