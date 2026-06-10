@@ -354,54 +354,52 @@ pub(super) async fn send_and_confirm(
             }
         };
 
-    // Persist the signature write-ahead, fail-closed. A withdrawal nonce is
-    // consumed on broadcast, so every consumed nonce must already have a durable
-    // signature record. On persist failure we abort before broadcasting (the
-    // nonce stays unconsumed) and leave the row Processing for the recovery worker.
-    if let Some(nonce) = ctx.withdrawal_nonce {
-        // The durable write needs a transaction_id; the in-memory stash does not.
-        if let Some(txid) = ctx.transaction_id {
-            if let Err(e) = state
-                .storage
-                .insert_release_signature(
-                    txid,
-                    signature.to_string(),
-                    last_valid_block_height as i64,
-                )
-                .await
-            {
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "pre_send_persist_error"])
-                    .inc();
-                let abort = TransactionError::PreSendPersistFailed {
-                    reason: e.to_string(),
-                };
-                error!(
-                    transaction_id = txid,
-                    signature = %signature,
-                    "Aborting release before broadcast, leaving row Processing for recovery: {}",
-                    abort
-                );
-                return;
-            }
+    // Persist the release signature write-ahead (DB only), fail-closed. A withdrawal
+    // nonce is consumed on broadcast, so a release that lands must already have a
+    // durable signature record for crash recovery to reconcile against. On persist
+    // failure we abort before broadcasting (the nonce stays unconsumed) and leave the
+    // row Processing for the recovery worker.
+    if let (Some(_nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
+        if let Err(e) = state
+            .storage
+            .insert_release_signature(txid, signature.to_string(), last_valid_block_height as i64)
+            .await
+        {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "pre_send_persist_error"])
+                .inc();
+            let abort = TransactionError::PreSendPersistFailed {
+                reason: e.to_string(),
+            };
+            error!(
+                transaction_id = txid,
+                signature = %signature,
+                "Aborting release before broadcast, leaving row Processing for recovery: {}",
+                abort
+            );
+            return;
         }
-
-        // Stash keyed by nonce (the in-process remint key), after any durable write
-        // so a persist failure rolls back nothing.
-        state
-            .pending_signatures
-            .entry(nonce)
-            .or_default()
-            .push(PendingSig {
-                signature,
-                last_valid_block_height,
-            });
     }
 
     match send_signed(&state.rpc_client, &transaction, retry_policy).await {
         // send_signed returns the same signature we already persisted; keep using it.
         Ok(_) => {
             info!("Transaction sent with signature: {}", signature);
+
+            // Stash the in-flight signature only after a successful broadcast. A send
+            // that never reached the network (e.g. a failed simulation) thus leaves no
+            // stashed signature, so a permanent failure routes to ManualReview rather
+            // than a deferred remint, preserving the pre-existing failure semantics.
+            if let Some(nonce) = ctx.withdrawal_nonce {
+                state
+                    .pending_signatures
+                    .entry(nonce)
+                    .or_default()
+                    .push(PendingSig {
+                        signature,
+                        last_valid_block_height,
+                    });
+            }
 
             let commitment_config = CommitmentConfig::confirmed();
 
@@ -1877,9 +1875,12 @@ mod tests {
         );
     }
 
-    /// With the signature stashed write-ahead, a send failure routes to the finality-checked PendingRemint path, not zero-sig ManualReview.
+    /// The in-memory stash happens only after a successful broadcast, so a send that
+    /// never reached the network leaves no signature to verify and routes to
+    /// ManualReview, not a deferred remint. The write-ahead DB persist (for crash
+    /// recovery) does not change this.
     #[tokio::test]
-    async fn send_failure_after_persist_routes_to_pending_remint() {
+    async fn send_failure_routes_to_manual_review() {
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         let _send = server
@@ -1915,16 +1916,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            state.pending_remints.len(),
-            1,
-            "send failure with a stashed signature must defer to PendingRemint"
-        );
-        assert_eq!(state.pending_remints[0].ctx.transaction_id, Some(10));
         assert!(
-            storage_rx.try_recv().is_err(),
-            "no immediate ManualReview; remint is deferred for finality check"
+            state.pending_remints.is_empty(),
+            "a never-broadcast send must not defer a remint"
         );
+        let update = storage_rx
+            .try_recv()
+            .expect("send failure must surface a status update");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
     }
 
     // ── set_pending_remint persistence ───────────────────────────────
