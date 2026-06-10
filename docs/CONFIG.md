@@ -33,7 +33,9 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--metrics` | `PRIVATE_CHANNEL_METRICS` | `false` | Enable Prometheus stage metrics server |
 | — | `PRIVATE_CHANNEL_METRICS_PORT` | `9090` | Port for the stage metrics server |
 
-**Startup validation:** The node rejects `blocktime_ms == 0` and `transaction_expiration_ms < blocktime_ms` to prevent misconfiguration.
+**Startup validation:** The node rejects `blocktime_ms == 0`, `transaction_expiration_ms < blocktime_ms`, and any write-pipeline queue capacity of `0` (which would panic the channel constructors) to prevent misconfiguration.
+
+**Tuning the queue capacities:** these aren't machine-spec values. Each slot holds one transaction (a few KB), so even the `10000` ingress queue is only ~tens of MB — RAM is never the limit. Size them by traffic, not hardware: a larger ingress queue absorbs bigger bursts but adds latency when backed up. Tune by watching `rpc_ingress_shed_total` — raise `--ingress-queue-capacity` if real bursts are being shed, lower it if latency under load is too high.
 
 ### Read Node (`private-channel-node --mode read`)
 
