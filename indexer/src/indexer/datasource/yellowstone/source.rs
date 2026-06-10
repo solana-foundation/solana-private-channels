@@ -645,17 +645,22 @@ mod tests {
         data
     }
 
-    /// One transaction carrying `count` identical WithdrawFunds instructions, all
-    /// targeting the withdraw program, used to assert per-instruction indexing.
-    fn withdraw_tx_update(
+    /// Account-key slot holding the watched program; any other program_id_index
+    /// points at a foreign program that the handler must filter out.
+    const WITHDRAW_PROGRAM_KEY_INDEX: u32 = 5;
+
+    /// One transaction whose instructions target the given `program_indices`
+    /// (`WITHDRAW_PROGRAM_KEY_INDEX` is the watched program, anything else is a
+    /// foreign program that gets filtered out). Used to assert absolute
+    /// per-instruction indexing, including across filtered-out instructions.
+    fn withdraw_tx_update_with_program_indices(
         signature: Vec<u8>,
         program_id: &Pubkey,
-        count: usize,
+        program_indices: &[u32],
     ) -> yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
         use yellowstone_grpc_proto::prelude as proto;
 
-        let program_index = 5u32;
-        let mut account_keys: Vec<Vec<u8>> = (0..program_index)
+        let mut account_keys: Vec<Vec<u8>> = (0..WITHDRAW_PROGRAM_KEY_INDEX)
             .map(|i| {
                 let mut b = [0u8; 32];
                 b[0] = i as u8 + 1;
@@ -664,9 +669,10 @@ mod tests {
             .collect();
         account_keys.push(program_id.to_bytes().to_vec());
 
-        let instructions = (0..count)
-            .map(|_| proto::CompiledInstruction {
-                program_id_index: program_index,
+        let instructions = program_indices
+            .iter()
+            .map(|&pidx| proto::CompiledInstruction {
+                program_id_index: pidx,
                 accounts: vec![0, 1, 2, 3, 4],
                 data: withdraw_funds_proto_data(),
             })
@@ -700,6 +706,17 @@ mod tests {
         }
     }
 
+    /// One transaction carrying `count` WithdrawFunds instructions, all targeting
+    /// the withdraw program.
+    fn withdraw_tx_update(
+        signature: Vec<u8>,
+        program_id: &Pubkey,
+        count: usize,
+    ) -> yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
+        let program_indices = vec![WITHDRAW_PROGRAM_KEY_INDEX; count];
+        withdraw_tx_update_with_program_indices(signature, program_id, &program_indices)
+    }
+
     fn signature_placeholder() -> Vec<u8> {
         vec![7u8; 64]
     }
@@ -729,6 +746,37 @@ mod tests {
         assert_eq!(metas[1].signature.as_deref(), Some(expected_sig.as_str()));
         assert_eq!(metas[0].instruction_index, 0);
         assert_eq!(metas[1].instruction_index, 1);
+    }
+
+    #[tokio::test]
+    async fn handle_transaction_keeps_absolute_index_across_filtered_instruction() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let signature = vec![4u8; 64];
+
+        // Position 1 targets a foreign program (account index 0) and is filtered out;
+        // the surviving withdraw instructions must keep absolute positions 0 and 2,
+        // not the relative 0 and 1.
+        let tx_update = withdraw_tx_update_with_program_indices(
+            signature.clone(),
+            &program_id,
+            &[WITHDRAW_PROGRAM_KEY_INDEX, 0, WITHDRAW_PROGRAM_KEY_INDEX],
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(meta)) = rx.recv().await {
+            metas.push(meta);
+        }
+
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].instruction_index, 0);
+        assert_eq!(metas[1].instruction_index, 2);
     }
 
     #[tokio::test]
