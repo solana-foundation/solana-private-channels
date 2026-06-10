@@ -636,6 +636,101 @@ mod tests {
         );
     }
 
+    /// Borsh-encoded WithdrawFunds payload (discriminator 0, amount, None destination)
+    /// that `parse_withdraw_instruction` accepts.
+    fn withdraw_funds_proto_data() -> Vec<u8> {
+        let mut data = vec![0u8]; // WITHDRAW_FUNDS discriminator
+        data.extend_from_slice(&1000u64.to_le_bytes());
+        data.push(0); // None destination
+        data
+    }
+
+    /// One transaction carrying `count` identical WithdrawFunds instructions, all
+    /// targeting the withdraw program, used to assert per-instruction indexing.
+    fn withdraw_tx_update(
+        signature: Vec<u8>,
+        program_id: &Pubkey,
+        count: usize,
+    ) -> yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let program_index = 5u32;
+        let mut account_keys: Vec<Vec<u8>> = (0..program_index)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i as u8 + 1;
+                b.to_vec()
+            })
+            .collect();
+        account_keys.push(program_id.to_bytes().to_vec());
+
+        let instructions = (0..count)
+            .map(|_| proto::CompiledInstruction {
+                program_id_index: program_index,
+                accounts: vec![0, 1, 2, 3, 4],
+                data: withdraw_funds_proto_data(),
+            })
+            .collect();
+
+        let message = proto::Message {
+            header: Some(proto::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            }),
+            account_keys,
+            recent_blockhash: vec![0u8; 32],
+            instructions,
+            versioned: false,
+            address_table_lookups: vec![],
+        };
+
+        yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
+            slot: 42,
+            transaction: Some(proto::SubscribeUpdateTransactionInfo {
+                signature,
+                is_vote: false,
+                transaction: Some(proto::Transaction {
+                    signatures: vec![signature_placeholder()],
+                    message: Some(message),
+                }),
+                meta: None,
+                index: 0,
+            }),
+        }
+    }
+
+    fn signature_placeholder() -> Vec<u8> {
+        vec![7u8; 64]
+    }
+
+    #[tokio::test]
+    async fn handle_transaction_emits_absolute_instruction_index_per_instruction() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let signature = vec![3u8; 64];
+
+        let tx_update = withdraw_tx_update(signature.clone(), &program_id, 2);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(meta)) = rx.recv().await {
+            metas.push(meta);
+        }
+
+        assert_eq!(metas.len(), 2);
+        let expected_sig = bs58::encode(&signature).into_string();
+        assert_eq!(metas[0].signature.as_deref(), Some(expected_sig.as_str()));
+        assert_eq!(metas[1].signature.as_deref(), Some(expected_sig.as_str()));
+        assert_eq!(metas[0].instruction_index, 0);
+        assert_eq!(metas[1].instruction_index, 1);
+    }
+
     #[tokio::test]
     async fn try_fill_reconnect_gap_rpc_failure() {
         let mut server = Server::new_async().await;
@@ -734,7 +829,7 @@ async fn handle_transaction(
     );
 
     // Parse each instruction that belongs to our program
-    for instruction in instructions {
+    for (ix_index, instruction) in instructions.into_iter().enumerate() {
         let program_id_index = instruction.program_id_index as usize;
         if program_id_index >= account_keys.len() {
             error!(
@@ -806,6 +901,9 @@ async fn handle_transaction(
                 slot,
                 program_type,
                 signature: Some(signature.clone()),
+                // A Solana tx is packet-size-bounded to a few hundred instructions,
+                // far below u32/i32 max, so this cast cannot wrap.
+                instruction_index: ix_index as u32,
             };
 
             let res = send_guaranteed(
