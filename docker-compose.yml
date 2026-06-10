@@ -62,7 +62,7 @@ services:
       - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
       - POSTGRES_HOST_AUTH_METHOD=scram-sha-256
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-primary-data:/var/lib/postgresql/data
       - postgres-primary-wal-archive:/wal_archive
@@ -157,7 +157,7 @@ services:
       - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
       - PGUSER=${POSTGRES_USER}
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres-replica-data:/var/lib/postgresql/data
     user: postgres
@@ -389,7 +389,7 @@ services:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres-indexer-data:/var/lib/postgresql/data
       - postgres-indexer-wal-archive:/wal_archive

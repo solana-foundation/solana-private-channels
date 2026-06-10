@@ -20,7 +20,8 @@ type = "postgres"
 max_connections = 10
 
 # Database URL must be set via environment variable: DATABASE_URL
-# Example: export DATABASE_URL="postgresql://user:pass@localhost:5432/indexer"
+# The indexer DB is loopback/internal-only and listens on port 5434.
+# Example: export DATABASE_URL="postgresql://user:pass@localhost:5434/indexer"
 
 [operator]
 # Database polling interval in seconds

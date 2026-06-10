@@ -117,7 +117,13 @@ Back in the Admin UI:
 
 Update `.env.devnet` file in the project root. Replace the following environment variables:
 
+> **Required secrets — no defaults are shipped.** `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, and `ADMIN_PRIVATE_KEY` (and `JWT_SECRET` if you enable auth) MUST be set or the services fail to start. Generate strong passwords with `openssl rand -hex 32`.
+
 ```shell
+# Required: database credentials (services fail closed if blank)
+POSTGRES_PASSWORD=<openssl rand -hex 32>
+POSTGRES_REPLICATION_PASSWORD=<openssl rand -hex 32>
+
 # Escrow instance (from Step 3)
 ESCROW_INSTANCE_ID=<your_instance_address>
 
@@ -184,9 +190,9 @@ For reference, here are the ports and endpoints that are now running:
 | Gateway | `8899` | Main RPC endpoint (routes to read/write nodes) |
 | Write Node | `8900` | Handles transaction submissions |
 | Read Node | `8901` | Handles read requests (getAccountInfo, etc.) |
-| PostgreSQL Primary | `5432` | Solana Private Channels state database (write) |
-| PostgreSQL Replica | `5433` | Solana Private Channels state database (read) |
-| PostgreSQL Indexer | `5434` | Indexer/operator database |
+| PostgreSQL Primary | `5432` | State database (write) — bound to `127.0.0.1` (loopback-only), not externally reachable |
+| PostgreSQL Replica | `5433` | State database (read) — bound to `127.0.0.1` (loopback-only), not externally reachable |
+| PostgreSQL Indexer | `5434` | Indexer/operator database — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | Admin UI | `5173` | Web interface for instance management |
 | Grafana | `37429` | Metrics dashboard (default password: `admin`) |
 | Prometheus | `9090` | Metrics collection |
