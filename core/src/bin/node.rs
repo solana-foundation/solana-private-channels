@@ -1,7 +1,10 @@
 use {
     clap::Parser,
     private_channel_core::{
-        nodes::node::{run_node, NodeConfig, NodeMode},
+        nodes::node::{
+            run_node, NodeConfig, NodeMode, DEFAULT_EXECUTION_RESULTS_CAPACITY,
+            DEFAULT_INGRESS_QUEUE_CAPACITY, DEFAULT_SEQUENCER_QUEUE_CAPACITY,
+        },
         stage_metrics::{init_prometheus_metrics, NoopMetrics, PrometheusMetrics},
     },
     private_channel_metrics::start_metrics_server,
@@ -57,6 +60,30 @@ struct Args {
         env = "PRIVATE_CHANNEL_BATCH_CHANNEL_CAPACITY"
     )]
     batch_channel_capacity: usize,
+
+    /// RPC→dedup ingress queue capacity; a full queue sheds load at admission.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_INGRESS_QUEUE_CAPACITY,
+        env = "PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY"
+    )]
+    ingress_queue_capacity: usize,
+
+    /// sigverify→sequencer queue capacity; full applies upstream backpressure.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_SEQUENCER_QUEUE_CAPACITY,
+        env = "PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY"
+    )]
+    sequencer_queue_capacity: usize,
+
+    /// executor→settler results queue capacity; full applies upstream backpressure.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_EXECUTION_RESULTS_CAPACITY,
+        env = "PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY"
+    )]
+    execution_results_capacity: usize,
 
     /// Maximum parallel SVM worker threads per batch (including the calling thread).
     /// Set to 1 to disable intra-batch parallelism. Effective only for batches
@@ -161,6 +188,9 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         max_tx_per_batch: args.max_tx_per_batch,
         batch_deadline_ms: args.batch_deadline_ms,
         batch_channel_capacity: args.batch_channel_capacity,
+        ingress_queue_capacity: args.ingress_queue_capacity,
+        sequencer_queue_capacity: args.sequencer_queue_capacity,
+        execution_results_capacity: args.execution_results_capacity,
         max_svm_workers: args.max_svm_workers,
         accountsdb_connection_url: args.accountsdb_connection_url,
         admin_keys,

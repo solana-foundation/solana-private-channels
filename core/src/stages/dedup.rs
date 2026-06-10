@@ -16,7 +16,7 @@ use {
 
 pub struct DedupArgs {
     pub max_blockhashes: usize,
-    pub input_rx: mpsc::UnboundedReceiver<SanitizedTransaction>,
+    pub input_rx: mpsc::Receiver<SanitizedTransaction>,
     pub settled_blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
     pub output_tx: async_channel::Sender<SanitizedTransaction>,
     pub shutdown_token: CancellationToken,
@@ -28,12 +28,14 @@ pub struct DedupArgs {
     pub heartbeat: Arc<StageHeartbeat>,
 }
 
-/// Create the dedup channel pair (unbounded)
-pub fn create_dedup_channel() -> (
-    mpsc::UnboundedSender<SanitizedTransaction>,
-    mpsc::UnboundedReceiver<SanitizedTransaction>,
+/// Create the bounded dedup channel pair; a full queue sheds load at RPC ingress.
+pub fn create_dedup_channel(
+    capacity: usize,
+) -> (
+    mpsc::Sender<SanitizedTransaction>,
+    mpsc::Receiver<SanitizedTransaction>,
 ) {
-    mpsc::unbounded_channel()
+    mpsc::channel(capacity)
 }
 
 /// Load dedup state from the DB to seed the cache on restart.
@@ -373,14 +375,16 @@ mod tests {
         }
     }
 
+    const TEST_INGRESS_CAP: usize = 64;
+
     /// Spin up the dedup stage and return the handles needed for driving it.
     fn start_test_dedup() -> (
-        mpsc::UnboundedSender<SanitizedTransaction>,
+        mpsc::Sender<SanitizedTransaction>,
         mpsc::UnboundedSender<Hash>,
         async_channel::Receiver<SanitizedTransaction>,
         CancellationToken,
     ) {
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(TEST_INGRESS_CAP);
         let (bh_tx, bh_rx) = mpsc::unbounded_channel();
         let (output_tx, output_rx) = async_channel::bounded(64);
         let shutdown = CancellationToken::new();
@@ -416,7 +420,7 @@ mod tests {
         let payer = Keypair::new();
         let unknown_bh = Hash::new_unique();
         let tx = make_tx(&payer, unknown_bh);
-        input_tx.send(tx).unwrap();
+        input_tx.send(tx).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(
@@ -438,11 +442,11 @@ mod tests {
         let payer = Keypair::new();
         let tx = make_tx(&payer, bh);
 
-        input_tx.send(tx.clone()).unwrap();
+        input_tx.send(tx.clone()).await.unwrap();
         let first = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
         assert!(first.is_ok(), "first tx should be forwarded");
 
-        input_tx.send(tx).unwrap();
+        input_tx.send(tx).await.unwrap();
         let second = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(second.is_err(), "duplicate tx should not be forwarded");
 
@@ -461,7 +465,7 @@ mod tests {
         let tx = make_tx(&payer, bh);
         let expected_sig = *tx.signature();
 
-        input_tx.send(tx).unwrap();
+        input_tx.send(tx).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
         match result {
@@ -488,7 +492,7 @@ mod tests {
 
         let payer = Keypair::new();
         let tx = make_tx(&payer, hashes[0]);
-        input_tx.send(tx).unwrap();
+        input_tx.send(tx).await.unwrap();
         let result = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(
             result.is_err(),
@@ -496,7 +500,7 @@ mod tests {
         );
 
         let tx2 = make_tx(&payer, hashes[8]);
-        input_tx.send(tx2).unwrap();
+        input_tx.send(tx2).await.unwrap();
         let result2 = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
         assert!(
             result2.is_ok(),

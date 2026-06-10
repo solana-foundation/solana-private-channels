@@ -8,6 +8,10 @@ name = "private_channel_integration"
 path = "tests/private-channel/integration.rs"
 
 [[test]]
+name = "ingress_backpressure"
+path = "tests/private-channel/test_ingress_backpressure.rs"
+
+[[test]]
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
 
@@ -207,6 +211,7 @@ bs58 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 private-channel-core = { path = "../core" }
+private-channel-metrics = { path = "../metrics" }
 private-channel-escrow-program-client = { path = "../private-channel-escrow-program/clients/rust" }
 private-channel-indexer = { path = "../indexer", features = [
     "datasource-rpc",
