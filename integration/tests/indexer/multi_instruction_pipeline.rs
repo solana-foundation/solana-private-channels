@@ -113,15 +113,18 @@ async fn run_slot(storage: Arc<Storage>, instance: Pubkey, messages: Vec<Process
     let (checkpoint_tx, _checkpoint_rx) = mpsc::channel::<CheckpointUpdate>(16);
     let (instr_tx, instr_rx) = mpsc::channel::<ProcessorMessage>(16);
 
-    let processor = TransactionProcessor::new(storage, checkpoint_tx)
-        .with_escrow_instance_id(instance);
+    let processor =
+        TransactionProcessor::new(storage, checkpoint_tx).with_escrow_instance_id(instance);
     let handle = tokio::spawn(processor.start(instr_rx));
 
     for msg in messages {
         instr_tx.send(msg).await.expect("send to processor");
     }
     drop(instr_tx); // end the recv loop
-    handle.await.expect("processor task join").expect("processor ok");
+    handle
+        .await
+        .expect("processor task join")
+        .expect("processor ok");
 }
 
 /// Two `Deposit` instructions sharing one signature must both persist as
@@ -142,10 +145,20 @@ async fn two_same_signature_deposits_persist_as_distinct_rows() {
         instance,
         vec![
             ProcessorMessage::Instruction(deposit_meta(
-                7, &signature, instance, 0, recipient_a, 990,
+                7,
+                &signature,
+                instance,
+                0,
+                recipient_a,
+                990,
             )),
             ProcessorMessage::Instruction(deposit_meta(
-                7, &signature, instance, 1, recipient_b, 480,
+                7,
+                &signature,
+                instance,
+                1,
+                recipient_b,
+                480,
             )),
             ProcessorMessage::SlotComplete {
                 slot: 7,
@@ -183,7 +196,10 @@ async fn two_same_signature_deposits_persist_as_distinct_rows() {
     // The second (would-be dropped) instruction is the one that must survive
     // intact: its amount and recipient, not instruction 0's, define its row.
     assert_eq!(rows[0].1, 990);
-    assert_eq!(rows[1].1, 480, "instruction 1's economic value is not overwritten by instruction 0");
+    assert_eq!(
+        rows[1].1, 480,
+        "instruction 1's economic value is not overwritten by instruction 0"
+    );
     assert_eq!(rows[0].2, recipient_a.to_string());
     assert_eq!(rows[1].2, recipient_b.to_string());
 }
@@ -205,10 +221,20 @@ async fn replayed_slot_is_idempotent_on_composite_key() {
     let messages = || {
         vec![
             ProcessorMessage::Instruction(deposit_meta(
-                9, &signature, instance, 0, recipient_a, 990,
+                9,
+                &signature,
+                instance,
+                0,
+                recipient_a,
+                990,
             )),
             ProcessorMessage::Instruction(deposit_meta(
-                9, &signature, instance, 1, recipient_b, 480,
+                9,
+                &signature,
+                instance,
+                1,
+                recipient_b,
+                480,
             )),
             ProcessorMessage::SlotComplete {
                 slot: 9,
