@@ -439,7 +439,9 @@ async fn route_outcome(
 /// `Duration::ZERO` threshold (so even a fresh crash row is reconciled) until no
 /// `Processing` rows remain, bounded by `max_passes`. A withdraw operator is
 /// single-active (SMT nonce ordering forbids a second sender), so at boot there
-/// is no live sibling whose not-yet-stale work this could disrupt.
+/// is no live sibling whose not-yet-stale work this could disrupt. Exhausting
+/// `max_passes` with rows still `Processing` returns `Ok`: the caller's
+/// `validate_smt_root` is the terminal gate that refuses to start on a real mismatch.
 pub async fn boot_reconcile_processing(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
@@ -1332,8 +1334,7 @@ mod tests {
         .await
         .unwrap();
 
-        let validated =
-            validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
         assert!(
             validated.is_ok(),
             "validate must pass once the landed nonce is reconciled: {validated:?}"
@@ -1381,8 +1382,7 @@ mod tests {
         .await
         .unwrap();
 
-        let validated =
-            validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
         assert!(
             matches!(
                 validated,

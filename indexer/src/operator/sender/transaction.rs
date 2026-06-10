@@ -358,28 +358,36 @@ pub(super) async fn send_and_confirm(
     // consumed on broadcast, so every consumed nonce must already have a durable
     // signature record. On persist failure we abort before broadcasting (the
     // nonce stays unconsumed) and leave the row Processing for the recovery worker.
-    if let (Some(nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
-        if let Err(e) = state
-            .storage
-            .insert_release_signature(txid, signature.to_string(), last_valid_block_height as i64)
-            .await
-        {
-            metrics::OPERATOR_TRANSACTION_ERRORS
-                .with_label_values(&[pt, "pre_send_persist_error"])
-                .inc();
-            let abort = TransactionError::PreSendPersistFailed {
-                reason: e.to_string(),
-            };
-            error!(
-                transaction_id = txid,
-                signature = %signature,
-                "Aborting release before broadcast, leaving row Processing for recovery: {}",
-                abort
-            );
-            return;
+    if let Some(nonce) = ctx.withdrawal_nonce {
+        // The durable write needs a transaction_id; the in-memory stash does not.
+        if let Some(txid) = ctx.transaction_id {
+            if let Err(e) = state
+                .storage
+                .insert_release_signature(
+                    txid,
+                    signature.to_string(),
+                    last_valid_block_height as i64,
+                )
+                .await
+            {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "pre_send_persist_error"])
+                    .inc();
+                let abort = TransactionError::PreSendPersistFailed {
+                    reason: e.to_string(),
+                };
+                error!(
+                    transaction_id = txid,
+                    signature = %signature,
+                    "Aborting release before broadcast, leaving row Processing for recovery: {}",
+                    abort
+                );
+                return;
+            }
         }
 
-        // Stash in-memory after the durable write so a persist failure rolls back nothing.
+        // Stash keyed by nonce (the in-process remint key), after any durable write
+        // so a persist failure rolls back nothing.
         state
             .pending_signatures
             .entry(nonce)
@@ -391,7 +399,8 @@ pub(super) async fn send_and_confirm(
     }
 
     match send_signed(&state.rpc_client, &transaction, retry_policy).await {
-        Ok(signature) => {
+        // send_signed returns the same signature we already persisted; keep using it.
+        Ok(_) => {
             info!("Transaction sent with signature: {}", signature);
 
             let commitment_config = CommitmentConfig::confirmed();
