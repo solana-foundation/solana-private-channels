@@ -556,13 +556,13 @@ pub(super) fn handle_confirmation_result<'a>(
                 // Rejected because a reset already advanced the tree on-chain. Sync
                 // local SMT to the authoritative index. On fetch failure, leave it
                 // unchanged rather than guess; a restart re-syncs from chain.
+                // smt_state is always Some here: the reset submit path initializes
+                // it before sending, and nothing clears it back to None.
                 match state.fetch_onchain_tree_index().await {
                     Ok(idx) => {
                         if let Some(ref mut smt_state) = state.smt_state {
                             smt_state.smt_state.reset(idx);
                             warn!("ResetSmtRoot rejected - synced local SMT to on-chain tree_index {idx}");
-                        } else {
-                            warn!("ResetSmtRoot rejected - on-chain tree_index is {idx} but smt_state is None, sync skipped");
                         }
                     }
                     Err(e) => error!(

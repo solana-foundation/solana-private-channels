@@ -6,7 +6,7 @@ import { useCluster } from '../hooks/useCluster';
 import { address } from '@solana/addresses';
 import { useWalletAccountTransactionSendingSigner } from '@solana/react';
 import { getBase58Decoder } from '@solana/codecs-strings';
-import { getReleaseFundsInstructionAsync, getResetSmtRootInstructionAsync } from '@private-channel-escrow';
+import { getReleaseFundsInstructionAsync, getResetSmtRootInstructionAsync, fetchInstance } from '@private-channel-escrow';
 import { findAssociatedTokenPda } from '@solana-program/token';
 import {
   pipe,
@@ -157,11 +157,16 @@ function OperatorFunctionsContent({ instancePubkey, account, network }: Operator
       setError('');
       setSuccess(null);
 
+      // Bind the reset to the instance's current tree index so a replay (e.g. an
+      // ambiguously-confirmed retry) is rejected on-chain instead of rotating twice.
+      const instanceAccount = await fetchInstance(rpc, address(instancePubkey));
+
       // Get the reset SMT root instruction
       const instruction = await getResetSmtRootInstructionAsync({
         payer: transactionSigner,
         operator: transactionSigner,
         instance: address(instancePubkey),
+        expectedCurrentTreeIndex: instanceAccount.data.currentTreeIndex,
       });
 
       console.log('Created reset SMT root instruction:', instruction);
