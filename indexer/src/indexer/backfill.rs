@@ -262,11 +262,32 @@ impl BackfillService {
             last_checkpoint
         };
 
-        let current_slot = self
-            .rpc_poller
-            .get_latest_slot()
-            .await
-            .map_err(|e| BackfillError::SlotFetchFailed { slot: 0, source: e })?;
+        // Retry transient RPC failures with backoff (same policy as block fetches), so a
+        // single hiccup gating the checkpoint writer doesn't force an ungated fallback.
+        let mut retry_count = 0;
+        let current_slot = loop {
+            match self.rpc_poller.get_latest_slot().await {
+                Ok(slot) => break slot,
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= BACKFILL_MAX_RETRIES {
+                        error!(
+                            "Failed to fetch latest slot after {} retries: {}",
+                            BACKFILL_MAX_RETRIES, e
+                        );
+                        return Err(BackfillError::SlotFetchFailed { slot: 0, source: e }.into());
+                    }
+                    warn!(
+                        "Retry {}/{} fetching latest slot after error: {}",
+                        retry_count, BACKFILL_MAX_RETRIES, e
+                    );
+                    tokio::time::sleep(Duration::from_millis(
+                        BACKFILL_RETRY_DELAY_MS * retry_count as u64,
+                    ))
+                    .await;
+                }
+            }
+        };
 
         match validate_gap(current_slot, from_slot, self.config.max_gap_slots)
             .map_err(DataSourceError::from)?

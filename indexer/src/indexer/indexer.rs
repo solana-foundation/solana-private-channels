@@ -151,9 +151,8 @@ pub async fn run(
                 }
                 return Ok(());
             } else {
-                // Gate the writer to the exact range backfill will fill; on resolve
-                // failure fall back to an ungated writer (today's behavior) rather
-                // than aborting startup, since the live datasource still runs.
+                // Gate the writer to the range backfill will fill. resolve_range retries
+                // transient RPC failures; a persistent failure fails closed (see below).
                 match backfill_service.resolve_range().await {
                     Ok(Some((from_slot, target))) => {
                         checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
@@ -174,9 +173,11 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!(
-                            "Backfill range resolution failed; running ungated without backfill: {}",
+                            "Backfill range resolution failed after retries; refusing to start \
+                             rather than running ungated past the unfilled gap: {}",
                             e
                         );
+                        return Err(e);
                     }
                 }
             }
