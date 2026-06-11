@@ -22,7 +22,10 @@ use {
         indexer::{
             checkpoint::CheckpointUpdate,
             datasource::common::{
-                parser::{DepositAccounts, DepositData, DepositEvent, EscrowInstruction},
+                parser::{
+                    DepositAccounts, DepositData, DepositEvent, EscrowInstruction,
+                    WithdrawFundsAccounts, WithdrawFundsData, WithdrawInstruction,
+                },
                 types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
             },
             transaction_processor::TransactionProcessor,
@@ -102,6 +105,40 @@ fn deposit_meta(
         })),
         slot,
         program_type: ProgramType::Escrow,
+        signature: Some(signature.to_string()),
+        instruction_index,
+    }
+}
+
+/// Build a `WithdrawFunds` instruction; `amount` and `destination` define the row so two withdrawals can be told apart.
+fn withdraw_meta(
+    slot: u64,
+    signature: &str,
+    instruction_index: u32,
+    destination: Pubkey,
+    amount: u64,
+) -> InstructionWithMetadata {
+    let p = |i: u8| {
+        let mut b = [0u8; 32];
+        b[0] = i;
+        Pubkey::new_from_array(b)
+    };
+    InstructionWithMetadata {
+        instruction: ProgramInstruction::Withdraw(Box::new(WithdrawInstruction::WithdrawFunds {
+            accounts: WithdrawFundsAccounts {
+                user: p(1),
+                mint: p(2),
+                token_account: p(3),
+                token_program: p(4),
+                associated_token_program: p(5),
+            },
+            data: WithdrawFundsData {
+                amount,
+                destination,
+            },
+        })),
+        slot,
+        program_type: ProgramType::Withdraw,
         signature: Some(signature.to_string()),
         instruction_index,
     }
@@ -202,6 +239,69 @@ async fn two_same_signature_deposits_persist_as_distinct_rows() {
     );
     assert_eq!(rows[0].2, recipient_a.to_string());
     assert_eq!(rows[1].2, recipient_b.to_string());
+}
+
+/// Two `WithdrawFunds` instructions sharing one signature must both persist as distinct rows, each getting its own withdrawal_nonce from the per-row trigger.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_same_signature_withdrawals_persist_with_distinct_nonces() {
+    let (db, url, _pg) = start_postgres("c1_multi_ix_withdraw").await;
+    db.init_schema().await.unwrap();
+    let storage = Arc::new(Storage::Postgres(db));
+
+    let instance = Pubkey::new_unique();
+    let signature = Signature::new_unique().to_string();
+    let dest_a = Pubkey::new_unique();
+    let dest_b = Pubkey::new_unique();
+
+    run_slot(
+        storage,
+        instance,
+        vec![
+            ProcessorMessage::Instruction(withdraw_meta(7, &signature, 0, dest_a, 990)),
+            ProcessorMessage::Instruction(withdraw_meta(7, &signature, 1, dest_b, 480)),
+            ProcessorMessage::SlotComplete {
+                slot: 7,
+                program_type: ProgramType::Withdraw,
+            },
+        ],
+    )
+    .await;
+
+    let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+        .bind(&signature)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "both same-signature withdrawals must persist; got {count} (SOLA2-13 collapse)"
+    );
+
+    // Distinct indices, and a distinct non-null nonce per row from the INSERT trigger.
+    let rows: Vec<(i32, Option<i64>, i64, String)> = sqlx::query_as(
+        "SELECT instruction_index, withdrawal_nonce, amount, recipient FROM transactions \
+         WHERE signature = $1 ORDER BY instruction_index",
+    )
+    .bind(&signature)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 0, "first withdrawal keeps instruction_index 0");
+    assert_eq!(rows[1].0, 1, "second withdrawal keeps instruction_index 1");
+    let nonce_0 = rows[0].1.expect("withdrawal 0 must receive a nonce");
+    let nonce_1 = rows[1].1.expect("withdrawal 1 must receive a nonce");
+    assert_ne!(
+        nonce_0, nonce_1,
+        "each withdrawal row must get its own withdrawal_nonce"
+    );
+    // The second instruction's economic value is not overwritten by the first.
+    assert_eq!(rows[0].2, 990);
+    assert_eq!(rows[1].2, 480);
+    assert_eq!(rows[0].3, dest_a.to_string());
+    assert_eq!(rows[1].3, dest_b.to_string());
 }
 
 /// Reprocessing the same slot (the indexer replays a slot whose checkpoint did
