@@ -237,12 +237,13 @@ committing the row to manual review. Sub-triggers below; same recovery.
 
 > **If the quarantined release actually landed** (verdict `LANDED`, but
 > the row was quarantined with `no broadcast signatures recorded; cannot
-> verify release landed` and never written `Completed`), expect an
-> `SmtRootMismatch` halt on the next operator boot - the consumed nonce
-> is missing from the DB. See
+> verify release landed` and never written `Completed`), the consumed
+> nonce is missing from the DB. The boot pre-flight normally reconciles
+> this from the durable release signature; only if it cannot will the
+> operator refuse to start. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
-> Marking the row `Completed` per Step 2 above also resolves
-> that halt by re-recording the nonce.
+> Marking the row `Completed` per Step 2 above re-records the nonce and
+> resolves any such refuse-to-start.
 
 ## Path F - corrupt withdrawal row (missing nonce)
 

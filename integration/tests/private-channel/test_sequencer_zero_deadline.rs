@@ -26,6 +26,7 @@
 
 use {
     private_channel_core::{
+        nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY,
         scheduler::ConflictFreeBatch,
         stage_metrics::{NoopMetrics, SharedMetrics},
         stages::{start_sequence_worker, SequencerArgs},
@@ -45,7 +46,7 @@ use {
 /// the channel runs dry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sequencer_zero_deadline_drains_nonblocking() {
-    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = mpsc::channel(DEFAULT_SEQUENCER_QUEUE_CAPACITY);
     let (batch_tx, mut batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
     let shutdown = CancellationToken::new();
 
@@ -57,9 +58,11 @@ async fn sequencer_zero_deadline_drains_nonblocking() {
     let to_b = Pubkey::new_unique();
     input_tx
         .send(create_test_sanitized_transaction(&from_a, &to_a, 100))
+        .await
         .expect("send tx A");
     input_tx
         .send(create_test_sanitized_transaction(&from_b, &to_b, 100))
+        .await
         .expect("send tx B");
 
     let metrics: SharedMetrics = Arc::new(NoopMetrics);

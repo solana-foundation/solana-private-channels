@@ -55,7 +55,7 @@ const MIN_PARALLEL_BATCH_FACTOR: usize = 4;
 pub struct ExecutionArgs {
     pub batch_rx: mpsc::Receiver<ConflictFreeBatch>,
     pub settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
-    pub execution_results_tx: mpsc::UnboundedSender<(
+    pub execution_results_tx: mpsc::Sender<(
         LoadAndExecuteSanitizedTransactionsOutput,
         Vec<SanitizedTransaction>,
     )>,
@@ -146,10 +146,21 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             if !execution_result.admin_transactions.is_empty() {
                                 if let Some(admin_results) = execution_result.admin_results {
                                     let len = execution_result.admin_transactions.len();
-                                    if let Err(e) = execution_results_tx.send((admin_results, execution_result.admin_transactions)) {
-                                        metrics.executor_results_send_failed("admin");
-                                        error!("Failed to send admin results: {:?}", e);
-                                        break;
+                                    // Bounded send applies backpressure; race shutdown so a full
+                                    // settler queue never wedges executor exit. Owned values only,
+                                    // no lock guard is held across this await.
+                                    tokio::select! {
+                                        send_result = execution_results_tx.send((admin_results, execution_result.admin_transactions)) => {
+                                            if let Err(e) = send_result {
+                                                metrics.executor_results_send_failed("admin");
+                                                error!("Failed to send admin results: {:?}", e);
+                                                break;
+                                            }
+                                        }
+                                        _ = shutdown_token.cancelled() => {
+                                            info!("Executor shutdown while sending admin results");
+                                            return;
+                                        }
                                     }
                                     metrics.executor_results_sent(len);
                                 } else {
@@ -161,10 +172,18 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                             if !execution_result.regular_transactions.is_empty() {
                                 if let Some(regular_results) = execution_result.regular_results {
                                     let len = execution_result.regular_transactions.len();
-                                    if let Err(e) = execution_results_tx.send((regular_results, execution_result.regular_transactions)) {
-                                        metrics.executor_results_send_failed("regular");
-                                        error!("Failed to send regular results: {:?}", e);
-                                        break;
+                                    tokio::select! {
+                                        send_result = execution_results_tx.send((regular_results, execution_result.regular_transactions)) => {
+                                            if let Err(e) = send_result {
+                                                metrics.executor_results_send_failed("regular");
+                                                error!("Failed to send regular results: {:?}", e);
+                                                break;
+                                            }
+                                        }
+                                        _ = shutdown_token.cancelled() => {
+                                            info!("Executor shutdown while sending regular results");
+                                            return;
+                                        }
                                     }
                                     metrics.executor_results_sent(len);
                                 } else {
@@ -711,6 +730,8 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
 
     /// Helper: live-blockhash window containing only `Hash::default()` so the
     /// canned test transactions (built with `Hash::default()` as their recent
@@ -1448,10 +1469,10 @@ mod tests {
 
         let (_batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, _execution_results_rx) = mpsc::unbounded_channel::<(
+        let (execution_results_tx, _execution_results_rx) = mpsc::channel::<(
             LoadAndExecuteSanitizedTransactionsOutput,
             Vec<SanitizedTransaction>,
-        )>();
+        )>(RESULTS_CAP);
         let shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
@@ -1776,10 +1797,10 @@ mod tests {
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, _execution_results_rx) = mpsc::unbounded_channel::<(
+        let (execution_results_tx, _execution_results_rx) = mpsc::channel::<(
             LoadAndExecuteSanitizedTransactionsOutput,
             Vec<SanitizedTransaction>,
-        )>();
+        )>(RESULTS_CAP);
         let shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
@@ -1888,5 +1909,108 @@ mod tests {
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());
         assert!(result.regular_results.is_some());
+    }
+
+    // A full results channel blocks the executor's send (backpressure) without
+    // panic or lock poison — proving no guard is held across the await — and the
+    // blocked result is delivered once the receiver drains.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn executor_blocks_then_completes_on_full_results() {
+        let (_accounts_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
+        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<(
+            LoadAndExecuteSanitizedTransactionsOutput,
+            Vec<SanitizedTransaction>,
+        )>(1);
+        let shutdown = CancellationToken::new();
+
+        let _handle = start_execution_worker(ExecutionArgs {
+            batch_rx,
+            settled_accounts_rx: settled_rx,
+            execution_results_tx,
+            accountsdb_connection_url: url,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+            max_svm_workers: 1,
+            live_blockhashes: default_live_blockhashes(),
+        })
+        .await;
+
+        let one_batch = || ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(create_test_transaction()),
+                index: 0,
+            }],
+        };
+        // Two batches: the first fills the cap-1 channel, the second's send blocks.
+        batch_tx.send(one_batch()).await.unwrap();
+        batch_tx.send(one_batch()).await.unwrap();
+
+        // First result is available.
+        let first = tokio::time::timeout(Duration::from_secs(5), execution_results_rx.recv()).await;
+        assert!(first.is_ok(), "first result must arrive");
+
+        // Draining the first unblocks the executor's parked send; the second arrives.
+        let second =
+            tokio::time::timeout(Duration::from_secs(5), execution_results_rx.recv()).await;
+        assert!(
+            matches!(second, Ok(Some(_))),
+            "second result must arrive once the channel drains (no deadlock, no poison)"
+        );
+
+        shutdown.cancel();
+    }
+
+    // A full results channel with no receiver must not wedge executor shutdown:
+    // the send is raced against the shutdown token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn executor_exits_on_shutdown_with_full_results() {
+        let (_accounts_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+
+        let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
+        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let (execution_results_tx, execution_results_rx) = mpsc::channel::<(
+            LoadAndExecuteSanitizedTransactionsOutput,
+            Vec<SanitizedTransaction>,
+        )>(1);
+        let shutdown = CancellationToken::new();
+
+        let handle = start_execution_worker(ExecutionArgs {
+            batch_rx,
+            settled_accounts_rx: settled_rx,
+            execution_results_tx,
+            accountsdb_connection_url: url,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+            max_svm_workers: 1,
+            live_blockhashes: default_live_blockhashes(),
+        })
+        .await;
+
+        let one_batch = || ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(create_test_transaction()),
+                index: 0,
+            }],
+        };
+        // Fill the cap-1 channel and leave a second batch whose send will block;
+        // never drain the results channel.
+        batch_tx.send(one_batch()).await.unwrap();
+        batch_tx.send(one_batch()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "executor must exit promptly even with a full results channel"
+        );
+        drop(execution_results_rx);
     }
 }

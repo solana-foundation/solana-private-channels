@@ -70,6 +70,7 @@ fn pending_deposit_row(id: i64, mint: Pubkey, recipient: Pubkey) -> DbTransactio
         finality_check_attempts: 0,
         recovery_requeue_attempts: 0,
         instruction_index: 0,
+        landed_remint_signature: None,
     }
 }
 

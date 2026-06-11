@@ -86,6 +86,10 @@ pub struct DbTransaction {
     /// Paired with `signature` it is the row's durable identity, so multiple
     /// economic events in one transaction persist as distinct rows.
     pub instruction_index: i32,
+    /// Confirmed remint signature, written in the same UPDATE that flips status
+    /// to FailedReminted. A crash before the async writer runs can no longer
+    /// leave a landed remint recorded only as PendingRemint (which would replay).
+    pub landed_remint_signature: Option<String>,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -234,6 +238,7 @@ impl DbTransactionBuilder {
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
             instruction_index: self.instruction_index,
+            landed_remint_signature: None,
         }
     }
 }

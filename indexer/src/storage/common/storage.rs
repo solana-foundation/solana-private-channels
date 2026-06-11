@@ -25,6 +25,7 @@ pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
 pub mod quarantine_all_active_withdrawals;
+pub mod record_remint_result;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod try_complete_processing;
@@ -280,6 +281,17 @@ impl Storage {
         .await
     }
 
+    /// Durably record a confirmed remint (status -> FailedReminted plus the
+    /// signature) in one write, before the async status writer runs. Closes the
+    /// crash window that would otherwise leave a landed remint as PendingRemint.
+    pub async fn record_remint_result(
+        &self,
+        transaction_id: i64,
+        remint_signature: String,
+    ) -> Result<(), StorageError> {
+        record_remint_result::record_remint_result(self, transaction_id, remint_signature).await
+    }
+
     /// Returns all withdrawal transactions in PendingRemint status.
     /// Called on startup to re-hydrate the remint queue after a crash.
     pub async fn get_pending_remint_transactions(
@@ -431,6 +443,7 @@ mod tests {
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
             instruction_index: 0,
+            landed_remint_signature: None,
         }
     }
 
@@ -1154,6 +1167,7 @@ mod tests {
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
             instruction_index: 0,
+            landed_remint_signature: None,
         });
     }
 

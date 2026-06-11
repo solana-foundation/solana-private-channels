@@ -97,6 +97,7 @@ pub async fn run_recovery_worker(
                     program_type,
                     &storage_tx,
                     &cancellation_token,
+                    STALE_THRESHOLD,
                 )
                 .await
                 {
@@ -116,6 +117,7 @@ async fn recover_once(
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
+    threshold: Duration,
 ) -> Result<(), OperatorError> {
     // Best-effort GC of release signatures whose parent is no longer Processing;
     // a failure here must not block recovery.
@@ -125,7 +127,7 @@ async fn recover_once(
     }
 
     let stale = storage
-        .get_stale_processing_transactions(STALE_THRESHOLD, RECOVERY_BATCH_LIMIT)
+        .get_stale_processing_transactions(threshold, RECOVERY_BATCH_LIMIT)
         .await?;
 
     if stale.is_empty() {
@@ -433,6 +435,53 @@ async fn route_outcome(
     }
 }
 
+/// Synchronous boot pre-flight reconcile: repeatedly run `recover_once` with a
+/// `Duration::ZERO` threshold (so even a fresh crash row is reconciled) until no
+/// `Processing` rows remain, bounded by `max_passes`. A withdraw operator is
+/// single-active (SMT nonce ordering forbids a second sender), so at boot there
+/// is no live sibling whose not-yet-stale work this could disrupt. Exhausting
+/// `max_passes` with rows still `Processing` returns `Ok`: the caller's
+/// `validate_smt_root` is the terminal gate that refuses to start on a real mismatch.
+pub async fn boot_reconcile_processing(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+    admin_pubkey: Pubkey,
+    program_type: ProgramType,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    cancellation_token: &CancellationToken,
+    max_passes: u32,
+) -> Result<(), OperatorError> {
+    for pass in 0..max_passes {
+        recover_once(
+            storage,
+            rpc_client,
+            admin_pubkey,
+            program_type,
+            storage_tx,
+            cancellation_token,
+            Duration::ZERO,
+        )
+        .await?;
+
+        let remaining = storage
+            .get_stale_processing_transactions(Duration::ZERO, RECOVERY_BATCH_LIMIT)
+            .await?;
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        debug!(
+            pass,
+            remaining = remaining.len(),
+            "Boot reconcile still has Processing rows; iterating"
+        );
+    }
+    warn!(
+        max_passes,
+        "Boot reconcile exhausted its pass budget with Processing rows remaining"
+    );
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-mock-storage"))]
 pub mod test_hooks {
     //! Test-only entry to drive a single recovery tick deterministically.
@@ -445,7 +494,9 @@ pub mod test_hooks {
         program_type: ProgramType,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
-        // Fresh, never-cancelled token; tests run to completion.
+        // Fresh, never-cancelled token; tests run to completion. Uses the periodic
+        // worker's STALE_THRESHOLD; the ZERO boot threshold is exercised by calling
+        // recover_once directly.
         let token = CancellationToken::new();
         recover_once(
             storage,
@@ -454,6 +505,7 @@ pub mod test_hooks {
             program_type,
             storage_tx,
             &token,
+            STALE_THRESHOLD,
         )
         .await
     }
@@ -491,6 +543,7 @@ mod tests {
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
             instruction_index: 0,
+            landed_remint_signature: None,
         }
     }
 
@@ -1137,5 +1190,215 @@ mod tests {
 
         let after = mock.pending_transactions.lock().unwrap();
         assert_eq!(after[0].status, TransactionStatus::Processing);
+    }
+
+    // ── boot pre-flight (reconcile then validate) ──────────────────
+
+    use crate::operator::sender::validate_smt_root;
+    use crate::operator::utils::smt_util::SmtState;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use borsh::BorshSerialize;
+    use private_channel_escrow_program_client::Instance;
+
+    /// Mock a finalized-success `getSignatureStatuses` so the classifier reports the release landed.
+    fn mock_finalized_status(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#,
+            )
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// Mock `getAccountInfo` to return an Instance carrying `root`.
+    fn mock_instance_account(server: &mut mockito::ServerGuard, root: [u8; 32]) -> mockito::Mock {
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index: 0,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    fn processing_withdrawal(id: i64, nonce: i64) -> DbTransaction {
+        let mut row = make_withdrawal_row(id, Some(nonce));
+        row.status = TransactionStatus::Processing;
+        row
+    }
+
+    /// A fresh `Processing` row with a landed signature is promoted to `Completed` under `Duration::ZERO` (the 5-minute default would skip it).
+    #[tokio::test]
+    async fn recover_once_zero_threshold_picks_up_fresh_processing_row() {
+        let mut server = mockito::Server::new_async().await;
+        let landed_sig = Signature::new_unique();
+        let _status = mock_finalized_status(&mut server);
+
+        let mock = MockStorage::new();
+        let row = processing_withdrawal(1, 42);
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        recover_once(
+            &storage,
+            &client,
+            Pubkey::new_unique(),
+            ProgramType::Withdraw,
+            &storage_tx,
+            &CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Completed,
+            "fresh landed row must be promoted under ZERO threshold"
+        );
+        assert_eq!(
+            after[0].counterpart_signature.as_deref(),
+            Some(landed_sig.to_string().as_str())
+        );
+    }
+
+    /// Pre-flight happy path: a landed-but-uncompleted nonce is reconciled to Completed, then `validate_smt_root` agrees; zero rows Failed.
+    #[tokio::test]
+    async fn preflight_reconciles_landed_nonce_then_validates_ok() {
+        let landed_nonce: u64 = 3;
+        let mut onchain_tree = SmtState::new(0);
+        onchain_tree.insert_nonce(landed_nonce);
+
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+        let _account = mock_instance_account(&mut server, onchain_tree.current_root());
+
+        let mock = MockStorage::new();
+        let row = processing_withdrawal(1, landed_nonce as i64);
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let (storage_tx, _rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+
+        boot_reconcile_processing(
+            &storage,
+            &client,
+            Pubkey::new_unique(),
+            ProgramType::Withdraw,
+            &storage_tx,
+            &token,
+            5,
+        )
+        .await
+        .unwrap();
+
+        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        assert!(
+            validated.is_ok(),
+            "validate must pass once the landed nonce is reconciled: {validated:?}"
+        );
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(after[0].status, TransactionStatus::Completed);
+        assert!(
+            after.iter().all(|t| t.status != TransactionStatus::Failed),
+            "no row may be Failed by the pre-flight"
+        );
+    }
+
+    /// Pre-flight refuse-to-start path: a divergence the reconcile cannot resolve
+    /// (a no-signature Processing row goes to ManualReview, leaving the DB one nonce
+    /// behind an on-chain root) makes `validate_smt_root` return Err. No row is
+    /// Failed (the anti-SOLA2-21 assertion).
+    #[tokio::test]
+    async fn preflight_refuses_start_on_unreconcilable_mismatch() {
+        // On-chain root includes nonce 7 that the DB will never record.
+        let mut onchain_tree = SmtState::new(0);
+        onchain_tree.insert_nonce(7);
+
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_instance_account(&mut server, onchain_tree.current_root());
+
+        let mock = MockStorage::new();
+        // A no-signature Processing withdrawal is quarantined to ManualReview, not Failed.
+        let row = processing_withdrawal(1, 7);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+        let (storage_tx, _rx) = mpsc::channel(8);
+        let token = CancellationToken::new();
+
+        boot_reconcile_processing(
+            &storage,
+            &client,
+            Pubkey::new_unique(),
+            ProgramType::Withdraw,
+            &storage_tx,
+            &token,
+            5,
+        )
+        .await
+        .unwrap();
+
+        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        assert!(
+            matches!(
+                validated,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::SmtRootMismatch { .. }
+                ))
+            ),
+            "unreconcilable divergence must refuse to start: {validated:?}"
+        );
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert!(
+            after.iter().all(|t| t.status != TransactionStatus::Failed),
+            "refuse-to-start must never mark a row Failed"
+        );
     }
 }

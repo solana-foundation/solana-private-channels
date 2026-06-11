@@ -279,6 +279,24 @@ echo "Deposit instance PDA: ${BENCH_DEPOSIT_INSTANCE_PDA}"
 # keep BENCH_DEPOSIT_INSTANCE_PDA for reference / debugging.
 patch_env "COMMON_ESCROW_INSTANCE_ID" "${BENCH_DEPOSIT_INSTANCE_PDA}"
 
+# ---------------------------------------------------------------------------
+# Step 5c — Generate DB passwords when blank
+#
+# The sample env ships no default DB credentials. Generate strong random
+# values for any that are empty and patch them into .env (same mechanism as
+# the admin keypair), so a blanked sample never ships or requires a default.
+# ---------------------------------------------------------------------------
+if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    POSTGRES_PASSWORD=$(openssl rand -hex 32)
+    patch_env "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD}"
+    echo "Generated random POSTGRES_PASSWORD in ${BENCH_ENV}"
+fi
+if [ -z "${POSTGRES_REPLICATION_PASSWORD:-}" ]; then
+    POSTGRES_REPLICATION_PASSWORD=$(openssl rand -hex 32)
+    patch_env "POSTGRES_REPLICATION_PASSWORD" "${POSTGRES_REPLICATION_PASSWORD}"
+    echo "Generated random POSTGRES_REPLICATION_PASSWORD in ${BENCH_ENV}"
+fi
+
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
 # --env-file in docker compose, so without this re-source the operator
@@ -286,6 +304,12 @@ patch_env "COMMON_ESCROW_INSTANCE_ID" "${BENCH_DEPOSIT_INSTANCE_PDA}"
 # exported during the initial Step 3 source.
 # shellcheck disable=SC1091
 set -a; source "${BENCH_ENV}"; set +a
+
+# Fail closed before bringing the stack up if any required DB secret is empty.
+if [ -z "${POSTGRES_PASSWORD:-}" ] || [ -z "${POSTGRES_REPLICATION_PASSWORD:-}" ]; then
+    echo "ERROR: POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD must be non-empty" >&2
+    exit 1
+fi
 
 # (BENCH_METRICS_TARGET is set in Step 10b after the Docker network exists)
 
