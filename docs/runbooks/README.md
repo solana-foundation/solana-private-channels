@@ -8,10 +8,11 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
-> **One halt has no dedicated alert.** The **SMT-root-mismatch startup
-> halt** fires no "pipeline halted" event - it surfaces as repeated
-> per-row `failed` webhooks whose `error_message` carries `SMT root
-> mismatch` (plus `SMT root mismatch detected` in the operator logs).
+> **One halt has no dedicated alert.** The **SMT-root-mismatch boot
+> pre-flight** fires no "pipeline halted" event and marks no row `failed`.
+> The common cause is auto-reconciled at boot; an unforeseen divergence the
+> reconcile cannot resolve makes the operator **refuse to start**, surfacing
+> as a boot-time crash-loop with `SMT root mismatch` in the operator logs.
 > Recognize it by that pattern, not a single alert, and not via this
 > dispatch table. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).

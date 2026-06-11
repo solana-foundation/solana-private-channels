@@ -68,82 +68,8 @@ impl SenderState {
     /// Initialize SMT state lazily on first use
     /// Fetches tree_index from chain and populates SMT with completed withdrawals from DB
     pub(super) async fn initialize_smt_state(&mut self) -> Result<(), OperatorError> {
-        let instance_pda = self
-            .instance_pda
-            .ok_or_else(|| AccountError::InstanceNotFound {
-                instance: Pubkey::default(),
-            })?;
-
-        info!("Initializing SMT state for instance {}", instance_pda);
-
-        let instance_data = self
-            .rpc_client
-            .get_account_data(&instance_pda)
-            .await
-            .map_err(|_| AccountError::AccountNotFound {
-                pubkey: instance_pda,
-            })?;
-
-        let instance = parse_instance(&instance_data).map_err(|e| {
-            AccountError::AccountDeserializationFailed {
-                pubkey: instance_pda,
-                reason: e.to_string(),
-            }
-        })?;
-
-        let tree_index = instance.current_tree_index;
-        let min_nonce = tree_index * MAX_TREE_LEAVES as u64;
-        let max_nonce = (tree_index + 1) * MAX_TREE_LEAVES as u64;
-
-        // Fetch completed withdrawal nonces for current tree from DB
-        let nonces = self
-            .storage
-            .get_completed_withdrawal_nonces(min_nonce, max_nonce)
-            .await?;
-
-        // Create SMT and populate with existing nonces
-        let mut smt_state = SmtState::new(tree_index);
-        for nonce in &nonces {
-            smt_state.insert_nonce(*nonce);
-        }
-
-        info!(
-            "SMT state initialized with tree_index {}, populated {} existing nonces",
-            tree_index,
-            nonces.len()
-        );
-
-        // CRITICAL: Verify local SMT root matches on-chain root
-        // This ensures database is in sync with on-chain state
-        let computed_root = smt_state.current_root();
-        let onchain_root = instance.withdrawal_transactions_root;
-
-        if computed_root != onchain_root {
-            error!("SMT root mismatch detected! Database out of sync with on-chain state.");
-            error!("  Instance PDA: {}", instance_pda);
-            error!("  Tree Index: {}", tree_index);
-            error!("  Nonces from DB: {:?}", nonces);
-            error!("  Local root:    {:?}", computed_root);
-            error!("  On-chain root: {:?}", onchain_root);
-            error!("");
-            error!("This typically means:");
-            error!("  1. A withdrawal was successfully processed on-chain");
-            error!("  2. But the operator crashed before updating the database");
-            error!("  3. The database is now missing transaction records");
-            error!("");
-            error!("Resolution options:");
-            error!("  1. Reset and resync the database from on-chain events");
-            error!("  2. Manually reconcile missing transactions");
-            error!("  3. Reset the on-chain SMT tree (requires admin)");
-
-            return Err(crate::error::ProgramError::SmtRootMismatch {
-                local_root: computed_root,
-                onchain_root,
-            }
-            .into());
-        }
-
-        info!("SMT root verification passed: {:?}", computed_root);
+        let smt_state =
+            validate_smt_root(&self.storage, &self.rpc_client, self.instance_pda).await?;
 
         self.smt_state = Some(SenderSMTState {
             smt_state,
@@ -152,8 +78,83 @@ impl SenderState {
 
         Ok(())
     }
+}
 
-    /// Sends a ManualReview status update during startup recovery when a stored            
+/// Build the local SMT for the current tree window from DB-completed nonces and
+/// assert it matches the on-chain root, returning the built tree on agreement.
+///
+/// Shared by the sender's lazy `initialize_smt_state` (which needs the tree for
+/// proofs) and the boot pre-flight (which uses it purely as a consistency gate).
+pub(crate) async fn validate_smt_root(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+    instance_pda: Option<Pubkey>,
+) -> Result<SmtState, OperatorError> {
+    let instance_pda = instance_pda.ok_or_else(|| AccountError::InstanceNotFound {
+        instance: Pubkey::default(),
+    })?;
+
+    info!("Validating SMT root for instance {}", instance_pda);
+
+    let instance_data = rpc_client
+        .get_account_data(&instance_pda)
+        .await
+        .map_err(|_| AccountError::AccountNotFound {
+            pubkey: instance_pda,
+        })?;
+
+    let instance =
+        parse_instance(&instance_data).map_err(|e| AccountError::AccountDeserializationFailed {
+            pubkey: instance_pda,
+            reason: e.to_string(),
+        })?;
+
+    let tree_index = instance.current_tree_index;
+    let min_nonce = tree_index * MAX_TREE_LEAVES as u64;
+    let max_nonce = (tree_index + 1) * MAX_TREE_LEAVES as u64;
+
+    let nonces = storage
+        .get_completed_withdrawal_nonces(min_nonce, max_nonce)
+        .await?;
+
+    let mut smt_state = SmtState::new(tree_index);
+    for nonce in &nonces {
+        smt_state.insert_nonce(*nonce);
+    }
+
+    let computed_root = smt_state.current_root();
+    let onchain_root = instance.withdrawal_transactions_root;
+
+    if computed_root != onchain_root {
+        error!(
+            instance = %instance_pda,
+            tree_index,
+            local_root = ?computed_root,
+            onchain_root = ?onchain_root,
+            nonces = ?nonces,
+            "SMT root mismatch: database out of sync with on-chain state. \
+             A release likely landed on-chain but its Completed write was lost; \
+             resync the database from on-chain events to reconcile."
+        );
+
+        return Err(crate::error::ProgramError::SmtRootMismatch {
+            local_root: computed_root,
+            onchain_root,
+        }
+        .into());
+    }
+
+    info!(
+        tree_index,
+        nonces = nonces.len(),
+        "SMT root verification passed"
+    );
+
+    Ok(smt_state)
+}
+
+impl SenderState {
+    /// Sends a ManualReview status update during startup recovery when a stored
     /// transaction cannot be reconstructed (e.g. unparseable pubkey or signature).         
     /// Using send_guaranteed so the alert is never silently dropped.                       
     async fn send_recovery_manual_review(
@@ -963,13 +964,12 @@ mod tests {
         }
     }
 
-    /// `initialize_smt_state` requires a PDA to look up the on-chain SMT root; without one
-    /// it must return an `AccountError::InstanceNotFound` wrapped as `OperatorError::Account`.
+    /// `validate_smt_root` without a PDA must return `AccountError::InstanceNotFound` (as `OperatorError::Account`).
     #[tokio::test]
-    async fn initialize_smt_state_fails_without_instance_pda() {
-        let mut state = make_sender_state_with_pda(None);
+    async fn validate_smt_root_fails_without_instance_pda() {
+        let state = make_sender_state_with_pda(None);
 
-        let result = state.initialize_smt_state().await;
+        let result = super::validate_smt_root(&state.storage, &state.rpc_client, None).await;
         let err = result.unwrap_err();
         assert!(
             matches!(
@@ -1031,13 +1031,12 @@ mod tests {
         assert_eq!(state.retry_max_attempts, 5);
     }
 
-    /// Pins the SmtRootMismatch wedge (see
-    /// `docs/runbooks/withdrawal_pipeline_halt_runbook.md`): a landed release
-    /// whose nonce never reaches `Completed` leaves the DB one nonce behind the
-    /// chain, so next-boot `initialize_smt_state` MUST diverge and halt with
-    /// `Err(SmtRootMismatch)`. A change that silently absorbs it breaks here.
+    /// Pins the SmtRootMismatch wedge: a landed release whose nonce never reaches
+    /// `Completed` leaves the DB one nonce behind the chain, so `validate_smt_root`
+    /// MUST diverge and return `Err(SmtRootMismatch)`. A change that silently
+    /// absorbs it breaks here.
     #[tokio::test]
-    async fn initialize_smt_state_halts_on_consumed_but_unrecorded_nonce() {
+    async fn validate_smt_root_halts_on_consumed_but_unrecorded_nonce() {
         let landed_nonce: u64 = 1;
         let tree_index: u64 = 0;
 
@@ -1088,7 +1087,9 @@ mod tests {
         let mut state = make_sender_state_with_pda(Some(Pubkey::new_unique()));
         state.rpc_client = Arc::new(mock_rpc);
 
-        let err = state.initialize_smt_state().await.unwrap_err();
+        let err = super::validate_smt_root(&state.storage, &state.rpc_client, state.instance_pda)
+            .await
+            .unwrap_err();
 
         match err {
             OperatorError::Program(crate::error::ProgramError::SmtRootMismatch {

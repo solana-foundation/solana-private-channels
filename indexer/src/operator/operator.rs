@@ -58,6 +58,66 @@ pub async fn run(
     let (sender_tx, sender_rx) = mpsc::channel(config.channel_buffer_size);
     let (storage_tx, storage_rx) = mpsc::channel::<sender::TransactionStatusUpdate>(100);
 
+    let program_type = common_config.program_type;
+    let instance_pda = common_config.escrow_instance_id;
+
+    // Started first so the boot pre-flight's reconcile can drain its quarantine sends.
+    let writer_storage = storage.clone();
+    let storage_writer = DbTransactionWriter::new(
+        writer_storage,
+        storage_rx,
+        config.alert_webhook_url.clone(),
+        common_config.program_type,
+    );
+    let storage_writer_handle = tokio::spawn(async move {
+        if let Err(e) = storage_writer.start().await {
+            tracing::error!("Storage writer error: {}", e);
+        }
+    });
+
+    // Boot pre-flight for withdraw operators: reconcile in-flight releases, then
+    // validate the local SMT against the on-chain root BEFORE any row is fetched,
+    // locked, or processed. A residual mismatch the reconcile cannot resolve is a
+    // fail-closed refuse-to-start; it should never fire once the write-ahead
+    // signatures and this reconcile have run, and guards an unforeseen divergence.
+    if program_type == crate::config::ProgramType::Withdraw {
+        if let Some(preflight_instance) = instance_pda {
+            let admin_pubkey = SignerUtil::get_admin_pubkey();
+            // The main rpc_client is the chain where the instance and releases live.
+            let preflight = run_withdraw_preflight(
+                &storage,
+                &rpc_client,
+                admin_pubkey,
+                preflight_instance,
+                &storage_tx,
+                &cancellation_token,
+            )
+            .await;
+
+            if let Err(e) = preflight {
+                error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
+                // Drop the sole storage_tx so the writer's recv() returns None and
+                // the task exits, then await it so the reconcile's queued
+                // ManualReview alerts are flushed before we return. The writer
+                // watches only its channel, not the cancellation token, so without
+                // this drop the await would block forever. No storage_tx clones
+                // exist yet: the processor/sender/recovery senders are created
+                // after this block.
+                cancellation_token.cancel();
+                drop(storage_tx);
+                if let Err(join_err) = storage_writer_handle.await {
+                    error!(
+                        "Storage writer join error during refuse-to-start: {}",
+                        join_err
+                    );
+                }
+                return Err(e);
+            }
+        } else {
+            warn!("Withdraw operator has no escrow_instance_id; skipping boot pre-flight");
+        }
+    }
+
     // Start fetcher task
     let fetcher_storage = storage.clone();
     let fetcher_config = config.clone();
@@ -83,8 +143,6 @@ pub async fn run(
     // storage_tx is cloned into the processor so per-transaction quarantine
     // updates (ManualReview) flow through the same DbTransactionWriter path
     // the sender uses for status updates.
-    let program_type = common_config.program_type;
-    let instance_pda = common_config.escrow_instance_id;
     let processor_storage = storage.clone();
     let processor_rpc = rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
@@ -101,20 +159,6 @@ pub async fn run(
             processor_source_rpc,
         )
         .await;
-    });
-
-    // Start storage writer task (receives updates from sender + processor)
-    let writer_storage = storage.clone();
-    let storage_writer = DbTransactionWriter::new(
-        writer_storage,
-        storage_rx,
-        config.alert_webhook_url.clone(),
-        common_config.program_type,
-    );
-    let storage_writer_handle = tokio::spawn(async move {
-        if let Err(e) = storage_writer.start().await {
-            tracing::error!("Storage writer error: {}", e);
-        }
     });
 
     // Start sender task
@@ -295,6 +339,60 @@ pub async fn run(
     Ok(())
 }
 
+/// Reconcile in-flight releases, then validate the local SMT against the on-chain root.
+/// Only a genuine `SmtRootMismatch` returns `Err` (refuse to start).
+async fn run_withdraw_preflight(
+    storage: &Arc<Storage>,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    admin_pubkey: solana_sdk::pubkey::Pubkey,
+    instance_pda: solana_sdk::pubkey::Pubkey,
+    storage_tx: &mpsc::Sender<sender::TransactionStatusUpdate>,
+    cancellation_token: &CancellationToken,
+) -> Result<(), OperatorError> {
+    // Idempotent passes absorb rows that flip Processing to terminal across iterations.
+    const MAX_RECONCILE_PASSES: u32 = 8;
+
+    // Best-effort: a reconcile error must not block startup. Validation is the gate,
+    // and a transient DB error here would otherwise crash-loop the operator at boot.
+    if let Err(e) = recovery::boot_reconcile_processing(
+        storage,
+        rpc_client,
+        admin_pubkey,
+        crate::config::ProgramType::Withdraw,
+        storage_tx,
+        cancellation_token,
+        MAX_RECONCILE_PASSES,
+    )
+    .await
+    {
+        warn!("Boot reconcile failed, proceeding to SMT validation: {}", e);
+    }
+
+    // Only a genuine root mismatch is a refuse-to-start. Any other error (instance
+    // not yet on-chain, RPC failure, DB read failure) means we could not run the
+    // check; start anyway and let the sender's lazy init plus the recovery worker
+    // re-validate, neither of which marks a row Failed. Refusing on those would
+    // crash-loop the operator on any transient boot condition.
+    match sender::validate_smt_root(storage, rpc_client, Some(instance_pda)).await {
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e,
+                OperatorError::Program(crate::error::ProgramError::SmtRootMismatch { .. })
+            ) =>
+        {
+            Err(e)
+        }
+        Err(e) => {
+            warn!(
+                "Could not validate SMT root at boot, starting anyway (lazy init will re-check): {}",
+                e
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Log + metric for a critical task that exited before cancellation.
 ///
 /// We don't abort the process here — the caller falls through to
@@ -309,4 +407,142 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
     metrics::OPERATOR_TASK_EXIT
         .with_label_values(&[program_type_label, task_name])
         .inc();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::utils::rpc_util::RetryConfig;
+    use crate::operator::utils::smt_util::SmtState;
+    use crate::storage::common::storage::mock::MockStorage;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use borsh::BorshSerialize;
+    use private_channel_escrow_program_client::Instance;
+    use solana_sdk::pubkey::Pubkey;
+    use std::time::Duration;
+
+    // Single attempt with negligible backoff so an AccountNotFound resolves fast.
+    fn make_rpc_client(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    fn mock_instance_account(server: &mut mockito::ServerGuard, root: [u8; 32]) -> mockito::Mock {
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: root,
+            current_tree_index: 0,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    // getAccountInfo with a null value: the instance does not exist on-chain yet.
+    fn mock_instance_not_found(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":null}}"#)
+            .create()
+    }
+
+    async fn run_preflight(client: RpcClientWithRetry) -> Result<(), OperatorError> {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let client = Arc::new(client);
+        let (storage_tx, _rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
+        let token = CancellationToken::new();
+        run_withdraw_preflight(
+            &storage,
+            &client,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            &storage_tx,
+            &token,
+        )
+        .await
+    }
+
+    /// Matching local and on-chain roots: the pre-flight passes and the operator starts.
+    #[tokio::test]
+    async fn preflight_starts_when_root_matches() {
+        let mut server = mockito::Server::new_async().await;
+        // Empty DB rebuilds an empty tree, so the on-chain root must be the empty-tree root.
+        let _account = mock_instance_account(&mut server, SmtState::new(0).current_root());
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+        assert!(result.is_ok(), "matching root must start: {result:?}");
+    }
+
+    /// Regression guard (the integration failure): an instance not yet on-chain surfaces
+    /// as AccountNotFound, which must NOT refuse to start (only a real mismatch does).
+    /// Refusing here would crash-loop the operator at boot.
+    #[tokio::test]
+    async fn preflight_starts_when_instance_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_instance_not_found(&mut server);
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+        assert!(
+            result.is_ok(),
+            "AccountNotFound must start anyway, not refuse: {result:?}"
+        );
+    }
+
+    /// A genuine root divergence is the only refuse-to-start: the operator returns
+    /// `Err(SmtRootMismatch)` so it never consumes nonces against a tree it cannot reason about.
+    #[tokio::test]
+    async fn preflight_refuses_to_start_on_root_mismatch() {
+        let mut server = mockito::Server::new_async().await;
+        // On-chain root carries a nonce the empty DB will never reconcile.
+        let mut onchain = SmtState::new(0);
+        onchain.insert_nonce(7);
+        let _account = mock_instance_account(&mut server, onchain.current_root());
+        let result = run_preflight(make_rpc_client(&server.url())).await;
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Program(
+                    crate::error::ProgramError::SmtRootMismatch { .. }
+                ))
+            ),
+            "a real mismatch must refuse to start: {result:?}"
+        );
+    }
 }
