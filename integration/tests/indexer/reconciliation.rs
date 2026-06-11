@@ -26,6 +26,11 @@ mod db_migration_race;
 #[path = "pending_remint_storage.rs"]
 mod pending_remint_storage;
 
+// End-to-end multi-instruction ledger integrity (SOLA2-13): same-signature
+// instructions must persist as distinct rows through the real processor.
+#[path = "multi_instruction_pipeline.rs"]
+mod multi_instruction_pipeline;
+
 use helpers::{generate_mint, mint_to_owner, setup_wallets};
 use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{

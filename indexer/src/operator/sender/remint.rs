@@ -592,6 +592,7 @@ mod tests {
                 pending_remint_deadline_at: Some(now),
                 finality_check_attempts: attempts,
                 recovery_requeue_attempts: 0,
+                instruction_index: 0,
                 landed_remint_signature: None,
             });
     }
