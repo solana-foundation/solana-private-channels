@@ -311,7 +311,10 @@ Devnet variants exist for every target (`make docker-devnet-up`, `make docker-de
 
 ### Running with Auth (RBAC)
 
-Auth is opt-in. The gateway runs without it by default — all RPC methods are accessible without a token.
+Auth is opt-in. The gateway runs without it by default, and even when enabled the gateway's RBAC
+(account-gating and operator-only methods) protects **only the gateway port**. The read/write node RPC
+ports have **no node-side authentication** of their own, so the reference compose binds them to loopback
+(`127.0.0.1`): reachable from the host for local development, but not from other machines.
 
 To enable auth, set `JWT_SECRET` in your `.env.local` and start with the `auth` profile:
 
@@ -355,6 +358,7 @@ Container images used by integration tests (pulled automatically by
 | `redis:7`            | Warmed in CI before each integration run.      |
 
 Source of truth for tool versions:
+
 - **[`versions.env`](versions.env)** (consumed by Dockerfiles, `docker compose`, and `make install-toolchain` / `check-toolchain`): `SOLANA_VERSION`, `YELLOWSTONE_TAG`, `PNPM_VERSION`, `NODE_VERSION`, `GRAFANA_VERSION`, `PROMETHEUS_VERSION`, `BLACKBOX_VERSION`
 - Rust toolchain: [`rust-toolchain.toml`](rust-toolchain.toml)
 - Rust + `cargo-llvm-cov`: [`.github/actions/setup-environment/action.yml`](.github/actions/setup-environment/action.yml)
@@ -372,7 +376,7 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 ## Acknowledgments
 
 Built with:
+
 - [Agave](https://github.com/anza-xyz/agave) - Solana Validator Client
 - [Yellowstone gRPC](https://github.com/rpcpool/yellowstone-grpc) - Real-time Geyser streaming
 - [Pinocchio](https://github.com/anza-xyz/pinocchio) - Efficient Solana program SDK
-
