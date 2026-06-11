@@ -91,12 +91,12 @@ pub async fn run(
     let (instruction_tx, instruction_rx) = mpsc::channel(1000);
     let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
 
-    // 4. Start checkpoint writer service
-    let checkpoint_writer = CheckpointWriter::new(storage.clone());
-    let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
-    info!("CheckpointWriter service started");
+    // 4. Resolve the backfill range, gate the checkpoint writer to it, then start
+    //    the writer. Checkpoint updates only begin once the processor starts further
+    //    below (step 8), so the gate is always in place before the first update —
+    //    no live-tip slot can slip past it and push the checkpoint over the gap.
+    let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
 
-    // 5. Run backfill if enabled
     if indexer_config.backfill.enabled {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -127,8 +127,21 @@ pub async fn run(
             );
 
             if indexer_config.backfill.exit_after_backfill {
-                // Run backfill synchronously if exiting after
-                backfill_service.run(instruction_tx.clone()).await?;
+                // Backfill-only: gate the writer to the fill range so a withheld
+                // (failed-write) slot stalls the checkpoint instead of being
+                // leapfrogged by a later one. No live stream, so a resolve failure
+                // fails closed rather than falling back to ungated.
+                let range = backfill_service.resolve_range().await?;
+                if let Some((from_slot, target)) = range {
+                    checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
+                }
+                let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
+                info!("CheckpointWriter service started");
+                if let Some((from_slot, target)) = range {
+                    backfill_service
+                        .run_range(from_slot, target, instruction_tx.clone())
+                        .await?;
+                }
                 info!("Backfill completed, performing graceful cleanup...");
                 if let Err(e) =
                     cleanup_after_backfill(checkpoint_handle, checkpoint_tx, storage).await
@@ -138,18 +151,41 @@ pub async fn run(
                 }
                 return Ok(());
             } else {
-                // Run backfill concurrently with live indexing
-                let instruction_tx_clone = instruction_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = backfill_service.run(instruction_tx_clone).await {
-                        error!("Backfill failed: {}", e);
-                    } else {
-                        info!("Backfill completed successfully");
+                // Gate the writer to the range backfill will fill. resolve_range retries
+                // transient RPC failures; a persistent failure fails closed (see below).
+                match backfill_service.resolve_range().await {
+                    Ok(Some((from_slot, target))) => {
+                        checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
+                        let instruction_tx_clone = instruction_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = backfill_service
+                                .run_range(from_slot, target, instruction_tx_clone)
+                                .await
+                            {
+                                error!("Backfill failed: {}", e);
+                            } else {
+                                info!("Backfill completed successfully");
+                            }
+                        });
                     }
-                });
+                    Ok(None) => {
+                        info!("No backfill gap; checkpoint writer left ungated");
+                    }
+                    Err(e) => {
+                        error!(
+                            "Backfill range resolution failed after retries; refusing to start \
+                             rather than running ungated past the unfilled gap: {}",
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
     }
+
+    let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
+    info!("CheckpointWriter service started");
 
     // 6. Start datasource
     let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
