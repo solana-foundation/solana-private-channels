@@ -532,6 +532,7 @@ pub fn assert_get_or_reset_smt_root(
         .operator_pda(*operator_pda)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .expected_current_tree_index(previous_tree_index)
         .instruction();
 
     let transaction_metadata = context.send_transaction_with_signers_with_transaction_result(

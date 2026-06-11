@@ -56,6 +56,10 @@ pub enum PrivateChannelEscrowProgramError {
     /// (12) Invalid transaction nonce for current tree index
     #[error("Invalid transaction nonce for current tree index")]
     InvalidTransactionNonceForCurrentTreeIndex,
+
+    /// (13) ResetSmtRoot pre-state mismatch. Blocks replaying a landed reset.
+    #[error("Unexpected current tree index for SMT root reset")]
+    UnexpectedTreeIndex,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -90,6 +94,7 @@ mod tests {
             (InvalidAllowedMint, 10),
             (InvalidSmtProof, 11),
             (InvalidTransactionNonceForCurrentTreeIndex, 12),
+            (UnexpectedTreeIndex, 13),
         ];
 
         for (error, expected_code) in cases {

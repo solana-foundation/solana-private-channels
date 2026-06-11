@@ -222,6 +222,7 @@ impl FuzzTest {
             .operator_pda(operator_pda)
             .event_authority(event_authority)
             .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .expected_current_tree_index(self.current_tree_index)
             .instruction();
 
         let res = self

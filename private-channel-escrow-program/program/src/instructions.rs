@@ -232,7 +232,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
-    ResetSmtRoot {} = 8,
+    ResetSmtRoot {
+        /// Tree index the caller expects the instance to be at. Rejected if it
+        /// no longer matches, so a replayed reset cannot advance the tree twice.
+        expected_current_tree_index: u64,
+    } = 8,
 
     /// Invoked via CPI from another program to log event via instruction data.
     #[codama(account(
