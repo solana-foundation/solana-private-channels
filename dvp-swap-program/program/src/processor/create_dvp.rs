@@ -9,7 +9,7 @@ use crate::{
     processor::shared::pda_utils::create_pda_account,
     processor::shared::token_utils::{validate_mint_extensions, verify_canonical_ata},
     require, require_len,
-    state::swap_dvp::{SwapDvp, NONCE_TOMBSTONE_SEED, SWAP_DVP_SEED},
+    state::swap_dvp::{SwapDvp, MAX_REF_STRING_LEN, NONCE_TOMBSTONE_SEED, SWAP_DVP_SEED},
 };
 use pinocchio::{
     account::AccountView,
@@ -58,6 +58,12 @@ const MAX_DVP_DURATION_SECS: i64 = 365 * 24 * 60 * 60;
 /// * `amount_b` (u64) - Cash leg size
 /// * `expiry_timestamp` (i64) - After this, settlement is rejected
 /// * `nonce` (u64) - Disambiguates DvPs sharing all other seeds
+/// * `ref_string` (Option<String>) - Opaque client reference, at most
+///   `MAX_REF_STRING_LEN` bytes; stored zero-padded (None = all zeros)
+/// * `settlement_destination_a` (Option<Pubkey>) - Wallet receiving the
+///   cash leg at Settle; defaults to `user_a`
+/// * `settlement_destination_b` (Option<Pubkey>) - Wallet receiving the
+///   asset leg at Settle; defaults to `user_b`
 /// * `earliest_settlement_timestamp` (Option<i64>) - If set, settlement
 ///   is also rejected before this timestamp
 pub fn process_create_dvp(
@@ -163,6 +169,12 @@ pub fn process_create_dvp(
         amount_b: args.amount_b,
         expiry_timestamp: args.expiry_timestamp,
         nonce: args.nonce,
+        ref_string: args.ref_string,
+        // Resolve the destination defaults here (the consent point) so
+        // Settle never branches: delivery always goes to the stored
+        // destination's canonical ATA.
+        settlement_destination_a: args.settlement_destination_a.unwrap_or(args.user_a),
+        settlement_destination_b: args.settlement_destination_b.unwrap_or(args.user_b),
         earliest_settlement_timestamp: args.earliest_settlement_timestamp,
     };
     let (nonce_bytes, bump_bytes) = dvp.seed_buffers();
@@ -230,18 +242,28 @@ struct CreateDvpArgs {
     amount_b: u64,
     expiry_timestamp: i64,
     nonce: u64,
+    /// Zero-padded to the stored width at parse time; the wire length
+    /// prefix is consumed during parsing and never stored.
+    ref_string: [u8; MAX_REF_STRING_LEN],
+    settlement_destination_a: Option<Address>,
+    settlement_destination_b: Option<Address>,
     earliest_settlement_timestamp: Option<i64>,
 }
 
-/// Wire layout (variable, 97–105 bytes):
+/// Wire layout (variable, 100–240 bytes):
 ///   user_a(32) | user_b(32) |
 ///   amount_a(8) | amount_b(8) | expiry_timestamp(8) | nonce(8) |
+///   ref_tag(1) [ | ref_len(u32) | ref_bytes(0..=64) if tag == 1 ] |
+///   destination_a_tag(1) [ | destination_a(32) if tag == 1 ] |
+///   destination_b_tag(1) [ | destination_b(32) if tag == 1 ] |
 ///   earliest_tag(1) [ | earliest_payload(8) if tag == 1 ]
 ///
 /// Codama-style Option encoding: payload is omitted when tag == 0.
 fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
-    // Required prefix: two pubkeys + four u64/i64 fields + option tag.
-    require_len!(data, 32 * 2 + 8 * 4 + 1);
+    // Required prefix: two pubkeys + four u64/i64 fields + four option
+    // tags, so every tag read below is in bounds even when all options
+    // are None.
+    require_len!(data, 32 * 2 + 8 * 4 + 4);
 
     let mut offset = 0;
 
@@ -281,6 +303,66 @@ fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
     );
     offset += 8;
 
+    let ref_string = match data[offset] {
+        0 => {
+            offset += 1;
+            [0u8; MAX_REF_STRING_LEN]
+        }
+        1 => {
+            // Tag + u32 length prefix + the three remaining option tags.
+            require_len!(data, offset + 1 + 4 + 3);
+            let ref_string_wire_len = u32::from_le_bytes(
+                data[offset + 1..offset + 5]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            ) as usize;
+            require!(
+                ref_string_wire_len <= MAX_REF_STRING_LEN,
+                DvpSwapProgramError::RefStringTooLong
+            );
+            // The string bytes plus the three remaining option tags.
+            require_len!(data, offset + 5 + ref_string_wire_len + 3);
+            let mut ref_string = [0u8; MAX_REF_STRING_LEN];
+            ref_string[..ref_string_wire_len]
+                .copy_from_slice(&data[offset + 5..offset + 5 + ref_string_wire_len]);
+            offset += 5 + ref_string_wire_len;
+            ref_string
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
+    let settlement_destination_a = match data[offset] {
+        0 => {
+            offset += 1;
+            None
+        }
+        1 => {
+            // Tag + pubkey payload + the two remaining option tags.
+            require_len!(data, offset + 1 + 32 + 2);
+            let mut destination = [0u8; 32];
+            destination.copy_from_slice(&data[offset + 1..offset + 33]);
+            offset += 33;
+            Some(Address::new_from_array(destination))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
+    let settlement_destination_b = match data[offset] {
+        0 => {
+            offset += 1;
+            None
+        }
+        1 => {
+            // Tag + pubkey payload + the remaining option tag.
+            require_len!(data, offset + 1 + 32 + 1);
+            let mut destination = [0u8; 32];
+            destination.copy_from_slice(&data[offset + 1..offset + 33]);
+            offset += 33;
+            Some(Address::new_from_array(destination))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
     let earliest_settlement_timestamp = match data[offset] {
         0 => None,
         1 => {
@@ -301,6 +383,9 @@ fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
         amount_b,
         expiry_timestamp,
         nonce,
+        ref_string,
+        settlement_destination_a,
+        settlement_destination_b,
         earliest_settlement_timestamp,
     })
 }
@@ -355,6 +440,9 @@ mod tests {
             amount_b: 2_000,
             expiry_timestamp: NOW + 3_600,
             nonce: 0,
+            ref_string: [0u8; MAX_REF_STRING_LEN],
+            settlement_destination_a: None,
+            settlement_destination_b: None,
             earliest_settlement_timestamp: None,
         }
     }

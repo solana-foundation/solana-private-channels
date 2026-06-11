@@ -26,7 +26,7 @@ use crate::{
     state_utils::{
         assert_cancel_dvp, assert_create_dvp, assert_fund_a, assert_fund_a_amount, assert_fund_b,
         assert_fund_b_amount, assert_reclaim_a, assert_reject_dvp, assert_settle_dvp,
-        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE, REF_STRING,
     },
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, hook_extras_for_mint,
@@ -207,6 +207,7 @@ fn build_create_dvp_ix(
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction()
 }
 
@@ -532,8 +533,8 @@ fn test_settle_with_hook_on_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .destination_a_ata_b(fixture.user_a_ata_b)
+        .destination_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -728,8 +729,8 @@ fn test_settle_with_hook_and_surplus_on_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .destination_a_ata_b(fixture.user_a_ata_b)
+        .destination_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -825,8 +826,8 @@ fn test_settle_with_hooks_on_both_legs() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .destination_a_ata_b(fixture.user_a_ata_b)
+        .destination_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -870,8 +871,8 @@ fn test_settle_rejects_extras_count_overrun() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .destination_a_ata_b(fixture.user_a_ata_b)
+        .destination_b_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
