@@ -3,6 +3,9 @@ use tracing::debug;
 
 /// Instrumentation trait — each stage calls into this; no pipeline logic changes.
 pub trait StageMetrics: Send + Sync {
+    // RPC ingress
+    fn rpc_ingress_shed(&self);
+
     // Dedup
     fn dedup_received(&self);
     fn dedup_forwarded(&self);
@@ -52,6 +55,9 @@ pub type SharedMetrics = Arc<dyn StageMetrics>;
 pub struct NoopMetrics;
 
 impl StageMetrics for NoopMetrics {
+    fn rpc_ingress_shed(&self) {
+        debug!("rpc: ingress shed");
+    }
     fn dedup_received(&self) {
         debug!("dedup: received");
     }
@@ -136,6 +142,12 @@ impl StageMetrics for NoopMetrics {
 use private_channel_metrics::{counter_vec, gauge_vec, init_metrics};
 
 // Counters
+counter_vec!(
+    RPC_INGRESS_SHED,
+    "private_channel_rpc_ingress_shed_total",
+    "Transactions shed at RPC ingress because the dedup queue was full",
+    &[]
+);
 counter_vec!(
     DEDUP_RECEIVED,
     "private_channel_dedup_received_total",
@@ -298,6 +310,9 @@ histogram_vec!(
 pub struct PrometheusMetrics;
 
 impl StageMetrics for PrometheusMetrics {
+    fn rpc_ingress_shed(&self) {
+        RPC_INGRESS_SHED.with_label_values(&[] as &[&str]).inc();
+    }
     fn dedup_received(&self) {
         DEDUP_RECEIVED.with_label_values(&[] as &[&str]).inc();
     }
@@ -412,6 +427,7 @@ impl StageMetrics for PrometheusMetrics {
 /// Force-initialise all metric statics so they appear in /metrics from startup.
 pub fn init_prometheus_metrics() {
     init_metrics!(
+        RPC_INGRESS_SHED,
         DEDUP_RECEIVED,
         DEDUP_FORWARDED,
         DEDUP_DROPPED_DUP,

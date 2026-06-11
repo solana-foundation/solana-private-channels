@@ -1,17 +1,20 @@
 # Runbook - Withdrawal Pipeline Halt
 
-This runbook covers the **SMT-root-mismatch startup halt**. It is a
-deliberate fail-stop: on boot, the first release dispatch finds the local
-SMT root != the on-chain root, and the operator refuses to start the
-withdrawal pipeline rather than consume nonces against a tree it cannot
-reason about.
+This runbook covers the **SMT-root-mismatch boot pre-flight**. On startup a
+withdraw operator first reconciles any in-flight releases, then validates the
+local SMT root against the on-chain `withdrawal_transactions_root` **before**
+spawning the pipeline. The common cause - a release that landed on-chain whose
+`Completed` write was lost - is now **auto-reconciled** at boot from the durable
+release signature. The operator only refuses to start on an **unforeseen**
+divergence that the reconcile cannot resolve.
 
-This halt has **no dedicated "pipeline halted" alert**. It surfaces as
-repeated per-row `failed` webhooks whose `error_message` carries `SMT root
-mismatch` (each withdrawal dispatched after boot is marked `Failed` by
-`send_fatal_error`), plus the operator error logs. You recognize it by
-that pattern, not a single halt event, and it is not routed by the
-dispatch table in [`README.md`](README.md).
+This halt has **no dedicated "pipeline halted" alert**. A refuse-to-start
+surfaces as the operator process exiting at boot (a crash-loop under the
+supervisor) with `SMT root mismatch` in the error logs, and - if the divergence
+came from an in-flight row the reconcile quarantined - a `manual_review` webhook
+for that row. No withdrawal is ever marked `failed` by this path. Recognize it by
+the boot-time crash-loop plus the log markers, not a single halt event, and it is
+not routed by the dispatch table in [`README.md`](README.md).
 
 As with every runbook here, the recovery `UPDATE` statements are
 **bookkeeping, not fund movement** - see
@@ -22,70 +25,63 @@ is human-in-the-loop".
 
 ## SMT root mismatch on startup
 
-The terminal state of the best-effort release-signature persistence
-tradeoff at `indexer/src/operator/sender/transaction.rs` (the
-`insert_release_signature` site). When a release **lands on-chain** (the
-nonce is consumed and the Instance's `withdrawal_transactions_root`
-advances) but the operator crashes before writing `Completed` - and the
-best-effort signature insert had also failed - recovery correctly
-quarantines the row (`no broadcast signatures recorded; cannot verify
-release landed`), but the DB now has no record of that consumed nonce.
-The next boot rebuilds the local SMT without it and refuses to start the
-withdrawal pipeline.
+### What the operator does automatically
+
+On boot, before any withdrawal is fetched, locked, or processed, the operator:
+
+1. **Reconciles in-flight releases.** Every consumed nonce has a release
+   signature persisted **write-ahead** (before broadcast), so a release that
+   landed but never reached `Completed` is detected by an on-chain finality
+   check and promoted to `Completed` - re-recording the nonce. A row with no
+   recorded signature, or one the RPC cannot classify, is quarantined to
+   `manual_review` (never `failed`).
+2. **Validates** the rebuilt local SMT root against the on-chain root.
+
+If validation passes, the pipeline starts normally
+(`SMT root verification passed` in the logs). A residual mismatch the reconcile
+could not resolve is a **fail-closed refuse-to-start**: the operator returns an
+error and exits without consuming nonces against a tree it cannot reason about.
+This should never fire under the known cause (the write-ahead signature plus the
+boot reconcile close that gap); it guards an unforeseen divergence such as a
+program bug or a manual on-chain admin operation.
 
 ### Symptom
 
-- New withdrawals stop reaching `completed` - the release pipeline is
-  stalled. (`completed` itself fires no webhook, so the visible signal is
-  the failures below, not a missing success alert.)
-- Each withdrawal dispatched after boot is marked `Failed` and fires a
-  per-row `failed` webhook whose `error_message` contains `SMT root
-  mismatch` (`send_fatal_error` on the lazy `initialize_smt_state`). There
-  is **no dedicated halt-level alert** - recognize the halt by the
-  repeated `failed` + `SMT root mismatch` pattern, not a single event.
-- These rows did **not** actually fail; they are collateral and must be
-  re-armed once the mismatch is resolved (see Resolution).
+- The withdraw operator does not stay up: it exits at boot and the supervisor
+  restarts it in a loop. New withdrawals never reach `completed`.
+- The operator error logs carry `SMT root mismatch` at boot (see Detection).
+- **No** withdrawal row is marked `failed`. If the divergence originated from an
+  in-flight row, that single row is in `manual_review` with a recovery-worker
+  alert; no collateral rows exist.
 
 ### Detection
 
-`initialize_smt_state` (`indexer/src/operator/sender/state.rs`) compares
-the local SMT root against the on-chain `withdrawal_transactions_root`
-and, on mismatch, emits these `error!` markers before returning
-`Err(SmtRootMismatch)` (state.rs:122-137):
+`validate_smt_root` (`indexer/src/operator/sender/state.rs`) compares the local
+SMT root against the on-chain `withdrawal_transactions_root` and, on mismatch,
+emits an `error!` log carrying the instance, tree index, both roots, and the
+DB-derived nonces, e.g.:
 
 ```
-SMT root mismatch detected! Database out of sync with on-chain state.
-  Instance PDA: <pda>
-  Tree Index: <n>
-  Nonces from DB: [...]
-  Local root:    [...]
-  On-chain root: [...]
+SMT root mismatch: database out of sync with on-chain state. ...
+  instance=<pda> tree_index=<n>
+  local_root=[...] onchain_root=[...] nonces=[...]
 ```
 
-```
-This typically means:
-  1. A withdrawal was successfully processed on-chain
-  2. But the operator crashed before updating the database
-  3. The database is now missing transaction records
-```
-
-Grep the operator logs for `SMT root mismatch detected` to confirm.
+Grep the operator logs for `SMT root mismatch` to confirm, and check that the
+process is crash-looping at boot (not running with a halted pipeline).
 
 ### Diagnosis - find the consumed-but-unrecorded nonce
 
-The divergence direction is always the same here: a nonce was
+The divergence direction is the same as the known cause: a nonce was
 **consumed on-chain** (the on-chain root advanced) but is **missing
-`Completed` in the DB** (the DB is behind the chain). You must identify
-which nonce landed.
+`Completed` in the DB**. The boot reconcile already tried and failed to resolve
+it, so identify the nonce by hand.
 
-1. Read `Tree Index` from the log. The current tree window is
+1. Read `tree_index` from the log. The current tree window is
    `tree_index * MAX_TREE_LEAVES ..< (tree_index + 1) * MAX_TREE_LEAVES`
-   - the same window `initialize_smt_state` rebuilds from
-   `get_completed_withdrawal_nonces` (state.rs:94-102). Only nonces in
-   this window matter.
-2. Pull the withdrawal rows in that window that are NOT `completed`
-   (the candidates whose release may have landed without a `Completed`
-   write). The recovery quarantine reason is the strongest hint:
+   - the same `[min, max)` window `validate_smt_root` rebuilds from
+   `get_completed_withdrawal_nonces`. Only nonces in this window matter.
+2. Pull the withdrawal rows in that window that are NOT `completed`:
 
    ```sql
    SELECT id, withdrawal_nonce, status, counterpart_signature, updated_at
@@ -113,9 +109,9 @@ which nonce landed.
 ### Resolution - record the landed nonce, then restart
 
 Once on-chain verification proves a specific nonce landed, mark that row
-`Completed` with the observed signature. This re-inserts the missing
-nonce into the set `initialize_smt_state` rebuilds from, so the local
-root re-matches the on-chain root on the next boot.
+`Completed` with the observed signature. This re-inserts the missing nonce into
+the set `validate_smt_root` rebuilds from, so the local root re-matches the
+on-chain root on the next boot.
 
 ```sql
 UPDATE transactions
@@ -125,39 +121,21 @@ UPDATE transactions
  WHERE id = :transaction_id;
 ```
 
-Then restart the withdraw operator. On boot, `initialize_smt_state`
-rebuilds the SMT - now including the recorded nonce - and the root
-verification passes (`SMT root verification passed`).
+Then restart the withdraw operator. On boot, the pre-flight rebuilds the SMT -
+now including the recorded nonce - the root verification passes
+(`SMT root verification passed`), and the pipeline starts.
 
-This `UPDATE` is bookkeeping only: it does not move funds. The release
-already landed on-chain (that is what you verified); this statement only
-makes the operator's record agree with the chain so the pipeline can
-resume. Never run it without a `LANDED` verdict.
+This `UPDATE` is bookkeeping only: it does not move funds. The release already
+landed on-chain (that is what you verified); this statement only makes the
+operator's record agree with the chain so the pipeline can resume. Never run it
+without a `LANDED` verdict.
 
-**Re-arm the collateral rows.** Withdrawals dispatched during the halt
-were marked `Failed` by `send_fatal_error` but did not actually fail
-on-chain. Their failure reason is only in the alert webhook payload -
-`transactions` has no `error_message` column - so identify them by the
-halt window instead: `failed` withdrawals whose `processed_at` falls
-between the halting boot (the first `SMT root mismatch detected` log line)
-and this fix. Review the list before acting:
-
-```sql
-SELECT id, withdrawal_nonce, processed_at
-  FROM transactions
- WHERE transaction_type = 'withdrawal'
-   AND status = 'failed'
-   AND processed_at >= :halt_start_ts
- ORDER BY processed_at ASC;
-```
-
-Confirm each is a halt casualty (not a genuine on-chain failure), then
-re-arm the reviewed ids:
-
-```sql
-UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
- WHERE id = ANY(:reviewed_ids);
-```
+> **No collateral re-arm needed.** This path never marks withdrawals `failed`
+> (the SOLA2-21 fix routes SMT-init errors to leave the row `Processing`, never
+> `send_fatal_error`). There is no halt-window casualty list to re-arm - the only
+> row to act on is the verified-landed nonce above (and any single in-flight row
+> the reconcile quarantined to `manual_review`, handled by
+> [`withdrawal_manual_review.md`](withdrawal_manual_review.md)).
 
 ### Escalation
 

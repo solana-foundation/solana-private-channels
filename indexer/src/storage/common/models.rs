@@ -82,6 +82,10 @@ pub struct DbTransaction {
     /// `processing` -> `pending`) bumps this; the cap quarantines a row that
     /// can never progress instead of looping forever.
     pub recovery_requeue_attempts: i32,
+    /// Confirmed remint signature, written in the same UPDATE that flips status
+    /// to FailedReminted. A crash before the async writer runs can no longer
+    /// leave a landed remint recorded only as PendingRemint (which would replay).
+    pub landed_remint_signature: Option<String>,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -222,6 +226,7 @@ impl DbTransactionBuilder {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            landed_remint_signature: None,
         }
     }
 }

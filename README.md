@@ -289,7 +289,7 @@ make integration-test
 
 ### Docker stack
 
-The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in any secrets.
+The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` MUST be set (and `JWT_SECRET` if you enable auth, `ADMIN_PRIVATE_KEY` for the operator) or the stack fails to start. Generate strong values with `openssl rand -hex 32`.
 
 ```bash
 # Build all images
@@ -318,7 +318,9 @@ To enable auth, set `JWT_SECRET` in your `.env.local` and start with the `auth` 
 ```bash
 # Copy and configure env
 cp .env.example .env.local
-# Set JWT_SECRET=<your-secret> in .env.local
+# Required (no defaults shipped): set POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD in .env.local
+# Set JWT_SECRET=<your-secret> in .env.local to enable auth
+# Generate strong values with: openssl rand -hex 32
 
 # Start full stack including auth service
 docker compose --env-file versions.env --env-file .env.local --profile auth up

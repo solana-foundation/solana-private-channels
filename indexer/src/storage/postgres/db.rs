@@ -33,6 +33,7 @@ mod transaction_cols {
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
     pub const FINALITY_CHECK_ATTEMPTS: &str = "finality_check_attempts";
     pub const RECOVERY_REQUEUE_ATTEMPTS: &str = "recovery_requeue_attempts";
+    pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
 }
 
 #[derive(Clone)]
@@ -40,8 +41,27 @@ pub struct PostgresDb {
     pool: PgPool,
 }
 
+// Returns true when the URL parses and its password is absent or empty (a blanked secret).
+// Kept in sync with the identical guard in core's accounts/postgres.rs.
+fn database_url_password_is_blank(database_url: &str) -> bool {
+    match url::Url::parse(database_url) {
+        // None (no password) and Some("") (blanked secret) are both missing credentials.
+        Ok(parsed) => parsed.password().unwrap_or("").is_empty(),
+        // Leave unparseable URLs for sqlx to reject with the real connection error.
+        Err(_) => false,
+    }
+}
+
 impl PostgresDb {
     pub async fn new(config: &PostgresConfig) -> Result<Self, sqlx::Error> {
+        // Fail closed: reject a blank password before connecting (blanked env templates interpolate an empty ${POSTGRES_PASSWORD} into a passwordless URL).
+        if database_url_password_is_blank(&config.database_url) {
+            return Err(sqlx::Error::Configuration(
+                "database_url password component is empty; set a non-empty POSTGRES_PASSWORD"
+                    .into(),
+            ));
+        }
+
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.database_url)
@@ -234,6 +254,22 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("recovery_requeue_attempts migration complete");
+
+        // Confirmed remint signature, recorded synchronously after the remint
+        // confirms so a crash before the async writer cannot leave the row at
+        // pending_remint with a landed remint (which restart recovery replays).
+        info!("Running landed_remint_signature migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS landed_remint_signature TEXT;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("landed_remint_signature migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -671,7 +707,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -698,6 +734,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -720,7 +757,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -746,6 +783,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -768,7 +806,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -795,6 +833,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -857,7 +896,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -885,6 +924,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -958,7 +998,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -986,6 +1026,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -1137,6 +1178,57 @@ impl PostgresDb {
         .await?;
 
         if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        Ok(())
+    }
+
+    /// Durably record a confirmed remint: flip status to FailedReminted and
+    /// store the signature in one UPDATE, before the async writer runs. The
+    /// `pending_remint` guard makes it a no-op on an already-terminal row, so
+    /// a replayed call can never resurrect or double-record.
+    pub async fn record_remint_result_internal(
+        &self,
+        transaction_id: i64,
+        remint_signature: String,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET
+                status = $2,
+                landed_remint_signature = $3,
+                processed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+                AND status = 'pending_remint'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(TransactionStatus::FailedReminted)
+        .bind(remint_signature)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            // The guarded UPDATE matched nothing. Distinguish the two cases for
+            // on-call: a missing row is a bug (the id came from a live
+            // PendingRemint row), a non-pending_remint status is expected on an
+            // idempotent replay. Both still signal RowNotFound so the caller
+            // falls back to the async writer.
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+                    .bind(transaction_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            match current.as_deref() {
+                None => warn!("record_remint_result: transaction {transaction_id} not found"),
+                Some(status) => info!(
+                    "record_remint_result: transaction {transaction_id} not pending_remint \
+                     (status {status}); skipping"
+                ),
+            }
             return Err(sqlx::Error::RowNotFound);
         }
 
@@ -1534,5 +1626,36 @@ impl PostgresDb {
         .await?;
 
         Ok(nonces.into_iter().map(|(n,)| n).collect())
+    }
+}
+
+#[cfg(test)]
+mod password_guard_tests {
+    use super::database_url_password_is_blank;
+
+    #[test]
+    fn flags_blank_and_missing_password() {
+        // Set-but-empty password (blanked template) is flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://user:@host:5434/indexer"
+        ));
+        // No password at all is flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://user@host:5434/indexer"
+        ));
+        // No userinfo at all is flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://host:5434/indexer"
+        ));
+        // A real password is not blank.
+        assert!(!database_url_password_is_blank(
+            "postgres://user:secret@host:5434/indexer"
+        ));
+        // A percent-encoded password is a real, non-empty credential.
+        assert!(!database_url_password_is_blank(
+            "postgres://user:p%40ss@host:5434/indexer"
+        ));
+        // Unparseable URLs are not flagged; sqlx surfaces the real connect error.
+        assert!(!database_url_password_is_blank("not-a-valid-url"));
     }
 }

@@ -32,12 +32,30 @@ pub struct PostgresAccountsDB {
     pub read_only: bool,
 }
 
+/// Returns true when the URL parses and its password is absent or empty (a blanked secret).
+fn database_url_password_is_blank(database_url: &str) -> bool {
+    match url::Url::parse(database_url) {
+        // None (no password) and Some("") (blanked secret) are both missing credentials.
+        Ok(parsed) => parsed.password().unwrap_or("").is_empty(),
+        // Leave unparseable URLs for sqlx to reject with the real connection error.
+        Err(_) => false,
+    }
+}
+
 impl PostgresAccountsDB {
     pub async fn new(
         database_url: &str,
         read_only: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Parse URL to extract host/port without credentials
+        // Fail closed: reject a blank password before connecting (blanked env templates interpolate an empty ${POSTGRES_PASSWORD} into a passwordless URL).
+        if database_url_password_is_blank(database_url) {
+            return Err(
+                "database_url password component is empty; set a non-empty POSTGRES_PASSWORD"
+                    .into(),
+            );
+        }
+
+        // Parse URL to extract host/port without credentials for logging.
         let sanitized_url = if let Ok(parsed) = url::Url::parse(database_url) {
             let host = parsed.host_str().unwrap_or("unknown");
             let port = parsed.port().unwrap_or(5432);
@@ -356,6 +374,47 @@ mod tests {
         let invalid_url = "not-a-valid-url-at-all";
         let result = PostgresAccountsDB::new(invalid_url, false).await;
         assert!(result.is_err(), "Invalid URL should fail to connect");
+    }
+
+    /// database_url_password_is_blank flags blank/missing passwords and clears real ones.
+    #[test]
+    fn password_guard_classifies_urls() {
+        // Blanked secret interpolates to an empty password and must be flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://user:@localhost:5432/db"
+        ));
+        // No password component at all must be flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://user@localhost:5432/db"
+        ));
+        // No userinfo at all must be flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://localhost:5432/db"
+        ));
+        // A real password is not blank.
+        assert!(!database_url_password_is_blank(
+            "postgres://user:secret@localhost:5432/db"
+        ));
+        // A percent-encoded password (here '@' as %40) is still a real, non-empty password.
+        assert!(!database_url_password_is_blank(
+            "postgres://user:p%40ss@localhost:5432/db"
+        ));
+        // Unparseable URLs are not flagged here; sqlx surfaces the real connect error.
+        assert!(!database_url_password_is_blank("not-a-valid-url"));
+    }
+
+    /// PostgresAccountsDB::new must fail closed on a blank password before connecting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_rejects_empty_password_url() {
+        let empty_pw = PostgresAccountsDB::new("postgres://user:@localhost:5432/db", false).await;
+        assert!(empty_pw.is_err(), "empty password must be rejected");
+        assert!(empty_pw
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("password component is empty"));
+        let no_pw = PostgresAccountsDB::new("postgres://user@localhost:5432/db", false).await;
+        assert!(no_pw.is_err(), "missing password must be rejected");
     }
 
     /// Store an account via the production path and verify account_matches_owners.

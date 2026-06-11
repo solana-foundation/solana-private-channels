@@ -451,11 +451,41 @@ impl MockStorage {
         Ok(())
     }
 
+    /// Mirror `record_remint_result_internal`: flip a PendingRemint row to
+    /// FailedReminted and store the signature. The status guard means a row
+    /// that already moved on is RowNotFound, matching Postgres semantics.
+    /// Honors `should_fail("record_remint_result")`.
+    pub async fn record_remint_result(
+        &self,
+        transaction_id: i64,
+        remint_signature: String,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("record_remint_result")?;
+        let mut rows = self.pending_remint_transactions.lock().unwrap();
+        let row = rows
+            .iter_mut()
+            .find(|t| t.id == transaction_id && t.status == TransactionStatus::PendingRemint)
+            .ok_or_else(|| StorageError::DatabaseError {
+                message: format!("no PendingRemint row for id {transaction_id}"),
+            })?;
+        row.status = TransactionStatus::FailedReminted;
+        row.landed_remint_signature = Some(remint_signature);
+        row.processed_at = Some(Utc::now());
+        Ok(())
+    }
+
     pub async fn get_pending_remint_transactions(
         &self,
     ) -> Result<Vec<DbTransaction>, StorageError> {
+        // Match the Postgres query's status filter: a row that already moved to
+        // FailedReminted (via record_remint_result) is not re-hydrated, so a
+        // landed remint cannot be replayed on restart.
         let pending = self.pending_remint_transactions.lock().unwrap();
-        Ok(pending.clone())
+        Ok(pending
+            .iter()
+            .filter(|t| t.status == TransactionStatus::PendingRemint)
+            .cloned()
+            .collect())
     }
 
     pub async fn quarantine_all_active_withdrawals(

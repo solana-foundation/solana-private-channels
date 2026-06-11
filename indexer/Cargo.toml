@@ -59,6 +59,7 @@ private-channel-escrow-program-client = { workspace = true }
 private-channel-metrics = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-client = { version = "2.3.10" }

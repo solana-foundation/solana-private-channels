@@ -137,7 +137,7 @@ pub async fn warm_redis_cache(
 }
 
 pub struct SettleArgs {
-    pub execution_results_rx: mpsc::UnboundedReceiver<(
+    pub execution_results_rx: mpsc::Receiver<(
         LoadAndExecuteSanitizedTransactionsOutput,
         Vec<SanitizedTransaction>,
     )>,
@@ -169,7 +169,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
         async fn run_settle_worker(
-            mut execution_results_rx: mpsc::UnboundedReceiver<(
+            mut execution_results_rx: mpsc::Receiver<(
                 LoadAndExecuteSanitizedTransactionsOutput,
                 Vec<SanitizedTransaction>,
             )>,
@@ -669,6 +669,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
 
     fn make_executed(
         accounts: Vec<(solana_sdk::pubkey::Pubkey, AccountSharedData)>,
@@ -1175,7 +1177,7 @@ mod tests {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (_exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1206,7 +1208,7 @@ mod tests {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1239,7 +1241,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).unwrap();
+        exec_tx.send((output, vec![tx])).await.unwrap();
 
         // Wait for the blocktime tick to process and emit settlements
         let settlements =
@@ -1261,7 +1263,7 @@ mod tests {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1630,7 +1632,7 @@ mod tests {
         let (_db, pg_container) = start_test_postgres().await;
         let url = postgres_container_url(&pg_container, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (_settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (_settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1665,7 +1667,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).unwrap();
+        exec_tx.send((output, vec![tx])).await.unwrap();
 
         // Poll for perf sample with deadline instead of fixed sleep.
         // Perf tick fires after ~1s; poll every 100ms for up to 5s.
@@ -1691,7 +1693,7 @@ mod tests {
         let (_db, pg) = start_test_postgres().await;
         let url = postgres_container_url(&pg, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, address_signatures_rx) = mpsc::channel(8);
@@ -1729,7 +1731,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).unwrap();
+        exec_tx.send((output, vec![tx])).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
         assert!(

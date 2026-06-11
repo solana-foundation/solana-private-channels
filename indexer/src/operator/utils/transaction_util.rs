@@ -41,9 +41,24 @@ pub enum ConfirmationResult {
 /// * ReleaseFunds: Dual signers (admin as fee payer, operator for authorization)
 pub async fn sign_and_send_transaction(
     rpc_client: Arc<RpcClientWithRetry>,
-    mut ix_with_signers: InstructionWithSigners,
+    ix_with_signers: InstructionWithSigners,
     retry_policy: RetryPolicy,
 ) -> Result<(Signature, u64), TransactionError> {
+    let (transaction, signature, last_valid_block_height) =
+        build_and_sign(&rpc_client, ix_with_signers).await?;
+    send_signed(&rpc_client, &transaction, retry_policy).await?;
+    Ok((signature, last_valid_block_height))
+}
+
+/// Build and sign a transaction without broadcasting it.
+///
+/// Returns the signed transaction, its signature and the blockhash's
+/// `last_valid_block_height`. Splitting this from the send lets the release path
+/// persist the signature write-ahead before the broadcast.
+pub async fn build_and_sign(
+    rpc_client: &RpcClientWithRetry,
+    mut ix_with_signers: InstructionWithSigners,
+) -> Result<(Transaction, Signature, u64), TransactionError> {
     if let Some(compute_unit_price) = ix_with_signers.compute_unit_price {
         let compute_budget_ix =
             ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
@@ -76,12 +91,21 @@ pub async fn sign_and_send_transaction(
             .map_err(TransactionError::Signer)?;
     }
 
-    let signature = rpc_client
-        .send_transaction(&transaction, retry_policy)
-        .await
-        .map_err(TransactionError::Rpc)?;
+    let signature = transaction.signatures[0];
 
-    Ok((signature, last_valid_block_height))
+    Ok((transaction, signature, last_valid_block_height))
+}
+
+/// Broadcast an already-signed transaction.
+pub async fn send_signed(
+    rpc_client: &RpcClientWithRetry,
+    transaction: &Transaction,
+    retry_policy: RetryPolicy,
+) -> Result<Signature, TransactionError> {
+    rpc_client
+        .send_transaction(transaction, retry_policy)
+        .await
+        .map_err(TransactionError::Rpc)
 }
 
 /// Check transaction status with polling.
@@ -593,6 +617,46 @@ mod tests {
             matches!(result, Err(crate::error::TransactionError::Rpc(_))),
             "expected TransactionError::Rpc, got: {:?}",
             result
+        );
+    }
+
+    /// `build_and_sign` must return the signature embedded in the signed transaction (`signatures[0]`), so the write-ahead persist records the real on-chain signature.
+    #[tokio::test]
+    async fn build_and_sign_returns_first_transaction_signature() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m_hash = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                            "lastValidBlockHeight": 100
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let ix = make_instruction_with_empty_signers();
+
+        let (transaction, signature, _lvbh) = build_and_sign(&rpc_client, ix)
+            .await
+            .expect("build_and_sign");
+
+        assert_eq!(
+            signature, transaction.signatures[0],
+            "returned signature must be the transaction's first signature"
         );
     }
 }

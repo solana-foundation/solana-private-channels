@@ -27,6 +27,7 @@ use {
             send_transaction_impl::send_transaction_impl,
             simulate_transaction_impl::simulate_transaction,
         },
+        stage_metrics::SharedMetrics,
     },
     jsonrpsee::core::{async_trait, RpcResult},
     serde_json::Value,
@@ -63,7 +64,8 @@ pub struct ReadDeps {
 }
 
 pub struct WriteDeps {
-    pub dedup_tx: mpsc::UnboundedSender<SanitizedTransaction>,
+    pub dedup_tx: mpsc::Sender<SanitizedTransaction>,
+    pub metrics: SharedMetrics,
 }
 
 /// RPC implementation for PrivateChannel

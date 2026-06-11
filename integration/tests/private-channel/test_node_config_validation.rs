@@ -27,6 +27,11 @@ fn base_config(mode: NodeMode) -> NodeConfig {
         max_tx_per_batch: 8,
         batch_deadline_ms: 5,
         batch_channel_capacity: 4,
+        ingress_queue_capacity: private_channel_core::nodes::node::DEFAULT_INGRESS_QUEUE_CAPACITY,
+        sequencer_queue_capacity:
+            private_channel_core::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY,
+        execution_results_capacity:
+            private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 1,
         accountsdb_connection_url: "postgres://unused/private_channel".to_string(),
         admin_keys: vec![Keypair::new().pubkey()],

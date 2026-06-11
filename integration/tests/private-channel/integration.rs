@@ -251,6 +251,11 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         max_tx_per_batch: 32,
         batch_deadline_ms: 50,
         batch_channel_capacity: 16,
+        ingress_queue_capacity: private_channel_core::nodes::node::DEFAULT_INGRESS_QUEUE_CAPACITY,
+        sequencer_queue_capacity:
+            private_channel_core::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY,
+        execution_results_capacity:
+            private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url: accountsdb_connection_url.clone(),
         admin_keys: vec![operator_key.pubkey()],
