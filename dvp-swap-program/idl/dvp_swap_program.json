@@ -118,6 +118,20 @@
             },
             {
               "kind": "structFieldTypeNode",
+              "name": "settlementDestinationA",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "settlementDestinationB",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
               "name": "earliestSettlementTimestamp",
               "type": {
                 "item": {
@@ -420,15 +434,53 @@
             "kind": "instructionArgumentNode",
             "name": "refString",
             "type": {
-              "kind": "sizePrefixTypeNode",
+              "item": {
+                "kind": "sizePrefixTypeNode",
+                "prefix": {
+                  "endian": "le",
+                  "format": "u32",
+                  "kind": "numberTypeNode"
+                },
+                "type": {
+                  "encoding": "utf8",
+                  "kind": "stringTypeNode"
+                }
+              },
+              "kind": "optionTypeNode",
               "prefix": {
                 "endian": "le",
-                "format": "u32",
+                "format": "u8",
                 "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "settlementDestinationA",
+            "type": {
+              "item": {
+                "kind": "publicKeyTypeNode"
               },
-              "type": {
-                "encoding": "utf8",
-                "kind": "stringTypeNode"
+              "kind": "optionTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "settlementDestinationB",
+            "type": {
+              "item": {
+                "kind": "publicKeyTypeNode"
+              },
+              "kind": "optionTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
               }
             }
           },
@@ -610,21 +662,21 @@
           },
           {
             "docs": [
-              "user_a's ATA for mint_b; receives the cash leg"
+              "settlement_destination_a's ATA for mint_b; receives the cash leg (destination defaults to user_a)"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "userAAtaB"
+            "name": "destinationAAtaB"
           },
           {
             "docs": [
-              "user_b's ATA for mint_a; receives the asset leg"
+              "settlement_destination_b's ATA for mint_a; receives the asset leg (destination defaults to user_b)"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "userBAtaA"
+            "name": "destinationBAtaA"
           },
           {
             "docs": [

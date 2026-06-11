@@ -24,10 +24,11 @@ const FIXED_ACCOUNTS_LEN: usize = 13;
 
 /// Processes the SettleDvp instruction.
 ///
-/// Atomically delivers the asset leg to `user_b` (buyer) and the cash
-/// leg to `user_a` (seller), then closes the SwapDvp PDA and both
-/// escrow ATAs. Rent lamports from the three closed accounts are
-/// swept to the settlement authority.
+/// Atomically delivers the asset leg to `dvp.settlement_destination_b`
+/// (defaults to `user_b`, the buyer) and the cash leg to
+/// `dvp.settlement_destination_a` (defaults to `user_a`, the seller),
+/// then closes the SwapDvp PDA and both escrow ATAs. Rent lamports from
+/// the three closed accounts are swept to the settlement authority.
 ///
 /// Each leg transfers exactly `dvp.amount_x` to the counterparty. Any
 /// surplus held in the escrow above the leg amount (e.g. an over-deposit
@@ -48,8 +49,8 @@ const FIXED_ACCOUNTS_LEN: usize = 13;
 /// 3.  `[]` mint_b - Must equal `dvp.mint_b`
 /// 4.  `[writable]` dvp_ata_a - Escrow for the asset leg (drained, then closed)
 /// 5.  `[writable]` dvp_ata_b - Escrow for the cash leg (drained, then closed)
-/// 6.  `[writable]` user_a_ata_b - user_a's ATA for mint_b; receives the cash leg (caller must pre-initialize)
-/// 7.  `[writable]` user_b_ata_a - user_b's ATA for mint_a; receives the asset leg (caller must pre-initialize)
+/// 6.  `[writable]` destination_a_ata_b - dvp.settlement_destination_a's ATA for mint_b; receives the cash leg (caller must pre-initialize). The destination defaults to user_a at Create.
+/// 7.  `[writable]` destination_b_ata_a - dvp.settlement_destination_b's ATA for mint_a; receives the asset leg (caller must pre-initialize). Defaults to user_b.
 /// 8.  `[writable]` user_a_ata_a - user_a's ATA for mint_a; receives any asset-leg surplus refund. Required: anyone can dust the escrow, so a surplus refund can always fire — a missing ATA reverts the whole Settle. Pre-initialize it.
 /// 9.  `[writable]` user_b_ata_b - user_b's ATA for mint_b; receives any cash-leg surplus refund. Required: same as user_a_ata_a — pre-initialize it.
 /// 10. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
@@ -72,7 +73,7 @@ pub fn process_settle_dvp(
 ) -> ProgramResult {
     let (fixed, leg_a_extras, leg_b_extras) =
         split_leg_remaining_accounts(accounts, instruction_data, FIXED_ACCOUNTS_LEN)?;
-    let [settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, user_a_ata_b_info, user_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info, memo_program_info] =
+    let [settlement_authority_info, swap_dvp_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, destination_a_ata_b_info, destination_b_ata_a_info, user_a_ata_a_info, user_b_ata_b_info, token_program_a_info, token_program_b_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -108,10 +109,12 @@ pub fn process_settle_dvp(
         require!(now >= earliest, DvpSwapProgramError::SettlementTooEarly);
     }
 
-    // All six ATAs must be canonical. Note the cross at Settle: each user
-    // receives the *other* leg's mint, so user_a pairs with mint_b and
-    // user_b pairs with mint_a. The surplus refund ATAs follow the
-    // Cancel/Reject pairing (each user gets their own mint back).
+    // All six ATAs must be canonical. Note the cross at Settle: each
+    // side receives the *other* leg's mint, so destination_a (user_a's
+    // proceeds wallet, defaulted to user_a at Create) pairs with mint_b
+    // and destination_b with mint_a. The surplus refund ATAs follow the
+    // Cancel/Reject pairing (each *user* gets their own mint back —
+    // destinations receive settlement proceeds only, never refunds).
     // dvp_ata_a: DvP PDA's escrow for mint_a (asset, drained to user_b).
     verify_canonical_ata(
         dvp_ata_a_info,
@@ -126,17 +129,19 @@ pub fn process_settle_dvp(
         &dvp.mint_b,
         token_program_b_info,
     )?;
-    // user_a_ata_b: seller's ATA for mint_b — receives the cash leg.
+    // destination_a_ata_b: destination_a's ATA for mint_b — receives
+    // the cash leg.
     verify_canonical_ata(
-        user_a_ata_b_info,
-        &dvp.user_a,
+        destination_a_ata_b_info,
+        &dvp.settlement_destination_a,
         &dvp.mint_b,
         token_program_b_info,
     )?;
-    // user_b_ata_a: buyer's ATA for mint_a — receives the asset leg.
+    // destination_b_ata_a: destination_b's ATA for mint_a — receives
+    // the asset leg.
     verify_canonical_ata(
-        user_b_ata_a_info,
-        &dvp.user_b,
+        destination_b_ata_a_info,
+        &dvp.settlement_destination_b,
         &dvp.mint_a,
         token_program_a_info,
     )?;
@@ -186,7 +191,7 @@ pub fn process_settle_dvp(
     transfer_checked_cpi(
         dvp_ata_b_info,
         mint_b_info,
-        user_a_ata_b_info,
+        destination_a_ata_b_info,
         swap_dvp_info,
         dvp.amount_b,
         decimals_b,
@@ -199,7 +204,7 @@ pub fn process_settle_dvp(
     transfer_checked_cpi(
         dvp_ata_a_info,
         mint_a_info,
-        user_b_ata_a_info,
+        destination_b_ata_a_info,
         swap_dvp_info,
         dvp.amount_a,
         decimals_a,

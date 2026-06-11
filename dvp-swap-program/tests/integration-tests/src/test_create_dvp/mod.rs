@@ -397,6 +397,40 @@ fn test_create_dvp_stores_ref_string() {
     assert_eq!(dvp.amount_a, AMOUNT_A);
     assert_eq!(dvp.amount_b, AMOUNT_B);
     assert_eq!(dvp.earliest_settlement_timestamp, None);
+    // Destinations were not provided, so they resolved to the users.
+    assert_eq!(dvp.settlement_destination_a, fixture.user_a.pubkey());
+    assert_eq!(dvp.settlement_destination_b, fixture.user_b.pubkey());
+}
+
+/// `ref_string` is optional: omitting it stores all zeros.
+#[test]
+fn test_create_dvp_without_ref_string_stores_zeros() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .instruction();
+    context.send(ix, &[]).expect("CreateDvp without ref_string");
+
+    let account = context.get_account(&fixture.swap_dvp).expect("SwapDvp");
+    let dvp = SwapDvp::from_bytes(&account.data).expect("client must decode the account");
+    assert_eq!(dvp.ref_string, [0u8; 64]);
 }
 
 #[test]
