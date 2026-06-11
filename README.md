@@ -258,6 +258,25 @@ docker compose build --no-cache <service>
 docker builder prune -af
 ```
 
+### Building on Apple Silicon (M-series Macs)
+
+The Dockerfile pins the build platform to `linux/amd64`, so Apple Silicon hosts build through x86_64 emulation. By default this uses QEMU, which can be unstable for heavy Rust compilation, `rustc` may crash with `SIGSEGV` during `cargo build --release` under memory pressure.
+
+To build successfully on Apple Silicon:
+
+1. **Enable Rosetta emulation** (recommended): Docker Desktop → Settings → General → check **"Use Rosetta for x86/amd64 emulation on Apple Silicon"**. Rosetta tends to be more stable than QEMU for Rust builds.
+
+2. **Increase Docker memory**: Docker Desktop → Settings → Resources → Memory to at least **8 GB** (12 GB recommended). Rust compilation under emulation is memory-hungry, and the default 2-4 GB allocation can cause `SIGSEGV` or OOM during the build.
+
+3. **If builds still fail**, try sequential builds to further reduce memory pressure:
+
+```bash
+    docker compose --env-file .env.devnet -f docker-compose.devnet.yml build --parallel=false
+```
+
+These settings are not required on Intel Macs or x86_64 Linux hosts, where the build runs natively without emulation. The same memory guidance also applies to any low-memory host (e.g. CI runners with <8 GB RAM) that hits `SIGSEGV` or OOM during `cargo build --release`.
+
+
 ### Building a single Dockerfile standalone
 
 Compose loads [`versions.env`](versions.env) automatically; standalone `docker build` doesn't. Source the file first so the build args are available, then pass only the args that the Dockerfile declares:
