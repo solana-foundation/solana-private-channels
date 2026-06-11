@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::string::String;
 use codama::CodamaInstructions;
 use pinocchio::Address as Pubkey;
 
@@ -89,6 +90,10 @@ pub enum DvpSwapProgramInstruction {
         expiry_timestamp: i64,
         /// Disambiguates DvPs sharing all other seeds.
         nonce: u64,
+        /// Opaque client reference (e.g. an off-chain order ID), at most
+        /// `MAX_REF_STRING_LEN` (64) bytes. Stored zero-padded on the
+        /// SwapDvp; the program never reads it.
+        ref_string: String,
         /// If set, settlement is also rejected before this timestamp.
         earliest_settlement_timestamp: Option<i64>,
     } = 0,

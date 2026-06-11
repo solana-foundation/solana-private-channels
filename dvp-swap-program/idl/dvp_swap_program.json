@@ -102,6 +102,22 @@
             },
             {
               "kind": "structFieldTypeNode",
+              "name": "refString",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 64
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
               "name": "earliestSettlementTimestamp",
               "type": {
                 "item": {
@@ -215,6 +231,12 @@
         "kind": "errorNode",
         "message": "DvP expiry is too far in the future",
         "name": "expiryTooFarInFuture"
+      },
+      {
+        "code": 15,
+        "kind": "errorNode",
+        "message": "ref string exceeds the maximum byte length",
+        "name": "refStringTooLong"
       }
     ],
     "instructions": [
@@ -392,6 +414,22 @@
               "endian": "le",
               "format": "u64",
               "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "refString",
+            "type": {
+              "kind": "sizePrefixTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u32",
+                "kind": "numberTypeNode"
+              },
+              "type": {
+                "encoding": "utf8",
+                "kind": "stringTypeNode"
+              }
             }
           },
           {

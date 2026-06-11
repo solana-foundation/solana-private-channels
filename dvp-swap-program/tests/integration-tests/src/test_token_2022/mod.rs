@@ -26,7 +26,7 @@ use crate::{
     state_utils::{
         assert_cancel_dvp, assert_create_dvp, assert_fund_a, assert_fund_a_amount, assert_fund_b,
         assert_fund_b_amount, assert_reclaim_a, assert_reject_dvp, assert_settle_dvp,
-        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE, REF_STRING,
     },
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, hook_extras_for_mint,
@@ -207,6 +207,7 @@ fn build_create_dvp_ix(
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction()
 }
 

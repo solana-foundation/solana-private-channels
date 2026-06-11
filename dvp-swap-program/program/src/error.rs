@@ -72,6 +72,10 @@ pub enum DvpSwapProgramError {
     /// creation time, which would lock escrow rent for an unbounded term.
     #[error("DvP expiry is too far in the future")]
     ExpiryTooFarInFuture,
+
+    /// (15) `ref_string` exceeds `MAX_REF_STRING_LEN` bytes.
+    #[error("ref string exceeds the maximum byte length")]
+    RefStringTooLong,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {

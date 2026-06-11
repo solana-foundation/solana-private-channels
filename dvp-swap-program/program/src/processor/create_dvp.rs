@@ -9,7 +9,7 @@ use crate::{
     processor::shared::pda_utils::create_pda_account,
     processor::shared::token_utils::{validate_mint_extensions, verify_canonical_ata},
     require, require_len,
-    state::swap_dvp::{SwapDvp, NONCE_TOMBSTONE_SEED, SWAP_DVP_SEED},
+    state::swap_dvp::{SwapDvp, MAX_REF_STRING_LEN, NONCE_TOMBSTONE_SEED, SWAP_DVP_SEED},
 };
 use pinocchio::{
     account::AccountView,
@@ -58,6 +58,8 @@ const MAX_DVP_DURATION_SECS: i64 = 365 * 24 * 60 * 60;
 /// * `amount_b` (u64) - Cash leg size
 /// * `expiry_timestamp` (i64) - After this, settlement is rejected
 /// * `nonce` (u64) - Disambiguates DvPs sharing all other seeds
+/// * `ref_string` (String) - Opaque client reference, at most
+///   `MAX_REF_STRING_LEN` bytes; stored zero-padded
 /// * `earliest_settlement_timestamp` (Option<i64>) - If set, settlement
 ///   is also rejected before this timestamp
 pub fn process_create_dvp(
@@ -163,6 +165,7 @@ pub fn process_create_dvp(
         amount_b: args.amount_b,
         expiry_timestamp: args.expiry_timestamp,
         nonce: args.nonce,
+        ref_string: args.ref_string,
         earliest_settlement_timestamp: args.earliest_settlement_timestamp,
     };
     let (nonce_bytes, bump_bytes) = dvp.seed_buffers();
@@ -230,18 +233,23 @@ struct CreateDvpArgs {
     amount_b: u64,
     expiry_timestamp: i64,
     nonce: u64,
+    /// Zero-padded to the stored width at parse time; the wire length
+    /// prefix is consumed during parsing and never stored.
+    ref_string: [u8; MAX_REF_STRING_LEN],
     earliest_settlement_timestamp: Option<i64>,
 }
 
-/// Wire layout (variable, 97–105 bytes):
+/// Wire layout (variable, 101–173 bytes):
 ///   user_a(32) | user_b(32) |
 ///   amount_a(8) | amount_b(8) | expiry_timestamp(8) | nonce(8) |
+///   ref_string: u32 len prefix + bytes (Codama String encoding) |
 ///   earliest_tag(1) [ | earliest_payload(8) if tag == 1 ]
 ///
 /// Codama-style Option encoding: payload is omitted when tag == 0.
 fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
-    // Required prefix: two pubkeys + four u64/i64 fields + option tag.
-    require_len!(data, 32 * 2 + 8 * 4 + 1);
+    // Required prefix: two pubkeys + four u64/i64 fields + ref string
+    // length prefix + option tag.
+    require_len!(data, 32 * 2 + 8 * 4 + 4 + 1);
 
     let mut offset = 0;
 
@@ -281,6 +289,22 @@ fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
     );
     offset += 8;
 
+    let ref_string_wire_len = u32::from_le_bytes(
+        data[offset..offset + 4]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    ) as usize;
+    offset += 4;
+    require!(
+        ref_string_wire_len <= MAX_REF_STRING_LEN,
+        DvpSwapProgramError::RefStringTooLong
+    );
+    // The string bytes plus the option tag must still fit.
+    require_len!(data, offset + ref_string_wire_len + 1);
+    let mut ref_string = [0u8; MAX_REF_STRING_LEN];
+    ref_string[..ref_string_wire_len].copy_from_slice(&data[offset..offset + ref_string_wire_len]);
+    offset += ref_string_wire_len;
+
     let earliest_settlement_timestamp = match data[offset] {
         0 => None,
         1 => {
@@ -301,6 +325,7 @@ fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
         amount_b,
         expiry_timestamp,
         nonce,
+        ref_string,
         earliest_settlement_timestamp,
     })
 }
@@ -355,6 +380,7 @@ mod tests {
             amount_b: 2_000,
             expiry_timestamp: NOW + 3_600,
             nonce: 0,
+            ref_string: [0u8; MAX_REF_STRING_LEN],
             earliest_settlement_timestamp: None,
         }
     }

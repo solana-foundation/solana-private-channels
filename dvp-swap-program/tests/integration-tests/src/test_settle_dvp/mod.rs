@@ -6,6 +6,7 @@ use crate::{
     state_utils::{
         assert_create_dvp, assert_fund_a, assert_fund_a_amount, assert_fund_b,
         assert_fund_b_amount, assert_settle_dvp, setup_dvp, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        REF_STRING,
     },
     utils::{
         assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
@@ -371,6 +372,7 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .earliest_settlement_timestamp(earliest)
         .instruction();
     context
@@ -523,6 +525,7 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(first_dvp.expiry)
         .nonce(second_nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
     context
         .send(create_second, &[])

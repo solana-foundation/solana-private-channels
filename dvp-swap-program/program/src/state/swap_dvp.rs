@@ -12,6 +12,9 @@ pub const SWAP_DVP_SEED: &[u8] = b"dvp";
 /// `(seeds, nonce)` PDA address as used so it can't be re-instantiated.
 pub const NONCE_TOMBSTONE_SEED: &[u8] = b"nonce";
 
+/// Max byte length of `ref_string` (the stored buffer size).
+pub const MAX_REF_STRING_LEN: usize = 64;
+
 /// Atomic DvP escrow for a P2P token swap.
 ///
 /// `user_a` (seller) delivers `amount_a` of `mint_a` (the asset);
@@ -41,6 +44,11 @@ pub struct SwapDvp {
     /// Cluster time (`Clock::unix_timestamp`), not wall-clock. See README.
     pub expiry_timestamp: i64,
     pub nonce: u64,
+    /// Opaque client reference (e.g. an off-chain order ID), stored as
+    /// UTF-8 zero-padded to the right (`MAX_REF_STRING_LEN` bytes);
+    /// clients trim trailing zeros to recover the string. The program
+    /// never reads it.
+    pub ref_string: [u8; 64],
     /// `None` = settlement allowed any time before `expiry_timestamp`.
     /// `Some(t)` = additionally requires `now >= t`.
     pub earliest_settlement_timestamp: Option<i64>,
@@ -50,6 +58,7 @@ impl SwapDvp {
     pub const LEN: usize = 1   // bump
         + 32 * 7               // user_a, user_b, mint_a, mint_b, settlement_authority, token_program_a, token_program_b
         + 8 * 4                // amount_a, amount_b, expiry_timestamp, nonce
+        + MAX_REF_STRING_LEN   // ref_string (zero-padded)
         + 1 + 8; // earliest_settlement_timestamp (opt)
 
     /// Owned `(nonce, bump)` byte buffers. Bind to a local so
@@ -90,6 +99,7 @@ impl SwapDvp {
         data.extend_from_slice(&self.amount_b.to_le_bytes());
         data.extend_from_slice(&self.expiry_timestamp.to_le_bytes());
         data.extend_from_slice(&self.nonce.to_le_bytes());
+        data.extend_from_slice(&self.ref_string);
 
         match self.earliest_settlement_timestamp {
             Some(timestamp) => {
@@ -192,6 +202,11 @@ impl SwapDvp {
         );
         offset += 8;
 
+        let ref_string: [u8; MAX_REF_STRING_LEN] = data[offset..offset + MAX_REF_STRING_LEN]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        offset += MAX_REF_STRING_LEN;
+
         // Tag is the source of truth; the payload after a `0` tag is a
         // sentinel (see `to_bytes`) and is intentionally not validated.
         let earliest_settlement_timestamp = match data[offset] {
@@ -217,6 +232,7 @@ impl SwapDvp {
             amount_b,
             expiry_timestamp,
             nonce,
+            ref_string,
             earliest_settlement_timestamp,
         })
     }
@@ -245,11 +261,12 @@ mod tests {
             amount_b: 2_500,
             expiry_timestamp: 1_780_000_000,
             nonce: 42,
+            ref_string: [8u8; 64],
             earliest_settlement_timestamp: None,
         };
         let mut bytes = dvp.to_bytes();
-        // Tag offset = bump(1) + 7*pubkey(224) + 4*u64-or-i64(32) = 257.
-        let option_tag_offset = 1 + 32 * 7 + 8 * 4;
+        // Tag offset = bump(1) + 7*pubkey(224) + 4*u64-or-i64(32) + ref_string(64) = 321.
+        let option_tag_offset = 1 + 32 * 7 + 8 * 4 + MAX_REF_STRING_LEN;
         bytes[option_tag_offset] = 2;
         let err = SwapDvp::try_from_bytes(&bytes).expect_err("must reject invalid tag");
         assert!(matches!(err, ProgramError::InvalidAccountData));
