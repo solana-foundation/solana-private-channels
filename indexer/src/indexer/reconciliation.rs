@@ -12,24 +12,25 @@
 //! Only completed withdrawals (`release_funds`) reduce the ATA balance.
 //!
 //! Flow:
-//! 1. Query the DB for per-mint aggregate balances (all deposits − completed withdrawals).
-//! 2. Derive the escrow ATA for each mint (instance PDA + mint + token program).
-//! 3. Fetch the live ATA balance via RPC.
+//! 1. Sweep the escrow instance's on-chain token accounts, summed per mint.
+//! 2. Query the DB for per-mint aggregate balances (all deposits − completed withdrawals).
+//! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
 //! 4. If any |on_chain - db_expected| > threshold → log error, emit alert, abort startup.
 //! 5. If any mismatch ≤ threshold (but > 0) → log warning, continue.
-//! 6. If all balanced → log info, continue.
+//! 6. If all balanced (or both sides empty) → log info, continue.
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
-    operator::{rpc_util::RpcClientWithRetry, RetryConfig, RetryPolicy},
+    operator::{
+        escrow_sweep::fetch_escrow_balances_by_mint, rpc_util::RpcClientWithRetry, RetryConfig,
+    },
     storage::common::amount::{net_to_u64, NetBalance},
+    storage::common::models::MintDbBalance,
     storage::Storage,
 };
-use private_channel_core::rpc::error::INVALID_PARAMS_CODE;
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
-use spl_associated_token_account::get_associated_token_address_with_program_id;
-use std::str::FromStr;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{error, info, warn};
 
 /// Per-mint result produced during reconciliation.
@@ -97,58 +98,62 @@ pub async fn run_startup_reconciliation(
         CommitmentConfig::finalized(),
     );
 
+    // The on-chain sweep is the authoritative custody view.
+    let on_chain_balances = fetch_escrow_balances_by_mint(&rpc_client, instance_pda)
+        .await
+        .map_err(|e| ReconciliationError::Rpc {
+            mint: instance_pda.to_string(),
+            reason: e.reason,
+        })?;
+
     let mint_balances = storage
         .get_mint_balances_for_reconciliation()
         .await
         .map_err(ReconciliationError::Storage)?;
 
-    if mint_balances.is_empty() {
-        info!("No mints in storage; reconciliation passed (empty state)");
+    let results = build_reconciliation_set(&mint_balances, &on_chain_balances);
+
+    if results.is_empty() {
+        // Reached only when both the escrow sweep and the DB are genuinely empty, i.e. a truly-first deploy.
+        info!("Both on-chain escrow and DB are empty; reconciliation passed (empty state)");
         return Ok(());
     }
 
     info!(
-        mint_count = mint_balances.len(),
-        "Comparing DB totals against on-chain escrow ATA balances"
+        mint_count = results.len(),
+        "Comparing DB totals against on-chain escrow balances"
     );
 
-    let mut results = Vec::with_capacity(mint_balances.len());
+    classify_and_report(config, &results)
+}
 
-    for balance in &mint_balances {
-        let mint_pk = Pubkey::from_str(&balance.mint_address).map_err(|e| {
-            ReconciliationError::InvalidPubkey {
-                pubkey: balance.mint_address.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+/// Build the per-mint reconciliation set from the union of (DB mints) and
+/// (on-chain escrow mints). A mint present on only one side compares against 0
+/// on the other; an empty result means both sides are genuinely empty.
+fn build_reconciliation_set(
+    db_balances: &[MintDbBalance],
+    on_chain_balances: &HashMap<Pubkey, u64>,
+) -> Vec<MintReconciliation> {
+    // Keyed by mint string so the DB side (String addresses) and on-chain side
+    // (Pubkey) merge into one universe; BTreeMap keeps the order deterministic.
+    let mut by_mint: BTreeMap<String, (u64, u64)> = BTreeMap::new();
 
-        let token_program_pk = Pubkey::from_str(&balance.token_program).map_err(|e| {
-            ReconciliationError::InvalidPubkey {
-                pubkey: balance.token_program.clone(),
-                reason: e.to_string(),
-            }
-        })?;
-
-        let instance_ata = get_associated_token_address_with_program_id(
-            &instance_pda,
-            &mint_pk,
-            &token_program_pk,
-        );
-
-        let on_chain_actual =
-            fetch_ata_balance(&rpc_client, &instance_ata, &balance.mint_address).await?;
-
+    for balance in db_balances {
         let net = &balance.total_deposits - &balance.total_withdrawals;
-        let db_expected = net_db_expected(&net, &balance.mint_address);
-
-        results.push(MintReconciliation::new(
-            balance.mint_address.clone(),
-            db_expected,
-            on_chain_actual,
-        ));
+        by_mint.entry(balance.mint_address.clone()).or_default().0 =
+            net_db_expected(&net, &balance.mint_address);
     }
 
-    classify_and_report(config, &results)
+    for (mint, on_chain) in on_chain_balances {
+        by_mint.entry(mint.to_string()).or_default().1 = *on_chain;
+    }
+
+    by_mint
+        .into_iter()
+        .map(|(mint, (db_expected, on_chain_actual))| {
+            MintReconciliation::new(mint, db_expected, on_chain_actual)
+        })
+        .collect()
 }
 
 /// Log deposit rows whose mint was not allowed at the deposit's slot.
@@ -173,76 +178,6 @@ async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
                 e
             );
         }
-    }
-}
-
-/// Fetch the raw token balance for an ATA.
-///
-/// Returns `Ok(0)` if the account does not exist yet (valid before the first
-/// deposit for that mint). "Not found" is handled inside the retry closure as
-/// `Ok(None)` so it is never retried — only genuine transient failures are
-/// retried with exponential backoff.
-async fn fetch_ata_balance(
-    rpc_client: &RpcClientWithRetry,
-    ata: &Pubkey,
-    mint_address: &str,
-) -> Result<u64, IndexerError> {
-    let rpc = rpc_client.rpc_client.clone();
-    let ata = *ata;
-
-    let result = rpc_client
-        .with_retry("get_token_account_balance", RetryPolicy::Idempotent, || {
-            let rpc = rpc.clone();
-            async move {
-                match rpc.get_token_account_balance(&ata).await {
-                    Ok(ui_amount) => Ok(Some(ui_amount)),
-                    Err(e) if is_account_not_found(&e) => Ok(None),
-                    Err(e) => Err(e),
-                }
-            }
-        })
-        .await;
-
-    match result {
-        Ok(Some(ui_amount)) => ui_amount.amount.parse::<u64>().map_err(|e| {
-            IndexerError::Reconciliation(ReconciliationError::Rpc {
-                mint: mint_address.to_string(),
-                reason: format!(
-                    "Failed to parse token balance '{}': {}",
-                    ui_amount.amount, e
-                ),
-            })
-        }),
-        Ok(None) => Ok(0),
-        Err(e) => Err(IndexerError::Reconciliation(ReconciliationError::Rpc {
-            mint: mint_address.to_string(),
-            reason: e.to_string(),
-        })),
-    }
-}
-
-/// Returns true when the RPC error indicates the account simply does not exist.
-///
-/// Uses structured `ErrorKind` inspection rather than raw string matching:
-/// - Primary: `INVALID_PARAMS_CODE` (`-32602`, JSON-RPC "Invalid params"), which
-///   is what Solana validators return for a missing account.
-/// - Fallback: substring match on the error message for non-standard RPC
-///   providers that may emit the same wording with a different code.
-///
-/// This function only receives errors from `rpc.get_token_account_balance`, so
-/// it cannot be triggered by a DB error — DB failures propagate as a different
-/// error type entirely and never reach this function.
-fn is_account_not_found(e: &solana_rpc_client_api::client_error::Error) -> bool {
-    use solana_rpc_client_api::{client_error::ErrorKind, request::RpcError};
-
-    if let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) = &e.kind {
-        if *code == INVALID_PARAMS_CODE as i64 {
-            return true;
-        }
-        let msg = message.to_lowercase();
-        msg.contains("could not find account") || msg.contains("account not found")
-    } else {
-        false
     }
 }
 
@@ -400,74 +335,6 @@ mod tests {
     }
 
     // =========================================================================
-    // is_account_not_found tests
-    // =========================================================================
-
-    fn make_rpc_response_error(
-        code: i64,
-        message: &str,
-    ) -> solana_rpc_client_api::client_error::Error {
-        use solana_rpc_client_api::{
-            client_error::ErrorKind,
-            request::{RpcError, RpcResponseErrorData},
-        };
-        ErrorKind::RpcError(RpcError::RpcResponseError {
-            code,
-            message: message.to_string(),
-            data: RpcResponseErrorData::Empty,
-        })
-        .into()
-    }
-
-    #[test]
-    fn test_is_account_not_found_by_code() {
-        // INVALID_PARAMS_CODE matches regardless of message wording
-        let err = make_rpc_response_error(
-            INVALID_PARAMS_CODE as i64,
-            "Invalid param: some unrecognized wording",
-        );
-        assert!(is_account_not_found(&err));
-    }
-
-    #[test]
-    fn test_is_account_not_found_standard_message() {
-        // Standard Solana validator message — also matches via INVALID_PARAMS_CODE
-        let err = make_rpc_response_error(
-            INVALID_PARAMS_CODE as i64,
-            "Invalid param: could not find account",
-        );
-        assert!(is_account_not_found(&err));
-    }
-
-    #[test]
-    fn test_is_account_not_found_message_fallback() {
-        // Non-standard provider: different code but recognizable message
-        let err = make_rpc_response_error(-32000, "could not find account");
-        assert!(is_account_not_found(&err));
-    }
-
-    #[test]
-    fn test_is_account_not_found_account_not_found_variant() {
-        // Alternative message wording — message fallback
-        let err = make_rpc_response_error(-32000, "account not found");
-        assert!(is_account_not_found(&err));
-    }
-
-    #[test]
-    fn test_is_account_not_found_unrelated_error() {
-        // Unrelated RPC error — should not match
-        let err = make_rpc_response_error(-32005, "Node is unhealthy");
-        assert!(!is_account_not_found(&err));
-    }
-
-    #[test]
-    fn test_is_account_not_found_non_rpc_error() {
-        use solana_rpc_client_api::client_error::ErrorKind;
-        let err = ErrorKind::Custom("connection refused".to_string()).into();
-        assert!(!is_account_not_found(&err));
-    }
-
-    // =========================================================================
     // classify_and_report tests
     // =========================================================================
 
@@ -588,170 +455,78 @@ mod tests {
     }
 
     // =========================================================================
-    // run_startup_reconciliation skip / pass tests
+    // build_reconciliation_set (union) tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn test_reconciliation_skipped_for_withdraw_program() {
-        let config = ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-        };
-
-        #[cfg(test)]
-        {
-            use crate::storage::common::storage::mock::MockStorage;
-            let storage = Storage::Mock(MockStorage::new());
-            let seed = Pubkey::new_unique();
-
-            let result = run_startup_reconciliation(
-                &config,
-                ProgramType::Withdraw,
-                &storage,
-                "http://localhost:8899",
-                &seed,
-            )
-            .await;
-
-            assert!(result.is_ok());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_reconciliation_empty_mints_passes() {
-        let config = ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-        };
-
-        #[cfg(test)]
-        {
-            use crate::storage::common::storage::mock::MockStorage;
-            // Empty mock: no mints → should pass immediately
-            let storage = Storage::Mock(MockStorage::new());
-            let seed = Pubkey::new_unique();
-
-            let result = run_startup_reconciliation(
-                &config,
-                ProgramType::Escrow,
-                &storage,
-                "http://localhost:8899",
-                &seed,
-            )
-            .await;
-
-            // Empty state always passes (no mints to compare)
-            assert!(result.is_ok());
-        }
-    }
-
-    // =========================================================================
-    // InvalidPubkey error path tests (comment 4)
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_reconciliation_invalid_mint_pubkey_returns_error() {
-        use crate::storage::common::storage::mock::MockStorage;
-
-        let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![crate::storage::common::models::MintDbBalance {
-            mint_address: "not-a-valid-pubkey".to_string(),
+    fn db_balance(mint: &str, deposits: u64, withdrawals: u64) -> MintDbBalance {
+        MintDbBalance {
+            mint_address: mint.to_string(),
             token_program: spl_token::id().to_string(),
-            total_deposits: bigdecimal::BigDecimal::from(1000u64),
-            total_withdrawals: bigdecimal::BigDecimal::from(0u64),
-        }]);
-        let storage = Storage::Mock(mock_storage);
-        let config = ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-        };
-        let seed = Pubkey::new_unique();
-
-        let result = run_startup_reconciliation(
-            &config,
-            ProgramType::Escrow,
-            &storage,
-            "http://localhost:8899",
-            &seed,
-        )
-        .await;
-
-        match result {
-            Err(IndexerError::Reconciliation(ReconciliationError::InvalidPubkey {
-                pubkey,
-                reason: _,
-            })) => {
-                assert_eq!(pubkey, "not-a-valid-pubkey");
-            }
-            other => panic!("Expected InvalidPubkey error, got: {:?}", other),
+            total_deposits: bigdecimal::BigDecimal::from(deposits),
+            total_withdrawals: bigdecimal::BigDecimal::from(withdrawals),
         }
     }
 
-    #[tokio::test]
-    async fn test_reconciliation_invalid_token_program_pubkey_returns_error() {
-        use crate::storage::common::storage::mock::MockStorage;
+    #[test]
+    fn union_empty_both_sides_is_empty() {
+        assert!(build_reconciliation_set(&[], &HashMap::new()).is_empty());
+    }
 
-        let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![crate::storage::common::models::MintDbBalance {
-            mint_address: Pubkey::new_unique().to_string(),
-            token_program: "not-a-valid-token-program".to_string(),
-            total_deposits: bigdecimal::BigDecimal::from(500u64),
-            total_withdrawals: bigdecimal::BigDecimal::from(0u64),
-        }]);
-        let storage = Storage::Mock(mock_storage);
-        let config = ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-        };
-        let seed = Pubkey::new_unique();
+    #[test]
+    fn union_db_only_mint_compares_against_zero_on_chain() {
+        let results =
+            build_reconciliation_set(&[db_balance("MintAAAA", 1000, 200)], &HashMap::new());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].mint, "MintAAAA");
+        assert_eq!(results[0].db_expected, 800);
+        assert_eq!(results[0].on_chain_actual, 0);
+        assert_eq!(results[0].mismatch, 800);
+    }
 
-        let result = run_startup_reconciliation(
-            &config,
-            ProgramType::Escrow,
-            &storage,
-            "http://localhost:8899",
-            &seed,
-        )
-        .await;
+    #[test]
+    fn union_on_chain_only_mint_compares_against_zero_db() {
+        let mint = Pubkey::new_unique();
+        let on_chain = HashMap::from([(mint, 1234u64)]);
+        let results = build_reconciliation_set(&[], &on_chain);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].mint, mint.to_string());
+        assert_eq!(results[0].db_expected, 0);
+        assert_eq!(results[0].on_chain_actual, 1234);
+        assert_eq!(results[0].mismatch, 1234);
+    }
 
-        match result {
-            Err(IndexerError::Reconciliation(ReconciliationError::InvalidPubkey {
-                pubkey,
-                reason: _,
-            })) => {
-                assert_eq!(pubkey, "not-a-valid-token-program");
-            }
-            other => panic!("Expected InvalidPubkey error, got: {:?}", other),
-        }
+    #[test]
+    fn union_merges_same_mint_on_both_sides() {
+        let mint = Pubkey::new_unique();
+        let on_chain = HashMap::from([(mint, 1000u64)]);
+        let results =
+            build_reconciliation_set(&[db_balance(&mint.to_string(), 1000, 0)], &on_chain);
+        assert_eq!(results.len(), 1, "same mint must merge to one entry");
+        assert_eq!(results[0].mismatch, 0);
+    }
+
+    #[test]
+    fn union_includes_disjoint_mints_from_both_sides() {
+        let db_mint = Pubkey::new_unique();
+        let chain_mint = Pubkey::new_unique();
+        let on_chain = HashMap::from([(chain_mint, 700u64)]);
+        let results =
+            build_reconciliation_set(&[db_balance(&db_mint.to_string(), 500, 0)], &on_chain);
+        assert_eq!(results.len(), 2, "union must contain both mints");
     }
 
     // =========================================================================
-    // RPC integration tests (mockito)
+    // run_startup_reconciliation contract tests (mockito escrow sweep)
     // =========================================================================
 
     use crate::storage::common::storage::mock::MockStorage;
-
-    fn token_account_balance_response(amount: u64) -> String {
-        format!(
-            r#"{{
-                "context": {{"slot": 100}},
-                "value": {{
-                    "amount": "{}",
-                    "decimals": 6,
-                    "uiAmount": null,
-                    "uiAmountString": "{}"
-                }}
-            }}"#,
-            amount, amount
-        )
-    }
-
-    fn account_not_found_error() -> (i32, &'static str) {
-        (-32602, "Invalid param: could not find account")
-    }
 
     fn make_mint_balance(
         mint_address: &str,
         total_deposits: u64,
         total_withdrawals: u64,
-    ) -> crate::storage::common::models::MintDbBalance {
-        crate::storage::common::models::MintDbBalance {
+    ) -> MintDbBalance {
+        MintDbBalance {
             mint_address: mint_address.to_string(),
             token_program: spl_token::id().to_string(),
             total_deposits: bigdecimal::BigDecimal::from(total_deposits),
@@ -759,32 +534,145 @@ mod tests {
         }
     }
 
+    /// `get_token_accounts_by_owner` returns jsonParsed token accounts; the sweep
+    /// sums them per mint. Build one such account entry for the mock RPC response.
+    fn token_account_entry(mint: &str, amount: u64) -> String {
+        format!(
+            r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{owner}",
+                "executable":false,"rentEpoch":0,"space":165,
+                "data":{{"program":"spl-token","space":165,
+                    "parsed":{{"type":"account","info":{{"mint":"{mint}","owner":"{owner}",
+                        "tokenAmount":{{"amount":"{amount}","decimals":6,"uiAmount":null,
+                            "uiAmountString":"{amount}"}}}}}}}}}}}}"#,
+            ata = Pubkey::new_unique(),
+            owner = Pubkey::new_unique(),
+            mint = mint,
+            amount = amount,
+        )
+    }
+
+    /// Mock both sweep calls (SPL Token and Token-2022). The SPL Token call (matched
+    /// by its program id in the request body) returns `entries`; the Token-2022 call
+    /// returns an empty list so balances are not double-counted.
+    async fn mock_escrow_sweep(server: &mut mockito::Server, entries: &[(String, u64)]) {
+        let value: Vec<String> = entries
+            .iter()
+            .map(|(mint, amount)| token_account_entry(mint, *amount))
+            .collect();
+        let token_body = format!(
+            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":100}},"value":[{}]}},"id":1}}"#,
+            value.join(",")
+        );
+        let empty_body =
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":100},"value":[]},"id":1}"#.to_string();
+
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+            .with_status(200)
+            .with_body(token_body)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+            .with_status(200)
+            .with_body(empty_body)
+            .create_async()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_skipped_for_withdraw_program() {
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let storage = Storage::Mock(MockStorage::new());
+        let seed = Pubkey::new_unique();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Withdraw,
+            &storage,
+            "http://localhost:8899",
+            &seed,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_empty_db_and_empty_escrow_passes() {
+        let mut server = mockito::Server::new_async().await;
+        mock_escrow_sweep(&mut server, &[]).await;
+
+        let storage = Storage::Mock(MockStorage::new());
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &server.url(),
+            &seed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "truly-empty state (no DB mints, no escrow balance) must pass: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_empty_db_with_nonempty_escrow_blocks() {
+        // The SOLA3-7 regression: a fresh/partial DB (no `mints` rows) against a
+        // live escrow balance must fail closed instead of passing blind.
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
+
+        let storage = Storage::Mock(MockStorage::new());
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &server.url(),
+            &seed,
+        )
+        .await;
+
+        match result {
+            Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+                count,
+                ..
+            })) => assert_eq!(count, 1),
+            other => panic!(
+                "live escrow with empty DB must block startup, got: {:?}",
+                other
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn test_reconciliation_balanced_passes() {
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{},"id":1}}"#,
-                token_account_balance_response(1000)
-            ))
-            .create_async()
-            .await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
 
         let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![make_mint_balance(
-            &Pubkey::new_unique().to_string(),
-            1000,
-            0,
-        )]);
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
         let storage = Storage::Mock(mock_storage);
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
         };
         let seed = Pubkey::new_unique();
-
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -793,37 +681,24 @@ mod tests {
             &seed,
         )
         .await;
-
         assert!(result.is_ok(), "balanced state should pass: {:?}", result);
     }
 
     #[tokio::test]
     async fn test_reconciliation_mismatch_within_threshold_passes() {
         let mut server = mockito::Server::new_async().await;
-        // DB expects 1000, on-chain has 1005 → mismatch = 5 ≤ threshold 10 → ok
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{},"id":1}}"#,
-                token_account_balance_response(1005)
-            ))
-            .create_async()
-            .await;
+        let mint = Pubkey::new_unique();
+        // DB expects 1000, on-chain has 1005 => mismatch 5 <= threshold 10 => ok
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_005)]).await;
 
         let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![make_mint_balance(
-            &Pubkey::new_unique().to_string(),
-            1000,
-            0,
-        )]);
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
         let storage = Storage::Mock(mock_storage);
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
         };
         let seed = Pubkey::new_unique();
-
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -832,7 +707,6 @@ mod tests {
             &seed,
         )
         .await;
-
         assert!(
             result.is_ok(),
             "mismatch within threshold should pass: {:?}",
@@ -843,30 +717,18 @@ mod tests {
     #[tokio::test]
     async fn test_reconciliation_mismatch_exceeds_threshold_blocks() {
         let mut server = mockito::Server::new_async().await;
-        // DB expects 1000, on-chain has 1020 → mismatch = 20 > threshold 10 → err
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{},"id":1}}"#,
-                token_account_balance_response(1020)
-            ))
-            .create_async()
-            .await;
+        let mint = Pubkey::new_unique();
+        // DB expects 1000, on-chain has 1020 => mismatch 20 > threshold 10 => err
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_020)]).await;
 
         let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![make_mint_balance(
-            &Pubkey::new_unique().to_string(),
-            1000,
-            0,
-        )]);
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
         let storage = Storage::Mock(mock_storage);
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
         };
         let seed = Pubkey::new_unique();
-
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -875,7 +737,6 @@ mod tests {
             &seed,
         )
         .await;
-
         match result {
             Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
                 count,
@@ -889,121 +750,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconciliation_ata_not_found_treated_as_zero() {
-        let mut server = mockito::Server::new_async().await;
-        let (code, message) = account_not_found_error();
-        // Return "account not found" error → treated as balance 0
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","error":{{"code":{},"message":"{}"}},"id":1}}"#,
-                code, message
-            ))
-            .create_async()
-            .await;
-
-        let mock_storage = MockStorage::new();
-        // DB also expects 0 (no completed deposits) → balanced → should pass
-        mock_storage.set_mint_balances(vec![make_mint_balance(
-            &Pubkey::new_unique().to_string(),
-            0,
-            0,
-        )]);
-        let storage = Storage::Mock(mock_storage);
-
-        let config = ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-        };
-        let seed = Pubkey::new_unique();
-
-        let result = run_startup_reconciliation(
-            &config,
-            ProgramType::Escrow,
-            &storage,
-            &server.url(),
-            &seed,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "account not found should be treated as 0 balance: {:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
     async fn test_reconciliation_with_nonzero_withdrawals_balanced() {
-        // Exercises total_deposits - total_withdrawals: 1500 deposits, 500 withdrawals → db_expected 1000
+        // 1500 deposits, 500 withdrawals => db_expected 1000; on-chain 1000 => balanced.
         let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{},"id":1}}"#,
-                token_account_balance_response(1000)
-            ))
-            .create_async()
-            .await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
 
         let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![make_mint_balance(
-            &Pubkey::new_unique().to_string(),
-            1500,
-            500,
-        )]);
-        let storage = Storage::Mock(mock_storage);
-
-        let config = ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-        };
-        let seed = Pubkey::new_unique();
-
-        let result = run_startup_reconciliation(
-            &config,
-            ProgramType::Escrow,
-            &storage,
-            &server.url(),
-            &seed,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "1500 deposits - 500 withdrawals = 1000 on-chain should balance: {:?}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reconciliation_with_nonzero_withdrawals_mismatch_blocks() {
-        // 1500 deposits, 500 withdrawals → db_expected 1000
-        // on-chain = 1050 → mismatch 50 > threshold 10 → error
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("POST", "/")
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{},"id":1}}"#,
-                token_account_balance_response(1050)
-            ))
-            .create_async()
-            .await;
-
-        let mock_storage = MockStorage::new();
-        mock_storage.set_mint_balances(vec![make_mint_balance(
-            &Pubkey::new_unique().to_string(),
-            1500,
-            500,
-        )]);
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1500, 500)]);
         let storage = Storage::Mock(mock_storage);
 
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
         };
         let seed = Pubkey::new_unique();
-
         let result = run_startup_reconciliation(
             &config,
             ProgramType::Escrow,
@@ -1012,19 +772,10 @@ mod tests {
             &seed,
         )
         .await;
-
-        match result {
-            Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
-                count,
-                threshold,
-            })) => {
-                assert_eq!(count, 1);
-                assert_eq!(threshold, 10);
-            }
-            other => panic!(
-                "Expected MismatchExceedsThreshold for withdrawal mismatch, got: {:?}",
-                other
-            ),
-        }
+        assert!(
+            result.is_ok(),
+            "net (deposits - withdrawals) must match on-chain: {:?}",
+            result
+        );
     }
 }

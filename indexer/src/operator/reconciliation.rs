@@ -11,18 +11,13 @@
 
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
-use crate::operator::utils::instruction_util::RetryPolicy;
+use crate::operator::escrow_sweep::fetch_escrow_balances_by_mint;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::Storage;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
-use solana_account_decoder_client_types::UiAccountData;
-use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
-use spl_token::solana_program::program_pack::Pack;
-use spl_token::state::Account as TokenAccount;
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -393,101 +388,9 @@ async fn fetch_on_chain_balances(
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
 ) -> Result<HashMap<Pubkey, u64>, OperatorError> {
-    let mut balances = HashMap::new();
-    let token_programs = [spl_token::id(), spl_token_2022::id()];
-
-    for token_program_id in token_programs {
-        // Fetch all token accounts owned by the escrow for each supported token program
-        let accounts = rpc_client
-            .with_retry(
-                "get_token_accounts_by_owner",
-                RetryPolicy::Idempotent,
-                || async {
-                    rpc_client
-                        .rpc_client
-                        .get_token_accounts_by_owner(
-                            &escrow_instance_id,
-                            TokenAccountsFilter::ProgramId(token_program_id),
-                        )
-                        .await
-                },
-            )
-            .await
-            .map_err(|e| {
-                OperatorError::RpcError(format!(
-                    "Failed to fetch token accounts for program {}: {}",
-                    token_program_id, e
-                ))
-            })?;
-
-        // Parse each token account and aggregate balances by mint.
-        // The RPC may return accounts in either binary (base64) or JSON-parsed format
-        // depending on the client's requested encoding. We handle both variants.
-        for keyed_account in accounts {
-            let (mint, amount) = match &keyed_account.account.data {
-                // Binary encoding: decode base64, then unpack the SPL token layout
-                data if data.decode().is_some() => {
-                    let account_data = data.decode().unwrap();
-                    let token_account = TokenAccount::unpack(&account_data).map_err(|e| {
-                        OperatorError::RpcError(format!(
-                            "Failed to parse token account for program {}: {}",
-                            token_program_id, e
-                        ))
-                    })?;
-                    (token_account.mint, token_account.amount)
-                }
-                // JSON-parsed encoding: the RPC has already decoded the account for us;
-                // extract mint and amount from the nested `info` object.
-                UiAccountData::Json(parsed) => {
-                    let info = parsed.parsed.get("info").ok_or_else(|| {
-                        OperatorError::RpcError(
-                            "Missing 'info' in parsed token account".to_string(),
-                        )
-                    })?;
-                    let mint_str = info.get("mint").and_then(|v| v.as_str()).ok_or_else(|| {
-                        OperatorError::RpcError(
-                            "Missing 'mint' in parsed token account info".to_string(),
-                        )
-                    })?;
-                    let amount_str = info
-                        .get("tokenAmount")
-                        .and_then(|v| v.get("amount"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            OperatorError::RpcError(
-                                "Missing 'tokenAmount.amount' in parsed token account".to_string(),
-                            )
-                        })?;
-                    let mint = Pubkey::from_str(mint_str).map_err(|e| {
-                        OperatorError::RpcError(format!(
-                            "Invalid mint pubkey '{}': {}",
-                            mint_str, e
-                        ))
-                    })?;
-                    let amount = amount_str.parse::<u64>().map_err(|e| {
-                        OperatorError::RpcError(format!(
-                            "Invalid token amount '{}': {}",
-                            amount_str, e
-                        ))
-                    })?;
-                    (mint, amount)
-                }
-                // Unknown encoding variant — skip with a warning rather than hard-failing
-                _ => {
-                    warn!(
-                        "Skipping token account with unrecognised data encoding for program {}",
-                        token_program_id
-                    );
-                    continue;
-                }
-            };
-
-            // Sum balances for each mint (handles multiple token accounts for the same mint)
-            *balances.entry(mint).or_insert(0) += amount;
-        }
-    }
-
-    Ok(balances)
+    fetch_escrow_balances_by_mint(rpc_client, escrow_instance_id)
+        .await
+        .map_err(|e| OperatorError::RpcError(e.reason))
 }
 
 /// Sends webhook alerts for balance mismatches with retry logic
@@ -636,38 +539,8 @@ mod tests {
     use crate::storage::common::storage::{mock::MockStorage, Storage};
     use solana_sdk::pubkey::Pubkey;
 
-    #[test]
-    fn test_fetch_on_chain_balances_exists() {
-        // This test verifies that the fetch_on_chain_balances function exists and compiles
-        // Integration testing with a real RPC client would require a test validator
-        // and is better suited for integration tests rather than unit tests
-        let _function = fetch_on_chain_balances;
-    }
-
-    #[test]
-    fn test_pubkey_hashmap_initialization() {
-        // Test that we can create a HashMap<Pubkey, u64> as expected by the function
-        let mut balances: HashMap<Pubkey, u64> = HashMap::new();
-        let mint = Pubkey::new_unique();
-        balances.insert(mint, 1000);
-        assert_eq!(*balances.get(&mint).unwrap(), 1000);
-    }
-
-    #[test]
-    fn test_balance_aggregation_logic() {
-        // Test the aggregation logic used in fetch_on_chain_balances
-        let mut balances: HashMap<Pubkey, u64> = HashMap::new();
-        let mint1 = Pubkey::new_unique();
-        let mint2 = Pubkey::new_unique();
-
-        // Simulate multiple token accounts for the same mint
-        *balances.entry(mint1).or_insert(0) += 100;
-        *balances.entry(mint1).or_insert(0) += 200;
-        *balances.entry(mint2).or_insert(0) += 500;
-
-        assert_eq!(*balances.get(&mint1).unwrap(), 300);
-        assert_eq!(*balances.get(&mint2).unwrap(), 500);
-    }
+    // The sweep that `fetch_on_chain_balances` delegates to is tested directly in
+    // `operator::escrow_sweep` (both encodings, multi-account summing, skip/error arms).
 
     #[test]
     fn test_compare_balances_exact_match() {
