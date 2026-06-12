@@ -100,6 +100,7 @@ async fn build_state(
 /// Defer-path tests need this; without a row the bump returns RowNotFound
 /// and the fail-closed handler escalates to ManualReview.
 fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
+    use private_channel_indexer::storage::common::amount::TokenAmount;
     use private_channel_indexer::storage::common::models::{
         DbTransaction, TransactionStatus, TransactionType,
     };
@@ -115,7 +116,7 @@ fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
             initiator: Pubkey::new_unique().to_string(),
             recipient: Pubkey::new_unique().to_string(),
             mint: Pubkey::new_unique().to_string(),
-            amount: 0,
+            amount: TokenAmount(0),
             memo: None,
             transaction_type: TransactionType::Withdrawal,
             withdrawal_nonce: Some(id),

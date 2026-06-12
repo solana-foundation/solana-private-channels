@@ -11,7 +11,10 @@
 //!     regression anchoring)
 //!   - invalid `recipient` pubkey string
 //!   - invalid withdrawal `remint_signatures[i]` string
-//!   - negative `amount` (exercises the `u64::try_from` guard)
+//!
+//! The former negative-amount shape is gone: `amount` is a `TokenAmount(u64)`,
+//! so a negative value is unconstructable and its rejection lives in the
+//! storage decode seam (`TokenAmount`'s unit tests).
 //!
 //! Plus one valid row in the same batch — it must still be recovered
 //! and enqueued into `state.pending_remints`, proving the loop
@@ -24,6 +27,7 @@ use {
         operator::sender::{test_hooks, TransactionStatusUpdate},
         storage::{
             common::{
+                amount::TokenAmount,
                 models::{DbTransaction, TransactionStatus, TransactionType},
                 storage::mock::MockStorage,
             },
@@ -40,7 +44,7 @@ fn make_row(
     mint: String,
     recipient: String,
     sig_strings: Vec<String>,
-    amount: i64,
+    amount: u64,
     deadline: DateTime<Utc>,
 ) -> DbTransaction {
     let now = Utc::now();
@@ -53,7 +57,7 @@ fn make_row(
         initiator: Pubkey::new_unique().to_string(),
         recipient,
         mint,
-        amount,
+        amount: TokenAmount(amount),
         memo: None,
         transaction_type: TransactionType::Withdrawal,
         withdrawal_nonce: Some(id),
@@ -85,9 +89,9 @@ fn make_config() -> PrivateChannelIndexerConfig {
     }
 }
 
-/// Seed four malformed rows (one per parse-error shape) plus one
+/// Seed three malformed rows (one per parse-error shape) plus one
 /// valid row. Assert:
-///   - exactly 4 ManualReview escalations emitted on the channel
+///   - exactly 3 ManualReview escalations emitted on the channel
 ///   - each escalation carries the corresponding transaction_id
 ///   - the lone valid row is rehydrated into state.pending_remints
 #[tokio::test]
@@ -129,16 +133,6 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
         deadline,
     );
 
-    // Row 13 — negative amount (u64::try_from must reject)
-    let negative_amount = make_row(
-        13,
-        Pubkey::new_unique().to_string(),
-        Pubkey::new_unique().to_string(),
-        vec![Signature::new_unique().to_string()],
-        -42,
-        deadline,
-    );
-
     // Row 14 — valid, must still be recovered
     let good = make_row(
         14,
@@ -153,7 +147,6 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
         bad_mint,
         bad_recipient,
         bad_sig,
-        negative_amount,
         good,
     ]);
 
@@ -188,7 +181,7 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
     assert_eq!(entry.signatures.len(), 1);
     assert_eq!(entry.signatures[0].signature, good_sig);
 
-    // All four bad rows must have emitted ManualReview updates.
+    // All three bad rows must have emitted ManualReview updates.
     let mut escalated_ids: Vec<i64> = Vec::new();
     while let Ok(update) = storage_rx.try_recv() {
         assert_eq!(update.status, TransactionStatus::ManualReview);
@@ -197,7 +190,7 @@ async fn recover_escalates_every_parse_error_shape_and_preserves_valid_sibling()
     escalated_ids.sort();
     assert_eq!(
         escalated_ids,
-        vec![10, 11, 12, 13],
+        vec![10, 11, 12],
         "every malformed row must escalate exactly once; got {:?}",
         escalated_ids
     );

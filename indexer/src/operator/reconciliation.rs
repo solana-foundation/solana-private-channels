@@ -13,6 +13,7 @@ use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::RpcClientWithRetry;
+use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::Storage;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
 use solana_account_decoder_client_types::UiAccountData;
@@ -31,6 +32,32 @@ const WEBHOOK_MAX_ATTEMPTS: u32 = 3;
 const WEBHOOK_BASE_DELAY: Duration = Duration::from_millis(500);
 const WEBHOOK_MAX_DELAY: Duration = Duration::from_secs(5);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Convert a net (deposits - withdrawals) BigDecimal into the u64 the on-chain
+/// comparison uses, logging the two corruption cases. A negative net is treated
+/// as 0 (matching the prior behavior); an over-range net is surfaced as u64::MAX
+/// so the downstream compare flags a mismatch instead of silently wrapping.
+fn net_bigdecimal_to_u64(net: &bigdecimal::BigDecimal, mint_address: &str) -> u64 {
+    match net_to_u64(net) {
+        NetBalance::Exact(v) => v,
+        NetBalance::Negative => {
+            warn!(
+                mint = mint_address,
+                net = %net,
+                "Withdrawals exceed deposits; treating net escrow balance as 0 for comparison"
+            );
+            0
+        }
+        NetBalance::Overflow => {
+            warn!(
+                mint = mint_address,
+                net = %net,
+                "Net escrow balance exceeds u64::MAX; flagging as a reconciliation mismatch"
+            );
+            u64::MAX
+        }
+    }
+}
 
 /// Runs periodic escrow balance reconciliation checks
 ///
@@ -149,21 +176,8 @@ async fn perform_reconciliation_check(
             }
         })?;
 
-        // Calculate net balance (deposits - withdrawals)
-        let net_balance_i64 = if balance_result.total_deposits >= balance_result.total_withdrawals {
-            balance_result.total_deposits - balance_result.total_withdrawals
-        } else {
-            // This shouldn't happen in a properly functioning system, but handle it gracefully
-            warn!(
-                "Withdrawals exceed deposits for mint {}: deposits={}, withdrawals={}",
-                balance_result.mint_address,
-                balance_result.total_deposits,
-                balance_result.total_withdrawals
-            );
-            0 // Treat as zero balance for comparison
-        };
-
-        let net_balance = net_balance_i64 as u64;
+        let net = &balance_result.total_deposits - &balance_result.total_withdrawals;
+        let net_balance = net_bigdecimal_to_u64(&net, &balance_result.mint_address);
         db_balances.insert(mint, net_balance);
     }
 
@@ -618,6 +632,7 @@ pub async fn send_orphan_deposit_alert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::{mock::MockStorage, Storage};
     use solana_sdk::pubkey::Pubkey;
 
@@ -1662,7 +1677,7 @@ mod tests {
             initiator: "init".to_string(),
             recipient: "recip".to_string(),
             mint: mint.to_string(),
-            amount: 1,
+            amount: TokenAmount(1),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,

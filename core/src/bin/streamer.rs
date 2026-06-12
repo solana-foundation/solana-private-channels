@@ -419,7 +419,9 @@ struct IndexerTxRow {
     initiator: String,
     recipient: String,
     mint: String,
-    amount: i64,
+    // Read as text: the column is NUMERIC(20,0) (full u64 range) and this crate's sqlx has no
+    // numeric decoder, so casting to text keeps the exact value without a BigDecimal dependency.
+    amount: String,
     transaction_type: String,
     status: String,
     created_at_epoch: i64,
@@ -452,7 +454,7 @@ async fn poll_indexer(
 
         let rows = match sqlx::query_as::<_, IndexerTxRow>(
             r#"
-            SELECT id, signature, slot, initiator, recipient, mint, amount,
+            SELECT id, signature, slot, initiator, recipient, mint, amount::text as amount,
                    transaction_type::text as transaction_type,
                    status::text as status,
                    EXTRACT(EPOCH FROM created_at)::bigint as created_at_epoch
@@ -495,7 +497,7 @@ async fn poll_indexer(
                 tx_type: tx_type.to_string(),
                 from: row.initiator,
                 to: row.recipient,
-                amount: Some(row.amount.to_string()),
+                amount: Some(row.amount),
                 mint: Some(row.mint),
                 timestamp: row.created_at_epoch,
                 status: row.status,

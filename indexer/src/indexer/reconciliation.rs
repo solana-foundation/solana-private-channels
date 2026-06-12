@@ -23,6 +23,7 @@ use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
     operator::{rpc_util::RpcClientWithRetry, RetryConfig, RetryPolicy},
+    storage::common::amount::{net_to_u64, NetBalance},
     storage::Storage,
 };
 use private_channel_core::rpc::error::INVALID_PARAMS_CODE;
@@ -36,7 +37,10 @@ use tracing::{error, info, warn};
 pub struct MintReconciliation {
     pub mint: String,
     /// Expected balance according to DB: all indexed deposits − completed withdrawals.
-    pub db_expected: i64,
+    /// Unsigned because it mirrors the escrow ATA balance, itself a u64; a negative
+    /// net is clamped to 0 at the call site so this value stays lossless across the
+    /// full u64 range instead of truncating at i64::MAX.
+    pub db_expected: u64,
     /// Actual raw token balance in the escrow ATA on-chain.
     pub on_chain_actual: u64,
     /// Absolute difference: |on_chain_actual − db_expected|.  Derived from the
@@ -45,7 +49,7 @@ pub struct MintReconciliation {
 }
 
 impl MintReconciliation {
-    pub fn new(mint: String, db_expected: i64, on_chain_actual: u64) -> Self {
+    pub fn new(mint: String, db_expected: u64, on_chain_actual: u64) -> Self {
         let mismatch = compute_mismatch(db_expected, on_chain_actual);
         Self {
             mint,
@@ -134,7 +138,8 @@ pub async fn run_startup_reconciliation(
         let on_chain_actual =
             fetch_ata_balance(&rpc_client, &instance_ata, &balance.mint_address).await?;
 
-        let db_expected = balance.total_deposits - balance.total_withdrawals;
+        let net = &balance.total_deposits - &balance.total_withdrawals;
+        let db_expected = net_db_expected(&net, &balance.mint_address);
 
         results.push(MintReconciliation::new(
             balance.mint_address.clone(),
@@ -241,12 +246,37 @@ fn is_account_not_found(e: &solana_rpc_client_api::client_error::Error) -> bool 
     }
 }
 
+/// Convert a per-mint net (deposits - withdrawals) into the unsigned expected
+/// balance, mirroring the operator's continuous-reconciliation seam. A negative
+/// net (withdrawals exceed deposits) is clamped to 0 with a warning; an
+/// over-u64 net is surfaced as u64::MAX so the mismatch check trips rather than
+/// the value wrapping.
+fn net_db_expected(net: &bigdecimal::BigDecimal, mint_address: &str) -> u64 {
+    match net_to_u64(net) {
+        NetBalance::Exact(v) => v,
+        NetBalance::Negative => {
+            warn!(
+                mint = mint_address,
+                net = %net,
+                "Withdrawals exceed deposits; treating expected escrow balance as 0"
+            );
+            0
+        }
+        NetBalance::Overflow => {
+            warn!(
+                mint = mint_address,
+                net = %net,
+                "Expected escrow balance exceeds u64::MAX; flagging as a reconciliation mismatch"
+            );
+            u64::MAX
+        }
+    }
+}
+
 /// Compute the absolute difference between on-chain balance and DB expected value.
-/// Uses i128 internally to avoid overflow when subtracting.
-pub fn compute_mismatch(db_expected: i64, on_chain_actual: u64) -> u64 {
-    let diff = (on_chain_actual as i128) - (db_expected as i128);
-    // unsigned_abs() returns u128; cap at u64::MAX to keep the type consistent
-    diff.unsigned_abs().min(u64::MAX as u128) as u64
+/// Both sides are u64; the diff cannot exceed u64::MAX.
+pub fn compute_mismatch(db_expected: u64, on_chain_actual: u64) -> u64 {
+    on_chain_actual.abs_diff(db_expected)
 }
 
 /// Log results and decide whether to allow or block startup.
@@ -333,15 +363,40 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_mismatch_db_negative() {
-        // Impossible state: more completed withdrawals than deposits in DB.
-        // Mismatch is the absolute difference from 0.
-        assert_eq!(compute_mismatch(-50, 0), 50);
+    fn test_compute_mismatch_zero_both() {
+        assert_eq!(compute_mismatch(0, 0), 0);
     }
 
     #[test]
-    fn test_compute_mismatch_zero_both() {
-        assert_eq!(compute_mismatch(0, 0), 0);
+    fn test_compute_mismatch_full_u64_range() {
+        // A wiped DB (expected 0) against a u64::MAX escrow must not overflow.
+        assert_eq!(compute_mismatch(0, u64::MAX), u64::MAX);
+        assert_eq!(compute_mismatch(u64::MAX, 0), u64::MAX);
+    }
+
+    // =========================================================================
+    // net_db_expected tests
+    // =========================================================================
+
+    #[test]
+    fn net_db_expected_clamps_negative_to_zero() {
+        // Withdrawals exceeding deposits is an impossible-in-a-healthy-system
+        // state; the net is clamped to 0 so a corrupt over-withdrawn mint reads
+        // as expected balance 0 and surfaces as a mismatch, not a wrap.
+        let net = bigdecimal::BigDecimal::from(-50);
+        assert_eq!(net_db_expected(&net, "mint"), 0);
+    }
+
+    #[test]
+    fn net_db_expected_passes_full_u64_range() {
+        let net = bigdecimal::BigDecimal::from(u64::MAX);
+        assert_eq!(net_db_expected(&net, "mint"), u64::MAX);
+    }
+
+    #[test]
+    fn net_db_expected_flags_over_u64_as_mismatch_sentinel() {
+        let net = bigdecimal::BigDecimal::from(u64::MAX) + bigdecimal::BigDecimal::from(1);
+        assert_eq!(net_db_expected(&net, "mint"), u64::MAX);
     }
 
     // =========================================================================
@@ -416,7 +471,7 @@ mod tests {
     // classify_and_report tests
     // =========================================================================
 
-    fn make_result(mint: &str, db_expected: i64, on_chain_actual: u64) -> MintReconciliation {
+    fn make_result(mint: &str, db_expected: u64, on_chain_actual: u64) -> MintReconciliation {
         MintReconciliation::new(mint.to_string(), db_expected, on_chain_actual)
     }
 
@@ -600,8 +655,8 @@ mod tests {
         mock_storage.set_mint_balances(vec![crate::storage::common::models::MintDbBalance {
             mint_address: "not-a-valid-pubkey".to_string(),
             token_program: spl_token::id().to_string(),
-            total_deposits: 1000,
-            total_withdrawals: 0,
+            total_deposits: bigdecimal::BigDecimal::from(1000u64),
+            total_withdrawals: bigdecimal::BigDecimal::from(0u64),
         }]);
         let storage = Storage::Mock(mock_storage);
         let config = ReconciliationConfig {
@@ -637,8 +692,8 @@ mod tests {
         mock_storage.set_mint_balances(vec![crate::storage::common::models::MintDbBalance {
             mint_address: Pubkey::new_unique().to_string(),
             token_program: "not-a-valid-token-program".to_string(),
-            total_deposits: 500,
-            total_withdrawals: 0,
+            total_deposits: bigdecimal::BigDecimal::from(500u64),
+            total_withdrawals: bigdecimal::BigDecimal::from(0u64),
         }]);
         let storage = Storage::Mock(mock_storage);
         let config = ReconciliationConfig {
@@ -693,14 +748,14 @@ mod tests {
 
     fn make_mint_balance(
         mint_address: &str,
-        total_deposits: i64,
-        total_withdrawals: i64,
+        total_deposits: u64,
+        total_withdrawals: u64,
     ) -> crate::storage::common::models::MintDbBalance {
         crate::storage::common::models::MintDbBalance {
             mint_address: mint_address.to_string(),
             token_program: spl_token::id().to_string(),
-            total_deposits,
-            total_withdrawals,
+            total_deposits: bigdecimal::BigDecimal::from(total_deposits),
+            total_withdrawals: bigdecimal::BigDecimal::from(total_withdrawals),
         }
     }
 
