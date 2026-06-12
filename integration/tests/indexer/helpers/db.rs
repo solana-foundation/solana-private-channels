@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use private_channel_indexer::storage::common::amount::TokenAmount;
 use sqlx::PgPool;
 
 #[derive(Debug, Clone)]
@@ -9,7 +10,7 @@ pub struct DbTransaction {
     pub initiator: String,
     pub recipient: String,
     pub mint: String,
-    pub amount: i64,
+    pub amount: TokenAmount,
     pub transaction_type: String,
     pub status: String,
     pub counterpart_signature: Option<String>,
@@ -23,7 +24,7 @@ type TransactionRow = (
     String,
     String,
     String,
-    i64,
+    TokenAmount,
     String,
     String,
     Option<String>,

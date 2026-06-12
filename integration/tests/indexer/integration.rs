@@ -357,7 +357,7 @@ async fn verify_backfill_phase(
             idx + 1
         );
         assert_eq!(
-            db_tx.amount as u64,
+            db_tx.amount.value(),
             expected_tx.amount,
             "Amount mismatch for transaction {}",
             idx + 1

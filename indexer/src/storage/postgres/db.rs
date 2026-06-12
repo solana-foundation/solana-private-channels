@@ -113,7 +113,7 @@ impl PostgresDb {
                 initiator TEXT NOT NULL,
                 recipient TEXT NOT NULL,
                 mint TEXT NOT NULL,
-                amount BIGINT NOT NULL,
+                amount NUMERIC(20,0) NOT NULL,
                 memo TEXT,
                 status transaction_status NOT NULL DEFAULT 'pending',
                 transaction_type transaction_type NOT NULL,
@@ -1507,11 +1507,11 @@ impl PostgresDb {
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_deposits,
+                )::NUMERIC AS total_deposits,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_withdrawals
+                )::NUMERIC AS total_withdrawals
             FROM mints m
             LEFT JOIN transactions t ON t.mint = m.mint_address
             GROUP BY m.mint_address, m.token_program
@@ -1542,11 +1542,11 @@ impl PostgresDb {
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_deposits,
+                )::NUMERIC AS total_deposits,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_withdrawals
+                )::NUMERIC AS total_withdrawals
             FROM mints m
             LEFT JOIN transactions t ON t.mint = m.mint_address
             GROUP BY m.mint_address, m.token_program

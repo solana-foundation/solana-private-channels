@@ -289,7 +289,7 @@ make integration-test
 
 ### Docker stack
 
-The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` MUST be set (and `JWT_SECRET` if you enable auth, `ADMIN_PRIVATE_KEY` for the operator) or the stack fails to start. Generate strong values with `openssl rand -hex 32`.
+The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` MUST be set (and `JWT_SECRET` if you enable auth) or the stack fails to start. Generate strong values with `openssl rand -hex 32`. Put secrets in the gitignored `.env` (loaded last, overrides the templates) rather than the tracked `.env.local`; `make build-localnet` writes `ADMIN_PRIVATE_KEY` there for you.
 
 ```bash
 # Build all images

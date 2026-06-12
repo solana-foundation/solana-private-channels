@@ -115,20 +115,20 @@ Back in the Admin UI:
 
 ## Step 6: Configure Environment Variables
 
-Update `.env.devnet` file in the project root. Replace the following environment variables:
+Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates, so live keys never touch a tracked file. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
 
 > **Required secrets — no defaults are shipped.** `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, and `ADMIN_PRIVATE_KEY` (and `JWT_SECRET` if you enable auth) MUST be set or the services fail to start. Generate strong passwords with `openssl rand -hex 32`.
 
 ```shell
-# Required: database credentials (services fail closed if blank)
+# Required secrets: put these in the gitignored `.env`, NOT in .env.devnet
 POSTGRES_PASSWORD=<openssl rand -hex 32>
 POSTGRES_REPLICATION_PASSWORD=<openssl rand -hex 32>
+# Operator keypair (written to `.env` automatically by `make build-devnet`)
+ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>
 
+# Non-secret values below go in .env.devnet
 # Escrow instance (from Step 3)
 ESCROW_INSTANCE_ID=<your_instance_address>
-
-# Operator keypair (the contents of operator-keypair.json from Step 4)
-ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>
 
 # Keys allowed to mint on the Solana Private Channels payment channel (comma-separated public keys)
 # For testing, use your operator's public key

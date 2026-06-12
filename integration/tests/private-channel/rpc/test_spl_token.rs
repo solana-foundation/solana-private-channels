@@ -12,7 +12,7 @@ use {
         },
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     },
-    private_channel_indexer::storage::TransactionType,
+    private_channel_indexer::storage::{common::amount::TokenAmount, TransactionType},
     solana_account_decoder_client_types::UiAccountData,
     solana_pubkey::Pubkey,
     solana_sdk::{
@@ -461,7 +461,7 @@ async fn solana_deposit(
                     );
                     found_deposits.push(name.to_string());
 
-                    assert_eq!(deposit_tx.amount, *amount as i64);
+                    assert_eq!(deposit_tx.amount, TokenAmount(*amount));
                     assert_eq!(deposit_tx.transaction_type, TransactionType::Deposit);
                 }
             }
@@ -784,7 +784,7 @@ async fn private_channel_burn(
 
     let withdrawal_amount = 50_000; // Same as used above
     assert_eq!(withdrawal_tx.initiator, alice.pubkey().to_string());
-    assert_eq!(withdrawal_tx.amount, withdrawal_amount as i64);
+    assert_eq!(withdrawal_tx.amount, TokenAmount(withdrawal_amount));
     assert_eq!(withdrawal_tx.transaction_type, TransactionType::Withdrawal);
 
     println!("\n✓ Withdrawal successfully recorded in PrivateChannel indexer database");

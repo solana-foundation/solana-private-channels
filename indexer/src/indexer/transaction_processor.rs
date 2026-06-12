@@ -368,6 +368,7 @@ mod tests {
         AllowMintAccounts, AllowMintData, AllowMintEvent, DepositAccounts, DepositData,
         DepositEvent, ResetSmtRootAccounts, WithdrawFundsAccounts, WithdrawFundsData,
     };
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
     use solana_sdk::pubkey::Pubkey;
 
@@ -522,7 +523,7 @@ mod tests {
         assert_eq!(txn.slot, 100);
         // event.amount = 990, data.amount = 1000 (see make_deposit_instruction).
         // The DB row must carry the event-reported amount.
-        assert_eq!(txn.amount, 990);
+        assert_eq!(txn.amount, TokenAmount(990));
         assert_eq!(txn.recipient, recipient.to_string());
         assert_eq!(txn.initiator, make_pubkey(1).to_string());
         assert!(matches!(txn.transaction_type, TransactionType::Deposit));
@@ -557,7 +558,7 @@ mod tests {
         let (mint, txn) = convert_to_db_models(&ix, None);
         assert!(mint.is_none());
         let txn = txn.unwrap();
-        assert_eq!(txn.amount, 500);
+        assert_eq!(txn.amount, TokenAmount(500));
         assert_eq!(txn.recipient, make_pubkey(20).to_string());
         assert!(matches!(txn.transaction_type, TransactionType::Withdrawal));
     }

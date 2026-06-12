@@ -29,6 +29,7 @@ use {
         operator::sender::{test_hooks, TransactionStatusUpdate},
         storage::{
             common::{
+                amount::TokenAmount,
                 models::{DbTransaction, TransactionStatus, TransactionType},
                 storage::mock::MockStorage,
             },
@@ -45,7 +46,7 @@ fn make_row(
     mint: &Pubkey,
     recipient: &Pubkey,
     sig: &Signature,
-    amount: i64,
+    amount: u64,
     deadline: DateTime<Utc>,
 ) -> DbTransaction {
     let now = Utc::now();
@@ -57,7 +58,7 @@ fn make_row(
         initiator: Pubkey::new_unique().to_string(),
         recipient: recipient.to_string(),
         mint: mint.to_string(),
-        amount,
+        amount: TokenAmount(amount),
         memo: None,
         transaction_type: TransactionType::Withdrawal,
         withdrawal_nonce: Some(id),

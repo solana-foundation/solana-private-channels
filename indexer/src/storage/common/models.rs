@@ -1,3 +1,5 @@
+use crate::storage::common::amount::TokenAmount;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Type;
@@ -53,7 +55,7 @@ pub struct DbTransaction {
     pub initiator: String,
     pub recipient: String,
     pub mint: String,
-    pub amount: i64,
+    pub amount: TokenAmount,
     pub memo: Option<String>,
     pub transaction_type: TransactionType,
     pub withdrawal_nonce: Option<i64>,
@@ -97,10 +99,12 @@ pub struct MintDbBalance {
     /// Sum of amounts for all indexed deposits (any status).
     /// Deposits increase the on-chain ATA balance the moment they are observed,
     /// regardless of whether the operator has completed the corresponding private_channel mint.
-    pub total_deposits: i64,
+    /// Held as `BigDecimal` because the gross sum of many near-`u64::MAX` amounts can
+    /// exceed `u64::MAX` even though the net (deposits - withdrawals) cannot.
+    pub total_deposits: BigDecimal,
     /// Sum of amounts for completed withdrawals only.
     /// Only a completed `release_funds` call actually reduces the on-chain ATA balance.
-    pub total_withdrawals: i64,
+    pub total_withdrawals: BigDecimal,
 }
 
 /// Mint metadata stored
@@ -154,7 +158,7 @@ pub struct DbTransactionBuilder {
     signature: String,
     slot: i64,
     mint: String,
-    amount: i64,
+    amount: TokenAmount,
     initiator: Option<String>,
     recipient: Option<String>,
     memo: Option<String>,
@@ -168,7 +172,7 @@ impl DbTransactionBuilder {
             signature,
             slot: slot as i64,
             mint,
-            amount: amount as i64,
+            amount: TokenAmount(amount),
             initiator: None,
             recipient: None,
             memo: None,
