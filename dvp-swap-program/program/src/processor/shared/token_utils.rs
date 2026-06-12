@@ -15,7 +15,6 @@ use pinocchio_token_2022::{
     state::TokenAccount as Token2022Account, ID as TOKEN_2022_PROGRAM_ID,
 };
 use spl_token_2022::extension::{
-    confidential_transfer::ConfidentialTransferMint,
     confidential_transfer_fee::ConfidentialTransferFeeConfig,
     interest_bearing_mint::InterestBearingConfig, memo_transfer::memo_required,
     non_transferable::NonTransferable, scaled_ui_amount::ScaledUiAmountConfig,
@@ -128,17 +127,22 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
 
 /// Reject Token-2022 mints carrying either:
 /// - an amount-mutating extension that silently breaks the "escrow
-///   balance == sum of deposits" invariant (`ConfidentialTransfer`(+Fee),
-///   `TransferFee`, `InterestBearing`, `ScaledUiAmount`): the credited
-///   amount drifts from the debited amount, so the program would settle
-///   "successfully" while a leg comes up short; or
+///   balance == sum of deposits" invariant (`TransferFee` (+ its
+///   confidential variant), `InterestBearing`, `ScaledUiAmount`): the
+///   credited amount drifts from the debited amount, so the program
+///   would settle "successfully" while a leg comes up short; or
 /// - `NonTransferable`, which permanently blocks transfers out of the
 ///   escrow. Unlike everything else this never recovers — if a balance
 ///   reaches the escrow (e.g. the authority mints straight to it), no
 ///   settle/refund/reclaim can drain it, stranding both legs.
 ///
 /// Everything else is allowed, including `Pausable`, `PermanentDelegate`,
-/// `DefaultAccountState`, `TransferHook`, etc. These fail *loudly*
+/// `DefaultAccountState`, `TransferHook`, `ConfidentialTransfer`, etc.
+/// `ConfidentialTransfer` on the mint doesn't force confidential
+/// transfers — the public `TransferChecked` path keeps exact amounts —
+/// and the escrow can never receive a confidential deposit because
+/// configuring its `ConfidentialTransferAccount` extension would need
+/// the SwapDvp PDA to sign `ConfigureAccount`. These fail *loudly*
 /// (reverted CPI, atomic rollback) rather than silently — funds stay in
 /// escrow and recover once the blocking condition lifts.
 /// `PermanentDelegate` is a deliberate carve-out for regulated RWA tokens
@@ -178,10 +182,9 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
     let mint = StateWithExtensions::<Token2022MintState>::unpack(&data)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
-    if mint.get_extension::<ConfidentialTransferMint>().is_ok()
-        || mint
-            .get_extension::<ConfidentialTransferFeeConfig>()
-            .is_ok()
+    if mint
+        .get_extension::<ConfidentialTransferFeeConfig>()
+        .is_ok()
         || mint.get_extension::<TransferFeeConfig>().is_ok()
         || mint.get_extension::<InterestBearingConfig>().is_ok()
         || mint.get_extension::<ScaledUiAmountConfig>().is_ok()
