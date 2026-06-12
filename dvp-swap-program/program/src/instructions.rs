@@ -16,7 +16,7 @@ use pinocchio::Address as Pubkey;
 /// cross-program swaps (e.g. legacy-SPL ↔ Token-2022). Each token
 /// program account must match the owner of its leg's mint. Mints
 /// carrying amount-mutating Token-2022 extensions (TransferFee,
-/// ConfidentialTransferFee, InterestBearing, ScaledUiAmount) are
+/// ConfidentialTransferFeeConfig, InterestBearing, ScaledUiAmount) are
 /// rejected at CreateDvp; later instructions do not re-check so that
 /// funds remain recoverable if a mint's extension parameters change
 /// post-Create.
