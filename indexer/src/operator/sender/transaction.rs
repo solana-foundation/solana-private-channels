@@ -1392,6 +1392,7 @@ mod tests {
         ));
         SenderState {
             rpc_client: rpc_client.clone(),
+            source_rpc_client: rpc_client.clone(),
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -1425,6 +1426,7 @@ mod tests {
         ));
         SenderState {
             rpc_client: rpc_client.clone(),
+            source_rpc_client: rpc_client.clone(),
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -2776,6 +2778,15 @@ mod tests {
                     },
                     CommitmentConfig::confirmed(),
                 )),
+                source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::utils::rpc_util::RetryConfig {
+                        max_attempts: 1,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(1),
+                    },
+                    CommitmentConfig::confirmed(),
+                )),
                 storage: storage.clone(),
                 instance_pda: None,
                 smt_state: None,
@@ -2882,6 +2893,15 @@ mod tests {
             let storage = Arc::new(Storage::Mock(MockStorage::new()));
             SenderState {
                 rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    crate::operator::utils::rpc_util::RetryConfig {
+                        max_attempts: 1,
+                        base_delay: std::time::Duration::from_millis(1),
+                        max_delay: std::time::Duration::from_millis(1),
+                    },
+                    CommitmentConfig::confirmed(),
+                )),
+                source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
                     server.url(),
                     crate::operator::utils::rpc_util::RetryConfig {
                         max_attempts: 1,
@@ -3011,6 +3031,15 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3079,6 +3108,15 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mut state = SenderState {
             rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
                 server.url(),
                 crate::operator::utils::rpc_util::RetryConfig {
                     max_attempts: 1,
@@ -3159,6 +3197,15 @@ mod tests {
                 },
                 CommitmentConfig::confirmed(),
             )),
+            source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -3231,6 +3278,15 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mut state = SenderState {
             rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
                 server.url(),
                 crate::operator::utils::rpc_util::RetryConfig {
                     max_attempts: 1,
@@ -3346,6 +3402,15 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mut state = SenderState {
             rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
+                server.url(),
+                crate::operator::utils::rpc_util::RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::confirmed(),
+            )),
+            source_rpc_client: Arc::new(RpcClientWithRetry::with_retry_config(
                 server.url(),
                 crate::operator::utils::rpc_util::RetryConfig {
                     max_attempts: 1,

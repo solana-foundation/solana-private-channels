@@ -141,6 +141,10 @@ pub struct InFlightTx {
 /// Sender state tracking SMT and pending transactions
 pub struct SenderState {
     pub rpc_client: Arc<RpcClientWithRetry>,
+    /// Source chain RPC: PrivateChannel for the withdraw operator, where the
+    /// burn happened. Remints broadcast here to restore the burned balance.
+    /// rpc_client is the destination chain (Solana) for ReleaseFunds.
+    pub source_rpc_client: Arc<RpcClientWithRetry>,
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
     pub smt_state: Option<SenderSMTState>,

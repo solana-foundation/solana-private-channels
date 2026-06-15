@@ -59,7 +59,9 @@ async fn attempt_remint(
         txn_id: info.transaction_id,
         trace_id: info.trace_id.clone(),
     };
-    match find_existing_mint_signature_with_memo(&state.rpc_client, &builder_for_lookup, &memo)
+    // Idempotency lookup, send, and confirm all run on the source chain
+    // (PrivateChannel), not rpc_client (Solana, the ReleaseFunds destination).
+    match find_existing_mint_signature_with_memo(&state.source_rpc_client, &builder_for_lookup, &memo)
         .await
     {
         Ok(Some(existing_signature)) => {
@@ -92,12 +94,13 @@ async fn attempt_remint(
         compute_budget: None,
     };
 
-    let (signature, _) = sign_and_send_transaction(state.rpc_client.clone(), ix, RetryPolicy::None)
+    let (signature, _) =
+        sign_and_send_transaction(state.source_rpc_client.clone(), ix, RetryPolicy::None)
         .await
         .map_err(|e| format!("Failed to send remint transaction: {}", e))?;
 
     let result = check_transaction_status(
-        state.rpc_client.clone(),
+        state.source_rpc_client.clone(),
         &signature,
         CommitmentConfig::confirmed(),
         &ExtraErrorCheckPolicy::None,
@@ -540,7 +543,8 @@ mod tests {
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ));
         let state = SenderState {
-            rpc_client: rpc,
+            rpc_client: rpc.clone(),
+            source_rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -621,7 +625,8 @@ mod tests {
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ));
         let state = SenderState {
-            rpc_client: rpc,
+            rpc_client: rpc.clone(),
+            source_rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -655,6 +660,135 @@ mod tests {
             .with_body(body)
             .create_async()
             .await
+    }
+
+    /// Builds a SenderState with distinct rpc_client and source_rpc_client
+    /// endpoints, matching the cross-chain withdraw operator (rpc_url=Solana,
+    /// source_rpc_url=PrivateChannel).
+    fn make_sender_state_split_rpc(dest_url: &str, source_url: &str) -> (SenderState, MockStorage) {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let fast = crate::operator::RetryConfig {
+            max_attempts: 1,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(1),
+        };
+        let rpc_client = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+            dest_url.to_string(),
+            fast.clone(),
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ));
+        let source_rpc_client = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
+            source_url.to_string(),
+            fast,
+            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+        ));
+        let state = SenderState {
+            rpc_client,
+            source_rpc_client,
+            storage: storage.clone(),
+            instance_pda: None,
+            smt_state: None,
+            retry_counts: HashMap::new(),
+            mint_builders: HashMap::new(),
+            mint_cache: MintCache::new(storage),
+            retry_max_attempts: 3,
+            confirmation_poll_interval_ms: 1,
+            rotation_retry_queue: Vec::new(),
+            pending_rotation: None,
+            program_type: crate::config::ProgramType::Escrow,
+            remint_cache: HashMap::new(),
+            pending_signatures: HashMap::new(),
+            pending_remints: Vec::new(),
+            in_flight: InFlightQueue::new(),
+            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        };
+        (state, mock)
+    }
+
+    /// The withdraw operator's compensating remint MintTo must be broadcast on the
+    /// source (PrivateChannel) RPC, where the burn occurred, not on the destination
+    /// (Solana) RPC used for ReleaseFunds.
+    ///
+    /// Asserts the sendTransaction broadcast reaches the source server. On the buggy
+    /// code the remint runs against rpc_client, so the source server is never called.
+    #[tokio::test]
+    async fn withdrawal_remint_broadcasts_to_source_rpc_not_destination() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await; // Solana / rpc_client
+        let mut source = mockito::Server::new_async().await; // PrivateChannel / source_rpc_client
+
+        // Destination: release sig finalized-failed, so classify returns Dead and
+        // the gate proceeds to remint.
+        let _dest_status = dest
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignatureStatuses""#.into()),
+                mockito::Matcher::Regex(r#""searchTransactionHistory"\s*:\s*true"#.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                    "slot":100,"confirmations":null,
+                    "err":{"InstructionError":[0,{"Custom":1}]},
+                    "status":{"Err":{"InstructionError":[0,{"Custom":1}]}},
+                    "confirmationStatus":"finalized"}]},"id":0}"#,
+            )
+            .create_async()
+            .await;
+
+        // Source: backs the remint lookup, blockhash, and broadcast.
+        let _src_sigs = mock_rpc(
+            &mut source,
+            "getSignaturesForAddress",
+            r#"{"jsonrpc":"2.0","result":[],"id":0}"#,
+        )
+        .await;
+        let _src_bh = mock_rpc(
+            &mut source,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let sent_sig = Signature::new_unique();
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":"{sent_sig}","id":0}}"#))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let (mut state, _mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(555),
+                withdrawal_nonce: Some(5),
+                trace_id: Some("trace-555".to_string()),
+            },
+            remint_info: make_remint_info(555),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // The remint broadcast must reach the source server. The mocked node returns
+        // a placeholder signature so the send does not confirm, but the request still
+        // proves which chain the broadcast targeted.
+        src_send.assert_async().await;
     }
 
     #[tokio::test]

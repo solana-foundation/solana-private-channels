@@ -427,6 +427,7 @@ mod tests {
         ));
         SenderState {
             rpc_client: rpc_client.clone(),
+            source_rpc_client: rpc_client.clone(),
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,

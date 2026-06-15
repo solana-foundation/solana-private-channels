@@ -42,10 +42,12 @@ impl SenderState {
         ));
 
         let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
-        let mint_cache = MintCache::with_rpc(storage.clone(), mint_rpc_client);
+        let mint_cache = MintCache::with_rpc(storage.clone(), mint_rpc_client.clone());
 
         Ok(Self {
             rpc_client,
+            // Source chain client (also used by MintCache). Remints broadcast here.
+            source_rpc_client: mint_rpc_client,
             storage,
             instance_pda,
             smt_state: None,
@@ -410,7 +412,8 @@ mod tests {
             solana_sdk::commitment_config::CommitmentConfig::confirmed(),
         ));
         SenderState {
-            rpc_client: rpc,
+            rpc_client: rpc.clone(),
+            source_rpc_client: rpc,
             storage: storage.clone(),
             instance_pda: None,
             smt_state: None,
@@ -952,6 +955,7 @@ mod tests {
         ));
         SenderState {
             rpc_client: rpc_client.clone(),
+            source_rpc_client: rpc_client.clone(),
             storage: storage.clone(),
             instance_pda: pda,
             smt_state: None,
