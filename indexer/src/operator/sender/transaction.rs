@@ -1124,16 +1124,11 @@ pub(super) async fn fire_and_store_task(
                 .with_label_values(&[pt, "rpc_send_error"])
                 .inc();
             error!("Failed to send transaction (fire-and-forget): {}", e);
-            if persisted {
-                leave_processing_for_recovery(
-                    pt,
-                    ctx.transaction_id,
-                    &signature,
-                    "send error after write-ahead persist",
-                );
-            } else {
-                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
-            }
+            // A send error means the broadcast was rejected (e.g. preflight) and did not
+            // reach the network, so this is terminal, same as the withdrawal send path.
+            // The genuinely-uncertain case (broadcast accepted, confirmation never seen)
+            // is handled in route_poll_results, which leaves a persisted mint Processing.
+            send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
         }
     }
 }
@@ -3861,11 +3856,12 @@ mod tests {
         );
     }
 
-    /// A send error AFTER the write-ahead persist must leave the row Processing for
-    /// recovery (never a terminal Failed), because the broadcast may have landed and
-    /// the persisted signature is the only durable record recovery can reconcile.
+    /// A send error (e.g. preflight rejection) means the broadcast never reached the
+    /// network, so even with the signature already persisted the mint is terminal Failed,
+    /// same as the withdrawal send path. (The broadcast-accepted-but-unconfirmed case is
+    /// the one route_poll_results leaves Processing; see the poll timeout test.)
     #[tokio::test]
-    async fn mint_send_error_after_persist_leaves_processing() {
+    async fn mint_send_error_after_persist_routes_to_failed() {
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         let _send = server
@@ -3912,10 +3908,11 @@ mod tests {
             !mock.get_release_signatures(77).await.unwrap().is_empty(),
             "signature must be persisted before the failing broadcast",
         );
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "send error after persist must not write a terminal status",
-        );
+        let update = storage_rx
+            .try_recv()
+            .expect("send error must emit a terminal status");
+        assert_eq!(update.transaction_id, 77);
+        assert_eq!(update.status, TransactionStatus::Failed);
         assert!(
             state.in_flight.is_empty(),
             "a failed broadcast stashes no in-flight entry",
