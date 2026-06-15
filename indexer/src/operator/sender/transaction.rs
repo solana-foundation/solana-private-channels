@@ -1219,6 +1219,12 @@ pub(super) async fn route_poll_results(
                             }
                         }
                         RetryPolicy::Idempotent => {
+                            // This resend broadcasts a fresh unpersisted signature, so a persisted
+                            // mint must never reach it (Mint is RetryPolicy::None); assert it.
+                            debug_assert!(
+                                !tx.persisted,
+                                "a write-ahead-persisted tx must not use the idempotent resend path"
+                            );
                             metrics::OPERATOR_TRANSACTION_ERRORS
                                 .with_label_values(&[
                                     state.program_type.as_label(),

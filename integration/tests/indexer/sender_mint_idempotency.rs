@@ -1,21 +1,12 @@
-//! Mint idempotency short-circuit.
+//! Mint idempotency memo scan: `find_existing_mint_signature_with_memo` returns
+//! `Some(signature)` when a prior confirmed mint carries the expected memo on the
+//! recipient ATA, so the caller can skip re-minting a deposit that already landed.
 //!
-//! Covers the mint-idempotency short-circuit inside the sender's
-//! mint-build path (`indexer/src/operator/sender/transaction.rs`):
-//! when a prior confirmed mint with the expected idempotency memo is
-//! found on `getSignaturesForAddress`, the sender must short-circuit
-//! and NOT
-//! submit a duplicate mint. This is the operator-restart recovery
-//! guarantee: a mint that landed on-chain before the operator crashed
-//! should not be re-sent.
+//! No longer on the live deposit path (which now persists the signature before
+//! broadcast); only the remint path calls it. The wire behavior tested is the same.
 //!
-//! Strategy: drive the public `find_existing_mint_signature_with_memo` entry
-//! point at the `MockRpcServer` wire layer. Script a
-//! `getSignaturesForAddress` reply carrying the deterministic memo
-//! `mint_idempotency_memo(txn_id)` and a matching `getTransaction`
-//! payload, then assert the helper returns `Some(signature)` — proving
-//! the production short-circuit would fire and the caller (in
-//! `handle_transaction_submission`) would skip the submit path.
+//! Strategy: drive it against `MockRpcServer`, scripting a `getSignaturesForAddress`
+//! reply with `mint_idempotency_memo(txn_id)` and a matching `getTransaction`.
 //!
 //! What this test validates:
 //!   - `find_existing_mint_signature_with_memo` issues `getSignaturesForAddress`
@@ -24,13 +15,12 @@
 //!     `mint_idempotency_memo(txn_id)`
 //!   - It fetches the full transaction via `getTransaction` and
 //!     verifies the payload matches the expected mint parameters
-//!   - On a match, it returns `Some(signature)` so the caller can skip
+//!   - On a match, it returns `Some(signature)` so the remint caller can skip
 //!     re-sending
 //!
 //! What is intentionally NOT asserted here:
-//!   - Full `handle_transaction_submission` short-circuit (requires the
-//!     full sender state; the returned `Some(sig)` IS the production
-//!     signal that drives the caller's `return`)
+//!   - The remint caller's use of the returned `Some(sig)` (covered on the
+//!     remint path); this file pins the wire-level lookup behavior only
 //!   - Metric increments (none fire on the idempotency-hit path)
 
 use {
@@ -180,8 +170,8 @@ fn get_transaction_reply(
 }
 
 /// When a prior confirmed mint with the expected memo exists on the ATA,
-/// `find_existing_mint_signature_with_memo` returns `Some(sig)` - the short-circuit
-/// signal the production sender uses to skip the submit path.
+/// `find_existing_mint_signature_with_memo` returns `Some(sig)` - the signal the
+/// remint path uses to skip re-minting a deposit that already landed.
 #[tokio::test]
 async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
     let mock = MockRpcServer::start().await;
@@ -264,8 +254,8 @@ async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
 }
 
 /// When no prior confirmed mint matches the expected memo (empty result),
-/// `find_existing_mint_signature_with_memo` returns `Ok(None)` - the production
-/// signal that the normal send path should proceed.
+/// `find_existing_mint_signature_with_memo` returns `Ok(None)` - the signal that
+/// the remint path may proceed with the mint.
 #[tokio::test]
 async fn returns_none_when_no_prior_mint_signature_matches() {
     let mock = MockRpcServer::start().await;

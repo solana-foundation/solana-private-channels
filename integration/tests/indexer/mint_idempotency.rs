@@ -4,6 +4,10 @@
 //! confirmed mint-to transaction on-chain, preventing the operator from issuing
 //! duplicate channel tokens for the same deposit.
 //!
+//! As of the write-ahead signature-persistence change this memo scan is no longer on
+//! the live deposit-mint send path (which now persists its broadcast signature and lets
+//! recovery reconcile against it); the function is reached only from the remint path.
+//!
 //! Scenarios covered:
 //! 1. Matching txn_id + amount → existing signature returned (idempotent re-use).
 //! 2. Different txn_id (different memo)  → None (treated as a new, unseen deposit).
