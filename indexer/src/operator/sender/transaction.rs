@@ -748,6 +748,21 @@ pub(super) async fn handle_success(
 /// double-spend if the original withdrawal lands on-chain after our polling window.
 ///
 /// For non-withdrawal transactions: delegates to send_fatal_error.
+/// Whether a send failure came back as an explicit RPC rejection from the node
+/// (preflight simulation failure, blockhash errors, etc.). Such a response means the
+/// transaction was never submitted to the cluster, so failing fast is safe. A transport
+/// or IO error instead leaves the outcome ambiguous (the request may have reached the
+/// cluster), so a persisted mint defers to recovery rather than risk stranding a landed one.
+fn send_rejected_by_node(e: &TransactionError) -> bool {
+    use solana_rpc_client_api::client_error::ErrorKind;
+    use solana_rpc_client_api::request::RpcError;
+    matches!(
+        e,
+        TransactionError::Rpc(err)
+            if matches!(&err.kind, ErrorKind::RpcError(RpcError::RpcResponseError { .. }))
+    )
+}
+
 /// Leave a persisted transaction Processing after an uncertain terminal outcome.
 /// The broadcast may have landed, so a terminal Failed would strand a possibly-funded
 /// deposit and drop the signature recovery needs; recovery reconciles it next sweep.
@@ -1124,11 +1139,19 @@ pub(super) async fn fire_and_store_task(
                 .with_label_values(&[pt, "rpc_send_error"])
                 .inc();
             error!("Failed to send transaction (fire-and-forget): {}", e);
-            // A send error means the broadcast was rejected (e.g. preflight) and did not
-            // reach the network, so this is terminal, same as the withdrawal send path.
-            // The genuinely-uncertain case (broadcast accepted, confirmation never seen)
-            // is handled in route_poll_results, which leaves a persisted mint Processing.
-            send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+            // A node rejection (e.g. preflight) means the tx never reached the cluster, so
+            // fail fast. An ambiguous transport error on a persisted mint may have landed,
+            // so leave it Processing for recovery rather than strand a possibly-funded mint.
+            if persisted && !send_rejected_by_node(&e) {
+                leave_processing_for_recovery(
+                    pt,
+                    ctx.transaction_id,
+                    &signature,
+                    "ambiguous send error after write-ahead persist",
+                );
+            } else {
+                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+            }
         }
     }
 }
@@ -3921,6 +3944,35 @@ mod tests {
             state.semaphore.available_permits(),
             before + 1,
             "permit must be dropped on send error",
+        );
+    }
+
+    /// A node RPC rejection (preflight, blockhash, etc.) is definitive - the tx was never
+    /// submitted - so a persisted mint fails fast; a transport/IO error is ambiguous and a
+    /// persisted mint instead defers to recovery. This classifier draws that line.
+    #[test]
+    fn send_rejected_by_node_distinguishes_rejection_from_transport_error() {
+        use solana_rpc_client_api::client_error::{Error as ClientError, ErrorKind};
+        use solana_rpc_client_api::request::{RpcError, RpcResponseErrorData};
+
+        let node_rejection = TransactionError::Rpc(Box::new(ClientError::from(
+            ErrorKind::RpcError(RpcError::RpcResponseError {
+                code: -32002,
+                message: "preflight failure".to_string(),
+                data: RpcResponseErrorData::Empty,
+            }),
+        )));
+        assert!(
+            send_rejected_by_node(&node_rejection),
+            "an RPC response error is a definitive node rejection"
+        );
+
+        let transport_error = TransactionError::Rpc(Box::new(ClientError::from(
+            ErrorKind::Custom("connection reset".to_string()),
+        )));
+        assert!(
+            !send_rejected_by_node(&transport_error),
+            "a transport error is ambiguous, not a node rejection"
         );
     }
 
