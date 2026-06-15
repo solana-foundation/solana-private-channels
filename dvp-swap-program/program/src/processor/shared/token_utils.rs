@@ -15,7 +15,6 @@ use pinocchio_token_2022::{
     state::TokenAccount as Token2022Account, ID as TOKEN_2022_PROGRAM_ID,
 };
 use spl_token_2022::extension::{
-    confidential_transfer_fee::ConfidentialTransferFeeConfig,
     interest_bearing_mint::InterestBearingConfig, memo_transfer::memo_required,
     non_transferable::NonTransferable, scaled_ui_amount::ScaledUiAmountConfig,
     transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions,
@@ -127,10 +126,10 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
 
 /// Reject Token-2022 mints carrying either:
 /// - an amount-mutating extension that silently breaks the "escrow
-///   balance == sum of deposits" invariant (`TransferFee` (+ its
-///   confidential variant), `InterestBearing`, `ScaledUiAmount`): the
-///   credited amount drifts from the debited amount, so the program
-///   would settle "successfully" while a leg comes up short; or
+///   balance == sum of deposits" invariant (`TransferFee`,
+///   `InterestBearing`, `ScaledUiAmount`): the credited amount drifts
+///   from the debited amount, so the program would settle
+///   "successfully" while a leg comes up short; or
 /// - `NonTransferable`, which permanently blocks transfers out of the
 ///   escrow. Unlike everything else this never recovers — if a balance
 ///   reaches the escrow (e.g. the authority mints straight to it), no
@@ -182,10 +181,7 @@ pub fn validate_mint_extensions(mint_info: &AccountView) -> ProgramResult {
     let mint = StateWithExtensions::<Token2022MintState>::unpack(&data)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
-    if mint
-        .get_extension::<ConfidentialTransferFeeConfig>()
-        .is_ok()
-        || mint.get_extension::<TransferFeeConfig>().is_ok()
+    if mint.get_extension::<TransferFeeConfig>().is_ok()
         || mint.get_extension::<InterestBearingConfig>().is_ok()
         || mint.get_extension::<ScaledUiAmountConfig>().is_ok()
         || mint.get_extension::<NonTransferable>().is_ok()
