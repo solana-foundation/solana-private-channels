@@ -61,8 +61,12 @@ async fn attempt_remint(
     };
     // Idempotency lookup, send, and confirm all run on the source chain
     // (PrivateChannel), not rpc_client (Solana, the ReleaseFunds destination).
-    match find_existing_mint_signature_with_memo(&state.source_rpc_client, &builder_for_lookup, &memo)
-        .await
+    match find_existing_mint_signature_with_memo(
+        &state.source_rpc_client,
+        &builder_for_lookup,
+        &memo,
+    )
+    .await
     {
         Ok(Some(existing_signature)) => {
             info!(
@@ -96,8 +100,8 @@ async fn attempt_remint(
 
     let (signature, _) =
         sign_and_send_transaction(state.source_rpc_client.clone(), ix, RetryPolicy::None)
-        .await
-        .map_err(|e| format!("Failed to send remint transaction: {}", e))?;
+            .await
+            .map_err(|e| format!("Failed to send remint transaction: {}", e))?;
 
     let result = check_transaction_status(
         state.source_rpc_client.clone(),
@@ -342,7 +346,9 @@ pub async fn process_pending_remints(
             .map(|n| n.to_string())
             .unwrap_or_else(|| "none".to_string());
 
-        // Classify the stored signatures against on-chain state.
+        // Classify the stored signatures against on-chain state. This runs on
+        // rpc_client (the destination/Solana chain where ReleaseFunds was sent),
+        // not source_rpc_client which only the remint MintTo uses.
         match classify_release_signatures(&state.rpc_client, &entry.signatures).await {
             // Case 1: a sig finalized successfully — the withdrawal landed.
             SigFinality::Landed(sig) => {
@@ -739,7 +745,7 @@ mod tests {
             .await;
 
         // Source: backs the remint lookup, blockhash, and broadcast.
-        let _src_sigs = mock_rpc(
+        let src_lookup = mock_rpc(
             &mut source,
             "getSignaturesForAddress",
             r#"{"jsonrpc":"2.0","result":[],"id":0}"#,
@@ -759,7 +765,9 @@ mod tests {
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(format!(r#"{{"jsonrpc":"2.0","result":"{sent_sig}","id":0}}"#))
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{sent_sig}","id":0}}"#
+            ))
             .expect_at_least(1)
             .create_async()
             .await;
@@ -785,9 +793,10 @@ mod tests {
 
         process_pending_remints(&mut state, &storage_tx).await;
 
-        // The remint broadcast must reach the source server. The mocked node returns
-        // a placeholder signature so the send does not confirm, but the request still
-        // proves which chain the broadcast targeted.
+        // The idempotency lookup and the broadcast must both reach the source server.
+        // The mocked node returns a placeholder signature so the send does not confirm,
+        // but the requests still prove which chain the remint targeted.
+        src_lookup.assert_async().await;
         src_send.assert_async().await;
     }
 
