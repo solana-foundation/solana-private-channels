@@ -46,8 +46,11 @@ batch_size = 50
 # Yellowstone gRPC endpoint URL
 # endpoint = "grpc://your-yellowstone-endpoint:10000"
 
-# Commitment level: "processed", "confirmed", or "finalized"
-commitment = "confirmed"
+# Commitment level: "processed", "confirmed", or "finalized".
+# Keep "finalized" for escrow ingestion: deposits become irreversible
+# private-channel mints, so a "confirmed" deposit lost to a Solana reorg would
+# produce an unbacked mint with no rollback path.
+commitment = "finalized"
 
 # Token must be set via environment variable: INDEXER_YELLOWSTONE_TOKEN
 # Example: export INDEXER_YELLOWSTONE_TOKEN="your-token"

@@ -20,7 +20,9 @@ datasource_type = "yellowstone"
 
 [indexer.yellowstone]
 endpoint = "http://localhost:10000"
-commitment = "confirmed"
+# Must stay "finalized": deposits become irreversible private-channel mints, so
+# ingesting at "confirmed" would let a Solana reorg produce an unbacked mint.
+commitment = "finalized"
 
 [indexer.rpc_polling]
 poll_interval_ms = 1000
