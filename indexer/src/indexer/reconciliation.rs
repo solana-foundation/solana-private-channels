@@ -111,7 +111,7 @@ pub async fn run_startup_reconciliation(
         .await
         .map_err(ReconciliationError::Storage)?;
 
-    let results = build_reconciliation_set(&mint_balances, &on_chain_balances);
+    let results = build_reconciliation_set(&mint_balances, &on_chain_balances)?;
 
     if results.is_empty() {
         // Reached only when both the escrow sweep and the DB are genuinely empty, i.e. a truly-first deploy.
@@ -133,7 +133,7 @@ pub async fn run_startup_reconciliation(
 fn build_reconciliation_set(
     db_balances: &[MintDbBalance],
     on_chain_balances: &HashMap<Pubkey, u64>,
-) -> Vec<MintReconciliation> {
+) -> Result<Vec<MintReconciliation>, ReconciliationError> {
     // Keyed by mint string so the DB side (String addresses) and on-chain side
     // (Pubkey) merge into one universe; BTreeMap keeps the order deterministic.
     let mut by_mint: BTreeMap<String, (u64, u64)> = BTreeMap::new();
@@ -141,19 +141,19 @@ fn build_reconciliation_set(
     for balance in db_balances {
         let net = &balance.total_deposits - &balance.total_withdrawals;
         by_mint.entry(balance.mint_address.clone()).or_default().0 =
-            net_db_expected(&net, &balance.mint_address);
+            net_db_expected(&net, &balance.mint_address)?;
     }
 
     for (mint, on_chain) in on_chain_balances {
         by_mint.entry(mint.to_string()).or_default().1 = *on_chain;
     }
 
-    by_mint
+    Ok(by_mint
         .into_iter()
         .map(|(mint, (db_expected, on_chain_actual))| {
             MintReconciliation::new(mint, db_expected, on_chain_actual)
         })
-        .collect()
+        .collect())
 }
 
 /// Log deposit rows whose mint was not allowed at the deposit's slot.
@@ -182,29 +182,28 @@ async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
 }
 
 /// Convert a per-mint net (deposits - withdrawals) into the unsigned expected
-/// balance, mirroring the operator's continuous-reconciliation seam. A negative
-/// net (withdrawals exceed deposits) is clamped to 0 with a warning; an
-/// over-u64 net is surfaced as u64::MAX so the mismatch check trips rather than
-/// the value wrapping.
-fn net_db_expected(net: &bigdecimal::BigDecimal, mint_address: &str) -> u64 {
+/// balance. A negative net (withdrawals exceed deposits) is clamped to 0 with a
+/// warning. An over-u64 net is impossible for a real escrow (the ATA balance is
+/// itself a u64), so it signals a corrupt DB and aborts the startup gate rather
+/// than feeding a sentinel into the mismatch compare.
+fn net_db_expected(
+    net: &bigdecimal::BigDecimal,
+    mint_address: &str,
+) -> Result<u64, ReconciliationError> {
     match net_to_u64(net) {
-        NetBalance::Exact(v) => v,
+        NetBalance::Exact(v) => Ok(v),
         NetBalance::Negative => {
             warn!(
                 mint = mint_address,
                 net = %net,
                 "Withdrawals exceed deposits; treating expected escrow balance as 0"
             );
-            0
+            Ok(0)
         }
-        NetBalance::Overflow => {
-            warn!(
-                mint = mint_address,
-                net = %net,
-                "Expected escrow balance exceeds u64::MAX; flagging as a reconciliation mismatch"
-            );
-            u64::MAX
-        }
+        NetBalance::Overflow => Err(ReconciliationError::DbBalanceOverflow {
+            mint: mint_address.to_string(),
+            net: net.to_string(),
+        }),
     }
 }
 
@@ -319,19 +318,24 @@ mod tests {
         // state; the net is clamped to 0 so a corrupt over-withdrawn mint reads
         // as expected balance 0 and surfaces as a mismatch, not a wrap.
         let net = bigdecimal::BigDecimal::from(-50);
-        assert_eq!(net_db_expected(&net, "mint"), 0);
+        assert_eq!(net_db_expected(&net, "mint").unwrap(), 0);
     }
 
     #[test]
     fn net_db_expected_passes_full_u64_range() {
         let net = bigdecimal::BigDecimal::from(u64::MAX);
-        assert_eq!(net_db_expected(&net, "mint"), u64::MAX);
+        assert_eq!(net_db_expected(&net, "mint").unwrap(), u64::MAX);
     }
 
     #[test]
-    fn net_db_expected_flags_over_u64_as_mismatch_sentinel() {
+    fn net_db_expected_over_u64_is_a_hard_error() {
+        // A net above u64::MAX cannot back a real escrow ATA (itself a u64), so it
+        // is a corrupt-DB signal and must fail the startup gate, not return a value.
         let net = bigdecimal::BigDecimal::from(u64::MAX) + bigdecimal::BigDecimal::from(1);
-        assert_eq!(net_db_expected(&net, "mint"), u64::MAX);
+        assert!(matches!(
+            net_db_expected(&net, "mint"),
+            Err(ReconciliationError::DbBalanceOverflow { .. })
+        ));
     }
 
     // =========================================================================
@@ -469,13 +473,16 @@ mod tests {
 
     #[test]
     fn union_empty_both_sides_is_empty() {
-        assert!(build_reconciliation_set(&[], &HashMap::new()).is_empty());
+        assert!(build_reconciliation_set(&[], &HashMap::new())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn union_db_only_mint_compares_against_zero_on_chain() {
         let results =
-            build_reconciliation_set(&[db_balance("MintAAAA", 1000, 200)], &HashMap::new());
+            build_reconciliation_set(&[db_balance("MintAAAA", 1000, 200)], &HashMap::new())
+                .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].mint, "MintAAAA");
         assert_eq!(results[0].db_expected, 800);
@@ -487,7 +494,7 @@ mod tests {
     fn union_on_chain_only_mint_compares_against_zero_db() {
         let mint = Pubkey::new_unique();
         let on_chain = HashMap::from([(mint, 1234u64)]);
-        let results = build_reconciliation_set(&[], &on_chain);
+        let results = build_reconciliation_set(&[], &on_chain).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].mint, mint.to_string());
         assert_eq!(results[0].db_expected, 0);
@@ -500,7 +507,7 @@ mod tests {
         let mint = Pubkey::new_unique();
         let on_chain = HashMap::from([(mint, 1000u64)]);
         let results =
-            build_reconciliation_set(&[db_balance(&mint.to_string(), 1000, 0)], &on_chain);
+            build_reconciliation_set(&[db_balance(&mint.to_string(), 1000, 0)], &on_chain).unwrap();
         assert_eq!(results.len(), 1, "same mint must merge to one entry");
         assert_eq!(results[0].mismatch, 0);
     }
@@ -511,8 +518,22 @@ mod tests {
         let chain_mint = Pubkey::new_unique();
         let on_chain = HashMap::from([(chain_mint, 700u64)]);
         let results =
-            build_reconciliation_set(&[db_balance(&db_mint.to_string(), 500, 0)], &on_chain);
+            build_reconciliation_set(&[db_balance(&db_mint.to_string(), 500, 0)], &on_chain)
+                .unwrap();
         assert_eq!(results.len(), 2, "union must contain both mints");
+    }
+
+    #[test]
+    fn union_db_overflow_is_a_hard_error() {
+        // A DB net above u64::MAX is corrupt accounting; building the set must fail
+        // closed rather than emit a sentinel that could compare as balanced.
+        let mut bal = db_balance("MintAAAA", 0, 0);
+        bal.total_deposits =
+            bigdecimal::BigDecimal::from(u64::MAX) + bigdecimal::BigDecimal::from(1);
+        assert!(matches!(
+            build_reconciliation_set(&[bal], &HashMap::new()),
+            Err(ReconciliationError::DbBalanceOverflow { .. })
+        ));
     }
 
     // =========================================================================

@@ -271,6 +271,28 @@ impl PostgresDb {
         .await?;
         info!("landed_remint_signature migration complete");
 
+        // Widen a legacy BIGINT amount column to NUMERIC(20,0). BIGINT wraps amounts
+        // above i64::MAX negative; the cast is lossless and the guard makes it a no-op
+        // once already NUMERIC. Required because the BigDecimal decoder rejects BIGINT.
+        info!("Running amount NUMERIC widening migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'transactions'
+                      AND column_name = 'amount'
+                      AND data_type = 'bigint'
+                ) THEN
+                    ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(20,0);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("amount NUMERIC widening migration complete");
+
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
         )

@@ -130,6 +130,88 @@ async fn drop_tables_then_reinit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A database created before this change has `amount BIGINT`. init_schema must
+/// widen it to NUMERIC(20,0) in place, after which a value above i64::MAX (which
+/// BIGINT could not hold) round-trips through the TokenAmount decode path.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_widens_legacy_bigint_amount_column() -> Result<(), Box<dyn std::error::Error>>
+{
+    let container = Postgres::default()
+        .with_db_name("db_test")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{}:{}/db_test", host, port);
+    let pool = PgPool::connect(&db_url).await?;
+
+    // Stand up the pre-change shape: the base transactions table with a BIGINT
+    // amount (newer columns are added by init_schema's ALTER migrations).
+    sqlx::query(
+        "CREATE TYPE transaction_status AS ENUM ('pending', 'processing', 'completed', 'failed')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal')")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE transactions (
+            id BIGSERIAL PRIMARY KEY,
+            signature TEXT NOT NULL UNIQUE,
+            slot BIGINT NOT NULL,
+            initiator TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            amount BIGINT NOT NULL,
+            memo TEXT,
+            status transaction_status NOT NULL DEFAULT 'pending',
+            transaction_type transaction_type NOT NULL,
+            withdrawal_nonce BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            processed_at TIMESTAMPTZ,
+            counterpart_signature TEXT
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url,
+            max_connections: 5,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    // The column type must now be numeric, not bigint.
+    let (data_type,): (String,) = sqlx::query_as(
+        "SELECT data_type::text FROM information_schema.columns
+         WHERE table_name = 'transactions' AND column_name = 'amount'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(data_type, "numeric", "amount must be widened to NUMERIC");
+
+    // A value BIGINT could never have stored must now round-trip exactly.
+    let big = TokenAmount(i64::MAX as u64 + 1);
+    let mut txn = make_db_transaction("legacy_big", TransactionType::Deposit);
+    txn.amount = big;
+    let id = storage.insert_db_transaction(&txn).await?;
+    let (got,): (TokenAmount,) = sqlx::query_as("SELECT amount FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(got, big);
+    Ok(())
+}
+
 // ── 2. Single transaction insert ─────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
