@@ -186,10 +186,12 @@ impl TransactionProcessor {
         // Derive the `mints.status` mirror for each touched mint from history.
         // Gated on the writes above, so the mirror never leads the timeline.
         if send_checkpoint && !mint_statuses.is_empty() {
-            let touched: Vec<String> = mint_statuses
+            let mut touched: Vec<String> = mint_statuses
                 .iter()
                 .map(|s| s.mint_address.clone())
                 .collect();
+            touched.sort_unstable();
+            touched.dedup();
             if let Err(e) = self.storage.sync_mint_status(&touched).await {
                 error!("Failed to sync mint status mirror for slot {}: {}", slot, e);
                 metrics::INDEXER_SLOT_SAVE_ERRORS

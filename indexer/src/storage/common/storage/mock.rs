@@ -259,10 +259,7 @@ impl MockStorage {
 
     /// Mirrors `sync_mint_status_internal`: set each mint's `status` to its
     /// latest `mint_status_history` transition; a missing row is a no-op.
-    pub async fn sync_mint_status(
-        &self,
-        mint_addresses: &[String],
-    ) -> Result<(), StorageError> {
+    pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
         self.check_should_fail("sync_mint_status")?;
         // Resolve the latest status per address without holding both locks.
         let latest: std::collections::HashMap<String, String> = {

@@ -822,7 +822,10 @@ mod tests {
             .await
             .unwrap();
         storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
-        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "allowed");
+        assert_eq!(
+            storage.get_mint("m1").await.unwrap().unwrap().status,
+            "allowed"
+        );
     }
 
     /// A stale replay (older slot than the current head) must not move the mirror.
@@ -843,14 +846,20 @@ mod tests {
         // Replaying the slot-10 allow re-syncs, but the latest transition is still
         // blocked@20, so the mirror stays blocked.
         storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
-        assert_eq!(storage.get_mint("m1").await.unwrap().unwrap().status, "blocked");
+        assert_eq!(
+            storage.get_mint("m1").await.unwrap().unwrap().status,
+            "blocked"
+        );
     }
 
     #[tokio::test]
     async fn sync_mint_status_missing_row_is_noop() {
         let (storage, _mock) = make_mock_storage();
         // No row for "ghost" — must not error.
-        storage.sync_mint_status(&["ghost".to_string()]).await.unwrap();
+        storage
+            .sync_mint_status(&["ghost".to_string()])
+            .await
+            .unwrap();
         assert!(storage.get_mint("ghost").await.unwrap().is_none());
     }
 

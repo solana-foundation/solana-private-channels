@@ -640,7 +640,9 @@ async fn sync_mint_status_mirrors_history_against_postgres(
     );
 
     // Syncing a mint with no row is a no-op (no error).
-    storage.sync_mint_status(&["no_such_mint".to_string()]).await?;
+    storage
+        .sync_mint_status(&["no_such_mint".to_string()])
+        .await?;
     Ok(())
 }
 
