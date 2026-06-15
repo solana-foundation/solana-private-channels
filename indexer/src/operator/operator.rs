@@ -3,7 +3,7 @@ use crate::error::OperatorError;
 use crate::metrics;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
-    RetryConfig, RpcClientWithRetry, SignerUtil,
+    RetryConfig, RpcClientWithRetry,
 };
 use crate::shutdown_utils::shutdown_operator;
 use crate::storage::Storage;
@@ -96,12 +96,10 @@ pub async fn run(
     // signatures and this reconcile have run, and guards an unforeseen divergence.
     if program_type == crate::config::ProgramType::Withdraw {
         if let Some(preflight_instance) = instance_pda {
-            let admin_pubkey = SignerUtil::get_admin_pubkey();
             // The main rpc_client is the chain where the instance and releases live.
             let preflight = run_withdraw_preflight(
                 &storage,
                 &rpc_client,
-                admin_pubkey,
                 preflight_instance,
                 &storage_tx,
                 &cancellation_token,
@@ -238,12 +236,10 @@ pub async fn run(
         let recovery_rpc = rpc_client.clone();
         let recovery_program_type = common_config.program_type;
         let recovery_token = cancellation_token.clone();
-        let admin_pubkey = SignerUtil::get_admin_pubkey();
         tokio::spawn(async move {
             if let Err(e) = recovery::run_recovery_worker(
                 recovery_storage,
                 recovery_rpc,
-                admin_pubkey,
                 recovery_program_type,
                 recovery_storage_tx,
                 recovery_token,
@@ -358,7 +354,6 @@ pub async fn run(
 async fn run_withdraw_preflight(
     storage: &Arc<Storage>,
     rpc_client: &Arc<RpcClientWithRetry>,
-    admin_pubkey: solana_sdk::pubkey::Pubkey,
     instance_pda: solana_sdk::pubkey::Pubkey,
     storage_tx: &mpsc::Sender<sender::TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
@@ -371,7 +366,6 @@ async fn run_withdraw_preflight(
     if let Err(e) = recovery::boot_reconcile_processing(
         storage,
         rpc_client,
-        admin_pubkey,
         crate::config::ProgramType::Withdraw,
         storage_tx,
         cancellation_token,
@@ -504,15 +498,7 @@ mod tests {
         let client = Arc::new(client);
         let (storage_tx, _rx) = mpsc::channel::<sender::TransactionStatusUpdate>(8);
         let token = CancellationToken::new();
-        run_withdraw_preflight(
-            &storage,
-            &client,
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            &storage_tx,
-            &token,
-        )
-        .await
+        run_withdraw_preflight(&storage, &client, Pubkey::new_unique(), &storage_tx, &token).await
     }
 
     /// Matching local and on-chain roots: the pre-flight passes and the operator starts.

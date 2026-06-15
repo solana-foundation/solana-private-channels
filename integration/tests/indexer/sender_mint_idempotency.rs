@@ -9,7 +9,7 @@
 //! guarantee: a mint that landed on-chain before the operator crashed
 //! should not be re-sent.
 //!
-//! Strategy: drive the public `find_existing_mint_signature` entry
+//! Strategy: drive the public `find_existing_mint_signature_with_memo` entry
 //! point at the `MockRpcServer` wire layer. Script a
 //! `getSignaturesForAddress` reply carrying the deterministic memo
 //! `mint_idempotency_memo(txn_id)` and a matching `getTransaction`
@@ -18,7 +18,7 @@
 //! `handle_transaction_submission`) would skip the submit path.
 //!
 //! What this test validates:
-//!   - `find_existing_mint_signature` issues `getSignaturesForAddress`
+//!   - `find_existing_mint_signature_with_memo` issues `getSignaturesForAddress`
 //!     on the expected ATA
 //!   - It filters to entries that carry the memo produced by
 //!     `mint_idempotency_memo(txn_id)`
@@ -36,7 +36,7 @@
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
     private_channel_indexer::operator::{
-        find_existing_mint_signature,
+        find_existing_mint_signature_with_memo,
         utils::{
             instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},
             rpc_util::{RetryConfig, RpcClientWithRetry},
@@ -180,7 +180,7 @@ fn get_transaction_reply(
 }
 
 /// When a prior confirmed mint with the expected memo exists on the ATA,
-/// `find_existing_mint_signature` returns `Some(sig)` — the short-circuit
+/// `find_existing_mint_signature_with_memo` returns `Some(sig)` - the short-circuit
 /// signal the production sender uses to skip the submit path.
 #[tokio::test]
 async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
@@ -242,9 +242,13 @@ async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
         amount,
     );
 
-    let result = find_existing_mint_signature(&client, &builder_with_txn)
-        .await
-        .expect("idempotency lookup must succeed when payload matches");
+    let result = find_existing_mint_signature_with_memo(
+        &client,
+        &builder_with_txn,
+        &mint_idempotency_memo(builder_with_txn.txn_id),
+    )
+    .await
+    .expect("idempotency lookup must succeed when payload matches");
 
     let found = result.expect("matching memo + mint payload must yield Some(signature)");
     assert_eq!(
@@ -260,7 +264,7 @@ async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
 }
 
 /// When no prior confirmed mint matches the expected memo (empty result),
-/// `find_existing_mint_signature` returns `Ok(None)` — the production
+/// `find_existing_mint_signature_with_memo` returns `Ok(None)` - the production
 /// signal that the normal send path should proceed.
 #[tokio::test]
 async fn returns_none_when_no_prior_mint_signature_matches() {
@@ -287,9 +291,13 @@ async fn returns_none_when_no_prior_mint_signature_matches() {
         10_000,
     );
 
-    let result = find_existing_mint_signature(&client, &builder_with_txn)
-        .await
-        .expect("lookup on empty ATA must succeed");
+    let result = find_existing_mint_signature_with_memo(
+        &client,
+        &builder_with_txn,
+        &mint_idempotency_memo(builder_with_txn.txn_id),
+    )
+    .await
+    .expect("lookup on empty ATA must succeed");
 
     assert!(
         result.is_none(),

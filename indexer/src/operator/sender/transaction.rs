@@ -13,6 +13,7 @@ use crate::operator::{
     sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, RpcClientWithRetry,
 };
 use crate::storage::common::models::TransactionStatus;
+use crate::storage::common::storage::Storage;
 use chrono::Utc;
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
@@ -22,9 +23,7 @@ use solana_sdk::signature::Signature;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tracing::{error, info, info_span, warn, Instrument};
 
-use super::mint::{
-    cleanup_mint_builder, find_existing_mint_signature, try_jit_mint_initialization, JitOutcome,
-};
+use super::mint::{cleanup_mint_builder, try_jit_mint_initialization, JitOutcome};
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
 use super::types::{
     InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
@@ -174,26 +173,6 @@ pub async fn handle_transaction_submission(
     );
 
     async {
-        if let TransactionBuilder::Mint(builder_with_txn_id) = &tx_builder {
-            match find_existing_mint_signature(&state.rpc_client, builder_with_txn_id).await {
-                Ok(Some(existing_signature)) => {
-                    handle_success(state, &ctx, existing_signature, storage_tx).await;
-                    return;
-                }
-                Ok(None) => {}
-                // Deliberately fail-closed: an unverifiable lookup halts to
-                // manual review rather than risk a blind double-mint.
-                Err(e) => {
-                    error!(
-                        "Mint idempotency lookup failed for transaction_id {}: {}",
-                        builder_with_txn_id.txn_id, e
-                    );
-                    send_fatal_error(storage_tx, &ctx, &e).await;
-                    return;
-                }
-            }
-        }
-
         match state.handle_transaction_builder(tx_builder.clone()).await {
             Ok(instruction) => {
                 info!("Transaction instruction ready for submission");
@@ -203,6 +182,9 @@ pub async fn handle_transaction_submission(
                 // proof ordering requires at-most-one in-flight withdrawal at a time.
                 match &tx_builder {
                     TransactionBuilder::Mint(_) | TransactionBuilder::InitializeMint(_) => {
+                        // Only a real user-fund Mint persists write-ahead; InitializeMint
+                        // mints no balance and is on-chain idempotent, so it is excluded.
+                        let persist = matches!(tx_builder, TransactionBuilder::Mint(_));
                         spawn_fire_and_store(
                             state,
                             instruction,
@@ -211,6 +193,7 @@ pub async fn handle_transaction_submission(
                             retry_policy,
                             extra_error_checks_policy,
                             storage_tx.clone(),
+                            persist,
                         );
                     }
                     _ => {
@@ -302,6 +285,42 @@ pub(super) async fn route_builder_error(
     }
 }
 
+/// Persist a broadcast signature write-ahead (DB only), fail-closed: `Err(())` means
+/// "do not broadcast". On persist failure we count the error, log it with ids, and
+/// return early so the caller aborts before sending; the row stays Processing for the
+/// recovery worker to reconcile against the chain.
+pub(super) async fn persist_signature_or_abort(
+    storage: &Storage,
+    pt: &str,
+    transaction_id: i64,
+    signature: &Signature,
+    last_valid_block_height: u64,
+) -> Result<(), ()> {
+    if let Err(e) = storage
+        .insert_release_signature(
+            transaction_id,
+            signature.to_string(),
+            last_valid_block_height as i64,
+        )
+        .await
+    {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt, "pre_send_persist_error"])
+            .inc();
+        let abort = TransactionError::PreSendPersistFailed {
+            reason: e.to_string(),
+        };
+        error!(
+            transaction_id,
+            signature = %signature,
+            "Aborting before broadcast, leaving row Processing for recovery: {}",
+            abort
+        );
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Sign, send, confirm, and handle the result
 pub(super) async fn send_and_confirm(
     state: &mut SenderState,
@@ -362,29 +381,19 @@ pub(super) async fn send_and_confirm(
             }
         };
 
-    // Persist the release signature write-ahead (DB only), fail-closed. A withdrawal
-    // nonce is consumed on broadcast, so a release that lands must already have a
-    // durable signature record for crash recovery to reconcile against. On persist
-    // failure we abort before broadcasting (the nonce stays unconsumed) and leave the
-    // row Processing for the recovery worker.
+    // A withdrawal nonce is consumed on broadcast, so a release that lands must already
+    // have a durable signature record for crash recovery to reconcile against.
     if let (Some(_nonce), Some(txid)) = (ctx.withdrawal_nonce, ctx.transaction_id) {
-        if let Err(e) = state
-            .storage
-            .insert_release_signature(txid, signature.to_string(), last_valid_block_height as i64)
-            .await
+        if persist_signature_or_abort(
+            &state.storage,
+            pt,
+            txid,
+            &signature,
+            last_valid_block_height,
+        )
+        .await
+        .is_err()
         {
-            metrics::OPERATOR_TRANSACTION_ERRORS
-                .with_label_values(&[pt, "pre_send_persist_error"])
-                .inc();
-            let abort = TransactionError::PreSendPersistFailed {
-                reason: e.to_string(),
-            };
-            error!(
-                transaction_id = txid,
-                signature = %signature,
-                "Aborting release before broadcast, leaving row Processing for recovery: {}",
-                abort
-            );
             return;
         }
     }
@@ -739,6 +748,25 @@ pub(super) async fn handle_success(
 /// double-spend if the original withdrawal lands on-chain after our polling window.
 ///
 /// For non-withdrawal transactions: delegates to send_fatal_error.
+/// Leave a persisted transaction Processing after an uncertain terminal outcome.
+/// The broadcast may have landed, so a terminal Failed would strand a possibly-funded
+/// deposit and drop the signature recovery needs; recovery reconciles it next sweep.
+fn leave_processing_for_recovery(
+    pt: &str,
+    transaction_id: Option<i64>,
+    signature: &Signature,
+    reason: &str,
+) {
+    metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[pt, "left_processing_for_recovery"])
+        .inc();
+    warn!(
+        transaction_id,
+        signature = %signature,
+        "{reason}; leaving row Processing for recovery to reconcile",
+    );
+}
+
 pub(super) async fn handle_permanent_failure(
     state: &mut SenderState,
     ctx: &TransactionContext,
@@ -907,6 +935,7 @@ pub(super) async fn fire_and_store(
                 .observe(send_start.elapsed().as_secs_f64());
             info!("Transaction sent: {}", signature);
             // push() also notifies the poll task if it is waiting on an empty queue.
+            // Only InitializeMint is resent here, and it mints no balance, so no persist.
             state.in_flight.push(InFlightTx {
                 signature,
                 ctx,
@@ -916,6 +945,7 @@ pub(super) async fn fire_and_store(
                 extra_error_checks_policy,
                 poll_attempts: 0,
                 resend_count,
+                persisted: false,
                 permit,
             });
         }
@@ -944,6 +974,7 @@ pub(super) async fn fire_and_store(
 /// Returns `false` if the semaphore is already at `MAX_IN_FLIGHT` capacity.  The DB
 /// status is left unchanged so the fetcher re-emits the transaction on the next poll
 /// cycle.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_fire_and_store(
     state: &SenderState,
     instruction: InstructionWithSigners,
@@ -952,6 +983,8 @@ pub(super) fn spawn_fire_and_store(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
+    // True only for a real user-fund Mint
+    persist: bool,
 ) -> bool {
     let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
         Ok(p) => p,
@@ -971,42 +1004,138 @@ pub(super) fn spawn_fire_and_store(
     let rpc_client = state.rpc_client.clone();
     let in_flight = state.in_flight.clone();
     let program_type = state.program_type;
+    let storage = state.storage.clone();
 
-    tokio::spawn(async move {
-        let send_start = std::time::Instant::now();
-        match sign_and_send_transaction(rpc_client, instruction.clone(), retry_policy).await {
-            Ok((signature, _last_valid_block_height)) => {
-                metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[program_type.as_label(), "in_flight"])
-                    .observe(send_start.elapsed().as_secs_f64());
-                info!("Transaction sent: {}", signature);
-                in_flight.push(InFlightTx {
-                    signature,
-                    ctx,
-                    instruction,
-                    compute_unit_price,
-                    retry_policy,
-                    extra_error_checks_policy,
-                    poll_attempts: 0,
-                    resend_count: 0,
-                    permit,
-                });
-            }
+    tokio::spawn(fire_and_store_task(
+        rpc_client,
+        storage,
+        in_flight,
+        program_type,
+        instruction,
+        compute_unit_price,
+        ctx,
+        retry_policy,
+        extra_error_checks_policy,
+        storage_tx,
+        persist,
+        permit,
+    ));
+
+    true
+}
+
+/// Build, sign, persist the signature when `persist` is set, then broadcast and stash
+/// the in-flight tx. A persist failure aborts before broadcast and leaves the row
+/// Processing for recovery. Split from `spawn_fire_and_store` so tests can await it
+/// directly without `tokio::spawn`.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fire_and_store_task(
+    rpc_client: Arc<RpcClientWithRetry>,
+    storage: Arc<Storage>,
+    in_flight: Arc<InFlightQueue>,
+    program_type: ProgramType,
+    instruction: InstructionWithSigners,
+    compute_unit_price: Option<u64>,
+    ctx: TransactionContext,
+    retry_policy: RetryPolicy,
+    extra_error_checks_policy: ExtraErrorCheckPolicy,
+    storage_tx: mpsc::Sender<TransactionStatusUpdate>,
+    persist: bool,
+    permit: OwnedSemaphorePermit,
+) {
+    let pt = program_type.as_label();
+    let send_start = std::time::Instant::now();
+
+    let (transaction, signature, last_valid_block_height) =
+        match build_and_sign(&rpc_client, instruction.clone()).await {
+            Ok(signed) => signed,
             Err(e) => {
                 drop(permit);
                 metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[program_type.as_label(), "error"])
+                    .with_label_values(&[pt, "error"])
                     .observe(send_start.elapsed().as_secs_f64());
                 metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[program_type.as_label(), "rpc_send_error"])
+                    .with_label_values(&[pt, "build_sign_error"])
                     .inc();
-                error!("Failed to send transaction (fire-and-forget): {}", e);
+                error!("Failed to build/sign transaction (fire-and-forget): {}", e);
+                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+                return;
+            }
+        };
+
+    let persisted = if persist {
+        match ctx.transaction_id {
+            Some(txid) => {
+                if persist_signature_or_abort(
+                    &storage,
+                    pt,
+                    txid,
+                    &signature,
+                    last_valid_block_height,
+                )
+                .await
+                .is_err()
+                {
+                    drop(permit);
+                    return;
+                }
+                true
+            }
+            // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
+            None => {
+                drop(permit);
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "pre_send_persist_error"])
+                    .inc();
+                error!("Persist required but transaction has no id; aborting before broadcast");
+                return;
+            }
+        }
+    } else {
+        false
+    };
+
+    match send_signed(&rpc_client, &transaction, retry_policy).await {
+        // send_signed returns the same signature we already hold; keep using it.
+        Ok(_) => {
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "in_flight"])
+                .observe(send_start.elapsed().as_secs_f64());
+            info!("Transaction sent: {}", signature);
+            in_flight.push(InFlightTx {
+                signature,
+                ctx,
+                instruction,
+                compute_unit_price,
+                retry_policy,
+                extra_error_checks_policy,
+                poll_attempts: 0,
+                resend_count: 0,
+                persisted,
+                permit,
+            });
+        }
+        Err(e) => {
+            drop(permit);
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "rpc_send_error"])
+                .inc();
+            error!("Failed to send transaction (fire-and-forget): {}", e);
+            if persisted {
+                leave_processing_for_recovery(
+                    pt,
+                    ctx.transaction_id,
+                    &signature,
+                    "send error after write-ahead persist",
+                );
+            } else {
                 send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
             }
         }
-    });
-
-    true
+    }
 }
 
 /// Route a batch of `(InFlightTx, Option<TransactionStatus>)` pairs returned by a
@@ -1068,17 +1197,26 @@ pub(super) async fn route_poll_results(
                                     "confirmation_timeout_non_idempotent",
                                 ])
                                 .inc();
-                            warn!(
-                                "Confirmation timeout for non-idempotent tx {} after {} polls — permanent failure",
-                                tx.signature, tx.poll_attempts,
-                            );
-                            handle_permanent_failure(
-                                state,
-                                &tx.ctx,
-                                storage_tx,
-                                "Confirmation failed - transaction status unknown, unsafe to retry",
-                            )
-                            .await;
+                            if tx.persisted {
+                                leave_processing_for_recovery(
+                                    state.program_type.as_label(),
+                                    tx.ctx.transaction_id,
+                                    &tx.signature,
+                                    "confirmation timeout after write-ahead persist",
+                                );
+                            } else {
+                                warn!(
+                                    "Confirmation timeout for non-idempotent tx {} after {} polls - permanent failure",
+                                    tx.signature, tx.poll_attempts,
+                                );
+                                handle_permanent_failure(
+                                    state,
+                                    &tx.ctx,
+                                    storage_tx,
+                                    "Confirmation failed - transaction status unknown, unsafe to retry",
+                                )
+                                .await;
+                            }
                         }
                         RetryPolicy::Idempotent => {
                             metrics::OPERATOR_TRANSACTION_ERRORS
@@ -1096,17 +1234,26 @@ pub(super) async fn route_poll_results(
                                         "confirmation_timeout_resend_limit",
                                     ])
                                     .inc();
-                                warn!(
-                                    "Confirmation timeout for idempotent tx {} — resend limit ({}) reached, permanent failure",
-                                    tx.signature, state.retry_max_attempts,
-                                );
-                                handle_permanent_failure(
-                                    state,
-                                    &tx.ctx,
-                                    storage_tx,
-                                    "Confirmation timeout: resend limit exceeded",
-                                )
-                                .await;
+                                if tx.persisted {
+                                    leave_processing_for_recovery(
+                                        state.program_type.as_label(),
+                                        tx.ctx.transaction_id,
+                                        &tx.signature,
+                                        "resend limit reached after write-ahead persist",
+                                    );
+                                } else {
+                                    warn!(
+                                        "Confirmation timeout for idempotent tx {} - resend limit ({}) reached, permanent failure",
+                                        tx.signature, state.retry_max_attempts,
+                                    );
+                                    handle_permanent_failure(
+                                        state,
+                                        &tx.ctx,
+                                        storage_tx,
+                                        "Confirmation timeout: resend limit exceeded",
+                                    )
+                                    .await;
+                                }
                             } else {
                                 warn!(
                                     "Confirmation timeout for idempotent tx {} after {} polls — re-sending (attempt {}/{})",
@@ -1356,7 +1503,6 @@ mod tests {
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
-    use crate::storage::common::storage::Storage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use borsh::BorshSerialize;
@@ -2981,6 +3127,9 @@ mod tests {
             extra_error_checks_policy: ExtraErrorCheckPolicy::None,
             poll_attempts: 0,
             resend_count: 0,
+            // Default to not-persisted; tests that model a write-ahead-persisted
+            // deposit mint set `persisted = true` on the returned value explicitly.
+            persisted: false,
             permit: Arc::new(Semaphore::new(MAX_IN_FLIGHT))
                 .try_acquire_owned()
                 .unwrap(),
@@ -3249,10 +3398,11 @@ mod tests {
         );
     }
 
-    /// When poll_attempts reaches MAX_POLL_ATTEMPTS_CONFIRMATION for a RetryPolicy::None tx,
-    /// it must be declared a permanent failure and removed from in_flight.
+    /// When poll_attempts reaches MAX_POLL_ATTEMPTS_CONFIRMATION for a persisted
+    /// RetryPolicy::None mint, the broadcast may have landed, so it must be removed
+    /// from in_flight and left Processing for recovery (no terminal Failed write).
     #[tokio::test]
-    async fn poll_in_flight_timeout_none_policy_permanent_failure() {
+    async fn poll_in_flight_timeout_persisted_mint_left_processing() {
         let mut server = mockito::Server::new_async().await;
 
         let sig = Signature::new_unique();
@@ -3314,6 +3464,8 @@ mod tests {
                 let mut tx = make_in_flight_tx(sig, 101);
                 // Pre-fill poll_attempts to one below MAX so this poll tips it over.
                 tx.poll_attempts = MAX_POLL_ATTEMPTS_CONFIRMATION - 1;
+                // A real None-policy mint reaches in_flight only after a write-ahead persist.
+                tx.persisted = true;
                 q.push(tx);
                 q
             },
@@ -3330,20 +3482,11 @@ mod tests {
             "timed-out tx must leave in_flight"
         );
 
-        // Failed status emitted.
-        let update = storage_rx
-            .try_recv()
-            .expect("expected Failed status for non-idempotent timeout");
-        assert_eq!(update.transaction_id, 101);
-        assert_eq!(update.status, TransactionStatus::Failed);
+        // No terminal status: the row is left Processing for recovery to reconcile
+        // against the persisted signature, never written Failed here.
         assert!(
-            update
-                .error_message
-                .as_deref()
-                .unwrap_or("")
-                .contains("unknown"),
-            "error should mention unknown status: {:?}",
-            update.error_message,
+            storage_rx.try_recv().is_err(),
+            "persisted mint timeout must not write a terminal status",
         );
     }
 
@@ -3585,6 +3728,264 @@ mod tests {
         );
     }
 
+    // ── fire_and_store_task: deposit-mint pre-broadcast persist ───────
+
+    fn mint_ctx(txn_id: i64) -> TransactionContext {
+        TransactionContext {
+            transaction_id: Some(txn_id),
+            withdrawal_nonce: None,
+            trace_id: Some(format!("trace-{txn_id}")),
+        }
+    }
+
+    /// A persisting (Mint) fire-and-store run writes the signed transaction's signature
+    /// via `insert_release_signature` and then broadcasts that same signature.
+    #[tokio::test]
+    async fn mint_persists_signature_before_send() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            true,
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(77).await.unwrap();
+        assert_eq!(stored.len(), 1, "exactly one mint signature persisted");
+        assert_eq!(
+            stored[0].0,
+            Signature::default().to_string(),
+            "persisted signature must be the broadcast signature"
+        );
+        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "successful broadcast stashes the in-flight tx"
+        );
+    }
+
+    /// A failed write-ahead persist on the mint path must NOT broadcast, must stash no
+    /// in-flight entry, and must write no terminal status (row left Processing).
+    #[tokio::test]
+    async fn mint_persist_failure_aborts_before_broadcast() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("insert_release_signature", true);
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            true,
+            permit,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row stays Processing for recovery"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "nothing stashed when persist failed"
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on abort"
+        );
+    }
+
+    /// A send error AFTER the write-ahead persist must leave the row Processing for
+    /// recovery (never a terminal Failed), because the broadcast may have landed and
+    /// the persisted signature is the only durable record recovery can reconcile.
+    #[tokio::test]
+    async fn mint_send_error_after_persist_leaves_processing() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            true,
+            permit,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            !mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "signature must be persisted before the failing broadcast",
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "send error after persist must not write a terminal status",
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "a failed broadcast stashes no in-flight entry",
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on send error",
+        );
+    }
+
+    /// A non-persisting run (persist = false) broadcasts without writing any signature
+    /// even though a transaction_id is present, proving the `persist` gate (not the
+    /// id-presence guard) is what excludes the on-chain-idempotent initialization path.
+    #[tokio::test]
+    async fn initialize_mint_does_not_persist() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let _send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .create();
+
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        // Carry a transaction_id so the assertion exercises the `persist` gate
+        // itself rather than the inner id-presence guard short-circuiting.
+        let ctx = TransactionContext {
+            transaction_id: Some(909),
+            withdrawal_nonce: None,
+            trace_id: Some("trace-init".to_string()),
+        };
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            ctx,
+            RetryPolicy::Idempotent,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            false,
+            permit,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(909).await.unwrap().is_empty(),
+            "persist = false must not write a signature even with a transaction_id"
+        );
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "broadcast still stashes in-flight"
+        );
+    }
+
     // ── spawn_fire_and_store: cap enforcement ─────────────────────────
 
     /// When the semaphore is exhausted (all MAX_IN_FLIGHT slots occupied),
@@ -3616,6 +4017,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
+            false,
         );
 
         assert!(!result, "must return false when at capacity");
@@ -3648,6 +4050,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
+            false,
         );
 
         assert!(result, "must return true when capacity is available");

@@ -77,6 +77,7 @@ fn make_in_flight_tx(
         extra_error_checks_policy: ExtraErrorCheckPolicy::None,
         poll_attempts,
         resend_count,
+        persisted: false,
         permit,
     }
 }
