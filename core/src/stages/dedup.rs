@@ -1,7 +1,7 @@
 use {
     crate::{
-        accounts::traits::AccountsDB, health::StageHeartbeat, nodes::node::WorkerHandle,
-        stage_metrics::SharedMetrics,
+        accounts::traits::AccountsDB, accounts::traits::BlockInfo, health::StageHeartbeat,
+        nodes::node::WorkerHandle, stage_metrics::SharedMetrics,
     },
     anyhow::{ensure, Result},
     solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
@@ -51,6 +51,7 @@ pub fn create_dedup_channel(
 pub async fn load_dedup_state(
     accounts_db: &AccountsDB,
     max_blockhashes: usize,
+    expiry_ms: u64,
 ) -> Result<DedupState> {
     let live_blockhashes: LinkedList<Hash> = LinkedList::new();
     let dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
@@ -69,19 +70,44 @@ pub async fn load_dedup_state(
         .get_blocks_in_range(start_slot, latest_slot)
         .await?;
 
+    let loaded = blocks.len();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        // Checked cast; the i64::MAX fallback is unreachable
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let blocks = prune_expired_blocks(blocks, now_secs, expiry_ms);
+    let pruned = loaded.saturating_sub(blocks.len());
+
     let (live_blockhashes, dedup_cache) = build_dedup_state(&blocks)?;
 
     info!(
-        "Dedup: restored {} live blockhashes and {} cache entries from {} blocks",
-        live_blockhashes.len(),
-        dedup_cache.values().map(|s| s.len()).sum::<usize>(),
-        blocks.len(),
+        loaded_blocks = loaded,
+        pruned_blocks = pruned,
+        kept_blocks = blocks.len(),
+        live_blockhashes = live_blockhashes.len(),
+        cache_entries = dedup_cache.values().map(|s| s.len()).sum::<usize>(),
+        "Dedup: restored dedup state; {pruned} restored blocks were pruned as older than the {expiry_ms}ms expiry window",
     );
 
     Ok((live_blockhashes, dedup_cache))
 }
 
 type DedupState = (LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>);
+
+/// Drop restored blocks older than the expiry window.
+fn prune_expired_blocks(blocks: Vec<BlockInfo>, now_secs: i64, expiry_ms: u64) -> Vec<BlockInfo> {
+    // Checked: an oversized expiry clamps to i64::MAX, never wraps negative (drop all).
+    let expiry_secs = i64::try_from(expiry_ms / 1000).unwrap_or(i64::MAX);
+    blocks
+        .into_iter()
+        .filter(|block| match block.block_time {
+            Some(block_time) => now_secs.saturating_sub(block_time) <= expiry_secs,
+            // Age unknown means we cannot prove expiry, so keep the block.
+            None => true,
+        })
+        .collect()
+}
 
 /// Ingest pending blockhash updates into `live_blockhashes`
 ///
@@ -363,17 +389,30 @@ mod tests {
     }
 
     fn make_block(slot: u64, blockhash: Hash, sigs: &[(Signature, Hash)]) -> BlockInfo {
+        make_block_at(slot, blockhash, sigs, None)
+    }
+
+    fn make_block_at(
+        slot: u64,
+        blockhash: Hash,
+        sigs: &[(Signature, Hash)],
+        block_time: Option<i64>,
+    ) -> BlockInfo {
         BlockInfo {
             slot,
             blockhash,
             previous_blockhash: Hash::default(),
             parent_slot: slot.saturating_sub(1),
             block_height: Some(slot),
-            block_time: None,
+            block_time,
             transaction_signatures: sigs.iter().map(|(s, _)| *s).collect(),
             transaction_recent_blockhashes: sigs.iter().map(|(_, h)| *h).collect(),
         }
     }
+
+    // 15s window mirrored by the block ages below; bind both to one const so
+    // the prune boundary and the test fixtures can never drift apart.
+    const EXPIRY_MS: u64 = 15_000;
 
     const TEST_INGRESS_CAP: usize = 64;
 
@@ -573,6 +612,88 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("mismatched transaction_signatures"));
+    }
+
+    // --- prune_expired_blocks unit tests ---
+
+    #[test]
+    fn prune_drops_blocks_older_than_expiry() {
+        let now = 1_000_000i64;
+        let old = make_block_at(1, Hash::new_unique(), &[], Some(now - 20));
+        let fresh = make_block_at(2, Hash::new_unique(), &[], Some(now - 5));
+        let fresh_hash = fresh.blockhash;
+
+        let kept = prune_expired_blocks(vec![old, fresh], now, EXPIRY_MS);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].blockhash, fresh_hash);
+    }
+
+    #[test]
+    fn prune_keeps_all_when_within_expiry() {
+        let now = 1_000_000i64;
+        let blocks = vec![
+            make_block_at(1, Hash::new_unique(), &[], Some(now - 1)),
+            make_block_at(2, Hash::new_unique(), &[], Some(now - 1)),
+        ];
+
+        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
+
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn prune_keeps_none_when_all_stale() {
+        let now = 1_000_000i64;
+        let blocks = vec![
+            make_block_at(1, Hash::new_unique(), &[], Some(now - 3600)),
+            make_block_at(2, Hash::new_unique(), &[], Some(now - 3600)),
+        ];
+
+        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
+
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_block_time_none() {
+        let now = 1_000_000i64;
+        let blocks = vec![make_block_at(1, Hash::new_unique(), &[], None)];
+
+        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
+
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn prune_handles_future_block_time() {
+        let now = 1_000_000i64;
+        let blocks = vec![make_block_at(1, Hash::new_unique(), &[], Some(now + 3600))];
+
+        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
+
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn prune_then_build_drops_orphan_signatures() {
+        let now = 1_000_000i64;
+        let stale_hash = Hash::new_unique();
+        let fresh_hash = Hash::new_unique();
+        let stale_sig = Signature::new_unique();
+        let fresh_sig = Signature::new_unique();
+
+        // Stale block carries a self-referencing signature; fresh block too.
+        let stale = make_block_at(1, stale_hash, &[(stale_sig, stale_hash)], Some(now - 3600));
+        let fresh = make_block_at(2, fresh_hash, &[(fresh_sig, fresh_hash)], Some(now - 1));
+
+        let kept = prune_expired_blocks(vec![stale, fresh], now, EXPIRY_MS);
+        let (live, cache) = build_dedup_state(&kept).unwrap();
+
+        assert_eq!(live.len(), 1);
+        assert_eq!(*live.front().unwrap(), fresh_hash);
+        assert!(!cache.contains_key(&stale_hash));
+        assert!(cache.get(&fresh_hash).unwrap().contains(&fresh_sig));
     }
 
     #[test]

@@ -123,7 +123,7 @@ services:
       - PRIVATE_CHANNEL_METRICS=${PRIVATE_CHANNEL_METRICS:-false}
       - PRIVATE_CHANNEL_METRICS_PORT=${PRIVATE_CHANNEL_METRICS_PORT:-9090}
     ports:
-      - "${PRIVATE_CHANNEL_WRITE_PORT}:${PRIVATE_CHANNEL_WRITE_PORT}"
+      - "127.0.0.1:${PRIVATE_CHANNEL_WRITE_PORT}:${PRIVATE_CHANNEL_WRITE_PORT}"
     command: ["/usr/local/bin/private-channel-node"]
     networks:
       - private-channel-network
@@ -208,7 +208,7 @@ services:
       - PRIVATE_CHANNEL_JSON_LOGS=false
       - PRIVATE_CHANNEL_MODE=read
     ports:
-      - "${PRIVATE_CHANNEL_READ_PORT}:${PRIVATE_CHANNEL_READ_PORT}"
+      - "127.0.0.1:${PRIVATE_CHANNEL_READ_PORT}:${PRIVATE_CHANNEL_READ_PORT}"
     command: ["/usr/local/bin/private-channel-node"]
     networks:
       - private-channel-network

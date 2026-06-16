@@ -68,14 +68,12 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 ## Step 3: Create an Escrow Instance
 
 1. **Connect Wallet**  
-     
+
    - Set your browser wallet to **Devnet** network  
    - Ensure you have Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
 
-   
-
 2. **Create Instance**  
-     
+
    - In the Admin UI, click **"Create New Instance"**  
    - Approve the transaction in your wallet  
    - **Copy the Instance Address** — you'll need this for configuration
@@ -111,7 +109,6 @@ Back in the Admin UI:
 1. Go to **Admin Functions** → **Operator Management**  
 2. Enter your operator's public key (from Step 4)  
 3. Click **"Add Operator"** and approve the transaction
-
 
 ## Step 6: Configure Environment Variables
 
@@ -149,7 +146,7 @@ INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 
 ## Step 7: Start All Services
 
-Once your docker build (Step 1) is complete, run: 
+Once your docker build (Step 1) is complete, run:
 
 ```shell
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d
@@ -198,7 +195,14 @@ For reference, here are the ports and endpoints that are now running:
 | Prometheus | `9090` | Metrics collection |
 | cAdvisor | `8080` | Container metrics |
 
-## 
+### Node RPC ports and the RBAC boundary
+
+The gateway (`8899`) is the only port that enforces RBAC (account-gating and operator-only methods). The
+write-node (`8900`) and read-node (`8901`) RPC ports have **no node-side authentication**. Because of that, the
+reference compose binds these node ports to loopback (`127.0.0.1`), so they are reachable from the host
+but not from other machines. RBAC is an application-layer control on the gateway, not a network boundary.
+
+##
 
 ## Step 8: Test Deposits and Withdrawals
 
@@ -225,7 +229,6 @@ After your balance has been verified on Solana Private Channels, you should now 
 2. Enter a user destination address and amount (with decimal precision)
 3. Click send and confirm the transaction in your wallet!
 4. You can check your Solana Private Channels balance again and notice that the funds have been debited by your transfer amount.
-
 
 ### Withdraw (Solana Private Channels → Solana)
 
@@ -294,7 +297,7 @@ docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .
 
 ## Get Help
 
-Solana Private Channels is still in the early stages of development. If you run into issues or bugs, please [create an issue](https://github.com/solana-foundation/solana-private-channels/issues) and outline your steps to reproduce it. 
+Solana Private Channels is still in the early stages of development. If you run into issues or bugs, please [create an issue](https://github.com/solana-foundation/solana-private-channels/issues) and outline your steps to reproduce it.
 
 ## Configuration Reference
 
