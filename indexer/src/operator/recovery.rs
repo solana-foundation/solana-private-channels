@@ -481,6 +481,7 @@ pub mod test_hooks {
 mod tests {
     use super::*;
     use crate::operator::utils::rpc_util::RetryConfig;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
@@ -490,12 +491,13 @@ mod tests {
         DbTransaction {
             id,
             signature: format!("sig-{id}"),
+            instruction_index: 0,
             trace_id: format!("trace-{id}"),
             slot: 100,
             initiator: Pubkey::new_unique().to_string(),
             recipient: Pubkey::new_unique().to_string(),
             mint: Pubkey::new_unique().to_string(),
-            amount: 1_000,
+            amount: TokenAmount(1_000),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -509,7 +511,6 @@ mod tests {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
-            instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
         }
