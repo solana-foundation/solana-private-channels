@@ -27,12 +27,13 @@ pnpm add private-channel-escrow-program @solana/kit
 
 1. [CreateInstance](#createinstance) - Create a new escrow instance
 2. [AllowMint](#allowmint) - Whitelist a token mint for deposits
-3. [BlockMint](#blockmint) - Revoke deposit permissions for a mint
-4. [AddOperator](#addoperator) - Authorize a withdrawal operator
-5. [RemoveOperator](#removeoperator) - Remove an operator
-6. [SetNewAdmin](#setnewadmin) - Transfer admin control
-7. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
-8. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
+3. [Mint Risk Considerations](#mint-risk-considerations) - Authorities/extensions to vet before whitelisting
+4. [BlockMint](#blockmint) - Revoke deposit permissions for a mint
+5. [AddOperator](#addoperator) - Authorize a withdrawal operator
+6. [RemoveOperator](#removeoperator) - Remove an operator
+7. [SetNewAdmin](#setnewadmin) - Transfer admin control
+8. [Deposit](#deposit) - Deposit tokens to Solana Private Channels
+9. [PDA Reference](#pda-reference) - Reference of all PDA's used in the program
 
 ## CreateInstance
 
@@ -107,7 +108,21 @@ const allowMintIx = await getAllowMintInstructionAsync({
 - Only the instance admin can allow mints
 - **Token-2022 usage**: The `tokenProgram` parameter defaults to the legacy Token Program. For Token-2022 mints, you must explicitly pass the Token-2022 program ID (e.g., `tokenProgram: TOKEN_2022_PROGRAM_ADDRESS`). This also applies to the `Deposit` instruction.
 
+> **Before whitelisting any mint, review [Mint Risk Considerations](#mint-risk-considerations).** The escrow program accepts several mint authorities/extensions that a third party can use to strand or drain pooled escrow. The on-chain program does not block them, so whitelisting one is a trust decision about the mint's issuer.
+
 To derive your allowed mint PDA, refer to the [PDA Reference](#pda-reference) section.
+
+## Mint Risk Considerations
+
+The escrow program only rejects the `TransferHook` extension on-chain. Several other mint authorities and Token-2022 extensions are accepted but hand an external party control over the pooled `instance_ata`. There is no on-chain guard and the off-chain preflight only *detects* the aftermath — it cannot prevent or revert it. Whitelisting a mint that carries any of these is a trust decision about the mint's issuer (and whoever holds its authorities), not just about its current state.
+
+| Authority / extension | Risk | Operator guidance |
+|---|---|---|
+| `freeze_authority` (SPL & Token-2022) | The authority holder can `FreezeAccount` the pooled escrow ATA directly. Because the ATA is pooled per mint, one freeze strands *every* depositor's withdrawals for that mint until the holder thaws it. | Only whitelist mints whose `freeze_authority` is `None` (or held by a party you trust to never freeze escrow). |
+| `PermanentDelegate` (Token-2022) | The delegate can transfer or burn directly from the escrow ATA, outside `ReleaseFunds` and every escrow access control, draining escrow for that mint. The withdrawal preflight only notices the missing balance afterward and routes victims to manual review. | Only whitelist if you trust the permanent-delegate holder; treat the off-chain check as detection, not a mitigation. |
+| `MintCloseAuthority` (Token-2022) | Once supply reaches zero the mint can be closed and re-created at the *same pubkey* with a different extension set (e.g. adding `PermanentDelegate` or `PausableConfig`). The allowlist and the operator's safety cache are keyed only by pubkey, so a previously-reviewed "clean" mint can be swapped underneath that trust decision with no new allowlist review. | Prefer rejecting mints that carry `MintCloseAuthority`; if accepted, treat the original review as void after any close/recreate. |
+
+In every case the safe posture is the same: only whitelist mints whose close/mint/freeze/delegate authorities are disabled or held by a party you trust, since the protocol cannot retain custody once an external authority can act on the escrow ATA.
 
 ## BlockMint
 
