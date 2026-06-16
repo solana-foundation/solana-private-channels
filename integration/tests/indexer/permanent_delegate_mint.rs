@@ -452,6 +452,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
     // Start the withdraw operator.
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
+        test_validator.rpc_url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         instance_pda,
@@ -615,6 +616,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
     storage.insert_db_transaction(&withdrawal_tx).await?;
 
     let operator_handle = start_private_channel_to_solana_operator(
+        test_validator.rpc_url(),
         test_validator.rpc_url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,

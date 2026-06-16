@@ -43,6 +43,20 @@ pub async fn run(
         },
     ));
 
+    // The withdraw operator's compensating remint MintTo must broadcast on the source
+    // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
+    // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
+    // to the wrong chain and never restoring the burned balance. Fail closed at startup.
+    if common_config.program_type == crate::config::ProgramType::Withdraw
+        && common_config.source_rpc_url.is_none()
+    {
+        return Err(OperatorError::RpcError(
+            "source_rpc_url required for Withdraw operator: remints must target the source \
+             PrivateChannel, not the Solana destination"
+                .to_string(),
+        ));
+    }
+
     // Initialize source RPC client if configured
     let source_rpc_client = common_config.source_rpc_url.as_ref().map(|url| {
         Arc::new(RpcClientWithRetry::with_retry_config(

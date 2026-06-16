@@ -914,6 +914,7 @@ async fn test_master_chaos_stress_test() -> Result<(), Box<dyn std::error::Error
     let operator_key_clone = Keypair::try_from(&operator_key.to_bytes()[..]).unwrap();
     let _private_channel_to_solana_operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
+        test_validator.rpc_url(),
         indexer_db_url.clone(),
         operator_key_clone,
         instance_pda,

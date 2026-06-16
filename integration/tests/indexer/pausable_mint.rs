@@ -382,6 +382,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     // Start the withdraw operator.
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
+        test_validator.rpc_url(),
         db_url.clone(),
         Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
         instance_pda,

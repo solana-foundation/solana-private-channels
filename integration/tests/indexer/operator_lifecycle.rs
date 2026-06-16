@@ -1203,6 +1203,7 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
+        test_validator.rpc_url(),
         db_url.clone(),
         operator_keypair,
         env.instance,

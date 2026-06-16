@@ -310,6 +310,7 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
         ),
         start_private_channel_to_solana_operator(
             test_validator.rpc_url(),
+            private_channel_rpc_url.clone(),
             private_channel_indexer_db_url.clone(),
             operator_key_private_channel_to_solana,
             instance_pda,

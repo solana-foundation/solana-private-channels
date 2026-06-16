@@ -188,7 +188,9 @@ pub async fn start_private_channel_to_solana_operator_with_mocks(
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres, // no Mock variant on StorageType enum
         rpc_url: rpc.url(),
-        source_rpc_url: None,
+        // Withdraw operator requires a source chain for remints; the mock harness
+        // is single-server, so point it at the same scripted RPC.
+        source_rpc_url: Some(rpc.url()),
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -266,6 +268,7 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
 /// Start the operator that reads from PrivateChannel indexer and releases funds on Solana.
 pub async fn start_private_channel_to_solana_operator(
     solana_rpc_url: String,
+    private_channel_rpc_url: String,
     private_channel_indexer_db_url: String,
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
@@ -281,7 +284,8 @@ pub async fn start_private_channel_to_solana_operator(
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         rpc_url: solana_rpc_url,
-        source_rpc_url: None,
+        // Source chain (PrivateChannel), where the burn happened and remints land.
+        source_rpc_url: Some(private_channel_rpc_url),
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
