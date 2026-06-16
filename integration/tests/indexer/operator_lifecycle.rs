@@ -113,8 +113,10 @@ async fn start_operator_with_alert(
     let common_config = PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
-        rpc_url,
-        source_rpc_url: None,
+        rpc_url: rpc_url.clone(),
+        // Withdraw operator requires a source chain for remints; single-validator
+        // test, so point it at the same RPC. Harmless for Escrow callers.
+        source_rpc_url: Some(rpc_url),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -158,8 +160,10 @@ async fn start_operator_with_config(
     let common_config = PrivateChannelIndexerConfig {
         program_type,
         storage_type: StorageType::Postgres,
-        rpc_url,
-        source_rpc_url: None,
+        rpc_url: rpc_url.clone(),
+        // Withdraw operator requires a source chain for remints; single-validator
+        // test, so point it at the same RPC. Harmless for Escrow callers.
+        source_rpc_url: Some(rpc_url),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };

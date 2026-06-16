@@ -89,8 +89,10 @@ async fn start_withdraw_operator(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
-        rpc_url,
-        source_rpc_url: None,
+        rpc_url: rpc_url.clone(),
+        // Withdraw operator requires a source chain for remints; single-validator
+        // test, so point it at the same RPC.
+        source_rpc_url: Some(rpc_url),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
