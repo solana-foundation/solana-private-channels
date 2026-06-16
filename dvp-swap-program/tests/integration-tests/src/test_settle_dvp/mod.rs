@@ -476,8 +476,14 @@ fn test_settle_dvp_delivers_to_custom_destinations() {
         .expect("SettleDvp to destinations");
 
     // Proceeds land at the destinations, not the users' cross ATAs.
-    assert_eq!(get_token_balance(&context, &user_a_destination_ata_b), AMOUNT_B);
-    assert_eq!(get_token_balance(&context, &user_b_destination_ata_a), AMOUNT_A);
+    assert_eq!(
+        get_token_balance(&context, &user_a_destination_ata_b),
+        AMOUNT_B
+    );
+    assert_eq!(
+        get_token_balance(&context, &user_b_destination_ata_a),
+        AMOUNT_A
+    );
     assert_eq!(get_token_balance(&context, &fixture.user_a_ata_b), 0);
     assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), 0);
     assert!(context.get_account(&fixture.swap_dvp).is_none());
@@ -551,7 +557,10 @@ fn test_settle_dvp_surplus_refunds_depositor_not_destination() {
         .expect("SettleDvp with surplus");
 
     // The destination got exactly amount_a — not the surplus.
-    assert_eq!(get_token_balance(&context, &user_b_destination_ata_a), AMOUNT_A);
+    assert_eq!(
+        get_token_balance(&context, &user_b_destination_ata_a),
+        AMOUNT_A
+    );
     // The surplus came back to the depositor's own ATA.
     assert_eq!(
         get_token_balance(&context, &fixture.user_a_ata_a),
