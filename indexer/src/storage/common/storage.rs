@@ -408,6 +408,8 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::common::amount::TokenAmount;
+    use bigdecimal::BigDecimal;
     use chrono::Utc;
     use mock::MockStorage;
 
@@ -428,7 +430,7 @@ mod tests {
             initiator: "initiator".to_string(),
             recipient: "recipient".to_string(),
             mint: "mint_addr".to_string(),
-            amount: 1000,
+            amount: TokenAmount(1000),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -717,14 +719,14 @@ mod tests {
                 MintDbBalance {
                     mint_address: "mint_1".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 1000,
-                    total_withdrawals: 300,
+                    total_deposits: BigDecimal::from(1000u64),
+                    total_withdrawals: BigDecimal::from(300u64),
                 },
                 MintDbBalance {
                     mint_address: "mint_2".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 5000,
-                    total_withdrawals: 2000,
+                    total_deposits: BigDecimal::from(5000u64),
+                    total_withdrawals: BigDecimal::from(2000u64),
                 },
             ];
             mock.set_mint_balances(balances);
@@ -733,11 +735,11 @@ mod tests {
         let balances = storage.get_escrow_balances_by_mint().await.unwrap();
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].mint_address, "mint_1");
-        assert_eq!(balances[0].total_deposits, 1000);
-        assert_eq!(balances[0].total_withdrawals, 300);
+        assert_eq!(balances[0].total_deposits, BigDecimal::from(1000u64));
+        assert_eq!(balances[0].total_withdrawals, BigDecimal::from(300u64));
         assert_eq!(balances[1].mint_address, "mint_2");
-        assert_eq!(balances[1].total_deposits, 5000);
-        assert_eq!(balances[1].total_withdrawals, 2000);
+        assert_eq!(balances[1].total_deposits, BigDecimal::from(5000u64));
+        assert_eq!(balances[1].total_withdrawals, BigDecimal::from(2000u64));
     }
 
     #[tokio::test]
@@ -749,14 +751,14 @@ mod tests {
                 MintDbBalance {
                     mint_address: "usdc".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 10000,
-                    total_withdrawals: 5000,
+                    total_deposits: BigDecimal::from(10000u64),
+                    total_withdrawals: BigDecimal::from(5000u64),
                 },
                 MintDbBalance {
                     mint_address: "usdt".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 8000,
-                    total_withdrawals: 3000,
+                    total_deposits: BigDecimal::from(8000u64),
+                    total_withdrawals: BigDecimal::from(3000u64),
                 },
             ];
             mock.set_mint_balances(balances);
@@ -768,11 +770,11 @@ mod tests {
             .unwrap();
         assert_eq!(balances.len(), 2);
         assert!(balances.iter().any(|b| b.mint_address == "usdc"
-            && b.total_deposits == 10000
-            && b.total_withdrawals == 5000));
+            && b.total_deposits == BigDecimal::from(10000u64)
+            && b.total_withdrawals == BigDecimal::from(5000u64)));
         assert!(balances.iter().any(|b| b.mint_address == "usdt"
-            && b.total_deposits == 8000
-            && b.total_withdrawals == 3000));
+            && b.total_deposits == BigDecimal::from(8000u64)
+            && b.total_withdrawals == BigDecimal::from(3000u64)));
     }
 
     #[tokio::test]
@@ -1152,7 +1154,7 @@ mod tests {
             initiator: "init".to_string(),
             recipient: "recip".to_string(),
             mint: mint.to_string(),
-            amount: 1,
+            amount: TokenAmount(1),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,

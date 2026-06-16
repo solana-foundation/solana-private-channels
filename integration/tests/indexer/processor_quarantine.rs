@@ -22,6 +22,7 @@
 
 use {
     chrono::Utc,
+    private_channel_indexer::storage::common::amount::TokenAmount,
     private_channel_indexer::storage::common::models::{
         DbTransaction, TransactionStatus, TransactionType,
     },
@@ -41,7 +42,7 @@ fn make_bad_deposit(id: i64) -> DbTransaction {
         recipient: Pubkey::new_unique().to_string(),
         // Deliberately malformed: Pubkey::from_str will reject this.
         mint: "definitely-not-base58".to_string(),
-        amount: 1_000,
+        amount: TokenAmount(1_000),
         memo: None,
         transaction_type: TransactionType::Deposit,
         withdrawal_nonce: None,

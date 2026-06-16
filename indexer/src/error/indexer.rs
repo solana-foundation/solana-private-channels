@@ -46,6 +46,9 @@ pub enum ReconciliationError {
 
     #[error("Invalid pubkey '{pubkey}': {reason}")]
     InvalidPubkey { pubkey: String, reason: String },
+
+    #[error("DB net balance for mint {mint} exceeds u64::MAX ({net}); the escrow ATA cannot hold this, so the DB is corrupt")]
+    DbBalanceOverflow { mint: String, net: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

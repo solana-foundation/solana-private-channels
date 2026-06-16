@@ -11,7 +11,7 @@ pub fn validate_db_transaction(
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(db_transaction.signature, expected_transaction.signature);
     assert_eq!(db_transaction.slot, expected_transaction.slot as i64);
-    assert_eq!(db_transaction.amount, expected_transaction.amount as i64);
+    assert_eq!(db_transaction.amount.value(), expected_transaction.amount);
     assert_eq!(
         db_transaction.initiator,
         expected_transaction.user_pubkey.to_string()
