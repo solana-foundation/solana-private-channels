@@ -54,10 +54,10 @@ pub struct SwapDvp {
     /// optional instruction arg defaults to `user_a`, so Settle never
     /// branches. Only Settle reads this; refunds (Reclaim/Cancel/
     /// Reject and Settle surplus) always go to the depositor.
-    pub settlement_destination_a: Pubkey,
+    pub user_a_settlement_destination: Pubkey,
     /// Wallet receiving user_b's settlement proceeds — the asset leg
     /// (`mint_a`). Defaults to `user_b`; same rules as above.
-    pub settlement_destination_b: Pubkey,
+    pub user_b_settlement_destination: Pubkey,
     /// `None` = settlement allowed any time before `expiry_timestamp`.
     /// `Some(t)` = additionally requires `now >= t`.
     pub earliest_settlement_timestamp: Option<i64>,
@@ -68,7 +68,7 @@ impl SwapDvp {
         + 32 * 7               // user_a, user_b, mint_a, mint_b, settlement_authority, token_program_a, token_program_b
         + 8 * 4                // amount_a, amount_b, expiry_timestamp, nonce
         + MAX_REF_STRING_LEN   // ref_string (zero-padded)
-        + 32 * 2               // settlement_destination_a, settlement_destination_b
+        + 32 * 2               // user_a_settlement_destination, user_b_settlement_destination
         + 1 + 8; // earliest_settlement_timestamp (opt)
 
     /// Owned `(nonce, bump)` byte buffers. Bind to a local so
@@ -110,8 +110,8 @@ impl SwapDvp {
         data.extend_from_slice(&self.expiry_timestamp.to_le_bytes());
         data.extend_from_slice(&self.nonce.to_le_bytes());
         data.extend_from_slice(&self.ref_string);
-        data.extend_from_slice(self.settlement_destination_a.as_ref());
-        data.extend_from_slice(self.settlement_destination_b.as_ref());
+        data.extend_from_slice(self.user_a_settlement_destination.as_ref());
+        data.extend_from_slice(self.user_b_settlement_destination.as_ref());
 
         match self.earliest_settlement_timestamp {
             Some(timestamp) => {
@@ -219,14 +219,14 @@ impl SwapDvp {
             .map_err(|_| ProgramError::InvalidAccountData)?;
         offset += MAX_REF_STRING_LEN;
 
-        let settlement_destination_a = Pubkey::new_from_array(
+        let user_a_settlement_destination = Pubkey::new_from_array(
             data[offset..offset + 32]
                 .try_into()
                 .map_err(|_| ProgramError::InvalidAccountData)?,
         );
         offset += 32;
 
-        let settlement_destination_b = Pubkey::new_from_array(
+        let user_b_settlement_destination = Pubkey::new_from_array(
             data[offset..offset + 32]
                 .try_into()
                 .map_err(|_| ProgramError::InvalidAccountData)?,
@@ -259,8 +259,8 @@ impl SwapDvp {
             expiry_timestamp,
             nonce,
             ref_string,
-            settlement_destination_a,
-            settlement_destination_b,
+            user_a_settlement_destination,
+            user_b_settlement_destination,
             earliest_settlement_timestamp,
         })
     }
@@ -290,8 +290,8 @@ mod tests {
             expiry_timestamp: 1_780_000_000,
             nonce: 42,
             ref_string: [8u8; 64],
-            settlement_destination_a: Pubkey::new_from_array([9u8; 32]),
-            settlement_destination_b: Pubkey::new_from_array([10u8; 32]),
+            user_a_settlement_destination: Pubkey::new_from_array([9u8; 32]),
+            user_b_settlement_destination: Pubkey::new_from_array([10u8; 32]),
             earliest_settlement_timestamp: None,
         };
         let mut bytes = dvp.to_bytes();

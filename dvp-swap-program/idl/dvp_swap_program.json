@@ -118,14 +118,14 @@
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "settlementDestinationA",
+              "name": "userASettlementDestination",
               "type": {
                 "kind": "publicKeyTypeNode"
               }
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "settlementDestinationB",
+              "name": "userBSettlementDestination",
               "type": {
                 "kind": "publicKeyTypeNode"
               }
@@ -456,7 +456,7 @@
           },
           {
             "kind": "instructionArgumentNode",
-            "name": "settlementDestinationA",
+            "name": "userASettlementDestination",
             "type": {
               "item": {
                 "kind": "publicKeyTypeNode"
@@ -471,7 +471,7 @@
           },
           {
             "kind": "instructionArgumentNode",
-            "name": "settlementDestinationB",
+            "name": "userBSettlementDestination",
             "type": {
               "item": {
                 "kind": "publicKeyTypeNode"
@@ -662,21 +662,21 @@
           },
           {
             "docs": [
-              "settlement_destination_a's ATA for mint_b; receives the cash leg (destination defaults to user_a)"
+              "user_a_settlement_destination's ATA for mint_b; receives the cash leg (destination defaults to user_a)"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "destinationAAtaB"
+            "name": "userADestinationAtaB"
           },
           {
             "docs": [
-              "settlement_destination_b's ATA for mint_a; receives the asset leg (destination defaults to user_b)"
+              "user_b_settlement_destination's ATA for mint_a; receives the asset leg (destination defaults to user_b)"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "destinationBAtaA"
+            "name": "userBDestinationAtaA"
           },
           {
             "docs": [

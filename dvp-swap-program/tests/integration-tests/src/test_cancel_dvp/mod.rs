@@ -122,8 +122,8 @@ fn test_cancel_dvp_ignores_settlement_destinations() {
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
         .ref_string(REF_STRING.to_string())
-        .settlement_destination_a(Keypair::new().pubkey())
-        .settlement_destination_b(Keypair::new().pubkey())
+        .user_a_settlement_destination(Keypair::new().pubkey())
+        .user_b_settlement_destination(Keypair::new().pubkey())
         .instruction();
     context
         .send(create_ix, &[])

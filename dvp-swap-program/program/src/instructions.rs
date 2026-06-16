@@ -101,10 +101,10 @@ pub enum DvpSwapProgramInstruction {
         /// (`mint_b`) — at its canonical ATA (e.g. a custodian deposit
         /// wallet). Defaults to `user_a`. Settle-only: refunds always go
         /// to the depositor.
-        settlement_destination_a: Option<Pubkey>,
+        user_a_settlement_destination: Option<Pubkey>,
         /// Wallet receiving user_b's settlement proceeds — the asset leg
         /// (`mint_a`). Defaults to `user_b`; same rules as above.
-        settlement_destination_b: Option<Pubkey>,
+        user_b_settlement_destination: Option<Pubkey>,
         /// If set, settlement is also rejected before this timestamp.
         earliest_settlement_timestamp: Option<i64>,
     } = 0,
@@ -174,13 +174,13 @@ pub enum DvpSwapProgramInstruction {
         writable
     ))]
     #[codama(account(
-        name = "destination_a_ata_b",
-        docs = "settlement_destination_a's ATA for mint_b; receives the cash leg (destination defaults to user_a)",
+        name = "user_a_destination_ata_b",
+        docs = "user_a_settlement_destination's ATA for mint_b; receives the cash leg (destination defaults to user_a)",
         writable
     ))]
     #[codama(account(
-        name = "destination_b_ata_a",
-        docs = "settlement_destination_b's ATA for mint_a; receives the asset leg (destination defaults to user_b)",
+        name = "user_b_destination_ata_a",
+        docs = "user_b_settlement_destination's ATA for mint_a; receives the asset leg (destination defaults to user_b)",
         writable
     ))]
     #[codama(account(

@@ -398,8 +398,8 @@ fn test_create_dvp_stores_ref_string() {
     assert_eq!(dvp.amount_b, AMOUNT_B);
     assert_eq!(dvp.earliest_settlement_timestamp, None);
     // Destinations were not provided, so they resolved to the users.
-    assert_eq!(dvp.settlement_destination_a, fixture.user_a.pubkey());
-    assert_eq!(dvp.settlement_destination_b, fixture.user_b.pubkey());
+    assert_eq!(dvp.user_a_settlement_destination, fixture.user_a.pubkey());
+    assert_eq!(dvp.user_b_settlement_destination, fixture.user_b.pubkey());
 }
 
 /// `ref_string` is optional: omitting it stores all zeros.
