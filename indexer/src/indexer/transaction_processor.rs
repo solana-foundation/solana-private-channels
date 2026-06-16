@@ -318,6 +318,7 @@ fn convert_to_db_models(
                             .initiator(accounts.user.to_string())
                             .recipient(recipient)
                             .transaction_type(TransactionType::Deposit)
+                            .instruction_index(instruction_meta.instruction_index as i32)
                             .build(),
                         ),
                     )
@@ -352,6 +353,7 @@ fn convert_to_db_models(
                         .initiator(accounts.user.to_string())
                         .recipient(recipient)
                         .transaction_type(TransactionType::Withdrawal)
+                        .instruction_index(instruction_meta.instruction_index as i32)
                         .build(),
                     ),
                 )
@@ -438,6 +440,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            instruction_index: 0,
         }
     }
 
@@ -463,6 +466,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            instruction_index: 0,
         }
     }
 
@@ -486,6 +490,7 @@ mod tests {
             slot,
             program_type: ProgramType::Withdraw,
             signature: sig,
+            instruction_index: 0,
         }
     }
 
@@ -504,6 +509,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            instruction_index: 0,
         }
     }
 
@@ -563,6 +569,26 @@ mod tests {
     }
 
     #[test]
+    fn convert_threads_instruction_index_into_db_rows() {
+        let sig = "shared_sig".to_string();
+
+        let mut ix0 = make_deposit_instruction(100, Some(sig.clone()), None);
+        ix0.instruction_index = 0;
+        let mut ix1 = make_deposit_instruction(100, Some(sig.clone()), None);
+        ix1.instruction_index = 1;
+
+        let (_, txn0) = convert_to_db_models(&ix0, Some(&deposit_instance()));
+        let (_, txn1) = convert_to_db_models(&ix1, Some(&deposit_instance()));
+
+        let txn0 = txn0.unwrap();
+        let txn1 = txn1.unwrap();
+        assert_eq!(txn0.signature, sig);
+        assert_eq!(txn1.signature, sig);
+        assert_eq!(txn0.instruction_index, 0);
+        assert_eq!(txn1.instruction_index, 1);
+    }
+
+    #[test]
     fn convert_no_signature_returns_none() {
         let ix = make_deposit_instruction(100, None, None);
         let (mint, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
@@ -608,6 +634,7 @@ mod tests {
             slot: 100,
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
+            instruction_index: 0,
         };
 
         let (mint, txn) = convert_to_db_models(&ix, Some(&watched));
@@ -641,6 +668,7 @@ mod tests {
             slot: 200,
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
+            instruction_index: 0,
         };
 
         let (mint, txn) = convert_to_db_models(&ix, Some(&watched));

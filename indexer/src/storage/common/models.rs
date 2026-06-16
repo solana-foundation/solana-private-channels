@@ -82,6 +82,10 @@ pub struct DbTransaction {
     /// `processing` -> `pending`) bumps this; the cap quarantines a row that
     /// can never progress instead of looping forever.
     pub recovery_requeue_attempts: i32,
+    /// Absolute position of the source instruction within its transaction.
+    /// Paired with `signature` it is the row's durable identity, so multiple
+    /// economic events in one transaction persist as distinct rows.
+    pub instruction_index: i32,
     /// Confirmed remint signature, written in the same UPDATE that flips status
     /// to FailedReminted. A crash before the async writer runs can no longer
     /// leave a landed remint recorded only as PendingRemint (which would replay).
@@ -160,6 +164,7 @@ pub struct DbTransactionBuilder {
     memo: Option<String>,
     transaction_type: Option<TransactionType>,
     trace_id: Option<String>,
+    instruction_index: i32,
 }
 
 impl DbTransactionBuilder {
@@ -174,6 +179,7 @@ impl DbTransactionBuilder {
             memo: None,
             transaction_type: None,
             trace_id: None,
+            instruction_index: 0,
         }
     }
 
@@ -202,6 +208,11 @@ impl DbTransactionBuilder {
         self
     }
 
+    pub fn instruction_index(mut self, instruction_index: i32) -> Self {
+        self.instruction_index = instruction_index;
+        self
+    }
+
     pub fn build(self) -> DbTransaction {
         let now = Utc::now();
         DbTransaction {
@@ -226,6 +237,7 @@ impl DbTransactionBuilder {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: self.instruction_index,
             landed_remint_signature: None,
         }
     }
