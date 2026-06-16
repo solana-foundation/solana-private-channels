@@ -109,8 +109,8 @@ pub async fn fetch_escrow_balances_by_mint(
                 continue;
             };
 
-            // Multiple token accounts can hold the same mint; sum them. Saturating so a
-            // pathological set of balances reports u64::MAX instead of wrapping to a small value.
+            // One mint can span several token accounts; sum them. Saturating so a corrupt
+            // over-u64 sum reports u64::MAX (and trips the mismatch) instead of wrapping.
             let acc = balances.entry(mint).or_insert(0u64);
             *acc = acc.saturating_add(amount);
         }

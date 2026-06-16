@@ -181,11 +181,11 @@ async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
     }
 }
 
-/// Convert a per-mint net (deposits - withdrawals) into the unsigned expected
-/// balance. A negative net (withdrawals exceed deposits) is clamped to 0 with a
-/// warning. An over-u64 net is impossible for a real escrow (the ATA balance is
-/// itself a u64), so it signals a corrupt DB and aborts the startup gate rather
-/// than feeding a sentinel into the mismatch compare.
+/// Convert a per-mint net (deposits - withdrawals) into the unsigned expected balance.
+/// Negative (withdrawals > deposits) means the DB is missing deposit history (fresh or
+/// partial DB, or a withdrawal indexed before its deposit): clamp to 0 and warn, since any
+/// real on-chain balance still trips the mismatch. Over-u64 can't happen for a real escrow
+/// (the ATA balance is itself a u64), so treat it as corruption and abort startup.
 fn net_db_expected(
     net: &bigdecimal::BigDecimal,
     mint_address: &str,
