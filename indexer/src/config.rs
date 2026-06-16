@@ -134,6 +134,12 @@ pub struct PrivateChannelIndexerConfig {
 
 impl PrivateChannelIndexerConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if self.program_type == ProgramType::Withdraw && self.source_rpc_url.is_none() {
+            return Err("--source-rpc-url required when program_type is Withdraw: remints \
+                        must target the source PrivateChannel, not the Solana destination"
+                .to_string());
+        }
+
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {
                 Err("--escrow-instance-id required when program_type is Escrow".to_string())
@@ -392,6 +398,35 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err();
         assert!(err_msg.contains("should not be set for Withdraw program"));
+    }
+
+    #[test]
+    fn test_validate_common_config_withdraw_missing_source_rpc_url() {
+        let config = PrivateChannelIndexerConfig {
+            program_type: ProgramType::Withdraw,
+            escrow_instance_id: None,
+            source_rpc_url: None, // Remint would silently target the Solana destination
+            ..create_common_config()
+        };
+
+        let result = config.validate();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("--source-rpc-url required"));
+    }
+
+    #[test]
+    fn test_validate_common_config_valid_withdraw() {
+        let config = PrivateChannelIndexerConfig {
+            program_type: ProgramType::Withdraw,
+            escrow_instance_id: None,
+            source_rpc_url: Some("http://localhost:8899".to_string()),
+            ..create_common_config()
+        };
+
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 
     #[test]
