@@ -682,7 +682,7 @@ pub fn set_mint_2022_with_non_transferable(context: &mut TestContext, mint: &Pub
     write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
 }
 
-/// ConfidentialTransferMint — blocked; used in negative tests.
+/// ConfidentialTransferMint: allowed; used in the lifecycle test.
 pub fn set_mint_2022_with_confidential_transfer(
     context: &mut TestContext,
     mint: &Pubkey,
