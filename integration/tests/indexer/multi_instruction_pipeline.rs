@@ -220,7 +220,7 @@ async fn two_same_signature_deposits_persist_as_distinct_rows() {
 
     // Distinct absolute indices, ordered.
     let rows: Vec<(i32, i64, String)> = sqlx::query_as(
-        "SELECT instruction_index, amount, recipient FROM transactions \
+        "SELECT instruction_index, amount::bigint, recipient FROM transactions \
          WHERE signature = $1 ORDER BY instruction_index",
     )
     .bind(&signature)
@@ -281,7 +281,7 @@ async fn two_same_signature_withdrawals_persist_with_distinct_nonces() {
 
     // Distinct indices, and a distinct non-null nonce per row from the INSERT trigger.
     let rows: Vec<(i32, Option<i64>, i64, String)> = sqlx::query_as(
-        "SELECT instruction_index, withdrawal_nonce, amount, recipient FROM transactions \
+        "SELECT instruction_index, withdrawal_nonce, amount::bigint, recipient FROM transactions \
          WHERE signature = $1 ORDER BY instruction_index",
     )
     .bind(&signature)
