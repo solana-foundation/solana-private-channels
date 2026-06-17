@@ -6,9 +6,10 @@ use crate::{
     state_utils::{
         assert_create_dvp, assert_fund_a, assert_fund_a_amount, assert_fund_b,
         assert_fund_b_amount, assert_settle_dvp, setup_dvp, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        REF_STRING,
     },
     utils::{
-        assert_instruction_error, assert_program_error, dvp_ata, fund_wallet_ata,
+        assert_instruction_error, assert_program_error, create_ata, dvp_ata, fund_wallet_ata,
         get_token_balance, nonce_tombstone_pda, swap_dvp_pda, TestContext, DVP_EXPIRED,
         LEG_NOT_FUNDED, MEMO_PROGRAM_ID, SETTLEMENT_AUTHORITY_MISMATCH, SETTLEMENT_TOO_EARLY,
     },
@@ -100,8 +101,8 @@ fn test_settle_dvp_rejects_user_as_authority() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -131,8 +132,8 @@ fn test_settle_dvp_rejects_third_party_as_authority() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -158,8 +159,8 @@ fn test_settle_dvp_rejects_when_neither_leg_funded() {
             .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
             .dvp_ata_b(fixture.dvp_ata_b)
-            .user_a_ata_b(fixture.user_a_ata_b)
-            .user_b_ata_a(fixture.user_b_ata_a)
+            .user_a_destination_ata_b(fixture.user_a_ata_b)
+            .user_b_destination_ata_a(fixture.user_b_ata_a)
             .user_a_ata_a(fixture.user_a_ata_a)
             .user_b_ata_b(fixture.user_b_ata_b)
             .token_program_a(fixture.token_program_a)
@@ -189,8 +190,8 @@ fn test_settle_dvp_rejects_when_only_leg_b_funded() {
             .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
             .dvp_ata_b(fixture.dvp_ata_b)
-            .user_a_ata_b(fixture.user_a_ata_b)
-            .user_b_ata_a(fixture.user_b_ata_a)
+            .user_a_destination_ata_b(fixture.user_a_ata_b)
+            .user_b_destination_ata_a(fixture.user_b_ata_a)
             .user_a_ata_a(fixture.user_a_ata_a)
             .user_b_ata_b(fixture.user_b_ata_b)
             .token_program_a(fixture.token_program_a)
@@ -220,8 +221,8 @@ fn test_settle_dvp_rejects_when_only_leg_a_funded() {
             .mint_b(fixture.mint_b)
             .dvp_ata_a(fixture.dvp_ata_a)
             .dvp_ata_b(fixture.dvp_ata_b)
-            .user_a_ata_b(fixture.user_a_ata_b)
-            .user_b_ata_a(fixture.user_b_ata_a)
+            .user_a_destination_ata_b(fixture.user_a_ata_b)
+            .user_b_destination_ata_a(fixture.user_b_ata_a)
             .user_a_ata_a(fixture.user_a_ata_a)
             .user_b_ata_b(fixture.user_b_ata_b)
             .token_program_a(fixture.token_program_a)
@@ -331,8 +332,8 @@ fn test_settle_dvp_rejects_post_expiry() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -371,6 +372,7 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .earliest_settlement_timestamp(earliest)
         .instruction();
     context
@@ -388,8 +390,8 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -399,6 +401,231 @@ fn test_settle_dvp_rejects_before_earliest_settlement() {
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_program_error(result, SETTLEMENT_TOO_EARLY);
+}
+
+/// Settlement destinations set at Create redirect the two delivery
+/// transfers: the cash leg lands at destination_a's ATA and the asset
+/// leg at destination_b's ATA (the custodian-deposit-wallet case),
+/// while the named users receive nothing on the cross mints.
+#[test]
+fn test_settle_dvp_delivers_to_custom_destinations() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let destination_a = Keypair::new().pubkey();
+    let destination_b = Keypair::new().pubkey();
+    let user_a_destination_ata_b = create_ata(
+        &mut context,
+        &destination_a,
+        &fixture.mint_b,
+        &fixture.token_program_b,
+    );
+    let user_b_destination_ata_a = create_ata(
+        &mut context,
+        &destination_b,
+        &fixture.mint_a,
+        &fixture.token_program_a,
+    );
+
+    let create_ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
+        .user_a_settlement_destination(destination_a)
+        .user_b_settlement_destination(destination_b)
+        .instruction();
+    context
+        .send(create_ix, &[])
+        .expect("CreateDvp with destinations");
+
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    let settle_ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_destination_ata_b(user_a_destination_ata_b)
+        .user_b_destination_ata_a(user_b_destination_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
+        .leg_a_extras_count(0)
+        .instruction();
+    context
+        .send(settle_ix, &[&fixture.settlement_authority])
+        .expect("SettleDvp to destinations");
+
+    // Proceeds land at the destinations, not the users' cross ATAs.
+    assert_eq!(
+        get_token_balance(&context, &user_a_destination_ata_b),
+        AMOUNT_B
+    );
+    assert_eq!(
+        get_token_balance(&context, &user_b_destination_ata_a),
+        AMOUNT_A
+    );
+    assert_eq!(get_token_balance(&context, &fixture.user_a_ata_b), 0);
+    assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), 0);
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+}
+
+/// Destinations receive exactly `amount_x`; an over-deposit surplus is
+/// still refunded to the depositor's own ATA. Destinations get
+/// settlement proceeds only, never refunds.
+#[test]
+fn test_settle_dvp_surplus_refunds_depositor_not_destination() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let destination_b = Keypair::new().pubkey();
+    let user_b_destination_ata_a = create_ata(
+        &mut context,
+        &destination_b,
+        &fixture.mint_a,
+        &fixture.token_program_a,
+    );
+
+    let create_ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
+        .user_b_settlement_destination(destination_b)
+        .instruction();
+    context
+        .send(create_ix, &[])
+        .expect("CreateDvp with destination_b");
+
+    let surplus = 777u64;
+    assert_fund_a_amount(&mut context, &fixture, AMOUNT_A + surplus);
+    assert_fund_b(&mut context, &fixture);
+    let user_a_balance_after_funding = get_token_balance(&context, &fixture.user_a_ata_a);
+
+    // destination_a defaulted to user_a, so the cash leg still goes to
+    // user_a's own mint_b ATA.
+    let settle_ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(user_b_destination_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
+        .leg_a_extras_count(0)
+        .instruction();
+    context
+        .send(settle_ix, &[&fixture.settlement_authority])
+        .expect("SettleDvp with surplus");
+
+    // The destination got exactly amount_a — not the surplus.
+    assert_eq!(
+        get_token_balance(&context, &user_b_destination_ata_a),
+        AMOUNT_A
+    );
+    // The surplus came back to the depositor's own ATA.
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        user_a_balance_after_funding + surplus
+    );
+    // And user_a still received the cash leg.
+    assert_eq!(get_token_balance(&context, &fixture.user_a_ata_b), AMOUNT_B);
+}
+
+/// With a custom destination stored, the user's own cross ATA — the
+/// correct delivery account when no destination is set — is no longer
+/// canonical: the stored destination defines the only valid address.
+#[test]
+fn test_settle_dvp_rejects_wrong_destination_ata() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let destination_a = Keypair::new().pubkey();
+
+    let create_ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
+        .user_a_settlement_destination(destination_a)
+        .instruction();
+    context
+        .send(create_ix, &[])
+        .expect("CreateDvp with destination_a");
+
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    // Pass user_a's own mint_b ATA where destination_a's is required.
+    let settle_ix = SettleDvpBuilder::new()
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
+        .user_a_ata_a(fixture.user_a_ata_a)
+        .user_b_ata_b(fixture.user_b_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
+        .leg_a_extras_count(0)
+        .instruction();
+    let result = context.send(settle_ix, &[&fixture.settlement_authority]);
+    assert_instruction_error(result, "InvalidSeeds");
 }
 
 /// Mid-trade mint substitution: caller passes a mint pubkey that
@@ -424,8 +651,8 @@ fn test_settle_dvp_rejects_substituted_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -460,8 +687,8 @@ fn test_settle_dvp_rejects_swapped_cross_atas() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_a)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_a)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -523,6 +750,7 @@ fn test_two_dvps_same_parties_different_nonces_are_isolated() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(first_dvp.expiry)
         .nonce(second_nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
     context
         .send(create_second, &[])

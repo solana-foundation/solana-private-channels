@@ -3,14 +3,12 @@
 //! Coverage:
 //! - **Positive lifecycle** on Token-2022 mints with each *allowed*
 //!   amount-preserving extension applied to one leg in isolation
-//!   (Pausable, PermanentDelegate, TransferHook, plain T22 with no
-//!   extensions). Both single-program-T22 and mixed (legacy ↔ T22)
-//!   topologies are exercised.
+//!   (Pausable, PermanentDelegate, TransferHook, ConfidentialTransfer,
+//!   plain T22 with no extensions). Both single-program-T22 and mixed
+//!   (legacy ↔ T22) topologies are exercised.
 //! - **CreateDvp negative** for every *blocked* extension on either leg
 //!   (TransferFeeConfig, InterestBearingConfig, ScaledUiAmount,
-//!   ConfidentialTransferMint, NonTransferable). `ConfidentialTransferFeeConfig`
-//!   is also blocked but can't exist without `ConfidentialTransferMint`, so the
-//!   ConfidentialTransferMint test covers that path.
+//!   NonTransferable).
 //! - **Owner mismatch**: legacy SPL mint paired with T22 token program.
 //! - **Post-Create extension activation**: a mint is swapped to a
 //!   blocked-extension layout *after* CreateDvp, and Settle/Reject must
@@ -26,7 +24,7 @@ use crate::{
     state_utils::{
         assert_cancel_dvp, assert_create_dvp, assert_fund_a, assert_fund_a_amount, assert_fund_b,
         assert_fund_b_amount, assert_reclaim_a, assert_reject_dvp, assert_settle_dvp,
-        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE, REF_STRING,
     },
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, hook_extras_for_mint,
@@ -148,6 +146,35 @@ fn test_settle_with_pausable_on_mint_a() {
     assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), AMOUNT_A);
 }
 
+/// Allowed extension: ConfidentialTransfer on `mint_a`. The extension
+/// doesn't force confidential transfers, and the escrow can't be
+/// configured to receive one, so the public-transfer lifecycle settles
+/// normally.
+#[test]
+fn test_settle_with_confidential_transfer_on_mint_a() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    set_mint_2022_with_confidential_transfer(
+        &mut context,
+        &fixture.mint_a,
+        &fixture.settlement_authority.pubkey(),
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+    assert_settle_dvp(&mut context, &fixture);
+
+    assert_eq!(get_token_balance(&context, &fixture.user_a_ata_b), AMOUNT_B);
+    assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), AMOUNT_A);
+}
+
 /// Allowed at CreateDvp: TransferHook is *not* in the deny-list. The
 /// program forwards transfer-hook extras through every `TransferChecked`
 /// CPI (Settle/Cancel/Reject/Reclaim), so a hook-bearing mint can run
@@ -207,6 +234,7 @@ fn build_create_dvp_ix(
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction()
 }
 
@@ -308,26 +336,6 @@ fn test_create_rejects_non_transferable_on_mint_a() {
     );
 
     set_mint_2022_with_non_transferable(&mut context, &fixture.mint_a);
-
-    let ix = build_create_dvp_ix(&context, &fixture);
-    assert_program_error(context.send(ix, &[]), BLOCKED_MINT_EXTENSION);
-}
-
-#[test]
-fn test_create_rejects_confidential_transfer_on_mint_a() {
-    let mut context = TestContext::new();
-    let fixture = setup_dvp_with_programs(
-        &mut context,
-        0,
-        TOKEN_2022_PROGRAM_ID,
-        TOKEN_2022_PROGRAM_ID,
-    );
-
-    set_mint_2022_with_confidential_transfer(
-        &mut context,
-        &fixture.mint_a,
-        &fixture.settlement_authority.pubkey(),
-    );
 
     let ix = build_create_dvp_ix(&context, &fixture);
     assert_program_error(context.send(ix, &[]), BLOCKED_MINT_EXTENSION);
@@ -532,8 +540,8 @@ fn test_settle_with_hook_on_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -728,8 +736,8 @@ fn test_settle_with_hook_and_surplus_on_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -825,8 +833,8 @@ fn test_settle_with_hooks_on_both_legs() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
@@ -870,8 +878,8 @@ fn test_settle_rejects_extras_count_overrun() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)

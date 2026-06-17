@@ -33,6 +33,7 @@ use helpers::db;
 use private_channel_escrow_program_client::{
     instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
+use private_channel_indexer::storage::common::amount::TokenAmount;
 use private_channel_indexer::storage::common::models::{
     DbMint, DbMintStatus, DbTransaction, TransactionStatus, TransactionType,
 };
@@ -247,7 +248,7 @@ fn make_withdrawal_transaction(
     signature: String,
     mint: String,
     recipient: String,
-    amount: i64,
+    amount: u64,
     nonce: i64,
 ) -> DbTransaction {
     let now = Utc::now();
@@ -259,7 +260,7 @@ fn make_withdrawal_transaction(
         initiator: recipient.clone(),
         recipient,
         mint,
-        amount,
+        amount: TokenAmount(amount),
         memo: None,
         transaction_type: TransactionType::Withdrawal,
         withdrawal_nonce: Some(nonce),
@@ -273,6 +274,7 @@ fn make_withdrawal_transaction(
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
         recovery_requeue_attempts: 0,
+        instruction_index: 0,
         landed_remint_signature: None,
     }
 }
@@ -444,7 +446,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         withdrawal_sig.clone(),
         mint_pubkey.to_string(),
         recipient.pubkey().to_string(),
-        withdraw_amount as i64,
+        withdraw_amount,
         0,
     );
     storage.insert_db_transaction(&withdrawal_tx).await?;
@@ -610,7 +612,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
         withdrawal_sig.clone(),
         mint_pubkey.to_string(),
         recipient.pubkey().to_string(),
-        withdraw_amount as i64,
+        withdraw_amount,
         0,
     );
     storage.insert_db_transaction(&withdrawal_tx).await?;

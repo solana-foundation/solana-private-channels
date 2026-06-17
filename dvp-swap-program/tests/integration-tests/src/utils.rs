@@ -65,6 +65,7 @@ pub const SETTLEMENT_AUTHORITY_EXECUTABLE: u32 =
 pub const SETTLEMENT_AUTHORITY_IS_PARTY: u32 =
     DvpSwapProgramError::SettlementAuthorityIsParty as u32;
 pub const NONCE_ALREADY_USED: u32 = DvpSwapProgramError::NonceAlreadyUsed as u32;
+pub const REF_STRING_TOO_LONG: u32 = DvpSwapProgramError::RefStringTooLong as u32;
 
 const MIN_LAMPORTS: u64 = 500_000_000;
 
@@ -682,7 +683,7 @@ pub fn set_mint_2022_with_non_transferable(context: &mut TestContext, mint: &Pub
     write_account(context, mint, data, TOKEN_2022_PROGRAM_ID, 1_000_000_000);
 }
 
-/// ConfidentialTransferMint — blocked; used in negative tests.
+/// ConfidentialTransferMint: allowed; used in the lifecycle test.
 pub fn set_mint_2022_with_confidential_transfer(
     context: &mut TestContext,
     mint: &Pubkey,

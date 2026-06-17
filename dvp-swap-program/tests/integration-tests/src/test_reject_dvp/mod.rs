@@ -9,7 +9,7 @@ use spl_token_2022::instruction::transfer_checked;
 use crate::{
     state_utils::{
         assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp, setup_dvp, AMOUNT_A,
-        AMOUNT_B, INITIAL_BALANCE,
+        AMOUNT_B, INITIAL_BALANCE, REF_STRING,
     },
     utils::{
         assert_instruction_error, assert_program_error, create_ata, dvp_ata, fund_wallet_ata,
@@ -252,6 +252,7 @@ fn test_reject_dvp_works_when_settlement_authority_is_unreachable() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(expiry)
         .nonce(nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
     context.send(create_ix, &[]).expect("CreateDvp");
 
@@ -348,6 +349,7 @@ fn test_reject_dvp_syncs_native_escrow_before_refund() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(context.now() + 3600)
         .nonce(nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
     context.send(create_ix, &[]).expect("CreateDvp");
 

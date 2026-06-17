@@ -47,8 +47,8 @@ pub enum DvpSwapProgramError {
     ZeroAmount,
 
     /// (10) Mint carries a Token-2022 extension the swap program refuses
-    /// to support (confidential transfer, confidential transfer fee config,
-    /// transfer fee, interest bearing, scaled UI amount, non-transferable).
+    /// to support (transfer fee, confidential transfer fee config,
+    /// interest bearing, scaled UI amount, non-transferable).
     /// Checked only at CreateDvp.
     #[error("Mint carries an unsupported Token-2022 extension")]
     BlockedMintExtension,
@@ -72,6 +72,10 @@ pub enum DvpSwapProgramError {
     /// creation time, which would lock escrow rent for an unbounded term.
     #[error("DvP expiry is too far in the future")]
     ExpiryTooFarInFuture,
+
+    /// (15) `ref_string` exceeds `MAX_REF_STRING_LEN` bytes.
+    #[error("ref string exceeds the maximum byte length")]
+    RefStringTooLong,
 }
 
 impl From<DvpSwapProgramError> for ProgramError {

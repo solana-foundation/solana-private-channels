@@ -28,6 +28,7 @@ pub mod quarantine_all_active_withdrawals;
 pub mod record_remint_result;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
+pub mod sync_mint_status;
 pub mod try_complete_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_processing;
@@ -159,6 +160,12 @@ impl Storage {
         statuses: &[DbMintStatus],
     ) -> Result<(), StorageError> {
         insert_mint_statuses_batch::insert_mint_statuses_batch(self, statuses).await
+    }
+
+    /// Refresh the `mints.status` mirror for the given mints from their latest
+    /// `mint_status_history` transition. No-op for mints without a row.
+    pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
+        sync_mint_status::sync_mint_status(self, mint_addresses).await
     }
 
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
@@ -408,6 +415,8 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::common::amount::TokenAmount;
+    use bigdecimal::BigDecimal;
     use chrono::Utc;
     use mock::MockStorage;
 
@@ -428,7 +437,7 @@ mod tests {
             initiator: "initiator".to_string(),
             recipient: "recipient".to_string(),
             mint: "mint_addr".to_string(),
-            amount: 1000,
+            amount: TokenAmount(1000),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -442,6 +451,7 @@ mod tests {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: 0,
             landed_remint_signature: None,
         }
     }
@@ -716,14 +726,14 @@ mod tests {
                 MintDbBalance {
                     mint_address: "mint_1".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 1000,
-                    total_withdrawals: 300,
+                    total_deposits: BigDecimal::from(1000u64),
+                    total_withdrawals: BigDecimal::from(300u64),
                 },
                 MintDbBalance {
                     mint_address: "mint_2".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 5000,
-                    total_withdrawals: 2000,
+                    total_deposits: BigDecimal::from(5000u64),
+                    total_withdrawals: BigDecimal::from(2000u64),
                 },
             ];
             mock.set_mint_balances(balances);
@@ -732,11 +742,11 @@ mod tests {
         let balances = storage.get_escrow_balances_by_mint().await.unwrap();
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].mint_address, "mint_1");
-        assert_eq!(balances[0].total_deposits, 1000);
-        assert_eq!(balances[0].total_withdrawals, 300);
+        assert_eq!(balances[0].total_deposits, BigDecimal::from(1000u64));
+        assert_eq!(balances[0].total_withdrawals, BigDecimal::from(300u64));
         assert_eq!(balances[1].mint_address, "mint_2");
-        assert_eq!(balances[1].total_deposits, 5000);
-        assert_eq!(balances[1].total_withdrawals, 2000);
+        assert_eq!(balances[1].total_deposits, BigDecimal::from(5000u64));
+        assert_eq!(balances[1].total_withdrawals, BigDecimal::from(2000u64));
     }
 
     #[tokio::test]
@@ -748,14 +758,14 @@ mod tests {
                 MintDbBalance {
                     mint_address: "usdc".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 10000,
-                    total_withdrawals: 5000,
+                    total_deposits: BigDecimal::from(10000u64),
+                    total_withdrawals: BigDecimal::from(5000u64),
                 },
                 MintDbBalance {
                     mint_address: "usdt".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 8000,
-                    total_withdrawals: 3000,
+                    total_deposits: BigDecimal::from(8000u64),
+                    total_withdrawals: BigDecimal::from(3000u64),
                 },
             ];
             mock.set_mint_balances(balances);
@@ -767,11 +777,11 @@ mod tests {
             .unwrap();
         assert_eq!(balances.len(), 2);
         assert!(balances.iter().any(|b| b.mint_address == "usdc"
-            && b.total_deposits == 10000
-            && b.total_withdrawals == 5000));
+            && b.total_deposits == BigDecimal::from(10000u64)
+            && b.total_withdrawals == BigDecimal::from(5000u64)));
         assert!(balances.iter().any(|b| b.mint_address == "usdt"
-            && b.total_deposits == 8000
-            && b.total_withdrawals == 3000));
+            && b.total_deposits == BigDecimal::from(8000u64)
+            && b.total_withdrawals == BigDecimal::from(3000u64)));
     }
 
     #[tokio::test]
@@ -780,6 +790,77 @@ mod tests {
         let mint = DbMint::new("test_mint".to_string(), 6, TOKEN_PROGRAM.to_string());
         storage.upsert_mints_batch(&[mint]).await.unwrap();
         assert!(mock.mints.lock().unwrap().contains_key("test_mint"));
+    }
+
+    #[tokio::test]
+    async fn sync_mint_status_mirrors_latest_history_and_preserves_metadata() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+
+        // allowed@10 then blocked@20 → mirror resolves to the latest: blocked.
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+
+        let m = storage.get_mint("m1").await.unwrap().unwrap();
+        assert_eq!(m.status, "blocked");
+        // Metadata is untouched by the mirror sync.
+        assert_eq!(m.decimals, 6);
+        assert_eq!(m.token_program, TOKEN_PROGRAM);
+
+        // Re-allow at a later slot → mirror flips back to allowed.
+        storage
+            .insert_mint_statuses_batch(&[status_row("m1", "allowed", 30)])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(
+            storage.get_mint("m1").await.unwrap().unwrap().status,
+            "allowed"
+        );
+    }
+
+    /// A stale replay (older slot than the current head) must not move the mirror.
+    #[tokio::test]
+    async fn sync_mint_status_ignores_older_history_after_block() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        // Replaying the slot-10 allow re-syncs, but the latest transition is still
+        // blocked@20, so the mirror stays blocked.
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(
+            storage.get_mint("m1").await.unwrap().unwrap().status,
+            "blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_mint_status_missing_row_is_noop() {
+        let (storage, _mock) = make_mock_storage();
+        // No row for "ghost" — must not error.
+        storage
+            .sync_mint_status(&["ghost".to_string()])
+            .await
+            .unwrap();
+        assert!(storage.get_mint("ghost").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1139,6 +1220,28 @@ mod tests {
         assert_eq!(res, MintStatusAtSlot::Allowed);
     }
 
+    /// Accepted limitation: a same-slot allow + block can't both be stored — PK
+    /// `(mint_address, effective_slot)` with `ON CONFLICT DO NOTHING` and no
+    /// intra-slot tiebreak, so the first inserted wins. Rare (admin-only); pinned
+    /// here so it can't change silently. Allow inserted first → block dropped.
+    #[tokio::test]
+    async fn get_mint_status_at_slot_same_slot_allow_then_block_keeps_first_inserted() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 10),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
+        assert_eq!(
+            res,
+            MintStatusAtSlot::Allowed,
+            "first-inserted row wins on a same-slot conflict; the block is dropped",
+        );
+    }
+
     // ── orphan query against status history ──────────────────────────
 
     fn seed_deposit(mock: &MockStorage, id: i64, mint: &str, slot: i64) {
@@ -1151,7 +1254,7 @@ mod tests {
             initiator: "init".to_string(),
             recipient: "recip".to_string(),
             mint: mint.to_string(),
-            amount: 1,
+            amount: TokenAmount(1),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -1165,6 +1268,7 @@ mod tests {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: 0,
             landed_remint_signature: None,
         });
     }

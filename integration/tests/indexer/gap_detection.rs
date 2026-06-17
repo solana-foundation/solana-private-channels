@@ -208,7 +208,8 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
             tx.signature
         );
         assert_eq!(
-            db_tx.amount as u64, tx.amount,
+            db_tx.amount.value(),
+            tx.amount,
             "Amount mismatch for {}",
             tx.signature
         );
@@ -282,7 +283,8 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
             tx.signature
         );
         assert_eq!(
-            db_tx.amount as u64, tx.amount,
+            db_tx.amount.value(),
+            tx.amount,
             "Amount mismatch for {}",
             tx.signature
         );

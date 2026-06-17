@@ -271,19 +271,7 @@ impl SenderState {
                 &private_channel_token_program,
             );
 
-            // u64::try_from catches negative amounts. The write path already guards
-            // against this (ba77249) but a corrupt DB row could still produce one —
-            // casting a negative i64 to u64 would produce a massive spurious remint.
-            let Some(amount) = Self::or_manual_review(
-                u64::try_from(tx.amount).map_err(|_| format!("negative amount: {}", tx.amount)),
-                storage_tx,
-                tx.id,
-                &tx.trace_id,
-            )
-            .await
-            else {
-                continue;
-            };
+            let amount = tx.amount.value();
 
             // Pair each stored signature with its last_valid_block_height. The
             // remint gate needs both to verify the withdrawal cannot still land.
@@ -391,6 +379,7 @@ impl SenderState {
 mod tests {
     use super::*;
     use crate::operator::MintCache;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
@@ -452,7 +441,7 @@ mod tests {
             initiator: Pubkey::new_unique().to_string(),
             recipient: recipient.to_string(),
             mint: mint.to_string(),
-            amount: 5_000,
+            amount: TokenAmount(5_000),
             memo: None,
             transaction_type: TransactionType::Withdrawal,
             withdrawal_nonce: Some(id),
@@ -466,6 +455,7 @@ mod tests {
             pending_remint_deadline_at: Some(deadline),
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: 0,
             landed_remint_signature: None,
         }
     }
@@ -681,51 +671,8 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
-    /// A negative amount in a PendingRemint row must never be cast to u64.
-    /// `i64` to `u64` with `as` would silently wrap: `-1_i64 as u64` produces
-    /// `18_446_744_073_709_551_615` — a remint of the entire token supply.
-    ///
-    /// The write path guards against this, but a corrupted DB row could still
-    /// produce a negative value. `u64::try_from` catches it and the operator
-    /// must escalate to ManualReview rather than execute a catastrophic remint.
-    #[tokio::test]
-    async fn recover_pending_remints_escalates_negative_amount_to_manual_review() {
-        let mock = MockStorage::new();
-        let mint = Pubkey::new_unique();
-        let recipient = Pubkey::new_unique();
-        let sig = Signature::new_unique();
-        let deadline = Utc::now() + chrono::Duration::seconds(20);
-
-        let mut bad_row = make_pending_remint_row(30, &mint, &recipient, &sig, deadline);
-        bad_row.amount = -1;
-
-        mock.pending_remint_transactions
-            .lock()
-            .unwrap()
-            .push(bad_row);
-
-        let mut state = make_sender_state(mock);
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        state.recover_pending_remints(&storage_tx).await.unwrap();
-
-        let update = storage_rx
-            .try_recv()
-            .expect("should receive ManualReview for negative amount");
-        assert_eq!(update.transaction_id, 30);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-        let err = update.error_message.as_deref().unwrap_or("");
-        assert!(
-            err.contains("negative amount"),
-            "error message should describe the negative amount: {err}"
-        );
-
-        assert!(
-            state.pending_remints.is_empty(),
-            "negative-amount row must not be queued"
-        );
-        assert!(storage_rx.try_recv().is_err());
-    }
+    // No negative-amount test here anymore: `TokenAmount(u64)` makes a negative
+    // amount unconstructable; the rejection now lives in TokenAmount's decode tests.
 
     /// An unparseable withdrawal signature in a PendingRemint row breaks the
     /// finality check: the operator cannot call `get_signature_statuses` with

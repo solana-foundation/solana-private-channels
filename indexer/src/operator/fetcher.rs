@@ -107,6 +107,7 @@ pub async fn run_fetcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus};
     use crate::storage::common::storage::mock::MockStorage;
     use chrono::Utc;
@@ -139,7 +140,7 @@ mod tests {
             initiator: "init".to_string(),
             recipient: "recv".to_string(),
             mint: "mint".to_string(),
-            amount: 1000,
+            amount: TokenAmount(1000),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -153,6 +154,7 @@ mod tests {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: 0,
             landed_remint_signature: None,
         }
     }

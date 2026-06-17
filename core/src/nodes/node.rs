@@ -199,8 +199,12 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // duplicate transactions to execute after a restart.
             let db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
             repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
-            let (initial_live_blockhashes, initial_dedup_cache) =
-                load_dedup_state(&db, config.max_blockhashes()).await?;
+            let (initial_live_blockhashes, initial_dedup_cache) = load_dedup_state(
+                &db,
+                config.max_blockhashes(),
+                config.transaction_expiration_ms,
+            )
+            .await?;
 
             let dedup_hb = crate::health::StageHeartbeat::new();
             let sigverify_hb = crate::health::StageHeartbeat::new();

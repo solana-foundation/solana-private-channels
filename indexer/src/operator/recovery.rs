@@ -293,8 +293,7 @@ fn reconstruct_mint_builder_for_lookup(
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let amount =
-        u64::try_from(row.amount).map_err(|_| format!("negative amount: {}", row.amount))?;
+    let amount = row.amount.value();
 
     let mut builder = MintToBuilder::new();
     builder
@@ -515,6 +514,7 @@ pub mod test_hooks {
 mod tests {
     use super::*;
     use crate::operator::utils::rpc_util::RetryConfig;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
     use solana_sdk::commitment_config::CommitmentConfig;
 
@@ -528,7 +528,7 @@ mod tests {
             initiator: Pubkey::new_unique().to_string(),
             recipient: Pubkey::new_unique().to_string(),
             mint: Pubkey::new_unique().to_string(),
-            amount: 1_000,
+            amount: TokenAmount(1_000),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -542,6 +542,7 @@ mod tests {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: 0,
             landed_remint_signature: None,
         }
     }
@@ -656,7 +657,7 @@ mod tests {
                                                 "mint": mint.to_string(),
                                                 "account": recipient_ata.to_string(),
                                                 "mintAuthority": admin_pubkey.to_string(),
-                                                "amount": (row.amount as u64).to_string(),
+                                                "amount": row.amount.value().to_string(),
                                             },
                                         },
                                     },

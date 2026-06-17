@@ -33,6 +33,7 @@ mod transaction_cols {
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
     pub const FINALITY_CHECK_ATTEMPTS: &str = "finality_check_attempts";
     pub const RECOVERY_REQUEUE_ATTEMPTS: &str = "recovery_requeue_attempts";
+    pub const INSTRUCTION_INDEX: &str = "instruction_index";
     pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
 }
 
@@ -108,12 +109,13 @@ impl PostgresDb {
             r#"
             CREATE TABLE IF NOT EXISTS transactions (
                 id BIGSERIAL PRIMARY KEY,
-                signature TEXT NOT NULL UNIQUE,
+                signature TEXT NOT NULL,
+                instruction_index INTEGER NOT NULL DEFAULT 0,
                 slot BIGINT NOT NULL,
                 initiator TEXT NOT NULL,
                 recipient TEXT NOT NULL,
                 mint TEXT NOT NULL,
-                amount BIGINT NOT NULL,
+                amount NUMERIC(20,0) NOT NULL,
                 memo TEXT,
                 status transaction_status NOT NULL DEFAULT 'pending',
                 transaction_type transaction_type NOT NULL,
@@ -128,6 +130,48 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
+
+        // Durable identity for an indexed economic event is the pair
+        // (signature, instruction_index): one Solana transaction can carry several
+        // deposit or withdraw instructions, so each must persist as its own row.
+        // This runs right after the table is ensured, so the composite unique index
+        // exists before the table is exposed to any writer (init_schema completes
+        // before the pipeline starts). The column is added first so an in-place
+        // upgrade of a table that predates it does not reference a missing column,
+        // then the composite index is built while the old single-signature
+        // uniqueness is still in force, so signature is never left unprotected, and
+        // only then is the old single-signature constraint dropped. Existing rows
+        // backfill to instruction_index 0, and that old uniqueness guaranteed each
+        // signature mapped to one row, so every (signature, 0) pair is already
+        // unique and the build is clean. signature stays the leading column, so
+        // existing WHERE signature = $1 lookups remain index-served.
+        info!("Running instruction_index migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS instruction_index INTEGER NOT NULL DEFAULT 0;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_signature_ix ON transactions (signature, instruction_index)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_signature_key;
+                DROP INDEX IF EXISTS idx_transactions_signature;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("instruction_index migration complete");
 
         // Create indexes for transactions
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions (status)")
@@ -152,13 +196,6 @@ impl PostgresDb {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_transactions_recipient ON transactions (recipient)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Add unique index for signatures and counterpart_signature
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_signature ON transactions (signature)",
         )
         .execute(&self.pool)
         .await?;
@@ -270,6 +307,28 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("landed_remint_signature migration complete");
+
+        // Widen a legacy BIGINT amount column to NUMERIC(20,0). BIGINT wraps amounts
+        // above i64::MAX negative; the cast is lossless and the guard makes it a no-op
+        // once already NUMERIC. Required because the BigDecimal decoder rejects BIGINT.
+        info!("Running amount NUMERIC widening migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'transactions'
+                      AND column_name = 'amount'
+                      AND data_type = 'bigint'
+                ) THEN
+                    ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(20,0);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("amount NUMERIC widening migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -427,6 +486,14 @@ impl PostgresDb {
             .execute(&self.pool)
             .await?;
 
+        // Current allow/block state. Existing rows backfill to 'allowed' via the
+        // default; the point-in-time history lives in mint_status_history.
+        sqlx::query(
+            "ALTER TABLE mints ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'allowed'",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -551,11 +618,13 @@ impl PostgresDb {
         transaction: &DbTransaction,
     ) -> Result<i64, sqlx::Error> {
         let existing: Option<(i64,)> = sqlx::query_as(&format!(
-            "SELECT {} FROM transactions WHERE {} = $1",
+            "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
             transaction_cols::ID,
-            transaction_cols::SIGNATURE
+            transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX
         ))
         .bind(&transaction.signature)
+        .bind(transaction.instruction_index)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -566,12 +635,13 @@ impl PostgresDb {
         let result: Option<(i64,)> = sqlx::query_as(&format!(
             r#"
             INSERT INTO transactions (
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT ({}) DO NOTHING
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT ({}, {}) DO NOTHING
             RETURNING {}
             "#,
             transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::SLOT,
             transaction_cols::INITIATOR,
             transaction_cols::RECIPIENT,
@@ -582,9 +652,11 @@ impl PostgresDb {
             transaction_cols::STATUS,
             transaction_cols::TRACE_ID,
             transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::ID,
         ))
         .bind(&transaction.signature)
+        .bind(transaction.instruction_index)
         .bind(transaction.slot)
         .bind(&transaction.initiator)
         .bind(&transaction.recipient)
@@ -603,11 +675,13 @@ impl PostgresDb {
 
         // Conflict occurred, fetch existing ID
         let (id,): (i64,) = sqlx::query_as(&format!(
-            "SELECT {} FROM transactions WHERE {} = $1",
+            "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
             transaction_cols::ID,
-            transaction_cols::SIGNATURE
+            transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX
         ))
         .bind(&transaction.signature)
+        .bind(transaction.instruction_index)
         .fetch_one(&self.pool)
         .await?;
 
@@ -630,11 +704,13 @@ impl PostgresDb {
         for transaction in transactions {
             // Check if already exists
             let existing: Option<(i64,)> = sqlx::query_as(&format!(
-                "SELECT {} FROM transactions WHERE {} = $1",
+                "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
                 transaction_cols::ID,
-                transaction_cols::SIGNATURE
+                transaction_cols::SIGNATURE,
+                transaction_cols::INSTRUCTION_INDEX
             ))
             .bind(&transaction.signature)
+            .bind(transaction.instruction_index)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -647,12 +723,13 @@ impl PostgresDb {
             let result: Option<(i64,)> = sqlx::query_as(&format!(
                 r#"
                 INSERT INTO transactions (
-                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT ({}) DO NOTHING
+                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT ({}, {}) DO NOTHING
                 RETURNING {}
                 "#,
                 transaction_cols::SIGNATURE,
+                transaction_cols::INSTRUCTION_INDEX,
                 transaction_cols::SLOT,
                 transaction_cols::INITIATOR,
                 transaction_cols::RECIPIENT,
@@ -663,9 +740,11 @@ impl PostgresDb {
                 transaction_cols::STATUS,
                 transaction_cols::TRACE_ID,
                 transaction_cols::SIGNATURE,
+                transaction_cols::INSTRUCTION_INDEX,
                 transaction_cols::ID,
             ))
             .bind(&transaction.signature)
+            .bind(transaction.instruction_index)
             .bind(transaction.slot)
             .bind(&transaction.initiator)
             .bind(&transaction.recipient)
@@ -683,11 +762,13 @@ impl PostgresDb {
             } else {
                 // Conflict occurred, fetch existing ID
                 let (id,): (i64,) = sqlx::query_as(&format!(
-                    "SELECT {} FROM transactions WHERE {} = $1",
+                    "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
                     transaction_cols::ID,
-                    transaction_cols::SIGNATURE
+                    transaction_cols::SIGNATURE,
+                    transaction_cols::INSTRUCTION_INDEX
                 ))
                 .bind(&transaction.signature)
+                .bind(transaction.instruction_index)
                 .fetch_one(&mut *tx)
                 .await?;
                 ids.push(id);
@@ -707,7 +788,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -734,6 +815,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
@@ -757,7 +839,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -783,6 +865,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
@@ -806,7 +889,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -833,6 +916,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
@@ -896,7 +980,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -924,6 +1008,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
@@ -998,7 +1083,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
@@ -1026,6 +1111,7 @@ impl PostgresDb {
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
             transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
@@ -1359,8 +1445,8 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program)
-                VALUES ($1, $2, $3)
+                INSERT INTO mints (mint_address, decimals, token_program, status)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program
@@ -1369,11 +1455,42 @@ impl PostgresDb {
             .bind(&mint.mint_address)
             .bind(mint.decimals)
             .bind(&mint.token_program)
+            .bind(&mint.status)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set each mint's `status` mirror to its latest `mint_status_history`
+    /// transition (highest `effective_slot`); a mint with no row is untouched.
+    pub async fn sync_mint_status_internal(
+        &self,
+        mint_addresses: &[String],
+    ) -> Result<(), StorageError> {
+        if mint_addresses.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE mints m
+            SET status = h.status
+            FROM (
+                SELECT DISTINCT ON (mint_address) mint_address, status
+                FROM mint_status_history
+                WHERE mint_address = ANY($1)
+                ORDER BY mint_address, effective_slot DESC
+            ) h
+            WHERE m.mint_address = h.mint_address
+            "#,
+        )
+        .bind(mint_addresses)
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1507,11 +1624,11 @@ impl PostgresDb {
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_deposits,
+                )::NUMERIC AS total_deposits,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_withdrawals
+                )::NUMERIC AS total_withdrawals
             FROM mints m
             LEFT JOIN transactions t ON t.mint = m.mint_address
             GROUP BY m.mint_address, m.token_program
@@ -1542,11 +1659,11 @@ impl PostgresDb {
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_deposits,
+                )::NUMERIC AS total_deposits,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_withdrawals
+                )::NUMERIC AS total_withdrawals
             FROM mints m
             LEFT JOIN transactions t ON t.mint = m.mint_address
             GROUP BY m.mint_address, m.token_program
