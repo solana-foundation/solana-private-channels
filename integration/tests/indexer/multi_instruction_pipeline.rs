@@ -107,6 +107,7 @@ fn deposit_meta(
         program_type: ProgramType::Escrow,
         signature: Some(signature.to_string()),
         instruction_index,
+        inner_index: None,
     }
 }
 
@@ -141,6 +142,7 @@ fn withdraw_meta(
         program_type: ProgramType::Withdraw,
         signature: Some(signature.to_string()),
         instruction_index,
+        inner_index: None,
     }
 }
 
@@ -239,6 +241,72 @@ async fn two_same_signature_deposits_persist_as_distinct_rows() {
     );
     assert_eq!(rows[0].2, recipient_a.to_string());
     assert_eq!(rows[1].2, recipient_b.to_string());
+}
+
+/// A top-level deposit and a CPI deposit sharing one (signature,
+/// instruction_index) must persist as two distinct rows: the top-level row with
+/// NULL inner_index, the inner row with inner_index 0. Re-driving the slot is
+/// idempotent on the composite triple, so no duplicate rows appear.
+#[tokio::test(flavor = "multi_thread")]
+async fn top_level_and_cpi_deposit_persist_as_distinct_rows() {
+    let (db, url, _pg) = start_postgres("c1_cpi_pipeline").await;
+    db.init_schema().await.unwrap();
+    let storage = Arc::new(Storage::Postgres(db));
+
+    let instance = Pubkey::new_unique();
+    let signature = Signature::new_unique().to_string();
+    let recipient_top = Pubkey::new_unique();
+    let recipient_cpi = Pubkey::new_unique();
+
+    // Both at instruction_index 0; the CPI one carries inner_index 0.
+    let mut top = deposit_meta(7, &signature, instance, 0, recipient_top, 990);
+    top.inner_index = None;
+    let mut cpi = deposit_meta(7, &signature, instance, 0, recipient_cpi, 480);
+    cpi.inner_index = Some(0);
+
+    let messages = || {
+        vec![
+            ProcessorMessage::Instruction(top.clone()),
+            ProcessorMessage::Instruction(cpi.clone()),
+            ProcessorMessage::SlotComplete {
+                slot: 7,
+                program_type: ProgramType::Escrow,
+            },
+        ]
+    };
+
+    run_slot(storage.clone(), instance, messages()).await;
+    // Re-drive the same slot: must be idempotent on the triple.
+    run_slot(storage, instance, messages()).await;
+
+    let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+        .bind(&signature)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "top-level + CPI deposit persist as two rows, idempotent on replay; got {count}"
+    );
+
+    let rows: Vec<(i32, Option<i32>, i64, String)> = sqlx::query_as(
+        "SELECT instruction_index, inner_index, amount::bigint, recipient FROM transactions \
+         WHERE signature = $1 ORDER BY COALESCE(inner_index, -1)",
+    )
+    .bind(&signature)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    // Ordered by COALESCE(inner_index, -1): the top-level NULL coalesces to -1 and sorts first.
+    assert_eq!(rows[0].1, None, "top-level row has NULL inner_index");
+    assert_eq!(rows[0].2, 990);
+    assert_eq!(rows[0].3, recipient_top.to_string());
+    assert_eq!(rows[1].1, Some(0), "CPI row has inner_index 0");
+    assert_eq!(rows[1].2, 480);
+    assert_eq!(rows[1].3, recipient_cpi.to_string());
 }
 
 /// Two `WithdrawFunds` instructions sharing one signature must both persist as distinct rows, each getting its own withdrawal_nonce from the per-row trigger.

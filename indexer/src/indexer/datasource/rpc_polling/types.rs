@@ -36,10 +36,22 @@ pub struct TransactionMeta {
     pub log_messages: Option<Vec<String>>,
     #[serde(rename = "innerInstructions")]
     pub inner_instructions: Option<Vec<InnerInstructions>>,
+    /// ALT keys for a v0 transaction, appended after the static keys (writable then readonly) to rebuild the full account list.
+    #[serde(rename = "loadedAddresses")]
+    pub loaded_addresses: Option<solana_transaction_status::UiLoadedAddresses>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct InnerInstructions {
     pub index: u8,
-    pub instructions: Vec<CompiledInstruction>,
+    pub instructions: Vec<InnerInstruction>,
+}
+
+/// A single inner (CPI) instruction; `stack_height` is its CPI depth, used to match a deposit to the event it emitted.
+#[derive(Debug, Deserialize, Clone)]
+pub struct InnerInstruction {
+    #[serde(flatten)]
+    pub instruction: CompiledInstruction,
+    #[serde(rename = "stackHeight")]
+    pub stack_height: Option<u32>,
 }

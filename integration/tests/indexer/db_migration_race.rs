@@ -76,14 +76,29 @@ async fn test_init_schema_is_idempotent_across_runs() {
     assert_eq!(count, 0, "no rows yet; table exists and is reachable");
 
     // The single-signature uniqueness must have been swapped for the composite
-    // index across both runs; the old index and constraint must be gone.
-    let composite_index: i64 = sqlx::query_scalar(
+    // triple index across both runs; the old single-signature and
+    // (signature, instruction_index) indexes must be gone.
+    let triple_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix_inner'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        triple_index, 1,
+        "composite triple signature index must exist"
+    );
+
+    let prev_composite_index: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(composite_index, 1, "composite signature index must exist");
+    assert_eq!(
+        prev_composite_index, 0,
+        "the (signature, instruction_index) index must be dropped after the inner_index migration"
+    );
 
     let old_index: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature'",
@@ -117,10 +132,18 @@ async fn test_init_schema_upgrades_legacy_signature_only_schema() {
     let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
 
     // Seed the current schema, then rewind it to the legacy shape: drop the
-    // composite index and the instruction_index column, and restore the old
-    // single-signature unique constraint plus its standalone index.
+    // triple index, the inner_index and instruction_index columns, and restore
+    // the old single-signature unique constraint plus its standalone index.
     storage.init_schema().await.expect("seed current schema");
+    sqlx::query("DROP INDEX IF EXISTS idx_transactions_signature_ix_inner")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DROP INDEX IF EXISTS idx_transactions_signature_ix")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE transactions DROP COLUMN IF EXISTS inner_index")
         .execute(&pool)
         .await
         .unwrap();
@@ -155,15 +178,15 @@ async fn test_init_schema_upgrades_legacy_signature_only_schema() {
     .unwrap();
     assert_eq!(has_column, 1, "instruction_index column must be added");
 
-    let composite_index: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix'",
+    let triple_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix_inner'",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
-        composite_index, 1,
-        "composite signature index must exist after upgrade"
+        triple_index, 1,
+        "composite triple signature index must exist after upgrade"
     );
 
     let old_constraint: i64 = sqlx::query_scalar(
@@ -184,6 +207,137 @@ async fn test_init_schema_upgrades_legacy_signature_only_schema() {
     .await
     .unwrap();
     assert_eq!(old_index, 0, "old single-signature index must be dropped");
+}
+
+// ── 1c. Upgrade from a (signature, instruction_index) schema to the triple ──
+// A database that predates inner_index carries the
+// idx_transactions_signature_ix composite but no inner_index column. init_schema
+// must add the column, build the triple unique index, and drop the old one
+// without failing on the not-yet-present column.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_init_schema_upgrades_instruction_index_schema_to_triple() {
+    let (db, url, _container) = start_postgres("c1_triple_upgrade").await;
+    let storage = Storage::Postgres(db);
+    let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
+
+    // Seed the current schema, then rewind to the pre-inner_index shape: drop the
+    // triple index and inner_index column and restore the (signature,
+    // instruction_index) composite index.
+    storage.init_schema().await.expect("seed current schema");
+    sqlx::query("DROP INDEX IF EXISTS idx_transactions_signature_ix_inner")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE transactions DROP COLUMN inner_index")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE UNIQUE INDEX idx_transactions_signature_ix \
+         ON transactions (signature, instruction_index)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The upgrade run must not crash on the missing column and must converge.
+    storage
+        .init_schema()
+        .await
+        .expect("init_schema must upgrade a (signature, instruction_index) schema");
+
+    let has_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_name = 'transactions' AND column_name = 'inner_index'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(has_column, 1, "inner_index column must be added");
+
+    let triple_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes \
+         WHERE indexname = 'idx_transactions_signature_ix_inner'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        triple_index, 1,
+        "triple unique index must exist after upgrade"
+    );
+
+    let old_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_transactions_signature_ix'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_index, 0,
+        "old (signature, instruction_index) index must be dropped"
+    );
+}
+
+// ── 1d. Top-level + inner rows under one signature persist distinctly ───────
+// A top-level deposit (inner_index NULL) and an inner CPI deposit (inner_index 0)
+// at the SAME (signature, instruction_index) must persist as two rows, and the
+// COALESCE(-1) sentinel must still collapse a duplicate top-level row.
+#[tokio::test(flavor = "multi_thread")]
+async fn cpi_inner_and_top_level_persist_as_distinct_rows() {
+    let (db, url, _container) = start_postgres("c1_cpi_identity").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+
+    let signature = Signature::new_unique().to_string();
+    let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+    let recipient = solana_sdk::pubkey::Pubkey::new_unique().to_string();
+
+    let build = |inner_index: Option<i32>, amount: u64| {
+        DbTransactionBuilder::new(signature.clone(), 1, mint.clone(), amount)
+            .initiator(recipient.clone())
+            .recipient(recipient.clone())
+            .transaction_type(TransactionType::Deposit)
+            .instruction_index(0)
+            .inner_index(inner_index)
+            .build()
+    };
+
+    // Top-level (NULL) and inner (0) sharing (signature, instruction_index=0).
+    let batch = vec![build(None, 100), build(Some(0), 200)];
+    let ids = storage
+        .insert_db_transactions_batch(&batch)
+        .await
+        .expect("batch insert ok");
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "top-level and inner rows are distinct");
+
+    let pool = sqlx::PgPool::connect(&url).await.expect("sqlx connect");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+        .bind(&signature)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "two distinct rows persist; got {count}");
+
+    // Re-inserting both is idempotent, including the NULL-inner_index top-level
+    // row (COALESCE(-1) sentinel keeps it collision-detecting).
+    let ids_again = storage
+        .insert_db_transactions_batch(&batch)
+        .await
+        .expect("re-insert ok");
+    assert_eq!(ids_again, ids, "re-insert returns the same ids");
+
+    let count_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+            .bind(&signature)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count_after, 2,
+        "re-insert creates no new rows; got {count_after}"
+    );
 }
 
 // ── 2. Duplicate-key race in insert_transaction ────────────────────────────

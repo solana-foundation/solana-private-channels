@@ -1,6 +1,7 @@
 use crate::{
     error::{account::AccountError, ParserError},
-    indexer::datasource::common::types::CompiledInstruction,
+    indexer::datasource::common::parser::resolve_account,
+    indexer::datasource::common::types::{CompiledInstruction, InstructionLocation},
     indexer::datasource::rpc_polling::types::InnerInstructions,
 };
 use borsh::BorshDeserialize;
@@ -13,6 +14,11 @@ pub const PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID: &str =
 
 // Instruction discriminators
 const WITHDRAW_FUNDS: u8 = 0;
+
+/// Withdraw exposes only the user-initiated `WithdrawFunds`, so no inner (CPI) discriminator is excluded; mirrors the escrow predicate so both decoders share one per-program source of truth.
+pub fn withdraw_inner_discriminator_excluded(_discriminator: u8) -> bool {
+    false
+}
 
 // ******************************************************************************************
 // Data types for instructions
@@ -56,6 +62,8 @@ pub fn parse_withdraw_instruction(
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
     _inner_instructions: &[InnerInstructions],
+    // WithdrawFunds emits no event; the unused location keeps a uniform parser signature across both programs.
+    _location: InstructionLocation,
 ) -> Result<Option<WithdrawInstruction>, ParserError> {
     // Decode base58 instruction data
     let data = bs58::decode(&instruction.data).into_vec()?;
@@ -90,14 +98,14 @@ fn parse_withdraw_funds(
         .into());
     }
 
-    let user = account_keys[instruction.accounts[0] as usize];
+    let user = resolve_account(instruction, account_keys, 0)?;
 
     let accounts = WithdrawFundsAccounts {
         user,
-        mint: account_keys[instruction.accounts[1] as usize],
-        token_account: account_keys[instruction.accounts[2] as usize],
-        token_program: account_keys[instruction.accounts[3] as usize],
-        associated_token_program: account_keys[instruction.accounts[4] as usize],
+        mint: resolve_account(instruction, account_keys, 1)?,
+        token_account: resolve_account(instruction, account_keys, 2)?,
+        token_program: resolve_account(instruction, account_keys, 3)?,
+        associated_token_program: resolve_account(instruction, account_keys, 4)?,
     };
 
     let destination = ix_data

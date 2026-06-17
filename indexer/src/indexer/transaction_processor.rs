@@ -370,6 +370,7 @@ fn convert_to_db_models(
                             .recipient(recipient)
                             .transaction_type(TransactionType::Deposit)
                             .instruction_index(instruction_meta.instruction_index as i32)
+                            .inner_index(instruction_meta.inner_index.map(|i| i as i32))
                             .build(),
                         ),
                     )
@@ -421,6 +422,7 @@ fn convert_to_db_models(
                         .recipient(recipient)
                         .transaction_type(TransactionType::Withdrawal)
                         .instruction_index(instruction_meta.instruction_index as i32)
+                        .inner_index(instruction_meta.inner_index.map(|i| i as i32))
                         .build(),
                     ),
                 )
@@ -509,6 +511,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             signature: sig,
             instruction_index: 0,
+            inner_index: None,
         }
     }
 
@@ -535,6 +538,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             signature: sig,
             instruction_index: 0,
+            inner_index: None,
         }
     }
 
@@ -558,6 +562,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             signature: sig,
             instruction_index: 0,
+            inner_index: None,
         }
     }
 
@@ -582,6 +587,7 @@ mod tests {
             program_type: ProgramType::Withdraw,
             signature: sig,
             instruction_index: 0,
+            inner_index: None,
         }
     }
 
@@ -601,6 +607,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             signature: sig,
             instruction_index: 0,
+            inner_index: None,
         }
     }
 
@@ -747,6 +754,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
             instruction_index: 0,
+            inner_index: None,
         };
 
         let (mint, status, txn) = convert_to_db_models(&ix, Some(&watched));
@@ -782,6 +790,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
             instruction_index: 0,
+            inner_index: None,
         };
 
         let (mint, status, txn) = convert_to_db_models(&ix, Some(&watched));

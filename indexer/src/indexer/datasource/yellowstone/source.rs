@@ -24,7 +24,7 @@ use crate::error::{DataSourceError, DataSourceRpcError};
 use crate::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
 use crate::indexer::datasource::common::parser::withdraw::parse_withdraw_instruction;
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
-use crate::indexer::datasource::rpc_polling::types::InnerInstructions;
+use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
 use crate::storage::Storage;
 
 #[cfg(feature = "datasource-rpc")]
@@ -804,6 +804,270 @@ mod tests {
             err_str
         );
     }
+
+    /// A CPI-only withdraw surfaces as a row carrying the parent's top-level index and the inner position.
+    #[tokio::test]
+    async fn handle_transaction_emits_inner_cpi_withdraw() {
+        use std::str::FromStr;
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let signature = vec![9u8; 64];
+
+        // Top-level targets a foreign program (account index 0); the withdraw program at WITHDRAW_PROGRAM_KEY_INDEX is CPI-only.
+        let mut tx_update =
+            withdraw_tx_update_with_program_indices(signature.clone(), &program_id, &[0]);
+
+        let inner = proto::InnerInstruction {
+            program_id_index: WITHDRAW_PROGRAM_KEY_INDEX,
+            accounts: vec![0, 1, 2, 3, 4],
+            data: withdraw_funds_proto_data(),
+            stack_height: Some(2),
+        };
+        let inner_set = proto::InnerInstructions {
+            index: 0,
+            instructions: vec![inner],
+        };
+        tx_update.transaction.as_mut().unwrap().meta = Some(proto::TransactionStatusMeta {
+            inner_instructions: vec![inner_set],
+            ..Default::default()
+        });
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(meta)) = rx.recv().await {
+            metas.push(meta);
+        }
+
+        assert_eq!(metas.len(), 1, "the inner CPI withdraw must surface");
+        assert_eq!(metas[0].instruction_index, 0, "parent top-level index");
+        assert_eq!(metas[0].inner_index, Some(0), "inner position");
+    }
+
+    // ============================================================================
+    // Escrow CPI deposit parsing (real parser, loaded-address resolution)
+    // ============================================================================
+
+    /// Build an escrow `SubscribeUpdateTransaction`. `account_keys` are static
+    /// message keys (raw 32-byte); instruction `data` is raw (the handler base58-
+    /// encodes); `loaded_writable`/`loaded_readonly` become the meta's ALT keys.
+    fn escrow_tx_update(
+        signature: Vec<u8>,
+        account_keys: Vec<Vec<u8>>,
+        top_level: Vec<yellowstone_grpc_proto::prelude::CompiledInstruction>,
+        inner_instructions: Vec<yellowstone_grpc_proto::prelude::InnerInstructions>,
+        loaded_writable: Vec<Vec<u8>>,
+        loaded_readonly: Vec<Vec<u8>>,
+    ) -> yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
+        use yellowstone_grpc_proto::prelude as proto;
+        let message = proto::Message {
+            header: Some(proto::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            }),
+            account_keys,
+            recent_blockhash: vec![0u8; 32],
+            instructions: top_level,
+            versioned: true,
+            address_table_lookups: vec![],
+        };
+        yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
+            slot: 7,
+            transaction: Some(proto::SubscribeUpdateTransactionInfo {
+                signature,
+                is_vote: false,
+                transaction: Some(proto::Transaction {
+                    signatures: vec![signature_placeholder()],
+                    message: Some(message),
+                }),
+                meta: Some(proto::TransactionStatusMeta {
+                    inner_instructions,
+                    loaded_writable_addresses: loaded_writable,
+                    loaded_readonly_addresses: loaded_readonly,
+                    ..Default::default()
+                }),
+                index: 0,
+            }),
+        }
+    }
+
+    fn escrow_pubkey() -> Pubkey {
+        use std::str::FromStr;
+        Pubkey::from_str(
+            crate::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        )
+        .unwrap()
+    }
+
+    /// DepositEvent amount carried by a parsed escrow Deposit row.
+    fn escrow_deposit_amount(meta: &InstructionWithMetadata) -> u64 {
+        use crate::indexer::datasource::common::parser::EscrowInstruction;
+        match &meta.instruction {
+            ProgramInstruction::Escrow(ix) => match ix.as_ref() {
+                EscrowInstruction::Deposit { event, .. } => event.amount,
+                _ => panic!("expected a Deposit instruction"),
+            },
+            _ => panic!("expected an Escrow instruction"),
+        }
+    }
+
+    /// Two CPI escrow deposits sharing one transaction each resolve their own
+    /// DepositEvent amount by stack height (proto `stack_height` is threaded
+    /// through), landing as two rows with distinct inner indices. The borsh
+    /// amount stays at the default so the asserted amounts can only come from the
+    /// scoped event.
+    #[tokio::test]
+    async fn handle_transaction_scopes_two_cpi_escrow_deposits_by_stack_height() {
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes};
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        // Escrow at static key index 0; indices 1..12 fill the deposits' accounts.
+        let mut account_keys: Vec<Vec<u8>> = (0u8..12)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i + 1;
+                b.to_vec()
+            })
+            .collect();
+        account_keys[0] = escrow.to_bytes().to_vec();
+
+        // One foreign top-level instruction (index 1) that CPIs the two deposits.
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: vec![],
+        }];
+
+        let deposit = || proto::InnerInstruction {
+            program_id_index: 0,
+            accounts: (0u8..12).collect(),
+            data: deposit_ix_bytes(1000, None),
+            stack_height: Some(2),
+        };
+        let event = |amount: u64| proto::InnerInstruction {
+            program_id_index: 0,
+            accounts: vec![],
+            data: deposit_event_bytes(amount),
+            stack_height: Some(3),
+        };
+        // Pre-order walk: [0] deposit A h2, [1] event 300 h3, [2] deposit B h2, [3] event 480 h3.
+        let inner_set = vec![proto::InnerInstructions {
+            index: 0,
+            instructions: vec![deposit(), event(300), deposit(), event(480)],
+        }];
+
+        let tx_update =
+            escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(m)) = rx.recv().await {
+            metas.push(m);
+        }
+
+        assert_eq!(
+            metas.len(),
+            2,
+            "two CPI deposits; the event self-CPIs are not counted as rows"
+        );
+        assert_eq!(metas[0].inner_index, Some(0));
+        assert_eq!(
+            escrow_deposit_amount(&metas[0]),
+            300,
+            "deposit A reads its own event"
+        );
+        assert_eq!(metas[1].inner_index, Some(2));
+        assert_eq!(
+            escrow_deposit_amount(&metas[1]),
+            480,
+            "deposit B reads its own event, not A's"
+        );
+    }
+
+    /// A top-level escrow deposit whose program id is ALT-loaded is still parsed.
+    /// Escrow is the readonly loaded key behind one writable loaded key, so it
+    /// only resolves if loaded keys are appended writable-then-readonly after the
+    /// static keys (its full-list index is 13, not 12).
+    #[tokio::test]
+    async fn handle_transaction_resolves_alt_loaded_escrow_program() {
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes};
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        // 12 static keys (0..11), none is escrow.
+        let account_keys: Vec<Vec<u8>> = (0u8..12)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i + 1;
+                b.to_vec()
+            })
+            .collect();
+        let dummy_writable = {
+            let mut b = [0u8; 32];
+            b[0] = 200;
+            b.to_vec()
+        };
+
+        // Top-level deposit + its event target index 13: static 0..11, writable 12, readonly 13 (escrow).
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 13,
+            accounts: (0u8..12).collect(),
+            data: deposit_ix_bytes(1000, None),
+        }];
+        let inner_set = vec![proto::InnerInstructions {
+            index: 0,
+            instructions: vec![proto::InnerInstruction {
+                program_id_index: 13,
+                accounts: vec![],
+                data: deposit_event_bytes(555),
+                stack_height: Some(2),
+            }],
+        }];
+
+        let tx_update = escrow_tx_update(
+            vec![10u8; 64],
+            account_keys,
+            top,
+            inner_set,
+            vec![dummy_writable],
+            vec![escrow.to_bytes().to_vec()],
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, &tx)
+            .await
+            .unwrap();
+        drop(tx);
+
+        let mut metas = vec![];
+        while let Some(ProcessorMessage::Instruction(m)) = rx.recv().await {
+            metas.push(m);
+        }
+
+        assert_eq!(
+            metas.len(),
+            1,
+            "top-level ALT-loaded escrow deposit must be indexed"
+        );
+        assert_eq!(metas[0].instruction_index, 0);
+        assert!(
+            metas[0].inner_index.is_none(),
+            "a top-level deposit has a NULL inner_index"
+        );
+        assert_eq!(escrow_deposit_amount(&metas[0]), 555);
+    }
 }
 
 async fn handle_transaction(
@@ -821,6 +1085,9 @@ async fn handle_transaction(
         })?;
 
     let mut inner_instructions_vec: Vec<InnerInstructions> = vec![];
+    // ALT-resolved keys live on meta, not the message; capture them here to
+    // append below so inner and v0 top-level account indices resolve (no RPC).
+    let mut loaded_pubkeys: Vec<Pubkey> = vec![];
 
     if let Some(meta) = &tx_info.meta {
         inner_instructions_vec = meta
@@ -831,13 +1098,24 @@ async fn handle_transaction(
                 instructions: ix_set
                     .instructions
                     .iter()
-                    .map(|ix| CompiledInstruction {
-                        program_id_index: ix.program_id_index as u8,
-                        accounts: ix.accounts.clone(),
-                        data: bs58::encode(&ix.data).into_string(),
+                    .map(|ix| InnerInstruction {
+                        instruction: CompiledInstruction {
+                            program_id_index: ix.program_id_index as u8,
+                            accounts: ix.accounts.clone(),
+                            data: bs58::encode(&ix.data).into_string(),
+                        },
+                        stack_height: ix.stack_height,
                     })
                     .collect(),
             })
+            .collect();
+
+        // Order matters: writable then readonly, matching execution order.
+        loaded_pubkeys = meta
+            .loaded_writable_addresses
+            .iter()
+            .chain(meta.loaded_readonly_addresses.iter())
+            .filter_map(|bytes| Pubkey::try_from(bytes.as_slice()).ok())
             .collect();
     }
 
@@ -861,13 +1139,17 @@ async fn handle_transaction(
         })?;
 
     // Get account keys and instructions
-    let (account_keys, instructions): (
+    let (static_keys, instructions): (
         Vec<Pubkey>,
         Vec<solana_sdk::message::compiled_instruction::CompiledInstruction>,
     ) = match &versioned_message {
         VersionedMessage::Legacy(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
         VersionedMessage::V0(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
     };
+
+    // Full account list (static message keys, then loaded writable, then readonly) that inner and v0 top-level account indices reference.
+    let mut account_keys = static_keys;
+    account_keys.extend(loaded_pubkeys);
 
     info!(
         "Yellowstone received transaction at slot {}, signature: {}, {} instructions",
@@ -876,7 +1158,7 @@ async fn handle_transaction(
         instructions.len()
     );
 
-    // Parse each instruction that belongs to our program
+    // Parse each top-level instruction that belongs to our program.
     for (ix_index, instruction) in instructions.into_iter().enumerate() {
         let program_id_index = instruction.program_id_index as usize;
         if program_id_index >= account_keys.len() {
@@ -887,85 +1169,161 @@ async fn handle_transaction(
             continue;
         }
 
-        let ix_program_id = account_keys[program_id_index];
-        if ix_program_id != *program_id {
+        if account_keys[program_id_index] != *program_id {
             continue; // Not our program
         }
 
-        // Convert to our CompiledInstruction type (from types.rs)
         let compiled_ix = CompiledInstruction {
             program_id_index: instruction.program_id_index,
             accounts: instruction.accounts.clone(),
             data: bs58::encode(&instruction.data).into_string(),
         };
+        let location = InstructionLocation::top_level(ix_index as u32);
 
-        // Parse instruction based on program type and handle immediately to avoid Send issues
-        let instruction_data = match program_type {
-            ProgramType::Escrow => {
-                match parse_escrow_instruction(&compiled_ix, &account_keys, &inner_instructions_vec)
-                {
-                    Ok(Some(inst)) => Some(ProgramInstruction::Escrow(Box::new(inst))),
-                    Ok(None) => {
-                        debug!(
-                            "Yellowstone: Unsupported escrow instruction at slot {}",
-                            slot
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        error!("Failed to parse escrow instruction at slot {}: {}", slot, e);
-                        None
-                    }
-                }
-            }
-            ProgramType::Withdraw => {
-                match parse_withdraw_instruction(
-                    &compiled_ix,
-                    &account_keys,
-                    &inner_instructions_vec,
-                ) {
-                    Ok(Some(inst)) => Some(ProgramInstruction::Withdraw(Box::new(inst))),
-                    Ok(None) => {
-                        debug!(
-                            "Yellowstone: Unsupported withdraw instruction at slot {}",
-                            slot
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to parse withdraw instruction at slot {}: {}",
-                            slot, e
-                        );
-                        None
-                    }
-                }
-            }
-        };
+        parse_and_send(
+            &compiled_ix,
+            &account_keys,
+            &inner_instructions_vec,
+            location,
+            program_type,
+            slot,
+            &signature,
+            channel,
+        )
+        .await?;
+    }
 
-        if let Some(instruction_data) = instruction_data {
-            let instruction_meta = InstructionWithMetadata {
-                instruction: instruction_data,
-                slot,
-                program_type,
-                signature: Some(signature.clone()),
-                // A Solana tx is packet-size-bounded to a few hundred instructions,
-                // far below u32/i32 max, so this cast cannot wrap.
-                instruction_index: ix_index as u32,
+    // Parse our program's inner (CPI) instructions, skipping the excluded operator/admin escrow discriminators.
+    for inner_set in &inner_instructions_vec {
+        for (inner_ix_index, inner) in inner_set.instructions.iter().enumerate() {
+            let program_id_index = inner.instruction.program_id_index as usize;
+            if account_keys.get(program_id_index) != Some(program_id) {
+                continue; // Not our program
+            }
+            if inner_discriminator_excluded(program_type, &inner.instruction) {
+                continue;
+            }
+
+            let location = InstructionLocation {
+                top_level_index: inner_set.index as u32,
+                inner: Some(InnerLocation {
+                    inner_index: inner_ix_index as u32,
+                    stack_height: inner.stack_height,
+                }),
             };
 
-            let res = send_guaranteed(
+            parse_and_send(
+                &inner.instruction,
+                &account_keys,
+                &inner_instructions_vec,
+                location,
+                program_type,
+                slot,
+                &signature,
                 channel,
-                ProcessorMessage::Instruction(instruction_meta),
-                "instruction (yellowstone)",
             )
-            .await;
-            if let Err(e) = res {
-                return Err(DataSourceRpcError::Protocol {
-                    reason: format!("Instruction send failed: {}", e),
-                });
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether an inner (CPI) instruction's discriminator is one the indexer skips,
+/// via the per-program predicate. Decodes the leading byte; an empty/undecodable
+/// payload is never excluded (it parses to `Ok(None)` downstream).
+fn inner_discriminator_excluded(
+    program_type: ProgramType,
+    instruction: &CompiledInstruction,
+) -> bool {
+    let Some(discriminator) = bs58::decode(&instruction.data)
+        .into_vec()
+        .ok()
+        .and_then(|d| d.first().copied())
+    else {
+        return false;
+    };
+    match program_type {
+        ProgramType::Escrow => {
+            crate::indexer::datasource::common::parser::escrow::escrow_inner_discriminator_excluded(
+                discriminator,
+            )
+        }
+        ProgramType::Withdraw => {
+            crate::indexer::datasource::common::parser::withdraw::withdraw_inner_discriminator_excluded(
+                discriminator,
+            )
+        }
+    }
+}
+
+/// Parse one compiled instruction and forward it on the processor channel; shared by the top-level and inner (CPI) paths so both produce identical rows.
+#[allow(clippy::too_many_arguments)]
+async fn parse_and_send(
+    compiled_ix: &CompiledInstruction,
+    account_keys: &[Pubkey],
+    inner_instructions: &[InnerInstructions],
+    location: InstructionLocation,
+    program_type: ProgramType,
+    slot: u64,
+    signature: &str,
+    channel: &InstructionSender,
+) -> Result<(), DataSourceRpcError> {
+    let instruction_data = match program_type {
+        ProgramType::Escrow => {
+            match parse_escrow_instruction(compiled_ix, account_keys, inner_instructions, location)
+            {
+                Ok(Some(inst)) => Some(ProgramInstruction::Escrow(Box::new(inst))),
+                Ok(None) => {
+                    debug!("Yellowstone: Unsupported escrow instruction at slot {slot}");
+                    None
+                }
+                Err(e) => {
+                    error!("Failed to parse escrow instruction at slot {slot}: {e}");
+                    None
+                }
             }
         }
+        ProgramType::Withdraw => {
+            match parse_withdraw_instruction(
+                compiled_ix,
+                account_keys,
+                inner_instructions,
+                location,
+            ) {
+                Ok(Some(inst)) => Some(ProgramInstruction::Withdraw(Box::new(inst))),
+                Ok(None) => {
+                    debug!("Yellowstone: Unsupported withdraw instruction at slot {slot}");
+                    None
+                }
+                Err(e) => {
+                    error!("Failed to parse withdraw instruction at slot {slot}: {e}");
+                    None
+                }
+            }
+        }
+    };
+
+    if let Some(instruction_data) = instruction_data {
+        let instruction_meta = InstructionWithMetadata {
+            instruction: instruction_data,
+            slot,
+            program_type,
+            signature: Some(signature.to_string()),
+            // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
+            instruction_index: location.top_level_index,
+            inner_index: location.inner.map(|i| i.inner_index),
+        };
+
+        send_guaranteed(
+            channel,
+            ProcessorMessage::Instruction(instruction_meta),
+            "instruction (yellowstone)",
+        )
+        .await
+        .map_err(|e| DataSourceRpcError::Protocol {
+            reason: format!("Instruction send failed: {e}"),
+        })?;
     }
 
     Ok(())

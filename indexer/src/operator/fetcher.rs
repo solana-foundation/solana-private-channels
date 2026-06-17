@@ -155,6 +155,7 @@ mod tests {
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
             instruction_index: 0,
+            inner_index: None,
             landed_remint_signature: None,
         }
     }

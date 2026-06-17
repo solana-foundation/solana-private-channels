@@ -21,7 +21,9 @@
 //!   6. Truncated borsh payload for CreateInstance  → `Err` from borsh
 
 use private_channel_indexer::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
-use private_channel_indexer::indexer::datasource::common::types::CompiledInstruction;
+use private_channel_indexer::indexer::datasource::common::types::{
+    CompiledInstruction, InstructionLocation,
+};
 use solana_sdk::pubkey::Pubkey;
 
 fn account_keys(n: usize) -> Vec<Pubkey> {
@@ -41,7 +43,9 @@ fn ix(program_id_index: u8, accounts: Vec<u8>, data_b58: &str) -> CompiledInstru
 fn test_parse_escrow_empty_data_returns_none() {
     let keys = account_keys(8);
     let instruction = ix(0, vec![0, 1, 2, 3, 4, 5, 6], "");
-    let result = parse_escrow_instruction(&instruction, &keys, &[]).unwrap();
+    let result =
+        parse_escrow_instruction(&instruction, &keys, &[], InstructionLocation::top_level(0))
+            .unwrap();
     assert!(
         result.is_none(),
         "empty instruction data must produce Ok(None)"
@@ -56,7 +60,9 @@ fn test_parse_escrow_unknown_discriminator_returns_none() {
     // to `_ => Ok(None)` without erroring.
     let ff = bs58::encode(&[0xFFu8]).into_string();
     let instruction = ix(0, vec![0, 1, 2, 3, 4, 5, 6], &ff);
-    let result = parse_escrow_instruction(&instruction, &keys, &[]).unwrap();
+    let result =
+        parse_escrow_instruction(&instruction, &keys, &[], InstructionLocation::top_level(0))
+            .unwrap();
     assert!(
         result.is_none(),
         "unknown discriminator must be Ok(None), got {result:?}"
@@ -75,7 +81,7 @@ fn test_parse_escrow_create_instance_insufficient_accounts_errs() {
     let data_b58 = bs58::encode(&data_bytes).into_string();
     let instruction = ix(0, vec![0, 1, 2], &data_b58); // only 3 accounts
 
-    let err = parse_escrow_instruction(&instruction, &keys, &[])
+    let err = parse_escrow_instruction(&instruction, &keys, &[], InstructionLocation::top_level(0))
         .expect_err("CREATE_INSTANCE with < 7 accounts must error");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
@@ -90,7 +96,7 @@ fn test_parse_escrow_invalid_base58_errs() {
     let keys = account_keys(8);
     // Lowercase 'l' is invalid in base58's alphabet.
     let instruction = ix(0, vec![0, 1, 2, 3, 4, 5, 6], "lllll");
-    let err = parse_escrow_instruction(&instruction, &keys, &[])
+    let err = parse_escrow_instruction(&instruction, &keys, &[], InstructionLocation::top_level(0))
         .expect_err("invalid base58 must surface the decode error");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
@@ -112,7 +118,7 @@ fn test_parse_escrow_truncated_borsh_errs() {
     let keys = account_keys(8);
     let truncated = bs58::encode(&[6u8, 0u8]).into_string(); // DEPOSIT + 1 payload byte
     let instruction = ix(0, vec![0, 1, 2, 3, 4], &truncated); // 5 accounts — enough to pass the count check
-    let err = parse_escrow_instruction(&instruction, &keys, &[])
+    let err = parse_escrow_instruction(&instruction, &keys, &[], InstructionLocation::top_level(0))
         .expect_err("truncated borsh payload must error");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
@@ -134,7 +140,7 @@ fn test_parse_escrow_deposit_insufficient_accounts_errs() {
     let data_b58 = bs58::encode(&data_bytes).into_string();
     let instruction = ix(0, vec![0u8], &data_b58); // 1 account only
 
-    let err = parse_escrow_instruction(&instruction, &keys, &[])
+    let err = parse_escrow_instruction(&instruction, &keys, &[], InstructionLocation::top_level(0))
         .expect_err("DEPOSIT with 1 account must error");
     let msg = format!("{err:?}").to_lowercase();
     assert!(

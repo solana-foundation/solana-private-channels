@@ -215,6 +215,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
         finality_check_attempts: 0,
         recovery_requeue_attempts: 0,
         instruction_index: 0,
+        inner_index: None,
         landed_remint_signature: None,
     };
     storage.insert_db_transaction(&withdrawal).await?;
