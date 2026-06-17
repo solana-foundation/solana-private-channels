@@ -15,7 +15,7 @@ use {
 pub struct SequencerArgs {
     pub max_tx_per_batch: usize,
     pub batch_deadline_ms: u64,
-    pub rx: mpsc::UnboundedReceiver<SanitizedTransaction>,
+    pub rx: mpsc::Receiver<SanitizedTransaction>,
     pub batch_tx: mpsc::Sender<ConflictFreeBatch>,
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
@@ -276,6 +276,8 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
+    use crate::nodes::node::DEFAULT_SEQUENCER_QUEUE_CAPACITY as SEQ_CAP;
+
     #[tokio::test]
     async fn test_single_tx_produces_batch() {
         let mut scheduler = Scheduler::new_dag();
@@ -402,7 +404,7 @@ mod tests {
     // Closing the input channel with a pending tx causes the worker to flush it then exit.
     #[tokio::test]
     async fn worker_channel_closed_flushes_pending_and_exits() {
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(SEQ_CAP);
         let (batch_tx, mut batch_rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
 
@@ -410,6 +412,7 @@ mod tests {
         let to = Pubkey::new_unique();
         input_tx
             .send(create_test_sanitized_transaction(&from, &to, 100))
+            .await
             .unwrap();
         drop(input_tx); // close the channel with a pending tx
 
@@ -436,7 +439,7 @@ mod tests {
     // Cancelling the shutdown token stops the worker without deadlock or panic.
     #[tokio::test]
     async fn worker_shutdown_signal_exits_cleanly() {
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(SEQ_CAP);
         let (batch_tx, mut batch_rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
 
@@ -456,6 +459,7 @@ mod tests {
         let to = Pubkey::new_unique();
         input_tx
             .send(create_test_sanitized_transaction(&from, &to, 100))
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -470,7 +474,7 @@ mod tests {
     // The worker's non-blocking drain loop stops collecting once max_tx_per_batch is reached.
     #[tokio::test]
     async fn worker_collects_up_to_max_tx_per_batch() {
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(SEQ_CAP);
         let (batch_tx, mut batch_rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
         let max = 3usize;
@@ -483,6 +487,7 @@ mod tests {
             let to = Pubkey::new_unique();
             input_tx
                 .send(create_test_sanitized_transaction(&from, &to, 100))
+                .await
                 .unwrap();
         }
 

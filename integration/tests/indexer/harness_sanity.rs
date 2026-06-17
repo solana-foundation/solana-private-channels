@@ -30,6 +30,7 @@
 //! infrastructure and the operator did reach the HTTP boundary.
 
 use {
+    private_channel_indexer::storage::common::amount::TokenAmount,
     private_channel_indexer::storage::common::models::{
         DbMint, DbMintStatus, DbTransaction, TransactionStatus, TransactionType,
     },
@@ -55,7 +56,7 @@ fn pending_deposit_row(id: i64, mint: Pubkey, recipient: Pubkey) -> DbTransactio
         initiator: Pubkey::new_unique().to_string(),
         recipient: recipient.to_string(),
         mint: mint.to_string(),
-        amount: 1_000,
+        amount: TokenAmount(1_000),
         memo: None,
         transaction_type: TransactionType::Deposit,
         withdrawal_nonce: None,
@@ -68,6 +69,9 @@ fn pending_deposit_row(id: i64, mint: Pubkey, recipient: Pubkey) -> DbTransactio
         remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
+        instruction_index: 0,
+        landed_remint_signature: None,
     }
 }
 

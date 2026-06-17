@@ -11,6 +11,9 @@ pub enum TransactionError {
 
     #[error("Program execution failed: {0}")]
     Program(#[from] ProgramError),
+
+    #[error("Failed to persist release signature before broadcast: {reason}")]
+    PreSendPersistFailed { reason: String },
 }
 
 /// Errors from Solana program execution

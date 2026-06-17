@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::string::String;
 use codama::CodamaInstructions;
 use pinocchio::Address as Pubkey;
 
@@ -15,10 +16,11 @@ use pinocchio::Address as Pubkey;
 /// program per leg (`token_program_a` / `token_program_b`), enabling
 /// cross-program swaps (e.g. legacy-SPL ↔ Token-2022). Each token
 /// program account must match the owner of its leg's mint. Mints
-/// carrying amount-mutating Token-2022 extensions (ConfidentialTransfer,
-/// TransferFee, InterestBearing, ScaledUiAmount) are rejected at
-/// CreateDvp; later instructions do not re-check so that funds remain
-/// recoverable if a mint's extension parameters change post-Create.
+/// carrying amount-mutating Token-2022 extensions (TransferFee,
+/// InterestBearing, ScaledUiAmount) are
+/// rejected at CreateDvp; later instructions do not re-check so that
+/// funds remain recoverable if a mint's extension parameters change
+/// post-Create.
 ///
 /// TransferHook is supported: instructions that issue a `TransferChecked`
 /// CPI (Settle/Cancel/Reject/Reclaim) treat any accounts beyond their
@@ -31,6 +33,9 @@ use pinocchio::Address as Pubkey;
 /// expects.
 #[repr(C, u8)]
 #[derive(Clone, Debug, PartialEq, CodamaInstructions)]
+// IDL-only type: processors hand-parse instruction data and never
+// construct this enum, so the CreateDvp variant's size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub enum DvpSwapProgramInstruction {
     /// Permissionless. Creates the SwapDvp PDA and both escrow ATAs.
     /// No funding happens here; each leg is deposited by sending tokens
@@ -42,6 +47,11 @@ pub enum DvpSwapProgramInstruction {
         writable
     ))]
     #[codama(account(name = "swap_dvp", docs = "SwapDvp PDA to be created", writable))]
+    #[codama(account(
+        name = "nonce_tombstone",
+        docs = "Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse",
+        writable
+    ))]
     #[codama(account(
         name = "settlement_authority",
         docs = "Third-party authority allowed to settle/cancel; must not be executable so it can receive closed-account rent"
@@ -84,6 +94,18 @@ pub enum DvpSwapProgramInstruction {
         expiry_timestamp: i64,
         /// Disambiguates DvPs sharing all other seeds.
         nonce: u64,
+        /// Opaque client reference (e.g. an off-chain order ID), at most
+        /// `MAX_REF_STRING_LEN` (64) bytes. Stored zero-padded on the
+        /// SwapDvp (`None` stores all zeros); the program never reads it.
+        ref_string: Option<String>,
+        /// Wallet receiving user_a's settlement proceeds — the cash leg
+        /// (`mint_b`) — at its canonical ATA (e.g. a custodian deposit
+        /// wallet). Defaults to `user_a`. Settle-only: refunds always go
+        /// to the depositor.
+        user_a_settlement_destination: Option<Pubkey>,
+        /// Wallet receiving user_b's settlement proceeds — the asset leg
+        /// (`mint_a`). Defaults to `user_b`; same rules as above.
+        user_b_settlement_destination: Option<Pubkey>,
         /// If set, settlement is also rejected before this timestamp.
         earliest_settlement_timestamp: Option<i64>,
     } = 0,
@@ -118,6 +140,10 @@ pub enum DvpSwapProgramInstruction {
         name = "token_program",
         docs = "SPL Token or Token-2022 program; must own mint"
     ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used if signer_dest_ata requires a memo"
+    ))]
     ReclaimDvp {} = 1,
 
     /// Permissioned: signer must be `dvp.settlement_authority`. Atomic
@@ -149,23 +175,23 @@ pub enum DvpSwapProgramInstruction {
         writable
     ))]
     #[codama(account(
-        name = "user_a_ata_b",
-        docs = "user_a's ATA for mint_b; receives the cash leg",
+        name = "user_a_destination_ata_b",
+        docs = "user_a_settlement_destination's ATA for mint_b; receives the cash leg (destination defaults to user_a)",
         writable
     ))]
     #[codama(account(
-        name = "user_b_ata_a",
-        docs = "user_b's ATA for mint_a; receives the asset leg",
+        name = "user_b_destination_ata_a",
+        docs = "user_b_settlement_destination's ATA for mint_a; receives the asset leg (destination defaults to user_b)",
         writable
     ))]
     #[codama(account(
         name = "user_a_ata_a",
-        docs = "user_a's ATA for mint_a; receives any asset-leg surplus refund",
+        docs = "user_a's ATA for mint_a; receives any asset-leg surplus refund. Required and must be pre-initialized: anyone can dust the escrow, forcing a surplus refund, and a missing ATA reverts the whole Settle",
         writable
     ))]
     #[codama(account(
         name = "user_b_ata_b",
-        docs = "user_b's ATA for mint_b; receives any cash-leg surplus refund",
+        docs = "user_b's ATA for mint_b; receives any cash-leg surplus refund. Required and must be pre-initialized, same as user_a_ata_a",
         writable
     ))]
     #[codama(account(
@@ -175,6 +201,10 @@ pub enum DvpSwapProgramInstruction {
     #[codama(account(
         name = "token_program_b",
         docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used for destinations that require a memo"
     ))]
     SettleDvp {
         /// Splits the trailing remaining accounts between the two
@@ -229,6 +259,10 @@ pub enum DvpSwapProgramInstruction {
     #[codama(account(
         name = "token_program_b",
         docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used for destinations that require a memo"
     ))]
     CancelDvp {
         /// Splits the trailing remaining accounts between the two
@@ -285,6 +319,10 @@ pub enum DvpSwapProgramInstruction {
     #[codama(account(
         name = "token_program_b",
         docs = "SPL Token or Token-2022 program; must own mint_b"
+    ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used for destinations that require a memo"
     ))]
     RejectDvp {
         /// Splits the trailing remaining accounts between the two

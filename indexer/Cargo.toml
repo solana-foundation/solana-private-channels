@@ -44,6 +44,7 @@ sqlx = { workspace = true, features = [
     "runtime-tokio-rustls",
     "postgres",
     "chrono",
+    "bigdecimal",
 ] }
 spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
 tokio = { workspace = true, features = ["full"] }
@@ -52,6 +53,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 futures = { workspace = true }
 async-trait = "0.1"
+bigdecimal = "0.3"
 borsh = { workspace = true }
 const-crypto = { workspace = true }
 private-channel-core = { workspace = true }
@@ -59,6 +61,7 @@ private-channel-escrow-program-client = { workspace = true }
 private-channel-metrics = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-client = { version = "2.3.10" }
@@ -77,6 +80,7 @@ rustls = { workspace = true, optional = true }
 solana-keychain = { version = "0.1.0", features = ["all"] }
 
 [dev-dependencies]
+bigdecimal = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 spl-associated-token-account = { workspace = true }
 

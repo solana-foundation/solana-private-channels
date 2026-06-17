@@ -21,6 +21,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: generate-operator-keypair build-localnet build-devnet deploy-devnet
 .PHONY: profile obs-up obs-down obs-logs obs-devnet-up obs-devnet-down obs-devnet-logs
 .PHONY: install-buildkit-cache check-buildkit-cache
+.PHONY: check-env-local check-env-devnet
 .PHONY: docker-build docker-up docker-rebuild docker-restart docker-down docker-clean docker-logs docker-ps
 .PHONY: docker-devnet-build docker-devnet-up docker-devnet-rebuild docker-devnet-restart docker-devnet-down docker-devnet-clean docker-devnet-logs docker-devnet-ps
 
@@ -178,6 +179,8 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test test_sequencer_zero_deadline -- --nocapture
 	@cd integration && cargo test --test test_signatures_corruption_guard -- --nocapture
 	@cd integration && cargo test --test test_node_config_validation -- --nocapture
+	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
+	@cd integration && cargo test --test ingress_backpressure -- --nocapture
 	@cd integration && cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
@@ -191,6 +194,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
 	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
 	@cd integration && cargo test --test remint_recovery -- --nocapture
+	@cd integration && cargo test --test stuck_processing_recovery -- --nocapture
 	@cd integration && cargo test --test bootstrap_validation -- --nocapture
 	@cd integration && cargo test --test deposit_allowlist_e2e -- --nocapture
 	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
@@ -239,6 +243,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
 	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
 	@cd integration && cargo test --test remint_recovery -- --nocapture
+	@cd integration && cargo test --test stuck_processing_recovery -- --nocapture
 	@cd integration && cargo test --test bootstrap_validation -- --nocapture
 	@cd integration && cargo test --test deposit_allowlist_e2e -- --nocapture
 	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
@@ -522,8 +527,7 @@ check-buildkit-cache:
 #############
 # These targets save users from remembering the env-file chain on every invocation.
 # Load order: versions.env first (toolchain pins), then the env-specific overrides.
-# `.env.local` is the developer's machine config (gitignored — copy from .env.example
-# and fill in secrets); `.env.devnet` is the tracked devnet preset.
+# `.env.local` is a tracked template; fill in secrets locally and do not commit real values. `.env.devnet` is the tracked devnet preset.
 #
 # Override the env file chain by passing ENV_FILES_LOCAL / ENV_FILES_DEVNET on the
 # command line, e.g. `make docker-up ENV_FILES_LOCAL="--env-file versions.env --env-file .env.staging"`.
@@ -536,8 +540,20 @@ check-buildkit-cache:
 #     still run if Docker / BuildKit configuration is in a degraded state.
 COMPOSE_LOCAL    := docker-compose.yml
 COMPOSE_DEVNET   := docker-compose.devnet.yml
-ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local
-ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet
+# The gitignored `.env` is loaded last (later --env-file wins), so `make build-*`
+# writes live private keys there and the tracked templates stay secret-free.
+# $(wildcard) drops the flag when `.env` is absent; compose errors on missing files.
+ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local $(if $(wildcard .env),--env-file .env)
+ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet $(if $(wildcard .env),--env-file .env)
+
+# Fail closed before starting the stack if required secrets are blank. The
+# check script takes plain file paths, so pass the raw chain (no --env-file),
+# including the gitignored `.env` so it validates what compose actually resolves.
+check-env-local:
+	@./scripts/check-required-env.sh versions.env .env.local $(wildcard .env)
+
+check-env-devnet:
+	@./scripts/check-required-env.sh versions.env .env.devnet $(wildcard .env)
 
 # --- Local stack (local validator) ---
 
@@ -545,7 +561,7 @@ docker-build: check-docker check-buildkit-cache
 	@echo "Building all images ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) build
 
-docker-up: check-docker check-buildkit-cache
+docker-up: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
 
@@ -553,11 +569,11 @@ docker-up: check-docker check-buildkit-cache
 # on-chain state stays consistent with Postgres rows. Caveat: after changing
 # escrow/withdraw program code, run `make docker-clean` first or the validator
 # will keep running stale bytecode.
-docker-up-persist: check-docker check-buildkit-cache
+docker-up-persist: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack with validator persistence ($(COMPOSE_LOCAL))..."
 	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
 
-docker-rebuild: check-docker check-buildkit-cache
+docker-rebuild: check-env-local check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --build
 
@@ -585,11 +601,11 @@ docker-devnet-build: check-docker check-buildkit-cache
 	@echo "Building all images ($(COMPOSE_DEVNET))..."
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) build
 
-docker-devnet-up: check-docker check-buildkit-cache
+docker-devnet-up: check-env-devnet check-docker check-buildkit-cache
 	@echo "Starting devnet stack ($(COMPOSE_DEVNET))..."
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d
 
-docker-devnet-rebuild: check-docker check-buildkit-cache
+docker-devnet-rebuild: check-env-devnet check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting devnet stack ($(COMPOSE_DEVNET))..."
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --build
 

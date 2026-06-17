@@ -552,6 +552,12 @@
         "kind": "errorNode",
         "message": "Invalid transaction nonce for current tree index",
         "name": "invalidTransactionNonceForCurrentTreeIndex"
+      },
+      {
+        "code": 13,
+        "kind": "errorNode",
+        "message": "Unexpected current tree index for SMT root reset",
+        "name": "unexpectedTreeIndex"
       }
     ],
     "instructions": [
@@ -1612,6 +1618,15 @@
             "type": {
               "endian": "le",
               "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "expectedCurrentTreeIndex",
+            "type": {
+              "endian": "le",
+              "format": "u64",
               "kind": "numberTypeNode"
             }
           }

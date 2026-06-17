@@ -8,8 +8,9 @@
 //!
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 
+use bigdecimal::BigDecimal;
 use private_channel_indexer::{
-    storage::{PostgresDb, Storage},
+    storage::{common::amount::TokenAmount, PostgresDb, Storage},
     PostgresConfig,
 };
 use solana_sdk::pubkey::Pubkey;
@@ -77,7 +78,7 @@ async fn insert_transaction(
     pool: &PgPool,
     signature: &str,
     mint: &str,
-    amount: i64,
+    amount: u64,
     transaction_type: &str,
     status: &str,
     slot: i64,
@@ -91,7 +92,7 @@ async fn insert_transaction(
     .bind(signature)
     .bind(slot)
     .bind(mint)
-    .bind(amount)
+    .bind(TokenAmount(amount))
     .bind(transaction_type)
     .bind(status)
     .execute(pool)
@@ -200,13 +201,15 @@ async fn test_only_completed_transactions_counted() -> Result<(), Box<dyn std::e
 
     // Expected: completed deposits = 1,000,000 + 500,000 = 1,500,000
     assert_eq!(
-        balance.total_deposits, 1_500_000,
+        balance.total_deposits,
+        BigDecimal::from(1_500_000u64),
         "only completed deposits should be counted"
     );
 
     // Expected: completed withdrawals = 300,000
     assert_eq!(
-        balance.total_withdrawals, 300_000,
+        balance.total_withdrawals,
+        BigDecimal::from(300_000u64),
         "only completed withdrawals should be counted"
     );
 
@@ -308,18 +311,25 @@ async fn test_multiple_mints_aggregated_independently() -> Result<(), Box<dyn st
 
     // Verify mint1
     assert_eq!(
-        balance1.total_deposits, 3_000_000,
+        balance1.total_deposits,
+        BigDecimal::from(3_000_000u64),
         "mint1: 1M + 2M deposits"
     );
     assert_eq!(
-        balance1.total_withdrawals, 500_000,
+        balance1.total_withdrawals,
+        BigDecimal::from(500_000u64),
         "mint1: 500K withdrawals"
     );
 
     // Verify mint2
-    assert_eq!(balance2.total_deposits, 5_000_000, "mint2: 5M deposits");
     assert_eq!(
-        balance2.total_withdrawals, 1_500_000,
+        balance2.total_deposits,
+        BigDecimal::from(5_000_000u64),
+        "mint2: 5M deposits"
+    );
+    assert_eq!(
+        balance2.total_withdrawals,
+        BigDecimal::from(1_500_000u64),
         "mint2: 1M + 500K withdrawals"
     );
 
@@ -346,8 +356,16 @@ async fn test_mint_with_no_transactions() -> Result<(), Box<dyn std::error::Erro
     let balance = &balances[0];
     assert_eq!(balance.mint_address, mint);
     assert_eq!(balance.token_program, token_program);
-    assert_eq!(balance.total_deposits, 0, "no deposits");
-    assert_eq!(balance.total_withdrawals, 0, "no withdrawals");
+    assert_eq!(
+        balance.total_deposits,
+        BigDecimal::from(0u64),
+        "no deposits"
+    );
+    assert_eq!(
+        balance.total_withdrawals,
+        BigDecimal::from(0u64),
+        "no withdrawals"
+    );
 
     Ok(())
 }
@@ -380,8 +398,10 @@ async fn test_large_amounts() -> Result<(), Box<dyn std::error::Error>> {
     // Insert mint
     insert_mint(&pool, &mint, 6, &token_program).await?;
 
-    // Use large amounts close to i64::MAX / 4 to test overflow protection
-    let large_amount = i64::MAX / 4;
+    // Each deposit exceeds i64::MAX, so two of them gross-sum past i64::MAX while
+    // staying within u64 - the case BIGINT could not store and the ::BIGINT SUM
+    // cast would have overflowed. NUMERIC(20,0) must round-trip both exactly.
+    let large_amount: u64 = i64::MAX as u64 + 1;
 
     insert_transaction(
         &pool,
@@ -420,14 +440,16 @@ async fn test_large_amounts() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(balances.len(), 1, "expected one mint");
 
     let balance = &balances[0];
+    // Computed in BigDecimal because the gross deposit sum exceeds i64::MAX and
+    // 2 * large_amount would overflow u64 in plain arithmetic.
+    let expected_deposits = BigDecimal::from(large_amount) * BigDecimal::from(2u64);
     assert_eq!(
-        balance.total_deposits,
-        large_amount * 2,
-        "large deposits summed correctly"
+        balance.total_deposits, expected_deposits,
+        "large deposits summed correctly past i64::MAX"
     );
     assert_eq!(
         balance.total_withdrawals,
-        large_amount / 2,
+        BigDecimal::from(large_amount / 2),
         "large withdrawal counted correctly"
     );
 
@@ -547,11 +569,13 @@ async fn test_withdrawals_exceed_deposits() -> Result<(), Box<dyn std::error::Er
 
     let balance = &balances[0];
     assert_eq!(
-        balance.total_deposits, 500_000,
+        balance.total_deposits,
+        BigDecimal::from(500_000u64),
         "deposits counted correctly"
     );
     assert_eq!(
-        balance.total_withdrawals, 700_000,
+        balance.total_withdrawals,
+        BigDecimal::from(700_000u64),
         "withdrawals counted correctly"
     );
     // Net balance would be -200_000 (deposits - withdrawals), but we just store the raw totals

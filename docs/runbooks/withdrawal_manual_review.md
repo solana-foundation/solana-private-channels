@@ -43,6 +43,10 @@ have prefixes.
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `failed to persist pending remint:` | C - ambiguous (DB lost the sig) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
+| `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
+| `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
+| `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
+| `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
 
 ## Path A.halting - build error that halted the pipeline
 
@@ -85,7 +89,7 @@ collateral.
 4. **Re-arm sweep rows:**
    ```sql
    UPDATE transactions
-      SET status = 'pending', updated_at = NOW()
+      SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE transaction_type = 'withdrawal'
       AND status = 'manual_review'
       AND id <> :poison_id;
@@ -124,7 +128,7 @@ withdrawals are unaffected.
 3. **If the condition has cleared, re-arm just this row:**
    ```sql
    UPDATE transactions
-      SET status = 'pending', updated_at = NOW()
+      SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE id = :transaction_id;
    ```
 4. **No operator restart is needed.** The processor did not halt; the
@@ -194,7 +198,21 @@ release and the channel-side remint may have left partial state.
 ## Path C - ambiguous on-chain state
 
 The withdrawal *may* have landed; the operator could not verify before
-committing the row to manual review. Three sub-triggers; same recovery.
+committing the row to manual review. Sub-triggers below; same recovery.
+
+> **Recovery now verifies on-chain before demoting.** The crash-recovery
+> worker persists every broadcast release signature to
+> `pending_release_signatures` at send time and, for a stale `Processing`
+> withdrawal, classifies those signatures on-chain (the same finality check
+> the remint flow uses) *before* deciding. A finalized-success signature is
+> promoted to `Completed` (never re-sent); a dead/expired signature is
+> demoted to `Pending`; a still-live signature is left in `Processing` for
+> the next sweep. It only quarantines when it cannot prove the outcome:
+> either **no broadcast signatures were recorded** (`no broadcast signatures
+> recorded; cannot verify release landed`) or **the RPC could not classify
+> them** (`could not verify release landed (...)`, with the signature list
+> appended). Both land here in Path C — verify on-chain and act on the
+> verdict; never blindly re-arm a row whose release may already be on-chain.
 
 1. **Verify on-chain.** Run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). This is
@@ -216,6 +234,135 @@ committing the row to manual review. Three sub-triggers; same recovery.
    - Not burned → no user impact; close the alert and re-arm.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
+
+> **If the quarantined release actually landed** (verdict `LANDED`, but
+> the row was quarantined with `no broadcast signatures recorded; cannot
+> verify release landed` and never written `Completed`), the consumed
+> nonce is missing from the DB. The boot pre-flight normally reconciles
+> this from the durable release signature; only if it cannot will the
+> operator refuse to start. See
+> [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+> Marking the row `Completed` per Step 2 above re-records the nonce and
+> resolves any such refuse-to-start.
+
+## Path F - corrupt withdrawal row (missing nonce)
+
+`error_message`: `withdrawal row missing nonce`. The recovery worker
+found a stale `Processing` withdrawal whose `withdrawal_nonce` is
+`NULL`. The indexer always populates this column for withdrawal rows,
+so a NULL on this row indicates either a manual DB edit, a partial
+schema migration, or a defect in the indexer write path. **Do not
+re-arm.** The processor would reject the row identically on every tick.
+
+### Step 1 - confirm the corruption
+
+```sql
+SELECT id, signature, withdrawal_nonce, mint, amount, recipient,
+       created_at, updated_at
+  FROM transactions
+ WHERE id = :transaction_id;
+```
+
+If `withdrawal_nonce IS NOT NULL`, the row was repaired between
+quarantine and triage. Re-arm to `pending`:
+
+```sql
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+Otherwise proceed.
+
+### Step 2 - check whether the burn landed on the PrivateChannel side
+
+`signature` is the originating PrivateChannel burn signature.
+
+```bash
+solana confirm -v <signature> --url <private-channel-rpc>
+```
+
+### Step 3 - branch on burn verdict
+
+#### Burn landed
+
+The user already burned. Escalate (Tier 1) for refund coordination —
+either a manual `release_funds` to the depositor or a manual remint of
+the burned tokens. Then mark the row terminal:
+
+```sql
+UPDATE transactions SET status = 'failed', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+#### Burn did not land
+
+The indexer wrote a withdrawal row for an instruction that did not
+finalize. [Escalate](_escalation.md) (Tier 3) — the indexer
+write-or-classify path has a defect. Capture the row, then delete:
+
+```sql
+DELETE FROM transactions WHERE id = :transaction_id;
+```
+
+## Path G - requeue cap exhausted (release never landed)
+
+`error_message` contains `recovery requeues without progress`. Each
+recovery pass that finds the row's release signatures all
+finalized-failed or expired (`SigFinality::Dead`) demotes the stuck
+`processing` row back to `pending` for a fresh send. After
+`MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with no release ever
+landing, recovery quarantines instead of looping forever. So the
+release-funds transaction was rebroadcast 3 times and every attempt died
+on-chain or expired - none finalized. The row data is valid (distinct
+from Path A/F) and the signatures are conclusively Dead each cycle
+(distinct from Path C's ambiguity).
+
+### Step 1 - verify on-chain
+
+Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
+verdict: `NOT_LANDED` (every attempt died). If `LANDED` -> a landed
+signature was misclassified as Dead; switch to Path C reconciliation and
+[escalate](_escalation.md) (Tier 2) - the classifier has a defect.
+
+### Step 2 - find why every release died
+
+Pull the recorded release signatures (keyed by `transaction_id`) and read
+each on-chain failure:
+
+```sql
+SELECT signature, last_valid_block_height, created_at
+  FROM pending_release_signatures
+ WHERE transaction_id = :transaction_id
+ ORDER BY created_at;
+```
+
+For each, `solana confirm -v <signature> --url <solana-rpc-url>` to read
+the `InstructionError`. A repeating deterministic error (escrow
+underfunded, SMT/proof rejection, account state) means re-sending will not
+help - [escalate](_escalation.md) (Tier 2/3) to engineering. A transient
+cause (blockhash expiry under load, RPC outage during the send window)
+may already have cleared.
+
+### Step 3 - resolve, then re-arm
+
+Fix the root cause first. Then re-arm to `pending` **and reset the requeue
+counter** - re-arming without the reset re-quarantines the row on its next
+stall, since the counter is already at the cap:
+
+```sql
+UPDATE transactions
+   SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+If the release can never land (unrecoverable on-chain rejection), mark the
+row terminal and [escalate](_escalation.md) (Tier 1) for refund
+coordination:
+
+```sql
+UPDATE transactions SET status = 'failed', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
 
 ## Post-incident artifacts (required)
 

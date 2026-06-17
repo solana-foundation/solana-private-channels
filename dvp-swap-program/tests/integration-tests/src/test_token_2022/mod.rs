@@ -3,12 +3,12 @@
 //! Coverage:
 //! - **Positive lifecycle** on Token-2022 mints with each *allowed*
 //!   amount-preserving extension applied to one leg in isolation
-//!   (Pausable, PermanentDelegate, TransferHook, plain T22 with no
-//!   extensions). Both single-program-T22 and mixed (legacy ↔ T22)
-//!   topologies are exercised.
+//!   (Pausable, PermanentDelegate, TransferHook, ConfidentialTransfer,
+//!   plain T22 with no extensions). Both single-program-T22 and mixed
+//!   (legacy ↔ T22) topologies are exercised.
 //! - **CreateDvp negative** for every *blocked* extension on either leg
 //!   (TransferFeeConfig, InterestBearingConfig, ScaledUiAmount,
-//!   ConfidentialTransferMint).
+//!   NonTransferable).
 //! - **Owner mismatch**: legacy SPL mint paired with T22 token program.
 //! - **Post-Create extension activation**: a mint is swapped to a
 //!   blocked-extension layout *after* CreateDvp, and Settle/Reject must
@@ -18,20 +18,23 @@
 use dvp_swap_program_client::instructions::{
     CancelDvpBuilder, CreateDvpBuilder, ReclaimDvpBuilder, RejectDvpBuilder, SettleDvpBuilder,
 };
-use solana_sdk::signature::Signer;
+use solana_sdk::{account::Account, signature::Signer};
 
 use crate::{
     state_utils::{
-        assert_create_dvp, assert_fund_a, assert_fund_b, assert_reject_dvp, assert_settle_dvp,
-        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE,
+        assert_cancel_dvp, assert_create_dvp, assert_fund_a, assert_fund_a_amount, assert_fund_b,
+        assert_fund_b_amount, assert_reclaim_a, assert_reject_dvp, assert_settle_dvp,
+        setup_dvp_with_programs, AMOUNT_A, AMOUNT_B, INITIAL_BALANCE, REF_STRING,
     },
     utils::{
         assert_instruction_error, assert_program_error, get_token_balance, hook_extras_for_mint,
         set_mint_2022_with_confidential_transfer, set_mint_2022_with_interest_bearing,
-        set_mint_2022_with_pausable, set_mint_2022_with_permanent_delegate,
-        set_mint_2022_with_scaled_ui_amount, set_mint_2022_with_transfer_fee,
-        set_mint_2022_with_transfer_hook, set_token_2022_with_hook_account, setup_hook_mint,
-        TestContext, BLOCKED_MINT_EXTENSION, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
+        set_mint_2022_with_non_transferable, set_mint_2022_with_pausable,
+        set_mint_2022_with_permanent_delegate, set_mint_2022_with_scaled_ui_amount,
+        set_mint_2022_with_transfer_fee, set_mint_2022_with_transfer_hook,
+        set_token_2022_with_hook_account, set_token_2022_with_memo_required, setup_hook_mint,
+        TestContext, BLOCKED_MINT_EXTENSION, MEMO_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
+        TOKEN_PROGRAM_ID,
     },
 };
 
@@ -143,6 +146,35 @@ fn test_settle_with_pausable_on_mint_a() {
     assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), AMOUNT_A);
 }
 
+/// Allowed extension: ConfidentialTransfer on `mint_a`. The extension
+/// doesn't force confidential transfers, and the escrow can't be
+/// configured to receive one, so the public-transfer lifecycle settles
+/// normally.
+#[test]
+fn test_settle_with_confidential_transfer_on_mint_a() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    set_mint_2022_with_confidential_transfer(
+        &mut context,
+        &fixture.mint_a,
+        &fixture.settlement_authority.pubkey(),
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+    assert_settle_dvp(&mut context, &fixture);
+
+    assert_eq!(get_token_balance(&context, &fixture.user_a_ata_b), AMOUNT_B);
+    assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), AMOUNT_A);
+}
+
 /// Allowed at CreateDvp: TransferHook is *not* in the deny-list. The
 /// program forwards transfer-hook extras through every `TransferChecked`
 /// CPI (Settle/Cancel/Reject/Reclaim), so a hook-bearing mint can run
@@ -188,6 +220,7 @@ fn build_create_dvp_ix(
     CreateDvpBuilder::new()
         .payer(context.payer.pubkey())
         .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
         .mint_a(fixture.mint_a)
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
@@ -201,6 +234,7 @@ fn build_create_dvp_ix(
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction()
 }
 
@@ -288,8 +322,11 @@ fn test_create_rejects_scaled_ui_amount_on_mint_b() {
     assert_program_error(context.send(ix, &[]), BLOCKED_MINT_EXTENSION);
 }
 
+/// `NonTransferable` permanently blocks transfers out of any escrow, so
+/// a balance reaching it could never be settled, refunded, or reclaimed.
+/// Create must reject the mint up front.
 #[test]
-fn test_create_rejects_confidential_transfer_on_mint_a() {
+fn test_create_rejects_non_transferable_on_mint_a() {
     let mut context = TestContext::new();
     let fixture = setup_dvp_with_programs(
         &mut context,
@@ -298,11 +335,7 @@ fn test_create_rejects_confidential_transfer_on_mint_a() {
         TOKEN_2022_PROGRAM_ID,
     );
 
-    set_mint_2022_with_confidential_transfer(
-        &mut context,
-        &fixture.mint_a,
-        &fixture.settlement_authority.pubkey(),
-    );
+    set_mint_2022_with_non_transferable(&mut context, &fixture.mint_a);
 
     let ix = build_create_dvp_ix(&context, &fixture);
     assert_program_error(context.send(ix, &[]), BLOCKED_MINT_EXTENSION);
@@ -507,12 +540,13 @@ fn test_settle_with_hook_on_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(leg_a_extras.len() as u8)
         .add_remaining_accounts(&leg_a_extras)
         .instruction();
@@ -554,6 +588,7 @@ fn test_cancel_with_hook_on_mint_a() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(leg_a_extras.len() as u8)
         .add_remaining_accounts(&leg_a_extras)
         .instruction();
@@ -603,6 +638,7 @@ fn test_reject_with_hook_on_mint_a() {
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(leg_a_extras.len() as u8)
         .add_remaining_accounts(&leg_a_extras)
         .instruction();
@@ -637,6 +673,7 @@ fn test_reclaim_with_hook_on_mint_a() {
         .dvp_source_ata(fixture.dvp_ata_a)
         .signer_dest_ata(fixture.user_a_ata_a)
         .token_program(fixture.token_program_a)
+        .memo_program(MEMO_PROGRAM_ID)
         .add_remaining_accounts(&leg_a_extras)
         .instruction();
     let meta = context
@@ -699,12 +736,13 @@ fn test_settle_with_hook_and_surplus_on_mint_a() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(leg_a_extras.len() as u8)
         .add_remaining_accounts(&leg_a_extras)
         .instruction();
@@ -795,12 +833,13 @@ fn test_settle_with_hooks_on_both_legs() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(leg_a_extras.len() as u8)
         .add_remaining_accounts(&remaining)
         .instruction();
@@ -839,14 +878,263 @@ fn test_settle_rejects_extras_count_overrun() {
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)
         .token_program_b(fixture.token_program_b)
+        .memo_program(MEMO_PROGRAM_ID)
         .leg_a_extras_count(5)
         .instruction();
     let result = context.send(ix, &[&fixture.settlement_authority]);
     assert_instruction_error(result, "InvalidInstructionData");
+}
+
+// Closed-mint recovery: a closed leg mint must not block refunding the
+// other leg.
+
+/// Overwrite `mint` as an empty System-owned account (a closed mint).
+fn close_mint(context: &mut TestContext, mint: &solana_sdk::pubkey::Pubkey) {
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1,
+                data: vec![],
+                owner: solana_sdk::system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+}
+
+/// leg A unfunded with its mint closed, leg B funded; Cancel refunds B.
+#[test]
+fn test_cancel_recovers_funded_leg_when_other_legs_mint_closed() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    close_mint(&mut context, &fixture.mint_a);
+
+    // Past expiry, so Reclaim is no longer an option.
+    let advance = fixture.expiry - context.now() + 1;
+    context.advance_clock(advance);
+
+    assert_cancel_dvp(&mut context, &fixture);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_b_ata_b),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_a).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_b).is_none());
+}
+
+/// A memo-required refund destination must not block Cancel. Both legs
+/// funded; user_a's refund ATA requires an incoming memo. Cancel must
+/// still refund both legs.
+#[test]
+fn test_cancel_with_memo_required_destination() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_a_ata_a,
+        &fixture.mint_a,
+        &fixture.user_a.pubkey(),
+        INITIAL_BALANCE - AMOUNT_A,
+    );
+
+    assert_cancel_dvp(&mut context, &fixture);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE
+    );
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_b_ata_b),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+}
+
+/// A memo-required refund destination must not block Reject.
+#[test]
+fn test_reject_with_memo_required_destination() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+    assert_fund_b(&mut context, &fixture);
+
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_a_ata_a,
+        &fixture.mint_a,
+        &fixture.user_a.pubkey(),
+        INITIAL_BALANCE - AMOUNT_A,
+    );
+
+    assert_reject_dvp(&mut context, &fixture, &fixture.user_a);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE
+    );
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_b_ata_b),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+}
+
+/// A memo-required destination must not block Reclaim.
+#[test]
+fn test_reclaim_with_memo_required_destination() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_a_ata_a,
+        &fixture.mint_a,
+        &fixture.user_a.pubkey(),
+        INITIAL_BALANCE - AMOUNT_A,
+    );
+
+    assert_reclaim_a(&mut context, &fixture);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE
+    );
+}
+
+/// Every Settle destination (both deliveries and both surplus refunds)
+/// requires a memo; Settle must emit one before each transfer.
+#[test]
+fn test_settle_with_memo_required_destinations() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    let surplus_a: u64 = 5_000;
+    let surplus_b: u64 = 3_000;
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a_amount(&mut context, &fixture, AMOUNT_A + surplus_a);
+    assert_fund_b_amount(&mut context, &fixture, AMOUNT_B + surplus_b);
+
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_a_ata_b,
+        &fixture.mint_b,
+        &fixture.user_a.pubkey(),
+        0,
+    );
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_b_ata_a,
+        &fixture.mint_a,
+        &fixture.user_b.pubkey(),
+        0,
+    );
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_a_ata_a,
+        &fixture.mint_a,
+        &fixture.user_a.pubkey(),
+        INITIAL_BALANCE - AMOUNT_A - surplus_a,
+    );
+    set_token_2022_with_memo_required(
+        &mut context,
+        &fixture.user_b_ata_b,
+        &fixture.mint_b,
+        &fixture.user_b.pubkey(),
+        INITIAL_BALANCE - AMOUNT_B - surplus_b,
+    );
+
+    assert_settle_dvp(&mut context, &fixture);
+
+    assert_eq!(get_token_balance(&context, &fixture.user_a_ata_b), AMOUNT_B);
+    assert_eq!(get_token_balance(&context, &fixture.user_b_ata_a), AMOUNT_A);
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE - AMOUNT_A
+    );
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_b_ata_b),
+        INITIAL_BALANCE - AMOUNT_B
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+}
+
+/// Symmetric: leg B unfunded with its mint closed, leg A funded; Reject refunds A.
+#[test]
+fn test_reject_recovers_funded_leg_when_other_legs_mint_closed() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp_with_programs(
+        &mut context,
+        0,
+        TOKEN_2022_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
+    );
+
+    assert_create_dvp(&mut context, &fixture);
+    assert_fund_a(&mut context, &fixture);
+
+    close_mint(&mut context, &fixture.mint_b);
+
+    let advance = fixture.expiry - context.now() + 1;
+    context.advance_clock(advance);
+
+    assert_reject_dvp(&mut context, &fixture, &fixture.user_a);
+
+    assert_eq!(
+        get_token_balance(&context, &fixture.user_a_ata_a),
+        INITIAL_BALANCE
+    );
+    assert!(context.get_account(&fixture.swap_dvp).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_a).is_none());
+    assert!(context.get_account(&fixture.dvp_ata_b).is_none());
 }

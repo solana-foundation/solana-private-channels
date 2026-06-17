@@ -47,6 +47,29 @@ struct SettleResult {
     account_settlements: Vec<(Pubkey, AccountSettlement)>,
 }
 
+#[derive(Debug)]
+enum SettleError {
+    AddressIndexWriterGone,
+    Other(String),
+}
+
+impl std::fmt::Display for SettleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AddressIndexWriterGone => f.write_str("address_signatures writer dropped"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+impl std::error::Error for SettleError {}
+
+impl From<String> for SettleError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
 #[derive(Clone)]
 struct LastBlock {
     slot: u64,
@@ -114,7 +137,7 @@ pub async fn warm_redis_cache(
 }
 
 pub struct SettleArgs {
-    pub execution_results_rx: mpsc::UnboundedReceiver<(
+    pub execution_results_rx: mpsc::Receiver<(
         LoadAndExecuteSanitizedTransactionsOutput,
         Vec<SanitizedTransaction>,
     )>,
@@ -146,7 +169,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
         async fn run_settle_worker(
-            mut execution_results_rx: mpsc::UnboundedReceiver<(
+            mut execution_results_rx: mpsc::Receiver<(
                 LoadAndExecuteSanitizedTransactionsOutput,
                 Vec<SanitizedTransaction>,
             )>,
@@ -309,8 +332,13 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     break;
                                 }
                             }
-                            Err(_) => {
-                                error!("Failed to settle transactions");
+                            Err(SettleError::AddressIndexWriterGone) => {
+                                anyhow::bail!(
+                                    "address_signatures writer dropped, aborting settler"
+                                );
+                            }
+                            Err(SettleError::Other(msg)) => {
+                                error!("Failed to settle transactions: {}", msg);
                                 break;
                             }
                         }
@@ -432,7 +460,7 @@ async fn settle_transactions(
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
     metrics: &crate::stage_metrics::SharedMetrics,
     address_signatures_tx: Option<&mpsc::Sender<Vec<AddressSignatureRow>>>,
-) -> Result<SettleResult, Box<dyn std::error::Error>> {
+) -> Result<SettleResult, SettleError> {
     let t_total = tokio::time::Instant::now();
     // Preallocate per-tick collections from the known result count so the hot
     // path doesn't pay the geometric-growth realloc tax on every tick. The 4×
@@ -563,16 +591,7 @@ async fn settle_transactions(
         .await?;
     let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Send-after-commit: address_signatures rows are durable in
-    // `transactions` already; the index writer fills in the read view with
-    // an eventually-consistent gap of <1 writer-flush interval. .send().await
-    // applies backpressure when the bounded channel fills.
-    //
-    // A closed channel (writer task exited) is logged and tolerated: the
-    // atomic commit has already succeeded, so the only consequence is that
-    // `address_signatures` is missing this tick's entries. That's the same
-    // eventually-consistent contract `getSignaturesForAddress` already
-    // tolerates — not a reason to tear down the settler.
+    // Closed channel = writer gone; escalate to exit.
     if let Some(tx) = address_signatures_tx {
         if !addr_sig_rows.is_empty() {
             let send_t0 = tokio::time::Instant::now();
@@ -583,9 +602,7 @@ async fn settle_transactions(
                     );
                 }
                 Err(_) => {
-                    warn!(
-                        "address_signatures writer dropped; index entries for this tick will not be written"
-                    );
+                    return Err(SettleError::AddressIndexWriterGone);
                 }
             }
         }
@@ -652,6 +669,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
 
     fn make_executed(
         accounts: Vec<(solana_sdk::pubkey::Pubkey, AccountSharedData)>,
@@ -859,6 +878,63 @@ mod tests {
         assert!(block.transaction_signatures.contains(&sig));
         // But no account settlements
         assert!(result.account_settlements.is_empty());
+    }
+
+    /// Under the lamport cap, the executor zeroes a dataless gainer (e.g. the
+    /// synthetic fee payer) and floors a data account to its 1-lamport existence
+    /// floor. The settler must turn a capped dataless account (0 lamports, empty
+    /// data) into a `deleted` tombstone while persisting a capped data account.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_settle_capped_dataless_deleted_data_persisted() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+
+        // A capped dataless account (the zeroed synthetic payer) and a capped
+        // data account floored at its 1-lamport existence floor, both writable.
+        let dataless = from.pubkey();
+        let data_pk = Pubkey::new_unique();
+        let data_acct = AccountSharedData::new(1, 8, &spl_token::id());
+        let processed = make_executed(vec![
+            (dataless, AccountSharedData::default()),
+            (data_pk, data_acct),
+        ]);
+        let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
+
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Dataless (0 lamports, empty data) → deleted tombstone.
+        let dataless_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == dataless)
+            .expect("dataless account must be emitted as a settlement");
+        assert!(
+            dataless_settlement.1.deleted,
+            "capped dataless account must settle as deleted"
+        );
+
+        // Data account at the 1-lamport floor → persists, not deleted.
+        let data_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == data_pk)
+            .expect("data account must be emitted as a settlement");
+        assert!(
+            !data_settlement.1.deleted,
+            "capped data account at the 1-lamport floor must persist"
+        );
+        assert_eq!(data_settlement.1.account.lamports(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1101,7 +1177,7 @@ mod tests {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (_exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1132,7 +1208,7 @@ mod tests {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1165,7 +1241,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).unwrap();
+        exec_tx.send((output, vec![tx])).await.unwrap();
 
         // Wait for the blocktime tick to process and emit settlements
         let settlements =
@@ -1187,7 +1263,7 @@ mod tests {
         let (_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1556,7 +1632,7 @@ mod tests {
         let (_db, pg_container) = start_test_postgres().await;
         let url = postgres_container_url(&pg_container, "test_db").await;
 
-        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (_settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (_settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -1591,7 +1667,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx])).unwrap();
+        exec_tx.send((output, vec![tx])).await.unwrap();
 
         // Poll for perf sample with deadline instead of fixed sleep.
         // Perf tick fires after ~1s; poll every 100ms for up to 5s.
@@ -1609,5 +1685,58 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         shutdown.cancel();
+    }
+
+    /// Writer-dropped must exit settler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_aborts_when_address_index_writer_dropped() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, address_signatures_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+
+        let handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms: 50,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // Simulate the writer task exiting.
+        drop(address_signatures_rx);
+
+        // Tick triggers send-Err.
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let pk = Pubkey::new_unique();
+        let executed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(executed)],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        exec_tx.send((output, vec![tx])).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(
+            result.is_ok(),
+            "settle worker must exit when address-index writer is gone"
+        );
     }
 }

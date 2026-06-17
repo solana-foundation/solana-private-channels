@@ -6,6 +6,8 @@ mod transaction;
 pub mod types;
 
 pub use mint::{find_existing_mint_signature, find_existing_mint_signature_with_memo, JitOutcome};
+pub(crate) use remint::{classify_release_signatures, SigFinality};
+pub(crate) use state::validate_smt_root;
 pub use types::TransactionStatusUpdate;
 
 #[cfg(any(test, feature = "test-mock-storage"))]

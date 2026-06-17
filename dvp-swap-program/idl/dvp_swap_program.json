@@ -52,6 +52,20 @@
             },
             {
               "kind": "structFieldTypeNode",
+              "name": "tokenProgramA",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "tokenProgramB",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
               "name": "amountA",
               "type": {
                 "endian": "le",
@@ -84,6 +98,36 @@
                 "endian": "le",
                 "format": "u64",
                 "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "refString",
+              "type": {
+                "count": {
+                  "kind": "fixedCountNode",
+                  "value": 64
+                },
+                "item": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                },
+                "kind": "arrayTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "userASettlementDestination",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "userBSettlementDestination",
+              "type": {
+                "kind": "publicKeyTypeNode"
               }
             },
             {
@@ -189,6 +233,24 @@
         "kind": "errorNode",
         "message": "settlement_authority must not be executable",
         "name": "settlementAuthorityExecutable"
+      },
+      {
+        "code": 13,
+        "kind": "errorNode",
+        "message": "nonce already used for these DvP seeds",
+        "name": "nonceAlreadyUsed"
+      },
+      {
+        "code": 14,
+        "kind": "errorNode",
+        "message": "DvP expiry is too far in the future",
+        "name": "expiryTooFarInFuture"
+      },
+      {
+        "code": 15,
+        "kind": "errorNode",
+        "message": "ref string exceeds the maximum byte length",
+        "name": "refStringTooLong"
       }
     ],
     "instructions": [
@@ -211,6 +273,15 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "swapDvp"
+          },
+          {
+            "docs": [
+              "Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "nonceTombstone"
           },
           {
             "docs": [
@@ -361,6 +432,60 @@
           },
           {
             "kind": "instructionArgumentNode",
+            "name": "refString",
+            "type": {
+              "item": {
+                "kind": "sizePrefixTypeNode",
+                "prefix": {
+                  "endian": "le",
+                  "format": "u32",
+                  "kind": "numberTypeNode"
+                },
+                "type": {
+                  "encoding": "utf8",
+                  "kind": "stringTypeNode"
+                }
+              },
+              "kind": "optionTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "userASettlementDestination",
+            "type": {
+              "item": {
+                "kind": "publicKeyTypeNode"
+              },
+              "kind": "optionTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "userBSettlementDestination",
+            "type": {
+              "item": {
+                "kind": "publicKeyTypeNode"
+              },
+              "kind": "optionTypeNode",
+              "prefix": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
             "name": "earliestSettlementTimestamp",
             "type": {
               "item": {
@@ -442,6 +567,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgram"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used if signer_dest_ata requires a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -528,25 +662,25 @@
           },
           {
             "docs": [
-              "user_a's ATA for mint_b; receives the cash leg"
+              "user_a_settlement_destination's ATA for mint_b; receives the cash leg (destination defaults to user_a)"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "userAAtaB"
+            "name": "userADestinationAtaB"
           },
           {
             "docs": [
-              "user_b's ATA for mint_a; receives the asset leg"
+              "user_b_settlement_destination's ATA for mint_a; receives the asset leg (destination defaults to user_b)"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "userBAtaA"
+            "name": "userBDestinationAtaA"
           },
           {
             "docs": [
-              "user_a's ATA for mint_a; receives any asset-leg surplus refund"
+              "user_a's ATA for mint_a; receives any asset-leg surplus refund. Required and must be pre-initialized: anyone can dust the escrow, forcing a surplus refund, and a missing ATA reverts the whole Settle"
             ],
             "isSigner": false,
             "isWritable": true,
@@ -555,7 +689,7 @@
           },
           {
             "docs": [
-              "user_b's ATA for mint_b; receives any cash-leg surplus refund"
+              "user_b's ATA for mint_b; receives any cash-leg surplus refund. Required and must be pre-initialized, same as user_a_ata_a"
             ],
             "isSigner": false,
             "isWritable": true,
@@ -579,6 +713,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -707,6 +850,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [
@@ -835,6 +987,15 @@
             "isWritable": false,
             "kind": "instructionAccountNode",
             "name": "tokenProgramB"
+          },
+          {
+            "docs": [
+              "SPL Memo program; only used for destinations that require a memo"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "memoProgram"
           }
         ],
         "arguments": [

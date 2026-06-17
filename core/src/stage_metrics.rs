@@ -3,6 +3,9 @@ use tracing::debug;
 
 /// Instrumentation trait — each stage calls into this; no pipeline logic changes.
 pub trait StageMetrics: Send + Sync {
+    // RPC ingress
+    fn rpc_ingress_shed(&self);
+
     // Dedup
     fn dedup_received(&self);
     fn dedup_forwarded(&self);
@@ -21,6 +24,7 @@ pub trait StageMetrics: Send + Sync {
     fn executor_results_sent(&self, tx_count: usize);
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
+    fn executor_dropped_expired_blockhash(&self, count: usize);
 
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
@@ -51,6 +55,9 @@ pub type SharedMetrics = Arc<dyn StageMetrics>;
 pub struct NoopMetrics;
 
 impl StageMetrics for NoopMetrics {
+    fn rpc_ingress_shed(&self) {
+        debug!("rpc: ingress shed");
+    }
     fn dedup_received(&self) {
         debug!("dedup: received");
     }
@@ -83,6 +90,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_missing_results(&self, kind: &'static str) {
         debug!("executor: missing results kind={}", kind);
+    }
+    fn executor_dropped_expired_blockhash(&self, count: usize) {
+        debug!("executor: dropped {} expired blockhash txs", count);
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -132,6 +142,12 @@ impl StageMetrics for NoopMetrics {
 use private_channel_metrics::{counter_vec, gauge_vec, init_metrics};
 
 // Counters
+counter_vec!(
+    RPC_INGRESS_SHED,
+    "private_channel_rpc_ingress_shed_total",
+    "Transactions shed at RPC ingress because the dedup queue was full",
+    &[]
+);
 counter_vec!(
     DEDUP_RECEIVED,
     "private_channel_dedup_received_total",
@@ -197,6 +213,12 @@ counter_vec!(
     "private_channel_executor_missing_results_total",
     "Missing execution results",
     &["kind"]
+);
+counter_vec!(
+    EXECUTOR_DROPPED_EXPIRED_BH,
+    "private_channel_executor_dropped_expired_bh_total",
+    "Transactions dropped at execution due to expired blockhash",
+    &[]
 );
 counter_vec!(
     SETTLER_TXS_SETTLED,
@@ -288,6 +310,9 @@ histogram_vec!(
 pub struct PrometheusMetrics;
 
 impl StageMetrics for PrometheusMetrics {
+    fn rpc_ingress_shed(&self) {
+        RPC_INGRESS_SHED.with_label_values(&[] as &[&str]).inc();
+    }
     fn dedup_received(&self) {
         DEDUP_RECEIVED.with_label_values(&[] as &[&str]).inc();
     }
@@ -328,6 +353,11 @@ impl StageMetrics for PrometheusMetrics {
     }
     fn executor_missing_results(&self, kind: &'static str) {
         EXECUTOR_MISSING_RESULTS.with_label_values(&[kind]).inc();
+    }
+    fn executor_dropped_expired_blockhash(&self, count: usize) {
+        EXECUTOR_DROPPED_EXPIRED_BH
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
@@ -397,6 +427,7 @@ impl StageMetrics for PrometheusMetrics {
 /// Force-initialise all metric statics so they appear in /metrics from startup.
 pub fn init_prometheus_metrics() {
     init_metrics!(
+        RPC_INGRESS_SHED,
         DEDUP_RECEIVED,
         DEDUP_FORWARDED,
         DEDUP_DROPPED_DUP,
@@ -408,6 +439,7 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_RESULTS_SENT,
         EXECUTOR_RESULTS_SEND_FAILED,
         EXECUTOR_MISSING_RESULTS,
+        EXECUTOR_DROPPED_EXPIRED_BH,
         SETTLER_TXS_SETTLED,
         // Executor latency histograms
         EXECUTOR_BATCH_DURATION,

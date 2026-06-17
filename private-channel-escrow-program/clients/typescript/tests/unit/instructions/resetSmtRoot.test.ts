@@ -19,6 +19,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             const decodedData = getResetSmtRootInstructionDataCodec().decode(instruction.data);
@@ -28,7 +29,7 @@ describe('resetSmtRoot', () => {
             expect(decodedData.discriminator).toBe(8);
         });
 
-        it('should have no additional parameters beyond discriminator', async () => {
+        it('should encode discriminator and expectedCurrentTreeIndex', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
 
@@ -36,13 +37,15 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             const decodedData = getResetSmtRootInstructionDataCodec().decode(instruction.data);
 
-            // ResetSmtRoot instruction should only have discriminator field
-            expect(Object.keys(decodedData)).toEqual(['discriminator']);
+            // ResetSmtRoot carries the discriminator plus the expected tree index
+            expect(Object.keys(decodedData)).toEqual(['discriminator', 'expectedCurrentTreeIndex']);
             expect(typeof decodedData.discriminator).toBe('number');
+            expect(decodedData.expectedCurrentTreeIndex).toBe(0n);
         });
 
         it('should decode instruction data correctly', async () => {
@@ -53,6 +56,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             // Decode the instruction data
@@ -63,7 +67,7 @@ describe('resetSmtRoot', () => {
             expect(typeof decodedData.discriminator).toBe('number');
 
             // Re-encode and verify it matches
-            const reEncodedData = getResetSmtRootInstructionDataCodec().encode({});
+            const reEncodedData = getResetSmtRootInstructionDataCodec().encode({ expectedCurrentTreeIndex: 0n });
             expect(reEncodedData).toEqual(instruction.data);
         });
     });
@@ -77,6 +81,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             // Based on program instruction definition, ResetSmtRoot should have 6 accounts
@@ -115,6 +120,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             // Account 0: payer - should be WritableSigner
@@ -150,6 +156,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             // Verify the instruction uses the correct program address
@@ -182,6 +189,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
                 // Not providing operatorPda - should be auto-derived
             });
 
@@ -197,6 +205,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
                 // Not providing eventAuthority or privateChannelEscrowProgram - should use defaults
             });
 
@@ -222,6 +231,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
                 operatorPda: overriddenOperatorPda,
                 eventAuthority: overriddenEventAuthority,
                 privateChannelEscrowProgram: overriddenPrivateChannelEscrowProgram,
@@ -243,6 +253,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             // Verify operator account is a signer
@@ -266,6 +277,7 @@ describe('resetSmtRoot', () => {
                     payer,
                     operator,
                     instance: TEST_ADDRESSES.INSTANCE,
+                    expectedCurrentTreeIndex: 0n,
                 });
 
                 // Verify operator account uses the correct address
@@ -295,6 +307,7 @@ describe('resetSmtRoot', () => {
                     payer,
                     operator,
                     instance: TEST_ADDRESSES.INSTANCE,
+                    expectedCurrentTreeIndex: 0n,
                 });
 
                 // Verify operatorPda is derived correctly for this operator
@@ -321,6 +334,7 @@ describe('resetSmtRoot', () => {
                     payer,
                     operator,
                     instance: instanceAddress,
+                    expectedCurrentTreeIndex: 0n,
                 });
 
                 // Verify instance account uses the correct address
@@ -338,6 +352,7 @@ describe('resetSmtRoot', () => {
                 payer,
                 operator,
                 instance: TEST_ADDRESSES.INSTANCE,
+                expectedCurrentTreeIndex: 0n,
             });
 
             // Verify account ordering is consistent
@@ -367,6 +382,7 @@ describe('resetSmtRoot', () => {
                     payer,
                     operator,
                     instance: TEST_ADDRESSES.INSTANCE,
+                    expectedCurrentTreeIndex: 0n,
                 });
 
                 // Verify payer account uses the correct address

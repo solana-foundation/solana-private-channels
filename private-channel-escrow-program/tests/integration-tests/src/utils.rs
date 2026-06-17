@@ -55,6 +55,8 @@ pub const TRANSFER_HOOK_NOT_ALLOWED_ERROR: u32 =
     PrivateChannelEscrowProgramError::TransferHookNotAllowed as u32;
 pub const INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR: u32 =
     PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex as u32;
+pub const UNEXPECTED_TREE_INDEX_ERROR: u32 =
+    PrivateChannelEscrowProgramError::UnexpectedTreeIndex as u32;
 
 // Standard Solana Program Error Codes
 pub const INVALID_ARGUMENT_ERROR: u32 = 5; // ProgramError::InvalidArgument

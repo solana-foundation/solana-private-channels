@@ -60,6 +60,13 @@ gauge_vec!(
     &["program_type"]
 );
 
+gauge_vec!(
+    INDEXER_CHECKPOINT_FRONTIER_LAG,
+    "private_channel_indexer_checkpoint_frontier_lag",
+    "Slots between the backfill target tip and the contiguous checkpoint frontier while gated (0 when ungated or after handoff)",
+    &["program_type"]
+);
+
 counter_vec!(
     INDEXER_DATASOURCE_RECONNECTS,
     "private_channel_indexer_datasource_reconnects_total",
@@ -156,6 +163,17 @@ counter_vec!(
     &["program_type", "task"]
 );
 
+// Recovery worker outcome: a stuck-`Processing` row was healed by the
+// stuck-row recovery worker.  `outcome` ∈ {completed, requeued, quarantined};
+// `type` ∈ {deposit, withdrawal}.  All values 0 in steady state — any
+// sustained nonzero is concrete evidence of operator crash-window activity.
+counter_vec!(
+    OPERATOR_STALE_PROCESSING_RECOVERED,
+    "private_channel_operator_stale_processing_recovered_total",
+    "Stale Processing rows healed by the recovery worker",
+    &["program_type", "outcome", "type"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -166,6 +184,7 @@ pub fn init_labels(program_type: &str) {
     INDEXER_CURRENT_SLOT.with_label_values(&[program_type]);
     INDEXER_CHAIN_TIP_SLOT.with_label_values(&[program_type]);
     INDEXER_BACKFILL_SLOTS_REMAINING.with_label_values(&[program_type]);
+    INDEXER_CHECKPOINT_FRONTIER_LAG.with_label_values(&[program_type]);
     INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
 
     for error_type in &["stream", "get_slots", "get_block"] {
@@ -216,8 +235,21 @@ pub fn init_labels(program_type: &str) {
         "storage_writer",
         "reconciliation",
         "feepayer_monitor",
+        "recovery",
     ] {
         OPERATOR_TASK_EXIT.with_label_values(&[program_type, task]);
+    }
+
+    // Pre-register every (outcome, type) combination so dashboards see the
+    // full label space immediately rather than only after the first hit.
+    for outcome in &["completed", "requeued", "quarantined"] {
+        for txn_type in &["deposit", "withdrawal"] {
+            OPERATOR_STALE_PROCESSING_RECOVERED.with_label_values(&[
+                program_type,
+                outcome,
+                txn_type,
+            ]);
+        }
     }
 }
 
@@ -231,6 +263,7 @@ pub fn init() {
         INDEXER_RPC_ERRORS,
         INDEXER_CHAIN_TIP_SLOT,
         INDEXER_BACKFILL_SLOTS_REMAINING,
+        INDEXER_CHECKPOINT_FRONTIER_LAG,
         INDEXER_DATASOURCE_RECONNECTS,
         INDEXER_SLOT_PROCESSING_DURATION,
         OPERATOR_TRANSACTIONS_FETCHED,
@@ -243,6 +276,7 @@ pub fn init() {
         FEEPAYER_BALANCE_LAMPORTS,
         OPERATOR_TRANSACTION_QUARANTINED,
         OPERATOR_TASK_EXIT,
+        OPERATOR_STALE_PROCESSING_RECOVERED,
     );
 }
 
@@ -285,6 +319,7 @@ mod tests {
             "private_channel_indexer_current_slot",
             "private_channel_indexer_chain_tip_slot",
             "private_channel_indexer_backfill_slots_remaining",
+            "private_channel_indexer_checkpoint_frontier_lag",
             "private_channel_indexer_slot_processing_duration_seconds",
             "private_channel_operator_transactions_fetched_total",
             "private_channel_operator_db_update_errors_total",
@@ -317,6 +352,7 @@ mod tests {
             "private_channel_indexer_rpc_errors_total",
             "private_channel_indexer_chain_tip_slot",
             "private_channel_indexer_backfill_slots_remaining",
+            "private_channel_indexer_checkpoint_frontier_lag",
             "private_channel_indexer_datasource_reconnects_total",
             "private_channel_indexer_slot_processing_duration_seconds",
             "private_channel_operator_transactions_fetched_total",
@@ -329,6 +365,7 @@ mod tests {
             "private_channel_feepayer_balance_lamports",
             "private_channel_operator_transaction_quarantined_total",
             "private_channel_operator_task_exit_total",
+            "private_channel_operator_stale_processing_recovered_total",
         ];
 
         let families = prometheus::gather();

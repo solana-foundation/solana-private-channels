@@ -282,7 +282,7 @@ fn drill_1_error_message_contracts_present_in_source() {
             "private_channel:mint-idempotency:",
             "indexer/src/operator/constants.rs",
         ),
-        // Deposit — processor-side allowlist gate (Path E). The runbook
+        // Deposit — processor-side allowlist gate (Path F). The runbook
         // dispatches on the user-visible portion of
         // `OperatorError::MintNotAllowed`'s `#[error(...)]` template; if
         // that string is refactored, the triage table desyncs silently.
@@ -1064,9 +1064,9 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
     Ok(())
 }
 
-// ── Drill 15: deposit_manual_review.md § Path E recovery flows ─────────────
+// ── Drill 17: deposit_manual_review.md § Path F recovery flows ─────────────
 //
-// `deposit_manual_review.md` § Path E documents recovery for the
+// `deposit_manual_review.md` § Path F documents recovery for the
 // processor-side allowlist gate (`assert_mint_allowed_at_slot` rejects a
 // deposit whose mint was not in `allowed` status at the deposit's slot).
 // This drill pins:
@@ -1077,8 +1077,8 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
 //   2. The classifier routes `MintNotAllowed` to a quarantine reason of
 //      `mint_not_allowed`, and the call to `assert_mint_allowed_at_slot`
 //      is still wired into `process_deposit_funds`. A future refactor
-//      that drops either of these breaks Path E silently.
-//   3. Path E recovery SQL: 3a re-arms to `pending`; 3b `DELETE`s the
+//      that drops either of these breaks Path F silently.
+//   3. Path F recovery SQL: 3a re-arms to `pending`; 3b `DELETE`s the
 //      row (the orphan reconciliation query has no status filter, so
 //      DELETE is the only way to silence it). Both are id-targeted and
 //      leave unrelated rows alone.
@@ -1088,11 +1088,11 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
+async fn drill_17_deposit_manual_review_allowlist_gate_recovery_flows(
 ) -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "deposit_manual_review.md",
-        "Path E — processor-side allowlist gate",
+        "Path F — processor-side allowlist gate",
     );
 
     let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -1106,11 +1106,11 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
         .unwrap_or_else(|e| panic!("read {operator_err_path:?}: {e}"));
     assert!(
         operator_err.contains("MintNotAllowed"),
-        "Path E depends on OperatorError::MintNotAllowed — variant missing from operator.rs",
+        "Path F depends on OperatorError::MintNotAllowed — variant missing from operator.rs",
     );
     assert!(
         operator_err.contains("has no allowed status in mint_status_history"),
-        "Path E triage dispatches on this substring — missing from operator.rs",
+        "Path F triage dispatches on this substring — missing from operator.rs",
     );
     eprintln!("OK   error/operator.rs: MintNotAllowed + dispatch substring");
 
@@ -1125,13 +1125,13 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
     );
     assert!(
         processor.contains("assert_mint_allowed_at_slot"),
-        "process_deposit_funds must call assert_mint_allowed_at_slot — Path E's \
+        "process_deposit_funds must call assert_mint_allowed_at_slot — Path F's \
          entire trigger surface depends on this gate firing before the sender path",
     );
     eprintln!("OK   processor.rs: \"mint_not_allowed\" label + assert_mint_allowed_at_slot call");
 
     // ── Step 3: cross-signal contract with reconciliation ────────────
-    // Path E's recovery for the terminal branch tells the on-call that
+    // Path F's recovery for the terminal branch tells the on-call that
     // the reconciliation orphan check is the same incident — so the
     // runbook must reference that check, and reconciliation must
     // actually run the orphan-row check. Anchor each side concretely.
@@ -1141,7 +1141,7 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
     assert!(
         reconciliation.contains("check_orphan_deposit_rows"),
         "Reconciliation must run `check_orphan_deposit_rows` — the orphan \
-         alert Path E's recovery refers to",
+         alert Path F's recovery refers to",
     );
     let runbook_path = workspace_root.join("docs/runbooks/deposit_manual_review.md");
     let runbook = std::fs::read_to_string(&runbook_path)
@@ -1151,7 +1151,7 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
     // anchor is the existence of the cross-link, not its exact phrasing.
     assert!(
         runbook.contains("reconciliation orphan"),
-        "deposit_manual_review.md Path E must reference the reconciliation \
+        "deposit_manual_review.md Path F must reference the reconciliation \
          orphan check — without it, on-call triages the same incident twice",
     );
     eprintln!("OK   reconciliation.rs + runbook: orphan-alert cross-link");
@@ -1177,7 +1177,7 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
     assert_eq!(
         status_of(&pool, branch_3a_id).await?,
         "pending",
-        "Path E branch 3a re-arm must flip manual_review → pending",
+        "Path F branch 3a re-arm must flip manual_review → pending",
     );
 
     // 3b — not-allowlisted branch: DELETE the row (the orphan
@@ -1192,20 +1192,20 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
         .rows_affected();
     assert_eq!(
         rows_deleted, 1,
-        "Path E branch 3b must DELETE exactly the trigger row"
+        "Path F branch 3b must DELETE exactly the trigger row"
     );
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE id=$1")
         .bind(branch_3b_id)
         .fetch_one(&pool)
         .await?;
-    assert_eq!(exists, 0, "Path E branch 3b row must be gone after DELETE");
+    assert_eq!(exists, 0, "Path F branch 3b row must be gone after DELETE");
 
     // Control: a completed row must be untouched by either recovery —
     // and specifically not swept by the 3b DELETE.
     assert_eq!(
         status_of(&pool, control_id).await?,
         "completed",
-        "unrelated terminal rows must be untouched by Path E recovery",
+        "unrelated terminal rows must be untouched by Path F recovery",
     );
 
     // 3c — foreign-instance branch: documented as escalate-only, no
@@ -1214,7 +1214,7 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
     // SQL" check rather than execute anything against the pool.
     let step_3c_idx = runbook
         .find("Step 3c")
-        .expect("Path E Step 3c heading must exist");
+        .expect("Path F Step 3c heading must exist");
     let step_3c_section = &runbook[step_3c_idx..];
     let next_section_idx = step_3c_section[1..]
         .find("\n## ")
@@ -1225,12 +1225,12 @@ async fn drill_15_deposit_manual_review_allowlist_gate_recovery_flows(
         !step_3c_body.contains("UPDATE transactions")
             && !step_3c_body.contains("INSERT INTO")
             && !step_3c_body.contains("DELETE FROM"),
-        "Path E Step 3c (foreign-instance) must contain no mutating SQL — \
+        "Path F Step 3c (foreign-instance) must contain no mutating SQL — \
          escalate-only per the runbook",
     );
     eprintln!("OK   Step 3c body contains no mutating SQL");
 
-    eprintln!("Path E recovery flows verified end-to-end.");
+    eprintln!("Path F recovery flows verified end-to-end.");
     Ok(())
 }
 
@@ -1635,4 +1635,110 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+// Drill 15: pins Path E triage substring + row-scoped re-arm SQL.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_15_deposit_manual_review_recovery_idempotency_failure_flow(
+) -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "deposit_manual_review.md",
+        "Path E — recovery-worker idempotency lookup failed",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let recovery_path = workspace_root.join("indexer/src/operator/recovery.rs");
+    let recovery = std::fs::read_to_string(&recovery_path)
+        .unwrap_or_else(|e| panic!("read {recovery_path:?}: {e}"));
+    assert!(
+        recovery.contains("deposit idempotency:"),
+        "Path E dispatch substring missing from recovery.rs"
+    );
+    eprintln!("OK   recovery.rs: \"deposit idempotency:\"");
+
+    // ── Re-arm SQL is row-scoped and fungible across Path-E substrings ──
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    let trigger_id = seed_deposit(&pool, "manual_review").await?;
+    let collateral_id = seed_deposit(&pool, "manual_review").await?;
+
+    sqlx::query("UPDATE transactions SET status='pending', updated_at=NOW() WHERE id=$1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, trigger_id).await?,
+        "pending",
+        "Path E re-arm must flip the trigger row to pending"
+    );
+    assert_eq!(
+        status_of(&pool, collateral_id).await?,
+        "manual_review",
+        "Path E re-arm must NOT touch sibling manual_review rows"
+    );
+
+    eprintln!("Path E triage substring + re-arm SQL verified.");
+    Ok(())
+}
+
+// Drill 16: pins Path F triage substring + row-scoped terminal SQL.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn drill_16_withdrawal_manual_review_recovery_missing_nonce_flow(
+) -> Result<(), Box<dyn std::error::Error>> {
+    drill_header(
+        "withdrawal_manual_review.md",
+        "Path F — corrupt withdrawal row (missing nonce)",
+    );
+
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let recovery_path = workspace_root.join("indexer/src/operator/recovery.rs");
+    let recovery = std::fs::read_to_string(&recovery_path)
+        .unwrap_or_else(|e| panic!("read {recovery_path:?}: {e}"));
+    assert!(
+        recovery.contains("withdrawal row missing nonce"),
+        "Path F dispatch substring missing from recovery.rs"
+    );
+    eprintln!("OK   recovery.rs: \"withdrawal row missing nonce\"");
+
+    // ── Terminal SQL is row-scoped, ManualReview → Failed ──
+    let (pool, _storage, _pg) = start_postgres().await?;
+
+    let trigger_id = seed_withdrawal(&pool, "manual_review", 1, None).await?;
+    // Force-null the nonce to mirror the recovery-worker quarantine condition.
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+    let sibling_id = seed_withdrawal(&pool, "manual_review", 2, None).await?;
+
+    // Step 3 → Burn landed → mark failed (terminal).
+    sqlx::query("UPDATE transactions SET status='failed', updated_at=NOW() WHERE id=$1")
+        .bind(trigger_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, trigger_id).await?,
+        "failed",
+        "Path F § Step 3 burn-landed branch must terminalize the row to failed"
+    );
+    assert_eq!(
+        status_of(&pool, sibling_id).await?,
+        "manual_review",
+        "Path F terminal SQL must NOT touch sibling manual_review rows"
+    );
+
+    eprintln!("Path F triage substring + terminal SQL verified.");
+    Ok(())
 }

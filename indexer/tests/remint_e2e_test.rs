@@ -8,9 +8,10 @@
 //!
 //! Uses testcontainers for isolated Postgres instances.
 
+use bigdecimal::BigDecimal;
 use chrono::Utc;
 use private_channel_indexer::{
-    storage::{PostgresDb, Storage, TransactionStatus},
+    storage::{common::amount::TokenAmount, PostgresDb, Storage, TransactionStatus},
     PostgresConfig,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -32,7 +33,7 @@ async fn insert_mint(pool: &PgPool, mint: &Pubkey) -> Result<(), sqlx::Error> {
 }
 
 /// Insert a completed deposit so escrow has a baseline balance.
-async fn insert_deposit(pool: &PgPool, mint: &Pubkey, amount: i64) -> Result<(), sqlx::Error> {
+async fn insert_deposit(pool: &PgPool, mint: &Pubkey, amount: u64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
@@ -46,7 +47,7 @@ async fn insert_deposit(pool: &PgPool, mint: &Pubkey, amount: i64) -> Result<(),
     .bind(Pubkey::new_unique().to_string())
     .bind(Pubkey::new_unique().to_string())
     .bind(mint.to_string())
-    .bind(amount)
+    .bind(TokenAmount(amount))
     .bind(uuid::Uuid::new_v4().to_string())
     .execute(pool)
     .await?;
@@ -95,7 +96,7 @@ async fn insert_withdrawal(
     pool: &PgPool,
     mint: &Pubkey,
     recipient: &Pubkey,
-    amount: i64,
+    amount: u64,
 ) -> Result<i64, sqlx::Error> {
     let row = sqlx::query_scalar::<_, i64>(
         "INSERT INTO transactions
@@ -111,7 +112,7 @@ async fn insert_withdrawal(
     .bind(Pubkey::new_unique().to_string()) // initiator
     .bind(recipient.to_string())
     .bind(mint.to_string())
-    .bind(amount)
+    .bind(TokenAmount(amount))
     .bind(uuid::Uuid::new_v4().to_string())
     .fetch_one(pool)
     .await?;
@@ -140,7 +141,7 @@ async fn test_pending_remint_persisted_and_recovered() -> Result<(), Box<dyn std
     let recipient = Pubkey::new_unique();
     let sig1 = Signature::new_unique();
     let sig2 = Signature::new_unique();
-    let amount: i64 = 10_000;
+    let amount: u64 = 10_000;
 
     // Insert the transaction in Processing status (normal pre-failure state).
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, amount).await?;
@@ -169,7 +170,7 @@ async fn test_pending_remint_persisted_and_recovered() -> Result<(), Box<dyn std
 
     // Identity and amount.
     assert_eq!(row.id, tx_id);
-    assert_eq!(row.amount, amount);
+    assert_eq!(row.amount, TokenAmount(amount));
 
     // Pubkeys stored as strings and must round-trip correctly.
     assert_eq!(row.mint, mint.to_string());
@@ -355,8 +356,8 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
     let mint = Pubkey::new_unique();
     let recipient = Pubkey::new_unique();
     let withdrawal_sig = Signature::new_unique();
-    let deposit_amount: i64 = 10_000;
-    let withdrawal_amount: i64 = 10_000;
+    let deposit_amount: u64 = 10_000;
+    let withdrawal_amount: u64 = 10_000;
 
     // Step 1: a deposit lands — tokens enter the escrow.
     insert_mint(&pool, &mint).await?;
@@ -381,11 +382,13 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
         .find(|b| b.mint_address == mint.to_string())
         .expect("mint must appear in balance query");
     assert_eq!(
-        balance.total_deposits, deposit_amount,
+        balance.total_deposits,
+        BigDecimal::from(deposit_amount),
         "full deposit must be counted"
     );
     assert_eq!(
-        balance.total_withdrawals, 0,
+        balance.total_withdrawals,
+        BigDecimal::from(0u64),
         "PendingRemint withdrawal must NOT be counted — it never landed on-chain"
     );
 
@@ -411,11 +414,13 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
         .find(|b| b.mint_address == mint.to_string())
         .expect("mint must still appear in balance query");
     assert_eq!(
-        after_balance.total_deposits, deposit_amount,
+        after_balance.total_deposits,
+        BigDecimal::from(deposit_amount),
         "deposit must still be counted after remint"
     );
     assert_eq!(
-        after_balance.total_withdrawals, 0,
+        after_balance.total_withdrawals,
+        BigDecimal::from(0u64),
         "FailedReminted withdrawal must NOT be counted in total_withdrawals"
     );
 
@@ -435,7 +440,7 @@ async fn test_multiple_pending_remints_excluded_from_balance(
     let (pool, storage, _pg) = start_postgres().await?;
 
     let mint = Pubkey::new_unique();
-    let deposit_amount: i64 = 30_000;
+    let deposit_amount: u64 = 30_000;
 
     insert_mint(&pool, &mint).await?;
     insert_deposit(&pool, &mint, deposit_amount).await?;
@@ -443,7 +448,7 @@ async fn test_multiple_pending_remints_excluded_from_balance(
     let deadline = Utc::now() + chrono::Duration::seconds(32);
 
     // Three concurrent withdrawal failures — all in PendingRemint simultaneously.
-    for amount in [10_000i64, 8_000, 12_000] {
+    for amount in [10_000u64, 8_000, 12_000] {
         let tx_id = insert_withdrawal(&pool, &mint, &Pubkey::new_unique(), amount).await?;
         storage
             .set_pending_remint(
@@ -462,9 +467,10 @@ async fn test_multiple_pending_remints_excluded_from_balance(
         .find(|b| b.mint_address == mint.to_string())
         .expect("mint must appear in balance query");
 
-    assert_eq!(balance.total_deposits, deposit_amount);
+    assert_eq!(balance.total_deposits, BigDecimal::from(deposit_amount));
     assert_eq!(
-        balance.total_withdrawals, 0,
+        balance.total_withdrawals,
+        BigDecimal::from(0u64),
         "all three PendingRemint withdrawals must be excluded from total_withdrawals"
     );
 

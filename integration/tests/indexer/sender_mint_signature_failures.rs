@@ -74,12 +74,11 @@ fn complete_builder(
 }
 
 /// Backends that don't implement `getSignaturesForAddress` reply with
-/// JSON-RPC error code `-32601 Method not found`. The helper must
-/// degrade gracefully — log + return `Ok(None)` — so the sender keeps
-/// submitting (the alternative would freeze every withdrawal flow on
-/// such a backend).
+/// `-32601 Method not found`. The idempotency check fails closed and
+/// returns `Err` so callers refuse to blind-mint (sender → fatal,
+/// recovery → quarantine) rather than risk a double-mint.
 #[tokio::test]
-async fn method_not_found_returns_none_without_hard_failure() {
+async fn method_not_found_surfaces_as_error() {
     let mock = MockRpcServer::start().await;
     let client = test_client(mock.url());
 
@@ -105,13 +104,11 @@ async fn method_not_found_returns_none_without_hard_failure() {
         token_program,
         1_000,
     );
-    let result = find_existing_mint_signature_with_memo(&client, &bwt, &memo)
-        .await
-        .expect("method-not-found must NOT bubble up as a hard error");
+    let result = find_existing_mint_signature_with_memo(&client, &bwt, &memo).await;
 
     assert!(
-        result.is_none(),
-        "graceful-degradation contract: -32601 yields Ok(None)"
+        result.is_err(),
+        "fail-closed contract: -32601 yields Err so callers don't blind-mint"
     );
     mock.shutdown().await;
 }

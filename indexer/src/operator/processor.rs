@@ -374,14 +374,7 @@ async fn build_release_funds(
         .user(recipient)
         .transaction_nonce(nonce);
 
-    let amount = u64::try_from(transaction.amount).map_err(|_| {
-        OperatorError::Program(ProgramError::InvalidBuilder {
-            reason: format!(
-                "negative withdrawal amount {} for transaction {}",
-                transaction.amount, transaction.id
-            ),
-        })
-    })?;
+    let amount = transaction.amount.value();
     builder.amount(amount);
 
     // Remint info for recovery-on-permanent-failure.  PrivateChannel token program, not
@@ -476,14 +469,7 @@ async fn check_withdrawal_preflights(
     }
 
     if has_permanent_delegate {
-        let amount = u64::try_from(transaction.amount).map_err(|_| {
-            OperatorError::Program(ProgramError::InvalidBuilder {
-                reason: format!(
-                    "negative withdrawal amount {} for transaction {}",
-                    transaction.amount, transaction.id
-                ),
-            })
-        })?;
+        let amount = transaction.amount.value();
 
         let release_funds_state = processor_state
             .release_funds_state
@@ -688,7 +674,7 @@ pub async fn process_deposit_funds(
                 .payer(processor_state.admin_pubkey)
                 .mint_authority(processor_state.admin_pubkey)
                 .token_program(token_program)
-                .amount(transaction.amount as u64)
+                .amount(transaction.amount.value())
                 .idempotency_memo(mint_idempotency_memo(transaction.id));
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
@@ -753,6 +739,7 @@ mod tests {
     use super::*;
     use crate::error::{AccountError, StorageError, TransactionError};
     use crate::operator::find_allowed_mint_pda;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::DbMint;
     use crate::storage::common::models::TransactionType;
     use crate::storage::common::storage::mock::MockStorage;
@@ -838,6 +825,7 @@ mod tests {
                 decimals: 6,
                 token_program: spl_token::id().to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: Some(false),
                 has_permanent_delegate: Some(false),
             },
@@ -868,7 +856,7 @@ mod tests {
             initiator: "initiator".to_string(),
             recipient: recipient.to_string(),
             mint: mint.to_string(),
-            amount: 1000,
+            amount: TokenAmount(1000),
             memo: None,
             transaction_type: txn_type,
             withdrawal_nonce: nonce,
@@ -881,6 +869,9 @@ mod tests {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            landed_remint_signature: None,
         }
     }
 
@@ -939,6 +930,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
                     is_pausable: Some(false),
                     has_permanent_delegate: Some(false),
                 },
@@ -1006,6 +998,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
                     is_pausable: Some(false),
                     has_permanent_delegate: Some(false),
                 },
@@ -1315,6 +1308,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
                     is_pausable: Some(false),
                     has_permanent_delegate: Some(false),
                 },
@@ -1667,6 +1661,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
                     is_pausable: None,
                     has_permanent_delegate: None,
                 },
@@ -1795,6 +1790,7 @@ mod tests {
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
+                    status: "allowed".to_string(),
                     is_pausable: None,
                     has_permanent_delegate: None,
                 },
@@ -2151,6 +2147,7 @@ mod tests {
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: Some(false),
                 has_permanent_delegate: Some(true),
             },
@@ -2190,7 +2187,7 @@ mod tests {
             initiator: "initiator".to_string(),
             recipient: recipient.to_string(),
             mint: mint_pubkey.to_string(),
-            amount: 1000, // > on-chain balance of 500
+            amount: TokenAmount(1000), // > on-chain balance of 500
             memo: None,
             transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
             withdrawal_nonce: Some(5),
@@ -2203,6 +2200,9 @@ mod tests {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            landed_remint_signature: None,
         };
 
         fetcher_tx.send(txn).await.unwrap();
@@ -2255,6 +2255,7 @@ mod tests {
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: Some(false),
                 has_permanent_delegate: Some(true),
             },
@@ -2293,7 +2294,7 @@ mod tests {
             initiator: "initiator".to_string(),
             recipient: recipient.to_string(),
             mint: mint_pubkey.to_string(),
-            amount: 1000, // < on-chain balance of 5000
+            amount: TokenAmount(1000), // < on-chain balance of 5000
             memo: None,
             transaction_type: crate::storage::common::models::TransactionType::Withdrawal,
             withdrawal_nonce: Some(5),
@@ -2306,6 +2307,9 @@ mod tests {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            landed_remint_signature: None,
         };
 
         fetcher_tx.send(txn).await.unwrap();

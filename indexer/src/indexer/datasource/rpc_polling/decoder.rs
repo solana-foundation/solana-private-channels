@@ -36,12 +36,15 @@ pub fn parse_block(
             escrow_instance_id,
         )
         .into_iter()
-        .map(|(signature, ix)| InstructionWithMetadata {
-            instruction: ProgramInstruction::Escrow(Box::new(ix)),
-            slot,
-            program_type,
-            signature: Some(signature),
-        })
+        .map(
+            |(signature, instruction_index, ix)| InstructionWithMetadata {
+                instruction: ProgramInstruction::Escrow(Box::new(ix)),
+                slot,
+                program_type,
+                signature: Some(signature),
+                instruction_index,
+            },
+        )
         .collect(),
         ProgramType::Withdraw => parse_block_for_program::<WithdrawInstruction>(
             block,
@@ -50,24 +53,28 @@ pub fn parse_block(
             None,
         )
         .into_iter()
-        .map(|(signature, ix)| InstructionWithMetadata {
-            instruction: ProgramInstruction::Withdraw(Box::new(ix)),
-            slot,
-            program_type,
-            signature: Some(signature),
-        })
+        .map(
+            |(signature, instruction_index, ix)| InstructionWithMetadata {
+                instruction: ProgramInstruction::Withdraw(Box::new(ix)),
+                slot,
+                program_type,
+                signature: Some(signature),
+                instruction_index,
+            },
+        )
         .collect(),
     }
 }
 
 /// Parse a block and extract all instructions for a given program
-/// Returns tuples of (signature, instruction) for each parsed instruction
+/// Returns tuples of (signature, instruction_index, instruction) for each parsed
+/// instruction, where instruction_index is the absolute position in the transaction.
 pub fn parse_block_for_program<T>(
     block: &RpcBlock,
     filter_program_id: &str,
     parse_instruction: ParseInstructionFn<T>,
     escrow_instance_id: Option<&Pubkey>,
-) -> Vec<(String, T)>
+) -> Vec<(String, u32, T)>
 where
     T: std::fmt::Debug,
 {
@@ -110,15 +117,16 @@ where
             }
         }
 
-        // Parse each instruction in the transaction
-        for instruction in &tx.message.instructions {
+        // Enumerate before the program-id filter so the index is the instruction's
+        // absolute position in the transaction, independent of how many are relevant.
+        for (ix_index, instruction) in tx.message.instructions.iter().enumerate() {
             let program_id = account_keys.get(instruction.program_id_index as usize);
 
             // Only parse program filtered instructions
             if program_id == Some(&filter_program_id.to_string()) {
                 match parse_instruction(instruction, &account_pubkeys, inner_instructions_list) {
                     Ok(Some(ix)) => {
-                        instructions.push((signature.clone(), ix));
+                        instructions.push((signature.clone(), ix_index as u32, ix));
                     }
                     Ok(None) => {
                         debug!("Skipped unsupported instruction");
@@ -241,9 +249,32 @@ mod tests {
         let result = parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, None);
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0], ("sig1".to_string(), "data1".to_string()));
-        assert_eq!(result[1], ("sig1".to_string(), "data2".to_string()));
-        assert_eq!(result[2], ("sig1".to_string(), "data3".to_string()));
+        assert_eq!(result[0], ("sig1".to_string(), 0u32, "data1".to_string()));
+        assert_eq!(result[1], ("sig1".to_string(), 1u32, "data2".to_string()));
+        assert_eq!(result[2], ("sig1".to_string(), 2u32, "data3".to_string()));
+    }
+
+    #[test]
+    fn test_index_is_absolute_position_across_filtered_instructions() {
+        let mut block = create_test_block();
+        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+
+        let ix0 = create_instruction(0, vec![], "data0".to_string());
+        // Middle instruction targets a different program and is filtered out.
+        let ix1 = create_instruction(1, vec![], "data1".to_string());
+        let ix2 = create_instruction(0, vec![], "data2".to_string());
+
+        block.transactions.push(create_successful_transaction(
+            "sig1".to_string(),
+            account_keys,
+            vec![ix0, ix1, ix2],
+        ));
+
+        let result = parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, None);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("sig1".to_string(), 0u32, "data0".to_string()));
+        assert_eq!(result[1], ("sig1".to_string(), 2u32, "data2".to_string()));
     }
 
     #[test]
@@ -271,8 +302,8 @@ mod tests {
         let result = parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, None);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ("sig1".to_string(), "data1".to_string()));
-        assert_eq!(result[1], ("sig2".to_string(), "data2".to_string()));
+        assert_eq!(result[0], ("sig1".to_string(), 0u32, "data1".to_string()));
+        assert_eq!(result[1], ("sig2".to_string(), 0u32, "data2".to_string()));
     }
 
     #[test]
@@ -311,11 +342,11 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0],
-            ("sig_success".to_string(), "success".to_string())
+            ("sig_success".to_string(), 0u32, "success".to_string())
         );
         assert_eq!(
             result[1],
-            ("sig_success2".to_string(), "success2".to_string())
+            ("sig_success2".to_string(), 0u32, "success2".to_string())
         );
     }
 
@@ -401,8 +432,14 @@ mod tests {
         let result = parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, None);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ("sig1".to_string(), "at_index_0".to_string()));
-        assert_eq!(result[1], ("sig2".to_string(), "at_index_5".to_string()));
+        assert_eq!(
+            result[0],
+            ("sig1".to_string(), 0u32, "at_index_0".to_string())
+        );
+        assert_eq!(
+            result[1],
+            ("sig2".to_string(), 0u32, "at_index_5".to_string())
+        );
     }
 
     #[test]
@@ -422,7 +459,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0],
-            ("sig_no_meta".to_string(), "no_meta".to_string())
+            ("sig_no_meta".to_string(), 0u32, "no_meta".to_string())
         );
     }
 }

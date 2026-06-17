@@ -66,7 +66,7 @@ impl DbTransactionWriter {
         );
         let trace_id = update.trace_id.as_deref().unwrap_or("none");
         let pt = self.program_type.as_label();
-        if let Err(e) = self
+        match self
             .storage
             .update_transaction_status(
                 update.transaction_id,
@@ -76,24 +76,35 @@ impl DbTransactionWriter {
             )
             .await
         {
-            error!(
-                trace_id = trace_id,
-                "Failed to update transaction {} status: {}", update.transaction_id, e
-            );
-            metrics::OPERATOR_DB_UPDATE_ERRORS
-                .with_label_values(&[pt])
-                .inc();
-            if let Some(err_msg) = &update.error_message {
-                error!(trace_id = trace_id, "Transaction error was: {}", err_msg);
+            Ok(true) => {
+                info!(
+                    trace_id = trace_id,
+                    "Updated transaction {} to status {:?}", update.transaction_id, update.status
+                );
+                metrics::OPERATOR_DB_UPDATES
+                    .with_label_values(&[pt, &format!("{:?}", update.status)])
+                    .inc();
             }
-        } else {
-            info!(
-                trace_id = trace_id,
-                "Updated transaction {} to status {:?}", update.transaction_id, update.status
-            );
-            metrics::OPERATOR_DB_UPDATES
-                .with_label_values(&[pt, &format!("{:?}", update.status)])
-                .inc();
+            Ok(false) => {
+                // Row off Processing (recovery moved it); webhook still fires.
+                info!(
+                    trace_id = trace_id,
+                    "Transaction {} already past Processing; status write skipped",
+                    update.transaction_id
+                );
+            }
+            Err(e) => {
+                error!(
+                    trace_id = trace_id,
+                    "Failed to update transaction {} status: {}", update.transaction_id, e
+                );
+                metrics::OPERATOR_DB_UPDATE_ERRORS
+                    .with_label_values(&[pt])
+                    .inc();
+                if let Some(err_msg) = &update.error_message {
+                    error!(trace_id = trace_id, "Transaction error was: {}", err_msg);
+                }
+            }
         }
 
         if is_alertable {

@@ -25,13 +25,21 @@ use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResul
 pub fn process_reset_smt_root(
     program_id: &Address,
     accounts: &[AccountView],
-    _instruction_data: &[u8],
+    instruction_data: &[u8],
 ) -> ProgramResult {
     let [payer_info, operator_info, instance_info, operator_pda_info, event_authority_info, program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
+
+    let expected_current_tree_index = u64::from_le_bytes(
+        instruction_data
+            .get(..8)
+            .ok_or(ProgramError::InvalidInstructionData)?
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
 
     verify_signer(payer_info, true)?;
     verify_signer(operator_info, false)?;
@@ -61,6 +69,12 @@ pub fn process_reset_smt_root(
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidOperatorPda)?;
 
     drop(instance_data);
+
+    // Reject a stale replay: the reset is not idempotent, so a second landing
+    // would advance current_tree_index again and skip a whole tree generation.
+    if instance.current_tree_index != expected_current_tree_index {
+        return Err(PrivateChannelEscrowProgramError::UnexpectedTreeIndex.into());
+    }
 
     instance.withdrawal_transactions_root = EMPTY_TREE_ROOT;
     instance.current_tree_index = instance

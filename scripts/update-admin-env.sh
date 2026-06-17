@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "Usage: $0 <env-file> <operator-keypair-path>" >&2
+# Public admin key goes to the tracked template; the private key goes only to a
+# gitignored runtime env file, so `make build-*` never puts a live key in git.
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "Usage: $0 <env-file> <admin-keypair-path> [runtime-env-file]" >&2
   exit 1
 fi
 
 env_file="$1"
-operator_keypair="$2"
+admin_keypair="$2"
+# Defaults to the gitignored `.env`, loaded last in the compose env-file chain.
+runtime_env_file="${3:-.env}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-operator_pubkey="$(solana-keygen pubkey "$operator_keypair")"
-operator_private_key="$(tr -d '\n' < "$operator_keypair")"
+admin_pubkey="$(solana-keygen pubkey "$admin_keypair")"
+admin_private_key="$(tr -d '\n' < "$admin_keypair")"
 
-"$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_ADMIN_KEYS" "$operator_pubkey"
-"$script_dir/upsert-env.sh" "$env_file" "ADMIN_PRIVATE_KEY" "$operator_private_key"
+# Public key -> tracked template (safe to commit).
+"$script_dir/upsert-env.sh" "$env_file" "PRIVATE_CHANNEL_ADMIN_KEYS" "$admin_pubkey"
 
-echo "Updated $env_file with PRIVATE_CHANNEL_ADMIN_KEYS=$operator_pubkey"
-echo "Updated $env_file with ADMIN_PRIVATE_KEY"
+# Private key -> gitignored runtime file only.
+"$script_dir/upsert-env.sh" "$runtime_env_file" "ADMIN_PRIVATE_KEY" "$admin_private_key"
+
+echo "Updated $env_file with PRIVATE_CHANNEL_ADMIN_KEYS=$admin_pubkey"
+echo "Wrote ADMIN_PRIVATE_KEY to $runtime_env_file (gitignored)"

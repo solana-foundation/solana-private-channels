@@ -1,6 +1,6 @@
 use crate::{
     error::DvpSwapProgramError,
-    processor::shared::account_check::{verify_account_owner, verify_signer, verify_token_program},
+    processor::shared::account_check::{verify_account_owner, verify_signer},
     processor::shared::token_utils::{
         get_mint_decimals, get_token_account_balance, transfer_checked_cpi, verify_canonical_ata,
     },
@@ -8,17 +8,12 @@ use crate::{
     state::swap_dvp::SwapDvp,
 };
 use pinocchio::{
-    account::AccountView,
-    address::Address,
-    cpi::Signer,
-    error::ProgramError,
-    sysvars::{clock::Clock, Sysvar},
-    ProgramResult,
+    account::AccountView, address::Address, cpi::Signer, error::ProgramError, ProgramResult,
 };
 
 /// Length of the fixed account prefix; anything beyond this is treated
 /// as transfer-hook remaining accounts for the single refund CPI.
-const FIXED_ACCOUNTS_LEN: usize = 6;
+const FIXED_ACCOUNTS_LEN: usize = 7;
 
 /// Processes the ReclaimDvp instruction.
 ///
@@ -34,9 +29,9 @@ const FIXED_ACCOUNTS_LEN: usize = 6;
 /// is a no-op.
 ///
 /// The DvP itself stays open after a reclaim — the caller can re-fund
-/// the leg later, or either party can abort the trade. Reclaim only
-/// drains a single leg, so it only takes the mint and token program for
-/// that leg (not both).
+/// the leg later (pre-expiry, to still settle), or either party can
+/// abort the trade. Reclaim only drains a single leg, so it only takes
+/// the mint and token program for that leg (not both).
 ///
 /// Extension validation is **not** performed here — Create is the
 /// consent point. Reclaim must remain available even if a mint's
@@ -50,6 +45,7 @@ const FIXED_ACCOUNTS_LEN: usize = 6;
 /// 3. `[writable]`  dvp_source_ata  - DvP's escrow ATA for the leg's mint
 /// 4. `[writable]`  signer_dest_ata - Signer's canonical ATA for the leg's mint (caller must pre-initialize if the leg has a non-zero balance)
 /// 5. `[]`          token_program   - SPL Token or Token-2022; must own `mint`
+/// 6. `[]`          memo_program    - SPL Memo program; only used if signer_dest_ata requires a memo
 ///
 /// Trailing accounts (variable): transfer-hook extras forwarded to the
 /// refund `TransferChecked` CPI (hook program, validation PDA, and any
@@ -65,14 +61,13 @@ pub fn process_reclaim_dvp(
         ProgramError::NotEnoughAccountKeys
     );
     let (fixed, remaining) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [signer_info, swap_dvp_info, mint_info, dvp_source_ata_info, signer_dest_ata_info, token_program_info] =
+    let [signer_info, swap_dvp_info, mint_info, dvp_source_ata_info, signer_dest_ata_info, token_program_info, memo_program_info] =
         fixed
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
     verify_signer(signer_info, false)?;
-    verify_token_program(token_program_info)?;
     verify_account_owner(swap_dvp_info, program_id)?;
 
     let dvp = {
@@ -81,26 +76,26 @@ pub fn process_reclaim_dvp(
     };
 
     // Leg selection by signer identity.
-    let leg_mint = if signer_info.address() == &dvp.user_a {
-        &dvp.mint_a
+    let (leg_mint, leg_token_program) = if signer_info.address() == &dvp.user_a {
+        (&dvp.mint_a, &dvp.token_program_a)
     } else if signer_info.address() == &dvp.user_b {
-        &dvp.mint_b
+        (&dvp.mint_b, &dvp.token_program_b)
     } else {
         return Err(DvpSwapProgramError::SignerNotParty.into());
     };
 
-    // Bind the passed mint account to the state's mint pubkey and to the
-    // token program that owns it.
+    // Bind the passed mint and token program to state.
     require!(
         mint_info.address() == leg_mint,
         ProgramError::InvalidAccountData
     );
-    verify_account_owner(mint_info, token_program_info.address())?;
+    require!(
+        token_program_info.address() == leg_token_program,
+        ProgramError::IncorrectProgramId
+    );
 
-    // Reclaim only works pre-expiry. After expiry, Cancel or Reject
-    // is the way to drain a funded leg.
-    let now = Clock::get()?.unix_timestamp;
-    require!(now <= dvp.expiry_timestamp, DvpSwapProgramError::DvpExpired);
+    // No expiry gate: per-leg recovery stays open at all times. Safe
+    // because Settle is gated on `now <= expiry` and both legs funded.
 
     // Both ATAs must be canonical for the leg's token program.
     // dvp_source_ata is the DvP PDA's escrow for the leg's mint
@@ -139,6 +134,7 @@ pub fn process_reclaim_dvp(
         escrow_balance,
         get_mint_decimals(mint_info)?,
         token_program_info.address(),
+        memo_program_info,
         remaining,
         &[Signer::from(&swap_dvp_seeds)],
     )?;

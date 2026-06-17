@@ -8,6 +8,10 @@ name = "private_channel_integration"
 path = "tests/private-channel/integration.rs"
 
 [[test]]
+name = "ingress_backpressure"
+path = "tests/private-channel/test_ingress_backpressure.rs"
+
+[[test]]
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
 
@@ -58,6 +62,10 @@ path = "tests/indexer/checkpoint_partial_flush.rs"
 [[test]]
 name = "remint_recovery"
 path = "tests/indexer/remint_recovery.rs"
+
+[[test]]
+name = "stuck_processing_recovery"
+path = "tests/indexer/stuck_processing_recovery.rs"
 
 [[test]]
 name = "test_rpc_http_malformed"
@@ -203,6 +211,7 @@ bs58 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 private-channel-core = { path = "../core" }
+private-channel-metrics = { path = "../metrics" }
 private-channel-escrow-program-client = { path = "../private-channel-escrow-program/clients/rust" }
 private-channel-indexer = { path = "../indexer", features = [
     "datasource-rpc",

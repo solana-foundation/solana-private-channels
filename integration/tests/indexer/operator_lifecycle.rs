@@ -33,6 +33,7 @@ use private_channel_indexer::config::{
 use private_channel_indexer::operator;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
 use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
+use private_channel_indexer::storage::common::amount::TokenAmount;
 use private_channel_indexer::storage::common::models::{
     DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionStatus,
 };
@@ -203,7 +204,7 @@ fn make_withdrawal_transaction(
     signature: String,
     mint: String,
     recipient: String,
-    amount: i64,
+    amount: u64,
     nonce: i64,
 ) -> DbTransaction {
     let now = Utc::now();
@@ -215,7 +216,7 @@ fn make_withdrawal_transaction(
         initiator: recipient.clone(),
         recipient,
         mint,
-        amount,
+        amount: TokenAmount(amount),
         memo: None,
         transaction_type: TransactionType::Withdrawal,
         withdrawal_nonce: Some(nonce),
@@ -228,6 +229,9 @@ fn make_withdrawal_transaction(
         remint_last_valid_block_heights: None,
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
+        instruction_index: 0,
+        landed_remint_signature: None,
     }
 }
 
@@ -987,7 +991,7 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
     println!("=== Operator Lifecycle: Sequential Withdrawals (Multi-Nonce) ===");
 
     const ESCROW_FUND: u64 = 200_000;
-    const WITHDRAWAL_AMOUNT: i64 = 50_000;
+    const WITHDRAWAL_AMOUNT: u64 = 50_000;
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
@@ -1087,7 +1091,7 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
     let final_balance = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
         final_balance,
-        initial_balance + (WITHDRAWAL_AMOUNT as u64) * 2,
+        initial_balance + WITHDRAWAL_AMOUNT * 2,
         "User should have received both withdrawal amounts"
     );
 
@@ -1182,11 +1186,9 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     .execute(&pool)
     .await?;
 
-    // Step 2: add a PENDING withdrawal at nonce 1 so the operator has
-    // something to process. SMT init runs lazily on the first ReleaseFunds
-    // transaction (see `handle_transaction_builder` in
-    // `sender/transaction.rs`); without this trigger the mismatch branch
-    // is never reached.
+    // Step 2: add a PENDING withdrawal at nonce 1. The boot pre-flight validates the
+    // SMT root BEFORE any row is fetched, so on a mismatch the operator refuses to
+    // start and this row is never processed; it must stay `pending`.
     let trigger_sig = Signature::new_unique().to_string();
     let trigger_withdrawal = make_withdrawal_transaction(
         trigger_sig.clone(),
@@ -1197,10 +1199,9 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     );
     storage.insert_db_transaction(&trigger_withdrawal).await?;
 
-    // Start the withdrawal-side operator. When it picks up the pending
-    // nonce-1 withdrawal, `initialize_smt_state` runs, detects the
-    // mismatch, and triggers the `send_fatal_error` path for that
-    // transaction.
+    // Start the withdrawal-side operator. Its boot pre-flight rebuilds the SMT from
+    // the poisoned `completed` nonce, finds it diverges from the empty on-chain root,
+    // and refuses to start (returns Err); the operator task then exits.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
@@ -1210,30 +1211,31 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     )
     .await?;
 
-    // Wait for the pending nonce-1 withdrawal to transition out of
-    // Pending. A healthy operator would mark it `completed`; a
-    // mismatch-poisoned operator's fatal-error path must mark it
-    // `failed` (or some other terminal non-pending state).
+    // The operator must refuse to start: the task exits without processing any row.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut terminal_status = String::from("pending");
+    let mut exited = false;
     while std::time::Instant::now() < deadline {
-        if let Some(tx) = db::get_transaction(&pool, &trigger_sig).await? {
-            if tx.status != "pending" {
-                terminal_status = tx.status;
-                break;
-            }
+        if operator_handle._handle.is_finished() {
+            exited = true;
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-
-    assert_ne!(
-        terminal_status, "pending",
-        "operator must have moved the trigger tx out of 'pending'; SMT mismatch path never ran"
+    assert!(
+        exited,
+        "operator must refuse to start (the task exits) on a startup SMT root mismatch"
     );
-    assert_ne!(
-        terminal_status, "completed",
-        "SMT-poisoned pending withdrawal must NOT reach 'completed'; the mismatch \
-         detection branch in `initialize_smt_state` was bypassed. Got: {terminal_status}"
+
+    // SOLA2-21: the innocent trigger withdrawal is never moved out of `pending`
+    // (never `failed`, never `completed`) because the pre-flight gates before the
+    // pipeline runs.
+    let trigger = db::get_transaction(&pool, &trigger_sig)
+        .await?
+        .expect("trigger withdrawal row must exist");
+    assert_eq!(
+        trigger.status, "pending",
+        "trigger withdrawal must stay pending on refuse-to-start; got {}",
+        trigger.status
     );
 
     operator_handle.shutdown().await;

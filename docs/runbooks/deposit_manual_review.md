@@ -16,7 +16,7 @@ Practically: a single deposit `manual_review` is a single row in trouble.
 Other deposits keep flowing. There is no collateral, no sweep, no halt to
 recover from.
 
-There are **three trigger surfaces** that can land a deposit in
+There are **four trigger surfaces** that can land a deposit in
 `manual_review`:
 
 1. **Processor-side row-data validation** — deterministic per-row error
@@ -25,9 +25,14 @@ There are **three trigger surfaces** that can land a deposit in
    mint-init helper found the on-chain mint in a state it cannot fix by
    re-issuing `mint_to` (wrong authority on the private channel mint, or
    corrupt mint data). See **Path D** for recovery.
-3. **Processor-side allowlist gate** — the deposit's `mint` has no row
+3. **Recovery-worker idempotency lookup failed** — the periodic
+   stuck-row recovery worker found a stale `Processing` deposit, tried
+   the idempotency memo lookup against the PrivateChannel RPC, and the
+   RPC was unreachable. Row data is fine; no on-chain mint attempted.
+   See **Path E**.
+4. **Processor-side allowlist gate** — the deposit's `mint` has no row
    in the `mints` allowlist (`MintCache::assert_mint_allowlisted`). Row
-   data is fine; no `MintTo` was attempted. See **Path E**.
+   data is fine; no `MintTo` was attempted. See **Path F**.
 
 ## Symptom
 
@@ -36,7 +41,7 @@ There are **three trigger surfaces** that can land a deposit in
 
 ## Triage
 
-`error_message` distinguishes the three trigger surfaces and dispatches
+`error_message` distinguishes the four trigger surfaces and dispatches
 to the right Path below.
 
 ### Processor-side surface (`processor.rs::process_deposit_funds`)
@@ -46,6 +51,8 @@ to the right Path below.
 | `invalid_pubkey` | `mint` or `recipient` field is not a valid base58 pubkey. |
 | `invalid_builder` | Builder rejected the row's data (e.g. negative amount). |
 | `program_error` | Generic builder error not covered by the specific variants. |
+| `deposit idempotency:` | The recovery worker could not authoritatively decide whether the deposit's mint already landed. Row was quarantined on uncertainty rather than risk a double-mint. Indicates RPC health, not a row defect. See **Path E**. |
+| `recovery requeues without progress` | The recovery worker demoted this `processing` deposit 3 times (mint never landed each cycle) and quarantined rather than loop forever. Row data is fine; the mint keeps failing to land. See **Path G**. |
 
 ### Sender-side post-JIT surface (`sender/mint.rs`)
 
@@ -58,7 +65,7 @@ to the right Path below.
 
 | `error_message` contains | Cause |
 |---|---|
-| `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path E**. |
+| `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path F**. |
 
 Pull the row:
 
@@ -111,6 +118,7 @@ Correct the columns and re-arm:
 ```sql
 UPDATE transactions
    SET status = 'pending',
+       recovery_requeue_attempts = 0,
        mint = :corrected_mint,
        recipient = :corrected_recipient,
        updated_at = NOW()
@@ -136,7 +144,7 @@ extended to classify this error variant explicitly. Do not patch
 in-place.
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
@@ -207,11 +215,63 @@ Only for the recoverable authority case after the underlying authority
 correction has been performed:
 
 ```sql
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
-### Path E - mint not in `AllowMint` allowlist
+### Path E - recovery-worker idempotency lookup failed
+
+`error_message` starts with `deposit idempotency:`. The recovery worker
+quarantines rather than demote when the idempotency lookup fails on RPC
+error, because demoting would re-pick the row and risk a double-mint. This
+is the same fail-closed stance as the live mint path, which on the same RPC
+failure also stops without minting (it routes to a terminal failure via
+`send_fatal_error` rather than minting unverified). Both paths refuse to
+proceed on uncertainty; they differ only in terminal state.
+
+#### Step 1 - check RPC health
+
+Inspect the suffix of `error_message` to identify the underlying RPC
+transport failure (timeout, connection refused, HTTP 5xx, etc.).
+Confirm against the operator's current PrivateChannel RPC endpoint:
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+  <private-channel-rpc-url>
+```
+
+If RPC is unhealthy, address that first. If RPC is healthy now,
+proceed.
+
+#### Step 2 - verify on-chain
+
+Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). The row was
+quarantined because the recovery worker could not answer this question
+itself; resolving the runbook requires the same answer.
+
+#### Step 3 - branch on verdict
+
+##### `LANDED <signature>` — mint already succeeded
+
+Mark `completed` with the observed signature (same SQL as
+[`deposit_failed.md`](deposit_failed.md) Path B).
+
+##### `NOT_LANDED` — re-arm
+
+The mint did not land. Re-arm to `pending`; the idempotency memo
+prevents duplicate mint on the next attempt.
+
+```sql
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+##### `AMBIGUOUS`
+
+Stop. [Escalate](_escalation.md) (Tier 2). Do not act.
+
+### Path F - mint not in `AllowMint` allowlist
 
 `error_message`: `has no allowed status in mint_status_history`. The deposit's
 mint has no `allowed` entry in `mint_status_history` at the deposit's slot (the
@@ -276,7 +336,7 @@ VALUES
   (:mint, 'allowed', :allow_mint_slot, :allow_mint_signature, NOW())
 ON CONFLICT (mint_address, effective_slot) DO NOTHING;
 
-UPDATE transactions SET status = 'pending', updated_at = NOW()
+UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
@@ -322,6 +382,50 @@ ours. The operator should never see foreign-instance rows — this is the
 SOLA2-27 attack surface, not an operations recovery.
 [Escalate](_escalation.md) (Tier 3). No SQL.
 
+### Path G - requeue cap exhausted (mint never landed)
+
+`error_message` contains `recovery requeues without progress`. Each
+recovery pass whose idempotency scan finds no existing mint (`NotLanded`)
+demotes the stuck `processing` deposit back to `pending` for a fresh
+mint. After `MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with the
+mint still never landing, recovery quarantines instead of looping. So the
+mint was retried 3 times and never landed. The lookup *succeeded* each
+time and said not-landed (distinct from Path E, where the lookup itself
+*failed* on RPC error); the row data is valid (distinct from Path A).
+
+#### Step 1 - verify on-chain
+
+Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). Expected
+verdict: `NOT_LANDED`. If `LANDED` -> the idempotency scan missed a landed
+mint; mark `completed` per **Path E** (`LANDED` branch) and
+[escalate](_escalation.md) (Tier 2) - the scan has a defect (e.g. the sig
+is past its lookback window).
+
+#### Step 2 - find why the mint never lands
+
+The deposit mint is fire-and-forget (`spawn_fire_and_store`), so a
+repeating failure points at a deterministic mint rejection (paused/frozen
+mint, `mint_authority` mismatch, compute) or the sender never
+broadcasting. Read the operator logs for this `transaction_id`'s mint send
+error. A deterministic cause means re-arming will loop again ->
+[escalate](_escalation.md) (Tier 2) to engineering.
+
+#### Step 3 - resolve, then re-arm
+
+Fix the root cause first. Then re-arm to `pending` **and reset the requeue
+counter** - re-arming without the reset re-quarantines on the next stall,
+since the counter is already at the cap. The idempotency memo still guards
+against a double-mint on retry:
+
+```sql
+UPDATE transactions
+   SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+If the mint can never land (unrecoverable), mark `failed` and
+[escalate](_escalation.md) (Tier 1) for refund coordination.
+
 ## Post-incident artifacts
 
 - Transaction id, originating Solana `signature`, `recipient`, `mint`.
@@ -331,7 +435,9 @@ SOLA2-27 attack surface, not an operations recovery.
 - For Path D: on-chain `mint_authority` before/after, the
   `spl-token authorize` signature (if applicable), and the engineering
   ticket for any mint-replacement coordination.
-- For Path E: which branch (3a/3b/3c), the `AllowMint` signature if
+- For Path E: RPC endpoint health snapshot and the
+  `getHealth` / verification responses captured at triage time.
+- For Path F: which branch (3a/3b/3c), the `AllowMint` signature if
   found, any backfill SQL, refund ticket, and — for 3b — the full
   deleted row contents and the classified root cause (user error /
   indexer defect / manual insert).

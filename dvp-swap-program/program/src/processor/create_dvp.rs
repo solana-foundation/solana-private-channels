@@ -9,16 +9,20 @@ use crate::{
     processor::shared::pda_utils::create_pda_account,
     processor::shared::token_utils::{validate_mint_extensions, verify_canonical_ata},
     require, require_len,
-    state::swap_dvp::{SwapDvp, SWAP_DVP_SEED},
+    state::swap_dvp::{SwapDvp, MAX_REF_STRING_LEN, NONCE_TOMBSTONE_SEED, SWAP_DVP_SEED},
 };
 use pinocchio::{
     account::AccountView,
     address::Address,
+    cpi::Seed,
     error::ProgramError,
     sysvars::{clock::Clock, rent::Rent, Sysvar},
     ProgramResult,
 };
 use pinocchio_associated_token_account::instructions::CreateIdempotent as CreateAtaIdempotent;
+
+/// Max DvP lifetime (one year) as a duration from creation. Caps escrow rent lock-up.
+const MAX_DVP_DURATION_SECS: i64 = 365 * 24 * 60 * 60;
 
 /// Processes the CreateDvp instruction.
 ///
@@ -27,18 +31,25 @@ use pinocchio_associated_token_account::instructions::CreateIdempotent as Create
 /// a raw SPL Transfer (the canonical funding path so that custodian
 /// integrations need no custom program call).
 ///
+/// The parties do not sign, and terms aren't bound to the PDA address, so
+/// a record here is not proof the named parties agreed to its terms.
+/// Clients must use a random `nonce` (anti-squat) and verify the stored
+/// terms before funding or settling. See README "CreateDvp is
+/// permissionless".
+///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Funds account/ATA creation rent
 /// 1. `[writable]` swap_dvp - SwapDvp PDA to be created
-/// 2. `[]` settlement_authority - Third party allowed to settle/cancel; must not be executable
-/// 3. `[]` mint_a - Mint of the asset leg (seller delivers)
-/// 4. `[]` mint_b - Mint of the cash leg (buyer delivers)
-/// 5. `[writable]` dvp_ata_a - swap_dvp's ATA for mint_a (created here)
-/// 6. `[writable]` dvp_ata_b - swap_dvp's ATA for mint_b (created here)
-/// 7. `[]` system_program
-/// 8. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
-/// 9. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
-/// 10. `[]` associated_token_program
+/// 2. `[writable]` nonce_tombstone - Per-DvP nonce tombstone PDA, created here and never closed; rejects nonce reuse
+/// 3. `[]` settlement_authority - Third party allowed to settle/cancel; must not be executable
+/// 4. `[]` mint_a - Mint of the asset leg (seller delivers)
+/// 5. `[]` mint_b - Mint of the cash leg (buyer delivers)
+/// 6. `[writable]` dvp_ata_a - swap_dvp's ATA for mint_a (created here)
+/// 7. `[writable]` dvp_ata_b - swap_dvp's ATA for mint_b (created here)
+/// 8. `[]` system_program
+/// 9. `[]` token_program_a - SPL Token or Token-2022; must own mint_a
+/// 10. `[]` token_program_b - SPL Token or Token-2022; must own mint_b
+/// 11. `[]` associated_token_program
 ///
 /// # Instruction Data
 /// * `user_a` (Pubkey) - Seller
@@ -47,6 +58,12 @@ use pinocchio_associated_token_account::instructions::CreateIdempotent as Create
 /// * `amount_b` (u64) - Cash leg size
 /// * `expiry_timestamp` (i64) - After this, settlement is rejected
 /// * `nonce` (u64) - Disambiguates DvPs sharing all other seeds
+/// * `ref_string` (Option<String>) - Opaque client reference, at most
+///   `MAX_REF_STRING_LEN` bytes; stored zero-padded (None = all zeros)
+/// * `user_a_settlement_destination` (Option<Pubkey>) - Wallet receiving the
+///   cash leg at Settle; defaults to `user_a`
+/// * `user_b_settlement_destination` (Option<Pubkey>) - Wallet receiving the
+///   asset leg at Settle; defaults to `user_b`
 /// * `earliest_settlement_timestamp` (Option<i64>) - If set, settlement
 ///   is also rejected before this timestamp
 pub fn process_create_dvp(
@@ -56,7 +73,7 @@ pub fn process_create_dvp(
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
-    let [payer_info, swap_dvp_info, settlement_authority_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, system_program_info, token_program_a_info, token_program_b_info, associated_token_program_info] =
+    let [payer_info, swap_dvp_info, nonce_tombstone_info, settlement_authority_info, mint_a_info, mint_b_info, dvp_ata_a_info, dvp_ata_b_info, system_program_info, token_program_a_info, token_program_b_info, associated_token_program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -107,6 +124,23 @@ pub fn process_create_dvp(
         ProgramError::InvalidSeeds
     );
 
+    // Nonce tombstone, derived from the SwapDvp address so it's 1:1 with
+    // this trade's seeds. It's created below and never closed, so a
+    // non-system owner here means the nonce was already used — reject
+    // before re-creating the (closed) SwapDvp at the same address.
+    let (expected_tombstone, tombstone_bump) = Address::find_program_address(
+        &[NONCE_TOMBSTONE_SEED, expected_swap_dvp.as_ref()],
+        program_id,
+    );
+    require!(
+        nonce_tombstone_info.address() == &expected_tombstone,
+        ProgramError::InvalidAccountData
+    );
+    require!(
+        nonce_tombstone_info.owned_by(&pinocchio_system::ID),
+        DvpSwapProgramError::NonceAlreadyUsed
+    );
+
     // dvp_ata_a is the DvP PDA's ATA for mint_a (asset escrow).
     verify_canonical_ata(
         dvp_ata_a_info,
@@ -129,10 +163,18 @@ pub fn process_create_dvp(
         mint_a: *mint_a_info.address(),
         mint_b: *mint_b_info.address(),
         settlement_authority: *settlement_authority_info.address(),
+        token_program_a: *token_program_a_info.address(),
+        token_program_b: *token_program_b_info.address(),
         amount_a: args.amount_a,
         amount_b: args.amount_b,
         expiry_timestamp: args.expiry_timestamp,
         nonce: args.nonce,
+        ref_string: args.ref_string,
+        // Resolve the destination defaults here (the consent point) so
+        // Settle never branches: delivery always goes to the stored
+        // destination's canonical ATA.
+        user_a_settlement_destination: args.user_a_settlement_destination.unwrap_or(args.user_a),
+        user_b_settlement_destination: args.user_b_settlement_destination.unwrap_or(args.user_b),
         earliest_settlement_timestamp: args.earliest_settlement_timestamp,
     };
     let (nonce_bytes, bump_bytes) = dvp.seed_buffers();
@@ -146,6 +188,23 @@ pub fn process_create_dvp(
         program_id,
         swap_dvp_info,
         swap_dvp_seeds,
+    )?;
+
+    // Mark this nonce used. The tombstone holds no data — its mere
+    // existence (program-owned) is the signal — and is never closed.
+    let tombstone_bump_bytes = [tombstone_bump];
+    let tombstone_seeds = [
+        Seed::from(NONCE_TOMBSTONE_SEED),
+        Seed::from(expected_swap_dvp.as_ref()),
+        Seed::from(&tombstone_bump_bytes),
+    ];
+    create_pda_account(
+        payer_info,
+        &rent,
+        0,
+        program_id,
+        nonce_tombstone_info,
+        tombstone_seeds,
     )?;
 
     CreateAtaIdempotent {
@@ -183,18 +242,28 @@ struct CreateDvpArgs {
     amount_b: u64,
     expiry_timestamp: i64,
     nonce: u64,
+    /// Zero-padded to the stored width at parse time; the wire length
+    /// prefix is consumed during parsing and never stored.
+    ref_string: [u8; MAX_REF_STRING_LEN],
+    user_a_settlement_destination: Option<Address>,
+    user_b_settlement_destination: Option<Address>,
     earliest_settlement_timestamp: Option<i64>,
 }
 
-/// Wire layout (variable, 97–105 bytes):
+/// Wire layout (variable, 100–240 bytes):
 ///   user_a(32) | user_b(32) |
 ///   amount_a(8) | amount_b(8) | expiry_timestamp(8) | nonce(8) |
+///   ref_tag(1) [ | ref_len(u32) | ref_bytes(0..=64) if tag == 1 ] |
+///   destination_a_tag(1) [ | destination_a(32) if tag == 1 ] |
+///   destination_b_tag(1) [ | destination_b(32) if tag == 1 ] |
 ///   earliest_tag(1) [ | earliest_payload(8) if tag == 1 ]
 ///
 /// Codama-style Option encoding: payload is omitted when tag == 0.
 fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
-    // Required prefix: two pubkeys + four u64/i64 fields + option tag.
-    require_len!(data, 32 * 2 + 8 * 4 + 1);
+    // Required prefix: two pubkeys + four u64/i64 fields + four option
+    // tags, so every tag read below is in bounds even when all options
+    // are None.
+    require_len!(data, 32 * 2 + 8 * 4 + 4);
 
     let mut offset = 0;
 
@@ -234,6 +303,66 @@ fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
     );
     offset += 8;
 
+    let ref_string = match data[offset] {
+        0 => {
+            offset += 1;
+            [0u8; MAX_REF_STRING_LEN]
+        }
+        1 => {
+            // Tag + u32 length prefix + the three remaining option tags.
+            require_len!(data, offset + 1 + 4 + 3);
+            let ref_string_wire_len = u32::from_le_bytes(
+                data[offset + 1..offset + 5]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            ) as usize;
+            require!(
+                ref_string_wire_len <= MAX_REF_STRING_LEN,
+                DvpSwapProgramError::RefStringTooLong
+            );
+            // The string bytes plus the three remaining option tags.
+            require_len!(data, offset + 5 + ref_string_wire_len + 3);
+            let mut ref_string = [0u8; MAX_REF_STRING_LEN];
+            ref_string[..ref_string_wire_len]
+                .copy_from_slice(&data[offset + 5..offset + 5 + ref_string_wire_len]);
+            offset += 5 + ref_string_wire_len;
+            ref_string
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
+    let user_a_settlement_destination = match data[offset] {
+        0 => {
+            offset += 1;
+            None
+        }
+        1 => {
+            // Tag + pubkey payload + the two remaining option tags.
+            require_len!(data, offset + 1 + 32 + 2);
+            let mut destination = [0u8; 32];
+            destination.copy_from_slice(&data[offset + 1..offset + 33]);
+            offset += 33;
+            Some(Address::new_from_array(destination))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
+    let user_b_settlement_destination = match data[offset] {
+        0 => {
+            offset += 1;
+            None
+        }
+        1 => {
+            // Tag + pubkey payload + the remaining option tag.
+            require_len!(data, offset + 1 + 32 + 1);
+            let mut destination = [0u8; 32];
+            destination.copy_from_slice(&data[offset + 1..offset + 33]);
+            offset += 33;
+            Some(Address::new_from_array(destination))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
     let earliest_settlement_timestamp = match data[offset] {
         0 => None,
         1 => {
@@ -254,6 +383,9 @@ fn parse_instruction_data(data: &[u8]) -> Result<CreateDvpArgs, ProgramError> {
         amount_b,
         expiry_timestamp,
         nonce,
+        ref_string,
+        user_a_settlement_destination,
+        user_b_settlement_destination,
         earliest_settlement_timestamp,
     })
 }
@@ -270,6 +402,10 @@ fn validate_args(
     require!(
         args.expiry_timestamp > now,
         DvpSwapProgramError::ExpiryNotInFuture
+    );
+    require!(
+        args.expiry_timestamp <= now.saturating_add(MAX_DVP_DURATION_SECS),
+        DvpSwapProgramError::ExpiryTooFarInFuture
     );
     if let Some(earliest) = args.earliest_settlement_timestamp {
         require!(
@@ -304,6 +440,9 @@ mod tests {
             amount_b: 2_000,
             expiry_timestamp: NOW + 3_600,
             nonce: 0,
+            ref_string: [0u8; MAX_REF_STRING_LEN],
+            user_a_settlement_destination: None,
+            user_b_settlement_destination: None,
             earliest_settlement_timestamp: None,
         }
     }
@@ -361,6 +500,23 @@ mod tests {
         let err =
             validate_args(&a, &settlement_authority(), &mint_a(), &mint_b(), NOW).unwrap_err();
         assert_custom(err, DvpSwapProgramError::ExpiryNotInFuture);
+    }
+
+    #[test]
+    fn validate_args_accepts_expiry_at_max_horizon() {
+        let mut a = args();
+        a.expiry_timestamp = NOW + MAX_DVP_DURATION_SECS;
+        validate_args(&a, &settlement_authority(), &mint_a(), &mint_b(), NOW)
+            .expect("expiry exactly at the cap is allowed");
+    }
+
+    #[test]
+    fn validate_args_rejects_expiry_beyond_max_horizon() {
+        let mut a = args();
+        a.expiry_timestamp = NOW + MAX_DVP_DURATION_SECS + 1;
+        let err =
+            validate_args(&a, &settlement_authority(), &mint_a(), &mint_b(), NOW).unwrap_err();
+        assert_custom(err, DvpSwapProgramError::ExpiryTooFarInFuture);
     }
 
     #[test]

@@ -3,7 +3,9 @@ pub use super::models::*;
 pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
+pub mod delete_release_signatures;
 pub mod drop_tables;
+pub mod gc_stale_release_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
@@ -15,13 +17,21 @@ pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
+pub mod get_release_signatures;
+pub mod get_stale_processing_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
+pub mod insert_release_signature;
 pub mod quarantine_all_active_withdrawals;
+pub mod record_remint_result;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
+pub mod sync_mint_status;
+pub mod try_complete_processing;
+pub mod try_quarantine_processing;
+pub mod try_requeue_processing;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -120,14 +130,14 @@ impl Storage {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
     }
 
-    /// Update transaction status after processing
+    /// Terminal status write; `Ok(false)` if row already off Processing.
     pub async fn update_transaction_status(
         &self,
         transaction_id: i64,
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<bool, StorageError> {
         update_transaction_status::update_transaction_status(
             self,
             transaction_id,
@@ -150,6 +160,12 @@ impl Storage {
         statuses: &[DbMintStatus],
     ) -> Result<(), StorageError> {
         insert_mint_statuses_batch::insert_mint_statuses_batch(self, statuses).await
+    }
+
+    /// Refresh the `mints.status` mirror for the given mints from their latest
+    /// `mint_status_history` transition. No-op for mints without a row.
+    pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
+        sync_mint_status::sync_mint_status(self, mint_addresses).await
     }
 
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
@@ -272,6 +288,17 @@ impl Storage {
         .await
     }
 
+    /// Durably record a confirmed remint (status -> FailedReminted plus the
+    /// signature) in one write, before the async status writer runs. Closes the
+    /// crash window that would otherwise leave a landed remint as PendingRemint.
+    pub async fn record_remint_result(
+        &self,
+        transaction_id: i64,
+        remint_signature: String,
+    ) -> Result<(), StorageError> {
+        record_remint_result::record_remint_result(self, transaction_id, remint_signature).await
+    }
+
     /// Returns all withdrawal transactions in PendingRemint status.
     /// Called on startup to re-hydrate the remint queue after a crash.
     pub async fn get_pending_remint_transactions(
@@ -294,6 +321,92 @@ impl Storage {
     ) -> Result<u64, StorageError> {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
+
+    /// Stale `Processing` rows past the threshold (used by recovery).
+    pub async fn get_stale_processing_transactions(
+        &self,
+        threshold: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_stale_processing_transactions::get_stale_processing_transactions(self, threshold, limit)
+            .await
+    }
+
+    /// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_requeue_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
+            .await
+    }
+
+    /// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_complete_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        try_complete_processing::try_complete_processing(
+            self,
+            transaction_id,
+            expected_updated_at,
+            counterpart_signature,
+        )
+        .await
+    }
+
+    /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    pub async fn try_quarantine_processing(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_quarantine_processing::try_quarantine_processing(
+            self,
+            transaction_id,
+            expected_updated_at,
+        )
+        .await
+    }
+
+    /// Record a broadcast release signature so recovery can verify finality
+    /// before demoting. Idempotent on `signature`.
+    pub async fn insert_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), StorageError> {
+        insert_release_signature::insert_release_signature(
+            self,
+            transaction_id,
+            signature,
+            last_valid_block_height,
+        )
+        .await
+    }
+
+    /// Stored release signatures for a transaction as (signature, lvbh).
+    pub async fn get_release_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        get_release_signatures::get_release_signatures(self, transaction_id).await
+    }
+
+    /// Delete all stored release signatures for a transaction.
+    pub async fn delete_release_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        delete_release_signatures::delete_release_signatures(self, transaction_id).await
+    }
+
+    /// Drop release signatures whose parent transaction is no longer
+    /// `Processing`. Returns the number of rows removed.
+    pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
+        gc_stale_release_signatures::gc_stale_release_signatures(self).await
+    }
 }
 
 /// MockStorage behavior tests — only test non-trivial mock logic (filtering, recording, failure).
@@ -302,6 +415,8 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::common::amount::TokenAmount;
+    use bigdecimal::BigDecimal;
     use chrono::Utc;
     use mock::MockStorage;
 
@@ -322,7 +437,7 @@ mod tests {
             initiator: "initiator".to_string(),
             recipient: "recipient".to_string(),
             mint: "mint_addr".to_string(),
-            amount: 1000,
+            amount: TokenAmount(1000),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -335,6 +450,9 @@ mod tests {
             remint_last_valid_block_heights: None,
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            landed_remint_signature: None,
         }
     }
 
@@ -608,14 +726,14 @@ mod tests {
                 MintDbBalance {
                     mint_address: "mint_1".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 1000,
-                    total_withdrawals: 300,
+                    total_deposits: BigDecimal::from(1000u64),
+                    total_withdrawals: BigDecimal::from(300u64),
                 },
                 MintDbBalance {
                     mint_address: "mint_2".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 5000,
-                    total_withdrawals: 2000,
+                    total_deposits: BigDecimal::from(5000u64),
+                    total_withdrawals: BigDecimal::from(2000u64),
                 },
             ];
             mock.set_mint_balances(balances);
@@ -624,11 +742,11 @@ mod tests {
         let balances = storage.get_escrow_balances_by_mint().await.unwrap();
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].mint_address, "mint_1");
-        assert_eq!(balances[0].total_deposits, 1000);
-        assert_eq!(balances[0].total_withdrawals, 300);
+        assert_eq!(balances[0].total_deposits, BigDecimal::from(1000u64));
+        assert_eq!(balances[0].total_withdrawals, BigDecimal::from(300u64));
         assert_eq!(balances[1].mint_address, "mint_2");
-        assert_eq!(balances[1].total_deposits, 5000);
-        assert_eq!(balances[1].total_withdrawals, 2000);
+        assert_eq!(balances[1].total_deposits, BigDecimal::from(5000u64));
+        assert_eq!(balances[1].total_withdrawals, BigDecimal::from(2000u64));
     }
 
     #[tokio::test]
@@ -640,14 +758,14 @@ mod tests {
                 MintDbBalance {
                     mint_address: "usdc".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 10000,
-                    total_withdrawals: 5000,
+                    total_deposits: BigDecimal::from(10000u64),
+                    total_withdrawals: BigDecimal::from(5000u64),
                 },
                 MintDbBalance {
                     mint_address: "usdt".to_string(),
                     token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: 8000,
-                    total_withdrawals: 3000,
+                    total_deposits: BigDecimal::from(8000u64),
+                    total_withdrawals: BigDecimal::from(3000u64),
                 },
             ];
             mock.set_mint_balances(balances);
@@ -659,11 +777,11 @@ mod tests {
             .unwrap();
         assert_eq!(balances.len(), 2);
         assert!(balances.iter().any(|b| b.mint_address == "usdc"
-            && b.total_deposits == 10000
-            && b.total_withdrawals == 5000));
+            && b.total_deposits == BigDecimal::from(10000u64)
+            && b.total_withdrawals == BigDecimal::from(5000u64)));
         assert!(balances.iter().any(|b| b.mint_address == "usdt"
-            && b.total_deposits == 8000
-            && b.total_withdrawals == 3000));
+            && b.total_deposits == BigDecimal::from(8000u64)
+            && b.total_withdrawals == BigDecimal::from(3000u64)));
     }
 
     #[tokio::test]
@@ -672,6 +790,77 @@ mod tests {
         let mint = DbMint::new("test_mint".to_string(), 6, TOKEN_PROGRAM.to_string());
         storage.upsert_mints_batch(&[mint]).await.unwrap();
         assert!(mock.mints.lock().unwrap().contains_key("test_mint"));
+    }
+
+    #[tokio::test]
+    async fn sync_mint_status_mirrors_latest_history_and_preserves_metadata() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+
+        // allowed@10 then blocked@20 → mirror resolves to the latest: blocked.
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+
+        let m = storage.get_mint("m1").await.unwrap().unwrap();
+        assert_eq!(m.status, "blocked");
+        // Metadata is untouched by the mirror sync.
+        assert_eq!(m.decimals, 6);
+        assert_eq!(m.token_program, TOKEN_PROGRAM);
+
+        // Re-allow at a later slot → mirror flips back to allowed.
+        storage
+            .insert_mint_statuses_batch(&[status_row("m1", "allowed", 30)])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(
+            storage.get_mint("m1").await.unwrap().unwrap().status,
+            "allowed"
+        );
+    }
+
+    /// A stale replay (older slot than the current head) must not move the mirror.
+    #[tokio::test]
+    async fn sync_mint_status_ignores_older_history_after_block() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
+            .await
+            .unwrap();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("m1", "allowed", 10),
+                status_row("m1", "blocked", 20),
+            ])
+            .await
+            .unwrap();
+        // Replaying the slot-10 allow re-syncs, but the latest transition is still
+        // blocked@20, so the mirror stays blocked.
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+        assert_eq!(
+            storage.get_mint("m1").await.unwrap().unwrap().status,
+            "blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_mint_status_missing_row_is_noop() {
+        let (storage, _mock) = make_mock_storage();
+        // No row for "ghost" — must not error.
+        storage
+            .sync_mint_status(&["ghost".to_string()])
+            .await
+            .unwrap();
+        assert!(storage.get_mint("ghost").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1031,6 +1220,28 @@ mod tests {
         assert_eq!(res, MintStatusAtSlot::Allowed);
     }
 
+    /// Accepted limitation: a same-slot allow + block can't both be stored — PK
+    /// `(mint_address, effective_slot)` with `ON CONFLICT DO NOTHING` and no
+    /// intra-slot tiebreak, so the first inserted wins. Rare (admin-only); pinned
+    /// here so it can't change silently. Allow inserted first → block dropped.
+    #[tokio::test]
+    async fn get_mint_status_at_slot_same_slot_allow_then_block_keeps_first_inserted() {
+        let (storage, _mock) = make_mock_storage();
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "allowed", 10),
+                status_row("mint_a", "blocked", 10),
+            ])
+            .await
+            .unwrap();
+        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
+        assert_eq!(
+            res,
+            MintStatusAtSlot::Allowed,
+            "first-inserted row wins on a same-slot conflict; the block is dropped",
+        );
+    }
+
     // ── orphan query against status history ──────────────────────────
 
     fn seed_deposit(mock: &MockStorage, id: i64, mint: &str, slot: i64) {
@@ -1043,7 +1254,7 @@ mod tests {
             initiator: "init".to_string(),
             recipient: "recip".to_string(),
             mint: mint.to_string(),
-            amount: 1,
+            amount: TokenAmount(1),
             memo: None,
             transaction_type: TransactionType::Deposit,
             withdrawal_nonce: None,
@@ -1053,9 +1264,12 @@ mod tests {
             processed_at: None,
             counterpart_signature: None,
             remint_signatures: None,
-            pending_remint_deadline_at: None,
             remint_last_valid_block_heights: None,
+            pending_remint_deadline_at: None,
             finality_check_attempts: 0,
+            recovery_requeue_attempts: 0,
+            instruction_index: 0,
+            landed_remint_signature: None,
         });
     }
 

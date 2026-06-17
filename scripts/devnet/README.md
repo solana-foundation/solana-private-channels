@@ -4,6 +4,9 @@
 ```bash
 cp .env.example .env
 # Edit .env with your keys
+# Required (no defaults shipped): set POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD
+# (and JWT_SECRET if enabling auth, ADMIN_PRIVATE_KEY for the operator) or services fail to start
+# Generate strong values with: openssl rand -hex 32
 ```
 
 Run all commands from project root:

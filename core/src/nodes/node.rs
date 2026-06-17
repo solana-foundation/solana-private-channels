@@ -1,6 +1,6 @@
 use {
     crate::{
-        accounts::AccountsDB,
+        accounts::{address_index_repair::repair_address_signatures, AccountsDB},
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps, WriteDeps,
@@ -27,6 +27,13 @@ use {
     tracing::{error, info, warn},
 };
 
+/// RPC→dedup ingress queue capacity. Sized so steady state never sheds.
+pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
+/// sigverify→sequencer queue capacity (mirrors the sigverify queue size).
+pub const DEFAULT_SEQUENCER_QUEUE_CAPACITY: usize = 1000;
+/// executor→settler results queue capacity.
+pub const DEFAULT_EXECUTION_RESULTS_CAPACITY: usize = 1000;
+
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum NodeMode {
     /// Read-only node - serves read RPCs only
@@ -47,6 +54,12 @@ pub struct NodeConfig {
     pub max_tx_per_batch: usize,
     pub batch_deadline_ms: u64,
     pub batch_channel_capacity: usize,
+    /// RPC→dedup ingress queue capacity; a full queue sheds load at admission.
+    pub ingress_queue_capacity: usize,
+    /// sigverify→sequencer queue capacity; full applies upstream backpressure.
+    pub sequencer_queue_capacity: usize,
+    /// executor→settler results queue capacity; full applies upstream backpressure.
+    pub execution_results_capacity: usize,
     /// Max parallel SVM worker threads per batch (including the calling thread).
     /// Set to 1 to disable intra-batch parallelism entirely. Effective only for
     /// batches ≥ `MIN_PARALLEL_BATCH_SIZE`; smaller batches always run sequentially.
@@ -78,6 +91,9 @@ impl Default for NodeConfig {
             max_tx_per_batch: 64,
             batch_deadline_ms: 10,
             batch_channel_capacity: 16,
+            ingress_queue_capacity: DEFAULT_INGRESS_QUEUE_CAPACITY,
+            sequencer_queue_capacity: DEFAULT_SEQUENCER_QUEUE_CAPACITY,
+            execution_results_capacity: DEFAULT_EXECUTION_RESULTS_CAPACITY,
             max_svm_workers: 8,
             accountsdb_connection_url: "postgresql://user:password@localhost:5432/private_channel"
                 .to_string(),
@@ -120,6 +136,21 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)".into(),
         );
     }
+    // Zero capacity would panic the bounded-channel constructors below; fail closed instead.
+    if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+        for (name, cap) in [
+            ("ingress_queue_capacity", config.ingress_queue_capacity),
+            ("sequencer_queue_capacity", config.sequencer_queue_capacity),
+            (
+                "execution_results_capacity",
+                config.execution_results_capacity,
+            ),
+        ] {
+            if cap == 0 {
+                return Err(format!("{name} must be greater than 0").into());
+            }
+        }
+    }
 
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
@@ -131,25 +162,29 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
         if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-            // Create the dedup channel (receives from RPC, sends to sigverify) - unbounded
-            let (dedup_tx, dedup_rx) = crate::stages::create_dedup_channel();
+            // Create the bounded dedup channel (receives from RPC, sends to sigverify);
+            // a full queue sheds load at RPC ingress.
+            let (dedup_tx, dedup_rx) =
+                crate::stages::create_dedup_channel(config.ingress_queue_capacity);
 
             // Create the sigverify channel (needed for NodeHandles in all modes)
             let (sigverify_tx, sigverify_rx) =
                 async_channel::bounded::<SanitizedTransaction>(config.sigverify_queue_size);
 
-            // Create sequencer channel (unbounded mpsc for single consumer)
-            let (sequencer_tx, sequencer_rx) = mpsc::unbounded_channel::<SanitizedTransaction>();
+            // Create sequencer channel (bounded so backpressure chains upstream)
+            let (sequencer_tx, sequencer_rx) =
+                mpsc::channel::<SanitizedTransaction>(config.sequencer_queue_capacity);
 
             // Create batch channel between sequencer and executor (bounded for back-pressure)
             let (batch_tx, batch_rx) =
                 mpsc::channel::<ConflictFreeBatch>(config.batch_channel_capacity);
 
-            // Create execution results channel between executor and settler (unbounded for pipelining)
-            let (execution_results_tx, execution_results_rx) = mpsc::unbounded_channel::<(
-                LoadAndExecuteSanitizedTransactionsOutput,
-                Vec<SanitizedTransaction>,
-            )>();
+            // Create execution results channel between executor and settler (bounded for back-pressure)
+            let (execution_results_tx, execution_results_rx) =
+                mpsc::channel::<(
+                    LoadAndExecuteSanitizedTransactionsOutput,
+                    Vec<SanitizedTransaction>,
+                )>(config.execution_results_capacity);
 
             // Create settled accounts channel between settler and executor
             let (settled_accounts_tx, settled_accounts_rx) =
@@ -163,8 +198,13 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // Failure here is fatal: starting with an empty cache could allow
             // duplicate transactions to execute after a restart.
             let db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
-            let (initial_live_blockhashes, initial_dedup_cache) =
-                load_dedup_state(&db, config.max_blockhashes()).await?;
+            repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
+            let (initial_live_blockhashes, initial_dedup_cache) = load_dedup_state(
+                &db,
+                config.max_blockhashes(),
+                config.transaction_expiration_ms,
+            )
+            .await?;
 
             let dedup_hb = crate::health::StageHeartbeat::new();
             let sigverify_hb = crate::health::StageHeartbeat::new();
@@ -230,6 +270,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 metrics: Arc::clone(&config.metrics),
                 max_svm_workers: config.max_svm_workers,
                 heartbeat: executor_hb,
+                live_blockhashes: Arc::clone(&live_blockhashes),
             })
             .await;
             write_workers.push(execution);
@@ -274,6 +315,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             (
                 Some(WriteDeps {
                     dedup_tx: dedup_tx.clone(),
+                    metrics: Arc::clone(&config.metrics),
                 }),
                 live_blockhashes,
             )
@@ -284,20 +326,25 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             (None, Arc::new(RwLock::new(LinkedList::new())))
         };
 
-    // Start RPC service based on node mode
+    let read_deps = match config.mode {
+        NodeMode::Read | NodeMode::Aio => {
+            let accounts_db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            if matches!(config.mode, NodeMode::Read) {
+                repair_address_signatures(&accounts_db, Arc::clone(&config.metrics)).await?;
+            }
+            Some(ReadDeps {
+                admin_keys: config.admin_keys,
+                accounts_db,
+                live_blockhashes: live_blockhashes_arc,
+            })
+        }
+        NodeMode::Write => None,
+    };
+
     let rpc_config = RpcServiceConfig {
         port: config.port,
         max_connections: config.max_connections,
-        read_deps: match config.mode {
-            NodeMode::Read | NodeMode::Aio => Some(ReadDeps {
-                admin_keys: config.admin_keys,
-                accounts_db: AccountsDB::new(&config.accountsdb_connection_url, true)
-                    .await
-                    .unwrap(),
-                live_blockhashes: live_blockhashes_arc,
-            }),
-            NodeMode::Write => None,
-        },
+        read_deps,
         write_deps,
         heartbeats,
         shutdown_token: shutdown_token.clone(),
@@ -398,6 +445,21 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_node_rejects_zero_queue_capacity() {
+        let config = NodeConfig {
+            sequencer_queue_capacity: 0,
+            ..Default::default()
+        };
+
+        let result = run_node(config).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "sequencer_queue_capacity must be greater than 0"
         );
     }
 }

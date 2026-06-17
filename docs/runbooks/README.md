@@ -8,6 +8,15 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
+> **One halt has no dedicated alert.** The **SMT-root-mismatch boot
+> pre-flight** fires no "pipeline halted" event and marks no row `failed`.
+> The common cause is auto-reconciled at boot; an unforeseen divergence the
+> reconcile cannot resolve makes the operator **refuse to start**, surfacing
+> as a boot-time crash-loop with `SMT root mismatch` in the operator logs.
+> Recognize it by that pattern, not a single alert, and not via this
+> dispatch table. See
+> [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+
 ## Alert dispatch
 
 The **alert webhook** in `db_transaction_writer.rs` is the only
@@ -18,11 +27,10 @@ no retries). All dispatch below is keyed on the webhook payload.
 | Alert (webhook payload) | `transaction_type` | Symptom | Runbook |
 |---|---|---|---|
 | `status=manual_review` | `withdrawal` | Single row stopped; pipeline may also be halted. | [`withdrawal_manual_review.md`](withdrawal_manual_review.md) |
-| `status=manual_review` | `deposit` | Single row stopped — deterministic build error (processor), sender-side post-JIT mint failure (mint authority mismatch / corrupt state), or mint not in the `AllowMint` allowlist (processor-side gate). No halt, no collateral. | [`deposit_manual_review.md`](deposit_manual_review.md) |
+| `status=manual_review` | `deposit` | Single row stopped — deterministic build error (processor), sender-side post-JIT mint failure (mint authority mismatch / corrupt state), recovery-worker idempotency lookup failure, or mint not in the `AllowMint` allowlist (processor-side gate). No halt, no collateral. | [`deposit_manual_review.md`](deposit_manual_review.md) |
 | `status=failed` | `withdrawal` | Single row terminated without on-chain proof. Rare for withdrawals. | [`withdrawal_failed.md`](withdrawal_failed.md) |
 | `status=failed` | `deposit` | **Primary deposit alert.** Sender-side terminal failure (RPC, build, confirmation, on-chain rejection). | [`deposit_failed.md`](deposit_failed.md) |
 | `status=failed_reminted` | `withdrawal` | Withdrawal failed; remint succeeded. Reconcile only. | [`withdrawal_failed_reminted.md`](withdrawal_failed_reminted.md) |
-
 
 ## First action regardless of alert
 
@@ -73,11 +81,13 @@ The runbooks call this out at every relevant site.
   on-chain check (private channel chain).
 - [`_escalation.md`](_escalation.md) - escalation tiers and contacts.
   Every "escalate" call-site in the recovery runbooks links here.
+- [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
+  the SMT-root-mismatch startup halt (log-discovered, not paged).
 
 ## Drills
 
 [`indexer/tests/runbook_drills.rs`](../../indexer/tests/runbook_drills.rs)
-contains eleven `#[ignore]`-flagged drills that verify these runbooks'
+contains seventeen `#[ignore]`-flagged drills that verify these runbooks'
 commands actually do what the prose claims. Drills are **manually
 triggered, not in CI** - they exist so a human about to use a runbook
 (or about to publish an edit) can confirm the diagnostic and recovery
@@ -100,7 +110,9 @@ pins the relevant contract.
 | `drill_12_withdrawal_failed_recovery_flows` | withdrawal | `withdrawal_failed.md` LANDED → completed-with-sig; cross-row signature fence still applies on `failed`; NOT_LANDED is terminal (markdown + operator code grep); AMBIGUOUS escalates without SQL. |
 | `drill_13_withdrawal_failed_reminted_reconcile` | withdrawal | `failed_reminted` transition writes `remint_signatures`; runbook contains zero mutating SQL; LANDED verdict cannot be silently absorbed via `SET status='completed'`; webhook `remint_signature` (singular) ↔ DB `remint_signatures` (plural) asymmetry pinned. |
 | `drill_14_deposit_manual_review_post_jit_recovery_flows` | deposit | `deposit_manual_review.md` § Path D: post-JIT trigger strings present in `mint.rs`; re-arm SQL flips `manual_review` → `pending` and is targeted by id (not error_message); idempotency memo prefix anchored. |
-| `drill_15_deposit_manual_review_allowlist_gate_recovery_flows` | deposit | Allowlist-gate recovery flow in `deposit_manual_review.md` is in sync with source: triage strings still exist and recovery SQL is row-scoped. |
+| `drill_15_deposit_manual_review_recovery_idempotency_failure_flow` | deposit | `deposit_manual_review.md` § Path E: recovery-worker `deposit idempotency:` triage substring present in `recovery.rs`; re-arm SQL flips `manual_review` → `pending` and is row-scoped by id. |
+| `drill_16_withdrawal_manual_review_recovery_missing_nonce_flow` | withdrawal | `withdrawal_manual_review.md` § Path F: recovery-worker `withdrawal row missing nonce` triage substring present in `recovery.rs`; recovery branch SQL is row-scoped; no re-arm SQL exists for this path. |
+| `drill_17_deposit_manual_review_allowlist_gate_recovery_flows` | deposit | Allowlist-gate recovery flow in `deposit_manual_review.md` is in sync with source: triage strings still exist and recovery SQL is row-scoped. |
 
 Trigger (`make` shorthand, runs from repo root):
 

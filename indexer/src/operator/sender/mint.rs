@@ -8,8 +8,6 @@ use crate::operator::{
 };
 use serde_json::Value;
 use solana_keychain::SolanaSigner;
-use solana_rpc_client_api::client_error::ErrorKind;
-use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::program_option::COption;
 use solana_sdk::pubkey::Pubkey;
@@ -427,6 +425,7 @@ pub async fn find_existing_mint_signature(
 }
 
 /// Check recent ATA signatures for an already-confirmed mint carrying the given memo.
+/// Any RPC failure (including `-32601`) is returned as `Err` — callers decide.
 pub async fn find_existing_mint_signature_with_memo(
     rpc_client: &RpcClientWithRetry,
     builder_with_txn_id: &MintToBuilderWithTxnId,
@@ -446,14 +445,6 @@ pub async fn find_existing_mint_signature_with_memo(
     {
         Ok(signatures) => signatures,
         Err(e) => {
-            if is_method_not_found_error(e.as_ref()) {
-                warn!(
-                    "Skipping mint idempotency lookup for transaction_id {}: \
-                     RPC endpoint does not support getSignaturesForAddress",
-                    transaction_id
-                );
-                return Ok(None);
-            }
             return Err(format!(
                 "Failed idempotency lookup for transaction_id {} on {}: {}",
                 transaction_id, expected_mint.recipient_ata, e
@@ -502,13 +493,6 @@ pub async fn find_existing_mint_signature_with_memo(
     }
 
     Ok(None)
-}
-
-fn is_method_not_found_error(error: &solana_rpc_client_api::client_error::Error) -> bool {
-    matches!(
-        error.kind(),
-        ErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
-    )
 }
 
 fn expected_mint_instruction(
@@ -874,17 +858,12 @@ pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Opti
 mod tests {
     use super::{
         accounts_and_amount_match, decode_and_check_authority, expected_mint_instruction,
-        instruction_has_expected_mint, instruction_has_memo, is_method_not_found_error,
-        memo_matches, parse_token_instruction_mint_amount,
-        partially_decoded_instruction_has_expected_mint, raw_instruction_has_expected_mint,
-        strip_memo_length_prefix, transaction_matches_expected_mint, AuthorityCheck,
-        ExpectedMintInstruction,
+        instruction_has_expected_mint, instruction_has_memo, memo_matches,
+        parse_token_instruction_mint_amount, partially_decoded_instruction_has_expected_mint,
+        raw_instruction_has_expected_mint, strip_memo_length_prefix,
+        transaction_matches_expected_mint, AuthorityCheck, ExpectedMintInstruction,
     };
     use crate::operator::utils::instruction_util::{MintToBuilder, MintToBuilderWithTxnId};
-    use solana_rpc_client_api::{
-        client_error::{self, ErrorKind},
-        request::{RpcError, RpcResponseErrorData},
-    };
     use solana_sdk::pubkey::Pubkey;
     use solana_transaction_status::parse_instruction::ParsedInstruction;
     use solana_transaction_status::{
@@ -1544,40 +1523,6 @@ mod tests {
             },
         ));
         assert!(!instruction_has_memo(&ix, memo_text));
-    }
-
-    // ====================================================================
-    // is_method_not_found_error tests
-    // ====================================================================
-
-    /// JSON-RPC error code -32601 is the standard "method not found" code; the helper
-    /// must return true exactly for this value.
-    #[test]
-    fn is_method_not_found_error_returns_true_for_32601() {
-        let error = client_error::Error::new_with_request(
-            ErrorKind::RpcError(RpcError::RpcResponseError {
-                code: -32601,
-                message: "Method not found".to_string(),
-                data: RpcResponseErrorData::Empty,
-            }),
-            solana_rpc_client_api::request::RpcRequest::GetBalance,
-        );
-        assert!(is_method_not_found_error(&error));
-    }
-
-    /// Any other RPC response error code (e.g. -32600 "invalid request") must not be
-    /// confused with method-not-found.
-    #[test]
-    fn is_method_not_found_error_returns_false_for_other_rpc_code() {
-        let error = client_error::Error::new_with_request(
-            ErrorKind::RpcError(RpcError::RpcResponseError {
-                code: -32600,
-                message: "Invalid request".to_string(),
-                data: RpcResponseErrorData::Empty,
-            }),
-            solana_rpc_client_api::request::RpcRequest::GetBalance,
-        );
-        assert!(!is_method_not_found_error(&error));
     }
 
     // ====================================================================

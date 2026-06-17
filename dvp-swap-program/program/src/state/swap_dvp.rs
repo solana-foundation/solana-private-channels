@@ -6,6 +6,15 @@ use pinocchio::{cpi::Seed, error::ProgramError, Address as Pubkey};
 
 pub const SWAP_DVP_SEED: &[u8] = b"dvp";
 
+/// Seed prefix for the per-DvP nonce tombstone. The tombstone PDA is
+/// derived from `[NONCE_TOMBSTONE_SEED, swap_dvp_pubkey]`, created at
+/// CreateDvp, and never closed — its existence permanently marks a
+/// `(seeds, nonce)` PDA address as used so it can't be re-instantiated.
+pub const NONCE_TOMBSTONE_SEED: &[u8] = b"nonce";
+
+/// Max byte length of `ref_string` (the stored buffer size).
+pub const MAX_REF_STRING_LEN: usize = 64;
+
 /// Atomic DvP escrow for a P2P token swap.
 ///
 /// `user_a` (seller) delivers `amount_a` of `mint_a` (the asset);
@@ -26,10 +35,29 @@ pub struct SwapDvp {
     pub mint_a: Pubkey,
     pub mint_b: Pubkey,
     pub settlement_authority: Pubkey,
+    /// Owner of `mint_a`, captured at Create.
+    pub token_program_a: Pubkey,
+    /// Owner of `mint_b`, captured at Create.
+    pub token_program_b: Pubkey,
     pub amount_a: u64,
     pub amount_b: u64,
+    /// Cluster time (`Clock::unix_timestamp`), not wall-clock. See README.
     pub expiry_timestamp: i64,
     pub nonce: u64,
+    /// Opaque client reference (e.g. an off-chain order ID), stored as
+    /// UTF-8 zero-padded to the right (`MAX_REF_STRING_LEN` bytes);
+    /// clients trim trailing zeros to recover the string. The program
+    /// never reads it.
+    pub ref_string: [u8; 64],
+    /// Wallet receiving user_a's settlement proceeds — the cash leg
+    /// (`mint_b`) — at its canonical ATA. Resolved at Create: the
+    /// optional instruction arg defaults to `user_a`, so Settle never
+    /// branches. Only Settle reads this; refunds (Reclaim/Cancel/
+    /// Reject and Settle surplus) always go to the depositor.
+    pub user_a_settlement_destination: Pubkey,
+    /// Wallet receiving user_b's settlement proceeds — the asset leg
+    /// (`mint_a`). Defaults to `user_b`; same rules as above.
+    pub user_b_settlement_destination: Pubkey,
     /// `None` = settlement allowed any time before `expiry_timestamp`.
     /// `Some(t)` = additionally requires `now >= t`.
     pub earliest_settlement_timestamp: Option<i64>,
@@ -37,8 +65,10 @@ pub struct SwapDvp {
 
 impl SwapDvp {
     pub const LEN: usize = 1   // bump
-        + 32 * 5               // user_a, user_b, mint_a, mint_b, settlement_authority
+        + 32 * 7               // user_a, user_b, mint_a, mint_b, settlement_authority, token_program_a, token_program_b
         + 8 * 4                // amount_a, amount_b, expiry_timestamp, nonce
+        + MAX_REF_STRING_LEN   // ref_string (zero-padded)
+        + 32 * 2               // user_a_settlement_destination, user_b_settlement_destination
         + 1 + 8; // earliest_settlement_timestamp (opt)
 
     /// Owned `(nonce, bump)` byte buffers. Bind to a local so
@@ -73,10 +103,15 @@ impl SwapDvp {
         data.extend_from_slice(self.mint_a.as_ref());
         data.extend_from_slice(self.mint_b.as_ref());
         data.extend_from_slice(self.settlement_authority.as_ref());
+        data.extend_from_slice(self.token_program_a.as_ref());
+        data.extend_from_slice(self.token_program_b.as_ref());
         data.extend_from_slice(&self.amount_a.to_le_bytes());
         data.extend_from_slice(&self.amount_b.to_le_bytes());
         data.extend_from_slice(&self.expiry_timestamp.to_le_bytes());
         data.extend_from_slice(&self.nonce.to_le_bytes());
+        data.extend_from_slice(&self.ref_string);
+        data.extend_from_slice(self.user_a_settlement_destination.as_ref());
+        data.extend_from_slice(self.user_b_settlement_destination.as_ref());
 
         match self.earliest_settlement_timestamp {
             Some(timestamp) => {
@@ -137,6 +172,20 @@ impl SwapDvp {
         );
         offset += 32;
 
+        let token_program_a = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        offset += 32;
+
+        let token_program_b = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        offset += 32;
+
         let amount_a = u64::from_le_bytes(
             data[offset..offset + 8]
                 .try_into()
@@ -165,6 +214,25 @@ impl SwapDvp {
         );
         offset += 8;
 
+        let ref_string: [u8; MAX_REF_STRING_LEN] = data[offset..offset + MAX_REF_STRING_LEN]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        offset += MAX_REF_STRING_LEN;
+
+        let user_a_settlement_destination = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        offset += 32;
+
+        let user_b_settlement_destination = Pubkey::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
+        offset += 32;
+
         // Tag is the source of truth; the payload after a `0` tag is a
         // sentinel (see `to_bytes`) and is intentionally not validated.
         let earliest_settlement_timestamp = match data[offset] {
@@ -184,10 +252,15 @@ impl SwapDvp {
             mint_a,
             mint_b,
             settlement_authority,
+            token_program_a,
+            token_program_b,
             amount_a,
             amount_b,
             expiry_timestamp,
             nonce,
+            ref_string,
+            user_a_settlement_destination,
+            user_b_settlement_destination,
             earliest_settlement_timestamp,
         })
     }
@@ -210,15 +283,21 @@ mod tests {
             mint_a: Pubkey::new_from_array([3u8; 32]),
             mint_b: Pubkey::new_from_array([4u8; 32]),
             settlement_authority: Pubkey::new_from_array([5u8; 32]),
+            token_program_a: Pubkey::new_from_array([6u8; 32]),
+            token_program_b: Pubkey::new_from_array([7u8; 32]),
             amount_a: 1_000,
             amount_b: 2_500,
             expiry_timestamp: 1_780_000_000,
             nonce: 42,
+            ref_string: [8u8; 64],
+            user_a_settlement_destination: Pubkey::new_from_array([9u8; 32]),
+            user_b_settlement_destination: Pubkey::new_from_array([10u8; 32]),
             earliest_settlement_timestamp: None,
         };
         let mut bytes = dvp.to_bytes();
-        // Tag offset = bump(1) + 5*pubkey(160) + 4*u64-or-i64(32) = 193.
-        let option_tag_offset = 1 + 32 * 5 + 8 * 4;
+        // Tag offset = bump(1) + 7*pubkey(224) + 4*u64-or-i64(32)
+        //   + ref_string(64) + 2*destination pubkey(64) = 385.
+        let option_tag_offset = 1 + 32 * 7 + 8 * 4 + MAX_REF_STRING_LEN + 32 * 2;
         bytes[option_tag_offset] = 2;
         let err = SwapDvp::try_from_bytes(&bytes).expect_err("must reject invalid tag");
         assert!(matches!(err, ProgramError::InvalidAccountData));

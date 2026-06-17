@@ -1,4 +1,5 @@
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::{
@@ -31,6 +32,9 @@ mod transaction_cols {
     pub const REMINT_LAST_VALID_BLOCK_HEIGHTS: &str = "remint_last_valid_block_heights";
     pub const PENDING_REMINT_DEADLINE_AT: &str = "pending_remint_deadline_at";
     pub const FINALITY_CHECK_ATTEMPTS: &str = "finality_check_attempts";
+    pub const RECOVERY_REQUEUE_ATTEMPTS: &str = "recovery_requeue_attempts";
+    pub const INSTRUCTION_INDEX: &str = "instruction_index";
+    pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
 }
 
 #[derive(Clone)]
@@ -38,8 +42,27 @@ pub struct PostgresDb {
     pool: PgPool,
 }
 
+// Returns true when the URL parses and its password is absent or empty (a blanked secret).
+// Kept in sync with the identical guard in core's accounts/postgres.rs.
+fn database_url_password_is_blank(database_url: &str) -> bool {
+    match url::Url::parse(database_url) {
+        // None (no password) and Some("") (blanked secret) are both missing credentials.
+        Ok(parsed) => parsed.password().unwrap_or("").is_empty(),
+        // Leave unparseable URLs for sqlx to reject with the real connection error.
+        Err(_) => false,
+    }
+}
+
 impl PostgresDb {
     pub async fn new(config: &PostgresConfig) -> Result<Self, sqlx::Error> {
+        // Fail closed: reject a blank password before connecting (blanked env templates interpolate an empty ${POSTGRES_PASSWORD} into a passwordless URL).
+        if database_url_password_is_blank(&config.database_url) {
+            return Err(sqlx::Error::Configuration(
+                "database_url password component is empty; set a non-empty POSTGRES_PASSWORD"
+                    .into(),
+            ));
+        }
+
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.database_url)
@@ -86,12 +109,13 @@ impl PostgresDb {
             r#"
             CREATE TABLE IF NOT EXISTS transactions (
                 id BIGSERIAL PRIMARY KEY,
-                signature TEXT NOT NULL UNIQUE,
+                signature TEXT NOT NULL,
+                instruction_index INTEGER NOT NULL DEFAULT 0,
                 slot BIGINT NOT NULL,
                 initiator TEXT NOT NULL,
                 recipient TEXT NOT NULL,
                 mint TEXT NOT NULL,
-                amount BIGINT NOT NULL,
+                amount NUMERIC(20,0) NOT NULL,
                 memo TEXT,
                 status transaction_status NOT NULL DEFAULT 'pending',
                 transaction_type transaction_type NOT NULL,
@@ -106,6 +130,48 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
+
+        // Durable identity for an indexed economic event is the pair
+        // (signature, instruction_index): one Solana transaction can carry several
+        // deposit or withdraw instructions, so each must persist as its own row.
+        // This runs right after the table is ensured, so the composite unique index
+        // exists before the table is exposed to any writer (init_schema completes
+        // before the pipeline starts). The column is added first so an in-place
+        // upgrade of a table that predates it does not reference a missing column,
+        // then the composite index is built while the old single-signature
+        // uniqueness is still in force, so signature is never left unprotected, and
+        // only then is the old single-signature constraint dropped. Existing rows
+        // backfill to instruction_index 0, and that old uniqueness guaranteed each
+        // signature mapped to one row, so every (signature, 0) pair is already
+        // unique and the build is clean. signature stays the leading column, so
+        // existing WHERE signature = $1 lookups remain index-served.
+        info!("Running instruction_index migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS instruction_index INTEGER NOT NULL DEFAULT 0;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_signature_ix ON transactions (signature, instruction_index)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_signature_key;
+                DROP INDEX IF EXISTS idx_transactions_signature;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("instruction_index migration complete");
 
         // Create indexes for transactions
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions (status)")
@@ -130,13 +196,6 @@ impl PostgresDb {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_transactions_recipient ON transactions (recipient)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Add unique index for signatures and counterpart_signature
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_signature ON transactions (signature)",
         )
         .execute(&self.pool)
         .await?;
@@ -217,6 +276,59 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
         info!("finality_check_attempts migration complete");
+
+        // Durable recovery requeue counter so the MAX_RECOVERY_REQUEUE_ATTEMPTS
+        // cap survives operator restarts.
+        info!("Running recovery_requeue_attempts migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS recovery_requeue_attempts INTEGER NOT NULL DEFAULT 0;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("recovery_requeue_attempts migration complete");
+
+        // Confirmed remint signature, recorded synchronously after the remint
+        // confirms so a crash before the async writer cannot leave the row at
+        // pending_remint with a landed remint (which restart recovery replays).
+        info!("Running landed_remint_signature migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS landed_remint_signature TEXT;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("landed_remint_signature migration complete");
+
+        // Widen a legacy BIGINT amount column to NUMERIC(20,0). BIGINT wraps amounts
+        // above i64::MAX negative; the cast is lossless and the guard makes it a no-op
+        // once already NUMERIC. Required because the BigDecimal decoder rejects BIGINT.
+        info!("Running amount NUMERIC widening migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'transactions'
+                      AND column_name = 'amount'
+                      AND data_type = 'bigint'
+                ) THEN
+                    ALTER TABLE transactions ALTER COLUMN amount TYPE NUMERIC(20,0);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("amount NUMERIC widening migration complete");
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_trace_id ON transactions (trace_id)",
@@ -374,6 +486,14 @@ impl PostgresDb {
             .execute(&self.pool)
             .await?;
 
+        // Current allow/block state. Existing rows backfill to 'allowed' via the
+        // default; the point-in-time history lives in mint_status_history.
+        sqlx::query(
+            "ALTER TABLE mints ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'allowed'",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Add failed_reminted status for withdrawal remint recovery
         sqlx::query(
             r#"
@@ -423,6 +543,34 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Broadcast release signatures written at send time; recovery reads
+        // them to verify a release landed before demoting (avoids double-payout).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_release_signatures (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+                signature TEXT NOT NULL,
+                last_valid_block_height BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_prs_transaction_id ON pending_release_signatures(transaction_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_prs_signature ON pending_release_signatures(signature)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -431,6 +579,10 @@ impl PostgresDb {
         info!("Dropping database tables...");
 
         // Drop tables with CASCADE to handle dependencies
+        sqlx::query("DROP TABLE IF EXISTS pending_release_signatures CASCADE")
+            .execute(&self.pool)
+            .await?;
+
         sqlx::query("DROP TABLE IF EXISTS transactions CASCADE")
             .execute(&self.pool)
             .await?;
@@ -466,11 +618,13 @@ impl PostgresDb {
         transaction: &DbTransaction,
     ) -> Result<i64, sqlx::Error> {
         let existing: Option<(i64,)> = sqlx::query_as(&format!(
-            "SELECT {} FROM transactions WHERE {} = $1",
+            "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
             transaction_cols::ID,
-            transaction_cols::SIGNATURE
+            transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX
         ))
         .bind(&transaction.signature)
+        .bind(transaction.instruction_index)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -481,12 +635,13 @@ impl PostgresDb {
         let result: Option<(i64,)> = sqlx::query_as(&format!(
             r#"
             INSERT INTO transactions (
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT ({}) DO NOTHING
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT ({}, {}) DO NOTHING
             RETURNING {}
             "#,
             transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::SLOT,
             transaction_cols::INITIATOR,
             transaction_cols::RECIPIENT,
@@ -497,9 +652,11 @@ impl PostgresDb {
             transaction_cols::STATUS,
             transaction_cols::TRACE_ID,
             transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::ID,
         ))
         .bind(&transaction.signature)
+        .bind(transaction.instruction_index)
         .bind(transaction.slot)
         .bind(&transaction.initiator)
         .bind(&transaction.recipient)
@@ -518,11 +675,13 @@ impl PostgresDb {
 
         // Conflict occurred, fetch existing ID
         let (id,): (i64,) = sqlx::query_as(&format!(
-            "SELECT {} FROM transactions WHERE {} = $1",
+            "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
             transaction_cols::ID,
-            transaction_cols::SIGNATURE
+            transaction_cols::SIGNATURE,
+            transaction_cols::INSTRUCTION_INDEX
         ))
         .bind(&transaction.signature)
+        .bind(transaction.instruction_index)
         .fetch_one(&self.pool)
         .await?;
 
@@ -545,11 +704,13 @@ impl PostgresDb {
         for transaction in transactions {
             // Check if already exists
             let existing: Option<(i64,)> = sqlx::query_as(&format!(
-                "SELECT {} FROM transactions WHERE {} = $1",
+                "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
                 transaction_cols::ID,
-                transaction_cols::SIGNATURE
+                transaction_cols::SIGNATURE,
+                transaction_cols::INSTRUCTION_INDEX
             ))
             .bind(&transaction.signature)
+            .bind(transaction.instruction_index)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -562,12 +723,13 @@ impl PostgresDb {
             let result: Option<(i64,)> = sqlx::query_as(&format!(
                 r#"
                 INSERT INTO transactions (
-                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT ({}) DO NOTHING
+                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT ({}, {}) DO NOTHING
                 RETURNING {}
                 "#,
                 transaction_cols::SIGNATURE,
+                transaction_cols::INSTRUCTION_INDEX,
                 transaction_cols::SLOT,
                 transaction_cols::INITIATOR,
                 transaction_cols::RECIPIENT,
@@ -578,9 +740,11 @@ impl PostgresDb {
                 transaction_cols::STATUS,
                 transaction_cols::TRACE_ID,
                 transaction_cols::SIGNATURE,
+                transaction_cols::INSTRUCTION_INDEX,
                 transaction_cols::ID,
             ))
             .bind(&transaction.signature)
+            .bind(transaction.instruction_index)
             .bind(transaction.slot)
             .bind(&transaction.initiator)
             .bind(&transaction.recipient)
@@ -598,11 +762,13 @@ impl PostgresDb {
             } else {
                 // Conflict occurred, fetch existing ID
                 let (id,): (i64,) = sqlx::query_as(&format!(
-                    "SELECT {} FROM transactions WHERE {} = $1",
+                    "SELECT {} FROM transactions WHERE {} = $1 AND {} = $2",
                     transaction_cols::ID,
-                    transaction_cols::SIGNATURE
+                    transaction_cols::SIGNATURE,
+                    transaction_cols::INSTRUCTION_INDEX
                 ))
                 .bind(&transaction.signature)
+                .bind(transaction.instruction_index)
                 .fetch_one(&mut *tx)
                 .await?;
                 ids.push(id);
@@ -622,7 +788,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -648,6 +814,9 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -670,7 +839,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -695,6 +864,9 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -717,7 +889,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -743,6 +915,9 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -805,7 +980,7 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -832,6 +1007,9 @@ impl PostgresDb {
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
             transaction_cols::PENDING_REMINT_DEADLINE_AT,
             transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -864,22 +1042,24 @@ impl PostgresDb {
         Ok(transactions)
     }
 
+    /// Returns true if the row was updated; false if already terminal.
     pub async fn update_transaction_status_internal(
         &self,
         transaction_id: i64,
         status: TransactionStatus,
         counterpart_signature: Option<String>,
         processed_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        // Only write non-terminal source states — blocks late writes after recovery.
+        let result = sqlx::query(
             r#"
             UPDATE transactions
             SET
                 status = $2,
                 counterpart_signature = $3,
-                processed_at = $4,
-                updated_at = NOW()
+                processed_at = $4
             WHERE id = $1
+              AND status IN ('processing', 'pending_remint')
             "#,
         )
         .bind(transaction_id)
@@ -889,7 +1069,135 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Stale `Processing` rows older than the threshold, oldest-first.
+    pub async fn get_stale_processing_transactions_internal(
+        &self,
+        threshold: Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        let threshold_secs = threshold.as_secs() as f64;
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'processing'
+              AND {} < NOW() - make_interval(secs => $1)
+            ORDER BY {} ASC
+            LIMIT $2
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            // Filters
+            transaction_cols::STATUS,
+            transaction_cols::UPDATED_AT,
+            // Ordering (FIFO over stale)
+            transaction_cols::UPDATED_AT,
+        ))
+        .bind(threshold_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// CAS `Processing` → `Pending` keyed on `updated_at`; no-op if stale.
+    pub async fn try_requeue_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending',
+                recovery_requeue_attempts = recovery_requeue_attempts + 1
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// CAS `Processing` → `Completed` keyed on `updated_at`; sig may be `None`.
+    pub async fn try_complete_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'completed',
+                counterpart_signature = COALESCE($3, counterpart_signature),
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(counterpart_signature)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    pub async fn try_quarantine_processing_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'manual_review',
+                processed_at = NOW()
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
     }
 
     /// Transitions a withdrawal to PendingRemint status, storing the
@@ -962,6 +1270,127 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Durably record a confirmed remint: flip status to FailedReminted and
+    /// store the signature in one UPDATE, before the async writer runs. The
+    /// `pending_remint` guard makes it a no-op on an already-terminal row, so
+    /// a replayed call can never resurrect or double-record.
+    pub async fn record_remint_result_internal(
+        &self,
+        transaction_id: i64,
+        remint_signature: String,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET
+                status = $2,
+                landed_remint_signature = $3,
+                processed_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+                AND status = 'pending_remint'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(TransactionStatus::FailedReminted)
+        .bind(remint_signature)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            // The guarded UPDATE matched nothing. Distinguish the two cases for
+            // on-call: a missing row is a bug (the id came from a live
+            // PendingRemint row), a non-pending_remint status is expected on an
+            // idempotent replay. Both still signal RowNotFound so the caller
+            // falls back to the async writer.
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+                    .bind(transaction_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            match current.as_deref() {
+                None => warn!("record_remint_result: transaction {transaction_id} not found"),
+                Some(status) => info!(
+                    "record_remint_result: transaction {transaction_id} not pending_remint \
+                     (status {status}); skipping"
+                ),
+            }
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        Ok(())
+    }
+
+    /// Persist a broadcast release signature so recovery can verify finality
+    /// before demoting. Idempotent on `signature`.
+    pub async fn insert_release_signature_internal(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_release_signatures
+                (transaction_id, signature, last_valid_block_height)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (signature) DO NOTHING
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .bind(last_valid_block_height)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return a transaction's release signatures as (signature, lvbh).
+    pub async fn get_release_signatures_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT signature, last_valid_block_height
+            FROM pending_release_signatures
+            WHERE transaction_id = $1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(transaction_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Delete all stored release signatures for a transaction.
+    pub async fn delete_release_signatures_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM pending_release_signatures WHERE transaction_id = $1")
+            .bind(transaction_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drop release signatures whose parent transaction is no longer
+    /// `processing`. Returns the number of rows removed.
+    pub async fn gc_stale_release_signatures_internal(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM pending_release_signatures
+            WHERE transaction_id IN (
+                SELECT id FROM transactions WHERE status <> 'processing'
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.
     ///
     /// `exclude_id` is the poison row that the caller has already quarantined
@@ -1016,8 +1445,8 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program)
-                VALUES ($1, $2, $3)
+                INSERT INTO mints (mint_address, decimals, token_program, status)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program
@@ -1026,11 +1455,42 @@ impl PostgresDb {
             .bind(&mint.mint_address)
             .bind(mint.decimals)
             .bind(&mint.token_program)
+            .bind(&mint.status)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Set each mint's `status` mirror to its latest `mint_status_history`
+    /// transition (highest `effective_slot`); a mint with no row is untouched.
+    pub async fn sync_mint_status_internal(
+        &self,
+        mint_addresses: &[String],
+    ) -> Result<(), StorageError> {
+        if mint_addresses.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE mints m
+            SET status = h.status
+            FROM (
+                SELECT DISTINCT ON (mint_address) mint_address, status
+                FROM mint_status_history
+                WHERE mint_address = ANY($1)
+                ORDER BY mint_address, effective_slot DESC
+            ) h
+            WHERE m.mint_address = h.mint_address
+            "#,
+        )
+        .bind(mint_addresses)
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
@@ -1164,11 +1624,11 @@ impl PostgresDb {
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_deposits,
+                )::NUMERIC AS total_deposits,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_withdrawals
+                )::NUMERIC AS total_withdrawals
             FROM mints m
             LEFT JOIN transactions t ON t.mint = m.mint_address
             GROUP BY m.mint_address, m.token_program
@@ -1199,11 +1659,11 @@ impl PostgresDb {
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'deposit' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_deposits,
+                )::NUMERIC AS total_deposits,
                 COALESCE(
                     SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
                     0
-                )::BIGINT AS total_withdrawals
+                )::NUMERIC AS total_withdrawals
             FROM mints m
             LEFT JOIN transactions t ON t.mint = m.mint_address
             GROUP BY m.mint_address, m.token_program
@@ -1283,5 +1743,36 @@ impl PostgresDb {
         .await?;
 
         Ok(nonces.into_iter().map(|(n,)| n).collect())
+    }
+}
+
+#[cfg(test)]
+mod password_guard_tests {
+    use super::database_url_password_is_blank;
+
+    #[test]
+    fn flags_blank_and_missing_password() {
+        // Set-but-empty password (blanked template) is flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://user:@host:5434/indexer"
+        ));
+        // No password at all is flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://user@host:5434/indexer"
+        ));
+        // No userinfo at all is flagged.
+        assert!(database_url_password_is_blank(
+            "postgres://host:5434/indexer"
+        ));
+        // A real password is not blank.
+        assert!(!database_url_password_is_blank(
+            "postgres://user:secret@host:5434/indexer"
+        ));
+        // A percent-encoded password is a real, non-empty credential.
+        assert!(!database_url_password_is_blank(
+            "postgres://user:p%40ss@host:5434/indexer"
+        ));
+        // Unparseable URLs are not flagged; sqlx surfaces the real connect error.
+        assert!(!database_url_password_is_blank("not-a-valid-url"));
     }
 }
