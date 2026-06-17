@@ -154,17 +154,19 @@ fn process_instruction_data(data: &[u8]) -> Result<DepositArgs, ProgramError> {
     );
     offset += 8;
 
-    let has_recipient = data[offset] != 0;
+    let tag = data[offset];
     offset += 1;
 
-    let recipient = if has_recipient {
-        require_len!(data, offset + 32);
+    let recipient = match tag {
+        0 => None,
+        1 => {
+            require_len!(data, offset + 32);
 
-        let mut recipient_bytes = [0u8; 32];
-        recipient_bytes.copy_from_slice(&data[offset..offset + 32]);
-        Some(Address::new_from_array(recipient_bytes))
-    } else {
-        None
+            let mut recipient_bytes = [0u8; 32];
+            recipient_bytes.copy_from_slice(&data[offset..offset + 32]);
+            Some(Address::new_from_array(recipient_bytes))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
     };
 
     Ok(DepositArgs { amount, recipient })
@@ -211,6 +213,20 @@ mod tests {
     #[test]
     fn test_process_deposit_instruction_data_insufficient_length() {
         let instruction_data = vec![1, 2, 3];
+
+        let result = process_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_process_deposit_instruction_data_non_canonical_recipient_tag() {
+        // Flag byte = 2 is not a valid Option tag. The on-chain parser must reject it
+        // so it stays in sync with the Borsh-based indexer, which only accepts 0 or 1.
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&1000u64.to_le_bytes());
+        instruction_data.push(2);
+        instruction_data.extend_from_slice(&[0u8; 32]);
 
         let result = process_instruction_data(&instruction_data);
 
