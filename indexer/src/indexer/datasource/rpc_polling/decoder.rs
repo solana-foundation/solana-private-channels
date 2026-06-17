@@ -985,8 +985,7 @@ mod tests {
 
         // Top-level targets the foreign router (index 1); it is not indexed.
         let top = create_instruction(1, vec![], "router".to_string());
-        let mut tx =
-            create_successful_transaction("sig_deep".to_string(), account_keys, vec![top]);
+        let mut tx = create_successful_transaction("sig_deep".to_string(), account_keys, vec![top]);
 
         let foreign = |h: u32| InnerInstruction {
             instruction: create_instruction(1, vec![], "foreign".to_string()),
@@ -1040,7 +1039,11 @@ mod tests {
         let result = parse_block(&block, 9, ProgramType::Escrow, None);
 
         // Only the three deposits surface (events parse to Ok(None); foreign skipped).
-        assert_eq!(result.len(), 3, "three escrow deposits across mixed CPI depths");
+        assert_eq!(
+            result.len(),
+            3,
+            "three escrow deposits across mixed CPI depths"
+        );
 
         // Each deposit keeps its flat position as inner_index and reads its own event.
         let got: Vec<(u32, Option<u32>, u64)> = result
