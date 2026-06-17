@@ -83,13 +83,15 @@ fn parse_instruction_data(data: &[u8]) -> Result<WithdrawFundsArgs, ProgramError
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
-    let destination = if data[8] != 0 {
-        require_len!(data, 9 + 32);
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&data[9..41]);
-        Some(Address::new_from_array(bytes))
-    } else {
-        None
+    let destination = match data[8] {
+        0 => None,
+        1 => {
+            require_len!(data, 9 + 32);
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&data[9..41]);
+            Some(Address::new_from_array(bytes))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
     };
 
     Ok(WithdrawFundsArgs {
@@ -178,6 +180,20 @@ mod tests {
         instruction_data.extend_from_slice(&100u64.to_le_bytes());
         instruction_data.push(1);
         instruction_data.extend_from_slice(&[0u8; 5]);
+
+        let result = parse_instruction_data(&instruction_data);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_parse_instruction_data_non_canonical_option_tag() {
+        // Flag byte = 2 is not a valid Option tag. The on-chain parser must reject it
+        // so it stays in sync with the Borsh-based indexer, which only accepts 0 or 1.
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&100u64.to_le_bytes());
+        instruction_data.push(2);
+        instruction_data.extend_from_slice(&[0u8; 32]);
 
         let result = parse_instruction_data(&instruction_data);
 
