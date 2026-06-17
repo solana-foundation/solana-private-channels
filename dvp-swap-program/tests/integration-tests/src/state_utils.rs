@@ -16,6 +16,9 @@ use crate::utils::{
 pub const AMOUNT_A: u64 = 75_000;
 pub const AMOUNT_B: u64 = 50_000;
 pub const INITIAL_BALANCE: u64 = 200_000;
+/// Default ref string used by `assert_create_dvp`; stored zero-padded
+/// on the SwapDvp.
+pub const REF_STRING: &str = "INTEGRATION-TEST-REF";
 
 /// Pubkeys and ATAs for one DvP, built by `setup_dvp`. `token_program_a`
 /// and `token_program_b` default to legacy SPL Token for backwards
@@ -128,6 +131,7 @@ pub fn assert_create_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
     context.send(ix, &[]).expect("CreateDvp")
 }
@@ -219,8 +223,8 @@ pub fn assert_settle_dvp(context: &mut TestContext, fixture: &DvpFixture) -> Tra
         .mint_b(fixture.mint_b)
         .dvp_ata_a(fixture.dvp_ata_a)
         .dvp_ata_b(fixture.dvp_ata_b)
-        .user_a_ata_b(fixture.user_a_ata_b)
-        .user_b_ata_a(fixture.user_b_ata_a)
+        .user_a_destination_ata_b(fixture.user_a_ata_b)
+        .user_b_destination_ata_a(fixture.user_b_ata_a)
         .user_a_ata_a(fixture.user_a_ata_a)
         .user_b_ata_b(fixture.user_b_ata_b)
         .token_program_a(fixture.token_program_a)

@@ -65,6 +65,7 @@ pub const SETTLEMENT_AUTHORITY_EXECUTABLE: u32 =
 pub const SETTLEMENT_AUTHORITY_IS_PARTY: u32 =
     DvpSwapProgramError::SettlementAuthorityIsParty as u32;
 pub const NONCE_ALREADY_USED: u32 = DvpSwapProgramError::NonceAlreadyUsed as u32;
+pub const REF_STRING_TOO_LONG: u32 = DvpSwapProgramError::RefStringTooLong as u32;
 
 const MIN_LAMPORTS: u64 = 500_000_000;
 

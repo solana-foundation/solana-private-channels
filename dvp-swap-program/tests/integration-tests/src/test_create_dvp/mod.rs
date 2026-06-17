@@ -1,14 +1,16 @@
-use dvp_swap_program_client::instructions::CreateDvpBuilder;
+use dvp_swap_program_client::{accounts::SwapDvp, instructions::CreateDvpBuilder};
 use solana_sdk::signature::{Keypair, Signer};
 use spl_associated_token_account::instruction::create_associated_token_account;
 
 use crate::{
-    state_utils::{assert_cancel_dvp, assert_create_dvp, setup_dvp, AMOUNT_A, AMOUNT_B},
+    state_utils::{
+        assert_cancel_dvp, assert_create_dvp, setup_dvp, AMOUNT_A, AMOUNT_B, REF_STRING,
+    },
     utils::{
         assert_program_error, get_token_balance, TestContext, EARLIEST_AFTER_EXPIRY,
-        EXPIRY_NOT_IN_FUTURE, EXPIRY_TOO_FAR_IN_FUTURE, NONCE_ALREADY_USED, SAME_MINT, SELF_DVP,
-        SETTLEMENT_AUTHORITY_EXECUTABLE, SETTLEMENT_AUTHORITY_IS_PARTY, SWAP_PROGRAM_ID,
-        ZERO_AMOUNT,
+        EXPIRY_NOT_IN_FUTURE, EXPIRY_TOO_FAR_IN_FUTURE, NONCE_ALREADY_USED, REF_STRING_TOO_LONG,
+        SAME_MINT, SELF_DVP, SETTLEMENT_AUTHORITY_EXECUTABLE, SETTLEMENT_AUTHORITY_IS_PARTY,
+        SWAP_PROGRAM_ID, ZERO_AMOUNT,
     },
 };
 
@@ -63,6 +65,7 @@ fn test_create_dvp_rejects_expiry_at_now() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(now)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), EXPIRY_NOT_IN_FUTURE);
@@ -92,6 +95,7 @@ fn test_create_dvp_rejects_expiry_too_far_in_future() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(one_year_plus_one)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), EXPIRY_TOO_FAR_IN_FUTURE);
@@ -120,6 +124,7 @@ fn test_create_dvp_rejects_earliest_after_expiry() {
         .expiry_timestamp(fixture.expiry)
         .earliest_settlement_timestamp(fixture.expiry + 1)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), EARLIEST_AFTER_EXPIRY);
@@ -147,6 +152,7 @@ fn test_create_dvp_rejects_self_dvp() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), SELF_DVP);
@@ -174,6 +180,7 @@ fn test_create_dvp_rejects_same_mint() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), SAME_MINT);
@@ -201,6 +208,7 @@ fn test_create_dvp_rejects_zero_amount_a() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), ZERO_AMOUNT);
@@ -228,6 +236,7 @@ fn test_create_dvp_rejects_zero_amount_b() {
         .amount_b(0)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), ZERO_AMOUNT);
@@ -258,6 +267,7 @@ fn test_create_dvp_rejects_executable_settlement_authority() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), SETTLEMENT_AUTHORITY_EXECUTABLE);
@@ -289,6 +299,7 @@ fn test_create_dvp_rejects_settlement_authority_as_party() {
             .amount_b(AMOUNT_B)
             .expiry_timestamp(fixture.expiry)
             .nonce(fixture.nonce)
+            .ref_string(REF_STRING.to_string())
             .instruction();
 
         assert_program_error(context.send(ix, &[]), SETTLEMENT_AUTHORITY_IS_PARTY);
@@ -329,6 +340,7 @@ fn test_create_dvp_rejects_reused_nonce_after_close() {
         .amount_b(AMOUNT_B)
         .expiry_timestamp(fixture.expiry)
         .nonce(fixture.nonce)
+        .ref_string(REF_STRING.to_string())
         .instruction();
 
     assert_program_error(context.send(ix, &[]), NONCE_ALREADY_USED);
@@ -364,4 +376,119 @@ fn test_create_dvp_succeeds_when_escrow_ata_was_pre_created() {
     assert!(context.get_account(&fixture.dvp_ata_b).is_some());
     assert_eq!(get_token_balance(&context, &fixture.dvp_ata_a), 0);
     assert_eq!(get_token_balance(&context, &fixture.dvp_ata_b), 0);
+}
+
+/// The ref string is stored zero-padded, and the account decodes with
+/// the generated Borsh client — the only check that the hand-rolled
+/// on-chain serialization and the IDL-derived client layout agree.
+#[test]
+fn test_create_dvp_stores_ref_string() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    assert_create_dvp(&mut context, &fixture);
+
+    let account = context.get_account(&fixture.swap_dvp).expect("SwapDvp");
+    let dvp = SwapDvp::from_bytes(&account.data).expect("client must decode the account");
+
+    let mut expected = [0u8; 64];
+    expected[..REF_STRING.len()].copy_from_slice(REF_STRING.as_bytes());
+    assert_eq!(dvp.ref_string, expected);
+    assert_eq!(dvp.amount_a, AMOUNT_A);
+    assert_eq!(dvp.amount_b, AMOUNT_B);
+    assert_eq!(dvp.earliest_settlement_timestamp, None);
+    // Destinations were not provided, so they resolved to the users.
+    assert_eq!(dvp.user_a_settlement_destination, fixture.user_a.pubkey());
+    assert_eq!(dvp.user_b_settlement_destination, fixture.user_b.pubkey());
+}
+
+/// `ref_string` is optional: omitting it stores all zeros.
+#[test]
+fn test_create_dvp_without_ref_string_stores_zeros() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .instruction();
+    context.send(ix, &[]).expect("CreateDvp without ref_string");
+
+    let account = context.get_account(&fixture.swap_dvp).expect("SwapDvp");
+    let dvp = SwapDvp::from_bytes(&account.data).expect("client must decode the account");
+    assert_eq!(dvp.ref_string, [0u8; 64]);
+}
+
+#[test]
+fn test_create_dvp_accepts_max_len_ref_string() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let max_ref = "R".repeat(64);
+    let ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .ref_string(max_ref.clone())
+        .instruction();
+    context.send(ix, &[]).expect("CreateDvp with 64-byte ref");
+
+    let account = context.get_account(&fixture.swap_dvp).expect("SwapDvp");
+    let dvp = SwapDvp::from_bytes(&account.data).expect("client must decode the account");
+    assert_eq!(dvp.ref_string, max_ref.as_bytes());
+}
+
+#[test]
+fn test_create_dvp_rejects_ref_string_over_max_len() {
+    let mut context = TestContext::new();
+    let fixture = setup_dvp(&mut context, 0);
+
+    let ix = CreateDvpBuilder::new()
+        .payer(context.payer.pubkey())
+        .swap_dvp(fixture.swap_dvp)
+        .nonce_tombstone(fixture.nonce_tombstone)
+        .mint_a(fixture.mint_a)
+        .mint_b(fixture.mint_b)
+        .dvp_ata_a(fixture.dvp_ata_a)
+        .dvp_ata_b(fixture.dvp_ata_b)
+        .token_program_a(fixture.token_program_a)
+        .token_program_b(fixture.token_program_b)
+        .user_a(fixture.user_a.pubkey())
+        .user_b(fixture.user_b.pubkey())
+        .settlement_authority(fixture.settlement_authority.pubkey())
+        .amount_a(AMOUNT_A)
+        .amount_b(AMOUNT_B)
+        .expiry_timestamp(fixture.expiry)
+        .nonce(fixture.nonce)
+        .ref_string("R".repeat(65))
+        .instruction();
+
+    assert_program_error(context.send(ix, &[]), REF_STRING_TOO_LONG);
 }
