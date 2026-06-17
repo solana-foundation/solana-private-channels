@@ -418,6 +418,7 @@ mod tests {
             decimals,
             token_program: token_program.to_string(),
             created_at: chrono::Utc::now(),
+            status: "allowed".to_string(),
             is_pausable: Some(false),
             has_permanent_delegate: Some(false),
         });
@@ -491,6 +492,7 @@ mod tests {
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: Some(false),
                 has_permanent_delegate: Some(false),
             });
@@ -521,6 +523,7 @@ mod tests {
             decimals: 6,
             token_program: TOKEN_PROGRAM_ID.to_string(),
             created_at: chrono::Utc::now(),
+            status: "allowed".to_string(),
             is_pausable: Some(false),
             has_permanent_delegate: Some(false),
         });
@@ -529,6 +532,7 @@ mod tests {
             decimals: 9,
             token_program: TOKEN_2022_PROGRAM_ID.to_string(),
             created_at: chrono::Utc::now(),
+            status: "allowed".to_string(),
             is_pausable: Some(false),
             has_permanent_delegate: Some(false),
         });
@@ -600,6 +604,7 @@ mod tests {
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: None,
                 has_permanent_delegate: None,
             },
@@ -647,6 +652,7 @@ mod tests {
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: None,
                 has_permanent_delegate: None,
             },
@@ -672,6 +678,7 @@ mod tests {
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
                 is_pausable: None,
                 has_permanent_delegate: None,
             },

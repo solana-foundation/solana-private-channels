@@ -117,6 +117,8 @@ pub struct DbMint {
     pub mint_address: String,
     pub decimals: i16,
     pub token_program: String,
+    /// Current allow/block state (`"allowed"` | `"blocked"`)
+    pub status: String,
     pub created_at: DateTime<Utc>,
     /// `None` = the on-chain PausableConfig extension state is unknown to us yet.
     /// Resolved lazily by the operator's MintCache on first RPC fetch.
@@ -132,6 +134,8 @@ impl DbMint {
             mint_address,
             decimals,
             token_program,
+            // A DbMint is only ever constructed on the allow path.
+            status: "allowed".to_string(),
             created_at: Utc::now(),
             is_pausable: None,
             has_permanent_delegate: None,
