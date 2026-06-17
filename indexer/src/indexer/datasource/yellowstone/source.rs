@@ -9,9 +9,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-#[cfg(feature = "datasource-rpc")]
-use tracing::warn;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
@@ -1111,12 +1109,19 @@ async fn handle_transaction(
             .collect();
 
         // Order matters: writable then readonly, matching execution order.
-        loaded_pubkeys = meta
+        loaded_pubkeys = match meta
             .loaded_writable_addresses
             .iter()
             .chain(meta.loaded_readonly_addresses.iter())
-            .filter_map(|bytes| Pubkey::try_from(bytes.as_slice()).ok())
-            .collect();
+            .map(|bytes| Pubkey::try_from(bytes.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("Skipping transaction at slot {slot}: invalid loaded address: {e}");
+                return Ok(());
+            }
+        };
     }
 
     // Extract signature
