@@ -68,14 +68,12 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 ## Step 3: Create an Escrow Instance
 
 1. **Connect Wallet**  
-     
+
    - Set your browser wallet to **Devnet** network  
    - Ensure you have Devnet SOL for transaction fees (use the [Solana Faucet](https://faucet.solana.com/) if needed)
 
-   
-
 2. **Create Instance**  
-     
+
    - In the Admin UI, click **"Create New Instance"**  
    - Approve the transaction in your wallet  
    - **Copy the Instance Address** — you'll need this for configuration
@@ -112,23 +110,22 @@ Back in the Admin UI:
 2. Enter your operator's public key (from Step 4)  
 3. Click **"Add Operator"** and approve the transaction
 
-
 ## Step 6: Configure Environment Variables
 
-Update `.env.devnet` file in the project root. Replace the following environment variables:
+Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates, so live keys never touch a tracked file. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
 
 > **Required secrets — no defaults are shipped.** `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, and `ADMIN_PRIVATE_KEY` (and `JWT_SECRET` if you enable auth) MUST be set or the services fail to start. Generate strong passwords with `openssl rand -hex 32`.
 
 ```shell
-# Required: database credentials (services fail closed if blank)
+# Required secrets: put these in the gitignored `.env`, NOT in .env.devnet
 POSTGRES_PASSWORD=<openssl rand -hex 32>
 POSTGRES_REPLICATION_PASSWORD=<openssl rand -hex 32>
+# Operator keypair (written to `.env` automatically by `make build-devnet`)
+ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>
 
+# Non-secret values below go in .env.devnet
 # Escrow instance (from Step 3)
 ESCROW_INSTANCE_ID=<your_instance_address>
-
-# Operator keypair (the contents of operator-keypair.json from Step 4)
-ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>
 
 # Keys allowed to mint on the Solana Private Channels payment channel (comma-separated public keys)
 # For testing, use your operator's public key
@@ -149,7 +146,7 @@ INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 
 ## Step 7: Start All Services
 
-Once your docker build (Step 1) is complete, run: 
+Once your docker build (Step 1) is complete, run:
 
 ```shell
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d
@@ -198,7 +195,14 @@ For reference, here are the ports and endpoints that are now running:
 | Prometheus | `9090` | Metrics collection |
 | cAdvisor | `8080` | Container metrics |
 
-## 
+### Node RPC ports and the RBAC boundary
+
+The gateway (`8899`) is the only port that enforces RBAC (account-gating and operator-only methods). The
+write-node (`8900`) and read-node (`8901`) RPC ports have **no node-side authentication**. Because of that, the
+reference compose binds these node ports to loopback (`127.0.0.1`), so they are reachable from the host
+but not from other machines. RBAC is an application-layer control on the gateway, not a network boundary.
+
+##
 
 ## Step 8: Test Deposits and Withdrawals
 
@@ -225,7 +229,6 @@ After your balance has been verified on Solana Private Channels, you should now 
 2. Enter a user destination address and amount (with decimal precision)
 3. Click send and confirm the transaction in your wallet!
 4. You can check your Solana Private Channels balance again and notice that the funds have been debited by your transfer amount.
-
 
 ### Withdraw (Solana Private Channels → Solana)
 
@@ -294,7 +297,7 @@ docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .
 
 ## Get Help
 
-Solana Private Channels is still in the early stages of development. If you run into issues or bugs, please [create an issue](https://github.com/solana-foundation/solana-private-channels/issues) and outline your steps to reproduce it. 
+Solana Private Channels is still in the early stages of development. If you run into issues or bugs, please [create an issue](https://github.com/solana-foundation/solana-private-channels/issues) and outline your steps to reproduce it.
 
 ## Configuration Reference
 

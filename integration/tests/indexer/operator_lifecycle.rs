@@ -33,6 +33,7 @@ use private_channel_indexer::config::{
 use private_channel_indexer::operator;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
 use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
+use private_channel_indexer::storage::common::amount::TokenAmount;
 use private_channel_indexer::storage::common::models::{
     DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionStatus,
 };
@@ -203,7 +204,7 @@ fn make_withdrawal_transaction(
     signature: String,
     mint: String,
     recipient: String,
-    amount: i64,
+    amount: u64,
     nonce: i64,
 ) -> DbTransaction {
     let now = Utc::now();
@@ -215,7 +216,7 @@ fn make_withdrawal_transaction(
         initiator: recipient.clone(),
         recipient,
         mint,
-        amount,
+        amount: TokenAmount(amount),
         memo: None,
         transaction_type: TransactionType::Withdrawal,
         withdrawal_nonce: Some(nonce),
@@ -229,6 +230,7 @@ fn make_withdrawal_transaction(
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
         recovery_requeue_attempts: 0,
+        instruction_index: 0,
         landed_remint_signature: None,
     }
 }
@@ -989,7 +991,7 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
     println!("=== Operator Lifecycle: Sequential Withdrawals (Multi-Nonce) ===");
 
     const ESCROW_FUND: u64 = 200_000;
-    const WITHDRAWAL_AMOUNT: i64 = 50_000;
+    const WITHDRAWAL_AMOUNT: u64 = 50_000;
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
@@ -1089,7 +1091,7 @@ async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std
     let final_balance = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
         final_balance,
-        initial_balance + (WITHDRAWAL_AMOUNT as u64) * 2,
+        initial_balance + WITHDRAWAL_AMOUNT * 2,
         "User should have received both withdrawal amounts"
     );
 

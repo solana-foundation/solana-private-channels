@@ -31,6 +31,7 @@ use {
     private_channel_indexer::{
         config::{OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator,
+        storage::common::amount::TokenAmount,
         storage::common::models::{DbMint, DbMintStatus, DbTransaction, TransactionStatus},
         storage::{PostgresDb, Storage, TransactionType},
         PostgresConfig,
@@ -199,7 +200,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
         initiator: recipient.to_string(),
         recipient: recipient.to_string(),
         mint: env.mint.to_string(),
-        amount: 10_000,
+        amount: TokenAmount(10_000),
         memo: None,
         transaction_type: TransactionType::Withdrawal,
         withdrawal_nonce: Some(0), // trigger will overwrite with NEXTVAL
@@ -213,6 +214,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
         recovery_requeue_attempts: 0,
+        instruction_index: 0,
         landed_remint_signature: None,
     };
     storage.insert_db_transaction(&withdrawal).await?;

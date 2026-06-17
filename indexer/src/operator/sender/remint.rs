@@ -512,6 +512,7 @@ mod tests {
     use crate::operator::MintCache;
     use crate::operator::RetryConfig;
     use crate::operator::RpcClientWithRetry;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
     use solana_sdk::commitment_config::CommitmentConfig;
@@ -578,7 +579,7 @@ mod tests {
                 initiator: Pubkey::new_unique().to_string(),
                 recipient: Pubkey::new_unique().to_string(),
                 mint: Pubkey::new_unique().to_string(),
-                amount: 0,
+                amount: TokenAmount(0),
                 memo: None,
                 transaction_type: TransactionType::Withdrawal,
                 withdrawal_nonce: Some(id),
@@ -592,6 +593,7 @@ mod tests {
                 pending_remint_deadline_at: Some(now),
                 finality_check_attempts: attempts,
                 recovery_requeue_attempts: 0,
+                instruction_index: 0,
                 landed_remint_signature: None,
             });
     }

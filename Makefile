@@ -540,16 +540,20 @@ check-buildkit-cache:
 #     still run if Docker / BuildKit configuration is in a degraded state.
 COMPOSE_LOCAL    := docker-compose.yml
 COMPOSE_DEVNET   := docker-compose.devnet.yml
-ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local
-ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet
+# The gitignored `.env` is loaded last (later --env-file wins), so `make build-*`
+# writes live private keys there and the tracked templates stay secret-free.
+# $(wildcard) drops the flag when `.env` is absent; compose errors on missing files.
+ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local $(if $(wildcard .env),--env-file .env)
+ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet $(if $(wildcard .env),--env-file .env)
 
 # Fail closed before starting the stack if required secrets are blank. The
-# check script takes plain file paths, so pass the raw chain (no --env-file).
+# check script takes plain file paths, so pass the raw chain (no --env-file),
+# including the gitignored `.env` so it validates what compose actually resolves.
 check-env-local:
-	@./scripts/check-required-env.sh versions.env .env.local
+	@./scripts/check-required-env.sh versions.env .env.local $(wildcard .env)
 
 check-env-devnet:
-	@./scripts/check-required-env.sh versions.env .env.devnet
+	@./scripts/check-required-env.sh versions.env .env.devnet $(wildcard .env)
 
 # --- Local stack (local validator) ---
 

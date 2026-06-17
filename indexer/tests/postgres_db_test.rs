@@ -5,9 +5,11 @@
 //!
 //! Run with: `cd indexer && cargo test --test postgres_db_test -- --test-threads=1`
 
+use bigdecimal::BigDecimal;
 use chrono::Utc;
 use private_channel_indexer::{
     storage::{
+        common::amount::TokenAmount,
         common::models::{DbMint, DbMintStatus, MintStatusAtSlot},
         DbTransaction, PostgresDb, Storage, TransactionStatus, TransactionType,
     },
@@ -55,7 +57,7 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         initiator: "initiator".to_string(),
         recipient: "recipient".to_string(),
         mint: "mint_addr".to_string(),
-        amount: 1_000,
+        amount: TokenAmount(1_000),
         memo: None,
         transaction_type: txn_type,
         withdrawal_nonce: None,
@@ -69,6 +71,7 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         pending_remint_deadline_at: None,
         finality_check_attempts: 0,
         recovery_requeue_attempts: 0,
+        instruction_index: 0,
         landed_remint_signature: None,
     }
 }
@@ -128,6 +131,88 @@ async fn drop_tables_then_reinit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A database created before this change has `amount BIGINT`. init_schema must
+/// widen it to NUMERIC(20,0) in place, after which a value above i64::MAX (which
+/// BIGINT could not hold) round-trips through the TokenAmount decode path.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_widens_legacy_bigint_amount_column() -> Result<(), Box<dyn std::error::Error>>
+{
+    let container = Postgres::default()
+        .with_db_name("db_test")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{}:{}/db_test", host, port);
+    let pool = PgPool::connect(&db_url).await?;
+
+    // Stand up the pre-change shape: the base transactions table with a BIGINT
+    // amount (newer columns are added by init_schema's ALTER migrations).
+    sqlx::query(
+        "CREATE TYPE transaction_status AS ENUM ('pending', 'processing', 'completed', 'failed')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("CREATE TYPE transaction_type AS ENUM ('deposit', 'withdrawal')")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        r#"
+        CREATE TABLE transactions (
+            id BIGSERIAL PRIMARY KEY,
+            signature TEXT NOT NULL UNIQUE,
+            slot BIGINT NOT NULL,
+            initiator TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            mint TEXT NOT NULL,
+            amount BIGINT NOT NULL,
+            memo TEXT,
+            status transaction_status NOT NULL DEFAULT 'pending',
+            transaction_type transaction_type NOT NULL,
+            withdrawal_nonce BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            processed_at TIMESTAMPTZ,
+            counterpart_signature TEXT
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url,
+            max_connections: 5,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    // The column type must now be numeric, not bigint.
+    let (data_type,): (String,) = sqlx::query_as(
+        "SELECT data_type::text FROM information_schema.columns
+         WHERE table_name = 'transactions' AND column_name = 'amount'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(data_type, "numeric", "amount must be widened to NUMERIC");
+
+    // A value BIGINT could never have stored must now round-trip exactly.
+    let big = TokenAmount(i64::MAX as u64 + 1);
+    let mut txn = make_db_transaction("legacy_big", TransactionType::Deposit);
+    txn.amount = big;
+    let id = storage.insert_db_transaction(&txn).await?;
+    let (got,): (TokenAmount,) = sqlx::query_as("SELECT amount FROM transactions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(got, big);
+    Ok(())
+}
+
 // ── 2. Single transaction insert ─────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -138,14 +223,57 @@ async fn insert_transaction_returns_id() -> Result<(), Box<dyn std::error::Error
     let id = storage.insert_db_transaction(&txn).await?;
     assert!(id > 0);
 
-    // Readable back
-    let row: (String, i64) =
+    // Readable back; amount is NUMERIC and decodes through the TokenAmount seam.
+    let row: (String, TokenAmount) =
         sqlx::query_as("SELECT signature, amount FROM transactions WHERE id = $1")
             .bind(id)
             .fetch_one(&pool)
             .await?;
     assert_eq!(row.0, "sig_1");
-    assert_eq!(row.1, 1_000);
+    assert_eq!(row.1, TokenAmount(1_000));
+    Ok(())
+}
+
+/// A deposit and a withdrawal of `i64::MAX + 1` (a value BIGINT would have
+/// wrapped to a negative i64) must round-trip through NUMERIC bit-for-bit, both
+/// when read back as the raw column and through the DbTransaction FromRow path.
+#[tokio::test(flavor = "multi_thread")]
+async fn amount_above_i64_max_round_trips_exactly() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let big = i64::MAX as u64 + 1;
+
+    let mut deposit = make_db_transaction("big_deposit", TransactionType::Deposit);
+    deposit.amount = TokenAmount(big);
+    let mut withdrawal = make_db_transaction("big_withdrawal", TransactionType::Withdrawal);
+    withdrawal.amount = TokenAmount(big);
+
+    let deposit_id = storage.insert_db_transaction(&deposit).await?;
+    let withdrawal_id = storage.insert_db_transaction(&withdrawal).await?;
+
+    for id in [deposit_id, withdrawal_id] {
+        let row: (TokenAmount,) = sqlx::query_as("SELECT amount FROM transactions WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            row.0,
+            TokenAmount(big),
+            "raw column must preserve the full u64"
+        );
+    }
+
+    let fetched = storage
+        .get_pending_db_transactions(TransactionType::Deposit, 10)
+        .await?;
+    let got = fetched
+        .iter()
+        .find(|t| t.signature == "big_deposit")
+        .expect("deposit row");
+    assert_eq!(
+        got.amount,
+        TokenAmount(big),
+        "FromRow must preserve the full u64"
+    );
     Ok(())
 }
 
@@ -465,6 +593,59 @@ async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_mint_status_mirrors_history_against_postgres(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    storage
+        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .await?;
+    assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
+
+    // allowed@10 then blocked@20 → mirror resolves to the latest (blocked),
+    // metadata untouched.
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("sm", "allowed", 10, "sig-a"),
+            mk_status("sm", "blocked", 20, "sig-b"),
+        ])
+        .await?;
+    storage.sync_mint_status(&["sm".to_string()]).await?;
+    let got = storage.get_mint("sm").await?.unwrap();
+    assert_eq!(got.status, "blocked");
+    assert_eq!(got.decimals, 6);
+    assert_eq!(got.token_program, "TokenkegQ");
+
+    // Re-allow at a later slot → mirror flips back.
+    storage
+        .insert_mint_statuses_batch(&[mk_status("sm", "allowed", 30, "sig-c")])
+        .await?;
+    storage.sync_mint_status(&["sm".to_string()]).await?;
+    assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
+
+    // Re-running the upsert (slot replay) must not clobber a later block: block
+    // it again, re-upsert, and confirm the mirror still reflects history.
+    storage
+        .insert_mint_statuses_batch(&[mk_status("sm", "blocked", 40, "sig-d")])
+        .await?;
+    storage.sync_mint_status(&["sm".to_string()]).await?;
+    storage
+        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .await?;
+    assert_eq!(
+        storage.get_mint("sm").await?.unwrap().status,
+        "blocked",
+        "upsert (re-allow ingest / replay) must not touch status"
+    );
+
+    // Syncing a mint with no row is a no-op (no error).
+    storage
+        .sync_mint_status(&["no_such_mint".to_string()])
+        .await?;
+    Ok(())
+}
+
 // ── 9. Reconciliation balance ────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -480,13 +661,13 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     // Pending deposit (ALL deposits count for reconciliation)
     let mut d1 = make_db_transaction("recon_d1", TransactionType::Deposit);
     d1.mint = mint.to_string();
-    d1.amount = 500;
+    d1.amount = TokenAmount(500);
     storage.insert_db_transaction(&d1).await?;
 
     // Completed deposit
     let mut d2 = make_db_transaction("recon_d2", TransactionType::Deposit);
     d2.mint = mint.to_string();
-    d2.amount = 300;
+    d2.amount = TokenAmount(300);
     let d2_id = storage.insert_db_transaction(&d2).await?;
     sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
         .bind(d2_id)
@@ -496,7 +677,7 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     // Completed withdrawal (only completed withdrawals count)
     let mut w1 = make_db_transaction("recon_w1", TransactionType::Withdrawal);
     w1.mint = mint.to_string();
-    w1.amount = 100;
+    w1.amount = TokenAmount(100);
     let w1_id = storage.insert_db_transaction(&w1).await?;
     sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
         .bind(w1_id)
@@ -506,15 +687,15 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     // Pending withdrawal (should NOT count)
     let mut w2 = make_db_transaction("recon_w2", TransactionType::Withdrawal);
     w2.mint = mint.to_string();
-    w2.amount = 9999;
+    w2.amount = TokenAmount(9999);
     storage.insert_db_transaction(&w2).await?;
 
     let balances = storage.get_mint_balances_for_reconciliation().await?;
     assert_eq!(balances.len(), 1);
     // Deposits: 500 (pending) + 300 (completed) = 800  (all statuses)
-    assert_eq!(balances[0].total_deposits, 800);
+    assert_eq!(balances[0].total_deposits, BigDecimal::from(800u64));
     // Withdrawals: only completed = 100
-    assert_eq!(balances[0].total_withdrawals, 100);
+    assert_eq!(balances[0].total_withdrawals, BigDecimal::from(100u64));
     Ok(())
 }
 

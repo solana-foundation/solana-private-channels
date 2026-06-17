@@ -1,3 +1,5 @@
+use crate::storage::common::amount::TokenAmount;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Type;
@@ -53,7 +55,7 @@ pub struct DbTransaction {
     pub initiator: String,
     pub recipient: String,
     pub mint: String,
-    pub amount: i64,
+    pub amount: TokenAmount,
     pub memo: Option<String>,
     pub transaction_type: TransactionType,
     pub withdrawal_nonce: Option<i64>,
@@ -82,6 +84,10 @@ pub struct DbTransaction {
     /// `processing` -> `pending`) bumps this; the cap quarantines a row that
     /// can never progress instead of looping forever.
     pub recovery_requeue_attempts: i32,
+    /// Absolute position of the source instruction within its transaction.
+    /// Paired with `signature` it is the row's durable identity, so multiple
+    /// economic events in one transaction persist as distinct rows.
+    pub instruction_index: i32,
     /// Confirmed remint signature, written in the same UPDATE that flips status
     /// to FailedReminted. A crash before the async writer runs can no longer
     /// leave a landed remint recorded only as PendingRemint (which would replay).
@@ -97,10 +103,12 @@ pub struct MintDbBalance {
     /// Sum of amounts for all indexed deposits (any status).
     /// Deposits increase the on-chain ATA balance the moment they are observed,
     /// regardless of whether the operator has completed the corresponding private_channel mint.
-    pub total_deposits: i64,
+    /// Held as `BigDecimal` because the gross sum of many near-`u64::MAX` amounts can
+    /// exceed `u64::MAX` even though the net (deposits - withdrawals) cannot.
+    pub total_deposits: BigDecimal,
     /// Sum of amounts for completed withdrawals only.
     /// Only a completed `release_funds` call actually reduces the on-chain ATA balance.
-    pub total_withdrawals: i64,
+    pub total_withdrawals: BigDecimal,
 }
 
 /// Mint metadata stored
@@ -109,6 +117,8 @@ pub struct DbMint {
     pub mint_address: String,
     pub decimals: i16,
     pub token_program: String,
+    /// Current allow/block state (`"allowed"` | `"blocked"`)
+    pub status: String,
     pub created_at: DateTime<Utc>,
     /// `None` = the on-chain PausableConfig extension state is unknown to us yet.
     /// Resolved lazily by the operator's MintCache on first RPC fetch.
@@ -124,6 +134,8 @@ impl DbMint {
             mint_address,
             decimals,
             token_program,
+            // A DbMint is only ever constructed on the allow path.
+            status: "allowed".to_string(),
             created_at: Utc::now(),
             is_pausable: None,
             has_permanent_delegate: None,
@@ -154,12 +166,13 @@ pub struct DbTransactionBuilder {
     signature: String,
     slot: i64,
     mint: String,
-    amount: i64,
+    amount: TokenAmount,
     initiator: Option<String>,
     recipient: Option<String>,
     memo: Option<String>,
     transaction_type: Option<TransactionType>,
     trace_id: Option<String>,
+    instruction_index: i32,
 }
 
 impl DbTransactionBuilder {
@@ -168,12 +181,13 @@ impl DbTransactionBuilder {
             signature,
             slot: slot as i64,
             mint,
-            amount: amount as i64,
+            amount: TokenAmount(amount),
             initiator: None,
             recipient: None,
             memo: None,
             transaction_type: None,
             trace_id: None,
+            instruction_index: 0,
         }
     }
 
@@ -202,6 +216,11 @@ impl DbTransactionBuilder {
         self
     }
 
+    pub fn instruction_index(mut self, instruction_index: i32) -> Self {
+        self.instruction_index = instruction_index;
+        self
+    }
+
     pub fn build(self) -> DbTransaction {
         let now = Utc::now();
         DbTransaction {
@@ -226,6 +245,7 @@ impl DbTransactionBuilder {
             pending_remint_deadline_at: None,
             finality_check_attempts: 0,
             recovery_requeue_attempts: 0,
+            instruction_index: self.instruction_index,
             landed_remint_signature: None,
         }
     }

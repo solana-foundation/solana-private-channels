@@ -8,11 +8,12 @@
 //!
 //! Uses testcontainers for isolated Postgres instances and mockito for webhook server.
 
+use bigdecimal::{BigDecimal, ToPrimitive};
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
 use private_channel_indexer::{
     config::OperatorConfig,
     operator::reconciliation::{compare_balances, send_webhook_alert, BalanceMismatch},
-    storage::{PostgresDb, Storage},
+    storage::{common::amount::TokenAmount, PostgresDb, Storage},
     PostgresConfig,
 };
 use solana_sdk::pubkey::Pubkey;
@@ -82,7 +83,7 @@ async fn insert_transaction(
     pool: &PgPool,
     signature: &str,
     mint: &str,
-    amount: i64,
+    amount: u64,
     transaction_type: &str,
     status: &str,
     slot: i64,
@@ -96,7 +97,7 @@ async fn insert_transaction(
     .bind(signature)
     .bind(slot)
     .bind(mint)
-    .bind(amount)
+    .bind(TokenAmount(amount))
     .bind(transaction_type)
     .bind(status)
     .execute(pool)
@@ -162,8 +163,8 @@ async fn test_reconciliation_success_within_tolerance() -> Result<(), Box<dyn st
 
     let balance = &balances[0];
     assert_eq!(balance.mint_address, mint);
-    assert_eq!(balance.total_deposits, 1_000_000);
-    assert_eq!(balance.total_withdrawals, 0);
+    assert_eq!(balance.total_deposits, BigDecimal::from(1_000_000u64));
+    assert_eq!(balance.total_withdrawals, BigDecimal::from(0u64));
 
     // In a real E2E test, we would:
     // 1. Mock RPC endpoint to return on-chain balance of 1,000,000
@@ -212,7 +213,9 @@ async fn test_reconciliation_detects_mismatch_and_alerts() -> Result<(), Box<dyn
             .mint_address
             .parse::<Pubkey>()
             .expect("valid mint");
-        let net_balance = (balance_result.total_deposits - balance_result.total_withdrawals) as u64;
+        let net_balance = (&balance_result.total_deposits - &balance_result.total_withdrawals)
+            .to_u64()
+            .expect("net fits u64");
         db_balances.insert(mint_key, net_balance);
     }
 
@@ -311,8 +314,8 @@ async fn test_reconciliation_multiple_mints_mixed_results() -> Result<(), Box<dy
         .find(|b| b.mint_address == mint2)
         .expect("mint2 not found");
 
-    assert_eq!(balance1.total_deposits, 1_000_000);
-    assert_eq!(balance2.total_deposits, 2_000_000);
+    assert_eq!(balance1.total_deposits, BigDecimal::from(1_000_000u64));
+    assert_eq!(balance2.total_deposits, BigDecimal::from(2_000_000u64));
 
     // In a real E2E test, we would:
     // 1. Mock RPC to return on-chain balances: mint1=1,000,000, mint2=1,800,000
@@ -430,12 +433,20 @@ async fn test_reconciliation_with_deposits_and_withdrawals(
     assert_eq!(balances.len(), 1);
 
     let balance = &balances[0];
-    assert_eq!(balance.total_deposits, 2_000_000, "total deposits");
-    assert_eq!(balance.total_withdrawals, 500_000, "total withdrawals");
+    assert_eq!(
+        balance.total_deposits,
+        BigDecimal::from(2_000_000u64),
+        "total deposits"
+    );
+    assert_eq!(
+        balance.total_withdrawals,
+        BigDecimal::from(500_000u64),
+        "total withdrawals"
+    );
 
     // Net balance should be 1,500,000 (deposits - withdrawals)
-    let net_balance = balance.total_deposits - balance.total_withdrawals;
-    assert_eq!(net_balance, 1_500_000, "net balance");
+    let net_balance = &balance.total_deposits - &balance.total_withdrawals;
+    assert_eq!(net_balance, BigDecimal::from(1_500_000u64), "net balance");
 
     // In a real E2E test, we would:
     // 1. Mock RPC to return on-chain balance of 1,500,000
@@ -507,11 +518,13 @@ async fn test_reconciliation_ignores_non_completed_transactions(
 
     let balance = &balances[0];
     assert_eq!(
-        balance.total_deposits, 1_000_000,
+        balance.total_deposits,
+        BigDecimal::from(1_000_000u64),
         "only completed deposits counted"
     );
     assert_eq!(
-        balance.total_withdrawals, 0,
+        balance.total_withdrawals,
+        BigDecimal::from(0u64),
         "only completed withdrawals counted"
     );
 
@@ -645,7 +658,9 @@ async fn test_e2e_reconciliation_with_mismatch_and_webhook_alert(
             .mint_address
             .parse::<Pubkey>()
             .expect("valid mint address");
-        let net_balance = (balance_result.total_deposits - balance_result.total_withdrawals) as u64;
+        let net_balance = (&balance_result.total_deposits - &balance_result.total_withdrawals)
+            .to_u64()
+            .expect("net fits u64");
         db_balances.insert(mint, net_balance);
     }
 
@@ -771,7 +786,9 @@ async fn test_e2e_reconciliation_success_no_alert() -> Result<(), Box<dyn std::e
             .mint_address
             .parse::<Pubkey>()
             .expect("valid mint");
-        let net_balance = (balance_result.total_deposits - balance_result.total_withdrawals) as u64;
+        let net_balance = (&balance_result.total_deposits - &balance_result.total_withdrawals)
+            .to_u64()
+            .expect("net fits u64");
         db_balances.insert(mint_key, net_balance);
     }
 
