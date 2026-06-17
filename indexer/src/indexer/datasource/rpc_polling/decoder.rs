@@ -15,7 +15,7 @@ use crate::indexer::datasource::common::types::CompiledInstruction;
 use crate::indexer::datasource::common::types::*;
 use crate::indexer::datasource::rpc_polling::types::{InnerInstructions, RpcBlock};
 use solana_sdk::pubkey::Pubkey;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 type ParseInstructionFn<T> = fn(
     instruction: &CompiledInstruction,
@@ -125,12 +125,21 @@ where
         // Inner (and v0 top-level) account indices reference the full key list:
         // static message keys, then loaded writable, then readonly. Append the
         // already-resolved loaded keys so those indices resolve.
-        let account_pubkeys: Vec<Pubkey> = account_keys
+        // A malformed key makes every account index untrustworthy (dropping one
+        // would shift the rest), so skip the whole transaction rather than panic.
+        let account_pubkeys: Vec<Pubkey> = match account_keys
             .iter()
             .chain(loaded_writable.iter())
             .chain(loaded_readonly.iter())
-            .map(|s| Pubkey::from_str(s).expect("Invalid pubkey"))
-            .collect();
+            .map(|s| Pubkey::from_str(s))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!("Skipping transaction {signature}: invalid account key: {e}");
+                continue;
+            }
+        };
 
         // Filter transactions by instance ID if provided
         // Check if any account in the transaction matches the instance ID
@@ -140,7 +149,12 @@ where
             }
         }
 
-        let filter_pubkey = Pubkey::from_str(filter_program_id).ok();
+        // The filter program id is a hardcoded constant; a parse failure is a
+        // programming error, not a per-transaction condition.
+        let Ok(filter_pubkey) = Pubkey::from_str(filter_program_id) else {
+            error!("Invalid filter program id: {filter_program_id}");
+            return instructions;
+        };
 
         // Enumerate before the program-id filter so the index is the instruction's
         // absolute position in the transaction, independent of how many are relevant.
@@ -149,7 +163,7 @@ where
             let program_id = account_pubkeys.get(instruction.program_id_index as usize);
 
             // Only parse program filtered instructions
-            if program_id == filter_pubkey.as_ref() {
+            if program_id == Some(&filter_pubkey) {
                 let location = InstructionLocation::top_level(ix_index as u32);
                 match parse_instruction(
                     instruction,
@@ -175,7 +189,7 @@ where
         for inner_set in inner_instructions_list {
             for (inner_ix_index, inner) in inner_set.instructions.iter().enumerate() {
                 let program_id = account_pubkeys.get(inner.instruction.program_id_index as usize);
-                if program_id != filter_pubkey.as_ref() {
+                if program_id != Some(&filter_pubkey) {
                     continue;
                 }
                 if instruction_discriminator(&inner.instruction)
