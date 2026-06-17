@@ -966,4 +966,105 @@ mod tests {
         );
         assert_eq!(deposit_amount(&result[0]), 555);
     }
+
+    /// End-to-end depth guarantee: a transaction whose flattened inner list mixes
+    /// escrow deposits at 1, 2, and 4 CPI hops deep (with intermediate foreign
+    /// CPIs and self-CPI events between them) is indexed so that every deposit
+    /// gets a UNIQUE `inner_index` (its flat position) and reads its OWN event.
+    /// A one-level-only scheme or mis-scoped subtree walk would drop deposits,
+    /// collide indices, or cross amounts — all caught here.
+    #[test]
+    fn real_parser_indexes_mixed_depth_cpi_deposits_uniquely() {
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes};
+
+        // escrow at key index 0; index 1 is a foreign program; 2..12 pad accounts.
+        let mut account_keys: Vec<String> = (0u8..12)
+            .map(|i| crate::test_utils::pubkey::test_pubkey(i).to_string())
+            .collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+
+        // Top-level targets the foreign router (index 1); it is not indexed.
+        let top = create_instruction(1, vec![], "router".to_string());
+        let mut tx =
+            create_successful_transaction("sig_deep".to_string(), account_keys, vec![top]);
+
+        let foreign = |h: u32| InnerInstruction {
+            instruction: create_instruction(1, vec![], "foreign".to_string()),
+            stack_height: Some(h),
+        };
+        let deposit = |h: u32| InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: 0, // escrow
+                accounts: (0u8..12).collect(),
+                data: bs58::encode(deposit_ix_bytes(1000, None)).into_string(),
+            },
+            stack_height: Some(h),
+        };
+        let event = |amount: u64, h: u32| InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index: 0, // escrow (its self-CPI event)
+                accounts: vec![],
+                data: bs58::encode(deposit_event_bytes(amount)).into_string(),
+            },
+            stack_height: Some(h),
+        };
+
+        // Pre-order flatten of the CPI tree under top-level 0 (height = depth):
+        //   [0] foreign A      h2
+        //   [1] deposit D1     h3   (2 hops)  -> event 111
+        //   [2]   event 111    h4
+        //   [3] foreign C      h3
+        //   [4]   foreign C2   h4
+        //   [5]   deposit D2   h5   (4 hops)  -> event 222
+        //   [6]     event 222  h6
+        //   [7] deposit D3     h2   (1 hop)   -> event 333
+        //   [8]   event 333    h3
+        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+            index: 0,
+            instructions: vec![
+                foreign(2),
+                deposit(3),
+                event(111, 4),
+                foreign(3),
+                foreign(4),
+                deposit(5),
+                event(222, 6),
+                deposit(2),
+                event(333, 3),
+            ],
+        }]);
+
+        let mut block = create_test_block();
+        block.transactions.push(tx);
+
+        let result = parse_block(&block, 9, ProgramType::Escrow, None);
+
+        // Only the three deposits surface (events parse to Ok(None); foreign skipped).
+        assert_eq!(result.len(), 3, "three escrow deposits across mixed CPI depths");
+
+        // Each deposit keeps its flat position as inner_index and reads its own event.
+        let got: Vec<(u32, Option<u32>, u64)> = result
+            .iter()
+            .map(|m| (m.instruction_index, m.inner_index, deposit_amount(m)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, Some(1), 111), (0, Some(5), 222), (0, Some(7), 333)],
+            "depth 2/4/1 deposits: unique flat inner_index, each reads its own event"
+        );
+
+        // The core guarantee: (instruction_index, inner_index) is unique at every depth.
+        let mut ids: Vec<(u32, Option<u32>)> = result
+            .iter()
+            .map(|m| (m.instruction_index, m.inner_index))
+            .collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "(instruction_index, inner_index) must be unique regardless of CPI depth"
+        );
+    }
 }

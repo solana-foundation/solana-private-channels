@@ -1079,6 +1079,71 @@ mod tests {
         assert_eq!(amount(deposit_b), 400, "deposit B reads its own event");
     }
 
+    /// A deposit nested two CPI hops deep (stack_height 3, beyond the one-level
+    /// case) still reads its own DepositEvent: the validator flattens every CPI
+    /// depth into one inner list, so `inner_index` stays a unique position and the
+    /// stack-height subtree scan is depth-agnostic.
+    #[test]
+    fn cpi_deposit_nested_two_levels_reads_own_event() {
+        let borsh_data = create_deposit_borsh_data();
+        let instruction = create_instruction_with_accounts(12, "dummy".to_string());
+        let account_keys = create_n_account_keys(12);
+
+        // Flattened inner set under one foreign top-level (index 4). Deposit A is
+        // two CPI hops deep (height 3); its event is a hop deeper (height 4). A
+        // deeper non-event entry sits in A's subtree before the event, proving the
+        // scan walks the whole subtree and skips non-events. Sibling deposit B
+        // (also height 3) bounds A's subtree.
+        //   [0] deposit A     height 3
+        //   [1]   nested ix   height 4   (in A's subtree, not an event)
+        //   [2]   event 700   height 4   (A's event)
+        //   [3] deposit B     height 3   (ends A's subtree)
+        //   [4]   event 800   height 4   (B's event)
+        let inner_set = vec![InnerInstructions {
+            index: 4,
+            instructions: vec![
+                deposit_ix_inner(3),
+                deposit_ix_inner(4),
+                deposit_event_inner(700, 4),
+                deposit_ix_inner(3),
+                deposit_event_inner(800, 4),
+            ],
+        }];
+
+        let parse_at = |inner_index: u32| {
+            parse_deposit(
+                &borsh_data,
+                &instruction,
+                &account_keys,
+                &inner_set,
+                InstructionLocation {
+                    top_level_index: 4,
+                    inner: Some(InnerLocation {
+                        inner_index,
+                        stack_height: Some(3),
+                    }),
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+
+        let amount = |ix: EscrowInstruction| match ix {
+            EscrowInstruction::Deposit { event, .. } => event.amount,
+            _ => panic!("expected Deposit"),
+        };
+        assert_eq!(
+            amount(parse_at(0)),
+            700,
+            "depth-3 deposit A reads its own event past a deeper non-event entry"
+        );
+        assert_eq!(
+            amount(parse_at(3)),
+            800,
+            "sibling deposit B at the same depth reads its own event, not A's"
+        );
+    }
+
     /// A CPI deposit whose location carries no stack height can't be scoped to
     /// its own subtree, so the parser errors (drops it) rather than risk reading
     /// a neighbouring deposit's event amount.

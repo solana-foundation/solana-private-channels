@@ -88,10 +88,11 @@ pub struct DbTransaction {
     /// Paired with `signature` it is the row's durable identity, so multiple
     /// economic events in one transaction persist as distinct rows.
     pub instruction_index: i32,
-    /// Position within the parent's inner set when the source instruction is a
-    /// CPI; `None` (NULL) for a top-level instruction. Completes the durable
-    /// identity `(signature, instruction_index, inner_index)` so a CPI
-    /// deposit/withdraw does not collide with its parent's top-level row.
+    /// Position in the top-level ancestor's *flattened* inner-instruction list
+    /// for a CPI; `None` (NULL) for a top-level instruction. The validator
+    /// flattens every CPI depth into one list, so this is unique at any depth (not
+    /// a nesting level). Completes the `(signature, instruction_index, inner_index)`
+    /// identity so a CPI deposit/withdraw never collides with its parent's row.
     pub inner_index: Option<i32>,
     /// Confirmed remint signature, written in the same UPDATE that flips status
     /// to FailedReminted. A crash before the async writer runs can no longer
