@@ -28,12 +28,10 @@ pub async fn get_latest_blockhash_impl(
             )
         })?;
 
-    // Calculate last valid block height
-    // In Solana, a blockhash is valid for approximately 150 blocks
-    // We'll use slot as the block height and add 150 for validity period
-    // TODO: We will have different expiration logic, which means it may not
-    // necessarily be 150 blocks
-    let last_valid_block_height = slot + 150;
+    // The dedup window holds max_blockhashes entries (block height == slot here),
+    // so a hash settled at this slot is evicted once the tip reaches
+    // slot + max_blockhashes.
+    let last_valid_block_height = slot.saturating_add(read_deps.max_blockhashes);
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

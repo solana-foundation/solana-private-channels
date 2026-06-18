@@ -128,8 +128,9 @@ pub struct NodeHandles {
 
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
-    if config.blocktime_ms == 0 && matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-        return Err("blocktime_ms cannot be 0 for write nodes".into());
+    // max_blockhashes() divides by blocktime_ms and every mode derives it and reject a zero divisor.
+    if config.blocktime_ms == 0 {
+        return Err("blocktime_ms cannot be 0".into());
     }
     if config.max_blockhashes() == 0 && matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
         return Err(
@@ -332,10 +333,12 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             if matches!(config.mode, NodeMode::Read) {
                 repair_address_signatures(&accounts_db, Arc::clone(&config.metrics)).await?;
             }
+            let max_blockhashes = config.max_blockhashes() as u64;
             Some(ReadDeps {
                 admin_keys: config.admin_keys,
                 accounts_db,
                 live_blockhashes: live_blockhashes_arc,
+                max_blockhashes,
             })
         }
         NodeMode::Write => None,
@@ -426,7 +429,7 @@ mod tests {
         let result = run_node(config).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert_eq!(err.to_string(), "blocktime_ms cannot be 0 for write nodes");
+        assert_eq!(err.to_string(), "blocktime_ms cannot be 0");
     }
 
     #[tokio::test]
