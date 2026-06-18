@@ -22,7 +22,7 @@ use chrono::Utc;
 use solana_keychain::SolanaSigner;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signature};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Cap on total deferrals of a single pending remint. Covers both transient
 /// RPC errors during the finality check AND liveness extensions when a stored
@@ -360,8 +360,11 @@ pub async fn process_pending_remints(
                 if let Some(nonce) = entry.ctx.withdrawal_nonce {
                     if let Some(smt) = state.smt_state.as_mut() {
                         if smt.smt_state.tree_index() == nonce / MAX_TREE_LEAVES as u64 {
-                            smt.smt_state.insert_nonce(nonce);
-                            info!("Re-inserted landed nonce {nonce} into local SMT");
+                            if smt.smt_state.insert_nonce(nonce) {
+                                info!("Re-inserted landed nonce {nonce} into local SMT");
+                            } else {
+                                debug!("Landed nonce {nonce} already present in local SMT, no divergence");
+                            }
                         }
                     }
                 }

@@ -370,6 +370,9 @@ pub(super) async fn drain_ambiguous_retry_queue(
             .clone()
             .expect("ambiguous retry must have trace_id");
         let remint_info = state.remint_cache.get(&nonce).cloned();
+        if remint_info.is_none() {
+            error!("Missing remint_info for ambiguous retry nonce {} - remint will not be possible on failure", nonce);
+        }
         let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
             builder,
             nonce,
