@@ -132,7 +132,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     if config.blocktime_ms == 0 {
         return Err("blocktime_ms cannot be 0".into());
     }
-    if config.max_blockhashes() == 0 && matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+    // All modes need a non-zero window: Read advertises it as last_valid_block_height, write modes size the dedup cache with it.
+    if config.max_blockhashes() == 0 {
         return Err(
             "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)".into(),
         );

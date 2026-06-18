@@ -827,14 +827,15 @@ mod tests {
         assert_eq!(block1.previous_blockhash, r1.blockhash);
     }
 
+    // End-to-end: settle derives the new hash and persists it round-tripped and chained.
+    // Signature-binding is proven deterministically by compute_blockhash_depends_on_signatures;
+    // it cannot be isolated here because each settle reads its own wall-clock nanos, so this
+    // asserts the wiring and persistence instead of re-proving the content dependency.
     #[tokio::test(flavor = "multi_thread")]
-    async fn settle_blockhash_binds_transactions() {
+    async fn settle_persists_computed_blockhash() {
         let (mut db, _pg) = start_test_postgres().await;
 
-        let last = LastBlock {
-            slot: 5,
-            blockhash: Hash::new_unique(),
-        };
+        let parent_hash = Hash::new_unique();
 
         let from = Keypair::new();
         let to = Pubkey::new_unique();
@@ -846,10 +847,10 @@ mod tests {
         )]);
         let with_tx: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let r_with_tx = settle_transactions(
+        let r = settle_transactions(
             Some(LastBlock {
-                slot: last.slot,
-                blockhash: last.blockhash,
+                slot: 5,
+                blockhash: parent_hash,
             }),
             &mut db,
             None,
@@ -860,18 +861,11 @@ mod tests {
         .await
         .unwrap();
 
-        let r_empty = settle_transactions(
-            Some(last),
-            &mut db,
-            None,
-            &[],
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert_ne!(r_with_tx.blockhash, r_empty.blockhash);
+        assert_ne!(r.blockhash, Hash::default());
+        assert_ne!(r.blockhash, parent_hash);
+        let block = db.get_block(r.slot).await.unwrap();
+        assert_eq!(block.blockhash, r.blockhash);
+        assert_eq!(block.previous_blockhash, parent_hash);
     }
 
     #[tokio::test(flavor = "multi_thread")]
