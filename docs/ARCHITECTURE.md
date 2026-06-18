@@ -125,11 +125,11 @@ flowchart TB
     PG_P[(Postgres Primary)]
     PG_R[(Postgres Replica)]
     RN[Read Node :8901]
-    ST[Streamer :8902]
+    ST["Streamer :8902 (internal only)"]
 
     Wallet -- deposit --> Escrow
     Wallet -- transact / withdraw --> GW
-    ST -. WebSocket .-> Wallet
+    ST -. "WebSocket (internal network only)" .-> Wallet
 
     Escrow -- watch --> IS
     IS -- deposit events --> PG_I
@@ -158,4 +158,4 @@ flowchart TB
 | **Transfer** | User → Gateway → Write Node → Postgres Primary |
 | **Withdrawal** | User → Gateway → Write Node → Withdraw Program (burn) → Indexer Solana Private Channels → Indexer DB → Operator Solana Private Channels → Escrow Program (release on Mainnet) |
 | **Reads** | User → Gateway → Read Node → Postgres Replica |
-| **Streaming** | Postgres Primary → Streamer → WebSocket → User |
+| **Streaming** | Postgres Primary → Streamer → WebSocket (internal network only; not publicly exposed) → in-network consumer |

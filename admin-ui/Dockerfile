@@ -38,7 +38,6 @@ RUN --mount=type=cache,target=/pnpm-store,sharing=locked \
     pnpm install --frozen-lockfile
 
 ARG PRIVATE_CHANNEL_RPC_URL
-ARG PRIVATE_CHANNEL_WS_URL
 
 RUN npx vite build
 

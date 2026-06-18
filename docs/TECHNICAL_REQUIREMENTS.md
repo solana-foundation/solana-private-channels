@@ -91,7 +91,7 @@ streams WAL to archive volumes, wire those volumes to S3 lifecycle policies.
 | Service | Port | Exposure |
 |---|---|---|
 | Gateway (RPC) | 8899 | Public, clients |
-| Streamer (WebSocket) | 8902 | Public, clients |
+| Streamer (WebSocket) | 8902 | Internal only |
 | Grafana | 37429 | Restricted, operators only |
 
 All other services bind to internal ports on the Docker network and don't
@@ -99,7 +99,7 @@ need to be exposed at the host firewall; see `docker-compose.yml` for defaults.
 
 ### Firewall
 
-- **Public ingress:** 8899 (gateway), 8902 (streamer).
+- **Public ingress:** 8899 (gateway).
 - **Outbound:** 443 to Solana mainnet RPC, 10000 to Yellowstone gRPC (if used).
 - **Internal:** allow all between stack services on the private network.
 
