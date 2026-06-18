@@ -155,6 +155,10 @@ pub struct SenderState {
     /// Milliseconds between `getSignatureStatuses` polls. Populated from `OperatorConfig`.
     pub confirmation_poll_interval_ms: u64,
     pub rotation_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
+    /// Withdrawals parked because an unresolved PendingRemint nonce in the same
+    /// tree could leave the local SMT out of sync with chain. Drained each tick
+    /// after process_pending_remints.
+    pub ambiguous_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
     /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
     pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,
     pub program_type: ProgramType,

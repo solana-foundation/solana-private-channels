@@ -296,6 +296,9 @@ pub async fn run_sender(
                 // Process matured deferred remints
                 remint::process_pending_remints(&mut state, &storage_tx).await;
 
+                // Retry withdrawals parked while an ambiguous nonce blocked their tree
+                drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
+
                 // Process any transactions that were blocked by rotation
                 while let Some((ctx, builder)) = state.rotation_retry_queue.pop() {
                     let nonce = ctx.withdrawal_nonce.expect("rotation retry must have nonce");
@@ -343,6 +346,39 @@ pub async fn run_sender(
 
     info!("Sender stopped gracefully");
     Ok(())
+}
+
+/// Retry withdrawals parked while an ambiguous nonce blocked their tree.
+/// Call after process_pending_remints, which may have cleared the blocker.
+pub(super) async fn drain_ambiguous_retry_queue(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    // Grab everything out of the queue and go through that copy. The real queue
+    // is now empty. If a withdrawal is still blocked, it gets added back to the
+    // real queue, and we leave it there until the next tick. We do not retry it
+    // again right now.
+    for (ctx, builder) in std::mem::take(&mut state.ambiguous_retry_queue) {
+        let nonce = ctx
+            .withdrawal_nonce
+            .expect("ambiguous retry must have nonce");
+        let transaction_id = ctx
+            .transaction_id
+            .expect("ambiguous retry must have transaction_id");
+        let trace_id = ctx
+            .trace_id
+            .clone()
+            .expect("ambiguous retry must have trace_id");
+        let remint_info = state.remint_cache.get(&nonce).cloned();
+        let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
+            builder,
+            nonce,
+            transaction_id,
+            trace_id,
+            remint_info,
+        }));
+        handle_transaction_submission(state, tx_builder, storage_tx).await;
+    }
 }
 
 /// Wait for all in-flight fire-and-forget transactions to reach a terminal state.
@@ -397,14 +433,18 @@ mod tests {
     use crate::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::sender::types::{
-        InFlightQueue, InFlightTx, InstructionWithSigners, SenderState, TransactionContext,
-        MAX_IN_FLIGHT,
+        InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, SenderState,
+        TransactionContext, MAX_IN_FLIGHT,
     };
-    use crate::operator::utils::instruction_util::{ExtraErrorCheckPolicy, RetryPolicy};
+    use crate::operator::utils::instruction_util::{
+        ExtraErrorCheckPolicy, RetryPolicy, WithdrawalRemintInfo,
+    };
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::MintCache;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::PrivateChannelIndexerConfig;
+    use chrono::Utc;
+    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
     use solana_keychain::Signer;
     use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
     use solana_sdk::pubkey::Pubkey;
@@ -437,6 +477,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 1,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -619,6 +660,61 @@ mod tests {
         assert_eq!(
             remaining, 1,
             "unresolved entry must still be in in_flight after timeout"
+        );
+    }
+
+    // ── drain_ambiguous_retry_queue ──────────────────────────────────
+
+    /// A parked withdrawal whose blocker is still unresolved must be put back in
+    /// the queue, not sent. Proves the snapshot drain neither loops nor drops it.
+    #[tokio::test]
+    async fn drain_reparks_while_blocker_unresolved() {
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Blocker: nonce 2 (tree 0) still in pending_remints.
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(1),
+                withdrawal_nonce: Some(2),
+                trace_id: Some("t".to_string()),
+            },
+            remint_info: WithdrawalRemintInfo {
+                transaction_id: 1,
+                trace_id: "t".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+            signatures: vec![],
+            original_error: "x".to_string(),
+            deadline: Utc::now(),
+            finality_check_attempts: 0,
+        });
+
+        // Parked withdrawal nonce 3, same tree.
+        state.ambiguous_retry_queue.push((
+            TransactionContext {
+                transaction_id: Some(99),
+                withdrawal_nonce: Some(3),
+                trace_id: Some("trace-99".to_string()),
+            },
+            ReleaseFundsBuilder::new(),
+        ));
+
+        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
+
+        assert_eq!(
+            state.ambiguous_retry_queue.len(),
+            1,
+            "still-blocked withdrawal must re-park"
+        );
+        assert_eq!(state.ambiguous_retry_queue[0].0.withdrawal_nonce, Some(3));
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update while re-parked"
         );
     }
 }
