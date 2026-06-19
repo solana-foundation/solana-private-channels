@@ -72,11 +72,16 @@ mod tests {
         (db, container)
     }
 
+    // A non-default window so the assertion pins the value to the threaded
+    // config field rather than to any constant baked into the endpoint.
+    const TEST_MAX_BLOCKHASHES: u64 = 200;
+
     fn make_read_deps(db: AccountsDB) -> ReadDeps {
         ReadDeps {
             accounts_db: db,
             admin_keys: vec![],
             live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
+            max_blockhashes: TEST_MAX_BLOCKHASHES,
         }
     }
 
@@ -232,7 +237,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.value.blockhash, blockhash.to_string());
-        assert_eq!(resp.value.last_valid_block_height, 160); // slot 10 + 150
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn last_valid_block_height_uses_max_blockhashes() {
+        let (mut db, _pg) = start_pg().await;
+        let slot = 10u64;
+        db.store_block(make_block_info(slot, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+        let resp = get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.value.last_valid_block_height,
+            slot + TEST_MAX_BLOCKHASHES
+        );
     }
 
     // ── get_recent_blockhash ──────────────────────────────────────────────

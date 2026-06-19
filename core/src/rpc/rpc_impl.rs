@@ -61,6 +61,7 @@ pub struct ReadDeps {
     // Used for simulating sigverify
     pub admin_keys: Vec<Pubkey>,
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    pub max_blockhashes: u64,
 }
 
 pub struct WriteDeps {

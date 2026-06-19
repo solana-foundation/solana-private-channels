@@ -7,10 +7,7 @@ use {
         metrics::OPERATOR_STALE_PROCESSING_RECOVERED,
         operator::{
             recovery::test_hooks,
-            utils::{
-                instruction_util::mint_idempotency_memo,
-                rpc_util::{RetryConfig, RpcClientWithRetry},
-            },
+            utils::rpc_util::{RetryConfig, RpcClientWithRetry},
             TransactionStatusUpdate,
         },
         storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
@@ -18,7 +15,6 @@ use {
     },
     serde_json::json,
     solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature},
-    spl_associated_token_account::get_associated_token_address_with_program_id,
     std::{sync::Arc, time::Duration},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -175,66 +171,8 @@ fn test_client(url: String) -> RpcClientWithRetry {
     )
 }
 
-/// Scripted `getTransaction` reply satisfying `transaction_matches_expected_mint`.
-fn get_transaction_reply(
-    signature: &Signature,
-    mint: &Pubkey,
-    recipient_ata: &Pubkey,
-    mint_authority: &Pubkey,
-    token_program: &Pubkey,
-    amount: u64,
-    memo: &str,
-) -> Reply {
-    let memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
-    Reply::result(json!({
-        "slot": 100,
-        "blockTime": 1_700_000_000i64,
-        "meta": {
-            "err": null,
-            "status": { "Ok": null },
-            "fee": 5000u64,
-            "innerInstructions": [],
-            "preBalances": [1_000_000u64],
-            "postBalances": [999_995u64],
-            "logMessages": [],
-            "preTokenBalances": [],
-            "postTokenBalances": [],
-            "rewards": [],
-            "computeUnitsConsumed": 0u64,
-        },
-        "transaction": {
-            "signatures": [signature.to_string()],
-            "message": {
-                "accountKeys": [
-                    {"pubkey": mint_authority.to_string(), "signer": true, "writable": true, "source": "transaction"},
-                    {"pubkey": recipient_ata.to_string(), "signer": false, "writable": true, "source": "transaction"},
-                    {"pubkey": mint.to_string(), "signer": false, "writable": true, "source": "transaction"},
-                    {"pubkey": token_program.to_string(), "signer": false, "writable": false, "source": "transaction"},
-                    {"pubkey": memo_program_id, "signer": false, "writable": false, "source": "transaction"},
-                ],
-                "recentBlockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
-                "instructions": [
-                    {"program": "spl-memo", "programId": memo_program_id, "parsed": memo},
-                    {
-                        "program": "spl-token",
-                        "programId": token_program.to_string(),
-                        "parsed": {
-                            "type": "mintTo",
-                            "info": {
-                                "mint": mint.to_string(),
-                                "account": recipient_ata.to_string(),
-                                "mintAuthority": mint_authority.to_string(),
-                                "amount": amount.to_string(),
-                            },
-                        },
-                    },
-                ],
-            },
-        },
-    }))
-}
-
-// IT-1: deposit landed → Completed (with on-chain sig).
+// IT-1 / IT-D1: deposit whose persisted broadcast signature finalized to Completed,
+// recovered from the durable signature with no double-mint (no sendTransaction).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it1_deposit_landed_promoted_to_completed() {
@@ -243,74 +181,59 @@ async fn it1_deposit_landed_promoted_to_completed() {
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
 
-    let admin_pubkey = Pubkey::new_unique();
     let mint = Pubkey::new_unique();
     let recipient = Pubkey::new_unique();
-    let amount: u64 = 12_345;
-    let token_program = spl_token::id();
-    let recipient_ata =
-        get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-
-    let deposit_sig = Signature::new_unique();
-    let tx = make_deposit(&deposit_sig.to_string(), mint, recipient, amount);
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        mint,
+        recipient,
+        12_345,
+    );
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
-    let _ = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
-    let memo = mint_idempotency_memo(tx_id);
-    let prior_sig = Signature::new_unique();
+    // The mint persisted this signature write-ahead before broadcast; it then landed.
+    let landed_sig = Signature::new_unique();
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+        .await
+        .unwrap();
 
     let mock = MockRpcServer::start().await;
     mock.enqueue(
-        "getSignaturesForAddress",
-        Reply::result(json!([{
-            "signature": prior_sig.to_string(),
-            "slot": 100u64,
-            "err": serde_json::Value::Null,
-            "memo": format!("[{}] {}", memo.len(), memo),
-            "blockTime": 1_700_000_000i64,
-            "confirmationStatus": "finalized",
-        }])),
+        "getSignatureStatuses",
+        Reply::result(json!({
+            "context": {"slot": 200},
+            "value": [{
+                "slot": 100,
+                "confirmations": null,
+                "err": null,
+                "status": {"Ok": null},
+                "confirmationStatus": "finalized"
+            }]
+        })),
     );
-    mock.enqueue(
-        "getTransaction",
-        get_transaction_reply(
-            &prior_sig,
-            &mint,
-            &recipient_ata,
-            &admin_pubkey,
-            &token_program,
-            amount,
-            &memo,
-        ),
-    );
-
     let client = test_client(mock.url());
     let (storage_tx, _storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     let metric_before = snapshot_recovered("escrow", "completed", "deposit");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        admin_pubkey,
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "completed");
     assert_eq!(
         counterpart_sig_of(&pool, tx_id).await,
-        Some(prior_sig.to_string())
+        Some(landed_sig.to_string())
     );
-    // Recovery never sends transactions.
+    // Recovery never re-mints a landed deposit (no double-mint).
     assert_eq!(mock.call_count("sendTransaction"), 0);
     assert_recovered_increment("escrow", "completed", "deposit", metric_before, "IT-1");
     mock.shutdown().await;
 }
 
-// IT-2: deposit not landed → Pending (demote step).
+// IT-2 / IT-D2: deposit with no persisted signature, provably never broadcast,
+// demoted to Pending for a safe re-mint, consulting no RPC.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it2_deposit_not_landed_demoted_to_pending() {
@@ -325,27 +248,71 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
+    // No persisted signature and no RPC mocks: empty-sigs demotes without any RPC call.
     let mock = MockRpcServer::start().await;
-    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     let client = test_client(mock.url());
     let (storage_tx, _storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
+    assert_eq!(
+        mock.call_count("getSignatureStatuses"),
+        0,
+        "empty-sigs demote must not consult the RPC"
+    );
     // Live fetcher picks it up on the next tick (out of scope here).
     assert_eq!(mock.call_count("sendTransaction"), 0);
     assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-2");
+    mock.shutdown().await;
+}
+
+// IT-2b: deposit that WAS broadcast (persisted signature present) but whose mint is
+// provably dead (null status, blockhash expired) is demoted for a safe re-mint. Unlike
+// IT-2 (no signature, no RPC), this exercises the RPC finality classification driving
+// the re-mint decision, the case-(B)-dead double-mint boundary for deposits.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn it2b_deposit_dead_signature_demoted() {
+    let (db, url, _container) = start_pg("it2b_dep_dead").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mint = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 100);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    // Persisted write-ahead before broadcast; the mint never landed and the blockhash expired.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    // Status null + current height (1000) > lvbh (100) → expired/dead.
+    mock.enqueue(
+        "getSignatureStatuses",
+        Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
+    );
+    mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
+
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    // Recovery classifies the dead signature but never re-mints itself (the fetcher does).
+    assert_eq!(mock.call_count("sendTransaction"), 0);
+    assert_recovered_increment("escrow", "requeued", "deposit", metric_before, "IT-2b");
     mock.shutdown().await;
 }
 
@@ -377,15 +344,9 @@ async fn it3_withdrawal_dead_signature_demoted() {
 
     let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "pending");
     let fresh = updated_at_of(&pool, tx_id).await;
@@ -434,15 +395,9 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
 
     let metric_before = snapshot_recovered("withdraw", "completed", "withdrawal");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "completed");
     assert_eq!(
@@ -480,15 +435,9 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(
         status_of(&pool, tx_id).await,
@@ -523,15 +472,9 @@ async fn it4c_withdrawal_no_signatures_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "manual_review");
     // No RPC needed — empty signature set short-circuits before classification.
@@ -586,15 +529,9 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(
         status_of(&pool, tx_id).await,
@@ -656,15 +593,9 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // recover_once runs gc_stale_release_signatures at the top of the sweep.
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     let remaining_done: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pending_release_signatures WHERE transaction_id = $1",
@@ -685,7 +616,8 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     mock.shutdown().await;
 }
 
-// IT-5: deposit RPC failure → ManualReview (never silent demote).
+// IT-5 / IT-D5: deposit with a persisted signature but an RPC that cannot classify it.
+// ManualReview (never a silent demote, which would risk a double-mint).
 
 #[tokio::test(flavor = "multi_thread")]
 async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
@@ -699,11 +631,14 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 500);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+        .await
+        .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // Always return a generic JSON-RPC error → transport / RPC error path.
+    // The classifier's status RPC errors every attempt, so Uncertain, so quarantine.
     mock.enqueue_sequence(
-        "getSignaturesForAddress",
+        "getSignatureStatuses",
         vec![
             Reply::error(-32000, "internal"),
             Reply::error(-32000, "internal"),
@@ -715,15 +650,9 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(
         status_of(&pool, tx_id).await,
@@ -736,19 +665,19 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     assert_eq!(update.transaction_id, tx_id);
     let err = update.error_message.as_deref().unwrap_or("");
     assert!(
-        err.starts_with("deposit idempotency:"),
+        err.contains("could not verify mint landed"),
         "reason should match runbook substring: {err}"
     );
     assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-5");
     mock.shutdown().await;
 }
 
-// IT-6: idempotency RPC -32601 (method not found) → Ambiguous → quarantine,
-// NOT demote. A demote would re-mint a deposit we couldn't verify (double-mint).
+// IT-6: a malformed persisted signature is uncertainty (never read as "dead"),
+// quarantine via the shared load_pending_sigs path, with no RPC consulted.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it6_method_not_found_quarantines_deposit() {
-    let (db, url, _container) = start_pg("it6_method_not_found").await;
+async fn it6_malformed_stored_sig_quarantines_deposit() {
+    let (db, url, _container) = start_pg("it6_malformed_sig").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -758,38 +687,29 @@ async fn it6_method_not_found_quarantines_deposit() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 700);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100)
+        .await
+        .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // -32601 is permanent (no retry) → strict lookup returns Err → Ambiguous.
-    mock.enqueue(
-        "getSignaturesForAddress",
-        Reply::error(-32601, "Method not found"),
-    );
     let client = test_client(mock.url());
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
 
-    // Proves the RPC was actually reached (not a pre-RPC bail) and not retried.
     assert_eq!(
-        mock.call_count("getSignaturesForAddress"),
-        1,
-        "the -32601 branch must be reached via exactly one RPC call"
+        mock.call_count("getSignatureStatuses"),
+        0,
+        "a malformed stored signature must quarantine before any RPC"
     );
     assert_eq!(
         status_of(&pool, tx_id).await,
         "manual_review",
-        "method-not-found is uncertainty → quarantine, never silent demote"
+        "malformed signature is uncertainty so quarantine, never silent demote"
     );
     let update = storage_rx
         .try_recv()
@@ -797,8 +717,8 @@ async fn it6_method_not_found_quarantines_deposit() {
     assert_eq!(update.transaction_id, tx_id);
     let err = update.error_message.as_deref().unwrap_or("");
     assert!(
-        err.starts_with("deposit idempotency:"),
-        "reason should match runbook substring: {err}"
+        err.contains("malformed stored release signature"),
+        "reason should name the malformed signature: {err}"
     );
     assert_recovered_increment("escrow", "quarantined", "deposit", metric_before, "IT-6");
     mock.shutdown().await;
@@ -829,15 +749,9 @@ async fn it7_fresh_processing_row_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(
         status_of(&pool, tx_id).await,
@@ -912,20 +826,14 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
 
+    // No persisted signature, so demote with no RPC call.
     let mock = MockRpcServer::start().await;
-    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
 
     // Lagging in-flight write from dead operator — must no-op.
@@ -990,25 +898,16 @@ async fn it10_backlog_batched_across_ticks() {
         .await
         .unwrap();
 
+    // No persisted signatures, so demote-all path, with no RPC consulted.
     let mock = MockRpcServer::start().await;
-    // Every getSignaturesForAddress returns empty → demote-all path.
-    for _ in 0..300 {
-        mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
-    }
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // Tick 1: should heal exactly RECOVERY_BATCH_LIMIT (100) rows.
     let t0 = std::time::Instant::now();
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
     assert!(
         t0.elapsed() < Duration::from_secs(20),
         "single tick should not starve the live path"
@@ -1021,24 +920,12 @@ async fn it10_backlog_batched_across_ticks() {
     assert_eq!(pending_count, 100, "tick 1 must heal exactly the batch cap");
 
     // Ticks 2-3: drain the rest. Healed rows are excluded (trigger bumped updated_at).
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
     let pending_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE status = 'pending'")
             .fetch_one(&pool)
@@ -1096,15 +983,9 @@ async fn it11_pending_remint_rows_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(
         status_of(&pool, tx_id).await,
@@ -1139,15 +1020,9 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Withdraw,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(status_of(&pool, tx_id).await, "manual_review");
     let update = storage_rx
@@ -1199,23 +1074,16 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
         .await
         .unwrap();
 
+    // No persisted signatures means would Demote, but the requeue cap intercepts it.
     let mock = MockRpcServer::start().await;
-    // Empty signatures → NotLanded → would Demote, but the cap intercepts it.
-    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     let client = test_client(mock.url());
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(
-        &storage,
-        &client,
-        Pubkey::new_unique(),
-        ProgramType::Escrow,
-        &storage_tx,
-    )
-    .await
-    .unwrap();
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
 
     assert_eq!(
         status_of(&pool, tx_id).await,

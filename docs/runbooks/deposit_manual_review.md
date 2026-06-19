@@ -25,11 +25,13 @@ There are **four trigger surfaces** that can land a deposit in
    mint-init helper found the on-chain mint in a state it cannot fix by
    re-issuing `mint_to` (wrong authority on the private channel mint, or
    corrupt mint data). See **Path D** for recovery.
-3. **Recovery-worker idempotency lookup failed** — the periodic
-   stuck-row recovery worker found a stale `Processing` deposit, tried
-   the idempotency memo lookup against the PrivateChannel RPC, and the
-   RPC was unreachable. Row data is fine; no on-chain mint attempted.
-   See **Path E**.
+3. **Recovery-worker could not classify the persisted signature** - the
+   periodic stuck-row recovery worker found a stale `Processing` deposit
+   but could not determine whether its mint landed: either the
+   PrivateChannel RPC was unreachable, or a stored signature could not be
+   read or parsed (so it never reached the RPC check). Recovery quarantines
+   on uncertainty rather than risk a double-mint. The `transactions` row
+   itself is fine. See **Path E**.
 4. **Processor-side allowlist gate** — the deposit's `mint` has no row
    in the `mints` allowlist (`MintCache::assert_mint_allowlisted`). Row
    data is fine; no `MintTo` was attempted. See **Path F**.
@@ -51,7 +53,8 @@ to the right Path below.
 | `invalid_pubkey` | `mint` or `recipient` field is not a valid base58 pubkey. |
 | `invalid_builder` | Builder rejected the row's data (e.g. negative amount). |
 | `program_error` | Generic builder error not covered by the specific variants. |
-| `deposit idempotency:` | The recovery worker could not authoritatively decide whether the deposit's mint already landed. Row was quarantined on uncertainty rather than risk a double-mint. Indicates RPC health, not a row defect. See **Path E**. |
+| `could not verify mint landed` | The recovery worker could not determine whether the deposit's mint landed: the PrivateChannel RPC was uncertain, or a stored signature could not be read or parsed. Quarantined on uncertainty rather than risk a double-mint. See **Path E**. |
+| `legacy in-flight deposit, verify on-chain before re-mint` | A one-time upgrade quarantine: this deposit was already `processing` when the pre-broadcast-persist code was deployed, so it has no persisted signature and recovery cannot prove it never minted. Verify on-chain before re-arming. See **Path E** (treat as `AMBIGUOUS` until the on-chain check resolves). |
 | `recovery requeues without progress` | The recovery worker demoted this `processing` deposit 3 times (mint never landed each cycle) and quarantined rather than loop forever. Row data is fine; the mint keeps failing to land. See **Path G**. |
 
 ### Sender-side post-JIT surface (`sender/mint.rs`)
@@ -85,10 +88,15 @@ solana confirm -v <signature> --url <solana-rpc-url>
 
 ## Recovery
 
-Deposits do not need on-chain mint verification before recovery - the
-quarantine triggers on row-data validation, before any RPC call. The
-idempotency memo (`private_channel:mint-idempotency:<transaction_id>`) prevents
-double-mint on retry even if the mint somehow did land.
+Processor-side and allowlist quarantines (Paths A/B/C/F) trigger on row-data
+validation before any mint is attempted, so they do not need on-chain mint
+verification before recovery. The signature-driven recovery worker (Path E)
+is the gate against a double-mint: it re-arms (`pending`) only a deposit it
+has proven did not mint - either no signature was ever persisted (so it was
+never broadcast) or the persisted signature is provably dead. An on-chain
+mint memo (`private_channel:mint-idempotency:<transaction_id>`) is still
+emitted as a forensic marker for manual review, but recovery no longer
+depends on scanning for it.
 
 That said: **if `error_message` is `program_error`** the trigger is less
 specific and may indicate a real on-chain rejection. In that case run
@@ -138,10 +146,11 @@ deterministic error as transient could put the operator into a tight
 retry loop. The asymmetric cost favors a noisy quarantine over a silent
 retry.
 
-Re-arm to `pending` (safe - idempotency memo prevents duplicate mint),
-then [escalate](_escalation.md) (Tier 3) so the taxonomy can be
-extended to classify this error variant explicitly. Do not patch
-in-place.
+This quarantine fires on a transient error raised before the mint is
+broadcast, so no `MintTo` reached the chain and re-arming cannot
+double-mint. Re-arm to `pending`, then [escalate](_escalation.md) (Tier 3)
+so the taxonomy can be extended to classify this error variant explicitly.
+Do not patch in-place.
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
@@ -192,7 +201,8 @@ admin pubkey.
   ```
 
   to point the mint at the current operator admin. Then re-arm to
-  `pending` (SQL below). The idempotency memo prevents double-mint.
+  `pending` (SQL below). Safe because Step 1 already verified `NOT_LANDED`
+  on-chain - no mint exists to duplicate.
 - **Authority mismatch — current authority lost** (e.g. old admin key
   destroyed during rotation). The mint is permanently unusable.
   **Escalate (Tier 1).** Recovery is a manual coordinated mint
@@ -219,21 +229,32 @@ UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updat
  WHERE id = :transaction_id;
 ```
 
-### Path E - recovery-worker idempotency lookup failed
+### Path E - recovery-worker could not classify the persisted signature
 
-`error_message` starts with `deposit idempotency:`. The recovery worker
-quarantines rather than demote when the idempotency lookup fails on RPC
-error, because demoting would re-pick the row and risk a double-mint. This
-is the same fail-closed stance as the live mint path, which on the same RPC
-failure also stops without minting (it routes to a terminal failure via
-`send_fatal_error` rather than minting unverified). Both paths refuse to
-proceed on uncertainty; they differ only in terminal state.
+`error_message` contains `could not verify mint landed` (or, for a legacy
+upgrade row, `legacy in-flight deposit, verify on-chain before re-mint`).
+
+Deposit recovery is signature-driven: on every sweep the worker reads the
+deposit's persisted broadcast signature and asks the PrivateChannel RPC
+whether it landed. The decision is:
+
+| Persisted signature state | Recovery action |
+|---|---|
+| none recorded | demote to `pending` (provably never broadcast - the signature is persisted write-ahead, before the send) |
+| finalized success | mark `completed` |
+| dead (finalized-failed or blockhash-expired) | demote to `pending` |
+| still in flight | leave `processing`, re-check next sweep |
+| RPC uncertain / malformed signature | quarantine to `manual_review` (this Path) |
+
+The worker quarantines on uncertainty rather than demote, because demoting
+would re-pick the row and risk a double-mint. It never demotes a deposit it
+cannot prove did not mint.
 
 #### Step 1 - check RPC health
 
-Inspect the suffix of `error_message` to identify the underlying RPC
-transport failure (timeout, connection refused, HTTP 5xx, etc.).
-Confirm against the operator's current PrivateChannel RPC endpoint:
+Inspect the suffix of `error_message`. If it names an RPC transport
+failure (timeout, connection refused, HTTP 5xx, etc.), confirm against
+the operator's current PrivateChannel RPC endpoint:
 
 ```bash
 curl -s -X POST -H "Content-Type: application/json" \
@@ -241,8 +262,9 @@ curl -s -X POST -H "Content-Type: application/json" \
   <private-channel-rpc-url>
 ```
 
-If RPC is unhealthy, address that first. If RPC is healthy now,
-proceed.
+If RPC is unhealthy, address that first. If the suffix instead names an
+unparseable stored signature, RPC health is not the cause; proceed
+straight to Step 2 and treat it as an engineering escalation afterward.
 
 #### Step 2 - verify on-chain
 
@@ -259,8 +281,8 @@ Mark `completed` with the observed signature (same SQL as
 
 ##### `NOT_LANDED` — re-arm
 
-The mint did not land. Re-arm to `pending`; the idempotency memo
-prevents duplicate mint on the next attempt.
+Step 2 verified `NOT_LANDED` on-chain, so no mint exists to duplicate.
+Re-arm to `pending` for a fresh mint attempt.
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
@@ -385,21 +407,21 @@ SOLA2-27 attack surface, not an operations recovery.
 ### Path G - requeue cap exhausted (mint never landed)
 
 `error_message` contains `recovery requeues without progress`. Each
-recovery pass whose idempotency scan finds no existing mint (`NotLanded`)
-demotes the stuck `processing` deposit back to `pending` for a fresh
-mint. After `MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with the
-mint still never landing, recovery quarantines instead of looping. So the
-mint was retried 3 times and never landed. The lookup *succeeded* each
-time and said not-landed (distinct from Path E, where the lookup itself
-*failed* on RPC error); the row data is valid (distinct from Path A).
+recovery pass that classifies the deposit's signatures as absent or dead
+(`NotLanded`) demotes the stuck `processing` deposit back to `pending` for
+a fresh mint. After `MAX_RECOVERY_REQUEUE_ATTEMPTS` (3) such requeues with
+the mint still never landing, recovery quarantines instead of looping. So
+the mint was retried 3 times and never landed. The classification
+*succeeded* each time and said not-landed (distinct from Path E, where the
+RPC was uncertain); the row data is valid (distinct from Path A).
 
 #### Step 1 - verify on-chain
 
 Run [`_verify_onchain_mint.md`](_verify_onchain_mint.md). Expected
-verdict: `NOT_LANDED`. If `LANDED` -> the idempotency scan missed a landed
-mint; mark `completed` per **Path E** (`LANDED` branch) and
-[escalate](_escalation.md) (Tier 2) - the scan has a defect (e.g. the sig
-is past its lookback window).
+verdict: `NOT_LANDED`. If `LANDED` -> a broadcast signature landed after
+the last classification said dead; mark `completed` per **Path E**
+(`LANDED` branch) and [escalate](_escalation.md) (Tier 2) so engineering
+can review the finality timing.
 
 #### Step 2 - find why the mint never lands
 
@@ -414,8 +436,8 @@ error. A deterministic cause means re-arming will loop again ->
 
 Fix the root cause first. Then re-arm to `pending` **and reset the requeue
 counter** - re-arming without the reset re-quarantines on the next stall,
-since the counter is already at the cap. The idempotency memo still guards
-against a double-mint on retry:
+since the counter is already at the cap. Safe because Step 1 verified
+`NOT_LANDED` on-chain - no mint exists to duplicate:
 
 ```sql
 UPDATE transactions
@@ -425,6 +447,38 @@ UPDATE transactions
 
 If the mint can never land (unrecoverable), mark `failed` and
 [escalate](_escalation.md) (Tier 1) for refund coordination.
+
+## One-time upgrade step (pre-broadcast signature persistence)
+
+Deposit recovery's `none recorded -> demote` rule (Path E table) is only
+sound for rows created under the pre-broadcast-persist code. A deposit that
+was already `processing` at the moment of the upgrade may have been
+broadcast under the old combined-send path with **no persisted signature** -
+demoting it blindly would re-pick and double-mint.
+
+**Fresh deployment: N/A.** A clean install has no legacy in-flight rows.
+
+**Upgrading an environment with in-flight deposits:** the recommended cutover
+is to drain the operator (let it settle all in-flight deposits, or stop it
+with no deposits mid-`processing`) before deploying. If a drain is not
+possible, run this one-time query **once, immediately after the upgrade and
+before the recovery worker first sweeps**, to quarantine any legacy
+`processing` deposit that has no persisted signature so an operator verifies
+it on-chain (Path E) instead of risking a blind re-mint:
+
+```sql
+UPDATE transactions
+   SET status = 'manual_review',
+       error_message = 'SOLA2-12 upgrade: legacy in-flight deposit, verify on-chain before re-mint',
+       updated_at = NOW()
+ WHERE transaction_type = 'deposit'
+   AND status = 'processing'
+   AND id NOT IN (SELECT transaction_id FROM pending_release_signatures);
+```
+
+It is bounded by the in-flight-at-deploy count and never needs to run again:
+after cutover, every new deposit persists its signature before broadcast, so
+a missing signature reliably means "never sent".
 
 ## Post-incident artifacts
 

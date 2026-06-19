@@ -1,5 +1,5 @@
 use crate::operator::utils::instruction_util::{
-    mint_idempotency_memo, InitializeMintBuilder, MintToBuilderWithTxnId, TransactionBuilder,
+    InitializeMintBuilder, MintToBuilderWithTxnId, TransactionBuilder,
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{
@@ -412,16 +412,6 @@ async fn mint_authority_check_with_backoff(
         }
     }
     last_check
-}
-
-/// Check recent ATA signatures for an already-confirmed mint carrying this transaction's
-/// deterministic idempotency memo.
-pub async fn find_existing_mint_signature(
-    rpc_client: &RpcClientWithRetry,
-    builder_with_txn_id: &MintToBuilderWithTxnId,
-) -> Result<Option<Signature>, String> {
-    let expected_memo = mint_idempotency_memo(builder_with_txn_id.txn_id);
-    find_existing_mint_signature_with_memo(rpc_client, builder_with_txn_id, &expected_memo).await
 }
 
 /// Check recent ATA signatures for an already-confirmed mint carrying the given memo.

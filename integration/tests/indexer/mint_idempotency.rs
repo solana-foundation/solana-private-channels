@@ -1,8 +1,12 @@
 //! Integration tests for operator mint idempotency.
 //!
-//! Verifies that `find_existing_mint_signature` correctly detects a previously
+//! Verifies that `find_existing_mint_signature_with_memo` correctly detects a previously
 //! confirmed mint-to transaction on-chain, preventing the operator from issuing
 //! duplicate channel tokens for the same deposit.
+//!
+//! As of the write-ahead signature-persistence change this memo scan is no longer on
+//! the live deposit-mint send path (which now persists its broadcast signature and lets
+//! recovery reconcile against it); the function is reached only from the remint path.
 //!
 //! Scenarios covered:
 //! 1. Matching txn_id + amount → existing signature returned (idempotent re-use).
@@ -14,8 +18,8 @@ mod helpers;
 
 use helpers::{generate_mint, send_and_confirm_instructions, setup_wallets};
 use private_channel_indexer::operator::{
-    find_existing_mint_signature, mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId,
-    RetryConfig, RpcClientWithRetry,
+    find_existing_mint_signature_with_memo, mint_idempotency_memo, MintToBuilder,
+    MintToBuilderWithTxnId, RetryConfig, RpcClientWithRetry,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
@@ -31,11 +35,11 @@ use std::sync::Arc;
 use test_utils::validator_helper::start_test_validator;
 
 /// Submits a real `mint_to` instruction with an idempotency memo, then confirms
-/// that `find_existing_mint_signature` can locate the transaction by matching
+/// that `find_existing_mint_signature_with_memo` can locate the transaction by matching
 /// both the memo (txn_id) and the token amount.  Also asserts that a mismatched
 /// txn_id or a different amount each independently prevent a false positive.
 #[tokio::test(flavor = "multi_thread")]
-async fn find_existing_mint_signature_detects_confirmed_mint() {
+async fn find_existing_mint_signature_with_memo_detects_confirmed_mint() {
     let (validator, faucet_keypair, _geyser_port) = start_test_validator().await;
     let rpc_url = validator.rpc_url();
     let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
@@ -98,7 +102,7 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
     // after send_and_confirm_transaction returns, the address_signatures,
     // transaction_memos, and transaction_status columns may not yet be populated.
     // Poll until both getSignaturesForAddress and getTransaction succeed for
-    // our signature, guaranteeing full indexing before find_existing_mint_signature.
+    // our signature, guaranteeing full indexing before find_existing_mint_signature_with_memo.
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         loop {
@@ -115,7 +119,7 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
                 .await
                 .unwrap_or_default();
             if !sigs.is_empty() {
-                // Also verify getTransaction works for our sig so find_existing_mint_signature
+                // Also verify getTransaction works for our sig so find_existing_mint_signature_with_memo
                 // doesn't get a null response when it calls get_transaction internally.
                 let tx_ok = client
                     .get_transaction_with_config(
@@ -160,9 +164,13 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
         trace_id: "mint-idempotency-test".to_string(),
     };
 
-    let result = find_existing_mint_signature(&rpc_client, &builder_with_id)
-        .await
-        .unwrap();
+    let result = find_existing_mint_signature_with_memo(
+        &rpc_client,
+        &builder_with_id,
+        &mint_idempotency_memo(builder_with_id.txn_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, Some(sig));
 
     // Different txn_id (different memo) should return None
@@ -179,9 +187,13 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
         trace_id: "mint-idempotency-test".to_string(),
     };
 
-    let result2 = find_existing_mint_signature(&rpc_client, &builder_with_wrong_id)
-        .await
-        .unwrap();
+    let result2 = find_existing_mint_signature_with_memo(
+        &rpc_client,
+        &builder_with_wrong_id,
+        &mint_idempotency_memo(builder_with_wrong_id.txn_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(result2, None);
 
     // Wrong amount should return None
@@ -198,8 +210,12 @@ async fn find_existing_mint_signature_detects_confirmed_mint() {
         trace_id: "mint-idempotency-test".to_string(),
     };
 
-    let result3 = find_existing_mint_signature(&rpc_client, &builder_wrong_amount)
-        .await
-        .unwrap();
+    let result3 = find_existing_mint_signature_with_memo(
+        &rpc_client,
+        &builder_wrong_amount,
+        &mint_idempotency_memo(builder_wrong_amount.txn_id),
+    )
+    .await
+    .unwrap();
     assert_eq!(result3, None);
 }

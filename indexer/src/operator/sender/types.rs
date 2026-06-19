@@ -130,6 +130,10 @@ pub struct InFlightTx {
     /// before each re-send; once the cap is reached even an Idempotent tx is
     /// declared a permanent failure rather than looping forever.
     pub resend_count: u32,
+    /// Whether this transaction's signature was persisted write-ahead before broadcast.
+    /// When true, an uncertain terminal outcome (send error or confirmation timeout)
+    /// leaves the row Processing for recovery instead of writing Failed.
+    pub persisted: bool,
     /// Semaphore permit held for the lifetime of this entry.
     ///
     /// Acquired before spawning the send task; dropped when the entry is removed
