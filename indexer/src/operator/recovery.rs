@@ -1045,15 +1045,9 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(
-            &storage,
-            &client,
-            Pubkey::new_unique(),
-            ProgramType::Withdraw,
-            &storage_tx,
-        )
-        .await
-        .unwrap();
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
 
         let after = mock.pending_transactions.lock().unwrap();
         assert_eq!(
@@ -1084,15 +1078,9 @@ mod tests {
         let client = make_rpc_client("http://localhost:1");
         let (storage_tx, _rx) = mpsc::channel(8);
 
-        test_hooks::run_recovery_once(
-            &storage,
-            &client,
-            Pubkey::new_unique(),
-            ProgramType::Withdraw,
-            &storage_tx,
-        )
-        .await
-        .unwrap();
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
 
         assert_eq!(
             mock.pending_transactions.lock().unwrap()[0].status,
