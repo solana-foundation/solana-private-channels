@@ -18,6 +18,8 @@ use chrono::Utc;
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
 use solana_keychain::SolanaSigner;
+use solana_rpc_client_api::client_error::ErrorKind;
+use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
@@ -754,8 +756,6 @@ pub(super) async fn handle_success(
 /// or IO error instead leaves the outcome ambiguous (the request may have reached the
 /// cluster), so a persisted mint defers to recovery rather than risk stranding a landed one.
 fn send_rejected_by_node(e: &TransactionError) -> bool {
-    use solana_rpc_client_api::client_error::ErrorKind;
-    use solana_rpc_client_api::request::RpcError;
     matches!(
         e,
         TransactionError::Rpc(err)

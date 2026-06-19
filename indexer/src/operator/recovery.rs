@@ -354,7 +354,7 @@ async fn route_outcome(
             debug!(
                 transaction_id = row.id,
                 reason = %reason,
-                "Recovery left stale Processing withdrawal untouched — release may still land"
+                "Recovery left stale Processing row untouched — broadcast may still land"
             );
         }
         RecoveryAction::Quarantine { reason } => {
