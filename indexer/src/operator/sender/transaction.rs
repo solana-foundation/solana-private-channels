@@ -177,7 +177,9 @@ pub async fn handle_transaction_submission(
 
     // For a withdrawal, which tree does its nonce belong to? None for other txs.
     let release_tree_index = match &tx_builder {
-        TransactionBuilder::ReleaseFunds(b) => Some(b.nonce / MAX_TREE_LEAVES as u64),
+        TransactionBuilder::ReleaseFunds(builder_with_nonce) => {
+            Some(builder_with_nonce.nonce / MAX_TREE_LEAVES as u64)
+        }
         _ => None,
     };
 
@@ -186,12 +188,19 @@ pub async fn handle_transaction_submission(
     // the tick drain retries it once process_pending_remints resolves the nonce.
     if release_tree_index.is_some_and(|tree| state.has_unresolved_ambiguous_nonce(tree)) {
         // The if-let always matches here: only ReleaseFunds sets release_tree_index.
-        if let TransactionBuilder::ReleaseFunds(b) = tx_builder {
+        if let TransactionBuilder::ReleaseFunds(builder_with_nonce) = tx_builder {
             debug!(
-                nonce = b.nonce,
+                nonce = builder_with_nonce.nonce,
                 "Parking withdrawal: ambiguous nonce in same tree unresolved"
             );
-            state.ambiguous_retry_queue.push((ctx, b.builder));
+            // Mark the row Parked so recovery's Processing sweep does not
+            // quarantine it. Best-effort: the in-memory queue still drives it,
+            // and the tolerant unpark sends it even if this write was lost.
+            let id = builder_with_nonce.transaction_id;
+            if let Err(e) = state.storage.try_park_processing(id).await {
+                warn!(transaction_id = id, "Park status write failed: {e}");
+            }
+            state.ambiguous_retry_queue.push(builder_with_nonce);
         }
         // Always return: a blocked withdrawal is parked, not submitted.
         return;
@@ -3900,18 +3909,25 @@ mod tests {
         state.pending_remints.push(ambiguous_pending_remint(2));
 
         // Incoming withdrawal nonce 3 is in the same tree. The gate parks before
-        // touching the builder, so an empty builder is fine.
+        // touching the builder, so an empty builder is fine. It carries remint_info
+        // that must survive the park unchanged (the drain has no other source for it).
+        let remint_info = make_remint_info(99);
         let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
             builder: ReleaseFundsBuilder::new(),
             nonce: 3,
             transaction_id: 99,
             trace_id: "trace-99".to_string(),
-            remint_info: None,
+            remint_info: Some(remint_info.clone()),
         }));
         handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
 
         assert_eq!(state.ambiguous_retry_queue.len(), 1);
-        assert_eq!(state.ambiguous_retry_queue[0].0.withdrawal_nonce, Some(3));
+        assert_eq!(state.ambiguous_retry_queue[0].nonce, 3);
+        assert_eq!(
+            state.ambiguous_retry_queue[0].remint_info.as_ref(),
+            Some(&remint_info),
+            "remint_info must travel with the parked withdrawal unchanged"
+        );
         assert!(
             storage_rx.try_recv().is_err(),
             "parked withdrawal must not emit a status update"

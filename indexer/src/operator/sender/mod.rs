@@ -148,6 +148,7 @@ pub mod test_hooks {
 }
 
 use crate::error::OperatorError;
+use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::utils::instruction_util::TransactionBuilder;
 use crate::operator::ReleaseFundsBuilderWithNonce;
 use crate::operator::RpcClientWithRetry;
@@ -354,33 +355,45 @@ pub(super) async fn drain_ambiguous_retry_queue(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    // Grab everything out of the queue and go through that copy. The real queue
-    // is now empty. If a withdrawal is still blocked, it gets added back to the
-    // real queue, and we leave it there until the next tick. We do not retry it
-    // again right now.
-    for (ctx, builder) in std::mem::take(&mut state.ambiguous_retry_queue) {
-        let nonce = ctx
-            .withdrawal_nonce
-            .expect("ambiguous retry must have nonce");
-        let transaction_id = ctx
-            .transaction_id
-            .expect("ambiguous retry must have transaction_id");
-        let trace_id = ctx
-            .trace_id
-            .clone()
-            .expect("ambiguous retry must have trace_id");
-        let remint_info = state.remint_cache.get(&nonce).cloned();
-        if remint_info.is_none() {
-            error!("Missing remint_info for ambiguous retry nonce {} - remint will not be possible on failure", nonce);
+    // Take the whole queue and walk the copy; the real queue starts empty and
+    // anything still blocked goes back in for the next tick. Each parked builder
+    // carries its own remint_info, so there is nothing to look up.
+    for builder_with_nonce in std::mem::take(&mut state.ambiguous_retry_queue) {
+        let tree = builder_with_nonce.nonce / MAX_TREE_LEAVES as u64;
+
+        // Still blocked: re-write Parked each tick so updated_at stays fresh,
+        // which tells recovery a live sender still owns this row.
+        if state.has_unresolved_ambiguous_nonce(tree) {
+            let id = builder_with_nonce.transaction_id;
+            if let Err(e) = state.storage.try_park_processing(id).await {
+                warn!(transaction_id = id, "Re-park heartbeat write failed: {e}");
+            }
+            state.ambiguous_retry_queue.push(builder_with_nonce);
+            continue;
         }
-        let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
-            builder,
-            nonce,
-            transaction_id,
-            trace_id,
-            remint_info,
-        }));
-        handle_transaction_submission(state, tx_builder, storage_tx).await;
+
+        // Unblocked: flip the row back to Processing, then send it.
+        let id = builder_with_nonce.transaction_id;
+        match state.storage.try_unpark_to_processing(id).await {
+            // We won the flip, the row is ours to send.
+            Ok(true) => {
+                let tx_builder = TransactionBuilder::ReleaseFunds(builder_with_nonce);
+                handle_transaction_submission(state, tx_builder, storage_tx).await;
+            }
+            // Row is no longer Parked: recovery already requeued it, so another
+            // path owns this nonce now. Drop our copy to avoid sending twice.
+            Ok(false) => {
+                warn!(
+                    transaction_id = id,
+                    "Unpark CAS no-op; dropping stale parked builder"
+                )
+            }
+            // DB hiccup: keep it and try again next tick.
+            Err(e) => {
+                warn!(transaction_id = id, "Unpark write failed: {e}; re-queuing");
+                state.ambiguous_retry_queue.push(builder_with_nonce);
+            }
+        }
     }
 }
 
@@ -440,10 +453,12 @@ mod tests {
         TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
-        ExtraErrorCheckPolicy, RetryPolicy, WithdrawalRemintInfo,
+        ExtraErrorCheckPolicy, ReleaseFundsBuilderWithNonce, RetryPolicy, WithdrawalRemintInfo,
     };
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::MintCache;
+    use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use crate::PrivateChannelIndexerConfig;
     use chrono::Utc;
@@ -698,14 +713,15 @@ mod tests {
         });
 
         // Parked withdrawal nonce 3, same tree.
-        state.ambiguous_retry_queue.push((
-            TransactionContext {
-                transaction_id: Some(99),
-                withdrawal_nonce: Some(3),
-                trace_id: Some("trace-99".to_string()),
-            },
-            ReleaseFundsBuilder::new(),
-        ));
+        state
+            .ambiguous_retry_queue
+            .push(Box::new(ReleaseFundsBuilderWithNonce {
+                builder: ReleaseFundsBuilder::new(),
+                nonce: 3,
+                transaction_id: 99,
+                trace_id: "trace-99".to_string(),
+                remint_info: None,
+            }));
 
         drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
 
@@ -714,10 +730,136 @@ mod tests {
             1,
             "still-blocked withdrawal must re-park"
         );
-        assert_eq!(state.ambiguous_retry_queue[0].0.withdrawal_nonce, Some(3));
+        assert_eq!(state.ambiguous_retry_queue[0].nonce, 3);
         assert!(
             storage_rx.try_recv().is_err(),
             "no status update while re-parked"
+        );
+    }
+
+    /// Unblocked, but the unpark CAS loses (no Parked row in the DB, e.g. recovery
+    /// already requeued it). The builder must be dropped, not sent, so the nonce
+    /// is not submitted twice.
+    #[tokio::test]
+    async fn drain_drops_builder_when_unpark_cas_loses() {
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // No blocker → unblocked. The mock has no row for this id, so the unpark
+        // CAS returns Ok(false).
+        state
+            .ambiguous_retry_queue
+            .push(Box::new(ReleaseFundsBuilderWithNonce {
+                builder: ReleaseFundsBuilder::new(),
+                nonce: 5,
+                transaction_id: 500,
+                trace_id: "t".to_string(),
+                remint_info: None,
+            }));
+
+        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
+
+        assert!(
+            state.ambiguous_retry_queue.is_empty(),
+            "builder must be dropped when the unpark CAS loses"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "dropped builder emits no status update"
+        );
+    }
+
+    /// While the blocker is unresolved, the drain re-writes Parked each tick and
+    /// refreshes updated_at. That freshness is what keeps recovery from treating
+    /// a live parked row as a restart orphan.
+    #[tokio::test]
+    async fn drain_heartbeats_parked_row_while_blocked() {
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Blocker: nonce 2 (tree 0) unresolved.
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(1),
+                withdrawal_nonce: Some(2),
+                trace_id: Some("t".to_string()),
+            },
+            remint_info: WithdrawalRemintInfo {
+                transaction_id: 1,
+                trace_id: "t".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+            signatures: vec![],
+            original_error: "x".to_string(),
+            deadline: Utc::now(),
+            finality_check_attempts: 0,
+        });
+
+        // Parked withdrawal nonce 3 (same tree). Seed its DB row as stale Parked.
+        let stale = Utc::now() - chrono::Duration::minutes(10);
+        if let Storage::Mock(mock) = &*state.storage {
+            mock.pending_transactions
+                .lock()
+                .unwrap()
+                .push(DbTransaction {
+                    id: 3,
+                    signature: "sig-3".to_string(),
+                    trace_id: "trace-3".to_string(),
+                    slot: 100,
+                    initiator: Pubkey::new_unique().to_string(),
+                    recipient: Pubkey::new_unique().to_string(),
+                    mint: Pubkey::new_unique().to_string(),
+                    amount: TokenAmount(1_000),
+                    memo: None,
+                    transaction_type: TransactionType::Withdrawal,
+                    withdrawal_nonce: Some(3),
+                    status: TransactionStatus::Parked,
+                    created_at: stale,
+                    updated_at: stale,
+                    processed_at: None,
+                    counterpart_signature: None,
+                    remint_signatures: None,
+                    remint_last_valid_block_heights: None,
+                    pending_remint_deadline_at: None,
+                    finality_check_attempts: 0,
+                    recovery_requeue_attempts: 0,
+                    instruction_index: 0,
+                    inner_index: None,
+                    landed_remint_signature: None,
+                });
+        }
+        state
+            .ambiguous_retry_queue
+            .push(Box::new(ReleaseFundsBuilderWithNonce {
+                builder: ReleaseFundsBuilder::new(),
+                nonce: 3,
+                transaction_id: 3,
+                trace_id: "trace-3".to_string(),
+                remint_info: None,
+            }));
+
+        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
+
+        // Still blocked: builder re-queued.
+        assert_eq!(state.ambiguous_retry_queue.len(), 1);
+        assert_eq!(state.ambiguous_retry_queue[0].nonce, 3);
+
+        // Heartbeat fired: row still Parked, updated_at refreshed.
+        if let Storage::Mock(mock) = &*state.storage {
+            let rows = mock.pending_transactions.lock().unwrap();
+            assert_eq!(rows[0].status, TransactionStatus::Parked);
+            assert!(
+                rows[0].updated_at > stale,
+                "heartbeat must refresh updated_at"
+            );
+        }
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "heartbeat is a direct CAS, not a status update"
         );
     }
 }

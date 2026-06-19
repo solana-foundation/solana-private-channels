@@ -1,6 +1,7 @@
 use crate::config::ProgramType;
 use crate::operator::utils::instruction_util::{
-    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, WithdrawalRemintInfo,
+    ExtraErrorCheckPolicy, MintToBuilder, ReleaseFundsBuilderWithNonce, RetryPolicy,
+    WithdrawalRemintInfo,
 };
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::TransactionStatus;
@@ -157,8 +158,9 @@ pub struct SenderState {
     pub rotation_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
     /// Withdrawals parked because an unresolved PendingRemint nonce in the same
     /// tree could leave the local SMT out of sync with chain. Drained each tick
-    /// after process_pending_remints.
-    pub ambiguous_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
+    /// after process_pending_remints. Stores the full builder so remint_info
+    /// travels with the parked withdrawal.
+    pub ambiguous_retry_queue: Vec<Box<ReleaseFundsBuilderWithNonce>>,
     /// Pending ResetSmtRoot transaction waiting for in-flight txs to settle
     pub pending_rotation: Option<Box<ResetSmtRootBuilder>>,
     pub program_type: ProgramType,

@@ -29,6 +29,10 @@ pub enum TransactionStatus {
     Pending,
     // Currently processing by an Operator
     Processing,
+    // Withdrawal whose proof generation is blocked by an unresolved ambiguous
+    // nonce in the same tree. Never broadcast on-chain. Lives only while the
+    // sender owns it in memory; recovery requeues it if a restart orphans it.
+    Parked,
     Completed,
     Failed,
     // Withdrawal failed permanently but burned PrivateChannel tokens were reminted back to user
