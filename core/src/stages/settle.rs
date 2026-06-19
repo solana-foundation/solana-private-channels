@@ -9,11 +9,12 @@ use {
     },
     anyhow::{anyhow, Context, Result},
     redis::AsyncCommands,
-    solana_hash::Hash,
     solana_rpc_client_types::response::RpcPerfSample,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
+        hash::{hashv, Hash},
         pubkey::Pubkey,
+        signature::Signature,
         transaction::SanitizedTransaction,
     },
     solana_svm::{
@@ -452,6 +453,26 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
     WorkerHandle::new("Settle".to_string(), handle)
 }
 
+/// Derive a block's hash by SHA-256-hashing the parent hash, the slot, a
+/// high-resolution timestamp, and every transaction signature in the block.
+/// Folding in the nanosecond timestamp and the signatures makes a future block's hash
+/// unpredictable.
+fn compute_blockhash(
+    previous: &Hash,
+    slot: u64,
+    time_nanos: u128,
+    signatures: &[Signature],
+) -> Hash {
+    let slot_bytes = slot.to_le_bytes();
+    let time_bytes = time_nanos.to_le_bytes();
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(3 + signatures.len());
+    parts.push(previous.as_ref());
+    parts.push(&slot_bytes);
+    parts.push(&time_bytes);
+    parts.extend(signatures.iter().map(|s| s.as_ref()));
+    hashv(&parts)
+}
+
 /// Settle transactions: Update accounts database with changes
 async fn settle_transactions(
     last_block: Option<LastBlock>,
@@ -470,30 +491,16 @@ async fn settle_transactions(
     let mut final_accounts_actual: HashMap<Pubkey, AccountSettlement> =
         HashMap::with_capacity(n * 4);
 
-    // Determine block time
-    let block_time = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let block_time = now.as_secs() as i64;
+    let block_time_nanos = now.as_nanos();
 
-    // Generate blockhash and determine next slot
-    // TODO: Check the blockhash generation scheme
-    let (next_blockhash, next_slot, last_blockhash, last_slot) =
-        if let Some(ref last_block) = last_block {
-            let mut hash_bytes = [0u8; 32];
-            hash_bytes[0..8].copy_from_slice(&last_block.slot.to_le_bytes());
-            hash_bytes[8..16].copy_from_slice(&block_time.to_le_bytes());
-            let next_blockhash = Hash::new_from_array(hash_bytes);
-            let next_slot = last_block.slot + 1;
-            (
-                next_blockhash,
-                next_slot,
-                last_block.blockhash,
-                last_block.slot,
-            )
-        } else {
-            (Hash::default(), 0, Hash::default(), 0)
-        };
+    let (next_slot, last_blockhash, last_slot, is_genesis) = match last_block {
+        Some(ref lb) => (lb.slot + 1, lb.blockhash, lb.slot, false),
+        None => (0, Hash::default(), 0, true),
+    };
 
     // Phase 1: build account maps and transaction lists
     let t_processing_start = tokio::time::Instant::now();
@@ -562,6 +569,17 @@ async fn settle_transactions(
     }
 
     let t_processing_ms = t_processing_start.elapsed().as_secs_f64() * 1000.0;
+
+    let next_blockhash = if is_genesis {
+        Hash::default()
+    } else {
+        compute_blockhash(
+            &last_blockhash,
+            next_slot,
+            block_time_nanos,
+            &block_transaction_signatures,
+        )
+    };
 
     // Convert final_accounts to Vec for batch write
     let accounts_vec: Vec<(Pubkey, AccountSettlement)> =
@@ -658,7 +676,7 @@ mod tests {
     use solana_sdk::{
         account::AccountSharedData,
         pubkey::Pubkey,
-        signature::{Keypair, Signer},
+        signature::{Keypair, Signature, Signer},
     };
     use solana_svm::account_loader::{FeesOnlyTransaction, LoadedTransaction};
     use solana_svm::rollback_accounts::RollbackAccounts;
@@ -692,6 +710,65 @@ mod tests {
         }))
     }
 
+    fn sig(byte: u8) -> Signature {
+        Signature::from([byte; 64])
+    }
+
+    #[test]
+    fn compute_blockhash_is_deterministic_given_inputs() {
+        let parent = Hash::new_unique();
+        let sigs = vec![sig(1), sig(2)];
+        let a = compute_blockhash(&parent, 7, 123, &sigs);
+        let b = compute_blockhash(&parent, 7, 123, &sigs);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn compute_blockhash_depends_on_parent() {
+        let sigs = vec![sig(1)];
+        let a = compute_blockhash(&Hash::new_unique(), 7, 123, &sigs);
+        let b = compute_blockhash(&Hash::new_unique(), 7, 123, &sigs);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_blockhash_depends_on_slot() {
+        let parent = Hash::new_unique();
+        let sigs = vec![sig(1)];
+        let a = compute_blockhash(&parent, 7, 123, &sigs);
+        let b = compute_blockhash(&parent, 8, 123, &sigs);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_blockhash_depends_on_time() {
+        let parent = Hash::new_unique();
+        let sigs = vec![sig(1)];
+        let a = compute_blockhash(&parent, 7, 123, &sigs);
+        let b = compute_blockhash(&parent, 7, 124, &sigs);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_blockhash_depends_on_signatures() {
+        let parent = Hash::new_unique();
+        let empty = compute_blockhash(&parent, 7, 123, &[]);
+        let one = compute_blockhash(&parent, 7, 123, &[sig(1)]);
+        let other = compute_blockhash(&parent, 7, 123, &[sig(2)]);
+        assert_ne!(empty, one);
+        assert_ne!(one, other);
+    }
+
+    #[test]
+    fn compute_blockhash_is_not_predictable_packing() {
+        // A real hash spreads entropy across all 32 bytes, unlike the old slot-in-bytes[0..8], zero-tail packing.
+        let slot: u64 = 42;
+        let h = compute_blockhash(&Hash::new_unique(), slot, 123, &[sig(1)]);
+        let bytes = h.to_bytes();
+        assert!(bytes[16..32].iter().any(|&b| b != 0));
+        assert_ne!(&bytes[0..8], &slot.to_le_bytes());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_empty_results() {
         let (mut db, _pg) = start_test_postgres().await;
@@ -707,6 +784,7 @@ mod tests {
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.slot, 0);
+        // Genesis (last_block == None) deliberately stays the default hash.
         assert_eq!(r.blockhash, Hash::default());
         assert!(r.account_settlements.is_empty());
     }
@@ -743,6 +821,51 @@ mod tests {
         .unwrap();
         assert_eq!(r2.slot, 1);
         assert_ne!(r2.blockhash, Hash::default());
+
+        // The persisted block must record r1's hash as parent, proving the chain link is written through, not just in memory.
+        let block1 = db.get_block(1).await.expect("block 1 persisted");
+        assert_eq!(block1.previous_blockhash, r1.blockhash);
+    }
+
+    // End-to-end: settle derives the new hash and persists it round-tripped and chained.
+    // Signature-binding is proven deterministically by compute_blockhash_depends_on_signatures;
+    // it cannot be isolated here because each settle reads its own wall-clock nanos, so this
+    // asserts the wiring and persistence instead of re-proving the content dependency.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_persists_computed_blockhash() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let parent_hash = Hash::new_unique();
+
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let account_pk = Pubkey::new_unique();
+        let processed = make_executed(vec![(
+            account_pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        let with_tx: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
+
+        let r = settle_transactions(
+            Some(LastBlock {
+                slot: 5,
+                blockhash: parent_hash,
+            }),
+            &mut db,
+            None,
+            &with_tx,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(r.blockhash, Hash::default());
+        assert_ne!(r.blockhash, parent_hash);
+        let block = db.get_block(r.slot).await.unwrap();
+        assert_eq!(block.blockhash, r.blockhash);
+        assert_eq!(block.previous_blockhash, parent_hash);
     }
 
     #[tokio::test(flavor = "multi_thread")]

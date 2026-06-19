@@ -57,6 +57,7 @@ async fn build_module(admin_keys: Vec<Pubkey>) -> (RpcModule<()>, ContainerAsync
         accounts_db: db,
         admin_keys,
         live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
+        max_blockhashes: 150,
     };
     let module = create_rpc_module(Some(read_deps), None).await;
     (module, pg)

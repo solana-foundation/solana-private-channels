@@ -67,6 +67,18 @@ Routes `sendTransaction` to the write node; all other RPC methods go to the read
 
 Exposes `/ws` for real-time transaction streaming and `/health` for health checks.
 
+#### Accessing the streamer (internal-only)
+
+The streamer feed is unauthenticated, so it is **not published to the host**. It listens only on the
+`private-channel-network` Docker network at `ws://streamer:8902/ws` (`streamer` is the Compose service
+DNS name; container `private-channel-streamer`).
+
+To listen to the feed, attach a throwaway WebSocket client to the network:
+
+```shell
+docker run --rm --network private-channel_private-channel-network solsson/websocat ws://streamer:8902/ws
+```
+
 ## Changing Configuration
 
 Set the corresponding environment variable in your `.env.devnet` file (or equivalent) and restart the service:
