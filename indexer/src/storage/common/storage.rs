@@ -351,7 +351,7 @@ impl Storage {
         try_park_processing::try_park_processing(self, transaction_id).await
     }
 
-    /// CAS `Parked`/`Processing` → `Processing`; `Ok(false)` if the row is neither.
+    /// CAS `Parked` → `Processing`; `Ok(false)` if the row is not `Parked`.
     pub async fn try_unpark_to_processing(
         &self,
         transaction_id: i64,

@@ -196,7 +196,7 @@ pub async fn handle_transaction_submission(
             );
             // Mark the row Parked so recovery's Processing sweep does not
             // quarantine it. Best-effort: the in-memory queue still drives it,
-            // and the tolerant unpark sends it even if this write was lost.
+            // and the next heartbeat re-park repairs a write lost here.
             let id = builder_with_nonce.transaction_id;
             if let Err(e) = state.storage.try_park_processing(id).await {
                 warn!(transaction_id = id, "Park status write failed: {e}");

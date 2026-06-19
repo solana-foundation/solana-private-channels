@@ -1232,7 +1232,9 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// CAS `Parked`/`Processing` → `Processing`.
+    /// CAS `Parked` → `Processing`. Strict on purpose: if recovery requeued the
+    /// row and a new processor already took it back to `processing`, this returns
+    /// `Ok(false)` so the drain drops its stale builder instead of double-sending.
     pub async fn try_unpark_to_processing_internal(
         &self,
         transaction_id: i64,
@@ -1242,7 +1244,7 @@ impl PostgresDb {
             UPDATE transactions
             SET status = 'processing'
             WHERE id = $1
-              AND status IN ('parked', 'processing')
+              AND status = 'parked'
             "#,
         )
         .bind(transaction_id)

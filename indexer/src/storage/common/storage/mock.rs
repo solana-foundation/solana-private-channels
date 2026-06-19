@@ -604,12 +604,7 @@ impl MockStorage {
         self.check_should_fail("try_unpark_to_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();
         for txn in pending.iter_mut() {
-            if txn.id == transaction_id
-                && matches!(
-                    txn.status,
-                    TransactionStatus::Parked | TransactionStatus::Processing
-                )
-            {
+            if txn.id == transaction_id && txn.status == TransactionStatus::Parked {
                 txn.status = TransactionStatus::Processing;
                 txn.updated_at = Utc::now();
                 return Ok(true);
