@@ -443,9 +443,11 @@
   #
   # WHY THIS EXISTS — DO NOT REMOVE WITHOUT UNDERSTANDING THIS:
   #
-  # The validator container boots with `--reset` (see VALIDATOR_RESET_FLAG in
-  # templates/env.j2), so every redeploy starts from genesis: empty ledger,
-  # zero ATA balances, no prior signatures. Meanwhile the indexer's startup
+  # The validator container boots with `--reset` by default (VALIDATOR_RESET_FLAG
+  # in templates/env.j2, gated by the `validator_reset` var — default true), so
+  # every redeploy starts from genesis: empty ledger, zero ATA balances, no prior
+  # signatures. (Set validator_reset=false only with persistence — see its note
+  # in vars/common.yml.) Meanwhile the indexer's startup
   # reconciliation compares its Postgres totals (deposits/withdrawals per
   # mint) against on-chain ATA balances. Stale rows from a prior run describe
   # a chain that no longer exists, the on-chain balance comes back as 0, and
@@ -621,6 +623,19 @@
         dest: "{{ host_data_dir }}/config/.env"
         mode: "0600"
       no_log: true
+
+    # Fail closed if the rendered .env is missing required secrets, using the
+    # same scripts/check-required-env.sh the Makefile's check-env-* targets run.
+    # This gives deploy and local-dev one shared env-completeness guard so both
+    # enforce the identical contract (e.g. a blank POSTGRES_PASSWORD from an
+    # undecrypted SOPS var is caught here rather than at container start).
+    - name: Validate required secrets in rendered .env
+      ansible.builtin.script:
+        cmd: >-
+          {{ repo_root }}/scripts/check-required-env.sh
+          {{ target_versions_env_file }}
+          {{ target_config_dir }}/.env
+      changed_when: false
 
     # The base compose file has bind mounts with relative `./` sources resolved
     # against the compose file's directory ({{ target_config_dir }}). When a

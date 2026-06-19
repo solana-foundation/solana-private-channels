@@ -199,7 +199,14 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // Load persisted dedup state from DB before starting the stage.
             // Failure here is fatal: starting with an empty cache could allow
             // duplicate transactions to execute after a restart.
-            let db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            //
+            // Opened writable (read_only=false): this is the Write/Aio node, which
+            // connects to the primary and owns address_signatures index
+            // consistency. repair_address_signatures writes (seeds the watermark
+            // and re-derives rows), so it must run against a writable handle.
+            // The read-only node opens its own read_only=true handle below, where
+            // the repair is skipped.
+            let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
             repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
             let (initial_live_blockhashes, initial_dedup_cache) = load_dedup_state(
                 &db,

@@ -153,8 +153,8 @@ validator: 500–2000 TPS depending on hardware.
 ```
 bench (Solana Private Channels WithdrawFunds / burn)
   → Solana Private Channels write-node confirms (dedup → sigverify → sequencer → executor → settler)
-    → indexer-private_channel detects burn event, saves to DB
-      → operator-private_channel fetches from DB, sends Solana ReleaseFunds
+    → indexer-private-channel detects burn event, saves to DB
+      → operator-private-channel fetches from DB, sends Solana ReleaseFunds
 ```
 
 ### Dashboard: Withdraw Flow (Solana Private Channels → Solana)
@@ -171,9 +171,9 @@ Four panels in pipeline order:
 ### Signals
 
 - **Gap between Sent and Landed (panel 1)** — Solana Private Channels pipeline is dropping transactions; switch to the Pipeline Stages section to identify which Solana Private Channels stage is the bottleneck (same analysis as transfer flow above)
-- **Panel 2 `transactions_saved` grows but `mints_saved` doesn't** — indexer-private_channel indexed the slot but failed to classify the burn event; check indexer-private_channel logs
-- **Panel 3 backlog grows** — operator-private_channel is fetching but Solana RPC latency is high or ReleaseFunds transactions are failing; check operator-private_channel logs
-- **Panel 4 is zero** — operator-private_channel not running, `COMMON_SOURCE_RPC_URL` not pointing to the Solana Private Channels gateway, or the instance PDA does not match
+- **Panel 2 `transactions_saved` grows but `mints_saved` doesn't** — indexer-private-channel indexed the slot but failed to classify the burn event; check indexer-private-channel logs
+- **Panel 3 backlog grows** — operator-private-channel is fetching but Solana RPC latency is high or ReleaseFunds transactions are failing; check operator-private-channel logs
+- **Panel 4 is zero** — operator-private-channel not running, `COMMON_SOURCE_RPC_URL` not pointing to the Solana Private Channels gateway, or the instance PDA does not match
 - **`invalid instruction data` errors in operator logs** — withdrawer Solana ATAs were not created during setup; this should be handled by `setup_withdraw.rs` automatically
 
 ### Balance exhaustion

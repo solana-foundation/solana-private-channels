@@ -29,6 +29,16 @@ pub async fn repair_address_signatures(db: &AccountsDB, _metrics: SharedMetrics)
         }
     };
 
+    // The repair seeds/rewrites the address_signatures index and watermark, all
+    // of which are writes. A read-only node connects to the read replica, where
+    // any INSERT fails with "cannot execute INSERT in a read-only transaction".
+    // The writer node owns index consistency, so skip the repair here — mirrors
+    // the read-only guards in store_block / set_account / write_batch.
+    if postgres_db.read_only {
+        info!("address_signatures repair skipped (read-only mode)");
+        return Ok(());
+    }
+
     let pool = Arc::clone(&postgres_db.pool);
 
     let watermark_opt = get_address_signatures_flushed_slot(&pool)

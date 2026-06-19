@@ -65,6 +65,16 @@ postgres_replication_user: replicator
 # opt in explicitly. See vars/dev.yml for the rationale.
 reset_state: false
 
+# --- Validator ledger reset ---
+# Controls VALIDATOR_RESET_FLAG in the rendered .env (localnet bundled validator).
+# Default `true`: boot with `--reset` from genesis on every redeploy, which the
+# indexer's startup reconciliation depends on (see the RESET_STATE rationale in
+# deploy.yml). Set `false` to preserve the validator ledger across redeploys —
+# the deploy analogue of `make docker-up-persist`. Only safe when Postgres is
+# NOT wiped in lockstep, or the indexer will reconcile stale rows against an
+# empty chain.
+validator_reset: true
+
 # --- Optional notification webhook posted from the report phase ---
 notify_webhook: ""
 

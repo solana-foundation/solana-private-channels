@@ -205,7 +205,7 @@ mod tests {
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
             .with_status(200)
-            .with_body(EMPTY_BODY.to_string())
+            .with_body(EMPTY_BODY)
             .create_async()
             .await;
     }

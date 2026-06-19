@@ -34,14 +34,12 @@ privateChannelEscrowCodama.accept(
     }),
 );
 
-// Generate TypeScript client (renderers-js v2 signature: first arg is the
-// package root, generatedFolder option points at the codegen subdir).
-// syncPackageJson is disabled because we don't publish the generated client
-// as a standalone npm package — admin-ui consumes it via Vite path alias.
+// Emit to src/generated to match the Rust client and the @private-channel-escrow Vite/tsconfig alias; syncPackageJson off since the client isn't published.
 privateChannelEscrowCodama.accept(
-    renderJavaScriptVisitor(typescriptClientsDir, {
+    renderJavaScriptVisitor(path.join(typescriptClientsDir, 'src', 'generated'), {
         formatCode: true,
-        generatedFolder: 'src/generated',
+        // Default appends another src/generated under this path; '.' writes in place to avoid double-nesting.
+        generatedFolder: '.',
         syncPackageJson: false,
         deleteFolderBeforeRendering: true,
     }),

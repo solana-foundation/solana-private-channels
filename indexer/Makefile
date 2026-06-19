@@ -27,7 +27,10 @@ ESCROW_INSTANCE_ID ?=
 YELLOWSTONE_REPO ?= https://github.com/rpcpool/yellowstone-grpc.git
 YELLOWSTONE_DIR ?= .yellowstone-grpc
 YELLOWSTONE_BRANCH ?= fix-core-affinity-mac
-YELLOWSTONE_DYLIB_SRC = $(YELLOWSTONE_DIR)/target/release/libyellowstone_grpc_geyser.dylib
+# cargo emits the plugin as .so on Linux and .dylib on macOS; pick the right source extension.
+YELLOWSTONE_LIB_EXT := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
+YELLOWSTONE_DYLIB_SRC = $(YELLOWSTONE_DIR)/target/release/libyellowstone_grpc_geyser.$(YELLOWSTONE_LIB_EXT)
+# Canonical name config.json references; dlopen loads by file format not extension, so a Linux .so copied here loads fine.
 YELLOWSTONE_DYLIB_DEST = src/indexer/datasource/common/yellowstone_grpc/libyellowstone_grpc_geyser.dylib
 
 ## Build the indexer
@@ -203,10 +206,9 @@ yellowstone-clone:
 build-yellowstone-plugin: yellowstone-clone
 	@echo "Building Yellowstone gRPC Geyser plugin..."
 	@cd $(YELLOWSTONE_DIR)/yellowstone-grpc-geyser && cargo build --release --no-default-features
-	@echo "Copying dylib to indexer..."
+	@echo "Copying plugin ($(YELLOWSTONE_LIB_EXT)) to indexer..."
 	@cp $(YELLOWSTONE_DYLIB_SRC) $(YELLOWSTONE_DYLIB_DEST)
-	@echo "✅ Plugin built and copied to: $(YELLOWSTONE_DYLIB_DEST)"
-	@echo "Note: On Linux this will be .so, on macOS .dylib, update config.json accordingly"
+	@echo "Plugin built and copied to: $(YELLOWSTONE_DYLIB_DEST)"
 
 ## Clean Yellowstone build artifacts
 clean-yellowstone:

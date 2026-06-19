@@ -99,7 +99,8 @@ collateral.
    triage (Step 2: oldest `updated_at` is the trigger), not in the re-arm
    query. If you have *multiple* unresolved trigger rows from different
    incidents, recover them one at a time and exclude each via `id <> :id`.
-5. **Restart the withdraw operator** (Docker: `docker compose restart
+5. **Restart the withdraw operator** (Docker, from the repo root: `docker compose
+   restart operator-private-channel`; or by container: `docker restart
    private-channel-operator-private-channel`). The fetcher picks up `pending` rows and
    processing resumes.
 6. **Confirm recovery** by watching for new `Completed` webhooks for

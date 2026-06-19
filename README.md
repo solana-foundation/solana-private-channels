@@ -289,9 +289,14 @@ make integration-test
 
 ### Docker stack
 
-The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` MUST be set (and `JWT_SECRET` if you enable auth) or the stack fails to start. Generate strong values with `openssl rand -hex 32`. Put secrets in the gitignored `.env` (loaded last, overrides the templates) rather than the tracked `.env.local`; `make build-localnet` writes `ADMIN_PRIVATE_KEY` there for you.
+The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` MUST be set (and `JWT_SECRET` if you enable auth) or the stack fails to start. Generate strong values with `openssl rand -hex 32`. Put secrets in the gitignored `.env` (loaded last, overrides the templates) rather than the tracked `.env.local`.
+
+**Run `make build-localnet` once before the first `make docker-up`.** It generates an operator keypair and patches the real `PRIVATE_CHANNEL_ADMIN_KEYS` / `ADMIN_PRIVATE_KEY` and program IDs into `.env.local`, replacing the template placeholders. Skipping it leaves `PRIVATE_CHANNEL_ADMIN_KEYS=your_admin_public_key`, which the write-node rejects at startup (`Invalid admin key … Invalid Base58 string`).
 
 ```bash
+# First run only: bootstrap .env.local (admin key + program IDs)
+make build-localnet
+
 # Build all images
 make docker-build
 
@@ -305,7 +310,12 @@ make docker-rebuild
 make docker-logs
 make docker-ps
 make docker-down
+
+# Reset: wipe data volumes, then start clean
+make docker-clean && make docker-up
 ```
+
+**Resetting after a credential change.** Postgres applies `POSTGRES_PASSWORD` / `POSTGRES_REPLICATION_PASSWORD` only when it *first* initializes its data volume. If you change those values — or reuse volumes another run initialized with different credentials (e.g. `bench-tps/scripts/run.sh`, which generates its own passwords) — the server keeps the old password while the clients send the new one. Symptoms: `password authentication failed for user "private_channel"` on the nodes, and `postgres-replica` stuck at *Waiting for primary to be ready*. Fix: `make docker-clean` (drops the volumes) then `make docker-up`, so Postgres re-initializes with the current credentials.
 
 Devnet variants exist for every target (`make docker-devnet-up`, `make docker-devnet-down`, etc.) and read `.env.devnet` instead. Run `make help` for the full list.
 
@@ -325,8 +335,9 @@ cp .env.example .env.local
 # Set JWT_SECRET=<your-secret> in .env.local to enable auth
 # Generate strong values with: openssl rand -hex 32
 
-# Start full stack including auth service
-docker compose --env-file versions.env --env-file .env.local --profile auth up
+# Start full stack including the auth service (PROFILE=auth adds the auth profile;
+# omit it for the non-auth stack). Tear down with the same profile: make docker-down PROFILE=auth
+make docker-up PROFILE=auth
 ```
 
 Once running, the auth service is available at `http://localhost:${AUTH_PORT}` (default `8903`). See [auth/README.md](auth/README.md) for the full API reference, role definitions, and wallet verification flow.

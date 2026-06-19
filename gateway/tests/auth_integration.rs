@@ -1011,6 +1011,70 @@ async fn test_empty_jwt_secret_disables_auth() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_whitespace_jwt_secret_disables_auth() {
+    // A whitespace-only JWT_SECRET must be treated as "not set", disabling enforcement
+    // rather than enabling RBAC with a key the auth service would reject at startup.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
+    let (auth_db, _, _container) = start_postgres().await;
+    db::init_schema(&auth_db)
+        .await
+        .expect("failed to init schema");
+
+    // Spin up a minimal mock backend that always returns 200.
+    let read_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let read_backend = read_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = read_listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"value":null}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    let gateway = Arc::new(Gateway::new(
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", read_backend),
+        "*".to_string(),
+        Some("   ".to_string()), // whitespace-only — must be treated as "not set"
+        Some(auth_db),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve(listener, gateway).await;
+    });
+
+    // A gated method with no token should get 200 (auth disabled, proxied to backend).
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": ["SomePubkey"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        200,
+        "whitespace-only JWT_SECRET should disable auth enforcement"
+    );
+}
+
 /// `getSignaturesForAddress` with no token must return 401.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_signatures_for_address_no_token_returns_401() {

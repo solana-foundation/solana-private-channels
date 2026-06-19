@@ -10,8 +10,8 @@ Solana Private Channels is a private payment channel with direct access to Solan
 
 - **Escrow Program**: On-chain Solana program that holds deposited tokens (Devnet Program ID: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83`)
 - **Solana Private Channels Payment Channel**: Private execution environment (write node, read node, gateway)
-- **Indexer** (2 instances): `indexer-solana` watches the Escrow program on Solana for deposits; `indexer-private_channel` watches the Withdraw program on the Solana Private Channels payment channel for withdrawals
-- **Operator** (2 instances): `operator-solana` processes deposits (mints on the Solana Private Channels payment channel); `operator-private_channel` processes withdrawals (releases from escrow on Solana)
+- **Indexer** (2 instances): `indexer-solana` watches the Escrow program on Solana for deposits; `indexer-private-channel` watches the Withdraw program on the Solana Private Channels payment channel for withdrawals
+- **Operator** (2 instances): `operator-solana` processes deposits (mints on the Solana Private Channels payment channel); `operator-private-channel` processes withdrawals (releases from escrow on Solana)
 
 ## Prerequisites
 
@@ -34,6 +34,10 @@ From the project root:
 ```shell
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build
 ```
+
+> **Tip:** `make docker-devnet-build` / `make docker-devnet-up` wrap these exact
+> commands and add preflight guards (Docker ≥ 26, BuildKit cache, required-secret
+> checks). The raw commands here are equivalent but skip those guards.
 
 This builds all Solana Private Channels services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack (or go to the gym).
 
@@ -156,7 +160,7 @@ You should see all services in a healthy/running state:
 
 ```shell
 [+] Running 21/21a The requested image's platform (linux/amd64) does not match the detected host platfo
- ✔ Network private_channel_private-channel-network Created0.0s 
+ ✔ Network private-channel_private-channel-network Created0.0s 
  ✔ Container private-channel-cadvisor Started2.4s 
  ✔ Container private-channel-postgres-primary Healthy13.1s                                
  ✔ Container private-channel-postgres-indexer Healthy14.1s                                
@@ -164,8 +168,8 @@ You should see all services in a healthy/running state:
  ✔ Container private-channel-operator-solana Started12.2s
  ✔ Container private-channel-postgres-replica Started12.7s
  ✔ Container private-channel-write-node Started2.2s   ✔ Container private-channel-read-node Started12.4s 
- ✔ Container private-channel-operator-private_channel Started11.9s 
- ✔ Container private-channel-indexer-private_channel Started12.8s 
+ ✔ Container private-channel-operator-private-channel Started11.9s 
+ ✔ Container private-channel-indexer-private-channel Started12.8s 
  ✔ Container private-channel-gateway Started12.3s 
 ```
 
@@ -250,9 +254,9 @@ You should see something like this:
 
 ```shell
 [+] Running 14/14
- ✔ Container private-channel-indexer-private_channel    Removed         10.7s 
+ ✔ Container private-channel-indexer-private-channel    Removed         10.7s 
  ✔ Container private-channel-gateway           Removed          0.7s 
- ✔ Container private-channel-operator-private_channel   Removed         10.7s 
+ ✔ Container private-channel-operator-private-channel   Removed         10.7s 
  ✔ Container private-channel-grafana           Removed          0.5s 
  ✔ Container private-channel-operator-solana   Removed         10.5s 
  ✔ Container private-channel-cadvisor          Removed          0.7s 
@@ -263,7 +267,7 @@ You should see something like this:
  ✔ Container private-channel-postgres-replica  Removed          0.9s 
  ✔ Container private-channel-write-node        Removed          0.6s 
  ✔ Container private-channel-postgres-primary  Removed          0.5s 
- ✔ Network private_channel_private-channel-network      Removed          0.2s
+ ✔ Network private-channel_private-channel-network      Removed          0.2s
 ```
 
 To also remove volumes (reset all state):
@@ -306,9 +310,9 @@ The TOML config files in `scripts/devnet/config/` allow fine-tuning:
 | File | Purpose |
 | :---- | :---- |
 | `indexer-solana.toml` | Solana chain indexer (Yellowstone) |
-| `indexer-private_channel.toml` | Solana Private Channels payment channel indexer (RPC polling) |
+| `indexer-private-channel.toml` | Solana Private Channels payment channel indexer (RPC polling) |
 | `operator-solana.toml` | Processes deposits → mints on Solana Private Channels |
-| `operator-private_channel.toml` | Processes withdrawals → releases on Solana |
+| `operator-private-channel.toml` | Processes withdrawals → releases on Solana |
 
 **Note:** The TOML files contain placeholder values. When running via Docker Compose, the environment variables from `.env.devnet` override these values at runtime. You do not need to edit the TOML files directly — configure everything through `.env.devnet`.
 

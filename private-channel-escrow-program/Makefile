@@ -55,7 +55,8 @@ generate-clients: generate-idl
 ### Tests ###
 
 # Run unit tests in program/
-unit-test:
+# install + generate-clients first so the TS suites can import the gitignored src/generated.
+unit-test: install generate-clients
 	@echo "Running unit tests for escrow program..."
 	pnpm test:unit
 	@cd program && cargo test

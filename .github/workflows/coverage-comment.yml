@@ -1,0 +1,180 @@
+name: Fork PR Coverage Table
+
+# Second stage of the coverage pipeline, for fork PRs only.
+#
+# The "Rust Checks" pull_request run builds and tests untrusted fork code with a
+# read-only token and uploads .lcov artifacts, but cannot edit the PR body (GitHub
+# downgrades the fork token to read-only). This workflow_run stage runs trusted
+# base-repo code with a write token and publishes the table. It never checks out or
+# executes fork code, so the write token is never handed to untrusted code.
+
+on:
+  workflow_run:
+    workflows: ["Rust Checks"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+# Serialize per source branch so overlapping runs do not clobber each other's PR-body edits.
+concurrency:
+  group: fork-coverage-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  publish-coverage:
+    name: Publish Fork PR Coverage Table
+    # Fork PRs only: internal PRs already get the table inline from Rust Checks.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name != github.repository
+    runs-on: private-channel-runner-1
+    steps:
+      - name: Resolve and verify PR number
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const headSha = run.head_sha;
+
+            // Fork PRs leave run.pull_requests empty, so fall back to the commit association.
+            let prNumber = run.pull_requests?.[0]?.number ?? null;
+            if (!prNumber) {
+              const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: headSha,
+              });
+              prNumber = prs.find(p => p.state === 'open')?.number ?? null;
+            }
+            if (!prNumber) {
+              core.info('No open PR associated with the triggering commit; nothing to publish.');
+              core.setOutput('ok', 'false');
+              return;
+            }
+
+            // Anti-impersonation: the resolved PR must originate from the same head repo that
+            // produced this run, so a fork can only ever annotate its own PR, never another.
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            if (pr.head.repo?.full_name !== run.head_repository.full_name) {
+              core.warning('Resolved PR head repo does not match the run head repo; skipping.');
+              core.setOutput('ok', 'false');
+              return;
+            }
+
+            core.setOutput('pr', String(prNumber));
+            core.setOutput('ok', 'true');
+
+      - name: Checkout base repo
+        # Default ref is the base repo's default branch (trusted code), never the fork PR head.
+        if: steps.resolve.outputs.ok == 'true'
+        uses: actions/checkout@v4
+
+      - name: Download E2E coverage artifact
+        if: steps.resolve.outputs.ok == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-coverage-reports
+          path: artifacts/e2e
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download unit coverage artifact
+        if: steps.resolve.outputs.ok == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-unit-coverage-reports
+          path: artifacts/unit
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Seed coverage skeleton if missing
+        if: steps.resolve.outputs.ok == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.resolve.outputs.pr }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
+            if ((pr.body || '').includes('### Coverage Report')) return;
+            // Mirrors the skeleton seeded by the init-coverage-table job in rust.yml.
+            const skeleton = [
+              '',
+              '### Coverage Report',
+              '',
+              '| Component | Lines Hit | Lines Total | Coverage | Artifact |',
+              '|-----------|-----------|-------------|----------|----------|',
+              '| Core | - | - | - | - |',
+              '| Indexer | - | - | - | - |',
+              '| Gateway | - | - | - | - |',
+              '| Auth | - | - | - | - |',
+              '| Withdraw Program | - | - | - | - |',
+              '| Escrow Program | - | - | - | - |',
+              '| DvP Swap Program | - | - | - | - |',
+              '| E2E Integration | - | - | - | - |',
+              '| **Total** | **-** | **-** | **-** | |',
+              '',
+              '> Coverage runs in progress...',
+            ].join('\n');
+            await github.rest.pulls.update({ ...context.repo, pull_number: prNumber, body: (pr.body || '') + skeleton });
+
+      - name: Update PR coverage — E2E Integration
+        if: steps.resolve.outputs.ok == 'true' && hashFiles('artifacts/e2e/coverage-integration-e2e.lcov') != ''
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: E2E Integration
+          lcov-file: artifacts/e2e/coverage-integration-e2e.lcov
+          artifact-name: e2e-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.resolve.outputs.pr }}
+
+      - name: Update PR coverage — Core
+        if: steps.resolve.outputs.ok == 'true' && hashFiles('artifacts/unit/coverage-core-unit.lcov') != ''
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Core
+          lcov-file: artifacts/unit/coverage-core-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.resolve.outputs.pr }}
+
+      - name: Update PR coverage — Indexer
+        if: steps.resolve.outputs.ok == 'true' && hashFiles('artifacts/unit/coverage-indexer-unit.lcov') != ''
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Indexer
+          lcov-file: artifacts/unit/coverage-indexer-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.resolve.outputs.pr }}
+
+      - name: Update PR coverage — Gateway
+        if: steps.resolve.outputs.ok == 'true' && hashFiles('artifacts/unit/coverage-gateway-unit.lcov') != ''
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Gateway
+          lcov-file: artifacts/unit/coverage-gateway-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.resolve.outputs.pr }}
+
+      - name: Update PR coverage — Auth
+        if: steps.resolve.outputs.ok == 'true' && hashFiles('artifacts/unit/coverage-auth-unit.lcov') != ''
+        uses: ./.github/actions/update-coverage-row
+        with:
+          component: Auth
+          lcov-file: artifacts/unit/coverage-auth-unit.lcov
+          artifact-name: rust-unit-coverage-reports
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ steps.resolve.outputs.pr }}

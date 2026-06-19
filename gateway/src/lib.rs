@@ -122,6 +122,13 @@ struct ReadyCache {
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// A `JWT_SECRET` counts as "configured" only if non-empty after trimming, mirroring the
+/// auth service so a whitespace-only secret doesn't enable gateway RBAC while auth refuses
+/// to start.
+fn configured_secret(secret: Option<&str>) -> Option<&str> {
+    secret.filter(|s| !s.trim().is_empty())
+}
+
 impl Gateway {
     pub fn new(
         write_url: String,
@@ -136,12 +143,9 @@ impl Gateway {
             .enable_http1()
             .build();
         let client = Client::builder(TokioExecutor::new()).build(https);
-        // Convert the raw secret string into a DecodingKey once here.
-        // filter out empty strings so JWT_SECRET="" is treated as "not set" rather than
-        // enabling auth with a trivially forgeable empty secret (likely a misconfiguration).
-        let jwt_secret = jwt_secret
-            .as_deref()
-            .filter(|s| !s.is_empty())
+        // Treat an empty or whitespace-only JWT_SECRET as "not set"; key is built from the
+        // untrimmed bytes so it stays identical to the auth service's signing key.
+        let jwt_secret = configured_secret(jwt_secret.as_deref())
             .map(|s| DecodingKey::from_secret(s.as_bytes()));
         Self {
             write_url,
@@ -672,12 +676,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("  CORS Allowed Origin: {}", args.cors_allowed_origin);
     info!(
         "  Auth enforcement: {}",
-        if args
-            .jwt_secret
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .is_some()
-        {
+        if configured_secret(args.jwt_secret.as_deref()).is_some() {
             "enabled"
         } else {
             "disabled"
@@ -693,13 +692,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // operator who sets JWT_SECRET believes auth is active; failing here at boot
     // ensures that belief is correct rather than every request passing through
     // unguarded at runtime.
-    if args
-        .jwt_secret
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .is_some()
-        && args.auth_database_url.is_none()
-    {
+    if configured_secret(args.jwt_secret.as_deref()).is_some() && args.auth_database_url.is_none() {
         return Err(
             "JWT_SECRET is set but AUTH_DATABASE_URL is not configured. \
              Auth enforcement requires both. Either provide AUTH_DATABASE_URL \
