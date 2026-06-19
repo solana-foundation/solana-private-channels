@@ -7,7 +7,7 @@ use crate::operator::instruction_util::{
 use crate::operator::sender::TransactionStatusUpdate;
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
-    find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
+    fetch_current_tree_index, find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
     tree_constants::MAX_TREE_LEAVES, MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce,
     SignerUtil,
 };
@@ -517,51 +517,61 @@ pub async fn process_release_funds(
             // doesn't pay an extra DB/RPC round-trip for `get_mint_metadata`.
             let release_funds_tx = build_release_funds(processor_state, &transaction).await?;
 
-            // Pre-flight checks for Token-2022 extension state. Pause and
-            // permanent-delegate-drain are row-specific: the mint or its
-            // on-chain balance is the issue, but other withdrawals are
-            // unaffected. Bails route to ManualReview via `quarantine_single`
-            // and continue the loop — they intentionally do NOT trigger
-            // `halt_withdrawal_pipeline` (which is reserved for poison-pill
-            // rows that would corrupt the SMT).
-            //
-            // The pre-flight is best-effort, not a guarantee: a permanent
-            // delegate can drain the escrow ATA between this balance read and
-            // the on-chain `TransferChecked` CPI. In that race the CPI fails
-            // on-chain and the row is handled by the normal sender
-            // confirmation / retry path — the pre-flight just shrinks the
-            // window in the common case.
-            //
-            // RPC errors during pre-flight bubble up via `?` and are
-            // classified as Transient by `classify_processor_error`,
-            // restarting the task. That's preferred over flooding the alert
-            // stream with ManualReview entries while RPC flaps.
-            if let Some(reason) = check_withdrawal_preflights(processor_state, &transaction).await?
-            {
-                quarantine_single(&storage_tx, &transaction, reason).await;
-                return Ok(());
-            }
-
-            // Scheduled rotation (normal path): when a nonce lands on the
-            // MAX_TREE_LEAVES boundary, rotate the tree BEFORE dispatching the
-            // boundary withdrawal.
+            // Rotate on a boundary nonce BEFORE the pre-flight, so a boundary row
+            // that quarantines below still leaves later withdrawals on the new
+            // tree. Skip if already rotated on-chain: a re-armed boundary row
+            // reprocesses this nonce, and rotating twice skips a tree generation.
             if let Some(nonce_i64) = transaction.withdrawal_nonce {
                 let nonce = nonce_i64 as u64;
                 if nonce > 0 && nonce.is_multiple_of(MAX_TREE_LEAVES as u64) {
-                    info!(
-                        nonce,
-                        "Tree rotation boundary detected, dispatching ResetSmtRoot"
-                    );
+                    let target_tree_index = nonce / MAX_TREE_LEAVES as u64;
                     let release_funds_state = processor_state
                         .release_funds_state
                         .as_ref()
                         .ok_or(OperatorError::MissingBuilder)?;
-                    let rotation_tx =
-                        build_scheduled_rotation(processor_state.admin_pubkey, release_funds_state);
-                    send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
-                        .await
-                        .map_err(OperatorError::ChannelSend)?;
+                    let instance_pda = release_funds_state.instance_pda;
+                    let rpc_client = processor_state.mint_cache.rpc_client().ok_or_else(|| {
+                        OperatorError::RpcError(
+                            "tree index read requires an RPC client".to_string(),
+                        )
+                    })?;
+                    let onchain_tree_index =
+                        fetch_current_tree_index(rpc_client, &instance_pda).await?;
+                    if onchain_tree_index < target_tree_index {
+                        info!(
+                            nonce,
+                            target_tree_index,
+                            "Tree rotation boundary detected, dispatching ResetSmtRoot"
+                        );
+                        let rotation_tx = build_scheduled_rotation(
+                            processor_state.admin_pubkey,
+                            release_funds_state,
+                        );
+                        send_guaranteed(&sender_tx, rotation_tx, "reset smt root")
+                            .await
+                            .map_err(OperatorError::ChannelSend)?;
+                    } else {
+                        info!(
+                            nonce,
+                            target_tree_index,
+                            onchain_tree_index,
+                            "Boundary already rotated on-chain, skipping ResetSmtRoot"
+                        );
+                    }
                 }
+            }
+
+            // Pre-flight for Token-2022 pause / permanent-delegate drain. These
+            // are row-specific, so bails route to ManualReview and continue the
+            // loop rather than halting the pipeline (reserved for poison rows);
+            // the rotation above already fired, so later withdrawals proceed.
+            // It is best-effort: a delegate can still drain between this read and
+            // the on-chain CPI, leaving that to the sender retry path. RPC errors
+            // bubble up as Transient and restart the task.
+            if let Some(reason) = check_withdrawal_preflights(processor_state, &transaction).await?
+            {
+                quarantine_single(&storage_tx, &transaction, reason).await;
+                return Ok(());
             }
 
             info!("Processing withdrawal");
@@ -739,10 +749,16 @@ mod tests {
     use super::*;
     use crate::error::{AccountError, StorageError, TransactionError};
     use crate::operator::find_allowed_mint_pda;
+    use crate::operator::rpc_util::RpcClientWithRetry;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::DbMint;
     use crate::storage::common::models::TransactionType;
     use crate::storage::common::storage::mock::MockStorage;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use borsh::BorshSerialize;
+    use private_channel_escrow_program_client::Instance;
+    use solana_client::rpc_request::RpcRequest;
 
     fn make_release_funds_state() -> ReleaseFundsState {
         ReleaseFundsState {
@@ -839,6 +855,32 @@ mod tests {
                 created_at: chrono::Utc::now(),
             },
         );
+    }
+
+    /// Mocked `getAccountInfo` response for an Instance account carrying the
+    /// given on-chain tree index, used to drive the boundary-rotation read.
+    fn instance_account_response(current_tree_index: u64) -> serde_json::Value {
+        let instance = Instance {
+            discriminator: 0,
+            bump: 0,
+            version: 0,
+            instance_seed: Pubkey::new_unique(),
+            admin: Pubkey::new_unique(),
+            withdrawal_transactions_root: [0u8; 32],
+            current_tree_index,
+        };
+        let mut bytes = Vec::new();
+        instance.serialize(&mut bytes).unwrap();
+        serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": Pubkey::new_unique().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&bytes), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
     }
 
     fn make_db_transaction(
@@ -979,10 +1021,16 @@ mod tests {
     async fn process_release_funds_tree_rotation_sends_reset_first() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
+
+        // On-chain tree index 0 < boundary target 1, so the rotation must fire.
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -1050,6 +1098,152 @@ mod tests {
 
         // No further messages — exactly two were sent
         assert!(sender_rx.try_recv().is_err(), "unexpected third message");
+    }
+
+    /// Regression for the boundary-quarantine wedge: a boundary nonce whose
+    /// pre-flight bails (here, escrow underfunded) must STILL rotate the tree
+    /// first. Otherwise the rotation is skipped and every later-tree withdrawal
+    /// wedges on a tree-index mismatch. The boundary row itself is quarantined.
+    #[tokio::test]
+    async fn process_release_funds_boundary_quarantine_still_rotates() {
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        mock.mints.lock().unwrap().insert(
+            mint_pubkey.to_string(),
+            DbMint {
+                mint_address: mint_pubkey.to_string(),
+                decimals: 6,
+                token_program: spl_token_2022::id().to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(true),
+            },
+        );
+        let storage = Arc::new(Storage::Mock(mock));
+
+        // Instance on tree 0 (rotation needed); escrow balance 500 < amount 1000.
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        mocks.insert(
+            RpcRequest::GetTokenAccountBalance,
+            serde_json::json!({
+                "context": {"slot": 1},
+                "value": {"amount": "500", "decimals": 6, "uiAmount": 0.0005, "uiAmountString": "0.0005"}
+            }),
+        );
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let txn = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(MAX_TREE_LEAVES as i64),
+            TransactionType::Withdrawal,
+        );
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await
+        .unwrap();
+
+        // Rotation fired despite the bail...
+        let msg = sender_rx.recv().await.unwrap();
+        assert!(
+            matches!(msg, TransactionBuilder::ResetSmtRoot(_)),
+            "expected ResetSmtRoot to be dispatched before the pre-flight bail"
+        );
+        // ...and no ReleaseFunds for the quarantined boundary row.
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "boundary row must not be released, only the rotation is sent"
+        );
+
+        // The boundary row is quarantined to ManualReview.
+        let update = storage_rx.try_recv().expect("ManualReview update expected");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .expect("error_message must be set")
+            .contains("insufficient escrow balance"));
+    }
+
+    /// A re-armed boundary row (manual-review recovery) reprocesses the same
+    /// nonce. If the tree was already rotated on-chain, the rotation must be
+    /// skipped, otherwise it advances the tree a second time and skips a whole
+    /// generation. The withdrawal itself still proceeds.
+    #[tokio::test]
+    async fn process_release_funds_boundary_already_rotated_skips_reset() {
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        insert_mint_row(&storage, &mint_pubkey);
+
+        // Instance already on tree 1 == boundary target, so no rotation is owed.
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(1));
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let txn = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(MAX_TREE_LEAVES as i64),
+            TransactionType::Withdrawal,
+        );
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await
+        .unwrap();
+
+        // The only message is the withdrawal — no redundant ResetSmtRoot.
+        let msg = sender_rx.recv().await.unwrap();
+        let TransactionBuilder::ReleaseFunds(b) = msg else {
+            panic!("expected ReleaseFunds, got ResetSmtRoot or another variant");
+        };
+        assert_eq!(b.nonce, MAX_TREE_LEAVES as u64);
+        assert!(sender_rx.try_recv().is_err(), "no second message expected");
     }
 
     /// A mint field that cannot be parsed as a Pubkey halts the pipeline.

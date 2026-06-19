@@ -74,6 +74,11 @@ impl MintCache {
         }
     }
 
+    /// The RPC handle backing this cache, if one was configured.
+    pub fn rpc_client(&self) -> Option<&RpcClientWithRetry> {
+        self.rpc_client.as_deref()
+    }
+
     /// Basic mint metadata (decimals + token program). Cache → DB → RPC
     /// fallback only when no DB row exists.
     ///

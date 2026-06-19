@@ -1,3 +1,5 @@
+use crate::error::{AccountError, OperatorError};
+use crate::operator::RpcClientWithRetry;
 use private_channel_escrow_program_client::{
     programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, Instance,
 };
@@ -38,6 +40,25 @@ pub fn find_operator_pda(instance_pda: &Pubkey, wallet: &Pubkey) -> Pubkey {
 
 pub fn parse_instance(instance_data: &[u8]) -> Result<Instance, std::io::Error> {
     Instance::from_bytes(instance_data)
+}
+
+/// Read the authoritative `current_tree_index` from the on-chain instance account.
+pub async fn fetch_current_tree_index(
+    rpc_client: &RpcClientWithRetry,
+    instance_pda: &Pubkey,
+) -> Result<u64, OperatorError> {
+    let data = rpc_client
+        .get_account_data(instance_pda)
+        .await
+        .map_err(|_| AccountError::AccountNotFound {
+            pubkey: *instance_pda,
+        })?;
+    let instance =
+        parse_instance(&data).map_err(|e| AccountError::AccountDeserializationFailed {
+            pubkey: *instance_pda,
+            reason: e.to_string(),
+        })?;
+    Ok(instance.current_tree_index)
 }
 
 #[cfg(test)]
