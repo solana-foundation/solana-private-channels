@@ -1025,6 +1025,38 @@ async fn release_signature_gc_only_drops_non_processing() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// `pending_release_signatures` is keyed only by `transaction_id`, so a deposit row
+/// stores, fetches, and GCs its broadcast signature identically to a withdrawal. This
+/// proves deposits reuse the table with no schema change (the pre-broadcast persist).
+#[tokio::test(flavor = "multi_thread")]
+async fn release_signature_reuses_table_for_deposit() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let txn = make_db_transaction("rel_deposit", TransactionType::Deposit);
+    let id = storage.insert_db_transaction(&txn).await?;
+
+    storage
+        .insert_release_signature(id, "sig-deposit".to_string(), 100)
+        .await?;
+    assert_eq!(
+        storage.get_release_signatures(id).await?,
+        vec![("sig-deposit".to_string(), 100)],
+        "deposit signature round-trips like a withdrawal"
+    );
+
+    // Leaving Processing makes the row GC-eligible, same as a withdrawal.
+    sqlx::query("UPDATE transactions SET status = 'completed'::transaction_status WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let removed = storage.gc_stale_release_signatures().await?;
+    assert_eq!(
+        removed, 1,
+        "GC reclaims the deposit's sig once non-processing"
+    );
+    assert!(storage.get_release_signatures(id).await?.is_empty());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn release_signature_cascade_on_transaction_delete() -> Result<(), Box<dyn std::error::Error>>
 {

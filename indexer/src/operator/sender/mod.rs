@@ -5,7 +5,7 @@ mod state;
 mod transaction;
 pub mod types;
 
-pub use mint::{find_existing_mint_signature, find_existing_mint_signature_with_memo, JitOutcome};
+pub use mint::{find_existing_mint_signature_with_memo, JitOutcome};
 pub(crate) use remint::{classify_release_signatures, SigFinality};
 pub(crate) use state::validate_smt_root;
 pub use types::TransactionStatusUpdate;
@@ -467,6 +467,7 @@ mod tests {
             extra_error_checks_policy: ExtraErrorCheckPolicy::None,
             poll_attempts: 0,
             resend_count: 0,
+            persisted: false,
             permit: Arc::new(Semaphore::new(MAX_IN_FLIGHT))
                 .try_acquire_owned()
                 .unwrap(),
