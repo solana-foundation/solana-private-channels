@@ -50,9 +50,7 @@ pub async fn fetch_current_tree_index(
     let data = rpc_client
         .get_account_data(instance_pda)
         .await
-        .map_err(|_| AccountError::AccountNotFound {
-            pubkey: *instance_pda,
-        })?;
+        .map_err(|e| OperatorError::RpcError(format!("get_account_data({instance_pda}): {e}")))?;
     let instance =
         parse_instance(&data).map_err(|e| AccountError::AccountDeserializationFailed {
             pubkey: *instance_pda,
