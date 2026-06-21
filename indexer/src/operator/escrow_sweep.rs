@@ -15,6 +15,8 @@ use solana_client::rpc_request::TokenAccountsFilter;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
+use spl_token_2022::extension::StateWithExtensions;
+use spl_token_2022::state::Account as Token2022Account;
 use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::warn;
@@ -70,13 +72,21 @@ pub async fn fetch_escrow_balances_by_mint(
         // depending on the requested encoding; handle both.
         for keyed_account in accounts {
             let (mint, amount) = if let Some(decoded) = keyed_account.account.data.decode() {
-                let token_account =
-                    TokenAccount::unpack(&decoded).map_err(|e| EscrowSweepError {
-                        reason: format!(
-                            "Failed to parse token account for program {token_program_id}: {e}"
-                        ),
+                if token_program_id == spl_token_2022::id() {
+                    let token_account = StateWithExtensions::<Token2022Account>::unpack(&decoded)
+                        .map_err(|e| EscrowSweepError {
+                        reason: format!("Failed to parse token-2022 account: {e}"),
                     })?;
-                (token_account.mint, token_account.amount)
+                    (token_account.base.mint, token_account.base.amount)
+                } else {
+                    let token_account =
+                        TokenAccount::unpack(&decoded).map_err(|e| EscrowSweepError {
+                            reason: format!(
+                                "Failed to parse token account for program {token_program_id}: {e}"
+                            ),
+                        })?;
+                    (token_account.mint, token_account.amount)
+                }
             } else if let UiAccountData::Json(parsed) = &keyed_account.account.data {
                 let info = parsed.parsed.get("info").ok_or_else(|| EscrowSweepError {
                     reason: "Missing 'info' in parsed token account".to_string(),
@@ -301,5 +311,56 @@ mod tests {
 
         let err = result.expect_err("malformed account must error").reason;
         assert!(err.contains("tokenAmount"), "unexpected error: {err}");
+    }
+
+    fn base64_token2022_account(mint: Pubkey, amount: u64) -> String {
+        let account = Token2022Account {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount,
+            delegate: COption::None,
+            state: spl_token_2022::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        let mut buf = vec![0u8; Token2022Account::LEN];
+        account.pack_into_slice(&mut buf);
+        buf.push(spl_token_2022::extension::AccountType::Account as u8);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        format!(
+            r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":166,"data":["{b64}","base64"]}}}}"#,
+            ata = Pubkey::new_unique(),
+            prog = spl_token_2022::id(),
+        )
+    }
+
+    #[tokio::test]
+    async fn decodes_token2022_account_with_extensions() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+            .with_status(200)
+            .with_body(EMPTY_BODY.to_string())
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+            .with_status(200)
+            .with_body(result_body(&[base64_token2022_account(mint, 4_242)]))
+            .create_async()
+            .await;
+
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            balances[&mint], 4_242,
+            "token-2022 extension layout must unpack"
+        );
     }
 }
