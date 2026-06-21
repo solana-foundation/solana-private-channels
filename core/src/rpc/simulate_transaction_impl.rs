@@ -320,15 +320,7 @@ fn build_token_additional_data(
         return None;
     }
     let token_account = TokenAccount::unpack(account.data()).ok()?;
-    let mint_account = bob
-        .get_account_shared_data(&token_account.mint)
-        .or_else(|| {
-            warn!(
-                "mint account {} not found for jsonParsed encoding, falling back to base64",
-                token_account.mint
-            );
-            None
-        })?;
+    let mint_account = bob.get_account_shared_data(&token_account.mint)?;
     let mint = Mint::unpack(mint_account.data()).ok()?;
     Some(AccountAdditionalDataV3 {
         spl_token_additional_data: Some(SplTokenAdditionalDataV2 {
