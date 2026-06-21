@@ -280,8 +280,7 @@ mod tests {
         // Set some non-zero sibling values
         sibling_proofs[0] = test_hash(111);
         sibling_proofs[1] = test_hash(222);
-        sibling_proofs[5] = test_hash(333);
-        sibling_proofs[10] = test_hash(444);
+        sibling_proofs[TREE_HEIGHT - 1] = test_hash(333);
 
         let expected_root = compute_expected_root(transaction_nonce, &sibling_proofs);
 
@@ -321,7 +320,7 @@ mod tests {
 
         // Corrupt one sibling proof
         let mut corrupted_siblings = correct_siblings;
-        corrupted_siblings[3] = test_hash(666);
+        corrupted_siblings[TREE_HEIGHT - 1] = test_hash(666);
 
         let result = SparseMerkleTreeUtils::verify_smt_exclusion_proof(
             &expected_root,
@@ -370,16 +369,16 @@ mod tests {
         let transaction_nonce = 123u64;
         let mut sibling_proofs = [[0u8; 32]; TREE_HEIGHT];
 
-        // Set up siblings to cause early termination at level 8
+        // Set up siblings to cause early termination at TREE_HEIGHT
         sibling_proofs[0] = test_hash(11);
         sibling_proofs[1] = test_hash(22);
-        sibling_proofs[7] = test_hash(33);
+        sibling_proofs[TREE_HEIGHT - 1] = test_hash(33);
 
-        // Compute what the hash would be at level 8
+        // Compute what the hash would be at TREE_HEIGHT
         let leaf_position = transaction_nonce as usize % MAX_TREE_LEAVES;
         let mut current_hash = [0u8; 32];
 
-        for (level, &sibling) in sibling_proofs.iter().enumerate().take(8) {
+        for (level, &sibling) in sibling_proofs.iter().enumerate().take(TREE_HEIGHT) {
             let bit = (leaf_position >> level) & 1;
             current_hash = if bit == 0 {
                 SparseMerkleTreeUtils::hash_combine(&current_hash, &sibling)
@@ -456,8 +455,7 @@ mod tests {
         // Set some non-zero sibling values
         sibling_proofs[0] = test_hash(111);
         sibling_proofs[1] = test_hash(222);
-        sibling_proofs[5] = test_hash(333);
-        sibling_proofs[10] = test_hash(444);
+        sibling_proofs[TREE_HEIGHT - 1] = test_hash(333);
 
         let expected_root = compute_expected_inclusion_root(transaction_nonce, &sibling_proofs);
 
@@ -497,7 +495,7 @@ mod tests {
 
         // Corrupt one sibling proof
         let mut corrupted_siblings = correct_siblings;
-        corrupted_siblings[3] = test_hash(666);
+        corrupted_siblings[TREE_HEIGHT - 1] = test_hash(666);
 
         let result = SparseMerkleTreeUtils::verify_smt_inclusion_proof(
             &expected_root,
@@ -531,16 +529,16 @@ mod tests {
         let transaction_nonce = 456u64;
         let mut sibling_proofs = [[0u8; 32]; TREE_HEIGHT];
 
-        // Set up siblings to cause early termination at level 6
+        // Set up siblings to cause early termination at TREE_HEIGHT
         sibling_proofs[0] = test_hash(77);
         sibling_proofs[1] = test_hash(88);
-        sibling_proofs[5] = test_hash(99);
+        sibling_proofs[TREE_HEIGHT - 1] = test_hash(99);
 
-        // Compute what the hash would be at level 6
+        // Compute what the hash would be at TREE_HEIGHT
         let leaf_position = transaction_nonce as usize % MAX_TREE_LEAVES;
         let mut current_hash = NON_EMPTY_LEAF_HASH; // Start with actual leaf value for inclusion
 
-        for (level, &sibling) in sibling_proofs.iter().enumerate().take(6) {
+        for (level, &sibling) in sibling_proofs.iter().enumerate().take(TREE_HEIGHT) {
             let bit = (leaf_position >> level) & 1;
             current_hash = if bit == 0 {
                 SparseMerkleTreeUtils::hash_combine(&current_hash, &sibling)
