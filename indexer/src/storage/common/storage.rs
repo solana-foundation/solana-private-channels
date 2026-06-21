@@ -26,6 +26,7 @@ pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
 pub mod quarantine_all_active_withdrawals;
 pub mod record_remint_result;
+pub mod sender_lock;
 pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
@@ -305,6 +306,15 @@ impl Storage {
         &self,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         get_pending_remint_transactions::get_pending_remint_transactions(self).await
+    }
+
+    /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means
+    /// another sender holds it, so the caller must refuse to start.
+    pub async fn try_acquire_sender_lock(
+        &self,
+        key: i64,
+    ) -> Result<Option<sender_lock::SenderLockGuard>, StorageError> {
+        sender_lock::try_acquire_sender_lock(self, key).await
     }
 
     /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.

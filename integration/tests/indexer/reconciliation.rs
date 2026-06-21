@@ -26,6 +26,11 @@ mod db_migration_race;
 #[path = "pending_remint_storage.rs"]
 mod pending_remint_storage;
 
+// run_sender singleton advisory lock: a second sender is refused while the
+// first holds the lock.
+#[path = "sender_singleton_lock.rs"]
+mod sender_singleton_lock;
+
 // End-to-end multi-instruction ledger integrity (SOLA2-13): same-signature
 // instructions must persist as distinct rows through the real processor.
 #[path = "multi_instruction_pipeline.rs"]

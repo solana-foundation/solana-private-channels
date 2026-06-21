@@ -166,6 +166,15 @@ use transaction::{
 };
 use types::{PollTaskResult, SenderState};
 
+/// Advisory-lock key per operator role. Distinct keys so an escrow and a
+/// withdraw sender never contend on the same lock if they share a database.
+fn sender_lock_key(program_type: ProgramType) -> i64 {
+    match program_type {
+        ProgramType::Escrow => 1,
+        ProgramType::Withdraw => 2,
+    }
+}
+
 /// Sends transactions to the blockchain and updates their status
 ///
 /// Receives TransactionBuilder (either ReleaseFunds or Mint) from processor,
@@ -198,6 +207,23 @@ pub async fn run_sender(
         confirmation_poll_interval_ms,
         source_rpc_client,
     )?;
+
+    // Refuse to start if another sender for this role already holds the lock.
+    // Held for the rest of run_sender; released on drop or process crash. Stops
+    // two overlapping senders (e.g. a rolling restart) from both reminting the
+    // same row before either confirms on-chain.
+    let _sender_lock = match state
+        .storage
+        .try_acquire_sender_lock(sender_lock_key(config.program_type))
+        .await?
+    {
+        Some(guard) => guard,
+        None => {
+            return Err(OperatorError::SenderAlreadyRunning {
+                program_type: config.program_type,
+            });
+        }
+    };
 
     // Re-hydrate the deferred remint queue from any PendingRemint rows written
     // before a crash. These will be picked up by process_pending_remints on the

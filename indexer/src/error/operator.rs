@@ -43,4 +43,7 @@ pub enum OperatorError {
         "Mint {mint} has no allowed status in mint_status_history at the deposit's slot (transaction {transaction_id}); refusing to mint"
     )]
     MintNotAllowed { transaction_id: i64, mint: String },
+
+    #[error("Another {program_type:?} sender already holds the singleton lock; refusing to start")]
+    SenderAlreadyRunning { program_type: crate::ProgramType },
 }

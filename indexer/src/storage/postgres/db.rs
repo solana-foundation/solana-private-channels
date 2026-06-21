@@ -929,6 +929,21 @@ impl PostgresDb {
         .await
     }
 
+    /// Try to acquire the advisory lock for `key`. The lock lives on the
+    /// returned connection; holding it keeps the connection out of the pool so
+    /// Postgres keeps the lock held. Returns `None` if another holder exists.
+    pub async fn try_acquire_sender_lock(
+        &self,
+        key: i64,
+    ) -> Result<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *conn)
+            .await?;
+        Ok(acquired.then_some(conn))
+    }
+
     /// Get all transactions of a given type regardless of status
     pub async fn get_all_transactions_internal(
         &self,
