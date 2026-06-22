@@ -259,6 +259,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test remint_recovery -- --nocapture
 	@echo "Running stuck-Processing recovery tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test stuck_processing_recovery -- --nocapture
+	@echo "Running parked-withdrawal recovery tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test parked_withdrawal_recovery -- --nocapture
 	@echo "Running indexer bootstrap validation tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test bootstrap_validation -- --nocapture
 	@echo "Running deposit-allowlist e2e tests with coverage instrumentation..."
