@@ -322,19 +322,16 @@
           `postgres_replication_password` empty in secrets.yml. postgres-replica uses it for streaming replication.
           Fix: edit secrets.yml and add `postgres_replication_password: repl_password` (literal, until init-primary.sql is parameterised).
 
+    # Only required when enforcement is on: env.j2 blanks JWT_SECRET when
+    # gateway_enforce_jwt is false, so the secret's value is unused there.
+    # Mirror the template's `default(true)` so an unset flag still requires it.
     - name: Assert jwt_secret is set
       ansible.builtin.assert:
         that: jwt_secret | default('') | length > 0
         fail_msg: |
           `jwt_secret` empty in secrets.yml. Used by gateway to sign auth tokens.
           Fix: edit secrets.yml and add `jwt_secret: <random-32+-byte-string>`  (e.g. `openssl rand -hex 32`).
-
-    - name: Assert solana_keypair is defined
-      ansible.builtin.assert:
-        that: solana_keypair is defined
-        fail_msg: |
-          `solana_keypair` missing from secrets.yml. Used by operator services to sign on-chain transactions.
-          Fix: paste the JSON byte array from `solana-keygen new` into `solana_keypair:` in secrets.yml.
+      when: gateway_enforce_jwt | default(true) | bool
 
     - name: Assert GHCR creds present
       ansible.builtin.assert:

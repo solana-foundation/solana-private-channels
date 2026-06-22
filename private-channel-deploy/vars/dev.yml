@@ -1,6 +1,4 @@
-# Dev environment overrides. The file most users edit.
-# Loaded by deploy.yml when invoked with `-l dev`.
-# Each option below: what it does, then how to choose.
+# Loaded by deploy.yml when invoked with `-l dev`
 
 # === What to deploy =========================================================
 
@@ -46,15 +44,10 @@ gateway_enforce_jwt: false
 # Override here if 8899 collides on this host (e.g. local Solana test-validator).
 # gateway_port: 8899
 
-# === Compose subset =========================================================
-
-# compose_services is derived in vars/common.yml (base list + `validator` on
-# localnet only). Uncomment and set explicitly here to override.
-# compose_services: "postgres-primary postgres-replica write-node read-node gateway ..."
-
-# === On-host program IDs ====================================================
-# program IDs deployed to the validator container.
-# Only relevant when network=localnet. Pinned to match the keypairs in the repo.
+# === Program IDs ===========================================================
+# Addresses the indexer/operator watch. On localnet these are also where the
+# bundled validator deploys the repo's .so files (pinned to the repo keypairs).
+# On devnet/mainnet the programs must already be deployed; set these to match.
 escrow_program_id: GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
 withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 
@@ -87,7 +80,6 @@ monitoring_blackbox_port: 9115
 monitoring_cadvisor_port: 8081
 monitoring_node_exporter_port: 9101
 monitoring_postgres_exporter_port: 9187
-# Indexer postgres-exporter sits on a distinct host port so both exporters
-# (primary + indexer) can be reached without colliding. Defaults to one
-# above the primary; override only if 9188 is already taken.
+# Indexer postgres-exporter needs a distinct host port from the primary
+# exporter (9187) so both can be scraped without colliding.
 monitoring_postgres_exporter_indexer_port: 9188
