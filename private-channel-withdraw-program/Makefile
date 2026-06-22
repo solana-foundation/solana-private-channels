@@ -80,8 +80,10 @@ all-coverage: unit-coverage coverage-html
 build-localnet:
 	$(MAKE) generate-clients
 	cd program && cargo-build-sbf
-	@echo "Updating .env.local with program IDs..."
-	@../scripts/update-program-env.sh ../.env.local $(PROGRAM_ENV_KEY) $(PROGRAM_KEYPAIR)
+	@# Do NOT patch WITHDRAW_PROGRAM_ID from $(PROGRAM_KEYPAIR): the program ID is fixed by
+	@# the program's declare_id! and matched by the indexer's hardcoded constant, so
+	@# .env.local carries the canonical ID statically. The build keypair differs from
+	@# declare_id, and deploying at it makes the indexer watch the wrong address.
 
 #############
 # Devnet

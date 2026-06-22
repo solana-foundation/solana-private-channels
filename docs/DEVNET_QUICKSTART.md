@@ -35,14 +35,15 @@ Before starting, ensure you have:
 
 > **One-time setup for the `make` targets.** The `make docker-devnet-*` commands below enforce a BuildKit cache cap; install it once per host with `sudo make install-buildkit-cache` (writes `/etc/docker/daemon.json`, caps build cache at ~50 GB). Skip only if you run the raw `docker compose` commands instead.
 
-## Step 0 (Optional): Build & Deploy Your Own Programs
+## Step 0 (Optional): Use a Different Program ID
 
-Only if you want to run your *own* escrow/withdraw programs instead of the canonical devnet ones (program IDs above): this compiles the programs and publishes them to devnet under your keypair.
+The images are **pinned to the canonical program IDs at compile time** (the IDs above) — `ESCROW_PROGRAM_ID` is *not* read on devnet, so an env var can't repoint them. You only need this if the escrow/withdraw program has been **redeployed to a new address**, or you're running your own. To switch:
 
-```shell
-make build-devnet                                       # build the .so files + generate an operator keypair and patch ADMIN_PRIVATE_KEY into .env
-make deploy-devnet DEPLOYER_KEY=<your-deployer-keypair>  # deploy them to devnet (prints new program IDs — set ESCROW_PROGRAM_ID/WITHDRAW_PROGRAM_ID in .env.devnet)
-```
+1. Update the program ID everywhere it's compiled in: `declare_id!` in `private-channel-{escrow,withdraw}-program/program/src/lib.rs`, the constants in `indexer/src/indexer/datasource/common/parser/{escrow,withdraw}.rs`, and `core/src/bin/streamer.rs`.
+2. Rebuild the program `.so` **and** the images: `make build-devnet && make docker-devnet-build`.
+3. Deploy your program to devnet at that address: `make deploy-devnet DEPLOYER_KEY=<your-deployer-keypair>`.
+
+Otherwise skip this — the canonical defaults work out of the box.
 
 ## Step 1: Build Docker Images
 
