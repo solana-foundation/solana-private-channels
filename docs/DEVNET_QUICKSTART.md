@@ -17,29 +17,49 @@ Solana Private Channels is a private payment channel with direct access to Solan
 
 Before starting, ensure you have:
 
-- **Docker** (Engine or Desktop)  
+- **Docker Engine ≥ 26** (Engine or Desktop) — required for the BuildKit cache mounts the Dockerfiles use  
   - macOS Apple Silicon: Enable "Docker VMM" in Docker settings (configurable in "Settings" \-\> "Virtual Machine Options")  
-- **Node.js** (v20+) and **pnpm**  
-- **Solana CLI** (latest)  
-- **Rust** (latest)  
+- **Node.js 24.7.0** and **pnpm 10.15.1**  
+- **Solana CLI 3.1.13** (Agave)  
+- **Rust 1.91.0** (Agave v3.1.13 requires ≥ 1.86)  
 - **Solana Wallet** that supports localhost or custom RPC (e.g., Backpack, Phantom, Solflare)  
 - **Solana Devnet RPC** endpoint  
 - **Yellowstone gRPC (Devnet)** endpoint (for real-time Solana event streaming)  
   - **Note**: You can use public Devnet RPC but need a Devnet Yellowstone gRPC node from a service provider for real-time indexing (e.g., Helius LazerStream, Triton, QuickNode).
+
+> **Pinned versions.** Match these on the host to avoid drift from the images:
+>
+> - Solana, Node, and pnpm are the values in [`versions.env`](../versions.env), used as Docker build args — the images build with exactly these.
+> - Rust is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml).
+> - Docker's `≥ 26` floor is enforced by `scripts/check-docker.sh` and the deploy preflight.
+
+> **One-time setup for the `make` targets.** The `make docker-devnet-*` commands below enforce a BuildKit cache cap; install it once per host with `sudo make install-buildkit-cache` (writes `/etc/docker/daemon.json`, caps build cache at ~50 GB). Skip only if you run the raw `docker compose` commands instead.
+
+## Step 0 (Optional): Build & Deploy Your Own Programs
+
+Only if you want to run your *own* escrow/withdraw programs instead of the canonical devnet ones (program IDs above): this compiles the programs and publishes them to devnet under your keypair.
+
+```shell
+make build-devnet                                       # build the .so files + generate an operator keypair and patch ADMIN_PRIVATE_KEY into .env
+make deploy-devnet DEPLOYER_KEY=<your-deployer-keypair>  # deploy them to devnet (prints new program IDs — set ESCROW_PROGRAM_ID/WITHDRAW_PROGRAM_ID in .env.devnet)
+```
 
 ## Step 1: Build Docker Images
 
 From the project root:
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build
+make docker-devnet-build
 ```
 
-> **Tip:** `make docker-devnet-build` / `make docker-devnet-up` wrap these exact
-> commands and add preflight guards (Docker ≥ 26, BuildKit cache, required-secret
-> checks). The raw commands here are equivalent but skip those guards.
+> Wraps `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build` with preflight guards (Docker ≥ 26, BuildKit cache, env checks). Run the raw command directly if you prefer.
 
 This builds all Solana Private Channels services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack (or go to the gym).
+
+> ### Deploying to a remote host?
+>
+> **This guide builds and runs the stack *locally* with Docker Compose.** For an **automated single-host remote deployment** — Ansible-driven, pulls prebuilt images from GHCR, and self-verifies in one `ansible-playbook deploy.yml` command — follow the **[Operator Runbook → `private-channel-deploy/README.md`](../private-channel-deploy/README.md)** instead.
+> The remaining steps below are for local setup only.
 
 ## Step 2: Set Up Admin UI
 
@@ -153,7 +173,7 @@ INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 Once your docker build (Step 1) is complete, run:
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d
+make docker-devnet-up
 ```
 
 You should see all services in a healthy/running state:
@@ -177,10 +197,9 @@ Check logs if needed:
 
 ```shell
 # All services
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs -f
+make docker-devnet-logs
 
-
-# Specific service
+# Specific service (no make target — use raw compose)
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs -f indexer-solana
 ```
 
@@ -247,7 +266,7 @@ The indexer detects the burn on Solana Private Channels, builds a Merkle proof, 
 ## Stopping Services
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down
+make docker-devnet-down
 ```
 
 You should see something like this:
@@ -273,7 +292,7 @@ You should see something like this:
 To also remove volumes (reset all state):
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down -v
+make docker-devnet-clean
 ```
 
 ## Troubleshooting
@@ -290,7 +309,7 @@ docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .
 - Verify the mint is whitelisted on the instance  
 - Try using CLI tools in `scripts/devnet/` instead of the Admin UI  
 - Check operator logs: `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs operator-solana`  
-  - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down -v`.
+  - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh with `make docker-devnet-clean`.
 - If using the Admin UI, ensure your wallet is on the correct cluster for the correct task (instructions relating to instance management and deposits should use Devnet, and transfers/withdrawals should use your Solana Private Channels RPC URL (localhost:8899 in our example))
 
 ### Indexer not detecting events
