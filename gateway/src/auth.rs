@@ -123,6 +123,11 @@ const DELEGATE_END: usize = 108;
 // Accounts owned by this program hold a SwapDvp struct for a P2P token swap.
 // Read access is granted to either trading party (user_a, user_b) or the
 // settlement_authority, by inspecting raw bytes (no full deserialization).
+//
+// SWAP_DVP_SIZE and SWAP_DVP_OWNER_FIELDS mirror the SwapDvp layout in
+// dvp-swap-program/program/src/state/swap_dvp.rs. They are not derived from it,
+// so if a field is added or reordered there, update them here or these checks
+// will read the wrong bytes.
 // ---------------------------------------------------------------------------
 
 /// DvP swap escrow program ID.
