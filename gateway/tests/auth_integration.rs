@@ -267,6 +267,60 @@ fn mint_account_response() -> String {
     .to_string()
 }
 
+/// DvP swap escrow program ID. Mirrors DVP_SWAP_PROGRAM in the gateway's auth
+/// module. Placeholder until the program is deployed; keep both in sync.
+const DVP_SWAP_PROGRAM: &str = "DzG1qJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC";
+
+/// Build a getAccountInfo JSON-RPC response for a SwapDvp account (394 bytes,
+/// DvP program). user_a, user_b, and settlement_authority are written at their
+/// field offsets; all other fields are left zero.
+fn swap_dvp_response(
+    user_a: &[u8; 32],
+    user_b: &[u8; 32],
+    settlement_authority: &[u8; 32],
+) -> String {
+    let mut data = vec![0u8; 394];
+    data[1..33].copy_from_slice(user_a);
+    data[33..65].copy_from_slice(user_b);
+    data[129..161].copy_from_slice(settlement_authority);
+    let encoded = BASE64.encode(&data);
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "value": {
+                "lamports": 2_282_880,
+                "owner": DVP_SWAP_PROGRAM,
+                "data": [encoded, "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Build a getAccountInfo JSON-RPC response for a DvP-owned account too small
+/// to be a SwapDvp (e.g. the nonce tombstone PDA). Used to verify the gateway
+/// rejects non-swap DvP accounts for users.
+fn dvp_undersized_account_response() -> String {
+    let encoded = BASE64.encode(vec![0u8; 16]);
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "value": {
+                "lamports": 1_000_000,
+                "owner": DVP_SWAP_PROGRAM,
+                "data": [encoded, "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string()
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 /// `getAccountInfo` with no Authorization header must be rejected with 401.
@@ -1144,4 +1198,198 @@ async fn test_get_signatures_for_address_operator_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+// ── DvP swap escrow ──────────────────────────────────────────────────────────
+
+/// A user whose verified wallet is the SwapDvp's user_a (seller) may read it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_dvp_user_a_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let wallet_bytes = [31u8; 32];
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(wallet_bytes).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // wallet sits in user_a; user_b and settlement_authority are unrelated.
+    let backend =
+        start_mock_backend_with_body(swap_dvp_response(&wallet_bytes, &[32u8; 32], &[33u8; 32]))
+            .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    // The queried PDA address is arbitrary: the mock backend returns the swap
+    // account regardless, and ownership is decided from its data, not this key.
+    let dvp_pubkey = bs58::encode([99u8; 32]).into_string();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [dvp_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
+/// A user whose verified wallet is the SwapDvp's user_b (buyer) may read it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_dvp_user_b_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let wallet_bytes = [34u8; 32];
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(wallet_bytes).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // wallet sits in user_b; user_a and settlement_authority are unrelated.
+    let backend =
+        start_mock_backend_with_body(swap_dvp_response(&[35u8; 32], &wallet_bytes, &[36u8; 32]))
+            .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let dvp_pubkey = bs58::encode([99u8; 32]).into_string();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [dvp_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
+/// A user whose verified wallet is the SwapDvp's settlement_authority may read it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_dvp_settlement_authority_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let wallet_bytes = [37u8; 32];
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(wallet_bytes).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    // wallet sits in settlement_authority; user_a and user_b are unrelated.
+    let backend =
+        start_mock_backend_with_body(swap_dvp_response(&[38u8; 32], &[39u8; 32], &wallet_bytes))
+            .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let dvp_pubkey = bs58::encode([99u8; 32]).into_string();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [dvp_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
+/// A user querying a SwapDvp whose user_a, user_b, and settlement_authority are
+/// all unrelated to their wallets must get 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_dvp_unowned_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode([40u8; 32]).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let backend =
+        start_mock_backend_with_body(swap_dvp_response(&[41u8; 32], &[42u8; 32], &[43u8; 32]))
+            .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let dvp_pubkey = bs58::encode([99u8; 32]).into_string();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [dvp_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
+/// A user querying a DvP-owned account too small to be a SwapDvp (e.g. the
+/// nonce tombstone PDA) must get 403, regardless of their wallets.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_account_info_dvp_undersized_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let user_id = insert_user(&pool, "user").await;
+    let token = generate_token(user_id, "user");
+
+    let backend = start_mock_backend_with_body(dvp_undersized_account_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let dvp_pubkey = bs58::encode([99u8; 32]).into_string();
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [dvp_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
 }
