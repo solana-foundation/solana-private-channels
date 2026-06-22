@@ -166,12 +166,19 @@ use transaction::{
 };
 use types::{PollTaskResult, SenderState};
 
+/// Advisory-lock keys per sender role. Distinct, namespaced 64-bit values
+/// (ASCII tags, matching `TRUNCATE_ADVISORY_LOCK_ID`) so senders never collide
+/// with each other, the truncate lock, or third-party tooling that grabs
+/// small-integer advisory locks on a shared database.
+const ESCROW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_45_53_43_52; // "SND_ESCR"
+const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
+
 /// Advisory-lock key per operator role. Distinct keys so an escrow and a
 /// withdraw sender never contend on the same lock if they share a database.
 fn sender_lock_key(program_type: ProgramType) -> i64 {
     match program_type {
-        ProgramType::Escrow => 1,
-        ProgramType::Withdraw => 2,
+        ProgramType::Escrow => ESCROW_SENDER_LOCK_KEY,
+        ProgramType::Withdraw => WITHDRAW_SENDER_LOCK_KEY,
     }
 }
 
