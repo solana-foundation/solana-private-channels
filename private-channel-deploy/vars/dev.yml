@@ -25,6 +25,14 @@ network: localnet
 #   mainnet  : your dedicated RPC (Helius, Triton, QuickNode, etc.).
 rpc_url: http://127.0.0.1:18899
 
+# yellowstone_endpoint — Yellowstone gRPC endpoint for indexer-solana real-time
+# streaming. Env-specific, so it lives here rather than in common.yml.
+#   localnet : ignored — docker-compose.yml hardcodes http://validator:10000, so "" is fine.
+#   devnet / mainnet : your provider's URL (Helius/Triton/QuickNode). Preflight
+#                      asserts non-empty when network != localnet; pair with
+#                      yellowstone_token in secrets.yml.
+yellowstone_endpoint: ""
+
 # === On-host layout ========================================================
 
 # host_data_dir — where Compose volumes, rendered config, and logs live on the host.

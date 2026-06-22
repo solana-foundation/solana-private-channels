@@ -34,12 +34,6 @@ compose_file: "{{ 'docker-compose.devnet.yml' if network | default('localnet') i
 compose_services_base: "postgres-primary postgres-replica write-node read-node gateway postgres-indexer indexer-solana indexer-private-channel operator-solana operator-private-channel"
 compose_services: "{{ compose_services_base }}{{ ' validator' if network | default('localnet') == 'localnet' else '' }}"
 
-# Yellowstone gRPC endpoint for indexer-solana real-time streaming.
-# localnet : ignored — docker-compose.yml hardcodes http://validator:10000.
-# devnet / mainnet : your provider's URL (Helius/Triton/QuickNode); preflight
-#                    asserts non-empty. Pair with yellowstone_token in secrets.yml.
-yellowstone_endpoint: ""
-
 # --- Ports (host-side) — read by health probes ---
 gateway_port: 8899
 write_port: 8900
