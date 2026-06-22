@@ -629,9 +629,7 @@
     - name: Validate required secrets in rendered .env
       ansible.builtin.script:
         cmd: >-
-          {{ repo_root }}/scripts/check-required-env.sh
-          {{ target_versions_env_file }}
-          {{ target_config_dir }}/.env
+          {{ repo_root }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
       changed_when: false
 
     # The base compose file has bind mounts with relative `./` sources resolved
@@ -672,6 +670,23 @@
         dest: "{{ target_config_dir }}/indexer/config/"
         mode: "0644"
         directory_mode: "0755"
+
+    # Devnet/mainnet indexer + operator TOMLs. docker-compose.devnet.yml
+    # bind-mounts ./scripts/devnet/config:/config/devnet for all four
+    # indexer/operator services; the localnet stack uses indexer/config/ above
+    # instead. Without shipping this dir, Docker auto-creates an empty one at
+    # the bind source and every service crashes looking for
+    # /config/devnet/indexer-solana.toml. The rpc_url / yellowstone endpoint
+    # inside these TOMLs are placeholders — they're overridden at runtime by the
+    # COMMON_RPC_URL / INDEXER_YELLOWSTONE_ENDPOINT env vars the devnet compose
+    # injects from the rendered .env (figment merges env over TOML).
+    - name: Copy devnet/mainnet indexer/operator TOML configs to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/scripts/devnet/config/"
+        dest: "{{ target_config_dir }}/scripts/devnet/config/"
+        mode: "0644"
+        directory_mode: "0755"
+      when: network != 'localnet'
 
     # Validator-only assets. The validator service is included in
     # compose_services on localnet only (see vars/common.yml), but the bind
