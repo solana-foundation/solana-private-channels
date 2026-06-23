@@ -16,6 +16,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let config = Config::parse();
+    config.validate().expect("invalid auth configuration");
 
     info!("Starting private-channel-auth on port {}", config.port);
 
