@@ -846,6 +846,22 @@
         chdir: "{{ target_config_dir }}"
       changed_when: true
 
+    # Postgres runs as uid 70, but Docker creates named volumes root-owned, so the
+    # archive_command (`cp %p /wal_archive/...`) fails with "Permission denied" and
+    # WAL piles up unrecycled (archive_mode=on) until the disk fills. Chown the
+    # archive volumes to 70:70 before postgres starts; the one-off `docker run` also
+    # creates the volume if absent (e.g. after a reset_state wipe). Mirrors the
+    # WAL-permission fix in bench-tps/scripts/run.sh.
+    - name: Fix WAL-archive volume ownership for postgres (uid 70)
+      ansible.builtin.command:
+        cmd: >-
+          docker run --rm -v private-channel_{{ item }}:/vol alpine
+          chown -R 70:70 /vol
+      loop:
+        - postgres-primary-wal-archive
+        - postgres-indexer-wal-archive
+      changed_when: true
+
     # `up -d --wait` blocks until each service's healthcheck passes (or fails).
     # That's the bulk of the deploy-time gating; the explicit health phase
     # below is the second layer (HTTP probes from the control node).
