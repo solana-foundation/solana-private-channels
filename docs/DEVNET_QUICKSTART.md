@@ -35,15 +35,35 @@ Before starting, ensure you have:
 
 > **One-time setup for the `make` targets.** The `make docker-devnet-*` commands below enforce a BuildKit cache cap; install it once per host with `sudo make install-buildkit-cache` (writes `/etc/docker/daemon.json`, caps build cache at ~50 GB). Skip only if you run the raw `docker compose` commands instead.
 
-## Step 0 (Optional): Use a Different Program ID
+## Step 0: Check the on-chain programs are current (upgrade if stale)
 
-The images are **pinned to the canonical program IDs at compile time** (the IDs above) — `ESCROW_PROGRAM_ID` is *not* read on devnet, so an env var can't repoint them. You only need this if the escrow/withdraw program has been **redeployed to a new address**, or you're running your own. To switch:
+The escrow/withdraw programs are already deployed on Devnet at their canonical IDs. The indexer, operator, and clients you're about to run are built from the *current* source and expect the *current* program behavior, so if the on-chain programs are older than your source, deposits/withdrawals can silently break.
 
-1. Update the program ID everywhere it's compiled in: `declare_id!` in `private-channel-{escrow,withdraw}-program/program/src/lib.rs`, the constants in `indexer/src/indexer/datasource/common/parser/{escrow,withdraw}.rs`, and `core/src/bin/streamer.rs`.
-2. Rebuild the program `.so` **and** the images: `make build-devnet && make docker-devnet-build`.
-3. Deploy your program to devnet at that address: `make deploy-devnet DEPLOYER_KEY=<your-deployer-keypair>`.
+**Check staleness** — compare the on-chain deploy point to your source:
 
-Otherwise skip this — the canonical defaults work out of the box.
+```shell
+solana program show GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83 --url devnet   # note "Last Deployed In Slot"
+solana block-time <that-slot> --url devnet                                       # -> deploy date
+git log -1 --format="%ci %s" -- private-channel-escrow-program/program           # source last-changed date
+```
+
+If the source date is newer than the deploy date, the on-chain program is stale.
+
+**Upgrade in place**: You redeploy new bytecode at the same address (requires the upgrade-authority keypair):
+
+```shell
+make build-devnet          # rebuild both program .so files from current source
+solana program deploy target/deploy/private_channel_escrow_program.so \
+  --program-id GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83 \
+  --upgrade-authority <authority.json> --url devnet
+solana program deploy target/deploy/private_channel_withdraw_program.so \
+  --program-id J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi \
+  --upgrade-authority <authority.json> --url devnet
+```
+
+`declare_id!`, the indexer constants, and `.env` all keep pointing at the same IDs. If an upgrade changed an instruction layout or tightened validation, reset any existing on-chain instance afterward — `make docker-devnet-clean`, then re-create the instance in Step 3. If the programs are already current, skip this; the canonical defaults work out of the box.
+
+> **When you must change the program ID (uncommon).** Upgrading reuses the same ID. You only mint a *new* program ID when you can't upgrade in place e.g if you don't hold the upgrade authority (`8Qhpz…` on devnet). Then change the ID everywhere it's compiled in — `declare_id!` in `private-channel-{escrow,withdraw}-program/program/src/lib.rs`, the constants in `indexer/src/indexer/datasource/common/parser/{escrow,withdraw}.rs`, and `core/src/bin/streamer.rs` — then `make build-devnet && make docker-devnet-build`, and deploy the fresh program. All of these must move together, or the indexer will watch an address nothing is deployed at.
 
 ## Step 1: Build Docker Images
 
@@ -55,20 +75,18 @@ make docker-devnet-build
 
 > Wraps `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build` with preflight guards (Docker ≥ 26, BuildKit cache, env checks). Run the raw command directly if you prefer.
 
-This builds all Solana Private Channels services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack (or go to the gym).
+This builds all Solana Private Channels services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack.
 
 > ### Deploying to a remote host?
 >
-> **This guide builds and runs the stack *locally* with Docker Compose.** For an **automated single-host remote deployment** — Ansible-driven, pulls prebuilt images from GHCR, and self-verifies in one `ansible-playbook deploy.yml` command — follow the **[Operator Runbook → `private-channel-deploy/README.md`](../private-channel-deploy/README.md)** instead.
-> The remaining steps below are for local setup only.
+> **This guide builds and runs the stack *locally* with Docker Compose.** For an **automated single-host remote deployment** follow the **[Operator Runbook](../private-channel-deploy/README.md)** instead.
+> The remaining private-channel related steps below are for local setup only.
 
 ## Step 2: Set Up Admin UI
 
 The Admin UI lets you create and configure your escrow instance via a web interface.
 
 If you prefer, you can also use the [scripts](../scripts/devnet/README.md) or the [Escrow](../private-channel-escrow-program/clients/typescript) and [Withdrawal](../private-channel-withdraw-program/clients/typescript) clients to interact with the programs.
-
-**Note:** The CLI scripts in `scripts/devnet/` may reference port 8898 for the gateway. This guide uses the Docker Compose default of 8899. Ensure your port configuration is consistent.
 
 ```shell
 cd admin-ui
@@ -89,6 +107,14 @@ pnpm dev
 ```
 
 Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+> **Running on a remote host?** Vite binds the dev server to loopback (`127.0.0.1:5173`), so it isn't reachable over the public IP. Rather than exposing the dev server, forward the port over SSH from your local machine and browse to `http://localhost:5173` locally:
+>
+> ```shell
+> ssh -L 5173:127.0.0.1:5173 <user>@<remote-host>
+> ```
+>
+> Your wallet's RPC URLs (`http://localhost:8899` for the gateway in later steps) resolve through the same tunnel, so add `-L 8899:127.0.0.1:8899` too if you need the gateway from your local wallet.
 
 ## Step 3: Create an Escrow Instance
 
@@ -117,27 +143,9 @@ solana-keygen new -o operator-keypair.json -s --no-bip39-passphrase
 solana-keygen pubkey operator-keypair.json
 ```
 
-## Step 5: Configure the Instance
+## Step 5: Configure Environment Variables
 
-Back in the Admin UI:
-
-### Whitelist a Token Mint
-
-1. Go to **Admin Functions** → **Mint Management**  
-2. Enter the mint address you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` – you can get some at the [USDC Faucet](https://faucet.circle.com/) or use your own devnet token mint)  
-3. Click **"Allow Mint"** and approve the transaction
-
-![Allow Mint](./assets/allow-mint.png)
-
-### Add Operator
-
-1. Go to **Admin Functions** → **Operator Management**  
-2. Enter your operator's public key (from Step 4)  
-3. Click **"Add Operator"** and approve the transaction
-
-## Step 6: Configure Environment Variables
-
-Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates, so live keys never touch a tracked file. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
+Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
 
 > **Required secrets — no defaults are shipped.** `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, and `ADMIN_PRIVATE_KEY` (and `JWT_SECRET` if you enable auth) MUST be set or the services fail to start. Generate strong passwords with `openssl rand -hex 32`.
 
@@ -169,13 +177,15 @@ INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 
 **Make sure** to update each of these environment variables and ensure there are no duplicate keys before proceeding.
 
-## Step 7: Start All Services
+## Step 6: Start All Services
 
 Once your docker build (Step 1) is complete, run:
 
 ```shell
 make docker-devnet-up
 ```
+
+> **Why services start before you configure the instance.** The indexer only sees on-chain events that land after it's streaming (backfill is off by default), so bring the stack up first — then the Step 7 `AllowMint` and your deposits are indexed in order.
 
 You should see all services in a healthy/running state:
 
@@ -226,7 +236,23 @@ write-node (`8900`) and read-node (`8901`) RPC ports have **no node-side authent
 reference compose binds these node ports to loopback (`127.0.0.1`), so they are reachable from the host
 but not from other machines. RBAC is an application-layer control on the gateway, not a network boundary.
 
-##
+## Step 7: Configure the Instance (Whitelist Mint + Add Operator)
+
+With the services running, configure the instance from the Admin UI. Because the indexer is already streaming, the `AllowMint` and `AddOperator` events are indexed live — no backfill needed, and your first deposit won't be quarantined.
+
+### Whitelist a Token Mint
+
+1. Go to **Admin Functions** → **Mint Management**  
+2. Enter the mint address you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` – you can get some at the [USDC Faucet](https://faucet.circle.com/) or use your own devnet token mint)  
+3. Click **"Allow Mint"** and approve the transaction
+
+![Allow Mint](./assets/allow-mint.png)
+
+### Add Operator
+
+1. Go to **Admin Functions** → **Operator Management**  
+2. Enter your operator's public key (from Step 4)  
+3. Click **"Add Operator"** and approve the transaction
 
 ## Step 8: Test Deposits and Withdrawals
 

@@ -59,6 +59,16 @@ gateway_enforce_jwt: false
 escrow_program_id: GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
 withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 
+# === Escrow instance =======================================================
+# escrow_instance_id — the on-chain escrow instance the indexer/operator watch
+# (rendered as ESCROW_INSTANCE_ID / COMMON_ESCROW_INSTANCE_ID in .env).
+# Leave commented on localnet: the deploy's pipeline phase creates the instance
+# and writes the real PDA back into .env (env.j2 falls back to the all-1s
+# placeholder until then). On devnet/mainnet the instance already exists —
+# uncomment and set it to the address you created (e.g. via the Admin UI), or
+# the indexer will watch a placeholder address that nothing is deployed at.
+escrow_instance_id: "<your_instance_address>"
+
 # === Admin keypair ==========================================================
 # Path on the control node to a funded Solana keypair (JSON byte array).
 # Used to derive the operator services' ADMIN_PRIVATE_KEY at runtime, and by
