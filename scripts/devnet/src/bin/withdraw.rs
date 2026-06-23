@@ -17,9 +17,9 @@ fn main() -> Result<()> {
 
     if args.len() < 5 {
         eprintln!("Usage: {} <private-channel-gateway-rpc> <user-keypair-path> <mint-address> <amount> [destination]", args[0]);
-        eprintln!("Example: {} http://localhost:8898 ./keypairs/user.json PANskKbAxqUQuqVfwzMtkyxii5GLaG1VFmB9xWb5tTP 500000", args[0]);
+        eprintln!("Example: {} http://localhost:8899 ./keypairs/user.json PANskKbAxqUQuqVfwzMtkyxii5GLaG1VFmB9xWb5tTP 500000", args[0]);
         eprintln!("\n⚠️  IMPORTANT: RPC URL must be PrivateChannel gateway (NOT Solana devnet)");
-        eprintln!("  - Local:  http://localhost:8898");
+        eprintln!("  - Local:  http://localhost:8899");
         eprintln!("  - Docker: gateway:8899");
         eprintln!("\nThis burns tokens on PrivateChannel. The operator will then release funds on Solana.");
         std::process::exit(1);
