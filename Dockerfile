@@ -129,6 +129,7 @@ RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     make -C private-channel-escrow-program install build \
     && make -C private-channel-withdraw-program install build \
+    && make -C dvp-swap-program install generate-clients \
     && (cd dvp-swap-program/program && cargo-build-sbf) \
     && mkdir -p /out/deploy \
     && cp target/deploy/private_channel_escrow_program.so /out/deploy/ \
