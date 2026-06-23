@@ -661,6 +661,17 @@
         mode: "0644"
         directory_mode: "0755"
 
+    # The devnet/mainnet compose mounts ./scripts/devnet/config into the
+    # indexer + operator containers (program_type and other structural config
+    # live here; env vars override the connection values at runtime). Ship it
+    # so the bind mount resolves to the real TOMLs instead of an empty dir.
+    - name: Copy devnet indexer/operator TOML configs to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/scripts/devnet/config/"
+        dest: "{{ target_config_dir }}/scripts/devnet/config/"
+        mode: "0644"
+        directory_mode: "0755"
+
     # Validator-only assets. The validator service is included in
     # compose_services on localnet only (see vars/common.yml), but the bind
     # mounts exist in the base compose unconditionally — copying these for
