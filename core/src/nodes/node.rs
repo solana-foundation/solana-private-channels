@@ -331,9 +331,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     let read_deps = match config.mode {
         NodeMode::Read | NodeMode::Aio => {
             let accounts_db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
-            if matches!(config.mode, NodeMode::Read) {
-                repair_address_signatures(&accounts_db, Arc::clone(&config.metrics)).await?;
-            }
+            // Read nodes don't repair: the write node owns the address_signatures
+            // index and repairs it on the primary; the read-only replica receives
+            // it via replication (repair would write, which fails on a standby).
             let max_blockhashes = config.max_blockhashes() as u64;
             Some(ReadDeps {
                 admin_keys: config.admin_keys,
