@@ -67,7 +67,10 @@ withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # placeholder until then). On devnet/mainnet the instance already exists —
 # uncomment and set it to the address you created (e.g. via the Admin UI), or
 # the indexer will watch a placeholder address that nothing is deployed at.
-escrow_instance_id: "<your_instance_address>"
+# (Must stay commented when unset: Jinja2 `| default()` only fills an *undefined*
+# var, so an active placeholder would render a non-base58 ESCROW_INSTANCE_ID and
+# crash the indexer's Pubkey::from_str at boot.)
+# escrow_instance_id: "<your_instance_address>"
 
 # === Admin keypair ==========================================================
 # Path on the control node to a funded Solana keypair (JSON byte array).
