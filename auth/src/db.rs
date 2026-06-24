@@ -133,6 +133,19 @@ pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> 
     })
 }
 
+/// Set a user's role by username. Returns `false` if no such user exists.
+/// `role` is cast to the enum in SQL, so callers must pass a valid variant
+/// ("operator" or "user").
+pub async fn set_user_role(pool: &PgPool, username: &str, role: &str) -> AppResult<bool> {
+    let result =
+        sqlx::query(r#"UPDATE private_channel_auth.users SET role = $2::private_channel_auth.user_role WHERE username = $1"#)
+            .bind(username)
+            .bind(role)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Insert a new challenge tied to this user. Expires in 10 minutes.
 pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppResult<Challenge> {
     let expires_at = Utc::now() + chrono::Duration::minutes(10);
