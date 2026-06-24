@@ -4,6 +4,11 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::Type, Serialize, Deserialize, PartialEq)]
 #[sqlx(type_name = "user_role", rename_all = "lowercase")]
+// serde rename must match the gateway's Role enum (also lowercase): the JWT role
+// claim is serialized here and deserialized by the gateway. Without this the
+// claim would be PascalCase ("User"/"Operator") and the gateway rejects every
+// token with 401 once enforcement is on.
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     Operator,
     User,

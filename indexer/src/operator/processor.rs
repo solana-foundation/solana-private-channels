@@ -18,6 +18,7 @@ use chrono::Utc;
 use private_channel_escrow_program_client::instructions::{
     ReleaseFundsBuilder, ResetSmtRootBuilder,
 };
+use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -376,6 +377,12 @@ async fn build_release_funds(
         .instance_ata(instance_ata)
         .token_program(token_program)
         .user(recipient)
+        // The generated client's defaults for these two accounts are stale (they
+        // point at the previous escrow program and its event-authority PDA), so
+        // set them explicitly from the configured program id. Without this the
+        // release fails `verify_current_program` with IncorrectProgramId.
+        .event_authority(release_funds_state.event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .transaction_nonce(nonce);
 
     let amount = transaction.amount.value();
