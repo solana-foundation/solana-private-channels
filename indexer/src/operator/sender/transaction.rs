@@ -3,6 +3,7 @@ use crate::config::ProgramType;
 use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
+use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::utils::instruction_util::TransactionBuilder;
 use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
@@ -23,7 +24,7 @@ use solana_rpc_client_api::request::RpcError;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::Signature;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use super::mint::{cleanup_mint_builder, try_jit_mint_initialization, JitOutcome};
 use super::proof::{cleanup_failed_transaction, rebuild_with_regenerated_proof};
@@ -43,6 +44,17 @@ pub const FINALITY_SAFETY_DELAY: Duration = Duration::from_secs(32);
 const MAX_SIGS_PER_CALL: usize = 256;
 
 impl SenderState {
+    /// True if a withdrawal in `tree_index` is still parked in pending_remints
+    /// awaiting finality. While true we must not build new proofs for that tree:
+    /// the local SMT may disagree with chain until the nonce resolves.
+    pub(super) fn has_unresolved_ambiguous_nonce(&self, tree_index: u64) -> bool {
+        self.pending_remints.iter().any(|p| {
+            p.ctx
+                .withdrawal_nonce
+                .is_some_and(|n| n / MAX_TREE_LEAVES as u64 == tree_index)
+        })
+    }
+
     /// Handle incoming transaction builder (either ReleaseFunds or Mint)
     /// For ReleaseFunds: Generate SMT proof and complete builder
     /// For Mint: Just build instruction (no proof needed)
@@ -163,6 +175,38 @@ pub async fn handle_transaction_submission(
         withdrawal_nonce: tx_builder.withdrawal_nonce(),
         trace_id: tx_builder.trace_id(),
     };
+
+    // For a withdrawal, which tree does its nonce belong to? None for other txs.
+    let release_tree_index = match &tx_builder {
+        TransactionBuilder::ReleaseFunds(builder_with_nonce) => {
+            Some(builder_with_nonce.nonce / MAX_TREE_LEAVES as u64)
+        }
+        _ => None,
+    };
+
+    // Park the withdrawal if that tree still has an unresolved ambiguous nonce.
+    // Building its proof now could use a local SMT that disagrees with chain;
+    // the tick drain retries it once process_pending_remints resolves the nonce.
+    if release_tree_index.is_some_and(|tree| state.has_unresolved_ambiguous_nonce(tree)) {
+        // The if-let always matches here: only ReleaseFunds sets release_tree_index.
+        if let TransactionBuilder::ReleaseFunds(builder_with_nonce) = tx_builder {
+            debug!(
+                nonce = builder_with_nonce.nonce,
+                "Parking withdrawal: ambiguous nonce in same tree unresolved"
+            );
+            // Mark the row Parked so recovery's Processing sweep does not
+            // quarantine it. Best-effort: the in-memory queue still drives it,
+            // and the next heartbeat re-park repairs a write lost here.
+            let id = builder_with_nonce.transaction_id;
+            if let Err(e) = state.storage.try_park_processing(id).await {
+                warn!(transaction_id = id, "Park status write failed: {e}");
+            }
+            state.ambiguous_retry_queue.push(builder_with_nonce);
+        }
+        // Always return: a blocked withdrawal is parked, not submitted.
+        return;
+    }
+
     let retry_policy = tx_builder.retry_policy();
     let compute_unit_price = tx_builder.compute_unit_price();
     // Owned so it can be moved into InFlightTx
@@ -1526,6 +1570,7 @@ mod tests {
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
+    use crate::operator::ReleaseFundsBuilderWithNonce;
     use crate::storage::common::storage::mock::MockStorage;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -1572,6 +1617,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -1606,6 +1652,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -2966,6 +3013,7 @@ mod tests {
                 retry_max_attempts: 3,
                 confirmation_poll_interval_ms: 400,
                 rotation_retry_queue: Vec::new(),
+                ambiguous_retry_queue: Vec::new(),
                 pending_rotation: None,
                 program_type: ProgramType::Escrow,
                 remint_cache: HashMap::new(),
@@ -3089,6 +3137,7 @@ mod tests {
                 retry_max_attempts: 3,
                 confirmation_poll_interval_ms: 400,
                 rotation_retry_queue: Vec::new(),
+                ambiguous_retry_queue: Vec::new(),
                 pending_rotation: None,
                 program_type: ProgramType::Escrow,
                 remint_cache: HashMap::new(),
@@ -3222,6 +3271,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -3307,6 +3357,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -3388,6 +3439,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -3478,6 +3530,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -3595,6 +3648,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -4255,5 +4309,86 @@ mod tests {
             .await
             .expect("task must exit within 3s when result channel is closed")
             .expect("task must not panic");
+    }
+
+    // ── ambiguous-nonce gate ─────────────────────────────────────────
+
+    fn ambiguous_pending_remint(nonce: u64) -> PendingRemint {
+        PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(1),
+                withdrawal_nonce: Some(nonce),
+                trace_id: Some("t".to_string()),
+            },
+            remint_info: WithdrawalRemintInfo {
+                transaction_id: 1,
+                trace_id: "t".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+            signatures: vec![],
+            original_error: "x".to_string(),
+            deadline: Utc::now(),
+            finality_check_attempts: 0,
+        }
+    }
+
+    /// The gate must block only withdrawals in the same tree as the unresolved
+    /// nonce. Test config MAX_TREE_LEAVES = 8, so nonce 2 is tree 0.
+    #[test]
+    fn ambiguous_nonce_gate_is_tree_scoped() {
+        let mut state = make_sender_state();
+        state.pending_remints.push(ambiguous_pending_remint(2));
+
+        assert!(state.has_unresolved_ambiguous_nonce(0), "same tree blocks");
+        assert!(
+            !state.has_unresolved_ambiguous_nonce(1),
+            "other tree does not"
+        );
+
+        state.pending_remints.clear();
+        assert!(
+            !state.has_unresolved_ambiguous_nonce(0),
+            "no ambiguous nonce, gate clear"
+        );
+    }
+
+    /// A withdrawal blocked by the gate must be parked, not built or sent, and
+    /// must leave the DB row untouched (no status update).
+    #[tokio::test]
+    async fn blocked_withdrawal_is_parked_not_sent() {
+        let mut state = make_sender_state();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Nonce 2 (tree 0) is unresolved, blocking tree 0.
+        state.pending_remints.push(ambiguous_pending_remint(2));
+
+        // Incoming withdrawal nonce 3 is in the same tree. The gate parks before
+        // touching the builder, so an empty builder is fine. It carries remint_info
+        // that must survive the park unchanged (the drain has no other source for it).
+        let remint_info = make_remint_info(99);
+        let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
+            builder: ReleaseFundsBuilder::new(),
+            nonce: 3,
+            transaction_id: 99,
+            trace_id: "trace-99".to_string(),
+            remint_info: Some(remint_info.clone()),
+        }));
+        handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
+
+        assert_eq!(state.ambiguous_retry_queue.len(), 1);
+        assert_eq!(state.ambiguous_retry_queue[0].nonce, 3);
+        assert_eq!(
+            state.ambiguous_retry_queue[0].remint_info.as_ref(),
+            Some(&remint_info),
+            "remint_info must travel with the parked withdrawal unchanged"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "parked withdrawal must not emit a status update"
+        );
     }
 }

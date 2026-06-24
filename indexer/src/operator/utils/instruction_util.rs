@@ -31,7 +31,7 @@ pub fn remint_idempotency_memo(transaction_id: impl Display) -> String {
 /// Info needed to remint PrivateChannel tokens back to user on permanent withdrawal failure.
 /// Captured in the processor where locals are available, since ReleaseFundsBuilder
 /// has private fields (codama-generated).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WithdrawalRemintInfo {
     pub transaction_id: i64,
     pub trace_id: String,

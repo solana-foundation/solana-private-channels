@@ -49,7 +49,7 @@ cargo run --bin deposit -- \
 ## 5. Withdraw (Solana Private Channels → Solana)
 ```bash
 cargo run --bin withdraw -- \
-  http://localhost:8898 \
+  http://localhost:8899 \
   ./keypairs/user.json \
   <MINT_ADDRESS> \
   <AMOUNT>

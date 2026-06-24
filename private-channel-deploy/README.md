@@ -12,7 +12,7 @@ Run [`scripts/install-prereqs.sh`](./scripts/install-prereqs.sh) once **on both 
 ./scripts/install-prereqs.sh        # run on control node, then again on the target host
 ```
 
-Uses `sudo` (apt + Docker repo). Run this in a terminal that can show password prompts, or `sudo -v` first to cache credentials.
+> Uses `sudo` (apt + Docker repo). Run this in a interactive terminal that can show password prompts.
 
 **Control node** (where you run `ansible-playbook`):
 
@@ -38,7 +38,7 @@ Three one-time edits per environment, done before the first deploy. They tell th
    cp secrets.yml.example secrets.yml
    ```
 
-   `secrets.yml` is plain text and gitignored. Keys: DB passwords, JWT secret, Solana keypair, GHCR creds, optional Yellowstone token + notify webhook. See the file header for required vs optional and how to generate each value.
+   `secrets.yml` is plain text and gitignored. See the file header for required vs optional and how to generate each value.
 
 Everything else is wired and shouldn't need routine changes. Cross-env defaults that you can override but rarely need to (db/user names, replication user, health-probe budgets) live in [`vars/common.yml`](./vars/common.yml); set the same key in [`vars/dev.yml`](./vars/dev.yml) to override per environment.
 

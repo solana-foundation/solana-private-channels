@@ -18,6 +18,7 @@ pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
+pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
 pub mod init_schema;
 pub mod insert_db_transaction;
@@ -31,8 +32,11 @@ pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
+pub mod try_park_processing;
 pub mod try_quarantine_processing;
+pub mod try_requeue_parked;
 pub mod try_requeue_processing;
+pub mod try_unpark_to_processing;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -350,6 +354,37 @@ impl Storage {
     ) -> Result<bool, StorageError> {
         try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
             .await
+    }
+
+    /// CAS `Processing`/`Parked` → `Parked`; `Ok(false)` if the row is neither.
+    pub async fn try_park_processing(&self, transaction_id: i64) -> Result<bool, StorageError> {
+        try_park_processing::try_park_processing(self, transaction_id).await
+    }
+
+    /// CAS `Parked` → `Processing`; `Ok(false)` if the row is not `Parked`.
+    pub async fn try_unpark_to_processing(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        try_unpark_to_processing::try_unpark_to_processing(self, transaction_id).await
+    }
+
+    /// Stale `Parked` rows older than the threshold, oldest-first.
+    pub async fn get_stale_parked_transactions(
+        &self,
+        threshold: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_stale_parked_transactions::get_stale_parked_transactions(self, threshold, limit).await
+    }
+
+    /// CAS `Parked` → `Pending` on `updated_at`; `Ok(false)` if stale.
+    pub async fn try_requeue_parked(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        try_requeue_parked::try_requeue_parked(self, transaction_id, expected_updated_at).await
     }
 
     /// CAS `Processing` → `Completed` on `updated_at`; `Ok(false)` if stale.

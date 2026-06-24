@@ -79,21 +79,10 @@ check-toolchain:
 # and must work for contributors who don't have Docker installed. Gate compose/docker
 # build targets on this instead. Floor is 26.0 to match the README; the Dockerfiles use
 # BuildKit `--mount=type=cache` and the `# syntax=docker/dockerfile:1.7` frontend.
+# Shared with deployment automation via scripts/check-docker.sh so every surface
+# enforces the same Docker precondition (present + daemon reachable + >= 26).
 check-docker:
-	@if ! command -v docker >/dev/null 2>&1; then \
-	    echo "ERROR: docker not found on PATH — required for compose-based dev/test stacks (>= 26.0)"; \
-	    exit 1; \
-	fi
-	@ver="$$(docker version --format '{{.Server.Version}}' 2>/dev/null || docker version --format '{{.Client.Version}}' 2>/dev/null)"; \
-	if [ -z "$$ver" ]; then \
-	    echo "ERROR: docker present but version could not be read (daemon not running?)"; \
-	    exit 1; \
-	fi; \
-	major="$$(echo "$$ver" | cut -d. -f1)"; \
-	if [ "$$major" -lt 26 ] 2>/dev/null; then \
-	    echo "ERROR: docker is $$ver; this repo requires >= 26.0 (BuildKit cache mounts)."; \
-	    exit 1; \
-	fi
+	@./scripts/check-docker.sh
 
 install: install-toolchain ensure-geyser-plugin
 	@echo "Installing dependencies for all projects..."
@@ -545,25 +534,33 @@ COMPOSE_DEVNET   := docker-compose.devnet.yml
 # $(wildcard) drops the flag when `.env` is absent; compose errors on missing files.
 ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local $(if $(wildcard .env),--env-file .env)
 ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet $(if $(wildcard .env),--env-file .env)
+# Optional compose profile, e.g. `make docker-up PROFILE=auth`; expands to nothing when unset.
+PROFILE_FLAG = $(if $(PROFILE),--profile $(PROFILE))
+
+# Verify .env.example documents every key any surface (env files + deploy
+# template) uses, so the env contract can't silently drift. See docs/ENV_CONTRACT.md.
+check-env-contract:
+	@./scripts/check-env-contract.sh
 
 # Fail closed before starting the stack if required secrets are blank. The
 # check script takes plain file paths, so pass the raw chain (no --env-file),
 # including the gitignored `.env` so it validates what compose actually resolves.
-check-env-local:
+# Depends on check-env-contract so a drifted key set is caught before boot.
+check-env-local: check-env-contract
 	@./scripts/check-required-env.sh versions.env .env.local $(wildcard .env)
 
-check-env-devnet:
+check-env-devnet: check-env-contract
 	@./scripts/check-required-env.sh versions.env .env.devnet $(wildcard .env)
 
 # --- Local stack (local validator) ---
 
 docker-build: check-docker check-buildkit-cache
 	@echo "Building all images ($(COMPOSE_LOCAL))..."
-	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) build
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) build
 
 docker-up: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
-	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d
 
 # Like docker-up but preserves the local validator ledger across restarts so
 # on-chain state stays consistent with Postgres rows. Caveat: after changing
@@ -571,29 +568,29 @@ docker-up: check-env-local check-docker check-buildkit-cache
 # will keep running stale bytecode.
 docker-up-persist: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack with validator persistence ($(COMPOSE_LOCAL))..."
-	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d
+	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d
 
 docker-rebuild: check-env-local check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
-	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --build
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d --build
 
 docker-restart: check-docker
 	@echo "Restarting full stack ($(COMPOSE_LOCAL))..."
-	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) restart
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) restart
 
 docker-down:
 	@echo "Stopping full stack ($(COMPOSE_LOCAL); volumes preserved)..."
-	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) down
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) down
 
 docker-clean:
 	@echo "Stopping full stack and removing volumes ($(COMPOSE_LOCAL))..."
-	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) down -v --remove-orphans
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) down -v --remove-orphans
 
 docker-logs: check-docker
-	@docker compose -f $(COMPOSE_LOCAL) logs -f --tail=200
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) logs -f --tail=200
 
 docker-ps: check-docker
-	@docker compose -f $(COMPOSE_LOCAL) ps
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) ps
 
 # --- Devnet stack (against Solana devnet) ---
 
@@ -622,10 +619,10 @@ docker-devnet-clean:
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) down -v --remove-orphans
 
 docker-devnet-logs: check-docker
-	@docker compose -f $(COMPOSE_DEVNET) logs -f --tail=200
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) $(PROFILE_FLAG) logs -f --tail=200
 
 docker-devnet-ps: check-docker
-	@docker compose -f $(COMPOSE_DEVNET) ps
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) $(PROFILE_FLAG) ps
 
 help:
 	@echo "Solana Private Channels Programs - Available targets:"

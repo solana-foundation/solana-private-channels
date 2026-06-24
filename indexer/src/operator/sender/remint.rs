@@ -1,6 +1,7 @@
 #[cfg(test)]
 use super::types::InFlightQueue;
 use super::types::SenderState;
+use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
@@ -21,7 +22,7 @@ use chrono::Utc;
 use solana_keychain::SolanaSigner;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signature};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Cap on total deferrals of a single pending remint. Covers both transient
 /// RPC errors during the finality check AND liveness extensions when a stored
@@ -350,8 +351,23 @@ pub async fn process_pending_remints(
         // rpc_client (the destination/Solana chain where ReleaseFunds was sent),
         // not source_rpc_client which only the remint MintTo uses.
         match classify_release_signatures(&state.rpc_client, &entry.signatures).await {
-            // Case 1: a sig finalized successfully — the withdrawal landed.
+            // Case 1: a sig finalized successfully, the withdrawal landed.
             SigFinality::Landed(sig) => {
+                // Chain root now includes this nonce. handle_permanent_failure
+                // removed it from the local SMT assuming the tx failed; put it
+                // back so local matches chain. Skip if the tree already rotated
+                // past this nonce's window.
+                if let Some(nonce) = entry.ctx.withdrawal_nonce {
+                    if let Some(smt) = state.smt_state.as_mut() {
+                        if smt.smt_state.tree_index() == nonce / MAX_TREE_LEAVES as u64 {
+                            if smt.smt_state.insert_nonce(nonce) {
+                                info!("Re-inserted landed nonce {nonce} into local SMT");
+                            } else {
+                                debug!("Landed nonce {nonce} already present in local SMT, no divergence");
+                            }
+                        }
+                    }
+                }
                 send_completed(storage_tx, &entry, &nonce_label, sig).await;
             }
             // Case 2: could still land or unclassifiable → defer, don't remint.
@@ -515,9 +531,10 @@ async fn defer_or_escalate(
 mod tests {
     use super::*;
     use crate::operator::sender::types::{
-        PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
+        PendingRemint, PendingSig, SenderSMTState, SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+    use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::operator::RetryConfig;
     use crate::operator::RpcClientWithRetry;
@@ -561,6 +578,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -645,6 +663,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -704,6 +723,7 @@ mod tests {
             retry_max_attempts: 3,
             confirmation_poll_interval_ms: 1,
             rotation_retry_queue: Vec::new(),
+            ambiguous_retry_queue: Vec::new(),
             pending_rotation: None,
             program_type: crate::config::ProgramType::Escrow,
             remint_cache: HashMap::new(),
@@ -1127,6 +1147,79 @@ mod tests {
         assert!(
             state.pending_remints.is_empty(),
             "entry should be removed from queue after Completed"
+        );
+    }
+
+    /// A withdrawal that ambiguously failed but actually landed must have its
+    /// nonce re-inserted into the local SMT. Otherwise later withdrawals in the
+    /// same tree fail InvalidSmtProof until restart.
+    #[tokio::test]
+    async fn process_pending_remints_reinserts_landed_nonce_into_smt() {
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let landed_nonce: u64 = 7;
+
+        // Withdrawal signature finalized successfully.
+        let _status_mock = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignatureStatuses""#.into()),
+                mockito::Matcher::Regex(r#""searchTransactionHistory"\s*:\s*true"#.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                    "slot":100,"confirmations":null,"err":null,
+                    "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+            )
+            .create_async()
+            .await;
+
+        // Local SMT has forgotten the nonce: the bug's starting state.
+        state.smt_state = Some(SenderSMTState {
+            smt_state: SmtState::new(0),
+            nonce_to_builder: HashMap::new(),
+        });
+        assert!(!state
+            .smt_state
+            .as_ref()
+            .unwrap()
+            .smt_state
+            .contains_nonce(landed_nonce));
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(99),
+                withdrawal_nonce: Some(landed_nonce),
+                trace_id: Some("trace-99".to_string()),
+            },
+            remint_info: make_remint_info(99),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert!(
+            state
+                .smt_state
+                .as_ref()
+                .unwrap()
+                .smt_state
+                .contains_nonce(landed_nonce),
+            "landed nonce must be re-inserted so local tree matches chain"
+        );
+        assert!(
+            state.pending_remints.is_empty(),
+            "entry consumed after Completed"
         );
     }
 

@@ -34,12 +34,6 @@ compose_file: "{{ 'docker-compose.devnet.yml' if network | default('localnet') i
 compose_services_base: "postgres-primary postgres-replica write-node read-node gateway postgres-indexer indexer-solana indexer-private-channel operator-solana operator-private-channel"
 compose_services: "{{ compose_services_base }}{{ ' validator' if network | default('localnet') == 'localnet' else '' }}"
 
-# Yellowstone gRPC endpoint for indexer-solana real-time streaming.
-# localnet : ignored — docker-compose.yml hardcodes http://validator:10000.
-# devnet / mainnet : your provider's URL (Helius/Triton/QuickNode); preflight
-#                    asserts non-empty. Pair with yellowstone_token in secrets.yml.
-yellowstone_endpoint: ""
-
 # --- Ports (host-side) — read by health probes ---
 gateway_port: 8899
 write_port: 8900
@@ -64,6 +58,16 @@ postgres_replication_user: replicator
 # someone adds without thinking about it is non-destructive — they have to
 # opt in explicitly. See vars/dev.yml for the rationale.
 reset_state: false
+
+# --- Validator ledger reset ---
+# Controls VALIDATOR_RESET_FLAG in the rendered .env (localnet bundled validator).
+# Default `true`: boot with `--reset` from genesis on every redeploy, which the
+# indexer's startup reconciliation depends on (see the RESET_STATE rationale in
+# deploy.yml). Set `false` to preserve the validator ledger across redeploys —
+# the deploy analogue of `make docker-up-persist`. Only safe when Postgres is
+# NOT wiped in lockstep, or the indexer will reconcile stale rows against an
+# empty chain.
+validator_reset: true
 
 # --- Optional notification webhook posted from the report phase ---
 notify_webhook: ""

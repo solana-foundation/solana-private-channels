@@ -10,40 +10,83 @@ Solana Private Channels is a private payment channel with direct access to Solan
 
 - **Escrow Program**: On-chain Solana program that holds deposited tokens (Devnet Program ID: `GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83`)
 - **Solana Private Channels Payment Channel**: Private execution environment (write node, read node, gateway)
-- **Indexer** (2 instances): `indexer-solana` watches the Escrow program on Solana for deposits; `indexer-private_channel` watches the Withdraw program on the Solana Private Channels payment channel for withdrawals
-- **Operator** (2 instances): `operator-solana` processes deposits (mints on the Solana Private Channels payment channel); `operator-private_channel` processes withdrawals (releases from escrow on Solana)
+- **Indexer** (2 instances): `indexer-solana` watches the Escrow program on Solana for deposits; `indexer-private-channel` watches the Withdraw program on the Solana Private Channels payment channel for withdrawals
+- **Operator** (2 instances): `operator-solana` processes deposits (mints on the Solana Private Channels payment channel); `operator-private-channel` processes withdrawals (releases from escrow on Solana)
 
 ## Prerequisites
 
 Before starting, ensure you have:
 
-- **Docker** (Engine or Desktop)  
+- **Docker Engine ≥ 26** (Engine or Desktop) — required for the BuildKit cache mounts the Dockerfiles use  
   - macOS Apple Silicon: Enable "Docker VMM" in Docker settings (configurable in "Settings" \-\> "Virtual Machine Options")  
-- **Node.js** (v20+) and **pnpm**  
-- **Solana CLI** (latest)  
-- **Rust** (latest)  
+- **Node.js 24.7.0** and **pnpm 10.15.1**  
+- **Solana CLI 3.1.13** (Agave)  
+- **Rust 1.91.0** (Agave v3.1.13 requires ≥ 1.86)  
 - **Solana Wallet** that supports localhost or custom RPC (e.g., Backpack, Phantom, Solflare)  
 - **Solana Devnet RPC** endpoint  
 - **Yellowstone gRPC (Devnet)** endpoint (for real-time Solana event streaming)  
   - **Note**: You can use public Devnet RPC but need a Devnet Yellowstone gRPC node from a service provider for real-time indexing (e.g., Helius LazerStream, Triton, QuickNode).
+
+> **Pinned versions.** Match these on the host to avoid drift from the images:
+>
+> - Solana, Node, and pnpm are the values in [`versions.env`](../versions.env), used as Docker build args — the images build with exactly these.
+> - Rust is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml).
+> - Docker's `≥ 26` floor is enforced by `scripts/check-docker.sh` and the deploy preflight.
+
+> **One-time setup for the `make` targets.** The `make docker-devnet-*` commands below enforce a BuildKit cache cap; install it once per host with `sudo make install-buildkit-cache` (writes `/etc/docker/daemon.json`, caps build cache at ~50 GB). Skip only if you run the raw `docker compose` commands instead.
+
+## Step 0: Check the on-chain programs are current (upgrade if stale)
+
+The escrow/withdraw programs are already deployed on Devnet at their canonical IDs. The indexer, operator, and clients you're about to run are built from the *current* source and expect the *current* program behavior, so if the on-chain programs are older than your source, deposits/withdrawals can silently break.
+
+**Check staleness** — compare the on-chain deploy point to your source:
+
+```shell
+solana program show GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83 --url devnet   # note "Last Deployed In Slot"
+solana block-time <that-slot> --url devnet                                       # -> deploy date
+git log -1 --format="%ci %s" -- private-channel-escrow-program/program           # source last-changed date
+```
+
+If the source date is newer than the deploy date, the on-chain program is stale.
+
+**Upgrade in place**: You redeploy new bytecode at the same address (requires the upgrade-authority keypair):
+
+```shell
+make build-devnet          # rebuild both program .so files from current source
+solana program deploy target/deploy/private_channel_escrow_program.so \
+  --program-id GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83 \
+  --upgrade-authority <authority.json> --url devnet
+solana program deploy target/deploy/private_channel_withdraw_program.so \
+  --program-id J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi \
+  --upgrade-authority <authority.json> --url devnet
+```
+
+`declare_id!`, the indexer constants, and `.env` all keep pointing at the same IDs. If an upgrade changed an instruction layout or tightened validation, reset any existing on-chain instance afterward — `make docker-devnet-clean`, then re-create the instance in Step 3. If the programs are already current, skip this; the canonical defaults work out of the box.
+
+> **When you must change the program ID (uncommon).** Upgrading reuses the same ID. You only mint a *new* program ID when you can't upgrade in place e.g if you don't hold the upgrade authority (`8Qhpz…` on devnet). Then change the ID everywhere it's compiled in — `declare_id!` in `private-channel-{escrow,withdraw}-program/program/src/lib.rs`, the constants in `indexer/src/indexer/datasource/common/parser/{escrow,withdraw}.rs`, and `core/src/bin/streamer.rs` — then `make build-devnet && make docker-devnet-build`, and deploy the fresh program. All of these must move together, or the indexer will watch an address nothing is deployed at.
 
 ## Step 1: Build Docker Images
 
 From the project root:
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build
+make docker-devnet-build
 ```
 
-This builds all Solana Private Channels services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack (or go to the gym).
+> Wraps `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet build` with preflight guards (Docker ≥ 26, BuildKit cache, env checks). Run the raw command directly if you prefer.
+
+This builds all Solana Private Channels services (gateway, nodes, indexer, operator). This will take a long time (30min to an hour or so depending on your system), so it's recommended to run this in the background while you configure the rest of the stack.
+
+> ### Deploying to a remote host?
+>
+> **This guide builds and runs the stack *locally* with Docker Compose.** For an **automated single-host remote deployment** follow the **[Operator Runbook](../private-channel-deploy/README.md)** instead.
+> The remaining private-channel related steps below are for local setup only.
 
 ## Step 2: Set Up Admin UI
 
 The Admin UI lets you create and configure your escrow instance via a web interface.
 
 If you prefer, you can also use the [scripts](../scripts/devnet/README.md) or the [Escrow](../private-channel-escrow-program/clients/typescript) and [Withdrawal](../private-channel-withdraw-program/clients/typescript) clients to interact with the programs.
-
-**Note:** The CLI scripts in `scripts/devnet/` may reference port 8898 for the gateway. This guide uses the Docker Compose default of 8899. Ensure your port configuration is consistent.
 
 ```shell
 cd admin-ui
@@ -64,6 +107,14 @@ pnpm dev
 ```
 
 Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+> **Running on a remote host?** Vite binds the dev server to loopback (`127.0.0.1:5173`), so it isn't reachable over the public IP. Rather than exposing the dev server, forward the port over SSH from your local machine and browse to `http://localhost:5173` locally:
+>
+> ```shell
+> ssh -L 5173:127.0.0.1:5173 <user>@<remote-host>
+> ```
+>
+> Your wallet's RPC URLs (`http://localhost:8899` for the gateway in later steps) resolve through the same tunnel, so add `-L 8899:127.0.0.1:8899` too if you need the gateway from your local wallet.
 
 ## Step 3: Create an Escrow Instance
 
@@ -92,27 +143,9 @@ solana-keygen new -o operator-keypair.json -s --no-bip39-passphrase
 solana-keygen pubkey operator-keypair.json
 ```
 
-## Step 5: Configure the Instance
+## Step 5: Configure Environment Variables
 
-Back in the Admin UI:
-
-### Whitelist a Token Mint
-
-1. Go to **Admin Functions** → **Mint Management**  
-2. Enter the mint address you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` – you can get some at the [USDC Faucet](https://faucet.circle.com/) or use your own devnet token mint)  
-3. Click **"Allow Mint"** and approve the transaction
-
-![Allow Mint](./assets/allow-mint.png)
-
-### Add Operator
-
-1. Go to **Admin Functions** → **Operator Management**  
-2. Enter your operator's public key (from Step 4)  
-3. Click **"Add Operator"** and approve the transaction
-
-## Step 6: Configure Environment Variables
-
-Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates, so live keys never touch a tracked file. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
+Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
 
 > **Required secrets — no defaults are shipped.** `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, and `ADMIN_PRIVATE_KEY` (and `JWT_SECRET` if you enable auth) MUST be set or the services fail to start. Generate strong passwords with `openssl rand -hex 32`.
 
@@ -144,19 +177,21 @@ INDEXER_YELLOWSTONE_TOKEN=<your_yellowstone_auth_token>
 
 **Make sure** to update each of these environment variables and ensure there are no duplicate keys before proceeding.
 
-## Step 7: Start All Services
+## Step 6: Start All Services
 
 Once your docker build (Step 1) is complete, run:
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet up -d
+make docker-devnet-up
 ```
+
+> **Why services start before you configure the instance.** The indexer only sees on-chain events that land after it's streaming (backfill is off by default), so bring the stack up first — then the Step 7 `AllowMint` and your deposits are indexed in order.
 
 You should see all services in a healthy/running state:
 
 ```shell
 [+] Running 21/21a The requested image's platform (linux/amd64) does not match the detected host platfo
- ✔ Network private_channel_private-channel-network Created0.0s 
+ ✔ Network private-channel_private-channel-network Created0.0s 
  ✔ Container private-channel-cadvisor Started2.4s 
  ✔ Container private-channel-postgres-primary Healthy13.1s                                
  ✔ Container private-channel-postgres-indexer Healthy14.1s                                
@@ -164,8 +199,8 @@ You should see all services in a healthy/running state:
  ✔ Container private-channel-operator-solana Started12.2s
  ✔ Container private-channel-postgres-replica Started12.7s
  ✔ Container private-channel-write-node Started2.2s   ✔ Container private-channel-read-node Started12.4s 
- ✔ Container private-channel-operator-private_channel Started11.9s 
- ✔ Container private-channel-indexer-private_channel Started12.8s 
+ ✔ Container private-channel-operator-private-channel Started11.9s 
+ ✔ Container private-channel-indexer-private-channel Started12.8s 
  ✔ Container private-channel-gateway Started12.3s 
 ```
 
@@ -173,10 +208,9 @@ Check logs if needed:
 
 ```shell
 # All services
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs -f
+make docker-devnet-logs
 
-
-# Specific service
+# Specific service (no make target — use raw compose)
 docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs -f indexer-solana
 ```
 
@@ -202,7 +236,23 @@ write-node (`8900`) and read-node (`8901`) RPC ports have **no node-side authent
 reference compose binds these node ports to loopback (`127.0.0.1`), so they are reachable from the host
 but not from other machines. RBAC is an application-layer control on the gateway, not a network boundary.
 
-##
+## Step 7: Configure the Instance (Whitelist Mint + Add Operator)
+
+With the services running, configure the instance from the Admin UI. Because the indexer is already streaming, the `AllowMint` and `AddOperator` events are indexed live — no backfill needed, and your first deposit won't be quarantined.
+
+### Whitelist a Token Mint
+
+1. Go to **Admin Functions** → **Mint Management**  
+2. Enter the mint address you want to support (e.g., Devnet USDC: `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` – you can get some at the [USDC Faucet](https://faucet.circle.com/) or use your own devnet token mint)  
+3. Click **"Allow Mint"** and approve the transaction
+
+![Allow Mint](./assets/allow-mint.png)
+
+### Add Operator
+
+1. Go to **Admin Functions** → **Operator Management**  
+2. Enter your operator's public key (from Step 4)  
+3. Click **"Add Operator"** and approve the transaction
 
 ## Step 8: Test Deposits and Withdrawals
 
@@ -243,16 +293,16 @@ The indexer detects the burn on Solana Private Channels, builds a Merkle proof, 
 ## Stopping Services
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down
+make docker-devnet-down
 ```
 
 You should see something like this:
 
 ```shell
 [+] Running 14/14
- ✔ Container private-channel-indexer-private_channel    Removed         10.7s 
+ ✔ Container private-channel-indexer-private-channel    Removed         10.7s 
  ✔ Container private-channel-gateway           Removed          0.7s 
- ✔ Container private-channel-operator-private_channel   Removed         10.7s 
+ ✔ Container private-channel-operator-private-channel   Removed         10.7s 
  ✔ Container private-channel-grafana           Removed          0.5s 
  ✔ Container private-channel-operator-solana   Removed         10.5s 
  ✔ Container private-channel-cadvisor          Removed          0.7s 
@@ -263,13 +313,13 @@ You should see something like this:
  ✔ Container private-channel-postgres-replica  Removed          0.9s 
  ✔ Container private-channel-write-node        Removed          0.6s 
  ✔ Container private-channel-postgres-primary  Removed          0.5s 
- ✔ Network private_channel_private-channel-network      Removed          0.2s
+ ✔ Network private-channel_private-channel-network      Removed          0.2s
 ```
 
 To also remove volumes (reset all state):
 
 ```shell
-docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down -v
+make docker-devnet-clean
 ```
 
 ## Troubleshooting
@@ -286,7 +336,7 @@ docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .
 - Verify the mint is whitelisted on the instance  
 - Try using CLI tools in `scripts/devnet/` instead of the Admin UI  
 - Check operator logs: `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet logs operator-solana`  
-  - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh `docker compose -f docker-compose.devnet.yml --env-file versions.env --env-file .env.devnet down -v`.
+  - *Transaction failed: InstructionError(1, Custom(4))* error suggests that the admin environment variable is misconfigured. Check your ENV vars and restart your services. You may need to initialize a new instance/mint afterwards. Or, remove the volumes and start fresh with `make docker-devnet-clean`.
 - If using the Admin UI, ensure your wallet is on the correct cluster for the correct task (instructions relating to instance management and deposits should use Devnet, and transfers/withdrawals should use your Solana Private Channels RPC URL (localhost:8899 in our example))
 
 ### Indexer not detecting events
@@ -306,9 +356,9 @@ The TOML config files in `scripts/devnet/config/` allow fine-tuning:
 | File | Purpose |
 | :---- | :---- |
 | `indexer-solana.toml` | Solana chain indexer (Yellowstone) |
-| `indexer-private_channel.toml` | Solana Private Channels payment channel indexer (RPC polling) |
+| `indexer-private-channel.toml` | Solana Private Channels payment channel indexer (RPC polling) |
 | `operator-solana.toml` | Processes deposits → mints on Solana Private Channels |
-| `operator-private_channel.toml` | Processes withdrawals → releases on Solana |
+| `operator-private-channel.toml` | Processes withdrawals → releases on Solana |
 
 **Note:** The TOML files contain placeholder values. When running via Docker Compose, the environment variables from `.env.devnet` override these values at runtime. You do not need to edit the TOML files directly — configure everything through `.env.devnet`.
 

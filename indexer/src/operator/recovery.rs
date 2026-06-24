@@ -123,14 +123,12 @@ async fn recover_once(
         .get_stale_processing_transactions(threshold, RECOVERY_BATCH_LIMIT)
         .await?;
 
-    if stale.is_empty() {
-        return Ok(());
+    if !stale.is_empty() {
+        debug!(
+            count = stale.len(),
+            "Recovery sweep found stale Processing rows"
+        );
     }
-
-    debug!(
-        count = stale.len(),
-        "Recovery sweep found stale Processing rows"
-    );
 
     for row in stale {
         // Cooperate with shutdown between rows so long batches exit cleanly.
@@ -142,6 +140,20 @@ async fn recover_once(
         let captured = row.updated_at;
         let action = decide_action(&row, storage, rpc_client).await;
         route_outcome(storage, &row, captured, action, program_type, storage_tx).await;
+    }
+
+    // Rescue parked withdrawals orphaned by a restart. A live sender unparks
+    // these itself, so anything stale here lost its in-memory driver. Parked
+    // rows were never sent on-chain, so requeue them without verifying finality.
+    let stale_parked = storage
+        .get_stale_parked_transactions(threshold, RECOVERY_BATCH_LIMIT)
+        .await?;
+    for row in stale_parked {
+        if cancellation_token.is_cancelled() {
+            info!("Recovery sweep cancelled; remaining parked rows deferred");
+            return Ok(());
+        }
+        requeue_parked(storage, &row, program_type).await;
     }
     Ok(())
 }
@@ -284,6 +296,33 @@ async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>
     Ok(pending)
 }
 
+fn pt_label(program_type: ProgramType) -> &'static str {
+    match program_type {
+        ProgramType::Escrow => "escrow",
+        ProgramType::Withdraw => "withdraw",
+    }
+}
+
+/// Requeue an orphaned `Parked` row to `Pending` so the processor rebuilds it.
+async fn requeue_parked(storage: &Storage, row: &DbTransaction, program_type: ProgramType) {
+    match storage.try_requeue_parked(row.id, row.updated_at).await {
+        Ok(true) => {
+            info!(
+                transaction_id = row.id,
+                "Recovery requeued orphaned Parked → Pending"
+            );
+            OPERATOR_STALE_PROCESSING_RECOVERED
+                .with_label_values(&[pt_label(program_type), "requeued_parked", "withdrawal"])
+                .inc();
+        }
+        Ok(false) => debug!(
+            id = row.id,
+            "parked requeue skipped — another writer touched the row first"
+        ),
+        Err(e) => warn!(id = row.id, "parked requeue write error: {}", e),
+    }
+}
+
 async fn route_outcome(
     storage: &Storage,
     row: &DbTransaction,
@@ -292,10 +331,7 @@ async fn route_outcome(
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    let pt_label = match program_type {
-        ProgramType::Escrow => "escrow",
-        ProgramType::Withdraw => "withdraw",
-    };
+    let pt_label = pt_label(program_type);
     let type_label = match row.transaction_type {
         TransactionType::Deposit => "deposit",
         TransactionType::Withdrawal => "withdrawal",
@@ -988,6 +1024,68 @@ mod tests {
         assert_eq!(
             update.error_message.as_deref(),
             Some("withdrawal row missing nonce")
+        );
+    }
+
+    // ── parked sweep ─────────────────────────────────────────────────
+
+    /// A stale Parked row (orphaned by a restart) is requeued to Pending so the
+    /// processor rebuilds it. No signature lookup, no alert webhook, and the
+    /// requeue cap counter is left untouched.
+    #[tokio::test]
+    async fn stale_parked_row_requeued_to_pending_without_alert() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(70, Some(3));
+        row.status = TransactionStatus::Parked;
+        // Backdate past STALE_THRESHOLD so the parked sweep selects it.
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        // Parked rows need no on-chain check, so the RPC client is never called.
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Pending,
+            "stale parked → requeued"
+        );
+        assert_eq!(
+            after[0].recovery_requeue_attempts, 0,
+            "parked requeue must not bump the cap counter"
+        );
+        drop(after);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "parked requeue must not send an alert"
+        );
+    }
+
+    /// A fresh Parked row (a live sender still owns it) is left untouched.
+    #[tokio::test]
+    async fn fresh_parked_row_left_untouched() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(71, Some(3));
+        row.status = TransactionStatus::Parked;
+        row.updated_at = Utc::now();
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Parked,
+            "fresh parked row must be left alone"
         );
     }
 

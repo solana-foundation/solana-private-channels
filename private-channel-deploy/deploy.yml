@@ -322,19 +322,18 @@
           `postgres_replication_password` empty in secrets.yml. postgres-replica uses it for streaming replication.
           Fix: edit secrets.yml and add `postgres_replication_password: repl_password` (literal, until init-primary.sql is parameterised).
 
+    # Only required when enforcement is on: env.j2 blanks JWT_SECRET when
+    # gateway_enforce_jwt is false, so the secret's value is unused there.
+    # Mirror the template's `default(true)` so an unset flag still requires it.
     - name: Assert jwt_secret is set
       ansible.builtin.assert:
-        that: jwt_secret | default('') | length > 0
+        # `| trim` mirrors the gateway's configured_secret() trim semantics: a
+        # whitespace-only jwt_secret disables gateway auth, so it must fail here too.
+        that: jwt_secret | default('') | trim | length > 0
         fail_msg: |
-          `jwt_secret` empty in secrets.yml. Used by gateway to sign auth tokens.
+          `jwt_secret` empty (or whitespace-only) in secrets.yml. Used by gateway to sign auth tokens.
           Fix: edit secrets.yml and add `jwt_secret: <random-32+-byte-string>`  (e.g. `openssl rand -hex 32`).
-
-    - name: Assert solana_keypair is defined
-      ansible.builtin.assert:
-        that: solana_keypair is defined
-        fail_msg: |
-          `solana_keypair` missing from secrets.yml. Used by operator services to sign on-chain transactions.
-          Fix: paste the JSON byte array from `solana-keygen new` into `solana_keypair:` in secrets.yml.
+      when: gateway_enforce_jwt | default(true) | bool
 
     - name: Assert GHCR creds present
       ansible.builtin.assert:
@@ -443,9 +442,11 @@
   #
   # WHY THIS EXISTS — DO NOT REMOVE WITHOUT UNDERSTANDING THIS:
   #
-  # The validator container boots with `--reset` (see VALIDATOR_RESET_FLAG in
-  # templates/env.j2), so every redeploy starts from genesis: empty ledger,
-  # zero ATA balances, no prior signatures. Meanwhile the indexer's startup
+  # The validator container boots with `--reset` by default (VALIDATOR_RESET_FLAG
+  # in templates/env.j2, gated by the `validator_reset` var — default true), so
+  # every redeploy starts from genesis: empty ledger, zero ATA balances, no prior
+  # signatures. (Set validator_reset=false only with persistence — see its note
+  # in vars/common.yml.) Meanwhile the indexer's startup
   # reconciliation compares its Postgres totals (deposits/withdrawals per
   # mint) against on-chain ATA balances. Stale rows from a prior run describe
   # a chain that no longer exists, the on-chain balance comes back as 0, and
@@ -622,6 +623,17 @@
         mode: "0600"
       no_log: true
 
+    # Fail closed if the rendered .env is missing required secrets, using the
+    # same scripts/check-required-env.sh the Makefile's check-env-* targets run.
+    # This gives deploy and local-dev one shared env-completeness guard so both
+    # enforce the identical contract (e.g. a blank POSTGRES_PASSWORD from an
+    # undecrypted SOPS var is caught here rather than at container start).
+    - name: Validate required secrets in rendered .env
+      ansible.builtin.script:
+        cmd: >-
+          {{ repo_root }}/scripts/check-required-env.sh {{ target_versions_env_file }} {{ target_config_dir }}/.env
+      changed_when: false
+
     # The base compose file has bind mounts with relative `./` sources resolved
     # against the compose file's directory ({{ target_config_dir }}). When a
     # bind source doesn't exist on the host, Docker silently creates an empty
@@ -661,16 +673,22 @@
         mode: "0644"
         directory_mode: "0755"
 
-    # The devnet/mainnet compose mounts ./scripts/devnet/config into the
-    # indexer + operator containers (program_type and other structural config
-    # live here; env vars override the connection values at runtime). Ship it
-    # so the bind mount resolves to the real TOMLs instead of an empty dir.
-    - name: Copy devnet indexer/operator TOML configs to target
+    # Devnet/mainnet indexer + operator TOMLs. docker-compose.devnet.yml
+    # bind-mounts ./scripts/devnet/config:/config/devnet for all four
+    # indexer/operator services; the localnet stack uses indexer/config/ above
+    # instead. Without shipping this dir, Docker auto-creates an empty one at
+    # the bind source and every service crashes looking for
+    # /config/devnet/indexer-solana.toml. The rpc_url / yellowstone endpoint
+    # inside these TOMLs are placeholders — they're overridden at runtime by the
+    # COMMON_RPC_URL / INDEXER_YELLOWSTONE_ENDPOINT env vars the devnet compose
+    # injects from the rendered .env (figment merges env over TOML).
+    - name: Copy devnet/mainnet indexer/operator TOML configs to target
       ansible.builtin.copy:
         src: "{{ repo_root }}/scripts/devnet/config/"
         dest: "{{ target_config_dir }}/scripts/devnet/config/"
         mode: "0644"
         directory_mode: "0755"
+      when: network != 'localnet'
 
     # Validator-only assets. The validator service is included in
     # compose_services on localnet only (see vars/common.yml), but the bind
@@ -826,6 +844,22 @@
       ansible.builtin.shell: "{{ compose_cmd }} pull {{ compose_services }}"
       args:
         chdir: "{{ target_config_dir }}"
+      changed_when: true
+
+    # Postgres runs as uid 70, but Docker creates named volumes root-owned, so the
+    # archive_command (`cp %p /wal_archive/...`) fails with "Permission denied" and
+    # WAL piles up unrecycled (archive_mode=on) until the disk fills. Chown the
+    # archive volumes to 70:70 before postgres starts; the one-off `docker run` also
+    # creates the volume if absent (e.g. after a reset_state wipe). Mirrors the
+    # WAL-permission fix in bench-tps/scripts/run.sh.
+    - name: Fix WAL-archive volume ownership for postgres (uid 70)
+      ansible.builtin.command:
+        cmd: >-
+          docker run --rm -v private-channel_{{ item }}:/vol alpine
+          chown -R 70:70 /vol
+      loop:
+        - postgres-primary-wal-archive
+        - postgres-indexer-wal-archive
       changed_when: true
 
     # `up -d --wait` blocks until each service's healthcheck passes (or fails).

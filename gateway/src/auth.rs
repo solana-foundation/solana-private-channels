@@ -118,6 +118,39 @@ const DELEGATE_OFFSET: usize = 76;
 const DELEGATE_END: usize = 108;
 
 // ---------------------------------------------------------------------------
+// DvP swap escrow program
+//
+// Accounts owned by this program hold a SwapDvp struct for a P2P token swap.
+// Read access is granted to either trading party (user_a, user_b) or the
+// settlement_authority, by inspecting raw bytes (no full deserialization).
+//
+// SWAP_DVP_SIZE and SWAP_DVP_OWNER_FIELDS mirror the SwapDvp layout in
+// dvp-swap-program/program/src/state/swap_dvp.rs. They are not derived from it,
+// so if a field is added or reordered there, update them here or these checks
+// will read the wrong bytes.
+// ---------------------------------------------------------------------------
+
+/// DvP swap escrow program ID.
+///
+/// WARNING: the DvP swap program is NOT deployed yet. This value is the local
+/// `declare_id!` from dvp-swap-program/program/src/lib.rs and is a placeholder.
+/// Update it with the real program ID once the program is deployed, otherwise
+/// no live DvP account will match and these checks will never fire.
+const DVP_SWAP_PROGRAM: &str = "DzG1qJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC";
+
+/// Serialized size of a SwapDvp account (SwapDvp::LEN). Smaller DvP-owned
+/// accounts (e.g. the nonce tombstone PDA) are not swaps and are denied.
+const SWAP_DVP_SIZE: usize = 394;
+
+/// Byte ranges of the SwapDvp fields whose pubkey grants read access.
+/// Layout: bump(1), user_a, user_b, mint_a, mint_b, settlement_authority, ...
+const SWAP_DVP_OWNER_FIELDS: [(usize, usize); 3] = [
+    (1, 33),    // user_a (seller)
+    (33, 65),   // user_b (buyer)
+    (129, 161), // settlement_authority
+];
+
+// ---------------------------------------------------------------------------
 // Auth decision
 // ---------------------------------------------------------------------------
 
@@ -199,21 +232,15 @@ pub fn check_request_auth(
 // Ownership check — called by enforce_auth after fetching the raw account data
 // ---------------------------------------------------------------------------
 
-/// Checks account ownership by inspecting raw bytes without full deserialization.
+/// Checks whether `user_id` owns the account at `pubkey`, inspecting its raw
+/// `data` without full deserialization. Dispatches on `program_owner` — the
+/// account-level `owner` field from the `getAccountInfo` response, i.e. the
+/// program that owns this account:
 ///
-/// `program_owner` is the account-level `owner` field from the `getAccountInfo`
-/// response — i.e. the program that owns this account.
-///
-/// For SPL token accounts (owned by Token or Token-2022, data >= 165 bytes):
-/// - Checks the `owner` field at bytes 32-63 against `verified_wallets`.
-/// - If not matched, checks the `delegate` field at bytes 76-107 (when present).
-///
-/// For non-token-program accounts (e.g. System Program wallet accounts):
-/// - Falls back to checking `pubkey` itself against `verified_wallets`.
-///
-/// Denies if:
-/// - The account is a mint (SPL-owned but data < 165 bytes).
-/// - No ownership match is found.
+/// - SPL Token / Token-2022: `check_token_account_ownership`.
+/// - DvP swap escrow: `check_swap_dvp_ownership`.
+/// - Anything else (e.g. a System Program wallet account): falls back to
+///   checking whether the `pubkey` itself is a verified wallet.
 pub async fn check_account_data_ownership(
     data: &[u8],
     program_owner: &str,
@@ -221,20 +248,34 @@ pub async fn check_account_data_ownership(
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> AuthDecision {
-    // Non-token-program account (e.g. System Program wallet, unknown PDA).
-    // The account bytes don't have a meaningful owner field to inspect, so fall
-    // back to checking whether the pubkey itself is a verified wallet.
-    if program_owner != SPL_TOKEN_PROGRAM && program_owner != SPL_TOKEN_2022_PROGRAM {
-        return match is_wallet_owned_by_user(auth_db, user_id, pubkey).await {
+    match program_owner {
+        SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM => {
+            check_token_account_ownership(data, user_id, auth_db).await
+        }
+        DVP_SWAP_PROGRAM => check_swap_dvp_ownership(data, user_id, auth_db).await,
+        // Non-token-program account (e.g. System Program wallet, unknown PDA).
+        // The account bytes don't have a meaningful owner field to inspect, so
+        // fall back to checking whether the pubkey itself is a verified wallet.
+        _ => match is_wallet_owned_by_user(auth_db, user_id, pubkey).await {
             Ok(true) => AuthDecision::Proceed,
             Ok(false) => AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body()),
             Err(_) => AuthDecision::Reject(StatusCode::INTERNAL_SERVER_ERROR, db_error_body()),
-        };
+        },
     }
+}
 
-    // Both SPL Token and Token-2022 use the same program for mints and token
-    // accounts. Use the data size to tell them apart: mints are 82 bytes,
-    // token accounts are 165+ bytes. Mints are not user accounts — deny them.
+/// Ownership check for SPL Token and Token-2022 accounts. Both programs share
+/// the same base layout, so this checks the `owner` field (bytes 32-63) and,
+/// if it doesn't match, the `delegate` field (bytes 76-107) when present — a
+/// delegate has spend authority and counts as ownership for read access.
+///
+/// Mints are owned by the same programs but are only 82 bytes, below
+/// `TOKEN_ACCOUNT_SIZE`; they are not user accounts and are denied.
+async fn check_token_account_ownership(
+    data: &[u8],
+    user_id: Uuid,
+    auth_db: &PgPool,
+) -> AuthDecision {
     if data.len() < TOKEN_ACCOUNT_SIZE {
         return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
     }
@@ -251,11 +292,35 @@ pub async fn check_account_data_ownership(
 
     // Check the `delegate` field if one is set.
     // Bytes 72-75 == [1, 0, 0, 0] means the Option<Pubkey> is Some.
-    // A delegate has spend authority and counts as ownership for read access.
     if data[DELEGATE_OPTION_OFFSET..DELEGATE_OPTION_OFFSET + 4] == [1, 0, 0, 0] {
         let delegate = bs58::encode(&data[DELEGATE_OFFSET..DELEGATE_END]).into_string();
 
         match is_wallet_owned_by_user(auth_db, user_id, &delegate).await {
+            Ok(true) => return AuthDecision::Proceed,
+            Ok(false) => {}
+            Err(_) => {
+                return AuthDecision::Reject(StatusCode::INTERNAL_SERVER_ERROR, db_error_body())
+            }
+        }
+    }
+
+    AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body())
+}
+
+/// Ownership check for DvP swap escrow accounts. Grants read access if any
+/// verified wallet matches user_a, user_b, or settlement_authority, checked in
+/// that order and short-circuiting on the first match.
+///
+/// Accounts smaller than a full SwapDvp (e.g. the nonce tombstone PDA) are not
+/// swaps and are denied.
+async fn check_swap_dvp_ownership(data: &[u8], user_id: Uuid, auth_db: &PgPool) -> AuthDecision {
+    if data.len() < SWAP_DVP_SIZE {
+        return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
+    }
+
+    for (start, end) in SWAP_DVP_OWNER_FIELDS {
+        let candidate = bs58::encode(&data[start..end]).into_string();
+        match is_wallet_owned_by_user(auth_db, user_id, &candidate).await {
             Ok(true) => return AuthDecision::Proceed,
             Ok(false) => {}
             Err(_) => {
@@ -654,6 +719,26 @@ mod tests {
         let decision = check_account_data_ownership(
             &data,
             SPL_TOKEN_2022_PROGRAM,
+            "SomePubkey",
+            Uuid::new_v4(),
+            &pool,
+        )
+        .await;
+        assert!(matches!(
+            decision,
+            AuthDecision::Reject(StatusCode::FORBIDDEN, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn swap_dvp_undersized_rejected_by_size() {
+        // A DvP-owned account smaller than SWAP_DVP_SIZE (e.g. the nonce
+        // tombstone PDA) is not a swap. Rejected before touching the DB.
+        let data = vec![0u8; SWAP_DVP_SIZE - 1];
+        let pool = lazy_pool();
+        let decision = check_account_data_ownership(
+            &data,
+            DVP_SWAP_PROGRAM,
             "SomePubkey",
             Uuid::new_v4(),
             &pool,

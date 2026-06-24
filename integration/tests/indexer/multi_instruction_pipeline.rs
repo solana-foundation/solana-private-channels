@@ -3,6 +3,7 @@
 //! Target files:
 //!   - `indexer/src/indexer/transaction_processor.rs` (buffering + convert)
 //!   - `indexer/src/storage/postgres/db.rs` (composite-key batch insert)
+//!
 //! Binary: `reconciliation_integration` (attached via `#[path]` mod from
 //! `tests/indexer/reconciliation.rs`).
 //!

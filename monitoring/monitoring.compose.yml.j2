@@ -6,6 +6,13 @@
 # and cAdvisor sees every running container. Prometheus + Grafana run on
 # host-port-forwarded volumes for persistence across re-runs.
 
+# Explicit project name so this sibling stack has a stable, predictable identity
+# instead of inheriting the target directory basename. Kept separate from the
+# main `private-channel` project on purpose: the deploy stops/tears this stack
+# down independently, so sharing the main project name would let a main-stack
+# `down` also remove monitoring.
+name: private-channel-monitoring
+
 networks:
   private-channel:
     name: private-channel_private-channel-network

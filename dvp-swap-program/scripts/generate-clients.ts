@@ -38,6 +38,8 @@ dvpSwapCodama.accept(
 dvpSwapCodama.accept(
   renderJavaScriptVisitor(path.join(typescriptClientsDir, "src", "generated"), {
     formatCode: true,
+    // Default appends another src/generated under this path; "." writes in place to avoid double-nesting.
+    generatedFolder: ".",
     deleteFolderBeforeRendering: true,
   }),
 );

@@ -22,7 +22,10 @@ concurrency:
 jobs:
   init-coverage-table:
     name: Initialize Coverage Table
-    if: github.event_name == 'pull_request'
+    # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: private-channel-runner-1
     steps:
       - name: Insert coverage skeleton into PR body
@@ -265,7 +268,6 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --workspace --all-features \
-            --exclude private-channel-core \
             --exclude private-channel-integration \
             --exclude tests-private-channel-escrow-program \
             --exclude tests-private-channel-withdraw-program \
@@ -334,7 +336,11 @@ jobs:
           retention-days: 7
 
       - name: Update PR coverage — E2E Integration
-        if: github.event_name == 'pull_request'
+        # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
+        # Tests still run and artifacts still upload; only the PR-body table is skipped.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/update-coverage-row
         with:
           component: E2E Integration
@@ -384,7 +390,11 @@ jobs:
           retention-days: 7
 
       - name: Update PR coverage — Core
-        if: github.event_name == 'pull_request'
+        # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
+        # Tests still run and artifacts still upload; only the PR-body table is skipped.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/update-coverage-row
         with:
           component: Core
@@ -393,7 +403,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update PR coverage — Indexer
-        if: github.event_name == 'pull_request'
+        # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
+        # Tests still run and artifacts still upload; only the PR-body table is skipped.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/update-coverage-row
         with:
           component: Indexer
@@ -402,7 +416,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update PR coverage — Gateway
-        if: github.event_name == 'pull_request'
+        # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
+        # Tests still run and artifacts still upload; only the PR-body table is skipped.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/update-coverage-row
         with:
           component: Gateway
@@ -411,7 +429,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update PR coverage — Auth
-        if: github.event_name == 'pull_request'
+        # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
+        # Tests still run and artifacts still upload; only the PR-body table is skipped.
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/update-coverage-row
         with:
           component: Auth

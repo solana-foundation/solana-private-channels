@@ -50,7 +50,14 @@ This document describes how WAL archiving, base backups, and point-in-time recov
 - Identify the **target recovery time** (UTC timestamp)
 - Identify which database to restore (`primary` or `indexer`)
 
-> **Note:** The volume names below assume the Docker Compose project name is `private_channel` (the default when running from the repo root). If your project name differs, substitute `private_channel_` with your actual project name prefix. Run `docker volume ls | grep postgres` to confirm.
+> **Note:** The Compose project name is `private-channel` (set via the `name:` key
+> in `docker-compose.yml`), so volumes are prefixed `private-channel_` and containers
+> `private-channel-`. Run `docker volume ls | grep postgres` to confirm. All
+> `docker compose` commands below assume you're in the repo root (they resolve
+> `docker-compose.yml` and the `private-channel` project automatically); if compose
+> reports unset variables, prepend the standard env chain
+> `--env-file versions.env --env-file .env.local`, or use the guarded `make docker-*`
+> targets.
 
 ### Step 1: Stop the database and dependents
 
@@ -59,7 +66,7 @@ This document describes how WAL archiving, base backups, and point-in-time recov
 docker compose stop streamer write-node read-node postgres-replica postgres-primary pg-backup-primary
 
 # For postgres-indexer:
-docker compose stop indexer-solana indexer-private_channel operator-solana operator-private_channel streamer pg-backup-indexer postgres-indexer
+docker compose stop indexer-solana indexer-private-channel operator-solana operator-private-channel streamer pg-backup-indexer postgres-indexer
 ```
 
 > `streamer` depends on both `postgres-replica` (accounts DB) and `postgres-indexer` (indexer DB), so it must be stopped for either restore scenario.
@@ -68,10 +75,10 @@ docker compose stop indexer-solana indexer-private_channel operator-solana opera
 
 ```bash
 # For postgres-primary:
-docker run --rm -v private_channel_postgres-primary-data:/data alpine sh -c "rm -rf /data/*"
+docker run --rm -v private-channel_postgres-primary-data:/data alpine sh -c "rm -rf /data/*"
 
 # For postgres-indexer:
-docker run --rm -v private_channel_postgres-indexer-data:/data alpine sh -c "rm -rf /data/*"
+docker run --rm -v private-channel_postgres-indexer-data:/data alpine sh -c "rm -rf /data/*"
 ```
 
 ### Step 3: Restore the base backup
@@ -80,12 +87,12 @@ Pick the most recent base backup **before** your target recovery time.
 
 ```bash
 # List available backups:
-docker run --rm -v private_channel_postgres-primary-basebackups:/backups alpine ls -la /backups/
+docker run --rm -v private-channel_postgres-primary-basebackups:/backups alpine ls -la /backups/
 
 # Restore (example with base_20260304_060000):
 docker run --rm \
-  -v private_channel_postgres-primary-basebackups:/backups:ro \
-  -v private_channel_postgres-primary-data:/data \
+  -v private-channel_postgres-primary-basebackups:/backups:ro \
+  -v private-channel_postgres-primary-data:/data \
   postgres:16-alpine sh -c "
     cd /data
     tar xzf /backups/base_20260304_060000/base.tar.gz
@@ -102,7 +109,7 @@ PostgreSQL 16 uses `postgresql.auto.conf` + `recovery.signal` (not the removed `
 
 ```bash
 docker run --rm \
-  -v private_channel_postgres-primary-data:/data \
+  -v private-channel_postgres-primary-data:/data \
   alpine sh -c "
     cat >> /data/postgresql.auto.conf << 'EOF'
 restore_command = 'cp /wal_archive/%f %p'
@@ -135,13 +142,13 @@ docker compose logs -f postgres-indexer
 docker compose up -d postgres-replica write-node read-node streamer pg-backup-primary
 
 # For postgres-indexer:
-docker compose up -d indexer-solana indexer-private_channel operator-solana operator-private_channel streamer pg-backup-indexer
+docker compose up -d indexer-solana indexer-private-channel operator-solana operator-private-channel streamer pg-backup-indexer
 ```
 
 > **Note:** The postgres-replica will need to re-sync from scratch after a primary PITR. Delete its data volume if it fails to start:
 > ```bash
 > docker compose stop postgres-replica
-> docker run --rm -v private_channel_postgres-replica-data:/data alpine sh -c "rm -rf /data/*"
+> docker run --rm -v private-channel_postgres-replica-data:/data alpine sh -c "rm -rf /data/*"
 > docker compose up -d postgres-replica
 > ```
 
@@ -160,15 +167,15 @@ Restoring `postgres-indexer` via PITR is safe:
 
 ```bash
 # Should show WAL files accumulating:
-docker run --rm -v private_channel_postgres-primary-wal-archive:/archive alpine ls -la /archive/ | tail -5
-docker run --rm -v private_channel_postgres-indexer-wal-archive:/archive alpine ls -la /archive/ | tail -5
+docker run --rm -v private-channel_postgres-primary-wal-archive:/archive alpine ls -la /archive/ | tail -5
+docker run --rm -v private-channel_postgres-indexer-wal-archive:/archive alpine ls -la /archive/ | tail -5
 ```
 
 ### Check base backups exist
 
 ```bash
-docker run --rm -v private_channel_postgres-primary-basebackups:/backups alpine ls -la /backups/
-docker run --rm -v private_channel_postgres-indexer-basebackups:/backups alpine ls -la /backups/
+docker run --rm -v private-channel_postgres-primary-basebackups:/backups alpine ls -la /backups/
+docker run --rm -v private-channel_postgres-indexer-basebackups:/backups alpine ls -la /backups/
 ```
 
 ### Check sidecar logs

@@ -579,6 +579,81 @@ impl MockStorage {
         Ok(false)
     }
 
+    pub async fn try_park_processing(&self, transaction_id: i64) -> Result<bool, StorageError> {
+        self.check_should_fail("try_park_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && matches!(
+                    txn.status,
+                    TransactionStatus::Processing | TransactionStatus::Parked
+                )
+            {
+                txn.status = TransactionStatus::Parked;
+                txn.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn try_unpark_to_processing(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_unpark_to_processing")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id && txn.status == TransactionStatus::Parked {
+                txn.status = TransactionStatus::Processing;
+                txn.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn get_stale_parked_transactions(
+        &self,
+        threshold: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_stale_parked_transactions")?;
+        let threshold_chrono = chrono::Duration::from_std(threshold)
+            // Defensive: an overflowing Duration falls back to a 1-day cutoff.
+            .unwrap_or_else(|_| chrono::Duration::days(1));
+        let cutoff = Utc::now() - threshold_chrono;
+        let pending = self.pending_transactions.lock().unwrap();
+        let mut matched: Vec<DbTransaction> = pending
+            .iter()
+            .filter(|t| t.status == TransactionStatus::Parked && t.updated_at < cutoff)
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        matched.truncate(limit as usize);
+        Ok(matched)
+    }
+
+    pub async fn try_requeue_parked(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_requeue_parked")?;
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.status == TransactionStatus::Parked
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Pending;
+                txn.updated_at = Utc::now();
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn try_complete_processing(
         &self,
         transaction_id: i64,

@@ -60,7 +60,8 @@ fmt:
 	pnpm format
 
 # Unit tests: program crate's #[cfg(test)] modules + JS client tests.
-unit-test:
+# install + generate-clients first so the TS suites can import the gitignored src/generated.
+unit-test: install generate-clients
 	@echo "Running unit tests for swap program..."
 	pnpm test:unit
 	@cd program && cargo test

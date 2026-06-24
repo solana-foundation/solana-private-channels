@@ -14,6 +14,10 @@ inputs:
   github-token:
     description: 'GitHub token with pull-requests:write'
     required: true
+  pr-number:
+    description: 'PR number to update; defaults to the triggering pull_request event when empty'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -52,6 +56,7 @@ runs:
         INPUT_LINES_TOTAL: ${{ steps.parse.outputs.lines_total }}
         INPUT_COVERAGE: ${{ steps.parse.outputs.coverage }}
         INPUT_RUN_ID: ${{ github.run_id }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -62,7 +67,10 @@ runs:
           const artifactName = process.env.INPUT_ARTIFACT_NAME;
           const runId = process.env.INPUT_RUN_ID;
           const repo = context.repo;
-          const prNumber = context.payload.pull_request?.number;
+          // Explicit pr-number wins so this action works under workflow_run, which carries no pull_request context.
+          const prNumber = process.env.INPUT_PR_NUMBER
+            ? parseInt(process.env.INPUT_PR_NUMBER, 10)
+            : context.payload.pull_request?.number;
 
           if (!prNumber) {
             console.log('Not a PR event, skipping PR body update');

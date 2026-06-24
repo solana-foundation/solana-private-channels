@@ -555,6 +555,15 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Add parked status for withdrawals blocked by an unresolved ambiguous nonce
+        sqlx::query(
+            r#"
+            ALTER TYPE transaction_status ADD VALUE IF NOT EXISTS 'parked';
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS mint_status_history (
@@ -1217,6 +1226,126 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// CAS `Processing`/`Parked` → `Parked`. Accepts an already-parked row so the
+    /// drain's per-tick re-park bumps `updated_at` (the heartbeat).
+    pub async fn try_park_processing_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'parked'
+            WHERE id = $1
+              AND status IN ('processing', 'parked')
+            "#,
+        )
+        .bind(transaction_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// CAS `Parked` → `Processing`. Strict on purpose: if recovery requeued the
+    /// row and a new processor already took it back to `processing`, this returns
+    /// `Ok(false)` so the drain drops its stale builder instead of double-sending.
+    pub async fn try_unpark_to_processing_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'processing'
+            WHERE id = $1
+              AND status = 'parked'
+            "#,
+        )
+        .bind(transaction_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Stale `Parked` rows older than the threshold, oldest-first.
+    pub async fn get_stale_parked_transactions_internal(
+        &self,
+        threshold: Duration,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        let threshold_secs = threshold.as_secs() as f64;
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'parked'
+              AND {} < NOW() - make_interval(secs => $1)
+            ORDER BY {} ASC
+            LIMIT $2
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::INNER_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            // Filters
+            transaction_cols::STATUS,
+            transaction_cols::UPDATED_AT,
+            // Ordering (FIFO over stale)
+            transaction_cols::UPDATED_AT,
+        ))
+        .bind(threshold_secs)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// CAS `Parked` → `Pending` keyed on `updated_at`; no-op if stale.
+    pub async fn try_requeue_parked_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'parked'
+              AND updated_at = $2
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// CAS `Processing` → `Completed` keyed on `updated_at`; sig may be `None`.
     pub async fn try_complete_processing_internal(
         &self,
@@ -1491,7 +1620,7 @@ impl PostgresDb {
             UPDATE transactions
             SET status = 'manual_review', updated_at = NOW()
             WHERE transaction_type = 'withdrawal'
-              AND status IN ('pending', 'processing')
+              AND status IN ('pending', 'processing', 'parked')
               AND ($1::BIGINT IS NULL OR id <> $1)
             "#,
         )

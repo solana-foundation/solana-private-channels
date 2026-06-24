@@ -6,7 +6,7 @@ Load testing binary for the Solana Private Channels payment channel. Supports th
 |------|-----------------|
 | \`transfer\` | Solana Private Channels SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
 | `deposit` | Solana escrow deposits (Solana → Solana Private Channels, measured end-to-end via operator-solana) |
-| `withdraw` | Solana Private Channels burn + Solana release (Solana Private Channels → Solana, measured end-to-end via operator-private_channel) |
+| `withdraw` | Solana Private Channels burn + Solana release (Solana Private Channels → Solana, measured end-to-end via operator-private-channel) |
 
 ---
 
@@ -31,6 +31,16 @@ cargo build --release -p private-channel-bench-tps
 `run.sh` handles everything: generates the admin keypair, starts the full Docker
 stack, waits for services to stabilise, runs the bench, then tears down all
 containers on exit.
+
+> **Shares the `private-channel` compose stack.** `run.sh` brings up the same
+> `docker-compose.yml` (project `private-channel`) as `make docker-up`, using
+> `bench-tps/.env` and its own generated DB passwords + admin keypair. It
+> initializes the shared Postgres volumes with those credentials. So if you switch
+> back to the regular stack afterward, run `make docker-clean` first — otherwise
+> `make docker-up` (which reads `.env.local`) hits the bench-initialized volumes
+> with mismatched passwords and the nodes fail with `password authentication
+> failed` / the replica hangs at *Waiting for primary*. See the README's
+> "Resetting after a credential change" note.
 
 ---
 
@@ -133,8 +143,8 @@ exposes metrics on port 9102).
 The most complex flow — exercises the full cross-chain withdrawal path:
 
 ```
-bench → Solana Private Channels WithdrawFunds (burn) → indexer-private_channel indexes event
-      → operator-private_channel sends Solana ReleaseFunds → funds released on Solana
+bench → Solana Private Channels WithdrawFunds (burn) → indexer-private-channel indexes event
+      → operator-private-channel sends Solana ReleaseFunds → funds released on Solana
 ```
 
 Setup creates both Solana and Solana Private Channels state: an escrow instance on Solana, Solana Private Channels ATAs
@@ -158,7 +168,7 @@ funded with tokens, and Solana ATAs so that `ReleaseFunds` can transfer to them.
 | `solana_released` | `private_channel_operator_mints_sent_total{withdraw}` delta | Solana ReleaseFunds confirmed by operator |
 | `drop` | `private_channel_burned - solana_released` | Burns not yet released (indexer/operator lag) |
 
-`solana_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-private_channel
+`solana_released` requires `BENCH_WITHDRAW_OPERATOR_METRICS_URL` (operator-private-channel
 on port 9103).
 
 ### Config parameters

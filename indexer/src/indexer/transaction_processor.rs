@@ -1085,13 +1085,15 @@ mod tests {
 
         processor.start(rx).await.unwrap();
 
-        let batches = mock.inserted_transactions.lock().unwrap();
-        assert_eq!(batches.len(), 2, "each slot finalizes its own batch");
-        assert_eq!(batches[0][0].signature, "a");
-        assert_eq!(batches[0][0].slot, SLOT_A as i64);
-        assert_eq!(batches[1][0].signature, "b");
-        assert_eq!(batches[1][0].slot, SLOT_B as i64);
-        drop(batches);
+        // Scope the std Mutex guard so it is dropped before the awaits below.
+        {
+            let batches = mock.inserted_transactions.lock().unwrap();
+            assert_eq!(batches.len(), 2, "each slot finalizes its own batch");
+            assert_eq!(batches[0][0].signature, "a");
+            assert_eq!(batches[0][0].slot, SLOT_A as i64);
+            assert_eq!(batches[1][0].signature, "b");
+            assert_eq!(batches[1][0].slot, SLOT_B as i64);
+        }
 
         let first = checkpoint_rx.recv().await.unwrap();
         let second = checkpoint_rx.recv().await.unwrap();
