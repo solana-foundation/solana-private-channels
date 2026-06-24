@@ -97,7 +97,7 @@ RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-p
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/clients/rust/src \
     dvp-swap-program/program/src dvp-swap-program/tests/integration-tests/src \
     dvp-swap-program/tests/transfer-hook-fixture/src dvp-swap-program/clients/rust/src \
-    core/src metrics/src auth/src bench-tps/src
+    core/src metrics/src auth/src auth/src/bin bench-tps/src
 RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escrow-program/tests/integration-tests/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/program/src/lib.rs \
     private-channel-withdraw-program/tests/integration-tests/src/lib.rs \
@@ -108,7 +108,8 @@ RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escr
     dvp-swap-program/tests/transfer-hook-fixture/src/lib.rs dvp-swap-program/clients/rust/src/lib.rs \
     core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs && \
     printf 'fn main() {}\n' > bench-tps/src/main.rs && \
-    printf 'fn main() {}\n' > auth/src/main.rs
+    printf 'fn main() {}\n' > auth/src/main.rs && \
+    printf 'fn main() {}\n' > auth/src/bin/admin.rs
 
 # Build the project with the dummy files. We can cache this layer.
 # Cache mounts: target/ holds compiled artifacts; cargo registry/git hold downloaded crate sources.
@@ -167,7 +168,8 @@ RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     && cp target/release/gateway /out/gateway \
     && cp target/release/indexer /out/indexer \
     && cp target/release/streamer /out/streamer \
-    && cp target/release/auth /out/auth
+    && cp target/release/auth /out/auth \
+    && cp target/release/auth-admin /out/auth-admin
 
 # Stage 2: Runtime
 FROM --platform=linux/amd64 debian:bookworm-slim
@@ -196,6 +198,7 @@ COPY --from=builder /out/gateway /usr/local/bin/gateway
 COPY --from=builder /out/indexer /usr/local/bin/indexer
 COPY --from=builder /out/streamer /usr/local/bin/streamer
 COPY --from=builder /out/auth /usr/local/bin/auth
+COPY --from=builder /out/auth-admin /usr/local/bin/auth-admin
 
 # Copy indexer/operator config files
 COPY indexer/config /etc/private_channel/config
