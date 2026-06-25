@@ -1,7 +1,7 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    private_channel_auth::{db, error::AppError},
+    private_channel_auth::{db, error::AppError, models::Role},
     solana_sdk::pubkey::Pubkey,
     sqlx::postgres::PgPoolOptions,
     std::{env, str::FromStr},
@@ -30,6 +30,9 @@ struct Args {
 enum Command {
     /// Attach a wallet to a user without verification — operator asserts trust
     AttachWallet(AttachWalletArgs),
+    /// Set a user's RBAC role (e.g. promote to operator so the gateway grants it
+    /// full account access + getTransaction)
+    SetRole(SetRoleArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -41,6 +44,39 @@ struct AttachWalletArgs {
     /// Base58-encoded Solana pubkey to attach to the user
     #[arg(long)]
     pubkey: String,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum RoleArg {
+    Operator,
+    User,
+}
+
+impl RoleArg {
+    fn as_str(&self) -> &'static str {
+        match self {
+            RoleArg::Operator => "operator",
+            RoleArg::User => "user",
+        }
+    }
+
+    fn to_model(&self) -> Role {
+        match self {
+            RoleArg::Operator => Role::Operator,
+            RoleArg::User => Role::User,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+struct SetRoleArgs {
+    /// Username of the user whose role to change
+    #[arg(long)]
+    username: String,
+
+    /// Role to assign
+    #[arg(long)]
+    role: RoleArg,
 }
 
 #[tokio::main]
@@ -86,8 +122,20 @@ async fn run(args: Args) -> Result<()> {
 
     match args.command {
         Command::AttachWallet(args) => attach_wallet(&pool, args).await?,
+        Command::SetRole(args) => set_role(&pool, args).await?,
     }
 
+    Ok(())
+}
+
+async fn set_role(pool: &sqlx::PgPool, args: SetRoleArgs) -> Result<()> {
+    let role = args.role.as_str();
+    let updated = db::set_user_role(pool, &args.username, args.role.to_model()).await?;
+    if !updated {
+        return Err(anyhow!("user not found: {}", args.username));
+    }
+    info!(username = %args.username, role, "set role");
+    println!("set role of {} to {}", args.username, role);
     Ok(())
 }
 
@@ -287,5 +335,44 @@ mod tests {
             .expect("list wallets");
         assert_eq!(wallets.len(), 1, "failed attach should not duplicate row");
         assert_eq!(wallets[0].pubkey, pubkey);
+    }
+
+    #[tokio::test]
+    async fn set_role_promotes_user_to_operator() {
+        let (pool, _c) = start_pool().await;
+        db::insert_user(&pool, "dave", "$argon2id$placeholder")
+            .await
+            .expect("insert user");
+
+        set_role(
+            &pool,
+            SetRoleArgs {
+                username: "dave".into(),
+                role: RoleArg::Operator,
+            },
+        )
+        .await
+        .expect("set role should succeed");
+
+        let user = db::find_user_by_username(&pool, "dave")
+            .await
+            .expect("find user")
+            .expect("user exists");
+        assert_eq!(user.role, private_channel_auth::models::Role::Operator);
+    }
+
+    #[tokio::test]
+    async fn set_role_rejects_unknown_user() {
+        let (pool, _c) = start_pool().await;
+        let err = set_role(
+            &pool,
+            SetRoleArgs {
+                username: "ghost".into(),
+                role: RoleArg::Operator,
+            },
+        )
+        .await
+        .expect_err("expected error");
+        assert!(err.to_string().contains("user not found"), "got: {err}");
     }
 }

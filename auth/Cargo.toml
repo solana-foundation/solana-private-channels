@@ -11,6 +11,13 @@ path = "src/lib.rs"
 name = "auth"
 path = "src/main.rs"
 
+# Named explicitly (not the inferred "admin") so it doesn't collide with
+# core/src/bin/admin.rs, which also produces an "admin" binary. The collision
+# previously meant this admin tool was never the one shipped in the image.
+[[bin]]
+name = "auth-admin"
+path = "src/bin/admin.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true }
