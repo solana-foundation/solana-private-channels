@@ -522,11 +522,10 @@ pub async fn boot_reconcile_landed_pending_remints(
             continue;
         };
 
-        // Only a finalized-success release consumed the nonce. Dead/Live/Uncertain
-        // are correctly absent from the on-chain root, so leave them PendingRemint.
-        if let SigFinality::Landed(sig) = classify_release_signatures(rpc_client, &signatures).await
-        {
-            match storage
+        // Only a finalized-success release consumed the nonce. Dead/Live are
+        // correctly absent from the on-chain root, so leave them PendingRemint.
+        match classify_release_signatures(rpc_client, &signatures).await {
+            SigFinality::Landed(sig) => match storage
                 .update_transaction_status(
                     row.id,
                     TransactionStatus::Completed,
@@ -550,7 +549,15 @@ pub async fn boot_reconcile_landed_pending_remints(
                     transaction_id = row.id,
                     "Boot reconcile failed to complete landed PendingRemint: {}", e
                 ),
-            }
+            },
+            // Could not classify (RPC failure/length mismatch). The nonce stays
+            // out of the local tree, so if it did land validate_smt_root refuses;
+            // log it so that refusal is traceable to a flaky boot RPC.
+            SigFinality::Uncertain(reason) => warn!(
+                transaction_id = row.id,
+                nonce, "Boot reconcile could not classify PendingRemint signatures: {}", reason
+            ),
+            SigFinality::Live(_) | SigFinality::Dead => {}
         }
     }
     Ok(())
