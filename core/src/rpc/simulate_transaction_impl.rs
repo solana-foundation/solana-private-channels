@@ -11,7 +11,10 @@ use crate::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bincode::Options;
 use jsonrpsee::core::RpcResult;
-use solana_account_decoder::encode_ui_account;
+use solana_account_decoder::{
+    encode_ui_account,
+    parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
+};
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_types::{
     config::RpcSimulateTransactionConfig,
@@ -19,6 +22,7 @@ use solana_rpc_client_types::{
 };
 use solana_runtime_transaction::runtime_transaction::RuntimeTransaction;
 use solana_sdk::{
+    account::ReadableAccount,
     message::{v0::LoadedAddresses, SimpleAddressLoader},
     pubkey::Pubkey,
     transaction::{MessageHash, VersionedTransaction},
@@ -29,6 +33,8 @@ use solana_transaction_status::{
     UiCompiledInstruction, UiInnerInstructions, UiInstruction, UiReturnDataEncoding,
     UiTransactionEncoding, UiTransactionReturnData,
 };
+use spl_token::solana_program::program_pack::Pack;
+use spl_token::state::{Account as TokenAccount, Mint};
 use std::{collections::HashSet, str::FromStr, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -188,11 +194,20 @@ pub async fn simulate_transaction(
                                             .bob
                                             .get_account_shared_data(&pubkey)
                                             .map(|account_shared_data| {
+                                                let additional_data =
+                                                    if encoding == UiAccountEncoding::JsonParsed {
+                                                        build_token_additional_data(
+                                                            Some(&account_shared_data),
+                                                            &execution_deps.bob,
+                                                        )
+                                                    } else {
+                                                        None
+                                                    };
                                                 encode_ui_account(
                                                     &pubkey,
                                                     &account_shared_data,
                                                     encoding,
-                                                    None,
+                                                    additional_data,
                                                     None,
                                                 )
                                             }),
@@ -293,5 +308,24 @@ pub async fn simulate_transaction(
     Ok(Response {
         context: RpcResponseContext::new(slot),
         value,
+    })
+}
+
+fn build_token_additional_data(
+    account: Option<&solana_sdk::account::AccountSharedData>,
+    bob: &impl TransactionProcessingCallback,
+) -> Option<AccountAdditionalDataV3> {
+    let account = account?;
+    if *account.owner() != spl_token::id() {
+        return None;
+    }
+    let token_account = TokenAccount::unpack(account.data()).ok()?;
+    let mint_account = bob.get_account_shared_data(&token_account.mint)?;
+    let mint = Mint::unpack(mint_account.data()).ok()?;
+    Some(AccountAdditionalDataV3 {
+        spl_token_additional_data: Some(SplTokenAdditionalDataV2 {
+            decimals: mint.decimals,
+            ..Default::default()
+        }),
     })
 }
