@@ -1,7 +1,7 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    private_channel_auth::{db, error::AppError},
+    private_channel_auth::{db, error::AppError, models::Role},
     solana_sdk::pubkey::Pubkey,
     sqlx::postgres::PgPoolOptions,
     std::{env, str::FromStr},
@@ -57,6 +57,13 @@ impl RoleArg {
         match self {
             RoleArg::Operator => "operator",
             RoleArg::User => "user",
+        }
+    }
+
+    fn to_model(&self) -> Role {
+        match self {
+            RoleArg::Operator => Role::Operator,
+            RoleArg::User => Role::User,
         }
     }
 }
@@ -123,7 +130,7 @@ async fn run(args: Args) -> Result<()> {
 
 async fn set_role(pool: &sqlx::PgPool, args: SetRoleArgs) -> Result<()> {
     let role = args.role.as_str();
-    let updated = db::set_user_role(pool, &args.username, role).await?;
+    let updated = db::set_user_role(pool, &args.username, args.role.to_model()).await?;
     if !updated {
         return Err(anyhow!("user not found: {}", args.username));
     }
