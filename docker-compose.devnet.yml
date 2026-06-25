@@ -357,8 +357,13 @@ services:
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      - COMMON_RPC_URL=${GATEWAY_URL}
-      - INDEXER_BACKFILL_RPC_URL=${GATEWAY_URL}
+      # Read channel blocks straight from the read-node, not the gateway. The
+      # gateway enforces JWT auth on getBlock/getSignaturesForAddress when
+      # JWT_SECRET is set, and internal services carry no token, so routing them
+      # through the gateway would 401 and stall indexing. The read-node serves
+      # the same RPC without the auth gate.
+      - COMMON_RPC_URL=${GATEWAY_READ_URL}
+      - INDEXER_BACKFILL_RPC_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9100
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     command:
@@ -435,7 +440,10 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
-      - COMMON_SOURCE_RPC_URL=${GATEWAY_URL}
+      # Channel-side reads go direct to the read-node, not the gateway, so they
+      # aren't blocked by gateway JWT enforcement (see indexer-private-channel).
+      # COMMON_RPC_URL above stays on devnet — that's where releases are sent.
+      - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
