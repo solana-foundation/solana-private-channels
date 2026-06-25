@@ -376,6 +376,16 @@ async fn run_withdraw_preflight(
         warn!("Boot reconcile failed, proceeding to SMT validation: {}", e);
     }
 
+    // Pre-clear PendingRemint withdrawals that already landed so the validation
+    // below doesn't refuse to start on a nonce the chain consumed but the row
+    // hasn't recorded as Completed yet. Best-effort; validation is the gate.
+    if let Err(e) = recovery::boot_reconcile_landed_pending_remints(storage, rpc_client).await {
+        warn!(
+            "Boot reconcile of landed pending remints failed, proceeding to SMT validation: {}",
+            e
+        );
+    }
+
     // Only a genuine root mismatch is a refuse-to-start. Any other error (instance
     // not yet on-chain, RPC failure, DB read failure) means we could not run the
     // check; start anyway and let the sender's lazy init plus the recovery worker
