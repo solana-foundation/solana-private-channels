@@ -346,7 +346,10 @@ mod tests {
 
         set_role(
             &pool,
-            SetRoleArgs { username: "dave".into(), role: RoleArg::Operator },
+            SetRoleArgs {
+                username: "dave".into(),
+                role: RoleArg::Operator,
+            },
         )
         .await
         .expect("set role should succeed");
@@ -363,7 +366,10 @@ mod tests {
         let (pool, _c) = start_pool().await;
         let err = set_role(
             &pool,
-            SetRoleArgs { username: "ghost".into(), role: RoleArg::Operator },
+            SetRoleArgs {
+                username: "ghost".into(),
+                role: RoleArg::Operator,
+            },
         )
         .await
         .expect_err("expected error");
