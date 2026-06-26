@@ -66,7 +66,8 @@ fn main() -> Result<()> {
 
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_id, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-    let instance_ata = get_associated_token_address_with_program_id(&instance_id, &mint, &token_program);
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance_id, &mint, &token_program);
 
     println!("\nAllowing mint for instance...");
     println!("Allowed Mint PDA: {}", allowed_mint_pda);
