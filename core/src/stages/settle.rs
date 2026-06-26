@@ -37,6 +37,7 @@ const SETTLE_START_DELAY_MS: u64 = 1000;
 /// A single account that has been settled
 /// We need to track if the account was deleted so we can tombstone it
 /// in the accounts database
+#[derive(Clone)]
 pub struct AccountSettlement {
     pub account: AccountSharedData,
     pub deleted: bool,
@@ -45,7 +46,6 @@ pub struct AccountSettlement {
 struct SettleResult {
     slot: u64,
     blockhash: Hash,
-    account_settlements: Vec<(Pubkey, AccountSettlement)>,
 }
 
 #[derive(Debug)]
@@ -299,6 +299,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             &processing_results,
                             &metrics,
                             Some(&address_signatures_tx),
+                            Some(&settled_accounts_tx),
+                            Some(&settled_blockhashes_tx),
                         )
                         .await
                         {
@@ -320,18 +322,6 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     settle_result.slot,
                                     settle_result.blockhash
                                 );
-                                if let Err(e) =
-                                    settled_accounts_tx.send(settle_result.account_settlements)
-                                {
-                                    warn!("Failed to send settled accounts: {:?}", e);
-                                    break;
-                                }
-                                if let Err(e) =
-                                    settled_blockhashes_tx.send(settle_result.blockhash)
-                                {
-                                    warn!("Failed to send settled blockhashes: {:?}", e);
-                                    break;
-                                }
                             }
                             Err(SettleError::AddressIndexWriterGone) => {
                                 anyhow::bail!(
@@ -407,6 +397,8 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     &processing_results,
                     &metrics,
                     Some(&address_signatures_tx),
+                    Some(&settled_accounts_tx),
+                    Some(&settled_blockhashes_tx),
                 )
                 .await
                 {
@@ -414,11 +406,18 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         if num_results > 0 {
                             metrics.settler_txs_settled(num_results);
                         }
-                        let _ = settled_accounts_tx.send(settle_result.account_settlements);
-                        let _ = settled_blockhashes_tx.send(settle_result.blockhash);
                         info!(
                             "Final flush settled {} buffered transactions in slot {}",
                             num_results, settle_result.slot
+                        );
+                    }
+                    // Final flush runs while the node is already shutting down; the
+                    // block is durably committed before the addr-index send and the
+                    // index is rebuilt from Postgres on restart, so no txs are lost.
+                    Err(SettleError::AddressIndexWriterGone) => {
+                        warn!(
+                            "Final flush: address-index writer gone after committing {} buffered transactions; block durable, index rebuilt on restart",
+                            num_results
                         );
                     }
                     Err(e) => {
@@ -474,6 +473,7 @@ fn compute_blockhash(
 }
 
 /// Settle transactions: Update accounts database with changes
+#[allow(clippy::too_many_arguments)]
 async fn settle_transactions(
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
@@ -481,6 +481,8 @@ async fn settle_transactions(
     processing_results: &[(TransactionProcessingResult, SanitizedTransaction)],
     metrics: &crate::stage_metrics::SharedMetrics,
     address_signatures_tx: Option<&mpsc::Sender<Vec<AddressSignatureRow>>>,
+    settled_accounts_tx: Option<&mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>>,
+    settled_blockhashes_tx: Option<&mpsc::UnboundedSender<Hash>>,
 ) -> Result<SettleResult, SettleError> {
     let t_total = tokio::time::Instant::now();
     // Preallocate per-tick collections from the known result count so the hot
@@ -609,6 +611,24 @@ async fn settle_transactions(
         .await?;
     let t_db_ms = t_db_start.elapsed().as_secs_f64() * 1000.0;
 
+    // Publish the settled accounts and the new blockhash immediately after the
+    // durable Postgres commit and BEFORE any best-effort, post-commit work
+    // (the bounded address-index send and the Redis cache write).
+    //
+    // Both sends are non-fatal (warn-only): a send error can only mean that
+    // consumer already exited. The node supervisor turns any worker exit into
+    // a full graceful shutdown, so the settler must not self-abort here.
+    if let Some(tx) = settled_accounts_tx {
+        if let Err(e) = tx.send(accounts_vec.clone()) {
+            warn!("Failed to publish settled accounts: {:?}", e);
+        }
+    }
+    if let Some(tx) = settled_blockhashes_tx {
+        if let Err(e) = tx.send(next_blockhash) {
+            warn!("Failed to publish settled blockhash to dedup: {:?}", e);
+        }
+    }
+
     // Closed channel = writer gone; escalate to exit.
     if let Some(tx) = address_signatures_tx {
         if !addr_sig_rows.is_empty() {
@@ -658,7 +678,6 @@ async fn settle_transactions(
     Ok(SettleResult {
         slot: next_slot,
         blockhash: next_blockhash,
-        account_settlements: accounts_vec,
     })
 }
 
@@ -689,6 +708,34 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY as RESULTS_CAP;
+
+    /// Settle `results` and capture the accounts published on the broadcast
+    /// channel (the path the worker consumes), returning them with the result so
+    /// tests assert on the real settlement output rather than an internal field.
+    async fn settle_capturing_accounts(
+        last_block: Option<LastBlock>,
+        db: &mut AccountsDB,
+        results: &[(TransactionProcessingResult, SanitizedTransaction)],
+    ) -> (SettleResult, Vec<(Pubkey, AccountSettlement)>) {
+        let (accounts_tx, mut accounts_rx) = mpsc::unbounded_channel();
+        let result = settle_transactions(
+            last_block,
+            db,
+            None,
+            results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            Some(&accounts_tx),
+            None,
+        )
+        .await
+        .expect("settle_transactions succeeded");
+        let mut settled = Vec::new();
+        while let Ok(batch) = accounts_rx.try_recv() {
+            settled.extend(batch);
+        }
+        (result, settled)
+    }
 
     fn make_executed(
         accounts: Vec<(solana_sdk::pubkey::Pubkey, AccountSharedData)>,
@@ -772,21 +819,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_empty_results() {
         let (mut db, _pg) = start_test_postgres().await;
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &[],
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await;
-        assert!(result.is_ok());
-        let r = result.unwrap();
+        let (r, settled_accounts) = settle_capturing_accounts(None, &mut db, &[]).await;
         assert_eq!(r.slot, 0);
         // Genesis (last_block == None) deliberately stays the default hash.
         assert_eq!(r.blockhash, Hash::default());
-        assert!(r.account_settlements.is_empty());
+        assert!(settled_accounts.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -799,6 +836,8 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            None,
             None,
         )
         .await
@@ -815,6 +854,8 @@ mod tests {
             None,
             &[],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            None,
             None,
         )
         .await
@@ -857,6 +898,8 @@ mod tests {
             &with_tx,
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -888,6 +931,8 @@ mod tests {
             None,
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            None,
             None,
         )
         .await
@@ -921,19 +966,10 @@ mod tests {
         ]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (_result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // Writable accounts should be in settlements, readonly (system program) should not
-        let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
+        let settlement_keys: Vec<_> = settled_accounts.iter().map(|(k, _)| *k).collect();
         assert!(settlement_keys.contains(&pk0));
         assert!(settlement_keys.contains(&pk1));
         // system program at index 2 is read-only for a system transfer
@@ -953,19 +989,10 @@ mod tests {
         let processed = make_executed(vec![(pk, AccountSharedData::default())]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (_result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // The deleted account should be flagged
-        let settlement = result.account_settlements.iter().find(|(k, _)| k == &pk);
+        let settlement = settled_accounts.iter().find(|(k, _)| k == &pk);
         assert!(settlement.is_some());
         assert!(settlement.unwrap().1.deleted);
     }
@@ -985,22 +1012,13 @@ mod tests {
             tx,
         )];
 
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // Failed transactions still get their signature recorded in the block
         let block = db.get_block(result.slot).await.unwrap();
         assert!(block.transaction_signatures.contains(&sig));
         // But no account settlements
-        assert!(result.account_settlements.is_empty());
+        assert!(settled_accounts.is_empty());
     }
 
     /// Under the lamport cap, the executor zeroes a dataless gainer (e.g. the
@@ -1025,20 +1043,10 @@ mod tests {
         ]);
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (_result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // Dataless (0 lamports, empty data) → deleted tombstone.
-        let dataless_settlement = result
-            .account_settlements
+        let dataless_settlement = settled_accounts
             .iter()
             .find(|(k, _)| *k == dataless)
             .expect("dataless account must be emitted as a settlement");
@@ -1048,8 +1056,7 @@ mod tests {
         );
 
         // Data account at the 1-lamport floor → persists, not deleted.
-        let data_settlement = result
-            .account_settlements
+        let data_settlement = settled_accounts
             .iter()
             .find(|(k, _)| *k == data_pk)
             .expect("data account must be emitted as a settlement");
@@ -1082,6 +1089,8 @@ mod tests {
             &results1,
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1108,6 +1117,8 @@ mod tests {
             None,
             &results2,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            None,
             None,
         )
         .await
@@ -1144,23 +1155,14 @@ mod tests {
         }));
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(fees_only), tx)];
 
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // Signature should be recorded in the block
         let block = db.get_block(result.slot).await.unwrap();
         assert!(block.transaction_signatures.contains(&sig));
 
         // No account settlements — fees-only transactions don't modify accounts
-        assert!(result.account_settlements.is_empty());
+        assert!(settled_accounts.is_empty());
     }
 
     /// Test that cache warming reads from Postgres and writes to Redis correctly.
@@ -1456,20 +1458,11 @@ mod tests {
         let results: Vec<(TransactionProcessingResult, _)> =
             vec![(Ok(executed), tx1), (Ok(fees_only), tx2), (Err(err), tx3)];
 
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // All three signatures should be recorded in the block
         assert_eq!(
-            result.account_settlements.len(),
+            settled_accounts.len(),
             1,
             "only executed tx settles accounts"
         );
@@ -1510,6 +1503,8 @@ mod tests {
             &results1,
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1541,6 +1536,8 @@ mod tests {
             None,
             &results2,
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            None,
             None,
         )
         .await
@@ -1608,6 +1605,8 @@ mod tests {
             &results,
             &(Arc::new(NoopMetrics) as SharedMetrics),
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1660,24 +1659,11 @@ mod tests {
         }));
 
         let results = vec![(Ok(executed), tx)];
-        let result = settle_transactions(
-            None,
-            &mut db,
-            None,
-            &results,
-            &(Arc::new(NoopMetrics) as SharedMetrics),
-            None,
-        )
-        .await
-        .unwrap();
+        let (_result, settled_accounts) = settle_capturing_accounts(None, &mut db, &results).await;
 
         // Both writable accounts (payer and recipient) should be settled
-        assert_eq!(
-            result.account_settlements.len(),
-            2,
-            "both writable accounts settled"
-        );
-        let settlement_keys: Vec<_> = result.account_settlements.iter().map(|(k, _)| *k).collect();
+        assert_eq!(settled_accounts.len(), 2, "both writable accounts settled");
+        let settlement_keys: Vec<_> = settled_accounts.iter().map(|(k, _)| *k).collect();
         assert!(settlement_keys.contains(&from.pubkey()), "payer settled");
         assert!(settlement_keys.contains(&to), "recipient settled");
         assert!(
@@ -1708,6 +1694,8 @@ mod tests {
             None,
             &[(Ok(executed), tx)],
             &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            None,
             None,
         )
         .await
@@ -1861,5 +1849,384 @@ mod tests {
             result.is_ok(),
             "settle worker must exit when address-index writer is gone"
         );
+    }
+
+    // --- broadcast-before-side-effects ordering tests ---
+
+    /// Build a single successful transfer fixture whose `write_batch` yields a
+    /// non-empty address-index row set so the bounded send is actually exercised.
+    fn single_successful_transfer() -> Vec<(TransactionProcessingResult, SanitizedTransaction)> {
+        let from = Keypair::new();
+        let to = Pubkey::new_unique();
+        let tx = create_test_sanitized_transaction(&from, &to, 100);
+        let pk = Pubkey::new_unique();
+        let processed = make_executed(vec![(
+            pk,
+            AccountSharedData::new(500, 0, &Pubkey::new_unique()),
+        )]);
+        vec![(Ok(processed), tx)]
+    }
+
+    /// The regression test. A blocked-yet-open address-index send must NOT
+    /// gate the admission broadcasts: both the settled accounts and the new
+    /// blockhash have to reach their consumers while the settler is still parked
+    /// on the bounded address-index send, with accounts observed no later than
+    /// the blockhash (the preserved relative order).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broadcasts_precede_blocked_address_signatures() {
+        let (db, _pg) = start_test_postgres().await;
+        let mut db = db;
+
+        // capacity-1 channel pre-filled so the in-function send blocks.
+        let (addr_sig_tx, mut addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
+        addr_sig_tx.send(Vec::new()).await.unwrap();
+
+        let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+
+        let results = single_successful_transfer();
+        let last = LastBlock {
+            slot: 5,
+            blockhash: Hash::new_unique(),
+        };
+
+        // Spawn the settle on its own task; move the DB in and back out.
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let task = tokio::spawn(async move {
+            let r = settle_transactions(
+                Some(last),
+                &mut db,
+                None,
+                &results,
+                &metrics,
+                Some(&addr_sig_tx),
+                Some(&settled_accounts_tx),
+                Some(&settled_blockhashes_tx),
+            )
+            .await;
+            (r, db)
+        });
+
+        // Both broadcasts must arrive while addr-index is still undrained.
+        let accounts = tokio::time::timeout(Duration::from_secs(2), settled_accounts_rx.recv())
+            .await
+            .expect("settled accounts must broadcast before the blocked addr-index send")
+            .expect("accounts channel open");
+        assert_eq!(accounts.len(), 1, "the one writable account is broadcast");
+
+        let blockhash = tokio::time::timeout(Duration::from_secs(2), settled_blockhashes_rx.recv())
+            .await
+            .expect("settled blockhash must broadcast before the blocked addr-index send")
+            .expect("blockhash channel open");
+        assert_ne!(blockhash, Hash::default(), "non-genesis hash broadcast");
+
+        // Drain addr-index (prefill + the new rows) so the parked send completes.
+        let _prefill = addr_sig_rx.recv().await.expect("prefill row");
+        let _rows = tokio::time::timeout(Duration::from_secs(2), addr_sig_rx.recv())
+            .await
+            .expect("addr-index rows eventually sent")
+            .expect("addr-index channel open");
+
+        let (result, _db) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("settle task completes")
+            .expect("settle task joins");
+        assert!(result.is_ok(), "settle returns Ok after addr-index drains");
+    }
+
+    /// A block with no address-index rows must still broadcast the blockhash.
+    /// Guards against nesting the broadcast under the `!addr_sig_rows.is_empty()`
+    /// branch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broadcasts_with_empty_address_signatures() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+
+        // Empty processing results: no addr-index rows produced.
+        let result = settle_transactions(
+            Some(LastBlock {
+                slot: 9,
+                blockhash: Hash::new_unique(),
+            }),
+            &mut db,
+            None,
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            Some(&addr_sig_tx),
+            Some(&settled_accounts_tx),
+            Some(&settled_blockhashes_tx),
+        )
+        .await
+        .unwrap();
+
+        let blockhash = tokio::time::timeout(Duration::from_secs(2), settled_blockhashes_rx.recv())
+            .await
+            .expect("blockhash broadcast even with empty addr-index rows")
+            .expect("blockhash channel open");
+        assert_eq!(blockhash, result.blockhash);
+    }
+
+    /// Both broadcasts are non-fatal. With both receivers dropped, the
+    /// settle must still return Ok and the block must commit to Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broadcast_non_fatal_when_consumer_gone() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let (settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel();
+        // Drop both consumers before calling.
+        drop(settled_accounts_rx);
+        drop(settled_blockhashes_rx);
+
+        let results = single_successful_transfer();
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            Some(&settled_accounts_tx),
+            Some(&settled_blockhashes_tx),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "send failures to gone consumers must be non-fatal"
+        );
+        let slot = result.unwrap().slot;
+        // The block must be durable despite the broadcast failures.
+        let block = db.get_block(slot).await;
+        assert!(block.is_some(), "block committed to Postgres");
+    }
+
+    /// Genesis (last_block = None) still broadcasts the default hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genesis_blockhash_is_broadcast() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+
+        settle_transactions(
+            None,
+            &mut db,
+            None,
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            Some(&settled_accounts_tx),
+            Some(&settled_blockhashes_tx),
+        )
+        .await
+        .unwrap();
+
+        let blockhash = tokio::time::timeout(Duration::from_secs(2), settled_blockhashes_rx.recv())
+            .await
+            .expect("genesis blockhash broadcast")
+            .expect("blockhash channel open");
+        assert_eq!(blockhash, Hash::default());
+    }
+
+    /// Keep-alive handles for a wired settle + dedup integration harness. The
+    /// worker handles and dedup's input sender must outlive the assertions:
+    /// dropping any of them closes a pipeline channel and shuts the workers down
+    /// mid-test. The address-index receiver is pre-filled to capacity-1 and never
+    /// drained, so any row-producing block parks on the addr-index send while
+    /// empty blocks (no rows) pass through untouched.
+    struct WiredPipeline {
+        exec_tx: mpsc::Sender<(
+            LoadAndExecuteSanitizedTransactionsOutput,
+            Vec<SanitizedTransaction>,
+        )>,
+        addr_sig_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
+        live_blockhashes: Arc<std::sync::RwLock<std::collections::LinkedList<Hash>>>,
+        shutdown: CancellationToken,
+        _settle: WorkerHandle,
+        _dedup: WorkerHandle,
+        _dedup_in_tx: mpsc::Sender<SanitizedTransaction>,
+        _dedup_out_rx: async_channel::Receiver<SanitizedTransaction>,
+        _settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
+    }
+
+    async fn wire_settle_and_dedup(
+        url: String,
+        blocktime_ms: u64,
+        max_blockhashes: usize,
+    ) -> WiredPipeline {
+        use crate::stages::dedup::{start_dedup, DedupArgs};
+        use std::collections::{HashMap, LinkedList};
+
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
+        address_signatures_tx.send(Vec::new()).await.unwrap();
+
+        let shutdown = CancellationToken::new();
+        let _settle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            blocktime_ms,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // Dedup ingests the shared blockhash channel; we observe its window.
+        let (dedup_in_tx, dedup_in_rx) = mpsc::channel::<SanitizedTransaction>(64);
+        let (dedup_out_tx, dedup_out_rx) = async_channel::bounded(64);
+        let (_dedup, live_blockhashes) = start_dedup(DedupArgs {
+            max_blockhashes,
+            input_rx: dedup_in_rx,
+            settled_blockhashes_rx,
+            output_tx: dedup_out_tx,
+            shutdown_token: shutdown.clone(),
+            initial_live_blockhashes: LinkedList::new(),
+            initial_dedup_cache: HashMap::new(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        WiredPipeline {
+            exec_tx,
+            addr_sig_rx,
+            live_blockhashes,
+            shutdown,
+            _settle,
+            _dedup,
+            _dedup_in_tx: dedup_in_tx,
+            _dedup_out_rx: dedup_out_rx,
+            _settled_accounts_rx,
+        }
+    }
+
+    /// Poll dedup's live window until `pred` holds or an 8s deadline elapses.
+    async fn wait_for_window<F: Fn(&[Hash]) -> bool>(
+        live: &Arc<std::sync::RwLock<std::collections::LinkedList<Hash>>>,
+        pred: F,
+        what: &str,
+    ) -> Vec<Hash> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let window: Vec<Hash> = live
+                .read()
+                .expect("blockhash lock")
+                .iter()
+                .copied()
+                .collect();
+            if pred(&window) {
+                return window;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}; last saw {} entries: {:?}",
+                window.len(),
+                window
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Wiring + no-double-send: with no txs fed, empty blocks never touch
+    /// the bounded addr-index send, so dedup's window must fill purely from the
+    /// in-settle blockhash broadcast, to max_blockhashes entries that are all
+    /// distinct. A forgotten worker-side send would re-broadcast a hash and break
+    /// distinctness.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_tick_broadcasts_fill_live_window() {
+        use std::collections::HashSet;
+
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let max_blockhashes = 3usize;
+        let p = wire_settle_and_dedup(url, 50, max_blockhashes).await;
+
+        let window = wait_for_window(
+            &p.live_blockhashes,
+            |w| {
+                let distinct: HashSet<Hash> = w.iter().copied().collect();
+                w.len() == max_blockhashes && distinct.len() == w.len()
+            },
+            "empty-tick blockhash broadcasts must fill the live window with distinct hashes",
+        )
+        .await;
+        assert_eq!(window.len(), max_blockhashes);
+
+        p.shutdown.cancel();
+    }
+
+    /// The core SOLA6-16 property end-to-end: a row-producing block must
+    /// broadcast its blockhash to dedup before the bounded address-index send,
+    /// even when that send is blocked. The row tx is fed during the settler start
+    /// delay so the first produced block carries it; that block commits,
+    /// broadcasts its hash, then parks forever on the full, undrained addr-index
+    /// send. dedup's window must therefore hold exactly that one hash and stay
+    /// there (the park stops all further block production). The first block is
+    /// genesis, whose hash is the default by design; that is irrelevant here since
+    /// the test asserts a hash was published at all. Under the pre-fix ordering the
+    /// block parks on the addr-index send before broadcasting, leaving the window
+    /// empty and timing the wait out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_block_broadcast_precedes_blocked_addr_index() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let p = wire_settle_and_dedup(url, 50, 3).await;
+
+        // Feed the row tx during the start delay so the first produced block
+        // carries it and parks on the addr-index send right after broadcasting.
+        let (tx_result, tx) = single_successful_transfer().into_iter().next().unwrap();
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![tx_result],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        p.exec_tx.send((output, vec![tx])).await.unwrap();
+
+        wait_for_window(
+            &p.live_blockhashes,
+            |w| w.len() == 1,
+            "row block must broadcast its hash before parking on the blocked addr-index send",
+        )
+        .await;
+
+        // The window must stay at one entry: the row block parked the settler on
+        // the addr-index send, so no further block is produced. If the first block
+        // had instead been empty (row tx not buffered in time), the settler would
+        // not have parked and the window would keep growing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let window: Vec<Hash> = p
+            .live_blockhashes
+            .read()
+            .expect("blockhash lock")
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            window.len(),
+            1,
+            "settler parked after the one row block; window did not grow"
+        );
+
+        // The addr-index receiver was never drained, so the broadcast was not
+        // gated by it.
+        assert_eq!(
+            p.addr_sig_rx.capacity(),
+            0,
+            "addr-index channel stayed full (undrained) during the test"
+        );
+
+        p.shutdown.cancel();
     }
 }
