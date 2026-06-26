@@ -9,7 +9,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::{env, error::Error, str::FromStr};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -56,9 +56,18 @@ fn main() -> Result<()> {
 
     println!("Admin pubkey: {}", admin_keypair.pubkey());
 
+    // Detect the mint's token program (legacy SPL Token vs Token-2022) so this
+    // works for either; the escrow verifies the mint is owned by the program we pass.
+    let token_program = client
+        .get_account(&mint)
+        .map_err(|e| format!("Failed to fetch mint {}: {}", mint, e))?
+        .owner;
+    println!("Token program: {}", token_program);
+
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_id, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-    let instance_ata = get_associated_token_address(&instance_id, &mint);
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance_id, &mint, &token_program);
 
     println!("\nAllowing mint for instance...");
     println!("Allowed Mint PDA: {}", allowed_mint_pda);
@@ -72,7 +81,7 @@ fn main() -> Result<()> {
         allowed_mint: allowed_mint_pda,
         instance_ata,
         system_program: SYSTEM_PROGRAM_ID,
-        token_program: spl_token::ID,
+        token_program,
         associated_token_program: spl_associated_token_account::ID,
         event_authority: event_authority_pda,
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
