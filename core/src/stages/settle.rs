@@ -530,19 +530,22 @@ async fn settle_transactions(
                     sanitized_transaction.signature()
                 );
 
-                for (index, (pubkey, account_data)) in
-                    executed_tx.loaded_transaction.accounts.iter().enumerate()
-                {
-                    if sanitized_transaction.is_writable(index) {
-                        let deleted =
-                            account_data.lamports() == 0 && account_data.data().is_empty();
-                        final_accounts_actual.insert(
-                            *pubkey,
-                            AccountSettlement {
-                                account: account_data.clone(),
-                                deleted,
-                            },
-                        );
+                // A failed executed tx (status Err) holds rolled-back intermediate state; record its signature but persist no account writes.
+                if executed_tx.was_successful() {
+                    for (index, (pubkey, account_data)) in
+                        executed_tx.loaded_transaction.accounts.iter().enumerate()
+                    {
+                        if sanitized_transaction.is_writable(index) {
+                            let deleted =
+                                account_data.lamports() == 0 && account_data.data().is_empty();
+                            final_accounts_actual.insert(
+                                *pubkey,
+                                AccountSettlement {
+                                    account: account_data.clone(),
+                                    deleted,
+                                },
+                            );
+                        }
                     }
                 }
 
@@ -700,6 +703,30 @@ mod tests {
             },
             execution_details: TransactionExecutionDetails {
                 status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 100,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: std::collections::HashMap::new(),
+        }))
+    }
+
+    /// `make_executed` with an `Err` status: an executed tx that failed mid-transaction holding rolled-back accounts.
+    fn make_failed_executed(
+        accounts: Vec<(solana_sdk::pubkey::Pubkey, AccountSharedData)>,
+    ) -> ProcessedTransaction {
+        ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts,
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Err(solana_transaction_error::TransactionError::InstructionError(
+                    1,
+                    solana_sdk::instruction::InstructionError::Custom(0),
+                )),
                 log_messages: None,
                 inner_instructions: None,
                 return_data: None,
@@ -1001,6 +1028,92 @@ mod tests {
         assert!(block.transaction_signatures.contains(&sig));
         // But no account settlements
         assert!(result.account_settlements.is_empty());
+    }
+
+    /// A failed executed tx must persist no account writes from its rolled-back state, yet still be recorded by signature.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_executed_persists_no_accounts_but_records_sig() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 100);
+        let sig = *tx.signature();
+
+        // A token-like data account at idx 0 (writable fee payer slot).
+        let data_pk = from.pubkey();
+        let data_acct = AccountSharedData::new(500, 8, &spl_token::id());
+        let results: Vec<(TransactionProcessingResult, _)> =
+            vec![(Ok(make_failed_executed(vec![(data_pk, data_acct)])), tx)];
+
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.account_settlements.is_empty(),
+            "a failed executed tx must persist no account writes"
+        );
+        let block = db.get_block(result.slot).await.unwrap();
+        assert!(
+            block.transaction_signatures.contains(&sig),
+            "a failed executed tx must still be recorded by signature"
+        );
+    }
+
+    /// A successful executed tx (writes A) and a failed one (would-write B): only A settles, B is absent, both sigs recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_success_and_failed_executed_in_batch() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from1 = Keypair::new();
+        let tx1 = create_test_sanitized_transaction(&from1, &Pubkey::new_unique(), 100);
+        let sig1 = *tx1.signature();
+        let a = from1.pubkey();
+        let ok = make_executed(vec![(a, AccountSharedData::new(500, 8, &spl_token::id()))]);
+
+        let from2 = Keypair::new();
+        let tx2 = create_test_sanitized_transaction(&from2, &Pubkey::new_unique(), 200);
+        let sig2 = *tx2.signature();
+        let b = from2.pubkey();
+        let failed = make_failed_executed(vec![(b, AccountSharedData::new(700, 8, &spl_token::id()))]);
+
+        let results: Vec<(TransactionProcessingResult, _)> =
+            vec![(Ok(ok), tx1), (Ok(failed), tx2)];
+
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.account_settlements.iter().any(|(k, _)| *k == a),
+            "successful tx's account A must be settled"
+        );
+        assert!(
+            !result.account_settlements.iter().any(|(k, _)| *k == b),
+            "failed tx's account B must not be settled"
+        );
+        assert_eq!(result.account_settlements.len(), 1, "only A settles");
+
+        let block = db.get_block(result.slot).await.unwrap();
+        assert!(block.transaction_signatures.contains(&sig1));
+        assert!(
+            block.transaction_signatures.contains(&sig2),
+            "failed executed tx signature must still be recorded"
+        );
     }
 
     /// Under the lamport cap, the executor zeroes a dataless gainer (e.g. the

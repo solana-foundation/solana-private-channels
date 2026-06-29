@@ -174,31 +174,34 @@ impl BOB {
                         sanitized_transaction.signature()
                     );
 
-                    for (index, (pubkey, account_data)) in executed_transaction
-                        .loaded_transaction
-                        .accounts
-                        .iter()
-                        .enumerate()
-                    {
-                        if sanitized_transaction.is_writable(index) {
-                            if account_data.lamports() == 0 && account_data.data().is_empty() {
-                                self.accounts.insert(
-                                    *pubkey,
-                                    AccountWithMeta {
-                                        account: account_data.clone(),
-                                        deleted: true,
-                                        synced_since: None,
-                                    },
-                                );
-                            } else {
-                                self.accounts.insert(
-                                    *pubkey,
-                                    AccountWithMeta {
-                                        account: account_data.clone(),
-                                        deleted: false,
-                                        synced_since: None,
-                                    },
-                                );
+                    // A failed executed tx (status Err) holds rolled-back intermediate state; only a successful execution commits its writable accounts.
+                    if executed_transaction.was_successful() {
+                        for (index, (pubkey, account_data)) in executed_transaction
+                            .loaded_transaction
+                            .accounts
+                            .iter()
+                            .enumerate()
+                        {
+                            if sanitized_transaction.is_writable(index) {
+                                if account_data.lamports() == 0 && account_data.data().is_empty() {
+                                    self.accounts.insert(
+                                        *pubkey,
+                                        AccountWithMeta {
+                                            account: account_data.clone(),
+                                            deleted: true,
+                                            synced_since: None,
+                                        },
+                                    );
+                                } else {
+                                    self.accounts.insert(
+                                        *pubkey,
+                                        AccountWithMeta {
+                                            account: account_data.clone(),
+                                            deleted: false,
+                                            synced_since: None,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -331,7 +334,17 @@ impl TransactionProcessingCallback for BOB {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, solana_sdk::account::Account, solana_svm_callback::TransactionProcessingCallback,
+        super::*,
+        crate::test_helpers::create_test_sanitized_transaction,
+        solana_sdk::account::Account,
+        solana_sdk::signature::{Keypair, Signer},
+        solana_svm::account_loader::LoadedTransaction,
+        solana_svm::transaction_error_metrics::TransactionErrorMetrics,
+        solana_svm::transaction_execution_result::{
+            ExecutedTransaction, TransactionExecutionDetails,
+        },
+        solana_svm_callback::TransactionProcessingCallback,
+        solana_timings::ExecuteTimings,
     };
 
     fn create_test_bob() -> (BOB, mpsc::UnboundedSender<Vec<(Pubkey, AccountSettlement)>>) {
@@ -346,6 +359,132 @@ mod tests {
             executable: false,
             rent_epoch: 0,
         })
+    }
+
+    /// A token-like data account whose balance lives in its data (first 8 bytes), at the 1-lamport floor.
+    fn token_like(balance: u64) -> AccountSharedData {
+        make_account(1, &balance.to_le_bytes(), &spl_token::id())
+    }
+
+    /// Decode the `token_like` balance from an account's data.
+    fn token_balance(account: &AccountSharedData) -> u64 {
+        u64::from_le_bytes(account.data()[..8].try_into().unwrap())
+    }
+
+    /// Build a single-tx Executed processing result with the given status.
+    fn executed_with_status(
+        status: Result<(), solana_transaction_error::TransactionError>,
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> ProcessedTransaction {
+        ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts,
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status,
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }))
+    }
+
+    /// Wrap one processing result into a single-tx SVM output.
+    fn svm_output(result: ProcessedTransaction) -> LoadAndExecuteSanitizedTransactionsOutput {
+        LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(result)],
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+        }
+    }
+
+    /// A failed executed tx must not overwrite a preloaded data account X=10 with its intermediate X=6, nor create dest.
+    #[tokio::test]
+    async fn failed_executed_does_not_overwrite_existing() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let from = Keypair::new();
+        let x = from.pubkey();
+        let dest = Pubkey::new_unique();
+        bob.insert_account_for_test(x, token_like(10));
+
+        // idx 0 (x, fee payer) and idx 1 (dest) are writable in a transfer.
+        let tx = create_test_sanitized_transaction(&from, &dest, 0);
+        let output = svm_output(executed_with_status(
+            Err(solana_transaction_error::TransactionError::InstructionError(
+                1,
+                solana_sdk::instruction::InstructionError::Custom(0),
+            )),
+            vec![(x, token_like(6)), (dest, token_like(4))],
+        ));
+        bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        assert_eq!(
+            token_balance(&bob.get_account_shared_data(&x).expect("X must remain")),
+            10,
+            "failed tx must not overwrite X with its rolled-back intermediate balance"
+        );
+        assert!(
+            bob.get_account_shared_data(&dest).is_none(),
+            "dest from a failed tx must not be created"
+        );
+    }
+
+    /// Success path is unchanged: a successful executed tx still commits X=6 and dest=4 (guards against an inverted guard).
+    #[tokio::test]
+    async fn successful_executed_still_writes() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let from = Keypair::new();
+        let x = from.pubkey();
+        let dest = Pubkey::new_unique();
+        bob.insert_account_for_test(x, token_like(10));
+
+        let tx = create_test_sanitized_transaction(&from, &dest, 0);
+        let output = svm_output(executed_with_status(
+            Ok(()),
+            vec![(x, token_like(6)), (dest, token_like(4))],
+        ));
+        bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        assert_eq!(
+            token_balance(&bob.get_account_shared_data(&x).expect("X present")),
+            6,
+            "successful tx commits the new X balance"
+        );
+        assert_eq!(
+            token_balance(&bob.get_account_shared_data(&dest).expect("dest present")),
+            4,
+            "successful tx commits the new dest balance"
+        );
+    }
+
+    /// Admin-trap regression: a failed executed result with empty loaded accounts must leave a pre-existing fee payer untouched.
+    #[tokio::test]
+    async fn failed_executed_does_not_tombstone_fee_payer() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let from = Keypair::new();
+        let fee_payer = from.pubkey();
+        bob.insert_account_for_test(fee_payer, token_like(10));
+
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+        let output = svm_output(executed_with_status(
+            Err(solana_transaction_error::TransactionError::InstructionError(
+                0,
+                solana_sdk::instruction::InstructionError::Custom(0),
+            )),
+            vec![],
+        ));
+        bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        assert_eq!(
+            token_balance(&bob.get_account_shared_data(&fee_payer).expect("fee payer present")),
+            10,
+            "failed executed tx with empty accounts must not tombstone the fee payer"
+        );
     }
 
     fn now_secs() -> u64 {
