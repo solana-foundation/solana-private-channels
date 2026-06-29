@@ -557,6 +557,9 @@ pub async fn boot_reconcile_landed_pending_remints(
                 transaction_id = row.id,
                 nonce, "Boot reconcile could not classify PendingRemint signatures: {}", reason
             ),
+            // Live hasn't finalized yet, so it hasn't consumed the nonce; the
+            // next boot/tick promotes it once it does. Dead never will. Either
+            // way, leave it PendingRemint.
             SigFinality::Live(_) | SigFinality::Dead => {}
         }
     }
