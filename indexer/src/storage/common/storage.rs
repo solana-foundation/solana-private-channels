@@ -4,8 +4,10 @@ pub mod bump_pending_remint_finality_attempt;
 pub mod close;
 pub mod count_pending_transactions;
 pub mod delete_release_signatures;
+pub mod delete_remint_signatures;
 pub mod drop_tables;
 pub mod gc_stale_release_signatures;
+pub mod gc_stale_remint_signatures;
 pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
@@ -18,6 +20,7 @@ pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
+pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
 pub mod init_schema;
@@ -25,6 +28,7 @@ pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_release_signature;
+pub mod insert_remint_signature;
 pub mod quarantine_all_active_withdrawals;
 pub mod record_remint_result;
 pub mod sender_lock;
@@ -451,6 +455,42 @@ impl Storage {
     /// `Processing`. Returns the number of rows removed.
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
         gc_stale_release_signatures::gc_stale_release_signatures(self).await
+    }
+
+    /// Write-ahead record of a remint MintTo signature, persisted before the
+    /// broadcast. Idempotent on `signature`.
+    pub async fn insert_remint_signature(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), StorageError> {
+        insert_remint_signature::insert_remint_signature(
+            self,
+            transaction_id,
+            signature,
+            last_valid_block_height,
+        )
+        .await
+    }
+
+    /// Stored remint signatures for a transaction as (signature, lvbh).
+    pub async fn get_remint_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        get_remint_signatures::get_remint_signatures(self, transaction_id).await
+    }
+
+    /// Delete all stored remint signatures for a transaction.
+    pub async fn delete_remint_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        delete_remint_signatures::delete_remint_signatures(self, transaction_id).await
+    }
+
+    /// Drop remint signatures whose parent transaction is no longer
+    /// `PendingRemint`. Returns the number of rows removed.
+    pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
+        gc_stale_remint_signatures::gc_stale_remint_signatures(self).await
     }
 }
 

@@ -1,7 +1,6 @@
 pub const DEFAULT_CU_RELEASE_FUNDS: Option<u32> = Some(600_000);
 pub const DEFAULT_CU_MINT: Option<u32> = None;
 pub const MINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:mint-idempotency:";
-pub const MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
 
 // SMT tree constants (must match on-chain program)
 #[cfg(not(feature = "test-tree"))]

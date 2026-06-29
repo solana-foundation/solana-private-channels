@@ -5,7 +5,7 @@ use crate::config::ProgramType;
 use crate::error::OperatorError;
 use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
 use crate::operator::sender::types::PendingSig;
-use crate::operator::sender::{classify_release_signatures, SigFinality};
+use crate::operator::sender::{classify_signatures, SigFinality};
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use crate::operator::TransactionStatusUpdate;
 use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
@@ -112,11 +112,15 @@ async fn recover_once(
     cancellation_token: &CancellationToken,
     threshold: Duration,
 ) -> Result<(), OperatorError> {
-    // Best-effort GC of release signatures whose parent is no longer Processing;
-    // a failure here must not block recovery.
+    // Best-effort GC of release/remint signatures whose parent left its live
+    // status; a failure here must not block recovery.
     match storage.gc_stale_release_signatures().await {
         Ok(removed) => debug!(removed, "Recovery GC'd stale release signatures"),
         Err(e) => warn!("Recovery release-signature GC failed: {}", e),
+    }
+    match storage.gc_stale_remint_signatures().await {
+        Ok(removed) => debug!(removed, "Recovery GC'd stale remint signatures"),
+        Err(e) => warn!("Recovery remint-signature GC failed: {}", e),
     }
 
     let stale = storage
@@ -215,7 +219,7 @@ async fn check_deposit(
         return DepositOutcome::NotLanded;
     }
 
-    match classify_release_signatures(rpc_client, &pending).await {
+    match classify_signatures(rpc_client, &pending).await {
         SigFinality::Landed(sig) => DepositOutcome::Landed {
             signature: sig.to_string(),
         },
@@ -255,7 +259,7 @@ async fn check_withdrawal(
         };
     }
 
-    match classify_release_signatures(rpc_client, &pending).await {
+    match classify_signatures(rpc_client, &pending).await {
         SigFinality::Landed(sig) => WithdrawalAction::Complete {
             signature: sig.to_string(),
         },

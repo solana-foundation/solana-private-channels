@@ -20,10 +20,6 @@ name = "reconciliation_integration"
 path = "tests/indexer/reconciliation.rs"
 
 [[test]]
-name = "mint_idempotency_integration"
-path = "tests/indexer/mint_idempotency.rs"
-
-[[test]]
 name = "gap_detection_integration"
 path = "tests/indexer/gap_detection.rs"
 
@@ -121,18 +117,6 @@ name = "harness_sanity"
 path = "tests/indexer/harness_sanity.rs"
 
 # RPC-error + storage-failure fault-injection tests.
-[[test]]
-name = "sender_mint_idempotency"
-path = "tests/indexer/sender_mint_idempotency.rs"
-
-[[test]]
-name = "sender_mint_validator_encodings"
-path = "tests/indexer/sender_mint_validator_encodings.rs"
-
-[[test]]
-name = "sender_mint_signature_failures"
-path = "tests/indexer/sender_mint_signature_failures.rs"
-
 [[test]]
 name = "sender_poll_rpc_error"
 path = "tests/indexer/sender_poll_rpc_error.rs"
