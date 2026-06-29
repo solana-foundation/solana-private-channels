@@ -486,6 +486,86 @@ pub async fn boot_reconcile_processing(
     Ok(())
 }
 
+/// Promote PendingRemint withdrawals whose release already landed on-chain to
+/// Completed, so the boot SMT validation sees the consumed nonce instead of
+/// refusing to start on a spurious mismatch. Deadline is ignored: a landed
+/// nonce diverges the root the moment it lands. Best-effort like
+/// boot_reconcile_processing; on any error validate_smt_root still fails closed.
+pub async fn boot_reconcile_landed_pending_remints(
+    storage: &Storage,
+    rpc_client: &RpcClientWithRetry,
+) -> Result<(), OperatorError> {
+    for row in storage.get_pending_remint_transactions().await? {
+        let Some(nonce) = row.withdrawal_nonce else {
+            continue;
+        };
+
+        // Signatures live on the row, not the release_signatures table. Without
+        // a well-formed set we cannot verify finality, so skip and let the live
+        // sender escalate; validate_smt_root still fails closed if it landed.
+        let sig_strings = row.remint_signatures.unwrap_or_default();
+        let lvbhs = row.remint_last_valid_block_heights.unwrap_or_default();
+        if sig_strings.is_empty() || sig_strings.len() != lvbhs.len() {
+            continue;
+        }
+        let parsed: Result<Vec<PendingSig>, ()> = sig_strings
+            .iter()
+            .zip(&lvbhs)
+            .map(|(sig_str, &lvbh)| {
+                Ok(PendingSig {
+                    signature: Signature::from_str(sig_str).map_err(|_| ())?,
+                    last_valid_block_height: u64::try_from(lvbh).map_err(|_| ())?,
+                })
+            })
+            .collect();
+        let Ok(signatures) = parsed else {
+            continue;
+        };
+
+        // Only a finalized-success release consumed the nonce. Dead/Live are
+        // correctly absent from the on-chain root, so leave them PendingRemint.
+        match classify_release_signatures(rpc_client, &signatures).await {
+            SigFinality::Landed(sig) => match storage
+                .update_transaction_status(
+                    row.id,
+                    TransactionStatus::Completed,
+                    Some(sig.to_string()),
+                    Utc::now(),
+                )
+                .await
+            {
+                Ok(true) => info!(
+                    transaction_id = row.id,
+                    nonce,
+                    signature = %sig,
+                    "Boot reconcile promoted landed PendingRemint to Completed"
+                ),
+                // A rolling-restart sibling already completed it.
+                Ok(false) => debug!(
+                    transaction_id = row.id,
+                    "Boot reconcile skipped PendingRemint already past pending_remint"
+                ),
+                Err(e) => warn!(
+                    transaction_id = row.id,
+                    "Boot reconcile failed to complete landed PendingRemint: {}", e
+                ),
+            },
+            // Could not classify (RPC failure/length mismatch). The nonce stays
+            // out of the local tree, so if it did land validate_smt_root refuses;
+            // log it so that refusal is traceable to a flaky boot RPC.
+            SigFinality::Uncertain(reason) => warn!(
+                transaction_id = row.id,
+                nonce, "Boot reconcile could not classify PendingRemint signatures: {}", reason
+            ),
+            // Live hasn't finalized yet, so it hasn't consumed the nonce; the
+            // next boot/tick promotes it once it does. Dead never will. Either
+            // way, leave it PendingRemint.
+            SigFinality::Live(_) | SigFinality::Dead => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(test, feature = "test-mock-storage"))]
 pub mod test_hooks {
     //! Test-only entry to drive a single recovery tick deterministically.
@@ -1419,6 +1499,96 @@ mod tests {
         assert!(
             after.iter().all(|t| t.status != TransactionStatus::Failed),
             "refuse-to-start must never mark a row Failed"
+        );
+    }
+
+    /// A PendingRemint whose release finalized during the safety window must be
+    /// promoted to Completed at boot even though its deadline has not matured, so
+    /// validate_smt_root sees the consumed nonce and agrees instead of refusing
+    /// to start.
+    #[tokio::test]
+    async fn boot_reconcile_completes_landed_pending_remint_then_validates_ok() {
+        let landed_nonce: u64 = 3;
+        let mut onchain_tree = SmtState::new(0);
+        onchain_tree.insert_nonce(landed_nonce);
+
+        let mut server = mockito::Server::new_async().await;
+        let landed_sig = Signature::new_unique();
+        let _status = mock_finalized_status(&mut server);
+        let _account = mock_instance_account(&mut server, onchain_tree.current_root());
+
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(1, Some(landed_nonce as i64));
+        row.status = TransactionStatus::PendingRemint;
+        row.remint_signatures = Some(vec![landed_sig.to_string()]);
+        row.remint_last_valid_block_heights = Some(vec![100]);
+        // Deadline still in the future: the restart happened inside the window.
+        row.pending_remint_deadline_at = Some(Utc::now() + chrono::Duration::seconds(60));
+        // The mock splits storage: get_pending_remint_transactions reads one vec,
+        // update_transaction_status / get_completed_withdrawal_nonces the other.
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(row.clone());
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        boot_reconcile_landed_pending_remints(&storage, &client)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Completed,
+            "landed PendingRemint must be promoted despite a future deadline"
+        );
+
+        let validated = validate_smt_root(&storage, &client, Some(Pubkey::new_unique())).await;
+        assert!(
+            validated.is_ok(),
+            "validate must pass once the landed PendingRemint is reconciled: {validated:?}"
+        );
+    }
+
+    /// A PendingRemint whose release is on-chain but not yet finalized (still
+    /// inside the safety window) must be left PendingRemint, never completed on
+    /// an unfinalized signature.
+    #[tokio::test]
+    async fn boot_reconcile_leaves_unfinalized_pending_remint_untouched() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":10,"err":null,"status":{"Ok":null},"confirmationStatus":"confirmed"}]},"id":1}"#,
+            )
+            .create();
+
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(1, Some(3));
+        row.status = TransactionStatus::PendingRemint;
+        row.remint_signatures = Some(vec![Signature::new_unique().to_string()]);
+        row.remint_last_valid_block_heights = Some(vec![100]);
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(row.clone());
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        boot_reconcile_landed_pending_remints(&storage, &client)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::PendingRemint,
+            "unfinalized release must stay PendingRemint"
         );
     }
 }
