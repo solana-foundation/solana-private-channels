@@ -39,7 +39,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_transactions_fetched_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_transactions_fetched_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}}",
           "refId": "A"
         }
@@ -61,7 +61,7 @@
       },
       "targets": [
         {
-          "expr": "private_channel_operator_backlog_depth{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}",
+          "expr": "private_channel_operator_backlog_depth{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}",
           "legendFormat": "{{program_type}}",
           "refId": "A"
         }
@@ -83,7 +83,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_mints_sent_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_mints_sent_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}}",
           "refId": "A"
         }
@@ -108,7 +108,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_transaction_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_transaction_errors_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}} / {{error_reason}}",
           "refId": "A"
         }
@@ -130,7 +130,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_db_updates_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_db_updates_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}} / {{status}}",
           "refId": "A"
         }
@@ -155,7 +155,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_db_update_errors_total{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_db_update_errors_total{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}}",
           "refId": "A"
         }
@@ -184,7 +184,7 @@
       },
       "targets": [
         {
-          "expr": "rate(private_channel_operator_rpc_send_duration_seconds_count{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
+          "expr": "rate(private_channel_operator_rpc_send_duration_seconds_count{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])",
           "legendFormat": "{{program_type}} / {{result}}",
           "refId": "A"
         }
@@ -206,12 +206,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le, program_type) (rate(private_channel_operator_rpc_send_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, program_type) (rate(private_channel_operator_rpc_send_duration_seconds_bucket{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
           "legendFormat": "p50 {{program_type}}",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le, program_type) (rate(private_channel_operator_rpc_send_duration_seconds_bucket{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, program_type) (rate(private_channel_operator_rpc_send_duration_seconds_bucket{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"}[$__rate_interval])))",
           "legendFormat": "p99 {{program_type}}",
           "refId": "B"
         }
@@ -312,7 +312,7 @@
       },
       "targets": [
         {
-          "expr": "private_channel_feepayer_balance_lamports{job=~\"indexer-.*|operator-.*\", program_type=~\"$program_type\"} / 1e9",
+          "expr": "private_channel_feepayer_balance_lamports{job=~\"private-channel-(indexer|operator)-.*\", program_type=~\"$program_type\"} / 1e9",
           "legendFormat": "{{program_type}}",
           "refId": "A"
         }

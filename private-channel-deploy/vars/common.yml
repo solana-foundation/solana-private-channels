@@ -72,6 +72,15 @@ validator_reset: true
 # --- Optional notification webhook posted from the report phase ---
 notify_webhook: ""
 
+# --- Grafana alerting contact point (vendor-neutral by default) ------------
+# Grafana's provisioned contact point reads these via env substitution. Leave
+# at the defaults for a no-op (alerting evaluates but notifies nowhere). To
+# enable, set both, e.g. in your env vars or secrets:
+#   alert_contact_type: slack            # any Grafana receiver type
+#   alert_webhook_url: <slack incoming webhook URL>   # treat as a secret
+alert_contact_type: "webhook"
+alert_webhook_url: "http://localhost:9/no-op"
+
 # --- Build-arg pins, mirrored from versions.env so renders stay reproducible ---
 # Shipped to the target during PHASE 3 RENDER and passed to compose via --env-file.
 versions_env_file: "{{ repo_root }}/versions.env"

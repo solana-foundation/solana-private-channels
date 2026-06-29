@@ -611,6 +611,7 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      - ALERT_CONTACT_TYPE=${ALERT_CONTACT_TYPE:-webhook}
     networks:
       - private-channel-network
     healthcheck:

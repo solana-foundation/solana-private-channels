@@ -61,7 +61,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job=~"gateway|indexer-solana|indexer-private-channel|operator-solana|operator-private-channel"}
+              expr: up{job=~"private-channel-(indexer|operator)-.*"}
               instant: true
               refId: A
           - refId: C
@@ -134,7 +134,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -168,7 +168,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"} / 1e9
               instant: true
               refId: A
           - refId: C

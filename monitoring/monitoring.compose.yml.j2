@@ -65,9 +65,11 @@ services:
       # env vars at Grafana startup. Same set + defaults as docker-compose.yml's
       # grafana service so both deploy paths see identical config.
       - PROMETHEUS_URL=http://prometheus:9090
-      # alerting/contact-points.yml uses this; the no-op default keeps Grafana
-      # from failing provisioning when no real webhook is configured.
+      # alerting/contact-points.yml uses these; the no-op defaults keep Grafana
+      # from failing provisioning when no real notifier is configured. Set
+      # alert_contact_type (e.g. slack) + alert_webhook_url to enable alerting.
       - ALERT_WEBHOOK_URL={{ alert_webhook_url | default('http://localhost:9/no-op') }}
+      - ALERT_CONTACT_TYPE={{ alert_contact_type | default('webhook') }}
       # Postgres datasource (for the Postgres dashboard's direct-DB queries).
       - POSTGRES_INDEXER_HOST=postgres-indexer
       - POSTGRES_INDEXER_DB={{ postgres_indexer_db }}
