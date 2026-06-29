@@ -61,6 +61,8 @@ integration-test:
 	@cargo test --test yellowstone_wiring -- --nocapture
 	@cargo test --test malformed_yellowstone_update -- --nocapture
 	@cargo test --test yellowstone_reconnect_gap -- --nocapture
+	@cargo test --test yellowstone_startup_gap -- --nocapture
+	@cargo test --test rpc_startup_handoff -- --nocapture
 	@cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cargo test --test harness_sanity -- --nocapture
 	@cargo test --test sender_mint_idempotency -- --nocapture
