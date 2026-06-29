@@ -231,25 +231,30 @@ pub async fn execute_deferred_remint(
             };
 
             // Flip to FailedReminted now so a crash before the async writer runs can't
-            // leave the row PendingRemint for recovery to remint again. On failure the
-            // send below still drives the row terminal; only the signature is lost.
-            if let Err(persist_err) = state
+            // leave the row PendingRemint for recovery to remint again.
+            match state
                 .storage
                 .record_remint_result(transaction_id, signature.to_string())
                 .await
             {
-                error!(
-                    "Remint sig {} confirmed but durable persist failed for txn {}: {}; falling back to async writer",
-                    signature, transaction_id, persist_err
-                );
-            }
-
-            // Best-effort cleanup of the write-ahead rows; GC sweeps any leftovers.
-            if let Err(e) = state.storage.delete_remint_signatures(transaction_id).await {
-                warn!(
-                    "Failed to clear remint signatures for txn {}: {}; GC will sweep",
-                    transaction_id, e
-                );
+                // Row is durably terminal: safe to drop the write-ahead rows.
+                Ok(()) => {
+                    if let Err(e) = state.storage.delete_remint_signatures(transaction_id).await {
+                        warn!(
+                            "Failed to clear remint signatures for txn {}: {}; GC will sweep",
+                            transaction_id, e
+                        );
+                    }
+                }
+                // Row stays PendingRemint, so the write-ahead rows MUST be kept: if we
+                // crash before the async writer below commits, restart recovery has to
+                // classify this landed signature instead of broadcasting a duplicate.
+                Err(persist_err) => {
+                    error!(
+                        "Remint sig {} confirmed but durable persist failed for txn {}: {}; keeping write-ahead rows, falling back to async writer",
+                        signature, transaction_id, persist_err
+                    );
+                }
             }
 
             // Drives the webhook alert, and is the fallback status write. No-op once
@@ -2443,5 +2448,64 @@ mod tests {
         );
         // expect(0): recovery did not trigger a duplicate broadcast.
         src_send.assert_async().await;
+    }
+
+    /// If recording the confirmed remint fails, the write-ahead rows must be
+    /// kept (not cleaned up): the row is still PendingRemint, so a crash before
+    /// the async writer commits would otherwise leave recovery with an empty sig
+    /// table and re-broadcast a duplicate mint.
+    #[tokio::test]
+    async fn remint_keeps_write_ahead_rows_when_record_result_fails() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        let _dest_status = mock_release_dead(&mut dest).await;
+
+        // Stored attempt already finalized, so the gate confirms via short-circuit.
+        let landed_sig = Signature::new_unique();
+        let _src_status = mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        seed_pending_remint_row(&mock, 906, 0);
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(906, vec![(landed_sig.to_string(), 0)]);
+        // The durable terminal write fails.
+        mock.set_should_fail("record_remint_result", true);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(906),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-906".to_string()),
+            },
+            remint_info: make_remint_info(906),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // The write-ahead rows survive so restart recovery can still classify the
+        // landed signature instead of broadcasting a duplicate.
+        assert_eq!(
+            mock.remint_signatures.lock().unwrap().get(&906),
+            Some(&vec![(landed_sig.to_string(), 0)]),
+            "write-ahead rows must be kept when the terminal record write fails"
+        );
     }
 }
