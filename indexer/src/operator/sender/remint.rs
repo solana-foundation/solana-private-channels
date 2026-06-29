@@ -46,7 +46,11 @@ enum RemintAttempt {
 /// (before any resend) so a crash between broadcast and the FailedReminted write can't
 /// double-mint. Everything runs on the source chain (PrivateChannel). No sender-level retry.
 async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> RemintAttempt {
-    let stored = match state.storage.get_remint_signatures(info.transaction_id).await {
+    let stored = match state
+        .storage
+        .get_remint_signatures(info.transaction_id)
+        .await
+    {
         Ok(rows) => rows,
         Err(e) => {
             return RemintAttempt::Failed(format!(
@@ -89,7 +93,9 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
                 return RemintAttempt::Confirmed(signature);
             }
             SigFinality::Live(reason) => {
-                return RemintAttempt::Defer(format!("prior remint attempt still in flight: {reason}"));
+                return RemintAttempt::Defer(format!(
+                    "prior remint attempt still in flight: {reason}"
+                ));
             }
             SigFinality::Uncertain(reason) => {
                 return RemintAttempt::Failed(format!(
@@ -144,13 +150,11 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         };
 
     // Write-ahead persist before broadcast. Failure here means nothing was sent, so defer.
+    // Checked cast keeps the round-trip symmetric with the u64::try_from read-back.
+    let lvbh_i64 = i64::try_from(last_valid_block_height).unwrap_or(i64::MAX);
     if let Err(e) = state
         .storage
-        .insert_remint_signature(
-            info.transaction_id,
-            signature.to_string(),
-            last_valid_block_height as i64,
-        )
+        .insert_remint_signature(info.transaction_id, signature.to_string(), lvbh_i64)
         .await
     {
         return RemintAttempt::Defer(format!(
@@ -199,7 +203,8 @@ pub enum DeferredRemintOutcome {
     /// Terminal: a FailedReminted or ManualReview status was already emitted.
     Resolved,
     /// Could not complete yet; caller re-queues the entry with the given reason.
-    Defer(PendingRemint, String),
+    /// Boxed to keep the enum small (PendingRemint is ~300 bytes).
+    Defer(Box<PendingRemint>, String),
 }
 
 /// Execute the actual remint for a matured PendingRemint entry.
@@ -241,7 +246,10 @@ pub async fn execute_deferred_remint(
 
             // Best-effort cleanup of the write-ahead rows; GC sweeps any leftovers.
             if let Err(e) = state.storage.delete_remint_signatures(transaction_id).await {
-                debug!("Failed to clear remint signatures for txn {}: {}", transaction_id, e);
+                warn!(
+                    "Failed to clear remint signatures for txn {}: {}; GC will sweep",
+                    transaction_id, e
+                );
             }
 
             // Drives the webhook alert, and is the fallback status write. No-op once
@@ -269,7 +277,7 @@ pub async fn execute_deferred_remint(
             }
             DeferredRemintOutcome::Resolved
         }
-        RemintAttempt::Defer(reason) => DeferredRemintOutcome::Defer(entry, reason),
+        RemintAttempt::Defer(reason) => DeferredRemintOutcome::Defer(Box::new(entry), reason),
         RemintAttempt::Failed(remint_error) => {
             error!("Remint also failed: {}", remint_error);
             let combined = format!("{} | remint failed: {}", entry.original_error, remint_error);
@@ -468,7 +476,7 @@ pub async fn process_pending_remints(
                 {
                     defer_or_escalate(
                         &mut remaining,
-                        entry,
+                        *entry,
                         &nonce_label,
                         &reason,
                         &state.storage,
@@ -1740,10 +1748,7 @@ mod tests {
         ];
 
         assert!(
-            matches!(
-                classify_signatures(&rpc, &sigs).await,
-                SigFinality::Live(_)
-            ),
+            matches!(classify_signatures(&rpc, &sigs).await, SigFinality::Live(_)),
             "confirmed success behind a finalized failure must be Live, not Dead"
         );
     }
@@ -1780,10 +1785,7 @@ mod tests {
         ];
 
         assert!(
-            matches!(
-                classify_signatures(&rpc, &sigs).await,
-                SigFinality::Live(_)
-            ),
+            matches!(classify_signatures(&rpc, &sigs).await, SigFinality::Live(_)),
             "a still-valid null after an expired null must be Live, not Dead"
         );
     }

@@ -392,7 +392,6 @@ async fn mint_authority_check_with_backoff(
     last_check
 }
 
-
 /// Cleanup mint builder cache when transaction completes or fails
 pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Option<i64>) {
     if let Some(txn_id) = transaction_id {

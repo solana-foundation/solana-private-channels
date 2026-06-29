@@ -309,7 +309,13 @@ async fn test_remint_signatures_round_trip_and_gc() {
     // GC keeps rows whose parent is still PendingRemint.
     let removed = db.gc_stale_remint_signatures_internal().await.unwrap();
     assert_eq!(removed, 0, "live PendingRemint rows must be kept");
-    assert_eq!(db.get_remint_signatures_internal(tx_id).await.unwrap().len(), 2);
+    assert_eq!(
+        db.get_remint_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     // Once the parent goes terminal, GC sweeps its write-ahead rows.
     sqlx::query(
@@ -321,5 +327,9 @@ async fn test_remint_signatures_round_trip_and_gc() {
     .unwrap();
     let removed = db.gc_stale_remint_signatures_internal().await.unwrap();
     assert_eq!(removed, 2, "terminal parent's rows must be swept");
-    assert!(db.get_remint_signatures_internal(tx_id).await.unwrap().is_empty());
+    assert!(db
+        .get_remint_signatures_internal(tx_id)
+        .await
+        .unwrap()
+        .is_empty());
 }

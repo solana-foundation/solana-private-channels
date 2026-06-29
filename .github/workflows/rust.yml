@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, hardening/pre-release-audit]
   pull_request:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, cantina-audit]
 
 permissions:
   contents: read
