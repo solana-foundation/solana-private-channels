@@ -24,21 +24,22 @@ pub fn get_stored_transaction(
     let meta = match processed {
         ProcessedTransaction::Executed(executed) => {
             let details = &executed.execution_details;
+            // A failed executed tx commits no account changes; its loaded accounts hold rolled-back intermediate state, so report no balances rather than values that disagree with committed state.
+            let balances: Vec<u64> = if details.status.is_ok() {
+                executed
+                    .loaded_transaction
+                    .accounts
+                    .iter()
+                    .map(|(_, account)| account.lamports())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             TransactionStatusMeta {
                 status: details.status.clone(),
                 fee: executed.loaded_transaction.fee_details.total_fee(),
-                pre_balances: executed
-                    .loaded_transaction
-                    .accounts
-                    .iter()
-                    .map(|(_, account)| account.lamports())
-                    .collect(),
-                post_balances: executed
-                    .loaded_transaction
-                    .accounts
-                    .iter()
-                    .map(|(_, account)| account.lamports())
-                    .collect(),
+                pre_balances: balances.clone(),
+                post_balances: balances,
                 inner_instructions: details.inner_instructions.as_ref().map(|inner| {
                     inner
                         .iter()
@@ -145,5 +146,82 @@ mod tests {
         let parsed = encode_transaction_data(data, UiTransactionEncoding::JsonParsed);
         let base64 = encode_transaction_data(data, UiTransactionEncoding::Base64);
         assert_eq!(parsed, base64);
+    }
+
+    use solana_sdk::{
+        account::AccountSharedData, instruction::InstructionError, pubkey::Pubkey,
+        signature::Keypair, transaction::TransactionError,
+    };
+    use solana_svm::account_loader::LoadedTransaction;
+    use solana_svm::transaction_execution_result::{
+        ExecutedTransaction, TransactionExecutionDetails,
+    };
+
+    fn executed_processed(
+        status: Result<(), TransactionError>,
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> ProcessedTransaction {
+        ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts,
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status,
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: std::collections::HashMap::new(),
+        }))
+    }
+
+    /// A successful executed tx records its loaded-account lamports as the stored meta balances.
+    #[test]
+    fn stored_meta_records_balances_for_successful_executed() {
+        let tx = crate::test_helpers::create_test_sanitized_transaction(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            0,
+        );
+        let acct = AccountSharedData::new(7, 0, &Pubkey::new_unique());
+        let processed = executed_processed(Ok(()), vec![(Pubkey::new_unique(), acct)]);
+
+        let stored = get_stored_transaction(&tx, 1, 0, &processed);
+
+        assert_eq!(stored.meta.pre_balances, vec![7]);
+        assert_eq!(stored.meta.post_balances, vec![7]);
+    }
+
+    /// A failed executed tx commits nothing, so its stored meta must not report the rolled-back intermediate balances that would disagree with committed state.
+    #[test]
+    fn stored_meta_omits_balances_for_failed_executed() {
+        let tx = crate::test_helpers::create_test_sanitized_transaction(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            0,
+        );
+        let intermediate = AccountSharedData::new(6, 0, &Pubkey::new_unique());
+        let processed = executed_processed(
+            Err(TransactionError::InstructionError(
+                1,
+                InstructionError::Custom(0),
+            )),
+            vec![(Pubkey::new_unique(), intermediate)],
+        );
+
+        let stored = get_stored_transaction(&tx, 1, 0, &processed);
+
+        assert!(
+            stored.meta.pre_balances.is_empty(),
+            "failed executed tx must not report intermediate balances"
+        );
+        assert!(stored.meta.post_balances.is_empty());
+        assert!(
+            stored.meta.err.is_some(),
+            "failed executed tx must still record its error status"
+        );
     }
 }
