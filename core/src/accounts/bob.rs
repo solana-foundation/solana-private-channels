@@ -415,10 +415,12 @@ mod tests {
         // idx 0 (x, fee payer) and idx 1 (dest) are writable in a transfer.
         let tx = create_test_sanitized_transaction(&from, &dest, 0);
         let output = svm_output(executed_with_status(
-            Err(solana_transaction_error::TransactionError::InstructionError(
-                1,
-                solana_sdk::instruction::InstructionError::Custom(0),
-            )),
+            Err(
+                solana_transaction_error::TransactionError::InstructionError(
+                    1,
+                    solana_sdk::instruction::InstructionError::Custom(0),
+                ),
+            ),
             vec![(x, token_like(6)), (dest, token_like(4))],
         ));
         bob.update_accounts(&output, std::slice::from_ref(&tx));
@@ -472,16 +474,21 @@ mod tests {
 
         let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
         let output = svm_output(executed_with_status(
-            Err(solana_transaction_error::TransactionError::InstructionError(
-                0,
-                solana_sdk::instruction::InstructionError::Custom(0),
-            )),
+            Err(
+                solana_transaction_error::TransactionError::InstructionError(
+                    0,
+                    solana_sdk::instruction::InstructionError::Custom(0),
+                ),
+            ),
             vec![],
         ));
         bob.update_accounts(&output, std::slice::from_ref(&tx));
 
         assert_eq!(
-            token_balance(&bob.get_account_shared_data(&fee_payer).expect("fee payer present")),
+            token_balance(
+                &bob.get_account_shared_data(&fee_payer)
+                    .expect("fee payer present")
+            ),
             10,
             "failed executed tx with empty accounts must not tombstone the fee payer"
         );

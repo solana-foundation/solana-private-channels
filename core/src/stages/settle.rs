@@ -723,10 +723,12 @@ mod tests {
                 ..Default::default()
             },
             execution_details: TransactionExecutionDetails {
-                status: Err(solana_transaction_error::TransactionError::InstructionError(
-                    1,
-                    solana_sdk::instruction::InstructionError::Custom(0),
-                )),
+                status: Err(
+                    solana_transaction_error::TransactionError::InstructionError(
+                        1,
+                        solana_sdk::instruction::InstructionError::Custom(0),
+                    ),
+                ),
                 log_messages: None,
                 inner_instructions: None,
                 return_data: None,
@@ -1082,10 +1084,10 @@ mod tests {
         let tx2 = create_test_sanitized_transaction(&from2, &Pubkey::new_unique(), 200);
         let sig2 = *tx2.signature();
         let b = from2.pubkey();
-        let failed = make_failed_executed(vec![(b, AccountSharedData::new(700, 8, &spl_token::id()))]);
+        let failed =
+            make_failed_executed(vec![(b, AccountSharedData::new(700, 8, &spl_token::id()))]);
 
-        let results: Vec<(TransactionProcessingResult, _)> =
-            vec![(Ok(ok), tx1), (Ok(failed), tx2)];
+        let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(ok), tx1), (Ok(failed), tx2)];
 
         let result = settle_transactions(
             None,
