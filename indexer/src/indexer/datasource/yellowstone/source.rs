@@ -47,6 +47,8 @@ pub struct YellowstoneSource {
     batch_size: usize,
     #[cfg(feature = "datasource-rpc")]
     storage: Option<Arc<Storage>>,
+    #[cfg(feature = "datasource-rpc")]
+    initial_gap_floor: Option<u64>,
     health: Option<Arc<private_channel_metrics::HealthState>>,
 }
 
@@ -72,12 +74,23 @@ impl YellowstoneSource {
             batch_size: 0,
             #[cfg(feature = "datasource-rpc")]
             storage: None,
+            #[cfg(feature = "datasource-rpc")]
+            initial_gap_floor: None,
             health: None,
         }
     }
 
     pub fn with_health(mut self, health: Arc<private_channel_metrics::HealthState>) -> Self {
         self.health = Some(health);
+        self
+    }
+
+    /// Durable frontier to backfill up to once at startup, before the first
+    /// subscription, so the live tip can't leapfrog the backfill->live handoff.
+    /// `None` (a fresh node) runs no initial fill.
+    #[cfg(feature = "datasource-rpc")]
+    pub fn with_initial_gap_floor(mut self, floor: Option<u64>) -> Self {
+        self.initial_gap_floor = floor;
         self
     }
 
@@ -191,8 +204,51 @@ impl DataSource for YellowstoneSource {
         let batch_size = self.batch_size;
         #[cfg(feature = "datasource-rpc")]
         let storage = self.storage.clone();
+        #[cfg(feature = "datasource-rpc")]
+        let initial_gap_floor = self.initial_gap_floor;
 
         let handle = tokio::spawn(async move {
+            // One-shot startup gap-fill before the first subscription: the gRPC
+            // stream begins at the live tip, so without this the slots between
+            // the backfill target and the first streamed slot are covered by
+            // neither path (SOLA6-10). Reuses the reconnect machinery; the floor
+            // already carries the durable checkpoint, so storage is only a
+            // presence guard (gap detection wired) and isn't re-read. A fill
+            // failure must degrade to streaming, never skip it, so no `?`.
+            #[cfg(feature = "datasource-rpc")]
+            if let Some(floor) = initial_gap_floor {
+                if let (Some(ref poller), Some(_)) = (&rpc_poller, &storage) {
+                    match try_fill_reconnect_gap(
+                        floor,
+                        poller,
+                        max_gap_slots,
+                        batch_size,
+                        program_type,
+                        escrow_instance_id,
+                        &tx,
+                    )
+                    .await
+                    {
+                        Ok(filled) => {
+                            if filled > 0 {
+                                info!(
+                                    "Startup gap-fill complete: {} slots backfilled \
+                                     (from frontier {})",
+                                    filled, floor
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Startup gap-fill failed (frontier: {}): {}. \
+                                 Proceeding to stream.",
+                                floor, e
+                            );
+                        }
+                    }
+                }
+            }
+
             loop {
                 if cancellation_token.is_cancelled() {
                     info!("Yellowstone source received cancellation signal, stopping...");

@@ -107,6 +107,14 @@ path = "tests/indexer/malformed_yellowstone_update.rs"
 name = "yellowstone_reconnect_gap"
 path = "tests/indexer/yellowstone_reconnect_gap.rs"
 
+[[test]]
+name = "yellowstone_startup_gap"
+path = "tests/indexer/yellowstone_startup_gap.rs"
+
+[[test]]
+name = "rpc_startup_handoff"
+path = "tests/indexer/rpc_startup_handoff.rs"
+
 # Yellowstone inner_instructions + unknown-discriminator arms.
 [[test]]
 name = "yellowstone_inner_and_unknown"

@@ -14,6 +14,9 @@ use crate::{
 use crate::indexer::backfill::BackfillService;
 
 #[cfg(feature = "datasource-rpc")]
+use crate::indexer::checkpoint::get_last_checkpoint;
+
+#[cfg(feature = "datasource-rpc")]
 use crate::indexer::datasource::rpc_polling::{rpc::RpcPoller, RpcPollingSource};
 
 #[cfg(feature = "datasource-yellowstone")]
@@ -24,6 +27,37 @@ use tokio::signal;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+/// The durable frontier the live datasource must resume from: a resolved
+/// backfill gap target dominates, else the committed checkpoint, else `None`
+/// for a genuinely fresh node (checkpoint 0, no gap) so we never replay genesis.
+#[cfg(feature = "datasource-rpc")]
+fn durable_frontier(resolved_gap_target: Option<u64>, committed_checkpoint: u64) -> Option<u64> {
+    match resolved_gap_target {
+        Some(target) => Some(target),
+        None if committed_checkpoint > 0 => Some(committed_checkpoint),
+        None => None,
+    }
+}
+
+/// Slot the live RPC poller seeds at, one past the durable frontier so the
+/// backfill->live handoff is contiguous and cannot leapfrog an unfilled slot.
+/// A resolved gap dominates a stale `from_slot` (the bug); an explicit
+/// `from_slot` is honored only when no gap was resolved; a fresh node returns
+/// `None` so the poller seeds at the live tip rather than from genesis.
+#[cfg(feature = "datasource-rpc")]
+fn rpc_live_from_slot(
+    resolved_gap_target: Option<u64>,
+    config_from_slot: Option<u64>,
+    committed_checkpoint: u64,
+) -> Option<u64> {
+    match (resolved_gap_target, config_from_slot, committed_checkpoint) {
+        (Some(target), _, _) => Some(target + 1),
+        (None, Some(configured), _) => Some(configured),
+        (None, None, cp) if cp > 0 => Some(cp + 1),
+        (None, None, _) => None,
+    }
+}
 
 pub async fn run(
     common_config: PrivateChannelIndexerConfig,
@@ -97,6 +131,11 @@ pub async fn run(
     //    no live-tip slot can slip past it and push the checkpoint over the gap.
     let mut checkpoint_writer = CheckpointWriter::new(storage.clone());
 
+    // The inclusive backfill target when a gap is resolved; seeds the live
+    // datasource so it resumes contiguously instead of from an independent tip.
+    #[cfg(feature = "datasource-rpc")]
+    let mut resolved_gap_target: Option<u64> = None;
+
     if indexer_config.backfill.enabled {
         #[cfg(not(feature = "datasource-rpc"))]
         return Err(DataSourceError::InvalidConfig {
@@ -156,6 +195,7 @@ pub async fn run(
                 match backfill_service.resolve_range().await {
                     Ok(Some((from_slot, target))) => {
                         checkpoint_writer = checkpoint_writer.with_gate(from_slot, target);
+                        resolved_gap_target = Some(target);
                         let instruction_tx_clone = instruction_tx.clone();
                         tokio::spawn(async move {
                             if let Err(e) = backfill_service
@@ -187,6 +227,14 @@ pub async fn run(
     let checkpoint_handle = checkpoint_writer.start(checkpoint_rx);
     info!("CheckpointWriter service started");
 
+    // Resolve the durable frontier that seeds the live datasource. Read the
+    // committed checkpoint once (the processor, its only producer, starts last,
+    // so no update has flowed yet); fail closed via `?` rather than mis-seed.
+    #[cfg(feature = "datasource-rpc")]
+    let committed_checkpoint = get_last_checkpoint(&storage, common_config.program_type).await?;
+    #[cfg(feature = "datasource-rpc")]
+    let frontier = durable_frontier(resolved_gap_target, committed_checkpoint);
+
     // 6. Start datasource
     let mut datasource: Box<dyn DataSource> = match indexer_config.datasource_type {
         #[cfg(feature = "datasource-rpc")]
@@ -199,7 +247,11 @@ pub async fn run(
 
             let mut source = RpcPollingSource::new(
                 common_config.rpc_url.clone(),
-                rpc_config.from_slot,
+                rpc_live_from_slot(
+                    resolved_gap_target,
+                    rpc_config.from_slot,
+                    committed_checkpoint,
+                ),
                 rpc_config.poll_interval_ms,
                 rpc_config.error_retry_interval_ms,
                 rpc_config.batch_size,
@@ -270,6 +322,7 @@ pub async fn run(
                         indexer_config.backfill.batch_size,
                     )
                     .with_storage(storage.clone())
+                    .with_initial_gap_floor(frontier)
             };
 
             let source = if let Some(h) = health.clone() {
@@ -344,4 +397,43 @@ pub async fn run(
 
     info!("Indexer shutdown complete");
     Ok(())
+}
+
+#[cfg(all(test, feature = "datasource-rpc"))]
+mod tests {
+    use super::{durable_frontier, rpc_live_from_slot};
+
+    // T0 inclusive backfill target; CP a prior durable checkpoint; CFG a stale
+    // operator-set from_slot. Distinct values so a regressed branch can't alias.
+    const T0: u64 = 110;
+    const CP: u64 = 90;
+    const CFG: u64 = 500;
+
+    #[test]
+    fn rpc_live_from_slot_covers_every_case() {
+        let cases = [
+            // (resolved_gap_target, config_from_slot, checkpoint, expected)
+            (Some(T0), None, 0, Some(T0 + 1)),
+            (Some(T0), Some(CFG), CP, Some(T0 + 1)),
+            (None, Some(CFG), CP, Some(CFG)),
+            (None, None, CP, Some(CP + 1)),
+            (None, None, 0, None),
+            (None, Some(CFG), 0, Some(CFG)),
+        ];
+        for (gap, cfg, cp, expected) in cases {
+            assert_eq!(
+                rpc_live_from_slot(gap, cfg, cp),
+                expected,
+                "gap={gap:?} cfg={cfg:?} cp={cp}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_frontier_covers_every_case() {
+        assert_eq!(durable_frontier(Some(T0), 0), Some(T0));
+        assert_eq!(durable_frontier(Some(T0), CP), Some(T0));
+        assert_eq!(durable_frontier(None, CP), Some(CP));
+        assert_eq!(durable_frontier(None, 0), None);
+    }
 }
