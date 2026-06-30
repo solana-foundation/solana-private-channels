@@ -147,9 +147,52 @@ impl MockStorage {
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         let mut pending = self.pending_transactions.lock().unwrap();
+
+        // Withdrawals: mirror the Postgres frontier dequeue. Return Pending
+        // withdrawals in nonce order, only those below the lowest active
+        // (non-Pending) nonce, and mark them Processing in place (kept in the
+        // store so they act as the barrier on the next call).
+        if matches!(transaction_type, TransactionType::Withdrawal) {
+            let barrier = pending
+                .iter()
+                .filter(|t| {
+                    t.transaction_type == TransactionType::Withdrawal
+                        && matches!(
+                            t.status,
+                            TransactionStatus::Processing
+                                | TransactionStatus::Parked
+                                | TransactionStatus::PendingRemint
+                                | TransactionStatus::ManualReview
+                        )
+                })
+                .filter_map(|t| t.withdrawal_nonce)
+                .min();
+
+            let mut eligible: Vec<(i64, i64)> = pending
+                .iter()
+                .filter(|t| {
+                    t.transaction_type == TransactionType::Withdrawal
+                        && t.status == TransactionStatus::Pending
+                })
+                .filter_map(|t| t.withdrawal_nonce.map(|nonce| (nonce, t.id)))
+                .filter(|(nonce, _)| barrier.is_none_or(|b| *nonce < b))
+                .collect();
+            eligible.sort_by_key(|(nonce, _)| *nonce);
+            eligible.truncate(limit.max(0) as usize);
+
+            let mut matched = Vec::new();
+            for (_, id) in eligible {
+                if let Some(txn) = pending.iter_mut().find(|t| t.id == id) {
+                    txn.status = TransactionStatus::Processing;
+                    matched.push(txn.clone());
+                }
+            }
+            return Ok(matched);
+        }
+
+        // Deposits: FIFO by insertion order, removed from the queue on return.
         let mut matched = Vec::new();
         let mut remaining = Vec::new();
-
         for txn in pending.drain(..) {
             if txn.transaction_type == transaction_type && (matched.len() as i64) < limit {
                 matched.push(txn);
@@ -160,6 +203,22 @@ impl MockStorage {
 
         *pending = remaining;
         Ok(matched)
+    }
+
+    pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
+        let pending = self.pending_transactions.lock().unwrap();
+        Ok(pending.iter().any(|t| {
+            t.transaction_type == TransactionType::Withdrawal
+                && t.withdrawal_nonce.is_some_and(|n| n < nonce)
+                && matches!(
+                    t.status,
+                    TransactionStatus::Pending
+                        | TransactionStatus::Processing
+                        | TransactionStatus::Parked
+                        | TransactionStatus::PendingRemint
+                        | TransactionStatus::ManualReview
+                )
+        }))
     }
 
     pub async fn get_committed_checkpoint(

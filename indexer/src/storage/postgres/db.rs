@@ -1081,20 +1081,48 @@ impl PostgresDb {
         transaction_type: TransactionType,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        // Deposits dequeue FIFO by created_at. Withdrawals dequeue by nonce and
+        // enforce a frontier: never hand out a nonce while a lower one is still
+        // active, or the lower nonce gets stranded on a closed SMT tree after a
+        // boundary rotation. The `< MIN(lower active nonce)` filter is the
+        // frontier; dropping SKIP LOCKED stops a second worker from skipping a
+        // locked lower nonce and leapfrogging to a higher one.
+        let is_withdrawal = matches!(transaction_type, TransactionType::Withdrawal);
+        let (order_col, frontier_filter, lock_clause) = if is_withdrawal {
+            (
+                transaction_cols::WITHDRAWAL_NONCE,
+                format!(
+                    " AND {nonce} < COALESCE((SELECT MIN({nonce}) FROM transactions \
+                     WHERE {ttype} = $2 AND {status} IN \
+                     ('processing', 'parked', 'pending_remint', 'manual_review')), {max})",
+                    nonce = transaction_cols::WITHDRAWAL_NONCE,
+                    ttype = transaction_cols::TRANSACTION_TYPE,
+                    status = transaction_cols::STATUS,
+                    max = i64::MAX,
+                ),
+                "FOR UPDATE",
+            )
+        } else {
+            (
+                transaction_cols::CREATED_AT,
+                String::new(),
+                "FOR UPDATE SKIP LOCKED",
+            )
+        };
+
         // Use a transaction to ensure atomicity
         let mut tx = self.pool.begin().await?;
 
-        // Lock rows with FOR UPDATE SKIP LOCKED
         let transactions = sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
             FROM transactions
-            WHERE {} = $1 AND {} = $2
+            WHERE {} = $1 AND {} = $2{frontier}
             ORDER BY {} ASC
             LIMIT $3
-            FOR UPDATE SKIP LOCKED
+            {lock}
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1123,8 +1151,10 @@ impl PostgresDb {
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
-            // Ordering (FIFO)
-            transaction_cols::CREATED_AT,
+            // Ordering: nonce for withdrawals, created_at for deposits
+            order_col,
+            frontier = frontier_filter,
+            lock = lock_clause,
         ))
         .bind(TransactionStatus::Pending)
         .bind(transaction_type)
@@ -1150,6 +1180,34 @@ impl PostgresDb {
         tx.commit().await?;
 
         Ok(transactions)
+    }
+
+    /// True if any withdrawal with a lower nonce is still active (non-terminal).
+    /// Gates the boundary rotation: rotating while a lower nonce is unresolved
+    /// would strand it on the closed tree.
+    pub async fn has_active_withdrawal_below_internal(
+        &self,
+        nonce: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let exists: bool = sqlx::query_scalar(&format!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM transactions
+                WHERE {ttype} = $2
+                  AND {nonce} < $1
+                  AND {status} IN
+                      ('pending', 'processing', 'parked', 'pending_remint', 'manual_review')
+            )
+            "#,
+            ttype = transaction_cols::TRANSACTION_TYPE,
+            nonce = transaction_cols::WITHDRAWAL_NONCE,
+            status = transaction_cols::STATUS,
+        ))
+        .bind(nonce)
+        .bind(TransactionType::Withdrawal)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
     }
 
     /// Returns true if the row was updated; false if already terminal.

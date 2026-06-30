@@ -23,6 +23,7 @@ pub mod get_release_signatures;
 pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
+pub mod has_active_withdrawal_below;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
@@ -247,6 +248,10 @@ impl Storage {
         transaction_type: TransactionType,
     ) -> Result<i64, StorageError> {
         count_pending_transactions::count_pending_transactions(self, transaction_type).await
+    }
+
+    pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
+        has_active_withdrawal_below::has_active_withdrawal_below(self, nonce).await
     }
 
     /// Get completed withdrawal nonces in the given range [min_nonce, max_nonce)
