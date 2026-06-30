@@ -198,6 +198,11 @@ impl TransactionProcessor {
                             "Slot {} writes failed after {} attempt(s); giving up: {}",
                             slot, attempt, e
                         );
+                        // Count the slot once, only when the retry budget is spent;
+                        // a transient failure ridden out by the retry is not an error.
+                        metrics::INDEXER_SLOT_SAVE_ERRORS
+                            .with_label_values(&[program_type.as_label()])
+                            .inc();
                         return Err(e.into());
                     }
                     let backoff = self.retry.backoff(attempt);
@@ -270,9 +275,6 @@ impl TransactionProcessor {
                 }
                 Err(e) => {
                     error!("Failed to save mints from slot {}: {}", slot, e);
-                    metrics::INDEXER_SLOT_SAVE_ERRORS
-                        .with_label_values(&[program_type.as_label()])
-                        .inc();
                     return Err(e);
                 }
             }
@@ -292,9 +294,6 @@ impl TransactionProcessor {
                         "Failed to save mint status history from slot {}: {}",
                         slot, e
                     );
-                    metrics::INDEXER_SLOT_SAVE_ERRORS
-                        .with_label_values(&[program_type.as_label()])
-                        .inc();
                     return Err(e);
                 }
             }
@@ -309,9 +308,6 @@ impl TransactionProcessor {
             touched.dedup();
             if let Err(e) = self.storage.sync_mint_status(&touched).await {
                 error!("Failed to sync mint status mirror for slot {}: {}", slot, e);
-                metrics::INDEXER_SLOT_SAVE_ERRORS
-                    .with_label_values(&[program_type.as_label()])
-                    .inc();
                 return Err(e);
             }
         }
@@ -343,9 +339,6 @@ impl TransactionProcessor {
                 }
                 Err(e) => {
                     error!("Failed to save transactions from slot {}: {}", slot, e);
-                    metrics::INDEXER_SLOT_SAVE_ERRORS
-                        .with_label_values(&[program_type.as_label()])
-                        .inc();
                     return Err(e);
                 }
             }
@@ -1614,8 +1607,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            committed >= N,
-            "checkpoint advanced through the healed slot"
+            committed >= N2,
+            "checkpoint advanced through all slots after the healed one, not stalled at N"
         );
         // N's deposit row is present despite the transient failure.
         let inserted = mock.inserted_transactions.lock().unwrap();
