@@ -411,6 +411,10 @@ fn cap_lamports(
         let Ok(ProcessedTransaction::Executed(executed)) = result else {
             continue;
         };
+        if !executed.was_successful() {
+            // Failed executed txs commit no account writes downstream.
+            continue;
+        }
         for (index, (_, acct)) in executed.loaded_transaction.accounts.iter_mut().enumerate() {
             // Only writable accounts are persisted by the settler / BOB update.
             if !tx.is_writable(index) {
@@ -835,9 +839,11 @@ mod tests {
     // know (`transfer` → idx 0,1 writable, idx 2 system_program read-only),
     // run the cap, and read the accounts back.
 
-    /// Build a single-tx Executed output carrying `accounts` at the loaded
-    /// transaction's account positions.
-    fn executed_with(accounts: Vec<(Pubkey, AccountSharedData)>) -> TransactionProcessingResult {
+    /// Build a single-tx Executed output carrying `accounts` with the given `status`.
+    fn executed_with_status(
+        status: Result<(), solana_transaction_error::TransactionError>,
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> TransactionProcessingResult {
         use solana_svm::account_loader::LoadedTransaction;
         use solana_svm::transaction_execution_result::{
             ExecutedTransaction, TransactionExecutionDetails,
@@ -849,7 +855,7 @@ mod tests {
                     ..Default::default()
                 },
                 execution_details: TransactionExecutionDetails {
-                    status: Ok(()),
+                    status,
                     log_messages: None,
                     inner_instructions: None,
                     return_data: None,
@@ -859,6 +865,11 @@ mod tests {
                 programs_modified_by_tx: std::collections::HashMap::new(),
             },
         )))
+    }
+
+    /// A successful single-tx Executed output carrying `accounts`.
+    fn executed_with(accounts: Vec<(Pubkey, AccountSharedData)>) -> TransactionProcessingResult {
+        executed_with_status(Ok(()), accounts)
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.
@@ -962,6 +973,45 @@ mod tests {
             out[2].lamports(),
             99,
             "read-only account must not be capped"
+        );
+    }
+
+    /// A failed executed tx commits no account writes downstream, so cap_lamports leaves its loaded accounts untouched.
+    #[test]
+    fn cap_skips_failed_executed() {
+        let tx = transfer(&Keypair::new(), &Pubkey::new_unique(), 0);
+        let failed = executed_with_status(
+            Err(
+                solana_transaction_error::TransactionError::InstructionError(
+                    1,
+                    solana_sdk::instruction::InstructionError::Custom(0),
+                ),
+            ),
+            vec![
+                (Pubkey::new_unique(), data_account(11)),
+                (Pubkey::new_unique(), dataless_account(10)),
+            ],
+        );
+        let mut output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![failed],
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+        };
+        cap_lamports(&mut output, std::slice::from_ref(&tx));
+        let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
+            panic!("expected executed");
+        };
+        let accts = &executed.loaded_transaction.accounts;
+        assert_eq!(
+            accts[0].1.lamports(),
+            11,
+            "failed-tx data account must be left untouched"
+        );
+        assert_eq!(
+            accts[1].1.lamports(),
+            10,
+            "failed-tx dataless account must be left untouched"
         );
     }
 
@@ -1118,6 +1168,64 @@ mod tests {
         // transfer still executes; nothing native persists.
         assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
         assert!(bob_balance(&deps.bob, &b.pubkey()).is_none_or(|l| l == 0));
+    }
+
+    // Real-SVM premise: a mid-tx failure is Executed{Err} and persists nothing.
+
+    /// A two-instruction system tx where ix0 succeeds and ix1 fails on
+    /// insufficient funds. The SVM returns `Executed` with `status.is_err()`,
+    /// proving the premise that a partial failure is not a top-level `Err`. The
+    /// pre-funded payer must keep its pre-execution balance in BOB: its
+    /// rolled-back intermediate state must not be committed. The data-distinguishing
+    /// assertion is carried by the bob/settle unit tests; here both system
+    /// recipients are dataless so the cap would zero them regardless.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_failure_through_svm_is_executed_err_and_persists_nothing() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        fund(&mut deps.bob, &payer.pubkey(), 100);
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+
+        // ix0: payer pays A (60) and succeeds; ix1: payer pays B (60) and fails (only 40 left).
+        let ix0 = solana_system_interface::instruction::transfer(&payer.pubkey(), &a, 60);
+        let ix1 = solana_system_interface::instruction::transfer(&payer.pubkey(), &b, 60);
+        let msg = Message::new(&[ix0, ix1], Some(&payer.pubkey()));
+        let raw = Transaction::new(&[&payer], msg, Hash::default());
+        let tx = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
+            .expect("failed to build two-instruction tx");
+
+        let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+
+        let r = regular_result(&result, 0);
+        assert!(
+            is_executed(r),
+            "the SVM returns Executed for a mid-tx failure"
+        );
+        let Ok(ProcessedTransaction::Executed(executed)) = r else {
+            panic!("expected executed");
+        };
+        assert!(
+            !executed.was_successful(),
+            "the partial failure surfaces as Executed with an Err status"
+        );
+        assert_eq!(
+            bob_balance(&deps.bob, &payer.pubkey()),
+            Some(100),
+            "failed tx must not clobber the pre-funded payer with its rolled-back state"
+        );
+        assert!(
+            bob_balance(&deps.bob, &a).is_none_or(|l| l == 0),
+            "intermediate credit to A must not persist"
+        );
+        assert!(
+            bob_balance(&deps.bob, &b).is_none_or(|l| l == 0),
+            "B was never credited and must be absent"
+        );
     }
 
     // ── Path parity & invariants ──

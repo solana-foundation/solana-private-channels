@@ -24,6 +24,7 @@ pub fn get_stored_transaction(
     let meta = match processed {
         ProcessedTransaction::Executed(executed) => {
             let details = &executed.execution_details;
+            // Balances stay one-per-loaded-account (aligned with the account keys) for every executed result, success or failure, so callers can index balances by account.
             TransactionStatusMeta {
                 status: details.status.clone(),
                 fee: executed.loaded_transaction.fee_details.total_fee(),
@@ -145,5 +146,93 @@ mod tests {
         let parsed = encode_transaction_data(data, UiTransactionEncoding::JsonParsed);
         let base64 = encode_transaction_data(data, UiTransactionEncoding::Base64);
         assert_eq!(parsed, base64);
+    }
+
+    use solana_sdk::{
+        account::AccountSharedData, instruction::InstructionError, pubkey::Pubkey,
+        signature::Keypair, transaction::TransactionError,
+    };
+    use solana_svm::account_loader::LoadedTransaction;
+    use solana_svm::transaction_execution_result::{
+        ExecutedTransaction, TransactionExecutionDetails,
+    };
+
+    fn executed_processed(
+        status: Result<(), TransactionError>,
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> ProcessedTransaction {
+        ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts,
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status,
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: std::collections::HashMap::new(),
+        }))
+    }
+
+    /// A successful executed tx records its loaded-account lamports as the stored meta balances.
+    #[test]
+    fn stored_meta_records_balances_for_successful_executed() {
+        let tx = crate::test_helpers::create_test_sanitized_transaction(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            0,
+        );
+        let acct = AccountSharedData::new(7, 0, &Pubkey::new_unique());
+        let processed = executed_processed(Ok(()), vec![(Pubkey::new_unique(), acct)]);
+
+        let stored = get_stored_transaction(&tx, 1, 0, &processed);
+
+        assert_eq!(stored.meta.pre_balances, vec![7]);
+        assert_eq!(stored.meta.post_balances, vec![7]);
+    }
+
+    /// A failed executed tx keeps its balance arrays aligned with the loaded accounts (one entry per account) so callers can still index balances by account, and its error status is recorded.
+    #[test]
+    fn stored_meta_keeps_balances_aligned_for_failed_executed() {
+        let tx = crate::test_helpers::create_test_sanitized_transaction(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            0,
+        );
+        let accounts = vec![
+            (
+                Pubkey::new_unique(),
+                AccountSharedData::new(6, 0, &Pubkey::new_unique()),
+            ),
+            (
+                Pubkey::new_unique(),
+                AccountSharedData::new(4, 0, &Pubkey::new_unique()),
+            ),
+        ];
+        let n = accounts.len();
+        let processed = executed_processed(
+            Err(TransactionError::InstructionError(
+                1,
+                InstructionError::Custom(0),
+            )),
+            accounts,
+        );
+
+        let stored = get_stored_transaction(&tx, 1, 0, &processed);
+
+        assert_eq!(
+            stored.meta.pre_balances.len(),
+            n,
+            "balances must stay aligned with the account list on failure"
+        );
+        assert_eq!(stored.meta.post_balances.len(), n);
+        assert!(
+            stored.meta.err.is_some(),
+            "failed executed tx must still record its error status"
+        );
     }
 }
