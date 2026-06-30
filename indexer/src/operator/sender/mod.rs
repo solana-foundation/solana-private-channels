@@ -90,6 +90,16 @@ pub mod test_hooks {
         super::transaction::poll_in_flight(state, storage_tx).await
     }
 
+    /// Drives one `drain_rotation_retry_queue` pass. Classifies each queued
+    /// tree-mismatched withdrawal as future (requeue), matched (rebuild+submit),
+    /// or stale (escalate to ManualReview).
+    pub async fn drain_rotation_retry_queue(
+        state: &mut SenderState,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::drain_rotation_retry_queue(state, storage_tx).await
+    }
+
     /// Drives `handle_confirmation_result` end-to-end. Used by tests
     /// that synthesise a `Result<ConfirmationResult, TransactionError>`
     /// to pin which on-chain error arm routes where without going
@@ -399,32 +409,37 @@ pub(super) async fn drain_rotation_retry_queue(
             // Never broadcast, so the release never landed: scrub state and
             // escalate to ManualReview (runbook: withdrawal_manual_review).
             Ordering::Less => {
+                let Some(transaction_id) = ctx.transaction_id else {
+                    error!(
+                        "Stale rotation retry for nonce {} has no transaction_id; skipping escalation",
+                        nonce
+                    );
+                    continue;
+                };
                 warn!(
                     "Stale rotation retry: nonce {} belongs to tree {} but sender is on {} - escalating to ManualReview",
                     nonce, expected_tree_index, current_tree_index
                 );
                 cleanup_failed_transaction(state, Some(nonce));
-                if let Some(transaction_id) = ctx.transaction_id {
-                    send_guaranteed(
-                        storage_tx,
-                        TransactionStatusUpdate {
-                            transaction_id,
-                            trace_id: ctx.trace_id.clone(),
-                            status: TransactionStatus::ManualReview,
-                            counterpart_signature: None,
-                            processed_at: Some(Utc::now()),
-                            error_message: Some(format!(
-                                "stale tree index: nonce {} belongs to tree {}, sender on {}; release can never land on current SMT",
-                                nonce, expected_tree_index, current_tree_index
-                            )),
-                            remint_signature: None,
-                            remint_attempted: false,
-                        },
-                        "transaction status update",
-                    )
-                    .await
-                    .ok();
-                }
+                send_guaranteed(
+                    storage_tx,
+                    TransactionStatusUpdate {
+                        transaction_id,
+                        trace_id: ctx.trace_id.clone(),
+                        status: TransactionStatus::ManualReview,
+                        counterpart_signature: None,
+                        processed_at: Some(Utc::now()),
+                        error_message: Some(format!(
+                            "stale tree index: nonce {} belongs to tree {}, sender on {}; release can never land on current SMT",
+                            nonce, expected_tree_index, current_tree_index
+                        )),
+                        remint_signature: None,
+                        remint_attempted: false,
+                    },
+                    "transaction status update",
+                )
+                .await
+                .ok();
             }
             // Future: local tree hasn't reached this nonce's tree; requeue and wait.
             Ordering::Greater => {
