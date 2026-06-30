@@ -1146,18 +1146,18 @@ mod tests {
             },
         );
 
-        // Seed a lower-nonce withdrawal that is still active (nonce 1 < boundary).
-        // This is what the guard must see and refuse to rotate past.
-        mock.pending_transactions
-            .lock()
-            .unwrap()
-            .push(make_db_transaction(
-                2,
-                &mint_pubkey.to_string(),
-                &recipient.to_string(),
-                Some(1),
-                TransactionType::Withdrawal,
-            ));
+        // Seed a lower-nonce withdrawal stuck off the sender path (Parked, nonce 1
+        // < boundary). This is what the guard must see and refuse to rotate past.
+        // (Processing rows are excluded - the sender's in-flight guard covers those.)
+        let mut lower = make_db_transaction(
+            2,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(1),
+            TransactionType::Withdrawal,
+        );
+        lower.status = TransactionStatus::Parked;
+        mock.pending_transactions.lock().unwrap().push(lower);
 
         // Boundary nonce → target tree 1; on-chain index 0 means a rotation WOULD
         // fire here (0 < 1) absent the guard — so an empty sender proves the guard.

@@ -1091,10 +1091,13 @@ impl PostgresDb {
         let (order_col, frontier_filter, lock_clause) = if is_withdrawal {
             (
                 transaction_cols::WITHDRAWAL_NONCE,
+                // NULL-nonce rows are poison (e.g. a corrupt withdrawal); they have
+                // no tree, so the frontier doesn't apply - still dequeue them so the
+                // processor can quarantine them. ORDER BY ... ASC sorts them last.
                 format!(
-                    " AND {nonce} < COALESCE((SELECT MIN({nonce}) FROM transactions \
-                     WHERE {ttype} = $2 AND {status} IN \
-                     ('processing', 'parked', 'pending_remint', 'manual_review')), {max})",
+                    " AND ({nonce} IS NULL OR {nonce} < COALESCE((SELECT MIN({nonce}) \
+                     FROM transactions WHERE {ttype} = $2 AND {status} IN \
+                     ('processing', 'parked', 'pending_remint', 'manual_review')), {max}))",
                     nonce = transaction_cols::WITHDRAWAL_NONCE,
                     ttype = transaction_cols::TRANSACTION_TYPE,
                     status = transaction_cols::STATUS,
@@ -1182,9 +1185,11 @@ impl PostgresDb {
         Ok(transactions)
     }
 
-    /// True if any withdrawal with a lower nonce is still active (non-terminal).
-    /// Gates the boundary rotation: rotating while a lower nonce is unresolved
-    /// would strand it on the closed tree.
+    /// True if any withdrawal with a lower nonce is unresolved and not yet handed
+    /// to the sender. Gates the boundary rotation: rotating past such a nonce
+    /// would strand it on the closed tree. `Processing` rows are excluded on
+    /// purpose - they are already dispatched ahead of the rotation, so the
+    /// sender's in-flight guard holds the rotation until they settle.
     pub async fn has_active_withdrawal_below_internal(
         &self,
         nonce: i64,
@@ -1195,8 +1200,7 @@ impl PostgresDb {
                 SELECT 1 FROM transactions
                 WHERE {ttype} = $2
                   AND {nonce} < $1
-                  AND {status} IN
-                      ('pending', 'processing', 'parked', 'pending_remint', 'manual_review')
+                  AND {status} IN ('pending', 'parked', 'pending_remint', 'manual_review')
             )
             "#,
             ttype = transaction_cols::TRANSACTION_TYPE,

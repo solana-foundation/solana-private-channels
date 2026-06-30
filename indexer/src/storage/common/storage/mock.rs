@@ -168,7 +168,8 @@ impl MockStorage {
                 .filter_map(|t| t.withdrawal_nonce)
                 .min();
 
-            let mut eligible: Vec<(i64, i64)> = pending
+            // Numbered nonces below the frontier, in nonce order.
+            let mut numbered: Vec<(i64, i64)> = pending
                 .iter()
                 .filter(|t| {
                     t.transaction_type == TransactionType::Withdrawal
@@ -177,11 +178,26 @@ impl MockStorage {
                 .filter_map(|t| t.withdrawal_nonce.map(|nonce| (nonce, t.id)))
                 .filter(|(nonce, _)| barrier.is_none_or(|b| *nonce < b))
                 .collect();
-            eligible.sort_by_key(|(nonce, _)| *nonce);
-            eligible.truncate(limit.max(0) as usize);
+            numbered.sort_by_key(|(nonce, _)| *nonce);
+
+            // NULL-nonce rows are poison; the frontier doesn't apply. Dequeue them
+            // (sorted last, mirroring SQL ORDER BY ... ASC) so the processor can
+            // quarantine them.
+            let null_nonce_ids = pending
+                .iter()
+                .filter(|t| {
+                    t.transaction_type == TransactionType::Withdrawal
+                        && t.status == TransactionStatus::Pending
+                        && t.withdrawal_nonce.is_none()
+                })
+                .map(|t| t.id);
+
+            let mut ids: Vec<i64> = numbered.into_iter().map(|(_, id)| id).collect();
+            ids.extend(null_nonce_ids);
+            ids.truncate(limit.max(0) as usize);
 
             let mut matched = Vec::new();
-            for (_, id) in eligible {
+            for id in ids {
                 if let Some(txn) = pending.iter_mut().find(|t| t.id == id) {
                     txn.status = TransactionStatus::Processing;
                     matched.push(txn.clone());
@@ -207,13 +223,14 @@ impl MockStorage {
 
     pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
         let pending = self.pending_transactions.lock().unwrap();
+        // Processing excluded on purpose: those are already dispatched ahead of
+        // the rotation, so the sender's in-flight guard covers them.
         Ok(pending.iter().any(|t| {
             t.transaction_type == TransactionType::Withdrawal
                 && t.withdrawal_nonce.is_some_and(|n| n < nonce)
                 && matches!(
                     t.status,
                     TransactionStatus::Pending
-                        | TransactionStatus::Processing
                         | TransactionStatus::Parked
                         | TransactionStatus::PendingRemint
                         | TransactionStatus::ManualReview
