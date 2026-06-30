@@ -149,21 +149,25 @@ pub mod test_hooks {
     }
 }
 
+use crate::channel_utils::send_guaranteed;
 use crate::error::OperatorError;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
 use crate::operator::utils::instruction_util::TransactionBuilder;
 use crate::operator::ReleaseFundsBuilderWithNonce;
 use crate::operator::RpcClientWithRetry;
+use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use crate::ProgramType;
+use chrono::Utc;
 use solana_sdk::commitment_config::CommitmentLevel;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-use proof::take_pending_rotation_if_ready;
+use proof::{cleanup_failed_transaction, take_pending_rotation_if_ready};
 use transaction::{
     handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
 };
@@ -335,21 +339,8 @@ pub async fn run_sender(
                 // Retry withdrawals parked while an ambiguous nonce blocked their tree
                 drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
 
-                // Process any transactions that were blocked by rotation
-                while let Some((ctx, builder)) = state.rotation_retry_queue.pop() {
-                    let nonce = ctx.withdrawal_nonce.expect("rotation retry must have nonce");
-                    let transaction_id = ctx.transaction_id.expect("rotation retry must have transaction_id");
-                    let trace_id = ctx.trace_id.clone().expect("rotation retry must have trace_id");
-                    let remint_info = state.remint_cache.get(&nonce).cloned();
-                    if remint_info.is_none() {
-                        error!("Missing remint_info for rotation retry nonce {} - remint will not be possible on failure", nonce);
-                    }
-                    info!(trace_id = %trace_id, "Retrying blocked nonce {} after rotation", nonce);
-                    let tx_builder = TransactionBuilder::ReleaseFunds(Box::new(
-                        ReleaseFundsBuilderWithNonce { builder, nonce, transaction_id, trace_id, remint_info },
-                    ));
-                    handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
-                }
+                // Retry withdrawals blocked by a tree-index mismatch after rotation
+                drain_rotation_retry_queue(&mut state, &storage_tx).await;
             }
 
             // Back-pressure: stop consuming new transactions when in_flight is full.
@@ -382,6 +373,89 @@ pub async fn run_sender(
 
     info!("Sender stopped gracefully");
     Ok(())
+}
+
+/// Retry withdrawals blocked by a tree-index mismatch after a rotation.
+/// Drains a snapshot, not the live queue: a still-mismatched item is requeued
+/// for a later tick, never re-popped in this pass (the live queue would spin).
+pub(super) async fn drain_rotation_retry_queue(
+    state: &mut SenderState,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+) {
+    for (ctx, builder) in std::mem::take(&mut state.rotation_retry_queue) {
+        let nonce = ctx
+            .withdrawal_nonce
+            .expect("rotation retry must have nonce");
+        let Some(current_tree_index) = state.smt_state.as_ref().map(|s| s.smt_state.tree_index())
+        else {
+            // No local SMT (not expected here); keep it for the next tick.
+            state.rotation_retry_queue.push((ctx, builder));
+            continue;
+        };
+        let expected_tree_index = nonce / MAX_TREE_LEAVES as u64;
+
+        match expected_tree_index.cmp(&current_tree_index) {
+            // Stale: tree rotated past this nonce; retrying can never succeed.
+            // Never broadcast, so the release never landed: scrub state and
+            // escalate to ManualReview (runbook: withdrawal_manual_review).
+            Ordering::Less => {
+                warn!(
+                    "Stale rotation retry: nonce {} belongs to tree {} but sender is on {} - escalating to ManualReview",
+                    nonce, expected_tree_index, current_tree_index
+                );
+                cleanup_failed_transaction(state, Some(nonce));
+                if let Some(transaction_id) = ctx.transaction_id {
+                    send_guaranteed(
+                        storage_tx,
+                        TransactionStatusUpdate {
+                            transaction_id,
+                            trace_id: ctx.trace_id.clone(),
+                            status: TransactionStatus::ManualReview,
+                            counterpart_signature: None,
+                            processed_at: Some(Utc::now()),
+                            error_message: Some(format!(
+                                "stale tree index: nonce {} belongs to tree {}, sender on {}; release can never land on current SMT",
+                                nonce, expected_tree_index, current_tree_index
+                            )),
+                            remint_signature: None,
+                            remint_attempted: false,
+                        },
+                        "transaction status update",
+                    )
+                    .await
+                    .ok();
+                }
+            }
+            // Future: local tree hasn't reached this nonce's tree; requeue and wait.
+            Ordering::Greater => {
+                state.rotation_retry_queue.push((ctx, builder));
+            }
+            // Tree caught up: rebuild and submit.
+            Ordering::Equal => {
+                let transaction_id = ctx
+                    .transaction_id
+                    .expect("rotation retry must have transaction_id");
+                let trace_id = ctx
+                    .trace_id
+                    .clone()
+                    .expect("rotation retry must have trace_id");
+                let remint_info = state.remint_cache.get(&nonce).cloned();
+                if remint_info.is_none() {
+                    error!("Missing remint_info for rotation retry nonce {} - remint will not be possible on failure", nonce);
+                }
+                info!(trace_id = %trace_id, "Retrying blocked nonce {} after rotation", nonce);
+                let tx_builder =
+                    TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
+                        builder,
+                        nonce,
+                        transaction_id,
+                        trace_id,
+                        remint_info,
+                    }));
+                handle_transaction_submission(state, tx_builder, storage_tx).await;
+            }
+        }
+    }
 }
 
 /// Retry withdrawals parked while an ambiguous nonce blocked their tree.
@@ -484,13 +558,14 @@ mod tests {
     use crate::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::sender::types::{
-        InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, SenderState,
-        TransactionContext, MAX_IN_FLIGHT,
+        InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, SenderSMTState,
+        SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
         ExtraErrorCheckPolicy, ReleaseFundsBuilderWithNonce, RetryPolicy, WithdrawalRemintInfo,
     };
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
+    use crate::operator::utils::smt_util::SmtState;
     use crate::operator::MintCache;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
@@ -538,6 +613,15 @@ mod tests {
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+        }
+    }
+
+    /// Local SMT pinned to `tree_index`, so a test can pick the mismatch direction
+    /// against a queued nonce (test config: MAX_TREE_LEAVES = 8, so tree = nonce / 8).
+    fn smt_at(tree_index: u64) -> SenderSMTState {
+        SenderSMTState {
+            smt_state: SmtState::new(tree_index),
+            nonce_to_builder: HashMap::new(),
         }
     }
 
@@ -896,6 +980,143 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "heartbeat is a direct CAS, not a status update"
+        );
+    }
+
+    // ── drain_rotation_retry_queue ────────────────────────────────────
+
+    /// Future mismatch: the nonce's tree is ahead of the local SMT, so it can't
+    /// build yet. It must be requeued for a later tick, never retried in this pass.
+    /// Reaching the asserts proves the snapshot drain returns instead of spinning.
+    #[tokio::test]
+    async fn rotation_drain_future_requeues() {
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Local SMT on tree 0; first nonce of tree 1 is a future mismatch.
+        let future_nonce = MAX_TREE_LEAVES as u64;
+        state.smt_state = Some(smt_at(0));
+        state.rotation_retry_queue.push((
+            TransactionContext {
+                transaction_id: Some(80),
+                withdrawal_nonce: Some(future_nonce),
+                trace_id: Some("trace-8".to_string()),
+            },
+            ReleaseFundsBuilder::new(),
+        ));
+
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        // Item is back in the queue for the next tick, unchanged.
+        assert_eq!(state.rotation_retry_queue.len(), 1);
+        assert_eq!(
+            state.rotation_retry_queue[0].0.withdrawal_nonce,
+            Some(future_nonce)
+        );
+        // Not escalated: no status update emitted.
+        assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// Stale mismatch: the local SMT has rotated past this nonce's tree, so a
+    /// retry can never succeed. It must leave the queue, get its remint_cache
+    /// entry scrubbed, and be escalated to ManualReview.
+    #[tokio::test]
+    async fn rotation_drain_stale_escalates_to_manual_review() {
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Local SMT on tree 1; nonce 2 belongs to tree 0 (stale, can't return).
+        let stale_nonce = 2u64;
+        state.smt_state = Some(smt_at(1));
+        state.remint_cache.insert(
+            stale_nonce,
+            WithdrawalRemintInfo {
+                transaction_id: 20,
+                trace_id: "trace-2".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+        );
+        state.rotation_retry_queue.push((
+            TransactionContext {
+                transaction_id: Some(20),
+                withdrawal_nonce: Some(stale_nonce),
+                trace_id: Some("trace-2".to_string()),
+            },
+            ReleaseFundsBuilder::new(),
+        ));
+
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        // Dropped from the queue, not retried.
+        assert!(state.rotation_retry_queue.is_empty());
+        // In-memory state scrubbed.
+        assert!(!state.remint_cache.contains_key(&stale_nonce));
+        // Escalated to ManualReview for the right row.
+        let update = storage_rx.try_recv().expect("a status update");
+        assert_eq!(update.transaction_id, 20);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+    }
+
+    /// One drain pass classifies a mixed batch correctly: the future item is
+    /// requeued, the stale item is escalated, and the pass returns (no re-pop).
+    #[tokio::test]
+    async fn rotation_drain_mixed_batch_single_pass() {
+        let mut state = make_sender_state("http://localhost:8899");
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Local SMT on tree 1: nonce 2 is stale (tree 0), first nonce of tree 2
+        // is future.
+        let stale_nonce = 2u64;
+        let future_nonce = 2 * MAX_TREE_LEAVES as u64;
+        state.smt_state = Some(smt_at(1));
+        state.remint_cache.insert(
+            stale_nonce,
+            WithdrawalRemintInfo {
+                transaction_id: 20,
+                trace_id: "trace-2".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1000,
+            },
+        );
+        state.rotation_retry_queue.push((
+            TransactionContext {
+                transaction_id: Some(20),
+                withdrawal_nonce: Some(stale_nonce),
+                trace_id: Some("trace-2".to_string()),
+            },
+            ReleaseFundsBuilder::new(),
+        ));
+        state.rotation_retry_queue.push((
+            TransactionContext {
+                transaction_id: Some(200),
+                withdrawal_nonce: Some(future_nonce),
+                trace_id: Some("trace-future".to_string()),
+            },
+            ReleaseFundsBuilder::new(),
+        ));
+
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        // Only the future item remains, queued for a later tick.
+        assert_eq!(state.rotation_retry_queue.len(), 1);
+        assert_eq!(
+            state.rotation_retry_queue[0].0.withdrawal_nonce,
+            Some(future_nonce)
+        );
+        // The stale item was escalated to ManualReview.
+        let update = storage_rx.try_recv().expect("a status update");
+        assert_eq!(update.transaction_id, 20);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "only the stale item escalates"
         );
     }
 }
