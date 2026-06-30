@@ -44,6 +44,7 @@ pub async fn start_private_channel_indexer(
         from_slot: Some(1),
         encoding: UiTransactionEncoding::Json,
         commitment: CommitmentLevel::Finalized,
+        fallback_rpc_url: None,
     };
 
     let (datasource_type, yellowstone_config) = if let Some(endpoint) = geyser_endpoint {
@@ -135,6 +136,7 @@ pub async fn start_solana_indexer_rpc_polling(
         // without geyser / tower-bft leaves the deposit slots indefinitely
         // unfinalized and `getBlock` returns -32009.
         commitment: CommitmentLevel::Confirmed,
+        fallback_rpc_url: None,
     };
 
     let backfill_config = BackfillConfig {
@@ -214,6 +216,7 @@ pub async fn start_solana_indexer(
         from_slot: Some(1),
         encoding: UiTransactionEncoding::Json,
         commitment: CommitmentLevel::Finalized,
+        fallback_rpc_url: None,
     };
 
     let backfill_config = BackfillConfig {

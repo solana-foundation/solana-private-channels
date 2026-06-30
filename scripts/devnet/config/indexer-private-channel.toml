@@ -18,6 +18,9 @@ start_slot = 0
 poll_interval_ms = 1000
 error_retry_interval_ms = 5000
 batch_size = 50
+# Optional archival fallback for missing-meta slots (live polling only; backfill
+# fails closed). Omit to fail closed. Env: INDEXER_RPC_POLLING_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
 
 [indexer.backfill]
 enabled = false

@@ -61,6 +61,8 @@ struct RpcPollingSection {
     encoding: Option<UiTransactionEncoding>,
     #[serde(default)]
     commitment: Option<CommitmentLevel>,
+    #[serde(default)]
+    fallback_rpc_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +251,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
                 commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                fallback_rpc_url: rpc.fallback_rpc_url,
             };
             (Some(config), None)
         }
@@ -279,6 +282,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
                 commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                fallback_rpc_url: rpc.fallback_rpc_url,
             });
 
             (rpc_config, Some(config))
