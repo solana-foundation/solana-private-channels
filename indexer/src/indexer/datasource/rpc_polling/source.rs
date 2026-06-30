@@ -69,11 +69,23 @@ impl RpcPollingSource {
 }
 
 /// Re-fetches `slot` once from the fallback RPC, returning the block only if it now
-/// passes the missing-meta guard; any error, absent slot, or still-missing meta yields None.
-async fn refetch_missing_meta_via_fallback(fallback: &RpcPoller, slot: u64) -> Option<RpcBlock> {
+/// passes the missing-meta guard AND its blockhash matches `expected_blockhash` (the
+/// primary's). The blockhash check prevents a misconfigured (wrong-cluster, pruned) or
+/// compromised fallback from substituting a divergent-fork or fabricated block for the
+/// same slot number. Any error, absent slot, hash mismatch, or still-missing meta yields None.
+async fn refetch_missing_meta_via_fallback(
+    fallback: &RpcPoller,
+    slot: u64,
+    expected_blockhash: &str,
+) -> Option<RpcBlock> {
     let (_slot, result) = fallback.get_blocks_batch(vec![slot]).await.pop()?;
     match result {
-        Ok(Some(block)) if decoder::first_missing_meta(&block).is_none() => Some(block),
+        Ok(Some(block))
+            if block.blockhash == expected_blockhash
+                && decoder::first_missing_meta(&block).is_none() =>
+        {
+            Some(block)
+        }
         _ => None,
     }
 }
@@ -169,7 +181,12 @@ impl DataSource for RpcPollingSource {
                                 Some(signature) => {
                                     let recovered = match &fallback_poller {
                                         Some(fb) => {
-                                            refetch_missing_meta_via_fallback(fb, slot).await
+                                            refetch_missing_meta_via_fallback(
+                                                fb,
+                                                slot,
+                                                &block.blockhash,
+                                            )
+                                            .await
                                         }
                                         None => None,
                                     };
@@ -431,6 +448,22 @@ mod tests {
         slot: u64,
         expect_at_least: usize,
     ) -> mockito::Mock {
+        mock_get_block_complete_withdraw_with_hash(
+            server,
+            slot,
+            "TestBlockHash11111111111111111111111111111",
+            expect_at_least,
+        )
+    }
+
+    /// As `mock_get_block_complete_withdraw` but with a caller-chosen blockhash, to
+    /// exercise the primary/fallback blockhash cross-check.
+    fn mock_get_block_complete_withdraw_with_hash(
+        server: &mut Server,
+        slot: u64,
+        blockhash: &str,
+        expect_at_least: usize,
+    ) -> mockito::Mock {
         let meta = json!({
             "err": null,
             "logMessages": null,
@@ -448,7 +481,7 @@ mod tests {
                 json!({
                     "jsonrpc": "2.0",
                     "result": {
-                        "blockhash": "TestBlockHash11111111111111111111111111111",
+                        "blockhash": blockhash,
                         "parentSlot": slot - 1,
                         "transactions": [withdraw_block_transaction(meta)]
                     },
@@ -723,6 +756,68 @@ mod tests {
         assert!(
             !emitted_slot_complete,
             "SlotComplete{{slot:100}} must not be emitted when both primary and fallback are incomplete"
+        );
+    }
+
+    /// The fallback returns a complete block but for a different blockhash than the
+    /// primary's (wrong cluster or divergent fork). It must be rejected, not indexed,
+    /// and the slot fails closed (no SlotComplete, no advance).
+    #[tokio::test]
+    async fn missing_meta_fallback_wrong_blockhash_fails_closed() {
+        let mut primary = Server::new_async().await;
+        let mut fallback = Server::new_async().await;
+
+        let _m_slot = mock_get_slot(&mut primary, 105);
+        let m_primary = mock_get_block_missing_meta(&mut primary, 100, 2);
+        let m_fallback = mock_get_block_complete_withdraw_with_hash(
+            &mut fallback,
+            100,
+            "DifferentBlockHash2222222222222222222222222",
+            1,
+        );
+
+        let mut source = RpcPollingSource::new(
+            primary.url(),
+            Some(100),
+            10,
+            10,
+            10,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            Some(fallback.url()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        // Primary re-requested (no advance) and the fallback was consulted but rejected.
+        m_primary.assert();
+        m_fallback.assert();
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        let emitted_slot_complete = messages
+            .iter()
+            .any(|m| matches!(m, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100));
+        let emitted_instruction = messages
+            .iter()
+            .any(|m| matches!(m, ProcessorMessage::Instruction(_)));
+        assert!(
+            !emitted_slot_complete,
+            "SlotComplete{{slot:100}} must not be emitted when the fallback blockhash differs"
+        );
+        assert!(
+            !emitted_instruction,
+            "a fallback block with a mismatched blockhash must not be indexed"
         );
     }
 }

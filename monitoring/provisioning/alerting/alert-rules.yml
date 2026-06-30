@@ -197,7 +197,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} is rejecting a slot whose transactions are missing metadata (meta: null); the checkpoint cannot advance past it. Repoint the datasource RPC (or configure an archival fallback_rpc_url) at a full-history endpoint."
+          summary: "Indexer {{ $labels.program_type }} is rejecting a slot whose transactions are missing metadata (meta: null); the checkpoint cannot advance past it. Repoint the datasource RPC (or configure an archival fallback_rpc_url) at a full-history endpoint. This catches the sustained live-polling wedge; a backfill or resync hitting missing metadata instead aborts loudly with a MissingMeta error in the logs rather than sustaining this metric."
         labels:
           severity: critical
         data:
