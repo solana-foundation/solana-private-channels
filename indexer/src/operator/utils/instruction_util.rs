@@ -268,16 +268,6 @@ impl MintToBuilder {
         self.recipient_ata
     }
 
-    pub fn try_as_expected_mint(&self) -> Option<(Pubkey, Pubkey, Pubkey, Pubkey, u64)> {
-        Some((
-            self.mint?,
-            self.recipient_ata?,
-            self.mint_authority?,
-            self.token_program?,
-            self.amount?,
-        ))
-    }
-
     /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to]
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         let mint = self.mint.ok_or_else(|| ProgramError::InvalidBuilder {
@@ -411,32 +401,6 @@ mod tests {
     // ========================================================================
     // MintToBuilder
     // ========================================================================
-
-    #[test]
-    fn try_as_expected_mint_all_set() {
-        let mut b = MintToBuilder::new();
-        b.mint(pk(1))
-            .recipient_ata(pk(3))
-            .mint_authority(pk(5))
-            .token_program(pk(6))
-            .amount(100);
-        let result = b.try_as_expected_mint();
-        assert!(result.is_some());
-        let (mint, ata, auth, tp, amt) = result.unwrap();
-        assert_eq!(mint, pk(1));
-        assert_eq!(ata, pk(3));
-        assert_eq!(auth, pk(5));
-        assert_eq!(tp, pk(6));
-        assert_eq!(amt, 100);
-    }
-
-    #[test]
-    fn try_as_expected_mint_missing_field() {
-        let mut b = MintToBuilder::new();
-        b.mint(pk(1)).recipient_ata(pk(3));
-        // missing mint_authority, token_program, amount
-        assert!(b.try_as_expected_mint().is_none());
-    }
 
     fn fully_configured_builder() -> MintToBuilder {
         let mut b = MintToBuilder::new();

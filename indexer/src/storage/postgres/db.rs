@@ -614,6 +614,36 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Write-ahead log for compensating remint MintTo signatures. Separate
+        // from pending_release_signatures because these land on the source
+        // (PrivateChannel) chain and are classified against source_rpc_client,
+        // never the destination chain the release signatures belong to.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pending_remint_signatures (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+                signature TEXT NOT NULL,
+                last_valid_block_height BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_prms_transaction_id ON pending_remint_signatures(transaction_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_prms_signature ON pending_remint_signatures(signature)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -623,6 +653,10 @@ impl PostgresDb {
 
         // Drop tables with CASCADE to handle dependencies
         sqlx::query("DROP TABLE IF EXISTS pending_release_signatures CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query("DROP TABLE IF EXISTS pending_remint_signatures CASCADE")
             .execute(&self.pool)
             .await?;
 
@@ -1580,6 +1614,77 @@ impl PostgresDb {
             DELETE FROM pending_release_signatures
             WHERE transaction_id IN (
                 SELECT id FROM transactions WHERE status <> 'processing'
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Write-ahead record of a remint MintTo signature, persisted before the
+    /// broadcast so restart recovery can classify it instead of reminting
+    /// blind. Idempotent on `signature`.
+    pub async fn insert_remint_signature_internal(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_remint_signatures
+                (transaction_id, signature, last_valid_block_height)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (signature) DO NOTHING
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .bind(last_valid_block_height)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return a transaction's remint signatures as (signature, lvbh).
+    pub async fn get_remint_signatures_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT signature, last_valid_block_height
+            FROM pending_remint_signatures
+            WHERE transaction_id = $1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(transaction_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Delete all stored remint signatures for a transaction.
+    pub async fn delete_remint_signatures_internal(
+        &self,
+        transaction_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM pending_remint_signatures WHERE transaction_id = $1")
+            .bind(transaction_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drop remint signatures whose parent transaction is no longer
+    /// `pending_remint`. Returns the number of rows removed.
+    pub async fn gc_stale_remint_signatures_internal(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM pending_remint_signatures
+            WHERE transaction_id IN (
+                SELECT id FROM transactions WHERE status <> 'pending_remint'
             )
             "#,
         )

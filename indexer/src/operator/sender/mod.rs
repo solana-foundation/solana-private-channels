@@ -5,8 +5,8 @@ mod state;
 mod transaction;
 pub mod types;
 
-pub use mint::{find_existing_mint_signature_with_memo, JitOutcome};
-pub(crate) use remint::{classify_release_signatures, SigFinality};
+pub use mint::JitOutcome;
+pub(crate) use remint::{classify_signatures, SigFinality};
 pub(crate) use state::validate_smt_root;
 pub use types::TransactionStatusUpdate;
 
@@ -18,6 +18,8 @@ pub mod test_hooks {
     use super::*;
     use solana_sdk::commitment_config::CommitmentLevel;
     use std::sync::Arc;
+
+    pub use super::remint::DeferredRemintOutcome;
 
     pub fn new_sender_state(
         config: &PrivateChannelIndexerConfig,
@@ -71,9 +73,9 @@ pub mod test_hooks {
     /// transition in isolation.
     pub async fn execute_deferred_remint(
         state: &SenderState,
-        entry: &super::types::PendingRemint,
+        entry: super::types::PendingRemint,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-    ) {
+    ) -> super::remint::DeferredRemintOutcome {
         super::remint::execute_deferred_remint(state, entry, storage_tx).await
     }
 

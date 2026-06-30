@@ -44,7 +44,6 @@ integration-test:
 	@$(MAKE) -C ../private-channel-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cargo test --test reconciliation_integration -- --nocapture
-	@cargo test --test mint_idempotency_integration -- --nocapture
 	@cargo test --test gap_detection_integration -- --nocapture
 	@cargo test --test truncate_integration -- --nocapture
 	@cargo test --test pausable_mint_integration -- --nocapture
@@ -63,9 +62,6 @@ integration-test:
 	@cargo test --test yellowstone_reconnect_gap -- --nocapture
 	@cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cargo test --test harness_sanity -- --nocapture
-	@cargo test --test sender_mint_idempotency -- --nocapture
-	@cargo test --test sender_mint_validator_encodings -- --nocapture
-	@cargo test --test sender_mint_signature_failures -- --nocapture
 	@cargo test --test sender_poll_rpc_error -- --nocapture
 	@cargo test --test sender_sign_and_send_error -- --nocapture
 	@cargo test --test sender_max_retries -- --nocapture
@@ -237,8 +233,6 @@ integration-coverage-indexer:
 	@echo "=== prod feature group ==="
 	@echo "Running reconciliation integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture
-	@echo "Running mint idempotency integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test mint_idempotency_integration -- --nocapture
 	@echo "Running gap detection integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
 	@echo "Running truncate integration tests with coverage instrumentation..."
@@ -275,12 +269,6 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_inner_and_unknown -- --nocapture
 	@echo "Running OperatorMockHarness sanity test with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test harness_sanity -- --nocapture
-	@echo "Running sender mint-idempotency tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_mint_idempotency -- --nocapture
-	@echo "Running sender mint validator-encodings tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_mint_validator_encodings -- --nocapture
-	@echo "Running sender mint signature-failures tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_mint_signature_failures -- --nocapture
 	@echo "Running sender poll-RPC-error tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_poll_rpc_error -- --nocapture
 	@echo "Running sender sign-and-send error tests with coverage instrumentation..."

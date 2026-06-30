@@ -34,6 +34,8 @@ pub struct MockStorage {
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
     /// Mirrors the `pending_release_signatures` table for verify-before-demote.
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `pending_remint_signatures` write-ahead table.
+    pub remint_signatures: Arc<Mutex<ReleaseSignatureMap>>,
 }
 
 impl MockStorage {
@@ -759,6 +761,72 @@ impl MockStorage {
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {
             if processing_ids.contains(txn_id) {
+                true
+            } else {
+                removed += sigs.len() as u64;
+                false
+            }
+        });
+        Ok(removed)
+    }
+
+    pub async fn insert_remint_signature(
+        &self,
+        transaction_id: i64,
+        signature: String,
+        last_valid_block_height: i64,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("insert_remint_signature")?;
+        let mut map = self.remint_signatures.lock().unwrap();
+        // Mirror Postgres `ON CONFLICT (signature) DO NOTHING`.
+        if map_contains_signature(&map, &signature) {
+            return Ok(());
+        }
+        map.entry(transaction_id)
+            .or_default()
+            .push((signature, last_valid_block_height));
+        Ok(())
+    }
+
+    pub async fn get_remint_signatures(
+        &self,
+        transaction_id: i64,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        self.check_should_fail("get_remint_signatures")?;
+        Ok(self
+            .remint_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn delete_remint_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
+        self.check_should_fail("delete_remint_signatures")?;
+        self.remint_signatures
+            .lock()
+            .unwrap()
+            .remove(&transaction_id);
+        Ok(())
+    }
+
+    pub async fn gc_stale_remint_signatures(&self) -> Result<u64, StorageError> {
+        self.check_should_fail("gc_stale_remint_signatures")?;
+        // Mirror the Postgres predicate: keep sigs whose parent is still
+        // `PendingRemint`; an unknown transaction id counts as non-pending.
+        let pending_remint_ids: std::collections::HashSet<i64> = self
+            .pending_remint_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.status == TransactionStatus::PendingRemint)
+            .map(|t| t.id)
+            .collect();
+        let mut map = self.remint_signatures.lock().unwrap();
+        let mut removed = 0u64;
+        map.retain(|txn_id, sigs| {
+            if pending_remint_ids.contains(txn_id) {
                 true
             } else {
                 removed += sigs.len() as u64;

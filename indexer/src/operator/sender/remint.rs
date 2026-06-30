@@ -7,20 +7,20 @@ use crate::{
     operator::{
         check_transaction_status, remint_idempotency_memo,
         sender::{
-            find_existing_mint_signature_with_memo,
             transaction::FINALITY_SAFETY_DELAY,
             types::{InstructionWithSigners, PendingRemint, PendingSig},
         },
-        sign_and_send_transaction,
         utils::instruction_util::WithdrawalRemintInfo,
-        ConfirmationResult, ExtraErrorCheckPolicy, MintToBuilder, MintToBuilderWithTxnId,
-        RetryPolicy, RpcClientWithRetry, SignerUtil, TransactionStatusUpdate,
+        utils::transaction_util::{build_and_sign, send_signed},
+        ConfirmationResult, ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, RpcClientWithRetry,
+        SignerUtil, TransactionStatusUpdate,
     },
     storage::TransactionStatus,
 };
 use chrono::Utc;
 use solana_keychain::SolanaSigner;
 use solana_sdk::{commitment_config::CommitmentConfig, signature::Signature};
+use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -30,17 +30,88 @@ use tracing::{debug, error, info, warn};
 /// to ManualReview rather than loop indefinitely.
 const MAX_FINALITY_CHECK_ATTEMPTS: u32 = 3;
 
-/// Attempt to remint burned PrivateChannel tokens back to user after permanent withdrawal failure.
-/// Builds a MintTo instruction with an idempotency memo (same pattern as deposits).
-/// No sender-level retry; RPC-level retries may still occur via RpcClientWithRetry.
-async fn attempt_remint(
-    state: &SenderState,
-    info: &WithdrawalRemintInfo,
-) -> Result<Signature, String> {
+/// Outcome of a single `attempt_remint` call.
+enum RemintAttempt {
+    /// A remint landed on-chain (a prior attempt or the one just sent).
+    Confirmed(Signature),
+    /// Not done yet; caller re-queues with an extended deadline.
+    Defer(String),
+    /// Cannot proceed safely; escalate to ManualReview.
+    Failed(String),
+}
+
+/// Remint burned PrivateChannel tokens back to the user after a permanent withdrawal failure.
+///
+/// Persists every MintTo signature write-ahead, then classifies stored signatures on entry
+/// (before any resend) so a crash between broadcast and the FailedReminted write can't
+/// double-mint. Everything runs on the source chain (PrivateChannel). No sender-level retry.
+async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> RemintAttempt {
+    let stored = match state
+        .storage
+        .get_remint_signatures(info.transaction_id)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            return RemintAttempt::Failed(format!(
+                "stored remint-signature lookup failed for transaction {}: {}; refusing to remint",
+                info.transaction_id, e
+            ));
+        }
+    };
+
+    if !stored.is_empty() {
+        let prior_attempts: Vec<PendingSig> = match stored
+            .iter()
+            .map(|(sig_string, lvbh)| {
+                let signature = Signature::from_str(sig_string)
+                    .map_err(|e| format!("invalid stored remint signature: {e}"))?;
+                let last_valid_block_height = u64::try_from(*lvbh)
+                    .map_err(|_| format!("negative last_valid_block_height: {lvbh}"))?;
+                Ok(PendingSig {
+                    signature,
+                    last_valid_block_height,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+        {
+            Ok(sigs) => sigs,
+            Err(e) => {
+                return RemintAttempt::Failed(format!(
+                    "unparseable stored remint signature for transaction {}: {}; refusing to remint",
+                    info.transaction_id, e
+                ));
+            }
+        };
+
+        match classify_signatures(&state.source_rpc_client, &prior_attempts).await {
+            SigFinality::Landed(signature) => {
+                info!(
+                    "Remint already landed for transaction {}: {}",
+                    info.transaction_id, signature
+                );
+                return RemintAttempt::Confirmed(signature);
+            }
+            SigFinality::Live(reason) => {
+                return RemintAttempt::Defer(format!(
+                    "prior remint attempt still in flight: {reason}"
+                ));
+            }
+            SigFinality::Uncertain(reason) => {
+                return RemintAttempt::Failed(format!(
+                    "remint idempotency classification unavailable for transaction {}: {}; refusing to remint",
+                    info.transaction_id, reason
+                ));
+            }
+            // All prior attempts finalized-failed or expired: safe to resend.
+            SigFinality::Dead => {}
+        }
+    }
+
     let memo = remint_idempotency_memo(info.transaction_id);
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
-    // Build remint transaction with idempotency memo to prevent duplicate mints across restarts
+    // Memo is an on-chain marker only; the stored signature is the idempotency control.
     let mut builder = MintToBuilder::new();
     builder
         .mint(info.mint)
@@ -50,46 +121,14 @@ async fn attempt_remint(
         .mint_authority(admin_pubkey)
         .token_program(info.token_program)
         .amount(info.amount)
-        .idempotency_memo(memo.clone());
+        .idempotency_memo(memo);
 
-    // Check for an already-confirmed remint before sending (guards against duplicate
-    // remints when the operator restarts after a successful remint but before the
-    // FailedReminted status is persisted to the database).
-    let builder_for_lookup = MintToBuilderWithTxnId {
-        builder: builder.clone(),
-        txn_id: info.transaction_id,
-        trace_id: info.trace_id.clone(),
-    };
-    // Idempotency lookup, send, and confirm all run on the source chain
-    // (PrivateChannel), not rpc_client (Solana, the ReleaseFunds destination).
-    match find_existing_mint_signature_with_memo(
-        &state.source_rpc_client,
-        &builder_for_lookup,
-        &memo,
-    )
-    .await
-    {
-        Ok(Some(existing_signature)) => {
-            info!(
-                "Remint already confirmed for transaction {}: {}",
-                info.transaction_id, existing_signature
-            );
-            return Ok(existing_signature);
-        }
-        Ok(None) => {}
-        // Fail closed: an unverifiable lookup escalates to ManualReview (via the
-        // Err arm of execute_deferred_remint) instead of risking a duplicate remint.
+    let instructions = match builder.instructions() {
+        Ok(instructions) => instructions,
         Err(e) => {
-            return Err(format!(
-                "idempotency lookup unavailable for transaction {}: {}; refusing to remint",
-                info.transaction_id, e
-            ));
+            return RemintAttempt::Failed(format!("Failed to build remint instructions: {}", e));
         }
-    }
-
-    let instructions = builder
-        .instructions()
-        .map_err(|e| format!("Failed to build remint instructions: {}", e))?;
+    };
 
     let ix = InstructionWithSigners {
         instructions,
@@ -99,12 +138,40 @@ async fn attempt_remint(
         compute_budget: None,
     };
 
-    let (signature, _) =
-        sign_and_send_transaction(state.source_rpc_client.clone(), ix, RetryPolicy::None)
-            .await
-            .map_err(|e| format!("Failed to send remint transaction: {}", e))?;
+    let (transaction, signature, last_valid_block_height) =
+        match build_and_sign(&state.source_rpc_client, ix).await {
+            Ok(signed) => signed,
+            Err(e) => {
+                return RemintAttempt::Failed(format!(
+                    "Failed to build/sign remint transaction: {}",
+                    e
+                ));
+            }
+        };
 
-    let result = check_transaction_status(
+    // Write-ahead persist before broadcast. Failure here means nothing was sent, so defer.
+    // Checked cast keeps the round-trip symmetric with the u64::try_from read-back.
+    let lvbh_i64 = i64::try_from(last_valid_block_height).unwrap_or(i64::MAX);
+    if let Err(e) = state
+        .storage
+        .insert_remint_signature(info.transaction_id, signature.to_string(), lvbh_i64)
+        .await
+    {
+        return RemintAttempt::Defer(format!(
+            "pre-send remint persist failed for transaction {}: {}; will retry",
+            info.transaction_id, e
+        ));
+    }
+
+    if let Err(e) = send_signed(&state.source_rpc_client, &transaction, RetryPolicy::None).await {
+        // Signature is durable; next attempt reclassifies it.
+        return RemintAttempt::Defer(format!(
+            "remint send failed for transaction {}: {}; will reclassify",
+            info.transaction_id, e
+        ));
+    }
+
+    let result = match check_transaction_status(
         state.source_rpc_client.clone(),
         &signature,
         CommitmentConfig::confirmed(),
@@ -112,67 +179,86 @@ async fn attempt_remint(
         state.confirmation_poll_interval_ms,
     )
     .await
-    .map_err(|e| format!("Failed to confirm remint transaction: {}", e))?;
+    {
+        Ok(result) => result,
+        Err(e) => {
+            return RemintAttempt::Defer(format!(
+                "remint confirmation failed for transaction {}: {}; will reclassify",
+                info.transaction_id, e
+            ));
+        }
+    };
 
     match result {
         ConfirmationResult::Confirmed => {
             info!("Remint confirmed: {}", signature);
-            Ok(signature)
+            RemintAttempt::Confirmed(signature)
         }
-        other => Err(format!("Remint not confirmed: {:?}", other)),
+        other => RemintAttempt::Defer(format!("remint not yet confirmed: {:?}", other)),
     }
+}
+
+/// Result of executing a matured PendingRemint entry.
+pub enum DeferredRemintOutcome {
+    /// Terminal: a FailedReminted or ManualReview status was already emitted.
+    Resolved,
+    /// Could not complete yet; caller re-queues the entry with the given reason.
+    /// Boxed to keep the enum small (PendingRemint is ~300 bytes).
+    Defer(Box<PendingRemint>, String),
 }
 
 /// Execute the actual remint for a matured PendingRemint entry.
 pub async fn execute_deferred_remint(
     state: &SenderState,
-    entry: &super::types::PendingRemint,
+    entry: PendingRemint,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-) {
+) -> DeferredRemintOutcome {
     match attempt_remint(state, &entry.remint_info).await {
-        Ok(signature) => {
+        RemintAttempt::Confirmed(signature) => {
             info!(
                 "Withdrawal failed but tokens reminted successfully: {}",
                 signature
             );
 
-            // Always Some for remint entries: they are only queued for a failed
-            // withdrawal, which has a DB row. With no id there is no row to record
-            // the landed remint against and no status message to key, so the only
-            // action is a loud log. The remint already confirmed on-chain.
+            // Always Some for remint entries (queued only for a failed withdrawal,
+            // which has a DB row). No id means no row to record against — log loudly.
             let Some(transaction_id) = entry.ctx.transaction_id else {
                 error!(
-                    "Remint confirmed (sig: {}) but entry has no transaction_id; \
-                     cannot record FailedReminted",
+                    "Remint confirmed (sig: {}) but entry has no transaction_id; cannot record FailedReminted",
                     signature
                 );
-                return;
+                return DeferredRemintOutcome::Resolved;
             };
 
-            // Durably record the landed remint before the async channel send.
-            // This flips status to FailedReminted now, so a crash in the window
-            // before the writer runs can no longer leave the row PendingRemint
-            // for restart recovery to pick up and remint a second time.
-            //
-            // If this write fails we do not abort: the channel send below still
-            // drives the row to FailedReminted (its UPDATE accepts pending_remint),
-            // which is enough to stop replay. Only landed_remint_signature is lost.
-            if let Err(persist_err) = state
+            // Flip to FailedReminted now so a crash before the async writer runs can't
+            // leave the row PendingRemint for recovery to remint again.
+            match state
                 .storage
                 .record_remint_result(transaction_id, signature.to_string())
                 .await
             {
-                error!(
-                    "Remint sig {} confirmed but durable persist failed for txn {}: {}; \
-                     falling back to async status writer",
-                    signature, transaction_id, persist_err
-                );
+                // Row is durably terminal: safe to drop the write-ahead rows.
+                Ok(()) => {
+                    if let Err(e) = state.storage.delete_remint_signatures(transaction_id).await {
+                        warn!(
+                            "Failed to clear remint signatures for txn {}: {}; GC will sweep",
+                            transaction_id, e
+                        );
+                    }
+                }
+                // Row stays PendingRemint, so the write-ahead rows MUST be kept: if we
+                // crash before the async writer below commits, restart recovery has to
+                // classify this landed signature instead of broadcasting a duplicate.
+                Err(persist_err) => {
+                    error!(
+                        "Remint sig {} confirmed but durable persist failed for txn {}: {}; keeping write-ahead rows, falling back to async writer",
+                        signature, transaction_id, persist_err
+                    );
+                }
             }
 
-            // Drives the webhook alert, and is the fallback status write when the
-            // durable persist above errored. Its UPDATE only touches
-            // processing/pending_remint rows, so once the row is FailedReminted
-            // this is a no-op.
+            // Drives the webhook alert, and is the fallback status write. No-op once
+            // the row is already FailedReminted.
             if let Err(e) = send_guaranteed(
                 storage_tx,
                 TransactionStatusUpdate {
@@ -190,13 +276,14 @@ pub async fn execute_deferred_remint(
             .await
             {
                 error!(
-                    "Failed to send FailedReminted status for txn {}: {}. \
-                     Remint sig {} confirmed on-chain.",
+                    "Failed to send FailedReminted status for txn {}: {}. Remint sig {} confirmed on-chain.",
                     transaction_id, e, signature
                 );
             }
+            DeferredRemintOutcome::Resolved
         }
-        Err(remint_error) => {
+        RemintAttempt::Defer(reason) => DeferredRemintOutcome::Defer(Box::new(entry), reason),
+        RemintAttempt::Failed(remint_error) => {
             error!("Remint also failed: {}", remint_error);
             let combined = format!("{} | remint failed: {}", entry.original_error, remint_error);
             if let Some(transaction_id) = entry.ctx.transaction_id {
@@ -217,14 +304,15 @@ pub async fn execute_deferred_remint(
                 .await
                 .ok();
             }
+            DeferredRemintOutcome::Resolved
         }
     }
 }
 
-/// On-chain finality verdict for a set of broadcast release signatures. Shared
-/// by the remint gate and recovery so both agree before mutating a withdrawal.
+/// On-chain finality verdict for a set of broadcast signatures (withdrawal
+/// releases or remint MintTos). Shared by the remint gate and recovery.
 pub(crate) enum SigFinality {
-    /// A signature finalized successfully — the release landed.
+    /// A signature finalized successfully — the transaction landed.
     Landed(Signature),
     /// A signature could still land; carries a reason for triage logs.
     Live(String),
@@ -235,7 +323,7 @@ pub(crate) enum SigFinality {
 }
 
 /// Classify `sigs` against on-chain state (see `SigFinality` variants).
-pub(crate) async fn classify_release_signatures(
+pub(crate) async fn classify_signatures(
     rpc: &RpcClientWithRetry,
     sigs: &[PendingSig],
 ) -> SigFinality {
@@ -350,7 +438,7 @@ pub async fn process_pending_remints(
         // Classify the stored signatures against on-chain state. This runs on
         // rpc_client (the destination/Solana chain where ReleaseFunds was sent),
         // not source_rpc_client which only the remint MintTo uses.
-        match classify_release_signatures(&state.rpc_client, &entry.signatures).await {
+        match classify_signatures(&state.rpc_client, &entry.signatures).await {
             // Case 1: a sig finalized successfully, the withdrawal landed.
             SigFinality::Landed(sig) => {
                 // Chain root now includes this nonce. handle_permanent_failure
@@ -388,7 +476,19 @@ pub async fn process_pending_remints(
                     "All withdrawal signatures for nonce {} are finalized-failed or expired; attempting remint",
                     nonce_label
                 );
-                execute_deferred_remint(state, &entry, storage_tx).await;
+                if let DeferredRemintOutcome::Defer(entry, reason) =
+                    execute_deferred_remint(state, entry, storage_tx).await
+                {
+                    defer_or_escalate(
+                        &mut remaining,
+                        *entry,
+                        &nonce_label,
+                        &reason,
+                        &state.storage,
+                        storage_tx,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -767,13 +867,8 @@ mod tests {
             .create_async()
             .await;
 
-        // Source: backs the remint lookup, blockhash, and broadcast.
-        let src_lookup = mock_rpc(
-            &mut source,
-            "getSignaturesForAddress",
-            r#"{"jsonrpc":"2.0","result":[],"id":0}"#,
-        )
-        .await;
+        // Source: backs the remint blockhash and broadcast. With no stored
+        // remint signatures the idempotency classification is skipped entirely.
         let _src_bh = mock_rpc(
             &mut source,
             "getLatestBlockhash",
@@ -816,10 +911,9 @@ mod tests {
 
         process_pending_remints(&mut state, &storage_tx).await;
 
-        // The idempotency lookup and the broadcast must both reach the source server.
-        // The mocked node returns a placeholder signature so the send does not confirm,
-        // but the requests still prove which chain the remint targeted.
-        src_lookup.assert_async().await;
+        // The broadcast must reach the source server. The mocked node returns a
+        // placeholder signature so the send does not confirm, but the request
+        // still proves which chain the remint targeted.
         src_send.assert_async().await;
     }
 
@@ -1225,21 +1319,26 @@ mod tests {
 
     // ── execute_deferred_remint paths ───────────────────────────────
 
-    /// Fail-closed: when the idempotency lookup cannot run (here the backend
-    /// rejects getSignaturesForAddress), attempt_remint must refuse to mint and
-    /// escalate to ManualReview rather than risk a duplicate remint.
+    /// Fail-closed: when a stored remint attempt cannot be classified (here the
+    /// source backend errors on getSignatureStatuses), attempt_remint must refuse
+    /// to mint and escalate to ManualReview rather than risk a duplicate remint.
     #[tokio::test]
     async fn execute_deferred_remint_fails_closed_when_idempotency_lookup_unavailable() {
         ensure_test_signer();
         let mut rpc_server = mockito::Server::new_async().await;
-        let (state, _mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
-        // getSignaturesForAddress unavailable on this backend.
-        let _sigs = mock_rpc(
+        // A prior remint attempt is on record, so classification must run before
+        // any resend — and the source backend errors, making it unverifiable.
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(700, vec![(Signature::new_unique().to_string(), 0)]);
+        let _status = mock_rpc(
             &mut rpc_server,
-            "getSignaturesForAddress",
-            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
         )
         .await;
 
@@ -1259,11 +1358,12 @@ mod tests {
             finality_check_attempts: 0,
         };
 
-        execute_deferred_remint(&state, &entry, &storage_tx).await;
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+        assert!(matches!(outcome, DeferredRemintOutcome::Resolved));
 
         let update = storage_rx
             .try_recv()
-            .expect("unavailable lookup must emit a status update");
+            .expect("unverifiable classification must emit a status update");
         assert_eq!(update.transaction_id, 700);
         assert_eq!(update.status, TransactionStatus::ManualReview);
         let err = update.error_message.as_deref().unwrap_or("");
@@ -1568,7 +1668,7 @@ mod tests {
         );
     }
 
-    // ── classify_release_signatures (multi-sig) ─────────────────
+    // ── classify_signatures (multi-sig) ─────────────────
 
     /// Bare RPC client (1 attempt, fast) for direct classifier tests.
     fn make_rpc(url: &str) -> RpcClientWithRetry {
@@ -1585,7 +1685,7 @@ mod tests {
 
     /// Finalized success after an earlier finalized failure must win (full-list scan, not first-match).
     #[tokio::test]
-    async fn classify_release_signatures_finalized_success_wins_over_earlier_failure() {
+    async fn classify_signatures_finalized_success_wins_over_earlier_failure() {
         let mut rpc_server = mockito::Server::new_async().await;
         let rpc = make_rpc(&rpc_server.url());
 
@@ -1614,7 +1714,7 @@ mod tests {
             },
         ];
 
-        match classify_release_signatures(&rpc, &sigs).await {
+        match classify_signatures(&rpc, &sigs).await {
             SigFinality::Landed(s) => assert_eq!(
                 s, success,
                 "must return the finalized-success sig, not the failed one"
@@ -1625,7 +1725,7 @@ mod tests {
 
     /// Confirmed success behind a finalized failure must stay Live, never Dead.
     #[tokio::test]
-    async fn classify_release_signatures_confirmed_success_after_failure_is_live_not_dead() {
+    async fn classify_signatures_confirmed_success_after_failure_is_live_not_dead() {
         let mut rpc_server = mockito::Server::new_async().await;
         let rpc = make_rpc(&rpc_server.url());
 
@@ -1653,17 +1753,14 @@ mod tests {
         ];
 
         assert!(
-            matches!(
-                classify_release_signatures(&rpc, &sigs).await,
-                SigFinality::Live(_)
-            ),
+            matches!(classify_signatures(&rpc, &sigs).await, SigFinality::Live(_)),
             "confirmed success behind a finalized failure must be Live, not Dead"
         );
     }
 
     /// A still-valid null after an expired null must be Live: nulls are walked fully, not cut at the first.
     #[tokio::test]
-    async fn classify_release_signatures_live_null_after_expired_null_is_live() {
+    async fn classify_signatures_live_null_after_expired_null_is_live() {
         let mut rpc_server = mockito::Server::new_async().await;
         let rpc = make_rpc(&rpc_server.url());
 
@@ -1693,17 +1790,14 @@ mod tests {
         ];
 
         assert!(
-            matches!(
-                classify_release_signatures(&rpc, &sigs).await,
-                SigFinality::Live(_)
-            ),
+            matches!(classify_signatures(&rpc, &sigs).await, SigFinality::Live(_)),
             "a still-valid null after an expired null must be Live, not Dead"
         );
     }
 
     /// A truncated status list (fewer statuses than sigs) must be Uncertain, never read as "missing = dead".
     #[tokio::test]
-    async fn classify_release_signatures_status_length_mismatch_is_uncertain() {
+    async fn classify_signatures_status_length_mismatch_is_uncertain() {
         let mut rpc_server = mockito::Server::new_async().await;
         let rpc = make_rpc(&rpc_server.url());
 
@@ -1728,7 +1822,7 @@ mod tests {
 
         assert!(
             matches!(
-                classify_release_signatures(&rpc, &sigs).await,
+                classify_signatures(&rpc, &sigs).await,
                 SigFinality::Uncertain(_)
             ),
             "length mismatch must be Uncertain"
@@ -2037,5 +2131,381 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    }
+
+    // ── write-ahead remint signature classification (classify #2) ────
+
+    /// Finalized-failed release on the dest server so the gate proceeds to remint.
+    async fn mock_release_dead(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignatureStatuses""#.into()),
+                mockito::Matcher::Regex(r#""searchTransactionHistory"\s*:\s*true"#.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                    "slot":100,"confirmations":null,
+                    "err":{"InstructionError":[0,{"Custom":1}]},
+                    "status":{"Err":{"InstructionError":[0,{"Custom":1}]}},
+                    "confirmationStatus":"finalized"}]},"id":0}"#,
+            )
+            .create_async()
+            .await
+    }
+
+    /// A stored remint attempt still in flight (confirmed, not finalized) must
+    /// defer, never broadcast a duplicate while the prior one may still land.
+    #[tokio::test]
+    async fn remint_defers_when_stored_attempt_still_live() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        // Release is dead, so the gate reaches the remint step.
+        let _dest_status = mock_release_dead(&mut dest).await;
+
+        // The stored attempt is on-chain but not yet finalized (still live).
+        let _src_status = mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":10,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"confirmed"}]},"id":0}"#,
+        )
+        .await;
+        // Must not broadcast: expect(0).
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        seed_pending_remint_row(&mock, 901, 0);
+        // A prior attempt is on record, so classification runs before any resend.
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(901, vec![(Signature::new_unique().to_string(), 0)]);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(901),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-901".to_string()),
+            },
+            remint_info: make_remint_info(901),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Deferred: re-queued with a bumped attempt, no terminal status emitted.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a live prior attempt must defer, not resolve"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        src_send.assert_async().await;
+    }
+
+    /// A pre-send persist failure means nothing was broadcast, so the entry must
+    /// defer and retry next tick, not escalate.
+    #[tokio::test]
+    async fn remint_defers_when_pre_send_persist_fails() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        // Release is dead, so the gate reaches the remint step.
+        let _dest_status = mock_release_dead(&mut dest).await;
+
+        // Blockhash present so build_and_sign succeeds and we reach the persist step.
+        let _src_bh = mock_rpc(
+            &mut source,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        // Must not broadcast: expect(0).
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        seed_pending_remint_row(&mock, 902, 0);
+        // The write-ahead persist fails.
+        mock.set_should_fail("insert_remint_signature", true);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(902),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-902".to_string()),
+            },
+            remint_info: make_remint_info(902),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Deferred: re-queued, no terminal status, and nothing was broadcast.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "persist failure before send must defer, not emit a status"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        src_send.assert_async().await;
+    }
+
+    /// Send succeeds but the remint never reaches confirmed within the poll
+    /// budget. The signature is durable, so the gate defers (reclassify next
+    /// tick) rather than escalating.
+    #[tokio::test]
+    async fn remint_defers_when_sent_but_not_confirmed() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        // Release is dead, so the gate reaches the remint step.
+        let _dest_status = mock_release_dead(&mut dest).await;
+
+        // No stored attempt, so we sign and broadcast.
+        let _src_bh = mock_rpc(
+            &mut source,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // Confirmation never sees the sig: unconfirmed across the whole poll budget.
+        let _src_status = mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":[null]},"id":0}"#,
+        )
+        .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        seed_pending_remint_row(&mock, 904, 0);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(904),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-904".to_string()),
+            },
+            remint_info: make_remint_info(904),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // Broadcast happened, but confirmation is pending: defer, don't escalate.
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "an unconfirmed remint must defer, not emit a status"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        src_send.assert_async().await;
+    }
+
+    /// End-to-end restart: a PendingRemint row is rehydrated from the DB, and
+    /// its write-ahead remint signature already landed, so the gate confirms it
+    /// without broadcasting a duplicate. This is the core anti-double-mint
+    /// guarantee, exercised across the full recover → classify → resolve chain.
+    #[tokio::test]
+    async fn restart_recovery_skips_resend_when_stored_attempt_landed() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+
+        let release_sig = Signature::new_unique();
+        let landed_remint = Signature::new_unique();
+
+        // Release classifies dead, so the gate reaches the remint step.
+        let _dest_status = mock_release_dead(&mut dest).await;
+        // The stored remint attempt finalized on the source chain.
+        let _src_status = mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+        // Must not broadcast a duplicate: expect(0).
+        let src_send = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":"{}","id":0}}"#,
+                Signature::new_unique()
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        // A crashed-mid-flight row on disk: PendingRemint carrying its release
+        // signature, plus a write-ahead remint signature recorded before the crash.
+        seed_pending_remint_row(&mock, 905, 0);
+        {
+            let mut rows = mock.pending_remint_transactions.lock().unwrap();
+            let row = rows.iter_mut().find(|t| t.id == 905).unwrap();
+            row.remint_signatures = Some(vec![release_sig.to_string()]);
+            row.remint_last_valid_block_heights = Some(vec![0]);
+            row.pending_remint_deadline_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(905, vec![(landed_remint.to_string(), 0)]);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        // Restart: rehydrate the queue from the DB row.
+        state
+            .recover_pending_remints(&storage_tx)
+            .await
+            .expect("recovery must succeed");
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the PendingRemint row must rehydrate into the queue"
+        );
+
+        // Tick: classify release (dead) → remint gate → stored attempt already landed.
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        let update = storage_rx.try_recv().expect("should report FailedReminted");
+        assert_eq!(update.transaction_id, 905);
+        assert_eq!(update.status, TransactionStatus::FailedReminted);
+        assert_eq!(
+            update.remint_signature.as_deref(),
+            Some(landed_remint.to_string().as_str()),
+            "must report the already-landed signature, not a fresh one"
+        );
+        // expect(0): recovery did not trigger a duplicate broadcast.
+        src_send.assert_async().await;
+    }
+
+    /// If recording the confirmed remint fails, the write-ahead rows must be
+    /// kept (not cleaned up): the row is still PendingRemint, so a crash before
+    /// the async writer commits would otherwise leave recovery with an empty sig
+    /// table and re-broadcast a duplicate mint.
+    #[tokio::test]
+    async fn remint_keeps_write_ahead_rows_when_record_result_fails() {
+        ensure_test_signer();
+        let mut dest = mockito::Server::new_async().await;
+        let mut source = mockito::Server::new_async().await;
+        let _dest_status = mock_release_dead(&mut dest).await;
+
+        // Stored attempt already finalized, so the gate confirms via short-circuit.
+        let landed_sig = Signature::new_unique();
+        let _src_status = mock_rpc(
+            &mut source,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+
+        let (mut state, mock) = make_sender_state_split_rpc(&dest.url(), &source.url());
+        seed_pending_remint_row(&mock, 906, 0);
+        mock.remint_signatures
+            .lock()
+            .unwrap()
+            .insert(906, vec![(landed_sig.to_string(), 0)]);
+        // The durable terminal write fails.
+        mock.set_should_fail("record_remint_result", true);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                transaction_id: Some(906),
+                withdrawal_nonce: Some(9),
+                trace_id: Some("trace-906".to_string()),
+            },
+            remint_info: make_remint_info(906),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        // The write-ahead rows survive so restart recovery can still classify the
+        // landed signature instead of broadcasting a duplicate.
+        assert_eq!(
+            mock.remint_signatures.lock().unwrap().get(&906),
+            Some(&vec![(landed_sig.to_string(), 0)]),
+            "write-ahead rows must be kept when the terminal record write fails"
+        );
     }
 }
