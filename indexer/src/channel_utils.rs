@@ -9,7 +9,7 @@ use tracing::error;
 /// Once capacity is reserved, the send is guaranteed to succeed.
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// send_guaranteed(&tx, message, "committed checkpoint").await?;
 /// ```
 pub async fn send_guaranteed<T>(

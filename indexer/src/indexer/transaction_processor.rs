@@ -2,7 +2,7 @@ use crate::metrics;
 use crate::{
     channel_utils::send_guaranteed,
     config::ProgramType,
-    error::IndexerError,
+    error::{IndexerError, StorageError},
     indexer::{
         checkpoint::CheckpointUpdate,
         datasource::common::{
@@ -21,8 +21,45 @@ use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
+
+/// Production defaults for the per-slot DB-write retry. Sized to ride out a
+/// routine Postgres restart or failover (about 15s of cumulative backoff)
+/// before the processor gives up and exits so a restart can replay the slot.
+const DEFAULT_WRITE_MAX_ATTEMPTS: usize = 6;
+const DEFAULT_WRITE_BASE_DELAY: Duration = Duration::from_millis(500);
+const DEFAULT_WRITE_MAX_DELAY: Duration = Duration::from_secs(8);
+
+/// Bounded exponential-backoff policy for a slot's DB writes.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteRetryPolicy {
+    pub max_attempts: usize,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for WriteRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_WRITE_MAX_ATTEMPTS,
+            base_delay: DEFAULT_WRITE_BASE_DELAY,
+            max_delay: DEFAULT_WRITE_MAX_DELAY,
+        }
+    }
+}
+
+impl WriteRetryPolicy {
+    /// Backoff before the next attempt: `base_delay * 2^(attempt-1)`, capped at
+    /// `max_delay`. A zero base delay yields a zero wait (used by tests).
+    fn backoff(&self, attempt: usize) -> Duration {
+        let shift = attempt.saturating_sub(1).min(31) as u32;
+        self.base_delay
+            .saturating_mul(1u32 << shift)
+            .min(self.max_delay)
+    }
+}
 
 /// Transaction processor that converts instructions to transactions and saves to DB
 /// Tracks slot-level success/failure and emits committed checkpoints
@@ -40,6 +77,10 @@ pub struct TransactionProcessor {
     health: Option<Arc<HealthState>>,
 
     configured_escrow_instance_id: Option<Pubkey>,
+
+    // Bounded-backoff policy applied to a slot's DB writes before the failure
+    // is treated as fatal.
+    retry: WriteRetryPolicy,
 }
 
 impl TransactionProcessor {
@@ -50,11 +91,17 @@ impl TransactionProcessor {
             slot_buffers: HashMap::new(),
             health: None,
             configured_escrow_instance_id: None,
+            retry: WriteRetryPolicy::default(),
         }
     }
 
     pub fn with_health(mut self, health: Arc<HealthState>) -> Self {
         self.health = Some(health);
+        self
+    }
+
+    pub fn with_write_retry(mut self, retry: WriteRetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -80,7 +127,7 @@ impl TransactionProcessor {
                 }
                 ProcessorMessage::SlotComplete { slot, program_type } => {
                     let start = std::time::Instant::now();
-                    self.finalize_and_checkpoint(slot, program_type).await;
+                    self.finalize_and_checkpoint(slot, program_type).await?;
                     metrics::INDEXER_SLOT_PROCESSING_DURATION
                         .with_label_values(&[program_type.as_label()])
                         .observe(start.elapsed().as_secs_f64());
@@ -97,7 +144,14 @@ impl TransactionProcessor {
 
     /// Finalize and checkpoint a slot
     /// Saves any buffered transactions and always sends checkpoint (even if empty)
-    async fn finalize_and_checkpoint(&mut self, slot: u64, program_type: ProgramType) {
+    ///
+    /// Slot's write fail is a fatal error so the caller exits and restart replays
+    /// the slot from the last durable checkpoint.
+    async fn finalize_and_checkpoint(
+        &mut self,
+        slot: u64,
+        program_type: ProgramType,
+    ) -> Result<(), IndexerError> {
         let mut mints = Vec::new();
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
         let mut transactions = Vec::new();
@@ -130,39 +184,102 @@ impl TransactionProcessor {
             }
         }
 
-        let mut send_checkpoint = true;
+        // Retry the whole write sequence on failure; every write is idempotent.
+        let mut attempt = 1;
+        loop {
+            match self
+                .write_slot(slot, program_type, &mints, &mint_statuses, &transactions)
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => {
+                    if attempt >= self.retry.max_attempts {
+                        error!(
+                            "Slot {} writes failed after {} attempt(s); giving up: {}",
+                            slot, attempt, e
+                        );
+                        return Err(e.into());
+                    }
+                    let backoff = self.retry.backoff(attempt);
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    attempt += 1;
+                }
+            }
+        }
 
+        // Count saved mints once here rather than in write_slot, which may
+        // re-run the idempotent mints upsert across retries.
+        if !mints.is_empty() {
+            metrics::INDEXER_MINTS_SAVED
+                .with_label_values(&[program_type.as_label()])
+                .inc_by(mints.len() as f64);
+        }
+
+        // Send the checkpoint only after the writes commit. send_guaranteed
+        // reserves capacity first, so it errors only when the checkpoint writer
+        // is gone; that never recovers, so exit and let a restart rebuild the
+        // pipeline instead of retrying a closed channel.
+        match send_guaranteed(
+            &self.checkpoint_tx,
+            CheckpointUpdate { program_type, slot },
+            "checkpoint",
+        )
+        .await
+        {
+            Ok(_) => {
+                metrics::INDEXER_SLOTS_PROCESSED
+                    .with_label_values(&[program_type.as_label()])
+                    .inc();
+                metrics::INDEXER_CURRENT_SLOT
+                    .with_label_values(&[program_type.as_label()])
+                    .set(slot as f64);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Checkpoint send failed for slot {}: {}", slot, e);
+                Err(IndexerError::CheckpointChannelClosed)
+            }
+        }
+    }
+
+    /// Run one attempt of a slot's DB writes in order: mints, then mint-status
+    /// history, then the status mirror, then transactions. Short-circuits on the
+    /// first failing write so a deposit is never inserted without its backing
+    /// mint-status row.
+    async fn write_slot(
+        &self,
+        slot: u64,
+        program_type: ProgramType,
+        mints: &[DbMint],
+        mint_statuses: &[DbMintStatus],
+        transactions: &[DbTransaction],
+    ) -> Result<(), StorageError> {
         // Insert mints FIRST (before transactions that might reference them)
         if !mints.is_empty() {
             info!("Finalizing slot {} with {} mint(s)", slot, mints.len());
 
-            match self.storage.upsert_mints_batch(&mints).await {
+            match self.storage.upsert_mints_batch(mints).await {
                 Ok(_) => {
                     info!(
                         "Successfully saved {} mint(s) from slot {}",
                         mints.len(),
                         slot
                     );
-                    metrics::INDEXER_MINTS_SAVED
-                        .with_label_values(&[program_type.as_label()])
-                        .inc_by(mints.len() as f64);
                 }
                 Err(e) => {
                     error!("Failed to save mints from slot {}: {}", slot, e);
                     metrics::INDEXER_SLOT_SAVE_ERRORS
                         .with_label_values(&[program_type.as_label()])
                         .inc();
-                    send_checkpoint = false;
+                    return Err(e);
                 }
             }
         }
 
         if !mint_statuses.is_empty() {
-            match self
-                .storage
-                .insert_mint_statuses_batch(&mint_statuses)
-                .await
-            {
+            match self.storage.insert_mint_statuses_batch(mint_statuses).await {
                 Ok(_) => {
                     info!(
                         "Successfully saved {} mint status row(s) from slot {}",
@@ -178,14 +295,12 @@ impl TransactionProcessor {
                     metrics::INDEXER_SLOT_SAVE_ERRORS
                         .with_label_values(&[program_type.as_label()])
                         .inc();
-                    send_checkpoint = false;
+                    return Err(e);
                 }
             }
-        }
 
-        // Derive the `mints.status` mirror for each touched mint from history.
-        // Gated on the writes above, so the mirror never leads the timeline.
-        if send_checkpoint && !mint_statuses.is_empty() {
+            // Derive the `mints.status` mirror for each touched mint from history.
+            // Gated on the writes above, so the mirror never leads the timeline.
             let mut touched: Vec<String> = mint_statuses
                 .iter()
                 .map(|s| s.mint_address.clone())
@@ -197,23 +312,13 @@ impl TransactionProcessor {
                 metrics::INDEXER_SLOT_SAVE_ERRORS
                     .with_label_values(&[program_type.as_label()])
                     .inc();
-                send_checkpoint = false;
+                return Err(e);
             }
         }
 
         if transactions.is_empty() {
             // Empty slot, just checkpoint it
             debug!("Finalizing empty slot {}", slot);
-        } else if !send_checkpoint {
-            // A prerequisite write (mints/statuses) failed; skip the deposit
-            // rows so we don't commit a deposit with no backing row. The slot
-            // isn't checkpointed, so it replays atomically.
-            warn!(
-                "Skipping transaction insert for slot {} ({} row(s)) because an earlier \
-                 write failed; slot will be reprocessed",
-                slot,
-                transactions.len()
-            );
         } else {
             info!(
                 "Finalizing slot {} with {} transactions",
@@ -223,7 +328,7 @@ impl TransactionProcessor {
 
             match self
                 .storage
-                .insert_db_transactions_batch(&transactions)
+                .insert_db_transactions_batch(transactions)
                 .await
             {
                 Ok(ids) => {
@@ -241,46 +346,12 @@ impl TransactionProcessor {
                     metrics::INDEXER_SLOT_SAVE_ERRORS
                         .with_label_values(&[program_type.as_label()])
                         .inc();
-                    send_checkpoint = false;
+                    return Err(e);
                 }
             }
         }
 
-        if send_checkpoint {
-            const MAX_ATTEMPTS: usize = 3;
-            let mut attempt = 0;
-            loop {
-                let res = send_guaranteed(
-                    &self.checkpoint_tx,
-                    CheckpointUpdate { program_type, slot },
-                    "checkpoint",
-                )
-                .await;
-
-                match res {
-                    Ok(_) => {
-                        metrics::INDEXER_SLOTS_PROCESSED
-                            .with_label_values(&[program_type.as_label()])
-                            .inc();
-                        metrics::INDEXER_CURRENT_SLOT
-                            .with_label_values(&[program_type.as_label()])
-                            .set(slot as f64);
-                        break;
-                    }
-                    Err(e) => {
-                        attempt += 1;
-                        error!(
-                            "Checkpoint send failed for slot {} (attempt {}/{}): {}",
-                            slot, attempt, MAX_ATTEMPTS, e
-                        );
-                        if attempt >= MAX_ATTEMPTS {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -803,6 +874,16 @@ mod tests {
     // TransactionProcessor tests
     // ========================================================================
 
+    /// Fast retry policy for tests: a couple of attempts, no sleeping, so a
+    /// permanent failure exhausts immediately and a transient one self-heals.
+    fn fast_retry() -> WriteRetryPolicy {
+        WriteRetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+
     fn make_processor_and_rx(
         escrow_instance_id: Pubkey,
     ) -> (
@@ -813,7 +894,8 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let (checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::channel(100);
         let processor = TransactionProcessor::new(storage, checkpoint_tx)
-            .with_escrow_instance_id(escrow_instance_id);
+            .with_escrow_instance_id(escrow_instance_id)
+            .with_write_retry(fast_retry());
         (processor, checkpoint_rx)
     }
 
@@ -828,7 +910,8 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let (checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::channel(100);
         let processor = TransactionProcessor::new(storage, checkpoint_tx)
-            .with_escrow_instance_id(escrow_instance_id);
+            .with_escrow_instance_id(escrow_instance_id)
+            .with_write_retry(fast_retry());
         (processor, checkpoint_rx, mock)
     }
 
@@ -837,7 +920,8 @@ mod tests {
         let (mut processor, mut checkpoint_rx) = make_processor_and_rx(deposit_instance());
         processor
             .finalize_and_checkpoint(42, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
         let cp = checkpoint_rx.recv().await.unwrap();
         assert_eq!(cp.slot, 42);
         assert_eq!(cp.program_type, ProgramType::Escrow);
@@ -850,7 +934,8 @@ mod tests {
         processor.buffer(make_deposit_instruction(100, Some("s1".to_string()), None));
         processor
             .finalize_and_checkpoint(100, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         {
             let inserted = mock.inserted_transactions.lock().unwrap();
@@ -869,7 +954,8 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string())));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         {
             let mints = mock.mints.lock().unwrap();
@@ -891,7 +977,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         {
             let rows = mock.mint_status_history.lock().unwrap();
@@ -921,7 +1008,8 @@ mod tests {
         ));
         processor
             .finalize_and_checkpoint(250, ProgramType::Escrow)
-            .await;
+            .await
+            .unwrap();
 
         {
             let rows = mock.mint_status_history.lock().unwrap();
@@ -945,8 +1033,37 @@ mod tests {
         assert_eq!(cp.slot, 250);
     }
 
+    /// A transient write failure is ridden out by the retry: the slot finalizes
+    /// Ok, the row lands, and exactly one checkpoint is sent.
     #[tokio::test]
-    async fn finalize_insert_mint_statuses_failure_skips_checkpoint() {
+    async fn finalize_retries_then_succeeds_transient() {
+        let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        // Fail the first call, then succeed on retry (fast policy allows 2).
+        mock.set_fail_times("insert_db_transactions_batch", 1);
+        processor.buffer(make_deposit_instruction(
+            401,
+            Some("s-retry".to_string()),
+            None,
+        ));
+
+        processor
+            .finalize_and_checkpoint(401, ProgramType::Escrow)
+            .await
+            .expect("transient failure should self-heal");
+
+        {
+            let inserted = mock.inserted_transactions.lock().unwrap();
+            assert_eq!(inserted.len(), 1, "row lands once after the retry");
+            assert_eq!(inserted[0][0].slot, 401);
+        }
+        let cp = checkpoint_rx.recv().await.unwrap();
+        assert_eq!(cp.slot, 401);
+        // Exactly one checkpoint - the failed attempt did not also send one.
+        assert!(checkpoint_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn finalize_mint_status_failure_exhausts_returns_err() {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("insert_mint_statuses_batch", true);
@@ -954,18 +1071,19 @@ mod tests {
             201,
             Some("sig-allow-2".to_string()),
         ));
-        processor
+        let result = processor
             .finalize_and_checkpoint(201, ProgramType::Escrow)
             .await;
 
+        assert!(result.is_err(), "permanent write failure is fatal");
         assert!(checkpoint_rx.try_recv().is_err());
     }
 
     /// AllowMint + Deposit for the same mint in one slot: if the mint-status
-    /// write fails, the deposit row must be withheld (else the gate would
-    /// quarantine it) and the slot replays.
+    /// write fails permanently, the deposit row must be withheld (else the gate
+    /// would quarantine it) and the slot fails fatally so it replays.
     #[tokio::test]
-    async fn finalize_mint_status_failure_withholds_deposit_in_same_slot() {
+    async fn finalize_mint_status_failure_withholds_deposit_then_exhausts() {
         // Both instructions must target the configured instance, or the
         // instance filter would drop one and defeat the test's intent.
         let (mut processor, mut checkpoint_rx, mock) =
@@ -981,10 +1099,11 @@ mod tests {
             None,
             allow_mint_instance(),
         ));
-        processor
+        let result = processor
             .finalize_and_checkpoint(202, ProgramType::Escrow)
             .await;
 
+        assert!(result.is_err(), "permanent write failure is fatal");
         // Checkpoint withheld so the slot replays.
         assert!(checkpoint_rx.try_recv().is_err());
         // Deposit row must not be committed without its backing status row.
@@ -995,28 +1114,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_upsert_mints_failure_skips_checkpoint() {
+    async fn finalize_upsert_mints_failure_exhausts_returns_err() {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("upsert_mints_batch", true);
         processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string())));
-        processor
+        let result = processor
             .finalize_and_checkpoint(300, ProgramType::Escrow)
             .await;
 
-        // No checkpoint should be sent
+        assert!(result.is_err(), "permanent write failure is fatal");
         assert!(checkpoint_rx.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn finalize_insert_batch_failure_skips_checkpoint() {
+    async fn finalize_transaction_failure_exhausts_returns_err() {
         let (mut processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
         mock.set_should_fail("insert_db_transactions_batch", true);
         processor.buffer(make_deposit_instruction(400, Some("s4".to_string()), None));
-        processor
+        let result = processor
             .finalize_and_checkpoint(400, ProgramType::Escrow)
             .await;
 
+        assert!(result.is_err(), "permanent write failure is fatal");
         assert!(checkpoint_rx.try_recv().is_err());
     }
 
@@ -1102,7 +1222,8 @@ mod tests {
     }
 
     /// A foreign SlotComplete between a same-slot AllowMint and Deposit must not split the
-    /// finalize: the later mint-status failure still withholds the deposit and the checkpoint.
+    /// finalize: the later permanent mint-status failure still withholds the deposit,
+    /// withholds SLOT_S's checkpoint, and fails the processor fatally.
     #[tokio::test]
     async fn same_slot_atomicity_survives_foreign_slotcomplete() {
         const SLOT_S: u64 = 700;
@@ -1141,7 +1262,11 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        processor.start(rx).await.unwrap();
+        let result = processor.start(rx).await;
+        assert!(
+            result.is_err(),
+            "permanent same-slot write failure is fatal"
+        );
 
         let mut checkpointed = Vec::new();
         while let Ok(cp) = checkpoint_rx.try_recv() {
@@ -1166,6 +1291,126 @@ mod tests {
 
         let result = processor.start(rx).await;
         assert!(result.is_ok());
+    }
+
+    /// A permanently-failing slot write exhausts the retry and propagates out of
+    /// the start loop as a fatal Err.
+    #[tokio::test]
+    async fn start_propagates_fatal_after_exhaustion() {
+        const N: u64 = 800;
+        let (processor, _checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        mock.set_should_fail("insert_db_transactions_batch", true);
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            N,
+            Some("dep-n".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: N,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = processor.start(rx).await;
+        assert!(result.is_err());
+    }
+
+    /// The key no-leapfrog proof: when slot N's write fails permanently, start
+    /// exits Err BEFORE processing N+1, so no checkpoint is sent and N+1 is
+    /// never persisted. A restart would therefore replay from below N.
+    #[tokio::test]
+    async fn start_exhaustion_does_not_leapfrog_next_slot() {
+        const N: u64 = 900;
+        const N_NEXT: u64 = 901;
+        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        mock.set_should_fail("insert_db_transactions_batch", true);
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            N,
+            Some("dep-n".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: N,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            N_NEXT,
+            Some("dep-n-next".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: N_NEXT,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = processor.start(rx).await;
+        assert!(result.is_err(), "the failed slot is fatal");
+
+        // No checkpoint for N or N+1.
+        assert!(
+            checkpoint_rx.try_recv().is_err(),
+            "a withheld slot must not be leapfrogged"
+        );
+        // N+1's row was never written - the loop exited before processing it.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert!(
+            inserted.iter().flatten().all(|t| t.slot != N_NEXT as i64),
+            "N+1 must not be persisted after N fails"
+        );
+    }
+
+    /// A slot that fails within the retry budget then succeeds does not break the
+    /// happy path: N and N+1 both checkpoint in order and start ends Ok.
+    #[tokio::test]
+    async fn start_recovers_within_retries_continues() {
+        const N: u64 = 1000;
+        const N_NEXT: u64 = 1001;
+        let (processor, mut checkpoint_rx, mock) = make_processor_with_mock(deposit_instance());
+        // Fail N's write once, then succeed (fast policy allows 2 attempts).
+        mock.set_fail_times("insert_db_transactions_batch", 1);
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        for (slot, sig) in [(N, "dep-n"), (N_NEXT, "dep-n-next")] {
+            tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+                slot,
+                Some(sig.to_string()),
+                None,
+            )))
+            .await
+            .unwrap();
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        let result = processor.start(rx).await;
+        assert!(result.is_ok(), "retry self-heal keeps the loop running");
+
+        let first = checkpoint_rx.recv().await.unwrap();
+        let second = checkpoint_rx.recv().await.unwrap();
+        assert_eq!(first.slot, N);
+        assert_eq!(second.slot, N_NEXT);
     }
 
     // ========================================================================
@@ -1196,7 +1441,8 @@ mod tests {
         let checkpoint_handle = writer.start(checkpoint_rx);
 
         let processor = TransactionProcessor::new(storage, checkpoint_tx)
-            .with_escrow_instance_id(escrow_instance_id);
+            .with_escrow_instance_id(escrow_instance_id)
+            .with_write_retry(fast_retry());
         let processor_handle = tokio::spawn(async move {
             processor.start(instruction_rx).await.unwrap();
         });
@@ -1299,5 +1545,151 @@ mod tests {
             committed < T0,
             "the unfilled tail (103..=110) is not skipped"
         );
+    }
+
+    /// Like `spawn_pipeline` but exposes the processor's Result so a fatal write
+    /// exhaustion can be observed instead of unwrapped.
+    #[allow(clippy::type_complexity)]
+    fn spawn_pipeline_result(
+        escrow_instance_id: Pubkey,
+    ) -> (
+        mpsc::Sender<ProcessorMessage>,
+        tokio::task::JoinHandle<Result<(), IndexerError>>,
+        tokio::task::JoinHandle<()>,
+        MockStorage,
+    ) {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (instruction_tx, instruction_rx) = mpsc::channel(64);
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel(64);
+
+        let writer = CheckpointWriter::new(storage.clone())
+            .with_batch_interval(1)
+            .with_max_batch_size(1);
+        let checkpoint_handle = writer.start(checkpoint_rx);
+
+        let processor = TransactionProcessor::new(storage, checkpoint_tx)
+            .with_escrow_instance_id(escrow_instance_id)
+            .with_write_retry(fast_retry());
+        let processor_handle = tokio::spawn(processor.start(instruction_rx));
+
+        (instruction_tx, processor_handle, checkpoint_handle, mock)
+    }
+
+    /// End-to-end self-heal: a transient write blip on slot N is ridden out by
+    /// the retry, so the durable checkpoint advances through N with no restart.
+    #[tokio::test]
+    async fn live_transient_blip_self_heals_no_gap() {
+        const N: u64 = 200;
+        const N1: u64 = 201;
+        const N2: u64 = 202;
+        let (tx, processor_handle, checkpoint_handle, mock) =
+            spawn_pipeline(deposit_instance(), None);
+        // Fail N's transaction write once, then succeed on retry.
+        mock.set_fail_times("insert_db_transactions_batch", 1);
+
+        for (slot, sig) in [(N, "dep-n"), (N1, "dep-n1"), (N2, "dep-n2")] {
+            tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+                slot,
+                Some(sig.to_string()),
+                None,
+            )))
+            .await
+            .unwrap();
+            tx.send(ProcessorMessage::SlotComplete {
+                slot,
+                program_type: ProgramType::Escrow,
+            })
+            .await
+            .unwrap();
+        }
+
+        drop(tx);
+        processor_handle.await.unwrap();
+        checkpoint_handle.await.unwrap();
+
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            committed >= N,
+            "checkpoint advanced through the healed slot"
+        );
+        // N's deposit row is present despite the transient failure.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert!(inserted.iter().flatten().any(|t| t.slot == N as i64));
+    }
+
+    /// End-to-end exhaustion: a permanent write failure on slot N freezes the
+    /// durable checkpoint at the last good slot below N, the processor exits
+    /// Err, and N+1 is never persisted - so a restart replays from below N.
+    #[tokio::test]
+    async fn live_exhaustion_freezes_checkpoint_below_failed_slot() {
+        const M: u64 = 300;
+        const N: u64 = 301;
+        const N1: u64 = 302;
+        let (tx, processor_handle, checkpoint_handle, mock) =
+            spawn_pipeline_result(deposit_instance());
+        mock.set_should_fail("insert_db_transactions_batch", true);
+
+        // M is an empty slot that checkpoints cleanly (last good slot).
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: M,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        // N carries a deposit whose write fails permanently.
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            N,
+            Some("dep-n".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: N,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        // N+1 is queued but must never be processed.
+        tx.send(ProcessorMessage::Instruction(make_deposit_instruction(
+            N1,
+            Some("dep-n1".to_string()),
+            None,
+        )))
+        .await
+        .unwrap();
+        tx.send(ProcessorMessage::SlotComplete {
+            slot: N1,
+            program_type: ProgramType::Escrow,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let result = processor_handle.await.unwrap();
+        assert!(
+            result.is_err(),
+            "permanent write failure exits the processor"
+        );
+        checkpoint_handle.await.unwrap();
+
+        let committed = mock
+            .get_committed_checkpoint("escrow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed, M,
+            "checkpoint frozen at the last good slot below N"
+        );
+        assert!(committed < N);
+        // Neither N nor N+1 was persisted.
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert!(inserted.iter().flatten().all(|t| t.slot != N1 as i64));
     }
 }

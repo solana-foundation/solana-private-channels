@@ -7,6 +7,7 @@
 //! - Forced exit on timeout (configurable)
 //! - Buffer time before storage closure
 
+use crate::error::IndexerError;
 use crate::indexer::checkpoint::CheckpointUpdate;
 use crate::indexer::datasource::common::datasource::DataSource;
 use crate::indexer::datasource::common::types::ProcessorMessage;
@@ -106,7 +107,7 @@ pub async fn shutdown_indexer(
     instruction_tx: mpsc::Sender<ProcessorMessage>,
     checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
     checkpoint_handle: tokio::task::JoinHandle<()>,
-    processor_handle: tokio::task::JoinHandle<()>,
+    processor_handle: tokio::task::JoinHandle<Result<(), IndexerError>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_start = std::time::Instant::now();
 
@@ -172,7 +173,7 @@ async fn perform_indexer_shutdown_stages(
     instruction_tx: mpsc::Sender<ProcessorMessage>,
     checkpoint_tx: mpsc::Sender<CheckpointUpdate>,
     checkpoint_handle: tokio::task::JoinHandle<()>,
-    processor_handle: tokio::task::JoinHandle<()>,
+    processor_handle: tokio::task::JoinHandle<Result<(), IndexerError>>,
     config: &ShutdownConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Stage 1: Signal cancellation to datasource

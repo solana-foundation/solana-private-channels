@@ -13,6 +13,12 @@ pub enum IndexerError {
     #[error("Channel send failed during shutdown")]
     ShutdownChannelSend,
 
+    #[error("Checkpoint channel closed; cannot persist slot progress")]
+    CheckpointChannelClosed,
+
+    #[error("Transaction processor task panicked")]
+    ProcessorPanicked,
+
     #[error("Datasource error: {0}")]
     DataSource(#[from] DataSourceError),
 
