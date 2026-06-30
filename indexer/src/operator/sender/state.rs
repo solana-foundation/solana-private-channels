@@ -326,6 +326,13 @@ impl SenderState {
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
+                // Build from individual fields: `tx.remint_signatures` was moved out above,
+                // so the whole-row borrow `from_row` would take is no longer available.
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    &tx.signature,
+                    tx.instruction_index,
+                    tx.inner_index,
+                ),
                 trace_id: tx.trace_id.clone(),
                 mint,
                 user,

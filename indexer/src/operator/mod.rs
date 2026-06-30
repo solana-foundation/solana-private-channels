@@ -17,5 +17,8 @@ pub use fetcher::run_fetcher;
 pub use operator::run;
 pub use processor::run_processor;
 pub use recovery::run_recovery_worker;
-pub use sender::{find_existing_mint_signature_with_memo, run_sender, TransactionStatusUpdate};
+pub use sender::{
+    enumerate_consumed_mints, find_existing_mint_signature_with_memo, run_sender, ConsumedMintKind,
+    ConsumedSet, TransactionStatusUpdate,
+};
 pub use utils::*;

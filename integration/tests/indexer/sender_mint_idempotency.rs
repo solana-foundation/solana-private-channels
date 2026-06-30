@@ -6,13 +6,13 @@
 //! broadcast); only the remint path calls it. The wire behavior tested is the same.
 //!
 //! Strategy: drive it against `MockRpcServer`, scripting a `getSignaturesForAddress`
-//! reply with `mint_idempotency_memo(txn_id)` and a matching `getTransaction`.
+//! reply with `mint_idempotency_memo(&event_id(txn_id))` and a matching `getTransaction`.
 //!
 //! What this test validates:
 //!   - `find_existing_mint_signature_with_memo` issues `getSignaturesForAddress`
 //!     on the expected ATA
 //!   - It filters to entries that carry the memo produced by
-//!     `mint_idempotency_memo(txn_id)`
+//!     `mint_idempotency_memo(&event_id(txn_id))`
 //!   - It fetches the full transaction via `getTransaction` and
 //!     verifies the payload matches the expected mint parameters
 //!   - On a match, it returns `Some(signature)` so the remint caller can skip
@@ -28,7 +28,9 @@ use {
     private_channel_indexer::operator::{
         find_existing_mint_signature_with_memo,
         utils::{
-            instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},
+            instruction_util::{
+                mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId, SourceEventId,
+            },
             rpc_util::{RetryConfig, RpcClientWithRetry},
         },
     },
@@ -38,6 +40,11 @@ use {
     std::{str::FromStr, time::Duration},
     test_utils::mock_rpc::{MockRpcServer, Reply},
 };
+
+// Deterministic source-event id per txn_id so built, scripted, and expected memos agree.
+fn event_id(txn_id: i64) -> SourceEventId {
+    SourceEventId::new(&format!("mint-sig-{txn_id}"), 0, None)
+}
 
 fn test_client(url: String) -> RpcClientWithRetry {
     RpcClientWithRetry::with_retry_config(
@@ -68,7 +75,7 @@ fn build_mint_to_builder_with_txn_id(
         .mint_authority(mint_authority)
         .token_program(token_program)
         .amount(amount)
-        .idempotency_memo(mint_idempotency_memo(txn_id));
+        .idempotency_memo(mint_idempotency_memo(&event_id(txn_id)));
     MintToBuilderWithTxnId {
         builder,
         txn_id,
@@ -185,7 +192,7 @@ async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 12_345;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     // The on-chain signature we'll claim was landed on a previous operator run.
     let prior_signature = Signature::from_str(
@@ -235,7 +242,7 @@ async fn finds_prior_confirmed_mint_and_returns_short_circuit_signature() {
     let result = find_existing_mint_signature_with_memo(
         &client,
         &builder_with_txn,
-        &mint_idempotency_memo(builder_with_txn.txn_id),
+        &mint_idempotency_memo(&event_id(builder_with_txn.txn_id)),
     )
     .await
     .expect("idempotency lookup must succeed when payload matches");
@@ -284,7 +291,7 @@ async fn returns_none_when_no_prior_mint_signature_matches() {
     let result = find_existing_mint_signature_with_memo(
         &client,
         &builder_with_txn,
-        &mint_idempotency_memo(builder_with_txn.txn_id),
+        &mint_idempotency_memo(&event_id(builder_with_txn.txn_id)),
     )
     .await
     .expect("lookup on empty ATA must succeed");

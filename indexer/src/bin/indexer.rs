@@ -146,6 +146,10 @@ enum Mode {
         /// Genesis slot to start from (default: 0)
         #[arg(long, default_value = "0")]
         genesis_slot: u64,
+        /// PrivateChannel RPC URL to reconcile rebuilt rows against. Required: resync
+        /// refuses to run without it so it cannot rebuild without fail-closed reconciliation.
+        #[arg(long)]
+        channel_rpc_url: Option<String>,
     },
 }
 
@@ -207,7 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Indexer => run_indexer(figment, args.verbose).await,
         Mode::Operator => run_operator(figment, args.verbose).await,
-        Mode::Resync { genesis_slot } => run_resync(figment, args.verbose, genesis_slot).await,
+        Mode::Resync {
+            genesis_slot,
+            channel_rpc_url,
+        } => run_resync(figment, args.verbose, genesis_slot, channel_rpc_url).await,
     }
 }
 
@@ -433,6 +440,7 @@ async fn run_resync(
     figment: Figment,
     verbose: bool,
     genesis_slot: u64,
+    channel_rpc_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
@@ -513,6 +521,25 @@ async fn run_resync(
         common.program_type,
         backfill_config_base,
         escrow_instance_id,
+    );
+
+    // Reconcile-on-rebuild is mandatory: each already-serviced deposit or remint must be
+    // rebuilt in its terminal state rather than as a fresh pending row the operator would
+    // replay (mass double-mint). The channel RPC is the PrivateChannel whose confirmed
+    // mints carry the idempotency memos; its authority is the admin mint authority. Fail
+    // closed if it is not supplied rather than rebuild without reconciliation.
+    let Some(channel_rpc_url) = channel_rpc_url else {
+        return Err(
+            "resync requires --channel-rpc-url to reconcile against the PrivateChannel; \
+                    refusing to rebuild without it"
+                .into(),
+        );
+    };
+    let resync_service = resync_service.with_channel_reconcile(
+        private_channel_indexer::indexer::resync::ChannelReconcileConfig {
+            channel_rpc_url,
+            authority: private_channel_indexer::operator::SignerUtil::get_admin_pubkey(),
+        },
     );
 
     // Run resync

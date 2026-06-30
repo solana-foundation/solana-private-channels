@@ -49,6 +49,12 @@ pub enum ReconciliationError {
 
     #[error("DB net balance for mint {mint} exceeds u64::MAX ({net}); the escrow ATA cannot hold this, so the DB is corrupt")]
     DbBalanceOverflow { mint: String, net: String },
+
+    /// The pre-drop consumed-set could not be built completely (channel unreachable,
+    /// pagination failed, or a legacy-scheme memo could not be reconciled). Resync
+    /// aborts before any destruction so the live DB is left intact.
+    #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
+    ConsumedSetUnavailable { reason: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

@@ -29,7 +29,9 @@ use {
     private_channel_indexer::operator::{
         sender::find_existing_mint_signature_with_memo,
         utils::{
-            instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},
+            instruction_util::{
+                mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId, SourceEventId,
+            },
             rpc_util::{RetryConfig, RpcClientWithRetry},
         },
     },
@@ -41,6 +43,11 @@ use {
 };
 
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
+
+// Deterministic source-event id per txn_id so built, scripted, and expected memos agree.
+fn event_id(txn_id: i64) -> SourceEventId {
+    SourceEventId::new(&format!("mint-sig-{txn_id}"), 0, None)
+}
 /// Real-looking 64-byte signature usable across scenarios — the validators
 /// only care that `Signature::from_str` parses, not which signer produced it.
 const PRIOR_SIG_STR: &str =
@@ -79,7 +86,7 @@ fn builder_with_txn(
         .mint_authority(mint_authority)
         .token_program(token_program)
         .amount(amount)
-        .idempotency_memo(mint_idempotency_memo(txn_id));
+        .idempotency_memo(mint_idempotency_memo(&event_id(txn_id)));
     MintToBuilderWithTxnId {
         builder,
         txn_id,
@@ -356,7 +363,7 @@ async fn raw_message_spl_token_mint_to_returns_signature() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 1_234;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
     let signature = prior_sig();
 
     let mint_to_data = spl_token::instruction::TokenInstruction::MintTo { amount }.pack();
@@ -413,7 +420,7 @@ async fn raw_message_spl_token_2022_mint_to_returns_signature() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 9_999;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
     let signature = prior_sig();
 
     let mint_to_data = spl_token_2022::instruction::TokenInstruction::MintTo { amount }.pack();
@@ -467,7 +474,7 @@ async fn partially_decoded_instructions_return_signature() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 4_242;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
     let signature = prior_sig();
 
     let mint_to_data = spl_token::instruction::TokenInstruction::MintTo { amount }.pack();
@@ -523,7 +530,7 @@ async fn parsed_mint_to_checked_returns_signature() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 5_555;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
     let signature = prior_sig();
 
     mock.enqueue("getSignaturesForAddress", signature_reply(&memo));
@@ -574,7 +581,7 @@ async fn memo_with_mixed_prefix_segments_matches_and_returns_signature() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 8_192;
-    let expected = mint_idempotency_memo(txn_id);
+    let expected = mint_idempotency_memo(&event_id(txn_id));
     let signature = prior_sig();
 
     let memo_field = format!("unrelated-bare-memo; [{}] {}", expected.len(), expected);
@@ -629,7 +636,7 @@ async fn memo_mismatch_skips_entry_and_returns_none() {
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let expected = mint_idempotency_memo(txn_id);
+    let expected = mint_idempotency_memo(&event_id(txn_id));
 
     mock.enqueue(
         "getSignaturesForAddress",
@@ -676,7 +683,7 @@ async fn transaction_with_meta_error_is_skipped_and_returns_none() {
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
     let amount: u64 = 1_111;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
     let signature = prior_sig();
 
     let mint_to_data = spl_token::instruction::TokenInstruction::MintTo { amount }.pack();

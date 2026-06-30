@@ -1666,6 +1666,11 @@ mod tests {
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
+            source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                &format!("remint-sig-{txn_id}"),
+                0,
+                None,
+            ),
             trace_id: format!("trace-{txn_id}"),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             user: solana_sdk::pubkey::Pubkey::new_unique(),
@@ -4322,6 +4327,11 @@ mod tests {
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    "remint-sig-1",
+                    0,
+                    None,
+                ),
                 trace_id: "t".to_string(),
                 mint: Pubkey::new_unique(),
                 user: Pubkey::new_unique(),

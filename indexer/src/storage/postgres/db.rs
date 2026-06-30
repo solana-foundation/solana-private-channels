@@ -772,12 +772,15 @@ impl PostgresDb {
                 continue;
             }
 
-            // Insert new transaction
+            // Insert new transaction. counterpart_signature / landed_remint_signature are
+            // bound too: on a normal indexing path both are NULL (identical to the column
+            // defaults), while a resync reconcile-in-place carries the serviced row's
+            // terminal signature so the rebuilt row records it in the same insert.
             let result: Option<(i64,)> = sqlx::query_as(&format!(
                 r#"
                 INSERT INTO transactions (
-                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT {} DO NOTHING
                 RETURNING {}
                 "#,
@@ -793,6 +796,8 @@ impl PostgresDb {
                 transaction_cols::TRANSACTION_TYPE,
                 transaction_cols::STATUS,
                 transaction_cols::TRACE_ID,
+                transaction_cols::COUNTERPART_SIGNATURE,
+                transaction_cols::LANDED_REMINT_SIGNATURE,
                 TX_CONFLICT_TARGET,
                 transaction_cols::ID,
             ))
@@ -808,6 +813,8 @@ impl PostgresDb {
             .bind(transaction.transaction_type)
             .bind(transaction.status)
             .bind(&transaction.trace_id)
+            .bind(&transaction.counterpart_signature)
+            .bind(&transaction.landed_remint_signature)
             .fetch_optional(&mut *tx)
             .await?;
 

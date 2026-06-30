@@ -5,7 +5,10 @@ mod state;
 mod transaction;
 pub mod types;
 
-pub use mint::{find_existing_mint_signature_with_memo, JitOutcome};
+pub use mint::{
+    enumerate_consumed_mints, find_existing_mint_signature_with_memo, ConsumedMintKind,
+    ConsumedSet, JitOutcome,
+};
 pub(crate) use remint::{classify_release_signatures, SigFinality};
 pub(crate) use state::validate_smt_root;
 pub use types::TransactionStatusUpdate;
@@ -733,6 +736,11 @@ mod tests {
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    "remint-sig-1",
+                    0,
+                    None,
+                ),
                 trace_id: "t".to_string(),
                 mint: Pubkey::new_unique(),
                 user: Pubkey::new_unique(),
@@ -820,6 +828,11 @@ mod tests {
             },
             remint_info: WithdrawalRemintInfo {
                 transaction_id: 1,
+                source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                    "remint-sig-1",
+                    0,
+                    None,
+                ),
                 trace_id: "t".to_string(),
                 mint: Pubkey::new_unique(),
                 user: Pubkey::new_unique(),

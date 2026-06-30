@@ -202,7 +202,8 @@ async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
 
     let txn_id: i64 = 7_777;
     let info = make_remint_info(txn_id);
-    let memo = remint_idempotency_memo(txn_id);
+    // Match what the production remint emits: the memo is built from the info's source-event id.
+    let memo = remint_idempotency_memo(&info.source_event_id);
 
     let prior_remint_sig = Signature::from_str(
         "4BxWw1FjwQCHXWkrK4ZehPWauFTPhBafSr9m8Cuht73LG73nUs3wfuJ6gigkhNppP4pYogP5pQDENbE5nQx1Qp4B",
@@ -620,7 +621,8 @@ async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
     let txn_id: i64 = 7_001;
     let info = make_remint_info(txn_id);
 
-    // Idempotency lookup: no prior remint.
+    // Idempotency lookup: no prior remint under either the new-scheme or legacy memo.
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     // Send + confirm: full happy path.
     mock.enqueue("getLatestBlockhash", blockhash_reply());
@@ -668,7 +670,8 @@ async fn execute_deferred_remint_durably_records_landed_signature() {
     // The PendingRemint row this remint resolves.
     seed_pending_remint_row(&storage_mock, txn_id, 0);
 
-    // Idempotency lookup empty, then a clean send and confirm.
+    // Idempotency lookup empty under both new-scheme and legacy memo, then send + confirm.
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
@@ -727,6 +730,7 @@ async fn execute_deferred_remint_emits_manual_review_when_send_fails() {
     let txn_id: i64 = 7_002;
     let info = make_remint_info(txn_id);
 
+    mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", Reply::error(-32601, "method not found"));

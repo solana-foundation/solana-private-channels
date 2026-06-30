@@ -37,7 +37,7 @@ async fn attempt_remint(
     state: &SenderState,
     info: &WithdrawalRemintInfo,
 ) -> Result<Signature, String> {
-    let memo = remint_idempotency_memo(info.transaction_id);
+    let memo = remint_idempotency_memo(&info.source_event_id);
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
     // Build remint transaction with idempotency memo to prevent duplicate mints across restarts
@@ -82,6 +82,33 @@ async fn attempt_remint(
         Err(e) => {
             return Err(format!(
                 "idempotency lookup unavailable for transaction {}: {}; refusing to remint",
+                info.transaction_id, e
+            ));
+        }
+    }
+
+    // Cutover safety for the one-time memo-scheme migration: a remint that landed under
+    // the old transaction-id memo must still be recognized so we do not pay twice. Can be
+    // removed post-cutover once no old-scheme remints remain unconfirmed.
+    let legacy_memo = format!("private_channel:remint:{}", info.transaction_id);
+    match find_existing_mint_signature_with_memo(
+        &state.source_rpc_client,
+        &builder_for_lookup,
+        &legacy_memo,
+    )
+    .await
+    {
+        Ok(Some(existing_signature)) => {
+            info!(
+                "Remint already confirmed under legacy memo for transaction {}: {}",
+                info.transaction_id, existing_signature
+            );
+            return Ok(existing_signature);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(format!(
+                "legacy idempotency lookup unavailable for transaction {}: {}; refusing to remint",
                 info.transaction_id, e
             ));
         }
@@ -630,6 +657,11 @@ mod tests {
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
+            source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                &format!("remint-sig-{txn_id}"),
+                0,
+                None,
+            ),
             trace_id: format!("trace-{txn_id}"),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             user: solana_sdk::pubkey::Pubkey::new_unique(),
@@ -767,13 +799,20 @@ mod tests {
             .create_async()
             .await;
 
-        // Source: backs the remint lookup, blockhash, and broadcast.
-        let src_lookup = mock_rpc(
-            &mut source,
-            "getSignaturesForAddress",
-            r#"{"jsonrpc":"2.0","result":[],"id":0}"#,
-        )
-        .await;
+        // Source: backs the remint lookup, blockhash, and broadcast. Two
+        // getSignaturesForAddress calls land here: the new-scheme memo lookup plus the
+        // legacy-memo cutover lookup, both returning empty so the remint proceeds.
+        let src_lookup = source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":[],"id":0}"#)
+            .expect(2)
+            .create_async()
+            .await;
         let _src_bh = mock_rpc(
             &mut source,
             "getLatestBlockhash",

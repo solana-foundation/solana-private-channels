@@ -19,7 +19,7 @@ mod helpers;
 use helpers::{generate_mint, send_and_confirm_instructions, setup_wallets};
 use private_channel_indexer::operator::{
     find_existing_mint_signature_with_memo, mint_idempotency_memo, MintToBuilder,
-    MintToBuilderWithTxnId, RetryConfig, RpcClientWithRetry,
+    MintToBuilderWithTxnId, RetryConfig, RpcClientWithRetry, SourceEventId,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
@@ -33,6 +33,11 @@ use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::sync::Arc;
 use test_utils::validator_helper::start_test_validator;
+
+// Deterministic source-event id per txn_id so the minted memo and the expected memo agree.
+fn event_id(txn_id: i64) -> SourceEventId {
+    SourceEventId::new(&format!("mint-sig-{txn_id}"), 0, None)
+}
 
 /// Submits a real `mint_to` instruction with an idempotency memo, then confirms
 /// that `find_existing_mint_signature_with_memo` can locate the transaction by matching
@@ -64,7 +69,7 @@ async fn find_existing_mint_signature_with_memo_detects_confirmed_mint() {
 
     let txn_id: i64 = 42;
     let amount: u64 = 1000;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     let create_ata_ix =
         spl_associated_token_account::instruction::create_associated_token_account_idempotent(
@@ -167,7 +172,7 @@ async fn find_existing_mint_signature_with_memo_detects_confirmed_mint() {
     let result = find_existing_mint_signature_with_memo(
         &rpc_client,
         &builder_with_id,
-        &mint_idempotency_memo(builder_with_id.txn_id),
+        &mint_idempotency_memo(&event_id(builder_with_id.txn_id)),
     )
     .await
     .unwrap();
@@ -190,7 +195,7 @@ async fn find_existing_mint_signature_with_memo_detects_confirmed_mint() {
     let result2 = find_existing_mint_signature_with_memo(
         &rpc_client,
         &builder_with_wrong_id,
-        &mint_idempotency_memo(builder_with_wrong_id.txn_id),
+        &mint_idempotency_memo(&event_id(builder_with_wrong_id.txn_id)),
     )
     .await
     .unwrap();
@@ -213,7 +218,7 @@ async fn find_existing_mint_signature_with_memo_detects_confirmed_mint() {
     let result3 = find_existing_mint_signature_with_memo(
         &rpc_client,
         &builder_wrong_amount,
-        &mint_idempotency_memo(builder_wrong_amount.txn_id),
+        &mint_idempotency_memo(&event_id(builder_wrong_amount.txn_id)),
     )
     .await
     .unwrap();
