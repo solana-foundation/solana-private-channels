@@ -61,7 +61,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job=~"private-channel-(indexer|operator)-.*"}
+              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway"}
               instant: true
               refId: A
           - refId: C
