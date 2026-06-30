@@ -250,6 +250,11 @@ mod tests {
     fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id,
+            source_event_id: crate::operator::instruction_util::SourceEventId::new(
+                &format!("remint-sig-{transaction_id}"),
+                0,
+                None,
+            ),
             trace_id: trace_id.to_string(),
             mint: Pubkey::new_unique(),
             user: Pubkey::new_unique(),

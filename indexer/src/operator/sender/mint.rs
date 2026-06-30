@@ -3,8 +3,9 @@ use crate::operator::utils::instruction_util::{
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{
-    sign_and_send_transaction, RpcClientWithRetry, SignerUtil,
-    MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+    sign_and_send_transaction, RpcClientWithRetry, SignerUtil, SourceEventId,
+    MINT_IDEMPOTENCY_MEMO_PREFIX, MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+    REMINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use serde_json::Value;
 use solana_keychain::SolanaSigner;
@@ -19,6 +20,7 @@ use solana_transaction_status::{
 };
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
+use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
@@ -412,6 +414,84 @@ async fn mint_authority_check_with_backoff(
         }
     }
     last_check
+}
+
+/// Which serviced operation a consumed channel mint corresponds to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumedMintKind {
+    /// A deposit `mint_to` (carries `MINT_IDEMPOTENCY_MEMO_PREFIX`).
+    Deposit,
+    /// A withdrawal remint `mint_to` (carries `REMINT_IDEMPOTENCY_MEMO_PREFIX`).
+    Remint,
+}
+
+/// Set of source events the PrivateChannel has already serviced, keyed by their durable
+/// source-event-id. Built once, before a resync wipe, so the rebuild can reconcile each
+/// row to its terminal state instead of re-emitting a serviceable `pending`.
+pub type ConsumedSet = HashMap<SourceEventId, (Signature, ConsumedMintKind)>;
+
+/// Enumerate every idempotency-memo'd mint the `authority` has confirmed on the channel
+/// into a `ConsumedSet`.
+///
+/// Fails closed (returns `Err`, never a partial/empty set) on any RPC/pagination error
+/// so an unverifiable lookup cannot be mistaken for "nothing was minted". Also fails
+/// closed if it finds an idempotency-prefixed memo that does not parse to a current
+/// source-event-id (a legacy serial-id memo): those are serviced mints a resync cannot
+/// reconcile, and proceeding would re-mint them.
+///
+/// Completeness assumes the PrivateChannel RPC populates the `memo` field in its
+/// getSignaturesForAddress responses (our channel node does). A confirmed signature with
+/// no memo is treated as a non-idempotency mint and skipped; we do not issue a
+/// per-signature getTransaction fallback to recover a missing memo.
+pub async fn enumerate_consumed_mints(
+    rpc: &RpcClientWithRetry,
+    authority: &Pubkey,
+    page_limit: usize,
+) -> Result<ConsumedSet, String> {
+    let signatures = rpc
+        .get_signatures_for_address_paginated(authority, page_limit)
+        .await
+        .map_err(|e| {
+            format!("consumed-set enumeration failed listing signatures for {authority}: {e}")
+        })?;
+
+    let mut set = ConsumedSet::new();
+    for status in signatures {
+        if status.err.is_some() {
+            continue;
+        }
+        let Some(memo) = status.memo.as_deref() else {
+            continue;
+        };
+
+        // A memo field can carry several "; "-joined entries, each possibly length-prefixed.
+        for piece in memo.split("; ") {
+            let value = strip_memo_length_prefix(piece);
+            let (kind, encoded) =
+                if let Some(rest) = value.strip_prefix(MINT_IDEMPOTENCY_MEMO_PREFIX) {
+                    (ConsumedMintKind::Deposit, rest)
+                } else if let Some(rest) = value.strip_prefix(REMINT_IDEMPOTENCY_MEMO_PREFIX) {
+                    (ConsumedMintKind::Remint, rest)
+                } else {
+                    continue;
+                };
+
+            let Some(source_event_id) = SourceEventId::from_encoded(encoded) else {
+                return Err(format!(
+                    "channel mint {} carries an idempotency memo that does not parse to a \
+                     current-scheme source-event-id (legacy memo scheme); resync cannot reconcile \
+                     across the memo cutover - drain the operator and follow the cutover runbook",
+                    status.signature
+                ));
+            };
+
+            let signature = Signature::from_str(&status.signature)
+                .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
+            // First (newest) confirmed mint for an id wins; a re-send would tie anyway.
+            set.entry(source_event_id).or_insert((signature, kind));
+        }
+    }
+    Ok(set)
 }
 
 /// Check recent ATA signatures for an already-confirmed mint carrying the given memo.
@@ -1781,6 +1861,156 @@ mod tests {
         assert_eq!(
             decode_and_check_authority(&data, &admin),
             AuthorityCheck::CorruptData
+        );
+    }
+}
+
+#[cfg(test)]
+mod consumed_set_tests {
+    use super::{enumerate_consumed_mints, ConsumedMintKind};
+    use crate::operator::instruction_util::{mint_idempotency_memo, SourceEventId};
+    use crate::operator::{RetryConfig, RpcClientWithRetry};
+    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::signature::Signature;
+
+    const PAGE_LIMIT: usize = 2;
+
+    fn fast_rpc(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    fn sig_entry(signature: &str, memo: &str) -> String {
+        format!(
+            r#"{{"signature":"{signature}","slot":1,"err":null,"memo":"{memo}","blockTime":null,"confirmationStatus":"confirmed"}}"#
+        )
+    }
+
+    /// A serviced mint that sits on the second page (reached via the `before` cursor)
+    /// must still be collected, guarding the bounded-lookback blind spot.
+    #[tokio::test]
+    async fn enumerate_pages_to_completion() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+
+        let page1_a = Signature::new_unique().to_string();
+        let page1_b = Signature::new_unique().to_string();
+        let page2_a = Signature::new_unique().to_string();
+
+        let id1 = SourceEventId::new("evt-page1", 0, None);
+        let id2 = SourceEventId::new("evt-page2", 0, None);
+
+        // Page 1: full page (== PAGE_LIMIT) so the cursor advances to page1_b.
+        let _p1 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(r#""before"\s*:\s*null"#.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{},{}],"id":0}}"#,
+                sig_entry(&page1_a, &mint_idempotency_memo(&id1)),
+                sig_entry(&page1_b, "unrelated-memo"),
+            ))
+            .create_async()
+            .await;
+
+        // Page 2: short page (< PAGE_LIMIT) terminates pagination.
+        let _p2 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(format!(r#""before"\s*:\s*"{}""#, page1_b)),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(&page2_a, &mint_idempotency_memo(&id2)),
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("enumeration should succeed across pages");
+
+        assert_eq!(set.len(), 2, "both pages' deposit mints must be collected");
+        assert_eq!(
+            set.get(&id1).map(|(_, k)| *k),
+            Some(ConsumedMintKind::Deposit)
+        );
+        assert_eq!(
+            set.get(&id2).map(|(_, k)| *k),
+            Some(ConsumedMintKind::Deposit)
+        );
+    }
+
+    /// An RPC error during enumeration returns Err, never an empty set (fail closed).
+    #[tokio::test]
+    async fn enumerate_rpc_error_is_err_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":0}"#,
+            )
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let result = enumerate_consumed_mints(&rpc, &Pubkey::new_unique(), PAGE_LIMIT).await;
+        assert!(
+            result.is_err(),
+            "RPC failure must surface as Err, not an empty set"
+        );
+    }
+
+    /// A legacy serial-id idempotency memo (unparseable under the current scheme) aborts
+    /// enumeration so resync fails closed instead of re-minting that serviced deposit.
+    #[tokio::test]
+    async fn enumerate_legacy_scheme_memo_is_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                // Legacy serial-id memo: prefix present, value is a bare number.
+                sig_entry(
+                    &Signature::new_unique().to_string(),
+                    "private_channel:mint-idempotency:42"
+                ),
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let result = enumerate_consumed_mints(&rpc, &Pubkey::new_unique(), PAGE_LIMIT).await;
+        let err = result.expect_err("legacy-scheme memo must abort enumeration");
+        assert!(
+            err.contains("cutover"),
+            "error should name the memo cutover: {err}"
         );
     }
 }

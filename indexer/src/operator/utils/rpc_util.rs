@@ -9,6 +9,7 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -288,6 +289,73 @@ impl RpcClientWithRetry {
             },
         )
         .await
+    }
+
+    /// Page `getSignaturesForAddress` to completeness via the `before` cursor.
+    ///
+    /// The bounded `get_signatures_for_address` is a fixed-window lookback; this walks
+    /// the entire signature history for an address, oldest page last, so a consumed-set
+    /// enumeration cannot miss a mint that sits beyond the first window. Any page error
+    /// propagates as `Err` so the caller can fail closed rather than treat a partial
+    /// history as complete.
+    pub async fn get_signatures_for_address_paginated(
+        &self,
+        address: &Pubkey,
+        page_limit: usize,
+    ) -> Result<
+        Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+        Box<client_error::Error>,
+    > {
+        let mut all = Vec::new();
+        let mut before: Option<Signature> = None;
+        loop {
+            let page = self
+                .with_retry(
+                    "get_signatures_for_address_paginated",
+                    RetryPolicy::Idempotent,
+                    || async {
+                        let config = GetConfirmedSignaturesForAddress2Config {
+                            before,
+                            until: None,
+                            limit: Some(page_limit),
+                            commitment: Some(CommitmentConfig::confirmed()),
+                        };
+                        self.rpc_client
+                            .get_signatures_for_address_with_config(address, config)
+                            .await
+                    },
+                )
+                .await?;
+
+            let page_len = page.len();
+            // Capture the oldest signature on this page; it becomes the next page's cursor.
+            let last_signature = page.last().map(|s| s.signature.clone());
+            all.extend(page);
+
+            // A short page is the only legitimate end of history.
+            if page_len < page_limit {
+                break;
+            }
+
+            // Full page: we must advance the cursor to keep walking. If the last signature
+            // does not parse we cannot guarantee completeness, so fail closed instead of
+            // silently returning a truncated history.
+            match last_signature
+                .as_deref()
+                .and_then(|s| Signature::from_str(s).ok())
+            {
+                Some(sig) => before = Some(sig),
+                None => {
+                    return Err(Box::new(client_error::Error::from(ErrorKind::Custom(
+                        format!(
+                            "get_signatures_for_address_paginated: full page for {address} but \
+                             last cursor signature failed to parse; cannot guarantee completeness"
+                        ),
+                    ))));
+                }
+            }
+        }
+        Ok(all)
     }
 
     /// Get a confirmed transaction in JSON-parsed encoding (read-only, safe to retry)

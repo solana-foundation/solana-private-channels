@@ -22,7 +22,9 @@ use {
     private_channel_indexer::operator::{
         sender::find_existing_mint_signature_with_memo,
         utils::{
-            instruction_util::{mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId},
+            instruction_util::{
+                mint_idempotency_memo, MintToBuilder, MintToBuilderWithTxnId, SourceEventId,
+            },
             rpc_util::{RetryConfig, RpcClientWithRetry},
         },
     },
@@ -35,6 +37,12 @@ use {
 
 const PRIOR_SIG_STR: &str =
     "4BxWw1FjwQCHXWkrK4ZehPWauFTPhBafSr9m8Cuht73LG73nUs3wfuJ6gigkhNppP4pYogP5pQDENbE5nQx1Qp4B";
+
+// Deterministic source-event id per txn_id so the built memo, the scripted memo, and the
+// expected memo passed to the lookup all agree (the lookup matches on the memo string).
+fn event_id(txn_id: i64) -> SourceEventId {
+    SourceEventId::new(&format!("mint-sig-{txn_id}"), 0, None)
+}
 
 fn test_client(url: String) -> RpcClientWithRetry {
     RpcClientWithRetry::with_retry_config(
@@ -65,7 +73,7 @@ fn complete_builder(
         .mint_authority(mint_authority)
         .token_program(token_program)
         .amount(amount)
-        .idempotency_memo(mint_idempotency_memo(txn_id));
+        .idempotency_memo(mint_idempotency_memo(&event_id(txn_id)));
     MintToBuilderWithTxnId {
         builder,
         txn_id,
@@ -89,7 +97,7 @@ async fn method_not_found_surfaces_as_error() {
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     mock.enqueue(
         "getSignaturesForAddress",
@@ -128,7 +136,7 @@ async fn generic_rpc_error_bubbles_up_as_err() {
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     mock.enqueue(
         "getSignaturesForAddress",
@@ -173,7 +181,7 @@ async fn entry_with_failed_status_is_skipped_and_returns_none() {
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     // err: Some(...) on the only signature → continue → empty → Ok(None).
     // `AccountNotFound` is a TransactionError unit variant — bare-string form
@@ -231,7 +239,7 @@ async fn invalid_signature_string_is_warned_and_skipped() {
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     // First entry: invalid base58 signature, but matching memo. The
     // validator must walk the memo filter (it matches), then trip on
@@ -283,7 +291,7 @@ async fn get_transaction_failure_after_memo_match_bubbles_up_as_err() {
     let token_program = spl_token::id();
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     mock.enqueue(
         "getSignaturesForAddress",
@@ -333,7 +341,7 @@ async fn incomplete_builder_returns_none_without_rpc_traffic() {
     let client = test_client(mock.url());
 
     let txn_id: i64 = 8_006;
-    let memo = mint_idempotency_memo(txn_id);
+    let memo = mint_idempotency_memo(&event_id(txn_id));
 
     let mut builder = MintToBuilder::new();
     builder.mint(Pubkey::new_unique());

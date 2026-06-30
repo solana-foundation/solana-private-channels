@@ -2,7 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::instruction_util::{
-    mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
+    mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawalRemintInfo,
 };
 use crate::operator::sender::TransactionStatusUpdate;
 use crate::operator::utils::mint_util::MintCache;
@@ -400,6 +400,7 @@ async fn build_release_funds(
     );
     let remint_info = WithdrawalRemintInfo {
         transaction_id: transaction.id,
+        source_event_id: SourceEventId::from_row(&transaction),
         trace_id: transaction.trace_id.clone(),
         mint,
         user: recipient,
@@ -696,7 +697,9 @@ pub async fn process_deposit_funds(
                 .mint_authority(processor_state.admin_pubkey)
                 .token_program(token_program)
                 .amount(transaction.amount.value())
-                .idempotency_memo(mint_idempotency_memo(transaction.id));
+                .idempotency_memo(mint_idempotency_memo(&SourceEventId::from_row(
+                    &transaction,
+                )));
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
             info!(proc_elapsed_ms, "Processing deposit");

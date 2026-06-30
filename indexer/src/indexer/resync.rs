@@ -1,15 +1,30 @@
 use crate::{
     config::{BackfillConfig, ProgramType},
-    error::{DataSourceError, IndexerError},
+    error::{indexer::ReconciliationError, DataSourceError, IndexerError},
     indexer::{
         backfill::BackfillService, checkpoint::CheckpointWriter,
         datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
     },
+    operator::{
+        enumerate_consumed_mints, ConsumedSet, RetryConfig, RpcClientWithRetry,
+        MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+    },
     storage::Storage,
 };
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
+#[derive(Clone, Debug)]
+pub struct ChannelReconcileConfig {
+    /// PrivateChannel RPC URL (the chain where mints land).
+    pub channel_rpc_url: String,
+    /// Mint authority (admin) whose confirmed mints carry the idempotency memos.
+    pub authority: Pubkey,
+}
 
 /// Resync service for rebuilding indexer database from chain history
 pub struct ResyncService {
@@ -17,7 +32,10 @@ pub struct ResyncService {
     rpc_poller: Arc<RpcPoller>,
     program_type: ProgramType,
     backfill_config_base: BackfillConfig,
-    escrow_instance_id: Option<solana_sdk::pubkey::Pubkey>,
+    escrow_instance_id: Option<Pubkey>,
+    // When set, the rebuild reconciles each row against the channel's existing mints and
+    // fails closed if that set cannot be built. None preserves the legacy rebuild.
+    channel_reconcile: Option<ChannelReconcileConfig>,
 }
 
 impl ResyncService {
@@ -26,7 +44,7 @@ impl ResyncService {
         rpc_poller: Arc<RpcPoller>,
         program_type: ProgramType,
         backfill_config_base: BackfillConfig,
-        escrow_instance_id: Option<solana_sdk::pubkey::Pubkey>,
+        escrow_instance_id: Option<Pubkey>,
     ) -> Self {
         Self {
             storage,
@@ -34,7 +52,57 @@ impl ResyncService {
             program_type,
             backfill_config_base,
             escrow_instance_id,
+            channel_reconcile: None,
         }
+    }
+
+    /// Enable reconcile-on-rebuild against the PrivateChannel's existing mints.
+    pub fn with_channel_reconcile(mut self, config: ChannelReconcileConfig) -> Self {
+        self.channel_reconcile = Some(config);
+        self
+    }
+
+    /// Build the consumed-set from the channel, failing closed on any error.
+    ///
+    /// The production entrypoint (run_resync) guarantees a channel RPC is configured and
+    /// refuses to run otherwise, so the None branch below (warn + Ok(None)) only applies to
+    /// direct/test construction.
+    async fn build_consumed_set(&self) -> Result<Option<Arc<ConsumedSet>>, IndexerError> {
+        let Some(reconcile) = self.channel_reconcile.as_ref() else {
+            warn!(
+                "Resync running WITHOUT channel reconciliation (no channel RPC configured); \
+                 rebuilt deposit/withdrawal rows will be pending. Only safe on an empty channel."
+            );
+            return Ok(None);
+        };
+
+        info!(
+            "Building consumed-set from PrivateChannel authority {} before any destruction...",
+            reconcile.authority
+        );
+        let channel_rpc = RpcClientWithRetry::with_retry_config(
+            reconcile.channel_rpc_url.clone(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        let set = enumerate_consumed_mints(
+            &channel_rpc,
+            &reconcile.authority,
+            MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+        )
+        .await
+        .map_err(|reason| {
+            error!(
+                authority = %reconcile.authority,
+                "Consumed-set enumeration failed; aborting resync before drop: {reason}"
+            );
+            IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable { reason })
+        })?;
+        info!(
+            "Consumed-set built: {} serviced mint(s) on the channel",
+            set.len()
+        );
+        Ok(Some(Arc::new(set)))
     }
 
     /// Run the resync process
@@ -45,6 +113,34 @@ impl ResyncService {
             self.program_type, genesis_slot
         );
 
+        // ---- Pre-flight: every check runs BEFORE any destruction (fail closed). ----
+        // On any failure below we return Err with the live DB completely untouched, so a
+        // future-slot, an unreachable channel, or a legacy-scheme memo can never leave a
+        // half-wiped database.
+
+        // Pre-flight 1: genesis_slot must not be ahead of the chain tip.
+        let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
+            error!("Failed to fetch current slot before resync backfill: {}", e);
+            IndexerError::DataSource(e.into())
+        })?;
+        if genesis_slot > current_slot {
+            error!(
+                "Invalid genesis_slot {}: cannot be ahead of current_slot {}",
+                genesis_slot, current_slot
+            );
+            return Err(IndexerError::from(DataSourceError::InvalidConfig {
+                reason: format!(
+                    "genesis_slot {} is ahead of current_slot {}",
+                    genesis_slot, current_slot
+                ),
+            }));
+        }
+
+        // Pre-flight 2+3: channel reachability + consumed-set completeness + cross-scheme
+        // guard, all inside build_consumed_set, which returns Err on any of them.
+        let consumed = self.build_consumed_set().await?;
+
+        // ---- Destruction: only now, with a complete consumed-set in hand. ----
         // Step 1: Drop existing tables
         info!("Dropping existing database tables...");
         self.storage.drop_tables().await.map_err(|e| {
@@ -98,29 +194,13 @@ impl ResyncService {
         if let Some(instance_id) = self.escrow_instance_id {
             transaction_processor = transaction_processor.with_escrow_instance_id(instance_id);
         }
+        // Inject the pre-drop consumed-set so the rebuild reconciles each row in place.
+        if let Some(consumed) = consumed {
+            transaction_processor = transaction_processor.with_consumed_set(consumed);
+        }
         let processor_handle =
             tokio::spawn(async move { transaction_processor.start(instruction_rx).await });
         info!("TransactionProcessor task spawned");
-
-        // Run backfill service (this will process all transactions from genesis_slot to current)
-        let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
-            error!("Failed to fetch current slot before resync backfill: {}", e);
-            IndexerError::DataSource(e.into())
-        })?;
-
-        // Validate genesis_slot is not in the future
-        if genesis_slot > current_slot {
-            error!(
-                "Invalid genesis_slot {}: cannot be ahead of current_slot {}",
-                genesis_slot, current_slot
-            );
-            return Err(IndexerError::from(DataSourceError::InvalidConfig {
-                reason: format!(
-                    "genesis_slot {} is ahead of current_slot {}",
-                    genesis_slot, current_slot
-                ),
-            }));
-        }
 
         let total_slots = current_slot.saturating_sub(genesis_slot);
 

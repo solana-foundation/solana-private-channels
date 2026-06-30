@@ -10,9 +10,11 @@ use crate::{
             types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
         },
     },
+    operator::{instruction_util::SourceEventId, ConsumedMintKind, ConsumedSet},
     storage::{
         common::models::{
-            DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionType,
+            DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionStatus,
+            TransactionType,
         },
         Storage,
     },
@@ -40,6 +42,11 @@ pub struct TransactionProcessor {
     health: Option<Arc<HealthState>>,
 
     configured_escrow_instance_id: Option<Pubkey>,
+
+    // Set only on a reconciling resync. When present, the per-slot insert rebuilds an
+    // already-serviced deposit/remint into its terminal status instead of `pending`.
+    // `None` on every normal/backfill/live path, so the hot path is unchanged.
+    consumed: Option<Arc<ConsumedSet>>,
 }
 
 impl TransactionProcessor {
@@ -50,6 +57,7 @@ impl TransactionProcessor {
             slot_buffers: HashMap::new(),
             health: None,
             configured_escrow_instance_id: None,
+            consumed: None,
         }
     }
 
@@ -61,6 +69,52 @@ impl TransactionProcessor {
     pub fn with_escrow_instance_id(mut self, escrow_instance_id: Pubkey) -> Self {
         self.configured_escrow_instance_id = Some(escrow_instance_id);
         self
+    }
+
+    /// Inject the pre-drop consumed-set so the rebuild reconciles each row in place.
+    pub fn with_consumed_set(mut self, consumed: Arc<ConsumedSet>) -> Self {
+        self.consumed = Some(consumed);
+        self
+    }
+
+    /// Rewrite a serviced deposit/remint row to its terminal status from the consumed-set
+    /// so the rebuilt table never contains a serviceable `pending` row for an event the
+    /// channel already minted. No-op when no consumed-set is configured.
+    fn reconcile_against_consumed(&self, slot: u64, transactions: &mut [DbTransaction]) {
+        let Some(consumed) = self.consumed.as_ref() else {
+            return;
+        };
+        let (mut completed, mut reminted, mut pending) = (0u64, 0u64, 0u64);
+        for transaction in transactions.iter_mut() {
+            let id = SourceEventId::from_row(transaction);
+            match consumed.get(&id) {
+                Some((signature, ConsumedMintKind::Deposit))
+                    if transaction.transaction_type == TransactionType::Deposit =>
+                {
+                    transaction.status = TransactionStatus::Completed;
+                    transaction.counterpart_signature = Some(signature.to_string());
+                    completed += 1;
+                }
+                Some((signature, ConsumedMintKind::Remint))
+                    if transaction.transaction_type == TransactionType::Withdrawal =>
+                {
+                    transaction.status = TransactionStatus::FailedReminted;
+                    transaction.landed_remint_signature = Some(signature.to_string());
+                    reminted += 1;
+                }
+                // Not serviced (or a kind/type mismatch we refuse to act on): stays pending.
+                _ => pending += 1,
+            }
+        }
+        if completed + reminted > 0 {
+            info!(
+                slot,
+                completed_from_chain = completed,
+                failed_reminted_from_chain = reminted,
+                pending,
+                "Resync reconcile-in-place applied"
+            );
+        }
     }
 
     /// Start processing messages from the channel
@@ -129,6 +183,9 @@ impl TransactionProcessor {
                 transactions.push(transaction);
             }
         }
+
+        // Reconcile rebuilt rows against already-serviced channel mints (resync only).
+        self.reconcile_against_consumed(slot, &mut transactions);
 
         let mut send_checkpoint = true;
 
@@ -1156,6 +1213,160 @@ mod tests {
             mock.inserted_transactions.lock().unwrap().is_empty(),
             "deposit must be withheld when its same-slot mint-status write failed"
         );
+    }
+
+    // ========================================================================
+    // Reconcile-in-place (resync consumed-set) tests
+    // ========================================================================
+
+    use solana_sdk::signature::Signature;
+
+    const RECONCILE_SLOT: u64 = 800;
+    const SERVICED_DEPOSIT_SIG: &str = "serviced-deposit-sig";
+    const SERVICED_WITHDRAW_SIG: &str = "serviced-withdraw-sig";
+
+    fn make_processor_with_consumed(
+        escrow_instance_id: Pubkey,
+        consumed: ConsumedSet,
+    ) -> (
+        TransactionProcessor,
+        tokio::sync::mpsc::Receiver<CheckpointUpdate>,
+        MockStorage,
+    ) {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (checkpoint_tx, checkpoint_rx) = tokio::sync::mpsc::channel(100);
+        let processor = TransactionProcessor::new(storage, checkpoint_tx)
+            .with_escrow_instance_id(escrow_instance_id)
+            .with_consumed_set(Arc::new(consumed));
+        (processor, checkpoint_rx, mock)
+    }
+
+    /// Source-event-id for a top-level deposit row.
+    fn deposit_event_id(signature: &str) -> SourceEventId {
+        SourceEventId::new(signature, 0, None)
+    }
+
+    /// A deposit already minted on the channel rebuilds `completed` with its mint sig,
+    /// never `pending` (so the fetcher cannot re-mint it).
+    #[tokio::test]
+    async fn resync_reconcile_completes_serviced_deposit() {
+        let mint_sig = Signature::new_unique();
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            (mint_sig, ConsumedMintKind::Deposit),
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await;
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::Completed);
+        assert_eq!(
+            row.counterpart_signature.as_deref(),
+            Some(mint_sig.to_string().as_str())
+        );
+    }
+
+    /// A new, unserviced deposit rebuilds `pending` (no false-completed) even with a
+    /// non-empty consumed-set that does not contain it.
+    #[tokio::test]
+    async fn resync_reconcile_leaves_new_deposit_pending() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id("some-other-deposit"),
+            (Signature::new_unique(), ConsumedMintKind::Deposit),
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await;
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::Pending);
+        assert!(row.counterpart_signature.is_none());
+    }
+
+    /// A withdrawal whose release failed and was reminted rebuilds `failed_reminted`
+    /// with its remint sig, so the operator never releases (double-pays) it.
+    #[tokio::test]
+    async fn resync_reconcile_reclassifies_reminted_withdrawal() {
+        let remint_sig = Signature::new_unique();
+        let mut consumed = ConsumedSet::new();
+        let id = SourceEventId::new(SERVICED_WITHDRAW_SIG, 0, None);
+        consumed.insert(id, (remint_sig, ConsumedMintKind::Remint));
+        let (mut processor, _rx, mock) = make_processor_with_consumed(Pubkey::default(), consumed);
+        processor.buffer(make_withdraw_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_WITHDRAW_SIG.to_string()),
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await;
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::FailedReminted);
+        assert_eq!(
+            row.landed_remint_signature.as_deref(),
+            Some(remint_sig.to_string().as_str())
+        );
+    }
+
+    /// A deposit id present in the set but tagged as a remint (kind/type mismatch) is
+    /// not acted on: the deposit stays `pending` rather than being wrongly completed.
+    #[tokio::test]
+    async fn resync_reconcile_ignores_kind_type_mismatch() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            (Signature::new_unique(), ConsumedMintKind::Remint),
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await;
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(inserted[0][0].status, TransactionStatus::Pending);
+    }
+
+    /// Regression contract: with no consumed-set configured, a deposit that *would*
+    /// match rebuilds `pending` exactly as on the normal indexing path.
+    #[tokio::test]
+    async fn resync_reconcile_none_set_leaves_pending() {
+        let (mut processor, _rx, mock) = make_processor_with_mock(deposit_instance());
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await;
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        assert_eq!(inserted[0][0].status, TransactionStatus::Pending);
+        assert!(inserted[0][0].counterpart_signature.is_none());
     }
 
     #[tokio::test]
