@@ -25,6 +25,30 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+/// Which side of the processor-vs-shutdown race fired.
+enum Supervision {
+    /// The processor task ended on its own, carrying its join result: a clean
+    /// stop, a fatal write-exhaustion error, or a panic.
+    ProcessorEnded(Result<Result<(), IndexerError>, tokio::task::JoinError>),
+    /// A shutdown signal arrived while the processor was still running.
+    ShutdownSignalled(std::io::Result<()>),
+}
+
+/// Race the running processor task against the shutdown signal. Biased to the
+/// processor so a fatal error that becomes ready at the same moment as the
+/// signal still wins, and the caller exits non-zero instead of reporting a
+/// clean shutdown.
+async fn supervise(
+    processor_handle: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
+    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+) -> Supervision {
+    tokio::select! {
+        biased;
+        res = &mut *processor_handle => Supervision::ProcessorEnded(res),
+        sig = shutdown => Supervision::ShutdownSignalled(sig),
+    }
+}
+
 pub async fn run(
     common_config: PrivateChannelIndexerConfig,
     indexer_config: IndexerConfig,
@@ -315,34 +339,108 @@ pub async fn run(
     if let Some(h) = health.clone() {
         transaction_processor = transaction_processor.with_health(h);
     }
-    let processor_handle = tokio::spawn(async move {
-        if let Err(e) = transaction_processor.start(instruction_rx).await {
-            error!("TransactionProcessor error: {}", e);
-        }
-    });
+    let mut processor_handle = tokio::spawn(transaction_processor.start(instruction_rx));
 
     info!("Indexer started, waiting for shutdown signal...");
 
-    // 9. Wait for shutdown signal
-    signal::ctrl_c()
-        .await
-        .map_err(|_| IndexerError::ShutdownChannelSend)?;
-    info!("Shutdown signal received, initiating graceful shutdown...");
+    // 9. Race the processor against the shutdown signal. The processor never
+    // returns on its own during normal operation (instruction_tx is held here
+    // and by the datasource), so the processor side only fires on a fatal write
+    // failure or a panic - both must crash the process so the supervisor
+    // restarts it and the failed slot replays from the durable checkpoint.
+    match supervise(&mut processor_handle, signal::ctrl_c()).await {
+        Supervision::ProcessorEnded(res) => {
+            // Flush batched checkpoints for already-committed slots so a restart resumes
+            // from the latest durable point; timeout-bounded since a dead DB would stall it.
+            cancellation_token.cancel();
+            drop(instruction_tx);
+            drop(checkpoint_tx);
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), checkpoint_handle).await;
 
-    // 10. Graceful shutdown
-    shutdown_indexer(
-        cancellation_token,
-        storage,
-        datasource,
-        datasource_handle,
-        instruction_tx,
-        checkpoint_tx,
-        checkpoint_handle,
-        processor_handle,
-    )
-    .await
-    .map_err(|_| IndexerError::ShutdownChannelSend)?;
+            match res {
+                Ok(Ok(())) => {
+                    info!("TransactionProcessor stopped cleanly");
+                }
+                Ok(Err(e)) => {
+                    error!("TransactionProcessor failed fatally: {}", e);
+                    return Err(e);
+                }
+                Err(join_err) => {
+                    error!("TransactionProcessor task panicked: {:?}", join_err);
+                    return Err(IndexerError::ProcessorPanicked);
+                }
+            }
+        }
+        Supervision::ShutdownSignalled(signal_res) => {
+            signal_res.map_err(|_| IndexerError::ShutdownChannelSend)?;
+            info!("Shutdown signal received, initiating graceful shutdown...");
+
+            // 10. Graceful shutdown
+            shutdown_indexer(
+                cancellation_token,
+                storage,
+                datasource,
+                datasource_handle,
+                instruction_tx,
+                checkpoint_tx,
+                checkpoint_handle,
+                processor_handle,
+            )
+            .await
+            .map_err(|_| IndexerError::ShutdownChannelSend)?;
+        }
+    }
 
     info!("Indexer shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ready shutdown future must not steal the race from an already-finished
+    /// processor: the biased select reports the processor's fatal error so run()
+    /// exits non-zero rather than treating it as a clean shutdown.
+    #[tokio::test]
+    async fn supervise_prefers_finished_processor_over_ready_signal() {
+        let mut handle = tokio::spawn(async { Err(IndexerError::CheckpointChannelClosed) });
+        // Let the task run to completion so its future is ready when raced.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let outcome = supervise(&mut handle, std::future::ready(Ok(()))).await;
+
+        match outcome {
+            Supervision::ProcessorEnded(Ok(Err(IndexerError::CheckpointChannelClosed))) => {}
+            _ => panic!("biased select must report the finished processor's fatal error"),
+        }
+    }
+
+    /// While the processor is still running, a ready shutdown signal wins.
+    #[tokio::test]
+    async fn supervise_takes_shutdown_when_processor_running() {
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        let outcome = supervise(&mut handle, std::future::ready(Ok(()))).await;
+
+        assert!(matches!(outcome, Supervision::ShutdownSignalled(Ok(()))));
+        handle.abort();
+    }
+
+    /// A processor panic surfaces as a join error so run() maps it to a fatal
+    /// ProcessorPanicked exit rather than a clean shutdown.
+    #[tokio::test]
+    async fn supervise_surfaces_processor_panic() {
+        let mut handle: tokio::task::JoinHandle<Result<(), IndexerError>> =
+            tokio::spawn(async { panic!("processor boom") });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let outcome = supervise(&mut handle, std::future::pending::<std::io::Result<()>>()).await;
+
+        assert!(matches!(outcome, Supervision::ProcessorEnded(Err(_))));
+    }
 }

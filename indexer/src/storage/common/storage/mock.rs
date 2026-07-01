@@ -20,6 +20,8 @@ pub type ReleaseSignatureMap = HashMap<i64, Vec<(String, i64)>>;
 pub struct MockStorage {
     pub committed_checkpoints: std::sync::Arc<Mutex<HashMap<String, u64>>>,
     pub should_fail: std::sync::Arc<Mutex<HashMap<String, bool>>>,
+    /// Per-op transient-failure counters: fail the first N calls of an op, then succeed.
+    pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
     pub pending_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
@@ -44,6 +46,19 @@ impl MockStorage {
     }
 
     fn check_should_fail(&self, operation: &str) -> Result<(), StorageError> {
+        // Transient injection takes precedence: fail the first N calls, then
+        // fall through to the sticky bool (and otherwise succeed).
+        {
+            let mut times = self.fail_times.lock().unwrap();
+            if let Some(remaining) = times.get_mut(operation) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(StorageError::DatabaseError {
+                        message: format!("Simulated transient {operation} failure"),
+                    });
+                }
+            }
+        }
         if self
             .should_fail
             .lock()
@@ -71,6 +86,15 @@ impl MockStorage {
             .lock()
             .unwrap()
             .insert(program_type.to_string(), should_fail);
+    }
+
+    /// Make `operation` fail its next `times` calls, then succeed. Used to
+    /// simulate a transient storage blip that the write retry rides out.
+    pub fn set_fail_times(&self, operation: &str, times: usize) {
+        self.fail_times
+            .lock()
+            .unwrap()
+            .insert(operation.to_string(), times);
     }
 
     pub fn add_mint(&mut self, mint: DbMint) {
