@@ -134,6 +134,10 @@ name = "sender_onchain_error_arms"
 path = "tests/indexer/sender_onchain_error_arms.rs"
 
 [[test]]
+name = "sender_rotation_retry"
+path = "tests/indexer/sender_rotation_retry.rs"
+
+[[test]]
 name = "jit_mint_helper"
 path = "tests/indexer/jit_mint_helper.rs"
 

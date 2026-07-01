@@ -47,6 +47,7 @@ have prefixes.
 | `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
+| `stale tree index:` ... `release can never land on current SMT` | H - stale tree index (release can never land) | no | `sender/mod.rs` rotation drain |
 
 ## Path A.halting - build error that halted the pipeline
 
@@ -364,6 +365,49 @@ coordination:
 UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
+
+## Path H - stale tree index (release can never land)
+
+`error_message`: `stale tree index: nonce <n> belongs to tree <a>, sender on
+<b>; release can never land on current SMT`. The sender held this withdrawal
+in its rotation-retry queue, but the local SMT rotated forward past the
+nonce's tree (`a < b`). The withdrawal's tree window is closed, so forward
+rotation can never make the release valid again - retrying or re-arming will
+not help (distinct from Path A/C, where a re-arm can succeed). The release
+failed at build and was never broadcast, so it definitively never landed.
+
+### Step 1 - verify on-chain
+
+Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
+verdict: `NOT_LANDED` (build-time failure, no RPC call). If `LANDED` -> the
+tree-index check is reading a stale local SMT; switch to Path C reconciliation
+and [escalate](_escalation.md) (Tier 2) - the sender's tree tracking has a
+defect.
+
+### Step 2 - confirm the burn, then escalate for refund
+
+`signature` is the originating PrivateChannel burn. Confirm whether the user's
+tokens were burned (channel read node). Burned, release can never land -> the
+user's funds are stuck and there is no automated recovery: forward rotation
+will not reopen the tree. [Escalate](_escalation.md) (Tier 1) for out-of-band
+restoration (manual `release_funds` to the depositor or a manual remint of the
+burned tokens), then mark the row terminal:
+
+```sql
+UPDATE transactions SET status = 'failed', updated_at = NOW()
+ WHERE id = :transaction_id;
+```
+
+If the burn did not land, there is no user impact; close the alert and mark
+`failed`.
+
+### Step 3 - capture why the sender fell behind its own tree
+
+A stale tree index means the rotation-retry queue outran the local SMT (e.g.
+the queue held a withdrawal across two rotations). [Escalate](_escalation.md)
+(Tier 3) with the row's nonce, the two tree indices from the message, and the
+surrounding rotation logs so engineering can confirm whether the rotation
+cadence or the queue retention needs tightening.
 
 ## Post-incident artifacts (required)
 

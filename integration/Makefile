@@ -66,6 +66,7 @@ integration-test:
 	@cargo test --test sender_sign_and_send_error -- --nocapture
 	@cargo test --test sender_max_retries -- --nocapture
 	@cargo test --test sender_onchain_error_arms -- --nocapture
+	@cargo test --test sender_rotation_retry -- --nocapture
 	@cargo test --test jit_mint_helper -- --nocapture
 	@cargo test --test storage_update_failure -- --nocapture
 	@cargo test --test processor_quarantine -- --nocapture
@@ -277,6 +278,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test sender_max_retries -- --nocapture
 	@echo "Running sender on-chain error-arm tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_onchain_error_arms -- --nocapture
+	@echo "Running sender rotation-retry drain tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test sender_rotation_retry -- --nocapture
 	@echo "Running JIT-mint helper coverage tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test jit_mint_helper -- --nocapture
 	@echo "Running storage-update-failure tests with coverage instrumentation..."
