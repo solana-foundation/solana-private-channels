@@ -535,6 +535,18 @@ pub async fn process_release_funds(
             if let Some(nonce_i64) = transaction.withdrawal_nonce {
                 let nonce = nonce_i64 as u64;
                 if nonce > 0 && nonce.is_multiple_of(MAX_TREE_LEAVES as u64) {
+                    // Durable frontier guard: never rotate while a lower withdrawal
+                    // is still active, or it gets stranded on the closed tree. The
+                    // dequeue frontier normally keeps a boundary from arriving out of
+                    // order; this catches paths that bypass it (e.g. a manual re-arm).
+                    // Leave the row Processing for recovery rather than dispatch it.
+                    if storage.has_active_withdrawal_below(nonce_i64).await? {
+                        warn!(
+                            nonce,
+                            "Lower active withdrawal exists - deferring boundary rotation"
+                        );
+                        return Ok(());
+                    }
                     let target_tree_index = nonce / MAX_TREE_LEAVES as u64;
                     let release_funds_state = processor_state
                         .release_funds_state
@@ -1109,6 +1121,88 @@ mod tests {
 
         // No further messages — exactly two were sent
         assert!(sender_rx.try_recv().is_err(), "unexpected third message");
+    }
+
+    /// A boundary nonce must not rotate or dispatch while a lower withdrawal is
+    /// still active in the DB. Nothing is sent; the boundary row is left
+    /// Processing for recovery.
+    #[tokio::test]
+    async fn process_release_funds_boundary_defers_when_lower_active() {
+        let mock = MockStorage::new();
+
+        // Allow the mint so build_release_funds succeeds before the guard runs.
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        mock.mints.lock().unwrap().insert(
+            mint_pubkey.to_string(),
+            DbMint {
+                mint_address: mint_pubkey.to_string(),
+                decimals: 6,
+                token_program: spl_token::id().to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: Some(false),
+                has_permanent_delegate: Some(false),
+            },
+        );
+
+        // Seed a lower-nonce withdrawal stuck off the sender path (Parked, nonce 1
+        // < boundary). This is what the guard must see and refuse to rotate past.
+        // (Processing rows are excluded - the sender's in-flight guard covers those.)
+        let mut lower = make_db_transaction(
+            2,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(1),
+            TransactionType::Withdrawal,
+        );
+        lower.status = TransactionStatus::Parked;
+        mock.pending_transactions.lock().unwrap().push(lower);
+
+        // Boundary nonce → target tree 1; on-chain index 0 means a rotation WOULD
+        // fire here (0 < 1) absent the guard — so an empty sender proves the guard.
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, instance_account_response(0));
+        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        // Feed the boundary withdrawal (nonce == MAX_TREE_LEAVES, first of next tree).
+        let boundary = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            Some(MAX_TREE_LEAVES as i64),
+            TransactionType::Withdrawal,
+        );
+        fetcher_tx.send(boundary).await.unwrap();
+        drop(fetcher_tx); // close the channel so the processor loop exits
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Guard fired: neither the ResetSmtRoot nor the boundary ReleaseFunds
+        // was dispatched, because lower nonce 1 is still active.
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "boundary must be deferred while a lower nonce is active"
+        );
     }
 
     /// Regression for the boundary-quarantine wedge: a boundary nonce whose
