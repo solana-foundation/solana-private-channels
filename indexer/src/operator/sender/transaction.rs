@@ -4,7 +4,9 @@ use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::tree_constants::MAX_TREE_LEAVES;
-use crate::operator::utils::instruction_util::TransactionBuilder;
+use crate::operator::utils::instruction_util::{
+    mint_extra_error_checks_policy, TransactionBuilder,
+};
 use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
     build_and_sign, check_transaction_status, send_signed, ConfirmationResult,
@@ -588,17 +590,41 @@ pub(super) fn handle_confirmation_result<'a>(
                 );
                 match try_jit_mint_initialization(state, txn_id, instruction.clone()).await {
                     JitOutcome::Retry(new_instruction) => {
-                        info!("JIT verdict: Retry — re-issuing mint instruction");
-                        send_and_confirm(
-                            state,
-                            new_instruction,
-                            compute_unit_price,
-                            ctx,
-                            retry_policy,
-                            extra_error_checks_policy,
-                            storage_tx,
-                        )
-                        .await;
+                        // Journal the signature before broadcast
+                        // Awaited inline since this rare retry is already off the hot path.
+                        match Arc::clone(&state.semaphore).try_acquire_owned() {
+                            Ok(permit) => {
+                                info!(
+                                    "JIT verdict: Retry - re-issuing mint via write-ahead fire-and-store for txn {}",
+                                    txn_id
+                                );
+                                fire_and_store_task(
+                                    state.rpc_client.clone(),
+                                    state.storage.clone(),
+                                    state.in_flight.clone(),
+                                    state.program_type,
+                                    new_instruction,
+                                    compute_unit_price,
+                                    ctx.clone(),
+                                    retry_policy,
+                                    mint_extra_error_checks_policy(),
+                                    storage_tx.clone(),
+                                    true,
+                                    permit,
+                                )
+                                .await;
+                            }
+                            Err(_) => {
+                                metrics::OPERATOR_TRANSACTION_ERRORS
+                                    .with_label_values(&[pt, "in_flight_cap_exceeded"])
+                                    .inc();
+                                warn!(
+                                    "In-flight cap reached - deferring JIT retry for txn {}; \
+                                     row left Processing for recovery",
+                                    txn_id
+                                );
+                            }
+                        }
                     }
                     JitOutcome::ManualReview(reason) => {
                         metrics::OPERATOR_TRANSACTION_ERRORS
@@ -1219,6 +1245,9 @@ pub(super) async fn route_poll_results(
     for (mut tx, status_opt) in results {
         match status_opt {
             Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                // Free this confirmed tx's in-flight slot now so a continuation (the JIT
+                // mint retry) can reuse it instead of being refused when in-flight is full.
+                drop(tx.permit);
                 let result = if let Some(err) = &status.err {
                     let mut extra_result = None;
                     if let ExtraErrorCheckPolicy::Extra(ref checks) = tx.extra_error_checks_policy {
@@ -3998,6 +4027,369 @@ mod tests {
             state.semaphore.available_permits(),
             before + 1,
             "permit must be dropped on send error",
+        );
+    }
+
+    // ── JIT mint retry: write-ahead journaling before broadcast ──────
+
+    static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
+
+    /// Configure an in-memory admin signer so `SignerUtil::admin_signer()` can
+    /// resolve inside the JIT pre-check. Must run before the first access to the
+    /// process-global signer Lazy, so every test touching it calls this first.
+    fn ensure_test_signer() {
+        INIT_TEST_SIGNER.call_once(|| {
+            let kp = solana_sdk::signer::keypair::Keypair::new();
+            let b58 = bs58::encode(kp.to_bytes()).into_string();
+            std::env::set_var("ADMIN_SIGNER", "memory");
+            std::env::set_var("ADMIN_PRIVATE_KEY", &b58);
+        });
+    }
+
+    /// Mock `getAccountInfo` returning a packed, initialized SPL `Mint` whose
+    /// `mint_authority` equals `authority`, owned by the SPL token program. This
+    /// makes the JIT pre-check decode an `AuthorityCheck::Match`, so
+    /// `try_jit_mint_initialization` returns `JitOutcome::Retry` without sending
+    /// an on-chain InitializeMint. Matched by method only, so a single mock
+    /// answers any mint pubkey the pre-check looks up.
+    fn mock_get_account_info_mint(
+        server: &mut mockito::ServerGuard,
+        authority: Pubkey,
+    ) -> mockito::Mock {
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        use spl_token::state::Mint;
+
+        let mint = Mint {
+            mint_authority: COption::Some(authority),
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut data = vec![0u8; Mint::LEN];
+        Mint::pack(mint, &mut data).expect("pack mint");
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getAccountInfo"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": spl_token::id().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&data), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Seed `mint_builders[txn_id]` with a builder carrying `mint` so the JIT
+    /// pre-check's `builder.get_mint()` is `Some`.
+    fn seed_mint_builder(state: &mut SenderState, txn_id: i64, mint: Pubkey) {
+        use crate::operator::utils::instruction_util::MintToBuilder;
+        let mut builder = MintToBuilder::new();
+        builder.mint(mint);
+        state.mint_builders.insert(txn_id, builder);
+    }
+
+    /// A JIT `Retry` verdict must journal the value-bearing retry signature
+    /// (write-ahead) before broadcasting it and stash a persisted in-flight tx.
+    #[tokio::test]
+    async fn jit_retry_persists_signature_before_broadcast() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let ctx = mint_ctx(77);
+        let (storage_tx, _rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let stored = mock.get_release_signatures(77).await.unwrap();
+        assert_eq!(stored.len(), 1, "exactly one retry signature journaled");
+        assert_eq!(
+            stored[0].0,
+            Signature::default().to_string(),
+            "journaled signature must be the broadcast signature"
+        );
+        assert_eq!(stored[0].1, 100, "journaled lvbh must match the blockhash");
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "successful broadcast stashes the in-flight tx"
+        );
+        assert!(
+            state.in_flight.entries.lock().unwrap()[0].persisted,
+            "the stashed JIT-retry tx must be marked persisted"
+        );
+    }
+
+    /// A failed write-ahead persist on the JIT retry must abort before
+    /// broadcast, leave the row Processing (no status update), stash nothing, and
+    /// release the permit.
+    #[tokio::test]
+    async fn jit_retry_persist_failure_aborts_before_broadcast() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        mock.set_should_fail("insert_release_signature", true);
+        let before = state.semaphore.available_permits();
+        let ctx = mint_ctx(77);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no status update; row stays Processing for recovery"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "nothing stashed when persist failed"
+        );
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before,
+            "permit must be released on abort"
+        );
+    }
+
+    /// When the in-flight cap is reached, the JIT retry must not broadcast
+    /// (nothing journaled, no status update, nothing stashed) so the row is left
+    /// Processing for recovery.
+    #[tokio::test]
+    async fn jit_retry_cap_reached_leaves_processing() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+
+        // Drain every permit and hold them so the JIT retry can't acquire one.
+        let _held: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(state.semaphore.available_permits(), 0);
+
+        let ctx = mint_ctx(77);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        handle_confirmation_result(
+            &mut state,
+            Ok(ConfirmationResult::MintNotInitialized),
+            Signature::new_unique(),
+            None,
+            &ctx,
+            dummy_instruction(),
+            RetryPolicy::None,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "cap path must journal nothing"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "cap path must leave the row Processing (no status update)"
+        );
+        assert!(
+            state.in_flight.is_empty(),
+            "cap path stashes no in-flight entry"
+        );
+    }
+
+    /// Regression: routed through the real poll path, a MintNotInitialized confirmation
+    /// at in-flight saturation must still retry. The confirmed parent releases its slot
+    /// before the JIT retry acquires one, so the retry reuses that freed slot instead of
+    /// being spuriously refused and deferred to recovery.
+    #[tokio::test]
+    async fn jit_retry_at_saturation_reuses_freed_parent_slot() {
+        use crate::operator::SignerUtil;
+
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let admin = SignerUtil::admin_signer().pubkey();
+
+        // Parent mint confirms with an on-chain error the mint policy maps to
+        // MintNotInitialized, driving the JIT verdict.
+        let sig = Signature::new_unique();
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 200},
+                        "value": [
+                            {
+                                "confirmationStatus": "confirmed",
+                                "confirmations": 1,
+                                "err": {"InstructionError": [0, "InvalidAccountData"]},
+                                "slot": 200,
+                                "status": {"Err": {"InstructionError": [0, "InvalidAccountData"]}}
+                            }
+                        ]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        let _acct = mock_get_account_info_mint(&mut server, admin);
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_mint_builder(&mut state, 77, Pubkey::new_unique());
+
+        // Parent in-flight tx holds a permit drawn from the state semaphore and carries
+        // the mint policy so route_poll_results classifies MintNotInitialized.
+        let parent = super::super::types::InFlightTx {
+            signature: sig,
+            ctx: mint_ctx(77),
+            instruction: dummy_instruction(),
+            compute_unit_price: None,
+            retry_policy: RetryPolicy::None,
+            extra_error_checks_policy: mint_extra_error_checks_policy(),
+            poll_attempts: 0,
+            resend_count: 0,
+            persisted: true,
+            permit: state.semaphore.clone().try_acquire_owned().unwrap(),
+        };
+        state.in_flight.push(parent);
+
+        // Hold every other permit so the parent's slot is the only one that can free up.
+        let _held: Vec<_> = (0..MAX_IN_FLIGHT - 1)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(state.semaphore.available_permits(), 0);
+
+        let (storage_tx, _rx) = mpsc::channel(10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(
+            !mock.get_release_signatures(77).await.unwrap().is_empty(),
+            "JIT retry must reuse the freed parent slot and journal its signature at saturation"
         );
     }
 

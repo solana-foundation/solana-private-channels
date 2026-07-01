@@ -165,15 +165,19 @@ impl TransactionBuilder {
 
     pub fn extra_error_checks_policy(&self) -> ExtraErrorCheckPolicy {
         match self {
-            Self::Mint(_) => {
-                ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
-            }
+            Self::Mint(_) => mint_extra_error_checks_policy(),
             Self::InitializeMint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_already_initialized_error)])
             }
             Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => ExtraErrorCheckPolicy::None,
         }
     }
+}
+
+// One source for the Mint error-check policy so every caller stays in sync.
+// Rebuilt on demand because the policy holds boxed closures and is not Clone.
+pub(crate) fn mint_extra_error_checks_policy() -> ExtraErrorCheckPolicy {
+    ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
 }
 
 #[derive(Clone, Debug)]
