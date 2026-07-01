@@ -184,3 +184,42 @@ groups:
                     type: lt
                     params: [0.5]
               refId: C
+
+  - orgId: 1
+    name: indexer-missing-meta-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-missing-meta
+        title: "Indexer slot stuck on missing transaction metadata"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} is rejecting a slot whose transactions are missing metadata (meta: null); the checkpoint cannot advance past it. Repoint the datasource RPC (or configure an archival fallback_rpc_url) at a full-history endpoint. This catches the sustained live-polling wedge; a backfill or resync hitting missing metadata instead aborts loudly with a MissingMeta error in the logs rather than sustaining this metric."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="missing_meta"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C

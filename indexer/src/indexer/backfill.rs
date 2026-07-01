@@ -133,6 +133,19 @@ pub async fn fill_slot_range(
         for (slot, block_result) in blocks {
             match block_result {
                 Ok(Some(block)) => {
+                    // A missing-meta block is unverifiable: abort before the SlotComplete send so the
+                    // checkpoint never advances past it; the caller surfaces the error and retries.
+                    if let Some(signature) = decoder::first_missing_meta(&block) {
+                        error!(
+                            "Backfill slot {} has transaction {} missing meta; aborting before checkpoint",
+                            slot, signature
+                        );
+                        metrics::INDEXER_RPC_ERRORS
+                            .with_label_values(&[program_type.as_label(), "missing_meta"])
+                            .inc();
+                        return Err(BackfillError::MissingMeta { slot, signature }.into());
+                    }
+
                     let instructions_with_meta = decoder::parse_block(
                         &block,
                         slot,
@@ -500,6 +513,37 @@ mod tests {
                 .create()
         }
 
+        /// getBlock returns a well-formed block carrying one transaction with
+        /// `meta: null`, which the guard must reject as incomplete.
+        fn mock_get_block_missing_meta(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash11111111111111111111111111111",
+                            "parentSlot": slot - 1,
+                            "transactions": [{
+                                "transaction": {
+                                    "signatures": ["sig_missing_meta"],
+                                    "message": { "accountKeys": [], "instructions": [] }
+                                },
+                                "meta": null
+                            }]
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
         #[tokio::test]
         async fn fill_slot_range_empty_blocks() {
             let mut server = Server::new_async().await;
@@ -587,6 +631,44 @@ mod tests {
                 fill_slot_range(&poller, 100, 101, 10, ProgramType::Escrow, None, &tx).await;
 
             assert!(result.is_err());
+        }
+
+        /// A batch where slot N's block has a `meta: null` transaction must
+        /// abort with `MissingMeta { slot: N }` before sending SlotComplete{N} (and
+        /// before any SlotComplete for slots after N), so the checkpoint never
+        /// advances past the incomplete slot.
+        #[tokio::test]
+        async fn fill_slot_range_missing_meta_aborts_before_slot_complete() {
+            let mut server = Server::new_async().await;
+
+            // Batch over (100, 102] = [101, 102]; slot 101 is incomplete.
+            let _m1 = mock_get_block_missing_meta(&mut server, 101);
+            let _m2 = mock_get_block_success(&mut server, 102);
+
+            let poller = RpcPoller::new(
+                server.url(),
+                UiTransactionEncoding::Json,
+                CommitmentLevel::Finalized,
+            );
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            let err = result.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("missing metadata"), "unexpected error: {msg}");
+            assert!(msg.contains("101"), "error should name the slot: {msg}");
+
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let advanced = messages
+                .iter()
+                .any(|m| matches!(m, ProcessorMessage::SlotComplete { slot, .. } if *slot >= 101));
+            assert!(
+                !advanced,
+                "no SlotComplete must be sent for slot 101 or beyond on an incomplete block"
+            );
         }
 
         #[tokio::test]

@@ -24,7 +24,28 @@ type ParseInstructionFn<T> = fn(
     location: InstructionLocation,
 ) -> Result<Option<T>, ParserError>;
 
-/// Parse a block and extract program-specific instructions with metadata
+/// Returns a label for the first `meta`-less
+/// transaction in `block`, or `None` if all carry metadata; a single `meta: null`
+/// tx makes the slot unverifiable, so callers MUST fail closed on `Some(_)`.
+pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
+    for (index, tx_with_meta) in block.transactions.iter().enumerate() {
+        if tx_with_meta.meta.is_none() {
+            return Some(
+                tx_with_meta
+                    .transaction
+                    .signatures
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| format!("tx#{index}")),
+            );
+        }
+    }
+    None
+}
+
+/// Parse a block and extract program-specific instructions with metadata.
+///
+/// Precondition: every transaction in `block` must carry `meta`.
 pub fn parse_block(
     block: &RpcBlock,
     slot: u64,
@@ -553,25 +574,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_transaction_no_meta_treated_as_successful() {
-        let mut block = create_test_block();
-        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
-        let instruction = create_instruction(0, vec![], "no_meta".to_string());
+    // ============================================================================
+    // first_missing_meta guard Tests
+    // ============================================================================
 
-        block.transactions.push(create_transaction_no_meta(
-            "sig_no_meta".to_string(),
-            account_keys,
-            vec![instruction],
+    /// Every transaction carries meta, so the block is complete.
+    #[test]
+    fn first_missing_meta_all_present_returns_none() {
+        let mut block = create_test_block();
+        let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        let ix = create_instruction(0, vec![], "data".to_string());
+        block.transactions.push(create_successful_transaction(
+            "sig_ok".to_string(),
+            keys.clone(),
+            vec![ix.clone()],
+        ));
+        block.transactions.push(create_failed_transaction(
+            "sig_failed".to_string(),
+            keys,
+            vec![ix],
         ));
 
-        let result = parse_for_test(&block, TEST_PROGRAM_ID, mock_parser, None);
+        assert_eq!(first_missing_meta(&block), None);
+    }
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(
-            result[0],
-            ("sig_no_meta".to_string(), 0u32, "no_meta".to_string())
-        );
+    /// One meta-less transaction among successful ones is reported by its signature.
+    #[test]
+    fn first_missing_meta_reports_signature_of_missing_tx() {
+        let mut block = create_test_block();
+        let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        let ix = create_instruction(0, vec![], "data".to_string());
+        block.transactions.push(create_successful_transaction(
+            "sig_ok".to_string(),
+            keys.clone(),
+            vec![ix.clone()],
+        ));
+        block.transactions.push(create_transaction_no_meta(
+            "sig_no_meta".to_string(),
+            keys,
+            vec![ix],
+        ));
+
+        assert_eq!(first_missing_meta(&block), Some("sig_no_meta".to_string()));
+    }
+
+    /// A meta-less transaction with no signature falls back to `tx#<index>` (no panic).
+    #[test]
+    fn first_missing_meta_no_signature_falls_back_to_index() {
+        let mut block = create_test_block();
+        let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        let ix = create_instruction(0, vec![], "data".to_string());
+        // First a normal tx so the missing-meta tx lands at index 1.
+        block.transactions.push(create_successful_transaction(
+            "sig_ok".to_string(),
+            keys.clone(),
+            vec![ix.clone()],
+        ));
+        let mut no_meta = create_transaction_no_meta("dummy".to_string(), keys, vec![ix]);
+        no_meta.transaction.signatures = vec![];
+        block.transactions.push(no_meta);
+
+        assert_eq!(first_missing_meta(&block), Some("tx#1".to_string()));
+    }
+
+    /// An empty block carries no missing-meta transaction.
+    #[test]
+    fn first_missing_meta_empty_block_returns_none() {
+        let block = create_test_block();
+        assert_eq!(first_missing_meta(&block), None);
+    }
+
+    /// A failed transaction (meta present, `err = Some`) is not missing meta;
+    /// the meta-less transaction is the one reported.
+    #[test]
+    fn first_missing_meta_failed_tx_is_not_missing_meta() {
+        let mut block = create_test_block();
+        let keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        let ix = create_instruction(0, vec![], "data".to_string());
+        block.transactions.push(create_failed_transaction(
+            "sig_failed".to_string(),
+            keys.clone(),
+            vec![ix.clone()],
+        ));
+        block.transactions.push(create_transaction_no_meta(
+            "sig_no_meta".to_string(),
+            keys,
+            vec![ix],
+        ));
+
+        assert_eq!(first_missing_meta(&block), Some("sig_no_meta".to_string()));
     }
 
     // ============================================================================

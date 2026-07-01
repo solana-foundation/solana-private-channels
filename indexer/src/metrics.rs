@@ -187,7 +187,7 @@ pub fn init_labels(program_type: &str) {
     INDEXER_CHECKPOINT_FRONTIER_LAG.with_label_values(&[program_type]);
     INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
 
-    for error_type in &["stream", "get_slots", "get_block"] {
+    for error_type in &["stream", "get_slots", "get_block", "missing_meta"] {
         INDEXER_RPC_ERRORS.with_label_values(&[program_type, error_type]);
     }
 

@@ -83,6 +83,10 @@ pub struct RpcPollingConfig {
     pub encoding: UiTransactionEncoding,
     /// RPC commitment level for getSlot calls
     pub commitment: CommitmentLevel,
+    /// Optional archival/full-history RPC consulted once by the live polling loop
+    /// when the primary returns a slot with missing transaction metadata.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
 }
 
 /// Yellowstone gRPC specific configuration
@@ -345,6 +349,7 @@ mod tests {
                 batch_size: 10,
                 encoding: UiTransactionEncoding::Json,
                 commitment: CommitmentLevel::Finalized,
+                fallback_rpc_url: None,
             }),
             yellowstone: None,
             backfill: BackfillConfig {

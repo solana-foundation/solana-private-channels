@@ -83,6 +83,9 @@ pub enum BackfillError {
         source: DataSourceRpcError,
     },
 
+    #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
+    MissingMeta { slot: u64, signature: String },
+
     // Channel errors
     #[error("Channel send failed: {0}")]
     ChannelSend(#[source] Box<dyn std::error::Error + Send + Sync>),
