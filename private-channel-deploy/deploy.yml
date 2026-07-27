@@ -335,6 +335,8 @@
           Fix: edit secrets.yml and add `jwt_secret: <random-32+-byte-string>`  (e.g. `openssl rand -hex 32`).
       when: gateway_enforce_jwt | default(true) | bool
 
+    # When skip_pull is set the stack runs a locally-built image (no registry),
+    # so GHCR creds aren't needed.
     - name: Assert GHCR creds present
       ansible.builtin.assert:
         that:
@@ -343,6 +345,7 @@
         fail_msg: |
           `ghcr_user`/`ghcr_token` empty in secrets.yml. Deploy needs them to docker-login to GHCR before pulling images.
           Fix: edit secrets.yml — `ghcr_user: <github-username>`, `ghcr_token: <PAT with read:packages>`.
+      when: not (skip_pull | default(false) | bool)
 
     # Yellowstone gRPC required for indexer-solana on public clusters
     # (localnet uses the bundled validator's Yellowstone, no external endpoint).
@@ -429,6 +432,7 @@
         executable: /bin/bash
       changed_when: true
       no_log: true
+      when: not (skip_pull | default(false) | bool)
 
     # Drop the marker last so a partial bootstrap re-runs cleanly.
     - name: Drop bootstrap marker
@@ -839,12 +843,14 @@
         docker compose -p private-channel --env-file {{ target_versions_env_file }} --env-file {{ target_config_dir }}/.env -f {{ target_compose_file }} -f {{ target_override_file }}
     block:
     # Pull pinned tag. Runs from the target's config dir so the host doesn't
-    # need the repo.
+    # need the repo. Skipped when skip_pull is set (image was built locally on
+    # this host and isn't in any registry).
     - name: Pull images from registry
       ansible.builtin.shell: "{{ compose_cmd }} pull {{ compose_services }}"
       args:
         chdir: "{{ target_config_dir }}"
       changed_when: true
+      when: not (skip_pull | default(false) | bool)
 
     # Postgres runs as uid 70, but Docker creates named volumes root-owned, so the
     # archive_command (`cp %p /wal_archive/...`) fails with "Permission denied" and

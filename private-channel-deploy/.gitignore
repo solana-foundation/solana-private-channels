@@ -10,6 +10,9 @@ ansible.log
 # improvements" for the SOPS upgrade path that lets this go in git encrypted.
 secrets.yml
 
+# Per-stack secret overrides (e.g. the auditor stack). Same rule as secrets.yml.
+*secrets.yml
+
 # Reserved for the SOPS upgrade. Keys must never live in the repo.
 age.key
 keys.txt
