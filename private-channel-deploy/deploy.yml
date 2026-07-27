@@ -423,6 +423,9 @@
   # Runs every deploy (not gated by the bootstrap marker) so a host first stood
   # up with skip_pull=true still gets logged in the day it switches to
   # skip_pull=false, instead of silently reusing a bootstrap that skipped auth.
+  # Tagged deploy (not just bootstrap) so a tag-scoped `--tags deploy` run — the
+  # normal way to redeploy an already-bootstrapped host — still authenticates
+  # before PHASE 4's `Pull images from registry` (also tagged deploy) runs.
   # Forced to /bin/bash because `set -o pipefail` is bash-only and Debian/Ubuntu
   # ship dash as /bin/sh.
   - name: Write GHCR credentials to docker config
@@ -442,7 +445,7 @@
       executable: /bin/bash
     changed_when: true
     no_log: true
-    tags: [ bootstrap ]
+    tags: [ bootstrap, deploy ]
     when: not (skip_pull | default(false) | bool)
 
   # =========================================================================
