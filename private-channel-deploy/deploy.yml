@@ -412,34 +412,38 @@
         mode: "0755"
       loop: [ "", data, logs, config ]
 
-    # GHCR creds → ~/.docker/config.json so `docker compose pull` can fetch images.
-    # Forced to /bin/bash because `set -o pipefail` is bash-only and Debian/Ubuntu
-    # ship dash as /bin/sh.
-    - name: Write GHCR credentials to docker config
-      ansible.builtin.shell: |
-        set -euo pipefail
-        mkdir -p ~/.docker
-        echo -n '{{ ghcr_user }}:{{ ghcr_token }}' | base64 -w0 > /tmp/.ghcr_b64
-        python3 -c "
-        import json, os, pathlib
-        p = pathlib.Path(os.path.expanduser('~/.docker/config.json'))
-        cfg = json.loads(p.read_text()) if p.exists() else {}
-        cfg.setdefault('auths', {})['ghcr.io'] = {'auth': open('/tmp/.ghcr_b64').read()}
-        p.write_text(json.dumps(cfg, indent=2))
-        "
-        rm -f /tmp/.ghcr_b64
-      args:
-        executable: /bin/bash
-      changed_when: true
-      no_log: true
-      when: not (skip_pull | default(false) | bool)
-
     # Drop the marker last so a partial bootstrap re-runs cleanly.
     - name: Drop bootstrap marker
       ansible.builtin.copy:
         dest: "{{ bootstrap_marker }}"
         content: "bootstrapped {{ ansible_date_time.iso8601 }}\n"
         mode: "0644"
+
+  # GHCR creds → ~/.docker/config.json so `docker compose pull` can fetch images.
+  # Runs every deploy (not gated by the bootstrap marker) so a host first stood
+  # up with skip_pull=true still gets logged in the day it switches to
+  # skip_pull=false, instead of silently reusing a bootstrap that skipped auth.
+  # Forced to /bin/bash because `set -o pipefail` is bash-only and Debian/Ubuntu
+  # ship dash as /bin/sh.
+  - name: Write GHCR credentials to docker config
+    ansible.builtin.shell: |
+      set -euo pipefail
+      mkdir -p ~/.docker
+      echo -n '{{ ghcr_user }}:{{ ghcr_token }}' | base64 -w0 > /tmp/.ghcr_b64
+      python3 -c "
+      import json, os, pathlib
+      p = pathlib.Path(os.path.expanduser('~/.docker/config.json'))
+      cfg = json.loads(p.read_text()) if p.exists() else {}
+      cfg.setdefault('auths', {})['ghcr.io'] = {'auth': open('/tmp/.ghcr_b64').read()}
+      p.write_text(json.dumps(cfg, indent=2))
+      "
+      rm -f /tmp/.ghcr_b64
+    args:
+      executable: /bin/bash
+    changed_when: true
+    no_log: true
+    tags: [ bootstrap ]
+    when: not (skip_pull | default(false) | bool)
 
   # =========================================================================
   # PHASE 2.5: RESET_STATE — wipe data volumes in lockstep with the validator.
