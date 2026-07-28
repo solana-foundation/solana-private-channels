@@ -11,6 +11,12 @@
 
 # Prepend image_registry so `compose pull` resolves to GHCR (or whatever registry).
 {% set img_prefix = image_registry ~ '/' %}
+# skip_pull stacks build the image locally under this same img_prefix tag, but
+# without pull_policy: never, `compose up`'s default "missing" policy would
+# still reach for the registry if that exact tag isn't found locally for any
+# reason (rebuild skipped, tag typo, etc.) — an unauthenticated pull attempt
+# instead of a clear local-image-missing failure.
+{% set no_pull = skip_pull | default(false) | bool %}
 
 services:
 {% for svc in ['write-node', 'read-node', 'gateway', 'streamer', 'auth',
@@ -18,8 +24,14 @@ services:
   {{ svc }}:
     # Pin every Solana Private Channels-app service to the deployed image tag.
     image: {{ img_prefix }}private-channel-app:{{ image_tag }}
+{% if no_pull %}
+    pull_policy: never
+{% endif %}
 {% endfor %}
 
   # Stamp the deployed tag onto the validator image too (built from validator.Dockerfile).
   validator:
     image: {{ img_prefix }}private-channel-validator:{{ image_tag }}
+{% if no_pull %}
+    pull_policy: never
+{% endif %}

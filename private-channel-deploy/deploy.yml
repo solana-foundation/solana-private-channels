@@ -335,6 +335,8 @@
           Fix: edit secrets.yml and add `jwt_secret: <random-32+-byte-string>`  (e.g. `openssl rand -hex 32`).
       when: gateway_enforce_jwt | default(true) | bool
 
+    # When skip_pull is set the stack runs a locally-built image (no registry),
+    # so GHCR creds aren't needed.
     - name: Assert GHCR creds present
       ansible.builtin.assert:
         that:
@@ -343,6 +345,7 @@
         fail_msg: |
           `ghcr_user`/`ghcr_token` empty in secrets.yml. Deploy needs them to docker-login to GHCR before pulling images.
           Fix: edit secrets.yml — `ghcr_user: <github-username>`, `ghcr_token: <PAT with read:packages>`.
+      when: not (skip_pull | default(false) | bool)
 
     # Yellowstone gRPC required for indexer-solana on public clusters
     # (localnet uses the bundled validator's Yellowstone, no external endpoint).
@@ -409,33 +412,41 @@
         mode: "0755"
       loop: [ "", data, logs, config ]
 
-    # GHCR creds → ~/.docker/config.json so `docker compose pull` can fetch images.
-    # Forced to /bin/bash because `set -o pipefail` is bash-only and Debian/Ubuntu
-    # ship dash as /bin/sh.
-    - name: Write GHCR credentials to docker config
-      ansible.builtin.shell: |
-        set -euo pipefail
-        mkdir -p ~/.docker
-        echo -n '{{ ghcr_user }}:{{ ghcr_token }}' | base64 -w0 > /tmp/.ghcr_b64
-        python3 -c "
-        import json, os, pathlib
-        p = pathlib.Path(os.path.expanduser('~/.docker/config.json'))
-        cfg = json.loads(p.read_text()) if p.exists() else {}
-        cfg.setdefault('auths', {})['ghcr.io'] = {'auth': open('/tmp/.ghcr_b64').read()}
-        p.write_text(json.dumps(cfg, indent=2))
-        "
-        rm -f /tmp/.ghcr_b64
-      args:
-        executable: /bin/bash
-      changed_when: true
-      no_log: true
-
     # Drop the marker last so a partial bootstrap re-runs cleanly.
     - name: Drop bootstrap marker
       ansible.builtin.copy:
         dest: "{{ bootstrap_marker }}"
         content: "bootstrapped {{ ansible_date_time.iso8601 }}\n"
         mode: "0644"
+
+  # GHCR creds → ~/.docker/config.json so `docker compose pull` can fetch images.
+  # Runs every deploy (not gated by the bootstrap marker) so a host first stood
+  # up with skip_pull=true still gets logged in the day it switches to
+  # skip_pull=false, instead of silently reusing a bootstrap that skipped auth.
+  # Tagged deploy (not just bootstrap) so a tag-scoped `--tags deploy` run — the
+  # normal way to redeploy an already-bootstrapped host — still authenticates
+  # before PHASE 4's `Pull images from registry` (also tagged deploy) runs.
+  # Forced to /bin/bash because `set -o pipefail` is bash-only and Debian/Ubuntu
+  # ship dash as /bin/sh.
+  - name: Write GHCR credentials to docker config
+    ansible.builtin.shell: |
+      set -euo pipefail
+      mkdir -p ~/.docker
+      echo -n '{{ ghcr_user }}:{{ ghcr_token }}' | base64 -w0 > /tmp/.ghcr_b64
+      python3 -c "
+      import json, os, pathlib
+      p = pathlib.Path(os.path.expanduser('~/.docker/config.json'))
+      cfg = json.loads(p.read_text()) if p.exists() else {}
+      cfg.setdefault('auths', {})['ghcr.io'] = {'auth': open('/tmp/.ghcr_b64').read()}
+      p.write_text(json.dumps(cfg, indent=2))
+      "
+      rm -f /tmp/.ghcr_b64
+    args:
+      executable: /bin/bash
+    changed_when: true
+    no_log: true
+    tags: [ bootstrap, deploy ]
+    when: not (skip_pull | default(false) | bool)
 
   # =========================================================================
   # PHASE 2.5: RESET_STATE — wipe data volumes in lockstep with the validator.
@@ -839,12 +850,14 @@
         docker compose -p private-channel --env-file {{ target_versions_env_file }} --env-file {{ target_config_dir }}/.env -f {{ target_compose_file }} -f {{ target_override_file }}
     block:
     # Pull pinned tag. Runs from the target's config dir so the host doesn't
-    # need the repo.
+    # need the repo. Skipped when skip_pull is set (image was built locally on
+    # this host and isn't in any registry).
     - name: Pull images from registry
       ansible.builtin.shell: "{{ compose_cmd }} pull {{ compose_services }}"
       args:
         chdir: "{{ target_config_dir }}"
       changed_when: true
+      when: not (skip_pull | default(false) | bool)
 
     # Postgres runs as uid 70, but Docker creates named volumes root-owned, so the
     # archive_command (`cp %p /wal_archive/...`) fails with "Permission denied" and
