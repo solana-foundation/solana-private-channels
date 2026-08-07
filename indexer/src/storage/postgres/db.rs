@@ -1148,11 +1148,15 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Stale `Processing` rows older than the threshold, oldest-first.
+    /// Stale `Processing` rows of one transaction type, oldest-first.
+    ///
+    /// Scoped by type because both operator roles share this table: the sweep
+    /// must only return rows the caller's role owns.
     pub async fn get_stale_processing_transactions_internal(
         &self,
         threshold: Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         let threshold_secs = threshold.as_secs() as f64;
         sqlx::query_as::<_, DbTransaction>(&format!(
@@ -1163,6 +1167,7 @@ impl PostgresDb {
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
+              AND {} = $3
             ORDER BY {} ASC
             LIMIT $2
             "#,
@@ -1193,11 +1198,13 @@ impl PostgresDb {
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
+            transaction_cols::TRANSACTION_TYPE,
             // Ordering (FIFO over stale)
             transaction_cols::UPDATED_AT,
         ))
         .bind(threshold_secs)
         .bind(limit)
+        .bind(transaction_type)
         .fetch_all(&self.pool)
         .await
     }
@@ -1269,11 +1276,16 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Stale `Parked` rows older than the threshold, oldest-first.
+    /// Stale `Parked` rows of one transaction type, oldest-first.
+    ///
+    /// Type-scoped for the same reason as the stale `Processing` read: the
+    /// parked sweep unparks rows unconditionally, so a cross-role hit would
+    /// hand back a row another operator still owns.
     pub async fn get_stale_parked_transactions_internal(
         &self,
         threshold: Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         let threshold_secs = threshold.as_secs() as f64;
         sqlx::query_as::<_, DbTransaction>(&format!(
@@ -1284,6 +1296,7 @@ impl PostgresDb {
             FROM transactions
             WHERE {} = 'parked'
               AND {} < NOW() - make_interval(secs => $1)
+              AND {} = $3
             ORDER BY {} ASC
             LIMIT $2
             "#,
@@ -1314,11 +1327,13 @@ impl PostgresDb {
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
+            transaction_cols::TRANSACTION_TYPE,
             // Ordering (FIFO over stale)
             transaction_cols::UPDATED_AT,
         ))
         .bind(threshold_secs)
         .bind(limit)
+        .bind(transaction_type)
         .fetch_all(&self.pool)
         .await
     }

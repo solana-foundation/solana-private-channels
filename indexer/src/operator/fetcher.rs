@@ -2,7 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::config::OperatorConfig;
 use crate::error::OperatorError;
 use crate::metrics;
-use crate::storage::common::models::{DbTransaction, TransactionType};
+use crate::storage::common::models::DbTransaction;
 use crate::storage::Storage;
 use crate::ProgramType;
 use private_channel_metrics::{HealthState, MetricLabel};
@@ -25,10 +25,7 @@ pub async fn run_fetcher(
 ) -> Result<(), OperatorError> {
     info!("Starting fetcher");
 
-    let transaction_type = match program_type {
-        ProgramType::Escrow => TransactionType::Deposit,
-        ProgramType::Withdraw => TransactionType::Withdrawal,
-    };
+    let transaction_type = program_type.owned_transaction_type();
 
     loop {
         // Check for cancellation
@@ -108,7 +105,7 @@ pub async fn run_fetcher(
 mod tests {
     use super::*;
     use crate::storage::common::amount::TokenAmount;
-    use crate::storage::common::models::{DbTransaction, TransactionStatus};
+    use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
     use crate::storage::common::storage::mock::MockStorage;
     use chrono::Utc;
     use std::time::Duration;

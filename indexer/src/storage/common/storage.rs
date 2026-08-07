@@ -336,14 +336,20 @@ impl Storage {
         quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
     }
 
-    /// Stale `Processing` rows past the threshold (used by recovery).
+    /// Stale `Processing` rows of one type past the threshold (used by recovery).
     pub async fn get_stale_processing_transactions(
         &self,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_stale_processing_transactions::get_stale_processing_transactions(self, threshold, limit)
-            .await
+        get_stale_processing_transactions::get_stale_processing_transactions(
+            self,
+            threshold,
+            limit,
+            transaction_type,
+        )
+        .await
     }
 
     /// CAS `Processing` → `Pending` on `updated_at`; `Ok(false)` if stale.
@@ -369,13 +375,20 @@ impl Storage {
         try_unpark_to_processing::try_unpark_to_processing(self, transaction_id).await
     }
 
-    /// Stale `Parked` rows older than the threshold, oldest-first.
+    /// Stale `Parked` rows of one type, oldest-first.
     pub async fn get_stale_parked_transactions(
         &self,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
-        get_stale_parked_transactions::get_stale_parked_transactions(self, threshold, limit).await
+        get_stale_parked_transactions::get_stale_parked_transactions(
+            self,
+            threshold,
+            limit,
+            transaction_type,
+        )
+        .await
     }
 
     /// CAS `Parked` → `Pending` on `updated_at`; `Ok(false)` if stale.

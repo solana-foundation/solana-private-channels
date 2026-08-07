@@ -119,8 +119,10 @@ async fn recover_once(
         Err(e) => warn!("Recovery release-signature GC failed: {}", e),
     }
 
+    let owned_type = program_type.owned_transaction_type();
+
     let stale = storage
-        .get_stale_processing_transactions(threshold, RECOVERY_BATCH_LIMIT)
+        .get_stale_processing_transactions(threshold, RECOVERY_BATCH_LIMIT, owned_type)
         .await?;
 
     if !stale.is_empty() {
@@ -136,6 +138,9 @@ async fn recover_once(
             info!("Recovery sweep cancelled; remaining rows deferred");
             return Ok(());
         }
+        if !role_owns(program_type, &row) {
+            continue;
+        }
         // Capture `updated_at` before the RPC so the write below CAS-checks it.
         let captured = row.updated_at;
         let action = decide_action(&row, storage, rpc_client).await;
@@ -146,16 +151,39 @@ async fn recover_once(
     // these itself, so anything stale here lost its in-memory driver. Parked
     // rows were never sent on-chain, so requeue them without verifying finality.
     let stale_parked = storage
-        .get_stale_parked_transactions(threshold, RECOVERY_BATCH_LIMIT)
+        .get_stale_parked_transactions(threshold, RECOVERY_BATCH_LIMIT, owned_type)
         .await?;
     for row in stale_parked {
         if cancellation_token.is_cancelled() {
             info!("Recovery sweep cancelled; remaining parked rows deferred");
             return Ok(());
         }
+        if !role_owns(program_type, &row) {
+            continue;
+        }
         requeue_parked(storage, &row, program_type).await;
     }
     Ok(())
+}
+
+/// Whether this operator role owns the row, and may therefore act on it.
+///
+/// The sweep queries already filter by type, so in production this is always
+/// true. It is kept as a second, in-process gate because the consequence of a
+/// miss is severe and silent: the two roles share one database but hold RPC
+/// clients pointed at opposite chains, so acting on a foreign row classifies
+/// its signatures against a chain they were never broadcast to. Guarding here,
+/// ahead of every storage read and RPC, means any future unfiltered query
+/// cannot reach the wrong chain.
+fn role_owns(program_type: ProgramType, row: &DbTransaction) -> bool {
+    let owned = row.transaction_type == program_type.owned_transaction_type();
+    if !owned {
+        warn!(
+            transaction_id = row.id,
+            "Recovery skipped a row owned by the other operator role"
+        );
+    }
+    owned
 }
 
 async fn decide_action(
@@ -443,7 +471,8 @@ async fn route_outcome(
 
 /// Synchronous boot pre-flight reconcile: repeatedly run `recover_once` with a
 /// `Duration::ZERO` threshold (so even a fresh crash row is reconciled) until no
-/// `Processing` rows remain, bounded by `max_passes`. A withdraw operator is
+/// `Processing` rows of this role's type remain, bounded by `max_passes`. Rows
+/// belonging to the other role are never counted or touched. A withdraw operator is
 /// single-active (SMT nonce ordering forbids a second sender), so at boot there
 /// is no live sibling whose not-yet-stale work this could disrupt. Exhausting
 /// `max_passes` with rows still `Processing` returns `Ok`: the caller's
@@ -467,8 +496,14 @@ pub async fn boot_reconcile_processing(
         )
         .await?;
 
+        // Same type scope as the sweep above, or the loop could never converge
+        // while a sibling role has Processing rows of its own.
         let remaining = storage
-            .get_stale_processing_transactions(Duration::ZERO, RECOVERY_BATCH_LIMIT)
+            .get_stale_processing_transactions(
+                Duration::ZERO,
+                RECOVERY_BATCH_LIMIT,
+                program_type.owned_transaction_type(),
+            )
             .await?;
         if remaining.is_empty() {
             return Ok(());
@@ -1086,6 +1121,96 @@ mod tests {
             mock.pending_transactions.lock().unwrap()[0].status,
             TransactionStatus::Parked,
             "fresh parked row must be left alone"
+        );
+    }
+
+    // ── role ownership ───────────────────────────────────────────────
+
+    /// A withdraw operator must leave escrow deposits alone. Its RPC client points
+    /// at the withdrawal destination chain, so classifying a deposit's mint
+    /// signature there reads a chain the signature was never sent to.
+    #[tokio::test]
+    async fn withdraw_sweep_ignores_processing_deposit() {
+        let mock = MockStorage::new();
+        let mut row = make_deposit_row(80);
+        row.status = TransactionStatus::Processing;
+        // Backdate past STALE_THRESHOLD so only ownership can keep the sweep off it.
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        // A persisted signature is what an unowned sweep would classify cross-chain.
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+            .await
+            .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Processing,
+            "a deposit is not the withdraw role's row to recover"
+        );
+        assert_eq!(
+            after[0].recovery_requeue_attempts, 0,
+            "a foreign row must not burn the requeue cap"
+        );
+        drop(after);
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "skipping a foreign row must not alert"
+        );
+    }
+
+    /// `role_owns` exhaustively, over all four role/row-type pairs. Called directly
+    /// on purpose: the SQL and mock reads are both type-scoped, so a cross-role row
+    /// can no longer reach the guard through storage.
+    #[test]
+    fn role_owns_rejects_cross_role_rows() {
+        let deposit = make_deposit_row(1);
+        let withdrawal = make_withdrawal_row(2, Some(1));
+        let cases = [
+            (ProgramType::Escrow, &deposit, true),
+            (ProgramType::Escrow, &withdrawal, false),
+            (ProgramType::Withdraw, &withdrawal, true),
+            (ProgramType::Withdraw, &deposit, false),
+        ];
+        for (program_type, row, expected) in cases {
+            assert_eq!(
+                role_owns(program_type, row),
+                expected,
+                "{program_type:?} vs {:?}",
+                row.transaction_type
+            );
+        }
+    }
+
+    /// The parked mirror: an escrow operator must not unpark a withdrawal a
+    /// withdraw sender still owns. This path issues no RPC, so ownership is the
+    /// only thing standing between it and a cross-role write.
+    #[tokio::test]
+    async fn escrow_sweep_ignores_parked_withdrawal() {
+        let mock = MockStorage::new();
+        let mut row = make_withdrawal_row(81, Some(9));
+        row.status = TransactionStatus::Parked;
+        row.updated_at = Utc::now() - chrono::Duration::minutes(10);
+        mock.pending_transactions.lock().unwrap().push(row);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client("http://localhost:1");
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Parked,
+            "a withdrawal is not the escrow role's row to unpark"
         );
     }
 

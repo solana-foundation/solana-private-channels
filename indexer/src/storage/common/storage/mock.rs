@@ -541,6 +541,7 @@ impl MockStorage {
         &self,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stale_processing_transactions")?;
         let threshold_chrono = chrono::Duration::from_std(threshold)
@@ -548,9 +549,15 @@ impl MockStorage {
             .unwrap_or_else(|_| chrono::Duration::days(1));
         let cutoff = Utc::now() - threshold_chrono;
         let pending = self.pending_transactions.lock().unwrap();
+        // Mirrors the Postgres type predicate so the mock cannot hand a caller a
+        // row its role does not own.
         let mut matched: Vec<DbTransaction> = pending
             .iter()
-            .filter(|t| t.status == TransactionStatus::Processing && t.updated_at < cutoff)
+            .filter(|t| {
+                t.status == TransactionStatus::Processing
+                    && t.updated_at < cutoff
+                    && t.transaction_type == transaction_type
+            })
             .cloned()
             .collect();
         matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
@@ -617,6 +624,7 @@ impl MockStorage {
         &self,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stale_parked_transactions")?;
         let threshold_chrono = chrono::Duration::from_std(threshold)
@@ -624,9 +632,14 @@ impl MockStorage {
             .unwrap_or_else(|_| chrono::Duration::days(1));
         let cutoff = Utc::now() - threshold_chrono;
         let pending = self.pending_transactions.lock().unwrap();
+        // Same type predicate as Postgres; see the stale Processing read.
         let mut matched: Vec<DbTransaction> = pending
             .iter()
-            .filter(|t| t.status == TransactionStatus::Parked && t.updated_at < cutoff)
+            .filter(|t| {
+                t.status == TransactionStatus::Parked
+                    && t.updated_at < cutoff
+                    && t.transaction_type == transaction_type
+            })
             .cloned()
             .collect();
         matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));

@@ -8,6 +8,7 @@ use crate::indexer::datasource::common::parser::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
 use crate::operator::SignerUtil;
+use crate::storage::common::models::TransactionType;
 
 /// Program type to index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
@@ -37,6 +38,20 @@ impl ProgramType {
             ProgramType::Withdraw => {
                 Pubkey::from_str(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID).expect("Invalid program ID")
             }
+        }
+    }
+
+    /// The one transaction type this role owns and may act on.
+    ///
+    /// Both operators share a single transactions table but point their RPC
+    /// clients at opposite chains: escrow mints deposits on PrivateChannel,
+    /// withdraw releases withdrawals on Solana. Every read that selects rows to
+    /// act on must be scoped through this mapping, or a role ends up checking
+    /// another role's signatures against a chain they were never sent to.
+    pub fn owned_transaction_type(&self) -> TransactionType {
+        match self {
+            ProgramType::Escrow => TransactionType::Deposit,
+            ProgramType::Withdraw => TransactionType::Withdrawal,
         }
     }
 }
@@ -399,6 +414,23 @@ mod tests {
         let config = create_common_config();
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    // ============================================================================
+    // Role Ownership Tests
+    // ============================================================================
+
+    /// The single source of truth the fetcher and both recovery sweeps share.
+    #[test]
+    fn owned_transaction_type_maps_each_role() {
+        assert_eq!(
+            ProgramType::Escrow.owned_transaction_type(),
+            TransactionType::Deposit
+        );
+        assert_eq!(
+            ProgramType::Withdraw.owned_transaction_type(),
+            TransactionType::Withdrawal
+        );
     }
 
     // ============================================================================

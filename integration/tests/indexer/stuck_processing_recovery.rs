@@ -6,7 +6,7 @@ use {
         config::ProgramType,
         metrics::OPERATOR_STALE_PROCESSING_RECOVERED,
         operator::{
-            recovery::test_hooks,
+            recovery::{boot_reconcile_processing, test_hooks},
             utils::rpc_util::{RetryConfig, RpcClientWithRetry},
             TransactionStatusUpdate,
         },
@@ -18,6 +18,7 @@ use {
     std::{sync::Arc, time::Duration},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
+    tokio_util::sync::CancellationToken,
 };
 
 /// Pre-test reading of a recovery-metric cell; assert `>snapshot` after.
@@ -1105,6 +1106,195 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
     mock.shutdown().await;
 }
 
+// I1: the stale-Processing read is scoped to one transaction type. Only this can
+// prove the SQL predicate, including that renumbering the placeholders left the
+// threshold and limit binds intact.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_queries_filter_by_transaction_type() {
+    let (db, url, _container) = start_pg("role_scope_query").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let deposit = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        1_000,
+    );
+    let deposit_id = db.insert_transaction_internal(&deposit).await.unwrap();
+    seed_backdated_processing(&pool, deposit_id, ChronoDuration::minutes(10)).await;
+
+    let withdrawal = make_withdrawal(&Signature::new_unique().to_string(), 55);
+    let withdrawal_id = db.insert_transaction_internal(&withdrawal).await.unwrap();
+    seed_backdated_processing(&pool, withdrawal_id, ChronoDuration::minutes(10)).await;
+
+    let deposits = db
+        .get_stale_processing_transactions_internal(
+            Duration::from_secs(5 * 60),
+            100,
+            TransactionType::Deposit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deposits.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![deposit_id],
+        "asking for deposits must not return the withdrawal"
+    );
+
+    let withdrawals = db
+        .get_stale_processing_transactions_internal(
+            Duration::from_secs(5 * 60),
+            100,
+            TransactionType::Withdrawal,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        withdrawals.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![withdrawal_id],
+        "asking for withdrawals must not return the deposit"
+    );
+
+    // The type bind must not have displaced the threshold bind: a threshold
+    // wider than the rows' age still excludes them.
+    let too_young = db
+        .get_stale_processing_transactions_internal(
+            Duration::from_secs(60 * 60),
+            100,
+            TransactionType::Deposit,
+        )
+        .await
+        .unwrap();
+    assert!(too_young.is_empty(), "threshold bind must still be $1");
+
+    // Nor the limit bind.
+    let capped = db
+        .get_stale_processing_transactions_internal(
+            Duration::from_secs(5 * 60),
+            0,
+            TransactionType::Deposit,
+        )
+        .await
+        .unwrap();
+    assert!(capped.is_empty(), "limit bind must still be $2");
+}
+
+// I2: a withdraw operator must never sweep an escrow deposit row. Its RPC client
+// points at the withdrawal destination chain, so classifying a deposit's mint
+// signature there reads a chain the signature was never sent to. Ownership is
+// checked before any request leaves the process, which the zero call counts pin.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdraw_recovery_never_touches_escrow_deposit() {
+    let (db, url, _container) = start_pg("role_scope_processing").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let tx = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        4_242,
+    );
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
+    // The persisted mint signature is what a cross-role sweep would classify.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+        .await
+        .unwrap();
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mock.call_count("getSignatureStatuses"),
+        0,
+        "ownership must be verified before any RPC to the wrong chain"
+    );
+    assert_eq!(
+        mock.call_count("getBlockHeight"),
+        0,
+        "no height comparison may run against a foreign chain"
+    );
+    assert_eq!(
+        status_of(&pool, tx_id).await,
+        "processing",
+        "a deposit is not the withdraw role's row to recover"
+    );
+    assert!(
+        updated_at_of(&pool, tx_id).await < Utc::now() - ChronoDuration::minutes(5),
+        "no write means updated_at stays backdated"
+    );
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "skipping a foreign row must not alert"
+    );
+    mock.shutdown().await;
+}
+
+// I4: the boot reconcile sweeps with a ZERO threshold, so age protects nothing.
+// A withdraw operator booting beside a live escrow operator must still leave every
+// deposit alone, including ones actively being minted.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdraw_boot_reconcile_ignores_foreign_processing_rows() {
+    let (db, url, _container) = start_pg("role_scope_boot").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mut ids = Vec::new();
+    for amount in [10u64, 20, 30] {
+        let tx = make_deposit(
+            &Signature::new_unique().to_string(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            amount,
+        );
+        let id = db.insert_transaction_internal(&tx).await.unwrap();
+        seed_backdated_processing(&pool, id, ChronoDuration::minutes(10)).await;
+        db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 100)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let mock = MockRpcServer::start().await;
+    let client = test_client(mock.url());
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+
+    boot_reconcile_processing(
+        &storage,
+        &client,
+        ProgramType::Withdraw,
+        &storage_tx,
+        &CancellationToken::new(),
+        2,
+    )
+    .await
+    .unwrap();
+
+    for id in ids {
+        assert_eq!(
+            status_of(&pool, id).await,
+            "processing",
+            "boot reconcile must leave foreign deposits untouched"
+        );
+    }
+    assert_eq!(mock.call_count("getSignatureStatuses"), 0);
+    assert_eq!(mock.call_count("getBlockHeight"), 0);
+    mock.shutdown().await;
+}
+
 // Threshold boundary: three rows at -4:59 / -5:00 / -5:01, expect the two older returned.
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1152,7 +1342,11 @@ async fn threshold_boundary_returns_only_strictly_older_rows() {
         .unwrap();
 
     let stale = db
-        .get_stale_processing_transactions_internal(Duration::from_secs(5 * 60), 100)
+        .get_stale_processing_transactions_internal(
+            Duration::from_secs(5 * 60),
+            100,
+            TransactionType::Deposit,
+        )
         .await
         .unwrap();
     // 4:59 excluded; 5:00 is timing-dependent (Postgres `<` is strict).

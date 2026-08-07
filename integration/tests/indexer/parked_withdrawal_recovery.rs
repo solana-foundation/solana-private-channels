@@ -277,7 +277,11 @@ async fn get_stale_parked_filters_and_orders() {
 
     // Stale parked only, oldest updated_at first.
     let stale = storage
-        .get_stale_parked_transactions(Duration::from_secs(5 * 60), 100)
+        .get_stale_parked_transactions(
+            Duration::from_secs(5 * 60),
+            100,
+            TransactionType::Withdrawal,
+        )
         .await
         .unwrap();
     let ids: Vec<i64> = stale.iter().map(|t| t.id).collect();
@@ -285,7 +289,7 @@ async fn get_stale_parked_filters_and_orders() {
 
     // Limit is honored (FIFO over stale → the oldest).
     let limited = storage
-        .get_stale_parked_transactions(Duration::from_secs(5 * 60), 1)
+        .get_stale_parked_transactions(Duration::from_secs(5 * 60), 1, TransactionType::Withdrawal)
         .await
         .unwrap();
     assert_eq!(limited.len(), 1);
@@ -342,6 +346,41 @@ async fn recovery_requeues_stale_parked_to_pending() {
     assert!(
         storage_rx.try_recv().is_err(),
         "parked rescue is routine cleanup — no webhook alert"
+    );
+}
+
+/// An escrow operator shares this database but owns only deposits. Parking is
+/// withdrawal-only, so its parked sweep must find nothing: unparking a withdrawal
+/// would hand a row a withdraw sender still owns back to the pending queue.
+#[tokio::test(flavor = "multi_thread")]
+async fn escrow_recovery_never_unparks_withdrawal() {
+    let (db, url, _c) = start_pg("role_scope_parked").await;
+    let storage = Arc::new(Storage::Postgres(db.clone()));
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let id = db
+        .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 22))
+        .await
+        .unwrap();
+    set_status(&pool, id, "parked").await;
+    // Stale enough that only ownership keeps the escrow sweep off it.
+    backdate(&pool, id, ChronoDuration::minutes(10)).await;
+
+    let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
+    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Escrow, &storage_tx)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status_of(&pool, id).await,
+        "parked",
+        "a withdrawal is not the escrow role's row to unpark"
+    );
+    assert_eq!(
+        requeue_attempts_of(&pool, id).await,
+        0,
+        "a foreign row must not be written at all"
     );
 }
 
