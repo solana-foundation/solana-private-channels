@@ -10,7 +10,7 @@ use solana_rpc_client_types::config::RpcSendTransactionConfig;
 use solana_runtime_transaction::runtime_transaction::RuntimeTransaction;
 use solana_sdk::{
     message::{v0::LoadedAddresses, SimpleAddressLoader},
-    transaction::{MessageHash, VersionedTransaction},
+    transaction::{MessageHash, SanitizedTransaction, VersionedTransaction, MAX_TX_ACCOUNT_LOCKS},
 };
 use std::collections::HashSet;
 use tokio::sync::mpsc;
@@ -68,6 +68,14 @@ pub async fn send_transaction_impl(
     )
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
+
+    // Sanitization never looks for repeated account keys, so a duplicate would
+    // otherwise reach the sequencer, which has no way to report a per-transaction
+    // error. Catching it here is what lets the caller be told why. Passing the
+    // real limit rather than usize::MAX also keeps the account-count bound in
+    // force. Agave rejects the same shape when admitting packets to its buffer.
+    SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
+        .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
 
     // Filter: only accept SPL token, ATA, System Program, Memo, Withdraw, and Swap Program transactions
     let is_allowed_transaction =
@@ -303,6 +311,27 @@ mod tests {
 
         let result = send_transaction_impl(&deps, encoded, None).await;
         assert!(result.is_ok(), "SPL token tx should pass allowlist");
+    }
+
+    // The rx assertion is load bearing: it proves the tx never entered the pipeline.
+    #[tokio::test]
+    async fn duplicate_account_keys_rejected() {
+        let payer = Keypair::new();
+        let tx = crate::test_helpers::duplicate_account_keys_transaction(&payer, Hash::default());
+        let (deps, rx) = make_write_deps();
+
+        let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+            .await
+            .expect_err("duplicate account keys must be rejected");
+
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        // TransactionError::AccountLoadedTwice renders as "Account loaded twice".
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Account loaded twice"),
+            "error must name the duplicate-key cause; got: {msg}"
+        );
+        assert_eq!(rx.len(), 0, "rejected tx must not reach the dedup stage");
     }
 
     #[tokio::test]

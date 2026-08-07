@@ -21,7 +21,7 @@ use solana_runtime_transaction::runtime_transaction::RuntimeTransaction;
 use solana_sdk::{
     message::{v0::LoadedAddresses, SimpleAddressLoader},
     pubkey::Pubkey,
-    transaction::{MessageHash, VersionedTransaction},
+    transaction::{MessageHash, SanitizedTransaction, VersionedTransaction, MAX_TX_ACCOUNT_LOCKS},
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use solana_svm_callback::TransactionProcessingCallback;
@@ -92,6 +92,10 @@ pub async fn simulate_transaction(
     )
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
+
+    // Refuse here what sendTransaction refuses, so preflight cannot bless a tx that will never land.
+    SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
+        .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
 
     if config.sig_verify {
         let sigverify_result = sigverify_transaction(&sanitized_tx, &read_deps.admin_keys).await;

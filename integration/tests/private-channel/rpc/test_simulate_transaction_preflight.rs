@@ -10,6 +10,8 @@
 //!   B. **Invalid base64** in the tx parameter → RPC error `-32602`.
 //!   C. **Malformed bincode** (valid base64 but not a transaction) → RPC
 //!      error `-32602` with "Failed to deserialize transaction".
+//!   D. **Duplicate account keys**: RPC error `-32602`, keeping simulation
+//!      and `sendTransaction` in agreement about what a valid transaction is.
 //!
 //! `test_simulate_transaction_with_account_writes` covers the
 //! accounts-return / encoding / replaceRecentBlockhash branches separately.
@@ -17,6 +19,7 @@
 use {
     super::test_context::PrivateChannelContext,
     base64::{engine::general_purpose::STANDARD, Engine as _},
+    private_channel_core::test_helpers::duplicate_account_keys_transaction,
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
@@ -29,8 +32,9 @@ pub async fn run_simulate_transaction_preflight_test(ctx: &PrivateChannelContext
     case_a_valid_simulation(ctx).await;
     case_b_invalid_base64(ctx).await;
     case_c_malformed_bincode(ctx).await;
+    case_d_duplicate_account_keys(ctx).await;
 
-    println!("✓ three preflight branches passed");
+    println!("✓ four preflight branches passed");
 }
 
 // ── Case A ──────────────────────────────────────────────────────────────────
@@ -103,5 +107,29 @@ async fn case_c_malformed_bincode(ctx: &PrivateChannelContext) {
     assert!(
         msg.contains("deserialize") || msg.contains("-32602"),
         "error must name deserialize failure or invalid-params; got {msg}"
+    );
+}
+
+// ── Case D ──────────────────────────────────────────────────────────────────
+async fn case_d_duplicate_account_keys(ctx: &PrivateChannelContext) {
+    // Simulation must refuse what sendTransaction refuses, or preflight blesses a doomed tx.
+    let payer = Keypair::new();
+    let blockhash = ctx.get_blockhash().await.expect("live blockhash");
+    let tx = duplicate_account_keys_transaction(&payer, blockhash);
+    let encoded = STANDARD.encode(bincode::serialize(&tx).expect("serialize duplicate-key tx"));
+
+    let err = ctx
+        .read_client
+        .send::<serde_json::Value>(
+            RpcRequest::SimulateTransaction,
+            json!([encoded, {"encoding": "base64", "sigVerify": false}]),
+        )
+        .await
+        .expect_err("duplicate account keys must be rejected by simulation");
+    // Cases B and C already return this code, so only the reason pins this arm.
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("account loaded twice"),
+        "error must name the duplicate cause; got {msg}"
     );
 }
