@@ -566,8 +566,9 @@ async fn settle_transactions(
                         executed_tx.loaded_transaction.accounts.iter().enumerate()
                     {
                         if sanitized_transaction.is_writable(index) {
-                            let deleted =
-                                account_data.lamports() == 0 && account_data.data().is_empty();
+                            // Zero lamports means the account is gone, whatever its data
+                            // holds. Must match BOB's rule or its entry never reconciles.
+                            let deleted = account_data.lamports() == 0;
                             final_accounts_actual.insert(
                                 *pubkey,
                                 AccountSettlement {
@@ -1206,6 +1207,163 @@ mod tests {
             "a data account at the 1-lamport floor must persist"
         );
         assert_eq!(data_settlement.1.account.lamports(), 1);
+    }
+
+    /// Count rows for this pubkey straight from the table. Reading through
+    /// `get_accounts` would pass on the filter alone, even if the row remained.
+    async fn raw_account_row_count(db: &PostgresAccountsDB, pubkey: &Pubkey) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM accounts WHERE pubkey = $1")
+            .bind(&pubkey.to_bytes()[..])
+            .fetch_one(db.pool.as_ref())
+            .await
+            .expect("count query must succeed")
+    }
+
+    /// A closed account keeps its data buffer, so the settler must still delete
+    /// its durable row rather than upserting a zero-lamport ghost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_deletes_zero_lamport_data_row_from_postgres() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let from = Keypair::new();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+
+        // Index 0 closed with its buffer intact, index 1 live on the 1-lamport
+        // floor. Both writable, so both settle.
+        let closed = from.pubkey();
+        let floor = Pubkey::new_unique();
+        let processed = make_executed(vec![
+            (closed, AccountSharedData::new(0, 8, &spl_token::id())),
+            (floor, AccountSharedData::new(1, 8, &spl_token::id())),
+        ]);
+
+        // Seed the row the close is supposed to remove, so the delete has work
+        // to do and the assertion cannot pass vacuously.
+        db.set_account(closed, AccountSharedData::new(500, 8, &spl_token::id()))
+            .await;
+        let AccountsDB::Postgres(ref raw) = db else {
+            panic!("start_test_postgres must hand back a Postgres backend");
+        };
+        assert_eq!(
+            raw_account_row_count(raw, &closed).await,
+            1,
+            "the row must exist before settlement for this test to mean anything"
+        );
+
+        let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let closed_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == closed)
+            .expect("the closed account must be emitted as a settlement");
+        assert!(
+            closed_settlement.1.deleted,
+            "a zero-lamport account must settle as deleted whatever its data holds"
+        );
+
+        let floor_settlement = result
+            .account_settlements
+            .iter()
+            .find(|(k, _)| *k == floor)
+            .expect("the floor account must be emitted as a settlement");
+        assert!(
+            !floor_settlement.1.deleted,
+            "a data account on the 1-lamport floor must still persist"
+        );
+
+        let AccountsDB::Postgres(ref raw) = db else {
+            panic!("backend must not change across settlement");
+        };
+        assert_eq!(
+            raw_account_row_count(raw, &closed).await,
+            0,
+            "the closed account's row must be deleted, not upserted"
+        );
+        assert_eq!(
+            raw_account_row_count(raw, &floor).await,
+            1,
+            "the floor account's row must be written"
+        );
+    }
+
+    /// Both classifications must move together. Change one side only and the
+    /// entry is never reconciled and never leaves the cache.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_then_preload_leaves_closed_account_absent() {
+        let (mut bob, settled_tx, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
+        let mut db = bob.accounts_db.clone();
+
+        let from = Keypair::new();
+        let closed = from.pubkey();
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+        let closed_account = AccountSharedData::new(0, 8, &spl_token::id());
+
+        db.set_account(closed, AccountSharedData::new(500, 8, &spl_token::id()))
+            .await;
+
+        // Both consumers see the same state so the generation lines up.
+        // `ProcessedTransaction` is not `Clone`, hence the rebuild below.
+        let output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![Ok(make_executed(vec![(closed, closed_account.clone())]))],
+            error_metrics: Default::default(),
+            execute_timings: Default::default(),
+            balance_collector: None,
+        };
+        let generation = bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        let results: Vec<(TransactionProcessingResult, _)> =
+            vec![(Ok(make_executed(vec![(closed, closed_account)])), tx)];
+        let result = settle_transactions(
+            None,
+            &mut db,
+            None,
+            &results,
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+        )
+        .await
+        .unwrap();
+
+        settled_tx
+            .send(AccountSettlements {
+                generation,
+                accounts: result.account_settlements,
+            })
+            .unwrap();
+
+        // Drains the acknowledgement and drops the tombstone, then proves the
+        // now-absent key is not refilled from the database.
+        let (fetched, cached) = bob.preload_accounts(&[closed]).await;
+        assert_eq!(
+            (fetched, cached),
+            (0, 1),
+            "the tombstone is still resident when the hit/miss split runs"
+        );
+
+        let (fetched, cached) = bob.preload_accounts(&[closed]).await;
+        assert_eq!(
+            (fetched, cached),
+            (0, 0),
+            "the dropped tombstone leaves a miss that the database must not fill"
+        );
+        assert!(
+            solana_svm_callback::TransactionProcessingCallback::get_account_shared_data(
+                &bob, &closed
+            )
+            .is_none(),
+            "the closed account must stay unreadable"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

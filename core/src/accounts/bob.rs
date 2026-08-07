@@ -94,7 +94,7 @@ struct AccountWithMeta {
     synced_since: Option<u64>,
     // Whether we deleted this account. We can't remove an account from the
     // HashMap while we keep it in-memory because it will fallback to the
-    // AccountsDB.
+    // AccountsDB. Set at zero lamports, the SVM's own test for absence.
     deleted: bool,
     /// Generation of the last executor write to this account, or `None` when the
     /// executor never wrote it (loaded from the AccountsDB, or injected by a
@@ -290,11 +290,9 @@ impl BOB {
                             .enumerate()
                         {
                             if sanitized_transaction.is_writable(index) {
-                                // A zero-lamport, empty-data writable account is a
-                                // tombstone; either way the written state is ahead
-                                // of the DB, so it goes in as dirty.
-                                let deleted =
-                                    account_data.lamports() == 0 && account_data.data().is_empty();
+                                // Zero lamports means the SVM deallocated it, whatever the
+                                // data holds. Either way this write goes in dirty.
+                                let deleted = account_data.lamports() == 0;
                                 let meta = AccountWithMeta {
                                     account: account_data.clone(),
                                     deleted,
@@ -754,6 +752,33 @@ mod tests {
             ),
             10,
             "failed executed tx with empty accounts must not tombstone the fee payer"
+        );
+    }
+
+    /// A closed data account keeps its buffer, so only the lamports say it is
+    /// gone. Classifying on the data too leaves a dead account readable.
+    #[tokio::test]
+    async fn update_accounts_tombstones_zero_lamport_data_account() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let from = Keypair::new();
+        let closed = from.pubkey();
+        bob.insert_account_for_test(closed, token_like(10));
+
+        let tx = create_test_sanitized_transaction(&from, &Pubkey::new_unique(), 0);
+        // Drained to zero lamports with the data buffer still allocated.
+        let output = svm_output(executed_with_status(
+            Ok(()),
+            vec![(closed, make_account(0, &[7, 7, 7], &spl_token::id()))],
+        ));
+        let _ = bob.update_accounts(&output, std::slice::from_ref(&tx));
+
+        assert!(
+            bob.accounts.get(&closed).is_some_and(|meta| meta.deleted),
+            "a zero-lamport account must be tombstoned whatever its data holds"
+        );
+        assert!(
+            bob.get_account_shared_data(&closed).is_none(),
+            "a tombstoned account must not be readable by the SVM"
         );
     }
 
@@ -2147,6 +2172,47 @@ mod tests {
         );
     }
 
+    /// A zero-lamport row must never be read back in as a live entry. The
+    /// 1-lamport control proves the seed landed, so the miss is the filter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_skips_zero_lamport_row() {
+        let (mut bob, _settled_tx, _pg) =
+            crate::test_helpers::create_test_bob_with_postgres().await;
+        let zero = Pubkey::new_unique();
+        let floor = Pubkey::new_unique();
+
+        bob.accounts_db
+            .set_account(zero, make_account(0, &[1, 2, 3], &spl_token::id()))
+            .await;
+        bob.accounts_db
+            .set_account(floor, make_account(1, &[1, 2, 3], &spl_token::id()))
+            .await;
+
+        let (fetched, cached) = bob.preload_accounts(&[zero, floor]).await;
+
+        assert_eq!(
+            (fetched, cached),
+            (1, 0),
+            "only the 1-lamport control is fetched; the zero-lamport row is not"
+        );
+        assert!(
+            !bob.accounts.contains_key(&zero),
+            "a zero-lamport row must not become a resident entry"
+        );
+        assert!(
+            bob.accounts.contains_key(&floor),
+            "the control must be resident, or the seed write never landed"
+        );
+        assert!(
+            TransactionProcessingCallback::get_account_shared_data(&bob, &zero).is_none(),
+            "a zero-lamport row must read as absent"
+        );
+        assert!(
+            TransactionProcessingCallback::get_account_shared_data(&bob, &floor).is_some(),
+            "an account on the 1-lamport floor must still load"
+        );
+    }
+
     /// `account_lamports` must report exactly what `get_account_shared_data`
     /// reports, for every entry shape: precompile, live, deleted, absent. The
     /// conservation check reads both "this account is new" and "this is what it
@@ -2176,9 +2242,21 @@ mod tests {
         // This case asserts the write side effects, not the generation.
         let _ = bob.update_accounts(&output, std::slice::from_ref(&tx));
 
+        // Same, but closed with its data buffer left allocated. The conservation
+        // check must see this as absent, not as an account holding zero.
+        let ghost_payer = Keypair::new();
+        let ghost = ghost_payer.pubkey();
+        bob.insert_account_for_test(ghost, token_like(10));
+        let ghost_tx = create_test_sanitized_transaction(&ghost_payer, &Pubkey::new_unique(), 0);
+        let ghost_output = svm_output(executed_with_status(
+            Ok(()),
+            vec![(ghost, make_account(0, &[9, 9, 9], &spl_token::id()))],
+        ));
+        let _ = bob.update_accounts(&ghost_output, std::slice::from_ref(&ghost_tx));
+
         let absent = Pubkey::new_unique();
 
-        for pubkey in [precompile, live, deleted, absent] {
+        for pubkey in [precompile, live, deleted, ghost, absent] {
             assert_eq!(
                 bob.account_lamports(&pubkey),
                 bob.get_account_shared_data(&pubkey)
@@ -2191,6 +2269,7 @@ mod tests {
         assert_eq!(bob.account_lamports(&precompile), Some(1));
         assert_eq!(bob.account_lamports(&live), Some(1));
         assert_eq!(bob.account_lamports(&deleted), None);
+        assert_eq!(bob.account_lamports(&ghost), None);
         assert_eq!(bob.account_lamports(&absent), None);
     }
 }

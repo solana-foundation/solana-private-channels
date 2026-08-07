@@ -14,12 +14,14 @@ pub async fn get_account_shared_data(
     db: &AccountsDB,
     pubkey: &Pubkey,
 ) -> Option<AccountSharedData> {
-    match db {
+    let account = match db {
         AccountsDB::Postgres(postgres_db) => {
             get_account_shared_data_postgres(postgres_db, pubkey).await
         }
         AccountsDB::Redis(redis_db) => get_account_shared_data_redis(redis_db, pubkey).await,
-    }
+    };
+    // A stored row with no lamports describes an account that no longer exists.
+    account.filter(|account| account.lamports() != 0)
 }
 
 async fn get_account_shared_data_postgres(

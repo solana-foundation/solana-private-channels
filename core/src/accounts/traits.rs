@@ -251,6 +251,41 @@ mod tests {
         assert!(results[2].is_none(), "pk3 was never stored");
     }
 
+    /// Both read paths must report absence at zero lamports and still return the
+    /// 1-lamport floor. `get_accounts` is positional, so indices stay aligned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_lamport_row_reads_as_absent() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let zero = Pubkey::new_unique();
+        let floor = Pubkey::new_unique();
+        let never_stored = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+
+        db.set_account(zero, AccountSharedData::new(0, 8, &owner))
+            .await;
+        db.set_account(floor, AccountSharedData::new(1, 8, &owner))
+            .await;
+
+        assert!(
+            db.get_account_shared_data(&zero).await.is_none(),
+            "a zero-lamport row must read as absent"
+        );
+        assert!(
+            db.get_account_shared_data(&floor).await.is_some(),
+            "an account on the 1-lamport floor must still read back"
+        );
+
+        let results = db.get_accounts(&[zero, floor, never_stored]).await;
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_none(), "the zero-lamport row is filtered out");
+        assert!(
+            results[1].is_some(),
+            "the floor account survives the filter"
+        );
+        assert!(results[2].is_none(), "never_stored was never written");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn store_block_and_get_block_round_trip() {
         let (mut db, _pg) = start_test_postgres().await;

@@ -2,16 +2,27 @@ use {
     super::traits::AccountsDB,
     crate::accounts::{PostgresAccountsDB, RedisAccountsDB},
     redis::{AsyncCommands, RedisResult},
-    solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
+    solana_sdk::{
+        account::{AccountSharedData, ReadableAccount},
+        pubkey::Pubkey,
+    },
     sqlx::Row,
     std::sync::Arc,
 };
 
 pub async fn get_accounts(db: &AccountsDB, accounts: &[Pubkey]) -> Vec<Option<AccountSharedData>> {
-    match db {
+    let mut results = match db {
         AccountsDB::Postgres(postgres_db) => get_accounts_postgres(postgres_db, accounts).await,
         AccountsDB::Redis(redis_db) => get_accounts_redis(redis_db, accounts).await,
+    };
+    // A stored row with no lamports describes an account that no longer exists.
+    // Cleared in place so the result stays positionally aligned with `accounts`.
+    for slot in results.iter_mut() {
+        if slot.as_ref().is_some_and(|account| account.lamports() == 0) {
+            *slot = None;
+        }
     }
+    results
 }
 
 async fn get_accounts_postgres(
