@@ -8,4 +8,7 @@ COPY monitoring/dashboards /var/lib/grafana/dashboards
 
 ENV GF_USERS_ALLOW_SIGN_UP=false
 ENV ALERT_WEBHOOK_URL=http://localhost:9/no-op
+# An unset var substitutes as empty in provisioning files, and an empty
+# contact-point type is a fatal provisioning error (Grafana crash-loops).
+ENV ALERT_CONTACT_TYPE=webhook
 ENV PROMETHEUS_URL=http://prometheus:9090

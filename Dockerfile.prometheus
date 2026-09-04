@@ -5,8 +5,12 @@ FROM prom/prometheus:${PROMETHEUS_VERSION}
 
 COPY prometheus.yml /etc/prometheus/prometheus.yml.tmpl
 
+# PROBE_STREAMER=false drops the streamer /health blackbox target: the devnet
+# compose runs no streamer, and probing it there leaves probe_success=0 firing
+# a permanent service-down alert on a healthy stack.
 ENTRYPOINT ["/bin/sh", "-c", \
   "sed \"s/\\${HOST_SUFFIX}/${HOST_SUFFIX}/g; s/\\${BENCH_METRICS_TARGET}/${BENCH_METRICS_TARGET}/g; s/\\${PRIVATE_CHANNEL_METRICS_PORT}/${PRIVATE_CHANNEL_METRICS_PORT}/g\" /etc/prometheus/prometheus.yml.tmpl > /tmp/prometheus.yml && \
+   if [ \"$PROBE_STREAMER\" = \"false\" ]; then sed -i '/streamer.*:8902\\/health/d' /tmp/prometheus.yml; fi && \
    exec /bin/prometheus \
      --config.file=/tmp/prometheus.yml \
      --storage.tsdb.path=/prometheus \

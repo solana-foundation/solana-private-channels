@@ -606,6 +606,8 @@ services:
       - HOST_SUFFIX=
       - BENCH_METRICS_TARGET=${BENCH_METRICS_TARGET:-host.docker.internal:9101}
       - PRIVATE_CHANNEL_METRICS_PORT=${PRIVATE_CHANNEL_METRICS_PORT:-9090}
+      # devnet runs no streamer; without this the baked config probes it forever
+      - PROBE_STREAMER=false
     networks:
       - private-channel-network
     healthcheck:
