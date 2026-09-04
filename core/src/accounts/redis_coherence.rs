@@ -58,11 +58,13 @@ const LEDGER_KEY_PREFIXES: [&str; 4] = ["account:", "tx:", "block:", "addr_sigs:
 
 /// Cached ledger state under fixed keys: the chain tip, plus the slot index,
 /// transaction counter and performance-sample list that older builds wrote.
-const LEDGER_FIXED_KEYS: [&str; 5] = [
+const LEDGER_FIXED_KEYS: [&str; 7] = [
     "block_slot_index",
     "transaction_count",
     "performance_samples",
     "latest_slot",
+    "current_slot",
+    "block_height",
     "latest_blockhash",
 ];
 
@@ -188,12 +190,9 @@ pub(crate) async fn staleness_reason(
 /// Detects that the cache has missed settled batches, and takes it out of
 /// service when it has.
 ///
-/// Call before mirroring the batch for `slot`. The tip is written by the same
-/// best-effort pipeline as the data, so when that pipeline fails the tip stops
-/// advancing along with everything else, and the accounts that batch touched are
-/// left holding their pre-batch values. A cached tip that is not exactly one slot
-/// back is therefore evidence that batches were missed and that every key in the
-/// cache is suspect.
+/// Call before mirroring the batch for `slot`. A cached tip that is not the block
+/// this batch extends means batches were missed, so every key is suspect. The
+/// parent, not `slot - 1`: the previous slot usually holds no block.
 ///
 /// The response is to clear the deployment stamp, which takes the cache out of
 /// service on the next read. The caller runs the purge off the block-production
@@ -201,6 +200,7 @@ pub(crate) async fn staleness_reason(
 /// allows.
 pub(crate) async fn ensure_cache_continuity(
     redis_db: &RedisAccountsDB,
+    parent_slot: u64,
     slot: u64,
 ) -> Result<CacheStatus> {
     let mut conn = redis_db.connection.clone();
@@ -214,7 +214,7 @@ pub(crate) async fn ensure_cache_continuity(
     let Some(cached_slot) = cached_slot else {
         return Ok(CacheStatus::InService);
     };
-    if cached_slot + 1 == slot {
+    if cached_slot == parent_slot {
         return Ok(CacheStatus::InService);
     }
 
@@ -487,7 +487,7 @@ mod tests {
     /// The normal case: each batch follows the one the cache last recorded, so
     /// nothing was missed and the cache keeps everything it holds.
     #[tokio::test(flavor = "multi_thread")]
-    async fn continuity_keeps_a_cache_whose_tip_is_one_slot_back() {
+    async fn continuity_keeps_a_cache_holding_the_block_this_batch_extends() {
         let (redis_db, postgres_db, _pg, _redis) = start_cache().await;
         let deployment_id = read_deployment_id(&postgres_db).await.unwrap();
         stamp_deployment_id(&redis_db, &deployment_id)
@@ -504,7 +504,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ensure_cache_continuity(&redis_db, cached_tip + 1)
+            ensure_cache_continuity(&redis_db, cached_tip, cached_tip + 1)
                 .await
                 .unwrap(),
             CacheStatus::InService,
@@ -545,7 +545,7 @@ mod tests {
 
         // Redis is back after missing slots 101..=200.
         assert_eq!(
-            ensure_cache_continuity(&redis_db, 201).await.unwrap(),
+            ensure_cache_continuity(&redis_db, 200, 201).await.unwrap(),
             CacheStatus::Condemned,
             "a missed batch must condemn the cache"
         );
@@ -582,7 +582,7 @@ mod tests {
         let _: () = conn.set("latest_slot", 100u64).await.unwrap();
 
         assert_eq!(
-            ensure_cache_continuity(&redis_db, 201).await.unwrap(),
+            ensure_cache_continuity(&redis_db, 200, 201).await.unwrap(),
             CacheStatus::Condemned
         );
         let generation = redis_db.condemnation_generation();
@@ -590,7 +590,7 @@ mod tests {
         // The tip is still 100, because a condemned cache is not mirrored to, so
         // this batch looks exactly like the one that condemned it.
         assert_eq!(
-            ensure_cache_continuity(&redis_db, 202).await.unwrap(),
+            ensure_cache_continuity(&redis_db, 201, 202).await.unwrap(),
             CacheStatus::Rebuilding,
             "a rebuild already in flight covers this"
         );
@@ -627,7 +627,7 @@ mod tests {
 
         let cancelled = tokio::time::timeout(
             Duration::from_millis(250),
-            ensure_cache_continuity(&redis_db, 200),
+            ensure_cache_continuity(&redis_db, 199, 200),
         )
         .await;
         assert!(
@@ -660,7 +660,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ensure_cache_continuity(&redis_db, 42).await.unwrap(),
+            ensure_cache_continuity(&redis_db, 41, 42).await.unwrap(),
             CacheStatus::InService,
             "a cache with no tip has nothing to be discontiguous with"
         );
@@ -732,7 +732,7 @@ mod tests {
         // second condemnation has already happened.
         let superseded = redis_db.condemnation_generation();
         assert_eq!(
-            ensure_cache_continuity(&redis_db, 200).await.unwrap(),
+            ensure_cache_continuity(&redis_db, 199, 200).await.unwrap(),
             CacheStatus::Condemned
         );
         let current = redis_db.condemnation_generation();
@@ -842,5 +842,39 @@ mod tests {
         verify_cache_stamp(&redis_db)
             .await
             .expect("a lapsed lease must not stop a read node from starting");
+    }
+
+    /// The live slot moves ten times per heartbeat block and is not the cached
+    /// tip, so the continuity check must ignore it. A cache condemned once per
+    /// tick would purge and rebuild the whole keyspace forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_moving_current_slot_does_not_condemn_the_cache() {
+        let (redis_db, postgres_db, _pg, _redis) = start_cache().await;
+        let deployment_id = read_deployment_id(&postgres_db).await.unwrap();
+        stamp_deployment_id(&redis_db, &deployment_id)
+            .await
+            .unwrap();
+
+        // The cache holds the block this batch extends, which is the only thing
+        // continuity is about.
+        let mut conn = redis_db.connection.clone();
+        let _: () = conn.set("latest_slot", 100u64).await.unwrap();
+
+        // Nine idle ticks between that block and the next one.
+        for slot in 101..=109u64 {
+            super::super::current_slot::mirror_current_slot(&redis_db, slot).await;
+        }
+
+        assert_eq!(
+            ensure_cache_continuity(&redis_db, 100, 110).await.unwrap(),
+            CacheStatus::InService,
+            "idle ticks must not look like a missed batch"
+        );
+        let stamp: Option<Vec<u8>> = conn.get(DEPLOYMENT_ID_KEY).await.unwrap();
+        assert_eq!(
+            stamp.as_deref(),
+            Some(deployment_id.as_slice()),
+            "the cache must still be in service"
+        );
     }
 }

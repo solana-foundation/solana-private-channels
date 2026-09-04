@@ -291,6 +291,17 @@ async fn run_anchors_at_resolved_from_slot_not_the_tip() {
 
     let mut rpc = MockitoServer::new_async().await;
     let _slot = mock_get_slot(&mut rpc, TIP).await;
+    // The floor is exclusive, so the anchor lookup lists from one slot below it.
+    let _anchor = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlocks", "params": [floor, TIP]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": [898, 899, 900], "id": 1}).to_string())
+        .expect_at_least(0)
+        .create_async()
+        .await;
     let _enumeration = rpc
         .mock("POST", "/")
         .match_body(Matcher::PartialJson(

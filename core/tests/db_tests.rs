@@ -707,6 +707,48 @@ async fn test_truncate_actually_deletes_blocks() {
     }
 }
 
+/// Pruning removes block rows, never the counters. Height counts blocks
+/// produced, so recomputing it from the surviving rows would make it go
+/// backwards and invalidate every deadline a client holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_height_survives_pruning() {
+    let (mut db, _pg) = start_postgres().await;
+
+    for slot in 1..=10u64 {
+        let mut block = create_test_block_info(slot, Hash::new_unique());
+        block.block_height = Some(slot);
+        db.write_batch(&[], vec![], Some(block)).await.unwrap();
+    }
+    assert_eq!(db.get_block_height().await.unwrap(), Some(10));
+
+    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
+        keep_slots: 5,
+        max_backup_age: std::time::Duration::from_secs(3600),
+        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
+        batch_size: 100,
+        dry_run: false,
+    };
+    let AccountsDB::Postgres(ref pg) = db else {
+        panic!("expected Postgres")
+    };
+    let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
+        .await
+        .unwrap();
+    assert_eq!(report.blocks_deleted, 5);
+
+    assert_eq!(
+        db.get_block_height().await.unwrap(),
+        Some(10),
+        "pruning must not move the height"
+    );
+    assert_eq!(
+        db.get_latest_slot().await.unwrap(),
+        Some(10),
+        "pruning must not move the slot"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_truncate_deletes_associated_transactions() {
     let (mut db, _pg) = start_postgres().await;

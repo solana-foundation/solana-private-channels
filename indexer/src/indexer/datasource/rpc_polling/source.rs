@@ -337,7 +337,7 @@ impl DataSource for RpcPollingSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::rpc_mocks::mock_get_blocks;
+    use crate::test_utils::rpc_mocks::{mock_get_blocks, mock_get_blocks_with_limit};
     use mockito::Server;
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -1019,13 +1019,14 @@ mod tests {
     /// A trailing run the endpoint cannot witness is undetermined, so live polling
     /// must fail closed and retry it rather than emit SlotComplete over it.
     #[tokio::test]
-    async fn unwitnessed_tail_does_not_emit_slot_complete_and_retries() {
+    async fn a_range_with_no_produced_block_does_not_emit_slot_complete_and_retries() {
         let mut server = Server::new_async().await;
 
-        // Chain tip 105 => get_slots_to_process(100, 10) returns [100..=104].
+        // Chain tip 105 => get_slots_to_process(100, 10) looks at [100..=104].
         let _m_slot = mock_get_slot(&mut server, 105);
-        // Nothing produced in the range and nothing listed past it: no witness exists.
-        // Expect >=2 of each, proving the range is retried rather than advanced past.
+        // Nothing produced in the range, so there is nothing provable to walk.
+        // Expect >=2 enumerations, proving the range is retried rather than
+        // advanced past.
         let m_enum = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
@@ -1036,15 +1037,16 @@ mod tests {
             .with_body(json!({ "jsonrpc": "2.0", "result": [], "id": 1 }).to_string())
             .expect_at_least(2)
             .create();
+        // The empty window sends the poller looking past it, and nothing is
+        // produced there either, so the range stays unclaimed.
         let m_witness = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
-                "method": "getBlocksWithLimit",
-                "params": [105]
+                "method": "getBlocksWithLimit"
             })))
             .with_status(200)
             .with_body(json!({ "jsonrpc": "2.0", "result": [], "id": 1 }).to_string())
-            .expect_at_least(2)
+            .expect_at_least(1)
             .create();
         let no_fetch = server
             .mock("POST", "/")
@@ -1090,5 +1092,58 @@ mod tests {
                 .any(|m| matches!(m, ProcessorMessage::SlotComplete { .. })),
             "no SlotComplete may be emitted for an unwitnessed tail"
         );
+    }
+
+    /// An idle gap twice the batch size puts every producer outside the window.
+    /// Treating the window as the search bound would leave the poller asking the
+    /// same empty range forever while looking exactly like it was caught up.
+    #[tokio::test]
+    async fn polling_advances_across_an_idle_gap_wider_than_the_batch() {
+        let mut server = Server::new_async().await;
+
+        // Chain tip 150 with a batch of 10 => the window is [100..=109], empty.
+        let _m_slot = mock_get_slot(&mut server, 150);
+        let _m_window = mock_get_blocks(&mut server, 100, 109, &[]);
+        // The next block sits twenty slots out, so the claimed range reaches it.
+        let _m_next = mock_get_blocks_with_limit(&mut server, 100, &[120]);
+        let _m_enum = mock_get_blocks(&mut server, 100, 120, &[120]);
+        // Its parent names the anchor below the range, proving the gap empty.
+        let _m_b120 = mock_get_block_at_parent(&mut server, 120, 99);
+
+        let mut source = RpcPollingSource::new(
+            server.url(),
+            Some(100),
+            10,
+            10,
+            10,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Escrow,
+            None,
+            None,
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while seen.len() < 21 && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(ProcessorMessage::SlotComplete { slot, .. })) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                seen.insert(slot);
+            }
+        }
+        cancel.cancel();
+        let _ = handle.await;
+
+        for slot in 100..=120u64 {
+            assert!(
+                seen.contains(&slot),
+                "slot {slot} must be completed once the poller reaches past the window"
+            );
+        }
     }
 }

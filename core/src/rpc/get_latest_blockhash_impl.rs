@@ -10,12 +10,24 @@ pub async fn get_latest_blockhash_impl(
     read_deps: &ReadDeps,
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<RpcBlockhash>> {
-    // Get the latest slot and blockhash from the database
+    // The context is a slot, as Solana reports it; the deadline below is a
+    // height. They are different counters now, so both are read.
     let slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
+        .unwrap_or(0);
+    let block_height = read_deps
+        .accounts_db
+        .get_block_height()
+        .await
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get block height: {}", e),
+            )
+        })?
         .unwrap_or(0);
     let blockhash = read_deps
         .accounts_db
@@ -28,10 +40,11 @@ pub async fn get_latest_blockhash_impl(
             )
         })?;
 
-    // The dedup window holds max_blockhashes entries (block height == slot here),
-    // so a hash settled at this slot is evicted once the tip reaches
-    // slot + max_blockhashes.
-    let last_valid_block_height = slot.saturating_add(read_deps.max_blockhashes);
+    // The window holds max_blockhashes entries and evicts one per produced block,
+    // so a hash minted here is live for that many heights and the last of them is
+    // the deadline. Inclusive, as Solana's is.
+    let last_valid_block_height =
+        block_height.saturating_add(read_deps.max_blockhashes.saturating_sub(1));
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

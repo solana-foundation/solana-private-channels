@@ -1,12 +1,15 @@
 use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
-    private_channel_core::accounts::{
-        postgres::PostgresAccountsDB,
-        truncate::{truncate_slots, TruncateOptions, TruncateReport},
+    private_channel_core::{
+        accounts::{
+            postgres::PostgresAccountsDB,
+            truncate::{retention_floor_slots, truncate_slots, TruncateOptions, TruncateReport},
+        },
+        nodes::node::{DEFAULT_BLOCKTIME_MS, DEFAULT_MAX_BLOCKHASHES},
     },
     std::{path::PathBuf, time::Duration},
-    tracing::{error, info},
+    tracing::{error, info, warn},
 };
 
 #[derive(Parser, Debug)]
@@ -62,6 +65,14 @@ struct TruncateArgs {
     /// Show what would be deleted without applying changes
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// The node's max_blockhashes, to size the retention floor warning
+    #[arg(long, default_value_t = DEFAULT_MAX_BLOCKHASHES as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    max_blockhashes: u64,
+
+    /// The node's blocktime_ms, to size the retention floor warning
+    #[arg(long, default_value_t = DEFAULT_BLOCKTIME_MS, value_parser = clap::value_parser!(u64).range(1..))]
+    blocktime_ms: u64,
 }
 
 #[tokio::main]
@@ -104,6 +115,23 @@ async fn run(args: Args) -> Result<()> {
 
     match args.command {
         Command::Truncate(truncate_args) => {
+            // A warning, not a refusal: the floor is the idle worst case, and a
+            // node under steady load keeps its whole window in far fewer slots.
+            let floor = retention_floor_slots(
+                truncate_args.max_blockhashes as usize,
+                truncate_args.blocktime_ms,
+            );
+            if truncate_args.keep_slots < floor {
+                warn!(
+                    "keep_slots {} is below the retention floor of {} ({} blockhashes at {}ms blocktime); \
+                     a restart will rebuild the dedup window short and reject transactions still inside \
+                     their published deadline",
+                    truncate_args.keep_slots,
+                    floor,
+                    truncate_args.max_blockhashes,
+                    truncate_args.blocktime_ms
+                );
+            }
             let options = TruncateOptions {
                 keep_slots: truncate_args.keep_slots,
                 max_backup_age: Duration::from_secs(

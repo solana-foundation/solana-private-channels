@@ -1,5 +1,5 @@
 use crate::rpc::{
-    error::{custom_error, JSON_RPC_SERVER_ERROR},
+    error::{block_not_available, custom_error, slot_skipped, JSON_RPC_SERVER_ERROR},
     ReadDeps,
 };
 use jsonrpsee::core::RpcResult;
@@ -13,14 +13,30 @@ pub async fn get_block_impl(
     slot: u64,
     config: Option<RpcEncodingConfigWrapper<RpcBlockConfig>>,
 ) -> RpcResult<Option<Value>> {
-    // A lookup failure is an error, never a "not found": the indexer's slot
-    // classifier reads an absent block as a slot it may checkpoint past.
+    // A lookup failure is an error, never a "not found": absence is a verdict
+    // about the slot and must not be confused with a store that could not answer.
     let block_info =
         read_deps.accounts_db.get_block(slot).await.map_err(|e| {
             custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get block: {}", e))
         })?;
     let Some(block_info) = block_info else {
-        return Ok(None);
+        // Solana reports a slot it passed without producing as skipped, and one
+        // it has not reached as not available. Most slots here carry no block, so
+        // a null would leave a stock client retrying the majority of them.
+        let tip = read_deps
+            .accounts_db
+            .get_current_slot()
+            .await
+            .map_err(|e| {
+                custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e))
+            })?;
+        // No tip is a chain that has passed no slot, so nothing on it was
+        // skipped. Reading it as a tip of zero would call genesis skipped, the
+        // one slot here that never is.
+        return Err(match tip {
+            Some(tip) if slot <= tip => slot_skipped(slot),
+            _ => block_not_available(slot),
+        });
     };
 
     let config = config.map(|c| c.convert_to_current()).unwrap_or_default();

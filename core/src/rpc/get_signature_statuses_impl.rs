@@ -32,7 +32,7 @@ pub async fn get_signature_statuses_impl(
     // null can never claim to cover a block the response has not yet seen.
     let current_slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
         .unwrap_or(0);

@@ -45,6 +45,9 @@ pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
 pub const DEFAULT_SEQUENCER_QUEUE_CAPACITY: usize = 1000;
 /// executor→settler results queue capacity.
 pub const DEFAULT_EXECUTION_RESULTS_CAPACITY: usize = 1000;
+/// The blockhash window in blocks, matching Solana.
+pub const DEFAULT_MAX_BLOCKHASHES: usize = 150;
+pub const DEFAULT_BLOCKTIME_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum NodeMode {
@@ -80,18 +83,37 @@ pub struct NodeConfig {
     /// Optional Redis cache in front of the read path. Reads consult Redis
     /// first and fall through to `accountsdb_connection_url` on a miss.
     pub redis_cache_url: Option<String>,
+    /// Expiry in seconds on cached block entries, bounding the growth an idle
+    /// node's heartbeat blocks cause. Zero disables it.
+    pub redis_block_ttl_secs: u64,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
-    pub transaction_expiration_ms: u64,
+    /// How many blocks a blockhash stays valid for. A block count, not a
+    /// duration: blocks come from traffic and from the idle heartbeat, so the
+    /// wall-clock window moves with load exactly as it does on Solana.
+    pub max_blockhashes: usize,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64, // Performance sample collection period (default 60 seconds)
     pub metrics: SharedMetrics,
 }
 
-impl NodeConfig {
-    /// Calculate max_blockhashes from transaction_expiration_ms and blocktime_ms
-    /// This represents how many blockhashes we need to keep in the dedup cache
-    pub fn max_blockhashes(&self) -> usize {
-        (self.transaction_expiration_ms / self.blocktime_ms) as usize
+/// Resolve the blockhash window, honouring the deprecated millisecond field for
+/// one release so an existing deployment keeps its effective window.
+pub fn resolve_max_blockhashes(
+    max_blockhashes: usize,
+    transaction_expiration_ms: Option<u64>,
+    blocktime_ms: u64,
+) -> usize {
+    match transaction_expiration_ms {
+        Some(expiration_ms) => {
+            let blocks = (expiration_ms / blocktime_ms.max(1)) as usize;
+            warn!(
+                "transaction_expiration_ms is deprecated and will be removed; use \
+                 max_blockhashes, a block count. It overrides max_blockhashes, mapping \
+                 {expiration_ms}ms at a {blocktime_ms}ms blocktime to {blocks} blocks."
+            );
+            blocks
+        }
+        None => max_blockhashes,
     }
 }
 
@@ -113,10 +135,11 @@ impl Default for NodeConfig {
             accountsdb_connection_url: "postgresql://user:password@localhost:5432/private_channel"
                 .to_string(),
             redis_cache_url: None,
-            admin_keys: vec![],               // No admin keys by default
-            transaction_expiration_ms: 15000, // 15 seconds default
-            blocktime_ms: 100,                // 100ms default
-            perf_sample_period_secs: 60,      // 60 seconds default
+            redis_block_ttl_secs: 3600, // one hour, well past the blockhash window
+            admin_keys: vec![],         // No admin keys by default
+            max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
+            blocktime_ms: DEFAULT_BLOCKTIME_MS,
+            perf_sample_period_secs: 60, // 60 seconds default
             metrics: Arc::new(NoopMetrics),
         }
     }
@@ -183,14 +206,15 @@ async fn wait_for_verified_cache(
 
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
-    // max_blockhashes() divides by blocktime_ms and every mode derives it and reject a zero divisor.
     if config.blocktime_ms == 0 {
         return Err("blocktime_ms cannot be 0".into());
     }
     // All modes need a non-zero window: Read advertises it as last_valid_block_height, write modes size the dedup cache with it.
-    if config.max_blockhashes() == 0 {
+    if config.max_blockhashes == 0 {
         return Err(
-            "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)".into(),
+            "max_blockhashes must be greater than 0 (if you set the deprecated \
+                    transaction_expiration_ms, it must be at least blocktime_ms)"
+                .into(),
         );
     }
     // Zero capacity would panic the bounded-channel constructors below; fail closed instead.
@@ -261,12 +285,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // the repair is skipped.
             let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
             repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
-            let (initial_live_blockhashes, initial_dedup_cache) = load_dedup_state(
-                &db,
-                config.max_blockhashes(),
-                config.transaction_expiration_ms,
-            )
-            .await?;
+            let (initial_live_blockhashes, initial_dedup_cache) =
+                load_dedup_state(&db, config.max_blockhashes).await?;
 
             let dedup_hb = crate::health::StageHeartbeat::new();
             let sigverify_hb = crate::health::StageHeartbeat::new();
@@ -297,7 +317,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // Start dedup stage (drops replays after verification, keyed on the
             // message hash so signature variants of one message collapse to one).
             let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
-                max_blockhashes: config.max_blockhashes(),
+                max_blockhashes: config.max_blockhashes,
                 input_rx: dedup_rx,
                 settled_blockhashes_rx,
                 output_tx: sequencer_tx,
@@ -350,6 +370,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 address_signatures_tx: addr_sig_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 redis_cache_url: config.redis_cache_url.clone(),
+                redis_block_ttl_secs: config.redis_block_ttl_secs,
                 blocktime_ms: config.blocktime_ms,
                 cache_mirror_cooldown: crate::stages::settle::CACHE_MIRROR_COOLDOWN,
                 perf_sample_period_secs: config.perf_sample_period_secs,
@@ -416,7 +437,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).
-            let max_blockhashes = config.max_blockhashes() as u64;
+            let max_blockhashes = config.max_blockhashes as u64;
             Some(ReadDeps {
                 admin_keys: config.admin_keys,
                 accounts_db,
@@ -711,21 +732,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_max_blockhashes() {
-        // transaction_expiration_ms < blocktime_ms → max_blockhashes() == 0
         let config = NodeConfig {
-            transaction_expiration_ms: 50,
-            blocktime_ms: 100,
+            max_blockhashes: 0,
             ..Default::default()
         };
 
-        assert_eq!(config.max_blockhashes(), 0);
         let result = run_node(config).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert_eq!(
-            err.to_string(),
-            "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)"
-        );
+        assert!(err
+            .to_string()
+            .contains("max_blockhashes must be greater than 0"));
+    }
+
+    /// The deprecated duration maps to the block count it used to imply, so an
+    /// existing deployment keeps its effective window across the upgrade.
+    #[test]
+    fn expiry_config_migrates_from_milliseconds() {
+        assert_eq!(resolve_max_blockhashes(150, Some(15_000), 100), 150);
+        assert_eq!(resolve_max_blockhashes(150, Some(60_000), 100), 600);
+        // Absent, the block count is taken as given.
+        assert_eq!(resolve_max_blockhashes(300, None, 100), 300);
+        // The deprecated field wins while it is set, so a migration is visible.
+        assert_eq!(resolve_max_blockhashes(300, Some(15_000), 100), 150);
     }
 
     #[tokio::test]

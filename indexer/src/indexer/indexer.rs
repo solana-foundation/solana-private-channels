@@ -1201,6 +1201,7 @@ mod tests {
             let mut server = Server::new_async().await;
             let _slot = mock_get_slot(&mut server, tip);
             // No producers plus a witness past the range proves every slot empty in one batch.
+            let _anchor = mock_get_blocks(&mut server, 100, tip, &[]);
             let _blocks = mock_get_blocks(&mut server, 101, tip, &[]);
             let _witness = mock_get_blocks_with_limit(&mut server, tip + 1, &[tip + 1]);
             let _witness_block = mock_get_block_at(&mut server, tip + 1, 100);
@@ -1226,6 +1227,7 @@ mod tests {
         async fn backfill_only_writes_deposit_rows_for_configured_instance() {
             let mut server = Server::new_async().await;
             let _slot = mock_get_slot(&mut server, 101);
+            let _anchor = mock_get_blocks(&mut server, 100, 101, &[101]);
             let _blocks = mock_get_blocks(&mut server, 101, 101, &[101]);
             let _block = mock_get_block_with_deposit(&mut server, 101, 100, 4242);
             let (mock, storage) = seeded_storage(100);
@@ -1259,6 +1261,7 @@ mod tests {
             let mut server = Server::new_async().await;
             let _slot = mock_get_slot(&mut server, 103);
             // batch_size 2 splits the range so the first batch lands before the second fails.
+            let _anchor = mock_get_blocks(&mut server, 100, 103, &[101, 102, 103]);
             let _first = mock_get_blocks(&mut server, 101, 102, &[101, 102]);
             let _b1 = mock_get_block_at(&mut server, 101, 100);
             let _b2 = mock_get_block_at(&mut server, 102, 101);

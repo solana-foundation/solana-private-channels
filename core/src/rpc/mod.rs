@@ -2,6 +2,7 @@ pub mod api;
 pub mod constants;
 pub mod error;
 mod get_account_info_impl;
+mod get_block_height_impl;
 mod get_block_impl;
 mod get_block_time_impl;
 mod get_blocks_impl;
@@ -86,6 +87,15 @@ mod tests {
         }
     }
 
+    /// A block whose height is deliberately not its slot, which is what a chain
+    /// with idle ticks looks like.
+    fn make_sparse_block_info(slot: u64, block_height: u64, blockhash: Hash) -> BlockInfo {
+        BlockInfo {
+            block_height: Some(block_height),
+            ..make_block_info(slot, blockhash)
+        }
+    }
+
     fn make_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
         BlockInfo {
             slot,
@@ -137,36 +147,35 @@ mod tests {
 
     // ── get_block_height ──────────────────────────────────────────────────
 
+    /// getBlockHeight counts blocks and getSlot counts ticks, so a stock client
+    /// polling a height against `lastValidBlockHeight` compares like with like.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_block_height_tracks_get_slot() {
+    async fn get_block_height_counts_blocks_not_slots() {
         use super::api::PrivateChannelRpcServer;
         let (db, _pg) = start_pg().await;
         let mut rpc = rpc_impl::PrivateChannelRpcImpl::new(Some(make_read_deps(db)), None).await;
 
         // A node with no blocks answers 0 on both reads instead of erroring.
-        let height = rpc.get_block_height(None).await.unwrap();
-        assert_eq!(height, rpc.get_slot(None).await.unwrap());
-        assert_eq!(height, 0);
+        assert_eq!(rpc.get_block_height(None).await.unwrap(), 0);
+        assert_eq!(rpc.get_slot(None).await.unwrap(), 0);
 
         rpc.read_deps
             .as_mut()
             .unwrap()
             .accounts_db
-            .store_block(make_block_info(10, Hash::new_unique()))
+            .store_block(make_sparse_block_info(10, 3, Hash::new_unique()))
             .await
             .unwrap();
 
-        // The two reads must stay equal: clients compare a height against a slot-scaled deadline.
-        let height = rpc.get_block_height(None).await.unwrap();
-        assert_eq!(height, rpc.get_slot(None).await.unwrap());
-        assert_eq!(height, 10);
+        assert_eq!(rpc.get_slot(None).await.unwrap(), 10);
+        assert_eq!(rpc.get_block_height(None).await.unwrap(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn block_height_crosses_stored_last_valid_block_height() {
         use super::api::PrivateChannelRpcServer;
         let (mut db, _pg) = start_pg().await;
-        db.store_block(make_block_info(10, Hash::new_unique()))
+        db.store_block(make_sparse_block_info(10, 3, Hash::new_unique()))
             .await
             .unwrap();
         let mut rpc = rpc_impl::PrivateChannelRpcImpl::new(Some(make_read_deps(db)), None).await;
@@ -185,7 +194,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .accounts_db
-            .store_block(make_block_info(300, Hash::new_unique()))
+            .store_block(make_sparse_block_info(3_000, 300, Hash::new_unique()))
             .await
             .unwrap();
 
@@ -340,11 +349,13 @@ mod tests {
         assert_eq!(resp.value.blockhash, blockhash.to_string());
     }
 
+    /// The deadline is the last height at which the hash is still in the window:
+    /// W entries keep a hash minted at height H live through H + W - 1. The
+    /// context stays a slot, as Solana reports it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn last_valid_block_height_uses_max_blockhashes() {
+    async fn last_valid_block_height_is_the_last_height_the_hash_is_live() {
         let (mut db, _pg) = start_pg().await;
-        let slot = 10u64;
-        db.store_block(make_block_info(slot, Hash::new_unique()))
+        db.store_block(make_sparse_block_info(40, 7, Hash::new_unique()))
             .await
             .unwrap();
         let deps = make_read_deps(db);
@@ -353,8 +364,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             resp.value.last_valid_block_height,
-            slot + TEST_MAX_BLOCKHASHES
+            7 + TEST_MAX_BLOCKHASHES - 1
         );
+        assert_eq!(resp.context.slot, 40);
     }
 
     // ── get_recent_blockhash ──────────────────────────────────────────────
@@ -500,14 +512,92 @@ mod tests {
         assert!(block.is_some());
     }
 
+    /// A slot the chain has passed that produced no block is Solana's skipped
+    /// slot, and a client written against that contract retries forever on a
+    /// null. Most slots are skipped here, so the code has to be right.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_on_a_skipped_slot_is_slot_skipped() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(42, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+
+        let err = get_block_impl::get_block_impl(&deps, 41, None)
+            .await
+            .expect_err("a slot below the tip with no block must not be a null");
+        assert_eq!(err.code(), crate::rpc::error::SLOT_SKIPPED_CODE);
+        assert!(
+            err.message().contains("41"),
+            "the message must name the slot: {}",
+            err.message()
+        );
+    }
+
+    /// Above the tip nothing has been produced yet, which Solana reports as
+    /// BlockNotAvailable rather than as a skipped slot.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_block_impl_missing() {
         let (db, _pg) = start_pg().await;
         let deps = make_read_deps(db);
-        let block = get_block_impl::get_block_impl(&deps, 999, None)
+        let err = get_block_impl::get_block_impl(&deps, 999, None)
+            .await
+            .expect_err("a slot the chain has not reached is not available");
+        assert_eq!(err.code(), crate::rpc::error::BLOCK_NOT_AVAILABLE_CODE);
+    }
+
+    /// A chain that has produced nothing has passed no slot, so nothing on it can
+    /// have been skipped. Slot 0 is genesis, the one slot that is never skipped,
+    /// and calling it skipped tells a client not to retry the slot about to exist.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_on_a_chain_with_no_tip_is_not_available() {
+        let (db, _pg) = start_pg().await;
+        let deps = make_read_deps(db);
+
+        let err = get_block_impl::get_block_impl(&deps, 0, None)
+            .await
+            .expect_err("genesis does not exist yet on a chain with no tip");
+        assert_eq!(
+            err.code(),
+            crate::rpc::error::BLOCK_NOT_AVAILABLE_CODE,
+            "no tip means no slot has been passed, so none was skipped"
+        );
+    }
+
+    /// The tip itself is the boundary: it has been reached, so a missing block
+    /// there is a skip rather than an unreached slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_at_the_tip_with_no_block_is_slot_skipped() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(42, Hash::new_unique()))
             .await
             .unwrap();
-        assert!(block.is_none());
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        crate::accounts::current_slot::set_current_slot(postgres_db, 50)
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+
+        let err = get_block_impl::get_block_impl(&deps, 50, None)
+            .await
+            .expect_err("the tip carried no block, so it was skipped");
+        assert_eq!(err.code(), crate::rpc::error::SLOT_SKIPPED_CODE);
+    }
+
+    /// A slot that does hold a block still returns it, unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_still_serves_a_produced_slot() {
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(42, Hash::new_unique()))
+            .await
+            .unwrap();
+        let deps = make_read_deps(db);
+        assert!(get_block_impl::get_block_impl(&deps, 42, None)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// A block whose transaction rows cannot be read must error, not encode a
@@ -594,20 +684,30 @@ mod tests {
         assert!(block_with_store(BlockStore::Corrupt).await.is_err());
     }
 
-    /// Truncation prunes blocks, so a genuinely absent slot is routine and must
-    /// keep reading as absence rather than becoming an error.
+    /// Truncation prunes blocks, so an absent row below the tip is routine. It
+    /// answers as a skipped slot, because Solana's cleaned-up code is already
+    /// taken by an unrelated error here.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_block_genuine_miss_is_absent() {
+    async fn get_block_genuine_miss_is_slot_skipped() {
         assert!(block_with_store(BlockStore::Healthy)
             .await
             .unwrap()
             .is_some());
-        let (db, _pg) = start_pg().await;
-        let deps = make_read_deps(db);
-        assert!(get_block_impl::get_block_impl(&deps, 999, None)
+
+        let (mut db, _pg) = start_pg().await;
+        db.store_block(make_block_info(42, Hash::new_unique()))
             .await
-            .unwrap()
-            .is_none());
+            .unwrap();
+        sqlx::query("DELETE FROM blocks WHERE slot = 42")
+            .execute(test_pool(&db).as_ref())
+            .await
+            .unwrap();
+
+        let deps = make_read_deps(db);
+        let err = get_block_impl::get_block_impl(&deps, 42, None)
+            .await
+            .expect_err("a pruned slot below the tip is not a null");
+        assert_eq!(err.code(), crate::rpc::error::SLOT_SKIPPED_CODE);
     }
 
     /// `getBlockTime` reads the same row, so it inherits the same split: an
@@ -794,13 +894,12 @@ mod tests {
         assert!(resp.value[0].is_none());
     }
 
-    /// The freshness witness the channel finality check reads is the response
-    /// context slot, which must equal the latest block's height for the
-    /// `lvbh` comparison to be exact.
+    /// Solana's getSignatureStatuses context is a slot, and so is this one. It
+    /// is not the block height, and nothing may read it as one.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_signature_statuses_context_slot_is_block_height() {
+    async fn get_signature_statuses_context_is_a_slot() {
         let (mut db, _pg) = start_pg().await;
-        let block = make_block_info(10, Hash::new_unique());
+        let block = make_sparse_block_info(40, 7, Hash::new_unique());
         db.write_batch(&[], vec![], Some(block.clone()))
             .await
             .unwrap();
@@ -814,7 +913,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(Some(resp.context.slot), block.block_height);
+        assert_eq!(resp.context.slot, block.slot);
+        assert_ne!(Some(resp.context.slot), block.block_height);
     }
 
     /// The context slot is read before the per-signature lookups, so a block that

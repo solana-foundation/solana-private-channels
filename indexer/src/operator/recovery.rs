@@ -1205,9 +1205,9 @@ mod tests {
     #[tokio::test]
     async fn deposit_dead_sigs_demote() {
         let mut server = mockito::Server::new_async().await;
-        // Channel: the status response's own context slot (200) is the block
-        // height, and 200 > lvbh (100) means expired/dead. No getBlockHeight.
+        // Block height 200 is past lvbh 100, so the absence is expired.
         let _status = mock_null_status(&mut server);
+        let _height = mock_block_height(&mut server, 200);
         // Covered floor (0) so the single-endpoint absence is proven Dead.
         let _floor = mock_first_available_block(&mut server, 0);
 
@@ -1232,8 +1232,9 @@ mod tests {
     #[tokio::test]
     async fn deposit_live_sig_leaves_processing() {
         let mut server = mockito::Server::new_async().await;
-        // Channel: context slot (200) <= lvbh (1000) means still live.
+        // Block height 200 is below lvbh 1000, so the sig can still land.
         let _status = mock_null_status(&mut server);
+        let _height = mock_block_height(&mut server, 200);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);

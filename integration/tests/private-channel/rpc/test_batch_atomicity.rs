@@ -2,7 +2,7 @@
 //! A slot and all its account changes, transactions, and metadata MUST be written
 //! as a single DB transaction. Either the whole slot commits or nothing does.
 //!
-//! Three tests verify this:
+//! Four tests verify this:
 //!
 //! 1. `test_write_batch_constraint_injection` — adds a CHECK constraint that forces
 //!    `write_batch` to fail after accounts are written but before the block row is
@@ -20,6 +20,11 @@
 //!    `store_block` to fail after the block row is written but before the
 //!    `latest_blockhash` metadata is updated, then asserts the block row was
 //!    rolled back with it. This proves the fix to `store_block_postgres` is correct.
+//!
+//! 4. `a_rolled_back_block_leaves_the_live_slot_ahead`: the live slot is
+//!    published by idle ticks outside the block transaction, so it stays where
+//!    those ticks left it when a block rolls back, ahead of the last stored
+//!    block. That is the ordinary idle state, not a partial write.
 
 use {
     private_channel_core::{
@@ -224,6 +229,18 @@ async fn test_write_batch_constraint_injection() {
         "slot 2 block must not exist after the rolled-back write_batch"
     );
 
+    // Both chain counters ride the same transaction as the block row.
+    assert_eq!(
+        db.get_current_slot().await.unwrap(),
+        Some(1),
+        "the live slot must not move for a block that never committed"
+    );
+    assert_eq!(
+        db.get_block_height().await.unwrap(),
+        Some(1),
+        "the height must not count a block that never committed"
+    );
+
     // pubkey_slot2's account was written to the accounts table BEFORE the block
     // insert failed. It must have been rolled back with the rest of the transaction.
     let accounts = db.get_accounts(&[pubkey_slot2]).await.unwrap();
@@ -265,6 +282,82 @@ async fn test_write_batch_constraint_injection() {
         Some(2),
         "DB must be at slot 2 after the clean write"
     );
+    assert_eq!(
+        db.get_current_slot().await.unwrap(),
+        Some(2),
+        "the live slot must follow the committed block"
+    );
+}
+
+/// Test 4: the live slot is published by idle ticks, outside the block
+/// transaction, so a rolled-back block leaves it ahead of the last stored block.
+/// That is the ordinary idle state: nothing requires a block to back a slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rolled_back_block_leaves_the_live_slot_ahead() {
+    let url = create_isolated_db_url("rolled_back_block_live_slot").await;
+
+    let mut db = AccountsDB::new(&url, false)
+        .await
+        .expect("Failed to create AccountsDB");
+    let pool = match &db {
+        AccountsDB::Postgres(pg) => Arc::clone(&pg.pool),
+        _ => panic!("Expected Postgres backend"),
+    };
+    let postgres_db = match &db {
+        AccountsDB::Postgres(pg) => pg.clone(),
+        _ => panic!("Expected Postgres backend"),
+    };
+
+    db.write_batch(&[], vec![], Some(slot_block_info(1)))
+        .await
+        .expect("slot 1 write_batch must succeed");
+
+    // Four idle ticks past the last block, which is what the settler publishes
+    // while nothing is landing.
+    for slot in 2..=5u64 {
+        private_channel_core::accounts::current_slot::set_current_slot(&postgres_db, slot)
+            .await
+            .expect("publishing an idle slot must succeed");
+    }
+
+    sqlx::query("ALTER TABLE blocks ADD CONSTRAINT test_no_slot_6 CHECK (slot <> 6)")
+        .execute(&*pool)
+        .await
+        .expect("Failed to add test constraint");
+
+    let result = db.write_batch(&[], vec![], Some(slot_block_info(6))).await;
+    assert!(result.is_err(), "the block insert must hit the constraint");
+
+    assert_eq!(
+        db.get_current_slot().await.unwrap(),
+        Some(5),
+        "the rolled-back block must not move the live slot"
+    );
+    assert_eq!(
+        db.get_latest_slot().await.unwrap(),
+        Some(1),
+        "the block tip must still name the last committed block"
+    );
+    assert_eq!(
+        db.get_block_height().await.unwrap(),
+        Some(1),
+        "the height must still count only committed blocks"
+    );
+    assert!(
+        db.get_block(5).await.unwrap().is_none(),
+        "a slot the ticks passed through carries no block"
+    );
+
+    sqlx::query("ALTER TABLE blocks DROP CONSTRAINT test_no_slot_6")
+        .execute(&*pool)
+        .await
+        .expect("Failed to drop test constraint");
+
+    db.write_batch(&[], vec![], Some(slot_block_info(6)))
+        .await
+        .expect("slot 6 write_batch must succeed after the constraint is removed");
+    assert_eq!(db.get_current_slot().await.unwrap(), Some(6));
+    assert_eq!(db.get_latest_slot().await.unwrap(), Some(6));
 }
 
 /// Test 2: process kill simulation via `pg_terminate_backend`

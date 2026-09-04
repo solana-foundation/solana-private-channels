@@ -7,9 +7,11 @@ pub async fn run_epoch_info_test(ctx: &PrivateChannelContext) {
     let transaction_count = ctx.get_transaction_count().await.unwrap();
     println!("Epoch info: {:?}", epoch_info);
 
-    assert_eq!(
-        epoch_info.absolute_slot, epoch_info.block_height,
-        "Absolute slot should be equal to block height"
+    // Slot and height are separate counters: idle ticks advance the slot without
+    // producing a block, so the height can only trail it.
+    assert!(
+        epoch_info.block_height <= epoch_info.absolute_slot,
+        "Block height should never exceed the absolute slot"
     );
     assert_eq!(
         epoch_info.absolute_slot, epoch_info.slot_index,

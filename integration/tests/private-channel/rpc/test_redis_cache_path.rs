@@ -63,8 +63,9 @@ fn minimal_node_config(accountsdb_connection_url: String, port: u16) -> NodeConf
         max_svm_workers: 2,
         accountsdb_connection_url,
         redis_cache_url: None,
+        redis_block_ttl_secs: 3_600,
         admin_keys: vec![dummy_admin],
-        transaction_expiration_ms: 15000,
+        max_blockhashes: 150,
         blocktime_ms: 100,
         perf_sample_period_secs: 10,
         metrics: Arc::new(NoopMetrics),
@@ -84,15 +85,29 @@ async fn wait_for_first_block(url: &str) {
     panic!("node never produced a block at {url}");
 }
 
-/// Poll `getSlot` until the node has committed `target`.
-async fn wait_for_slot(client: &RpcClient, target: u64) {
-    for _ in 0..100 {
-        if client.get_slot().await.unwrap_or(0) >= target {
+/// Poll `getBlockHeight` until the node has produced up to `target`. Blocks, not
+/// slots: an idle node ticks the slot every blocktime but only produces a block
+/// on the heartbeat.
+async fn wait_for_block_height(client: &RpcClient, target: u64) {
+    for _ in 0..150 {
+        if client.get_block_height().await.unwrap_or(0) >= target {
             return;
         }
         sleep(Duration::from_millis(100)).await;
     }
-    panic!("node never reached slot {target}");
+    panic!("node never reached block height {target}");
+}
+
+/// The slot of the last block actually produced, which is the tip the settler
+/// checks the cache against. `getSlot` is ahead of it across an idle stretch.
+async fn last_block_slot(client: &RpcClient) -> u64 {
+    let current_slot = client.get_slot().await.expect("getSlot");
+    *client
+        .get_blocks(0, Some(current_slot))
+        .await
+        .expect("getBlocks")
+        .last()
+        .expect("the node must have produced a block")
 }
 
 /// Exercise the settle worker's Redis init block + the per-batch best-effort
@@ -157,12 +172,13 @@ async fn settle_worker_mirrors_to_the_configured_redis_cache() -> Result<()> {
         .await
         .expect("redis conn");
     // `latest_slot` is written by the per-batch Redis write path, which runs
-    // for every produced block. We poll briefly to tolerate settle timing.
+    // for every produced block. Genesis writes a zero, and an idle node's next
+    // block is a heartbeat away, so poll past it rather than for the first write.
     use redis::AsyncCommands;
     let mut observed_slot: Option<u64> = None;
-    for _ in 0..20 {
+    for _ in 0..40 {
         observed_slot = conn.get("latest_slot").await.ok();
-        if observed_slot.is_some() {
+        if observed_slot.is_some_and(|slot| slot > 0) {
             break;
         }
         sleep(Duration::from_millis(100)).await;
@@ -389,14 +405,15 @@ async fn settler_stops_touching_a_cache_it_has_given_up_on() -> Result<()> {
         .await
         .expect("corrupt the cached tip");
 
-    // Failures are counted per block, so wait out more blocks than the limit.
+    // Failures are counted per block, so wait out more blocks than the limit of
+    // three. An idle node produces one per heartbeat, so this is not ten slots.
     let client = RpcClient::new(url.clone());
-    let corrupted_at = client.get_slot().await.expect("getSlot");
-    wait_for_slot(&client, corrupted_at + 10).await;
+    let corrupted_at = client.get_block_height().await.expect("getBlockHeight");
+    wait_for_block_height(&client, corrupted_at + 5).await;
 
     // A tip a settler still holding the cache would mirror against, and a marker
     // on the key that mirror would overwrite. Reads never write either.
-    let repaired_at = client.get_slot().await.expect("getSlot");
+    let repaired_at = last_block_slot(&client).await;
     let _: () = redis::cmd("SET")
         .arg("latest_slot")
         .arg(repaired_at)
@@ -410,7 +427,8 @@ async fn settler_stops_touching_a_cache_it_has_given_up_on() -> Result<()> {
         .await
         .expect("mark the cached tip");
 
-    wait_for_slot(&client, repaired_at + 10).await;
+    let repaired_height = client.get_block_height().await.expect("getBlockHeight");
+    wait_for_block_height(&client, repaired_height + 3).await;
 
     // A settler still attached would have overwritten this mirroring the next
     // batch, or purged it condemning a cache it could not line up with.
@@ -423,6 +441,226 @@ async fn settler_stops_touching_a_cache_it_has_given_up_on() -> Result<()> {
         cached_blockhash.as_deref(),
         Some("untouched"),
         "a cache the settler has given up on must not be written to inside its cooldown"
+    );
+
+    handles.shutdown().await;
+    Ok(())
+}
+
+/// Cached block entries expire while the mirror keeps following block
+/// production. The expiry must never look like a cache that missed batches: that
+/// would purge the keyspace and start a rebuild once per TTL, forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn ttl_does_not_condemn_the_cache() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
+    let redis = Redis::default()
+        .with_tag("7")
+        .start()
+        .await
+        .expect("start redis");
+    let redis_host = redis.get_host().await.expect("redis host");
+    let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
+    let redis_url = format!("redis://{redis_host}:{redis_port}");
+
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.redis_cache_url = Some(redis_url.clone());
+    // Short enough that entries expire while the node is still producing blocks
+    // past them, which is the interleaving a condemnation would show up in.
+    config.redis_block_ttl_secs = 1;
+    let handles = run_node(config).await.expect("run_node");
+    let url = format!("http://127.0.0.1:{port}");
+    wait_for_first_block(&url).await;
+
+    use redis::AsyncCommands;
+    let client = RpcClient::new(url.clone());
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+
+    // A key a rebuild purges but the mirror never writes. If the cache were
+    // condemned and rebuilt, the keyspace was emptied and this is gone.
+    let canary = format!("account:{}", Keypair::new().pubkey());
+    let _: () = conn.set(&canary, vec![7u8]).await.expect("seed the canary");
+    let stamp: Option<Vec<u8>> = conn.get("deployment_id").await.expect("redis get");
+    assert!(
+        stamp.is_some(),
+        "the cache must be in service before the expiry is worth testing"
+    );
+
+    // Take a mirrored block and confirm the expiry is actually stamped on it,
+    // so what follows measures an expiry rather than a key that never existed.
+    let mut mirrored_slot: Option<u64> = None;
+    for _ in 0..40 {
+        mirrored_slot = conn.get("latest_slot").await.ok().flatten();
+        if mirrored_slot.is_some_and(|slot: u64| slot > 0) {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let expiring_slot = mirrored_slot.expect("the mirror must publish a tip");
+    let ttl: i64 = conn
+        .ttl(format!("block:{expiring_slot}"))
+        .await
+        .expect("redis ttl");
+    assert!(
+        ttl > 0 && ttl <= 1,
+        "the cached block must carry the configured expiry, got {ttl}"
+    );
+
+    // Several TTL cycles, so the mirror keeps writing blocks past the expired
+    // ones and every one of those writes runs the continuity check.
+    sleep(Duration::from_millis(3_500)).await;
+
+    assert!(
+        !conn
+            .exists::<_, bool>(format!("block:{expiring_slot}"))
+            .await
+            .expect("redis exists"),
+        "the cached block entry must have expired"
+    );
+    assert!(
+        conn.exists::<_, bool>(&canary).await.expect("redis exists"),
+        "expiring block entries must not purge the keyspace"
+    );
+    assert_eq!(
+        conn.get::<_, Option<Vec<u8>>>("deployment_id")
+            .await
+            .expect("redis get"),
+        stamp,
+        "expiring block entries must leave the cache in service"
+    );
+
+    // The tip keys never expire, so the mirror is still following blocks and the
+    // node's own tip is still consistent with what the cache publishes. Read the
+    // cache first: it is written after the Postgres commit, so it never leads.
+    let cached_slot: Option<u64> = conn.get("latest_slot").await.expect("redis get");
+    let cached_height: Option<u64> = conn.get("block_height").await.expect("redis get");
+    let node_slot = client.get_slot().await.expect("getSlot");
+    let node_height = client.get_block_height().await.expect("getBlockHeight");
+    let cached_slot = cached_slot.expect("the cached tip must survive the expiry");
+    let cached_height = cached_height.expect("the cached height must survive the expiry");
+    assert!(
+        cached_slot > expiring_slot && cached_slot <= node_slot,
+        "the mirror must have followed blocks past the expired one: {expiring_slot} -> {cached_slot}, node at {node_slot}"
+    );
+    // At most one block can have been mirrored between the two reads.
+    assert!(
+        cached_height <= node_height && node_height - cached_height <= 1,
+        "the cached height must be the height the node serves: cached {cached_height}, node {node_height}"
+    );
+
+    // An expired entry is a miss that falls through, never lost history.
+    client
+        .get_block(expiring_slot)
+        .await
+        .expect("an expired entry must be resolved against Postgres");
+
+    handles.shutdown().await;
+    Ok(())
+}
+
+/// The live slot is mirrored on every idle tick but is not the cached tip, so
+/// the continuity check must ignore it. A cache condemned once per tick would
+/// purge and rebuild the whole keyspace forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_ticks_do_not_condemn_the_cache() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
+    let redis = Redis::default()
+        .with_tag("7")
+        .start()
+        .await
+        .expect("start redis");
+    let redis_host = redis.get_host().await.expect("redis host");
+    let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
+    let redis_url = format!("redis://{redis_host}:{redis_port}");
+
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url.clone(), port);
+    config.redis_cache_url = Some(redis_url.clone());
+    // No expiry, so anything missing later is a purge rather than a TTL.
+    config.redis_block_ttl_secs = 0;
+    let handles = run_node(config).await.expect("run_node");
+    let url = format!("http://127.0.0.1:{port}");
+    wait_for_first_block(&url).await;
+
+    use redis::AsyncCommands;
+    let client = RpcClient::new(url.clone());
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+
+    // A key a rebuild purges but the mirror never writes.
+    let canary = format!("account:{}", Keypair::new().pubkey());
+    let _: () = conn.set(&canary, vec![7u8]).await.expect("seed the canary");
+    let stamp: Option<Vec<u8>> = conn.get("deployment_id").await.expect("redis get");
+    assert!(
+        stamp.is_some(),
+        "the cache must be in service before the idle stretch is worth testing"
+    );
+
+    // Several heartbeats of idle ticks, each one mirroring a slot the cached tip
+    // does not follow.
+    sleep(Duration::from_millis(3_500)).await;
+
+    // The gap has to be real: the mirrored tip names a block, the mirrored slot
+    // names a tick well past it.
+    let cached_tip: u64 = conn
+        .get::<_, Option<u64>>("latest_slot")
+        .await
+        .expect("redis get")
+        .expect("the mirror must publish a tip");
+    let cached_slot: u64 = conn
+        .get::<_, Option<u64>>("current_slot")
+        .await
+        .expect("redis get")
+        .expect("the mirror must publish the live slot");
+    assert!(
+        cached_slot > cached_tip,
+        "idle ticks must have moved the slot past the cached tip: tip {cached_tip}, slot {cached_slot}"
+    );
+
+    assert!(
+        conn.exists::<_, bool>(&canary).await.expect("redis exists"),
+        "a moving slot must not purge the keyspace"
+    );
+    assert_eq!(
+        conn.get::<_, Option<Vec<u8>>>("deployment_id")
+            .await
+            .expect("redis get"),
+        stamp,
+        "a moving slot must leave the cache in service"
+    );
+
+    // The read path goes through the cache, so this is the slot a replica sees.
+    let node_slot = client.get_slot().await.expect("getSlot");
+    assert!(
+        node_slot >= cached_slot,
+        "the served slot must be the mirrored one: cached {cached_slot}, served {node_slot}"
     );
 
     handles.shutdown().await;

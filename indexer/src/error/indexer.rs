@@ -159,6 +159,14 @@ pub enum BackfillError {
     #[error("Slot {slot} is unavailable: a block exists here that this endpoint will not serve, so its contents are unknown")]
     SlotUnavailable { slot: u64 },
 
+    #[error("Could not list the blocks produced in slots {from}..={to}, so the backfill boundary cannot be anchored: {source}")]
+    ProducerLookupFailed {
+        from: u64,
+        to: u64,
+        #[source]
+        source: DataSourceRpcError,
+    },
+
     // Channel errors
     #[error("Channel send failed: {0}")]
     ChannelSend(#[source] Box<dyn std::error::Error + Send + Sync>),

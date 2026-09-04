@@ -372,12 +372,14 @@ async fn deposit_dead_signature_demoted() {
         .unwrap();
 
     let mock = MockRpcServer::start().await;
-    // Channel: the response's own context slot (200) is the block height and is
-    // past lvbh (100), so no getBlockHeight is scripted and none may be called.
+    // Block height 200 is past lvbh 100, so the absence has expired. The height
+    // is its own read on every chain: a response context slot is a slot, and
+    // slots outrun heights.
     mock.enqueue(
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
+    mock.enqueue("getBlockHeight", Reply::result(json!(200)));
     // Ledger floor 0 covers the attempt window, so the expired absence is proven dead, not uncertain.
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     let client = test_client(mock.url());
@@ -392,8 +394,8 @@ async fn deposit_dead_signature_demoted() {
     assert_eq!(status_of(&pool, tx_id).await, "pending");
     assert_eq!(
         mock.call_count("getBlockHeight"),
-        0,
-        "the channel classification must resolve from the status response alone"
+        1,
+        "the expiry check must be judged against a block height, not a context slot"
     );
     // Recovery classifies the dead signature but never re-mints itself (the fetcher does).
     assert_eq!(mock.call_count("sendTransaction"), 0);
@@ -2023,6 +2025,7 @@ async fn stale_jit_refire_does_not_double_mint() {
         "getSignatureStatuses",
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
+    mock.enqueue("getBlockHeight", Reply::result(json!(200)));
     mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     // The coverage proof reads the channel's live blockhash window per verdict.
     mock.enqueue("getLatestBlockhash", blockhash_reply());

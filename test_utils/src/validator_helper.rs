@@ -16,14 +16,63 @@ use {
     },
 };
 
+/// A port the OS has just released, with its successor free too, because the
+/// validator binds `rpc_port + 1` for pubsub and reserving only one leaves that
+/// second socket free for another validator to take.
 fn get_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
-    let port = listener
-        .local_addr()
-        .expect("Failed to get local address")
-        .port();
-    drop(listener);
-    port
+    for _ in 0..64 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
+        let Some(pubsub) = port.checked_add(1) else {
+            continue;
+        };
+        if TcpListener::bind(("127.0.0.1", pubsub)).is_ok() {
+            return port;
+        }
+    }
+    panic!("Could not find a free port pair for the test validator");
+}
+
+/// How many times a validator start is retried on a lost port race.
+const VALIDATOR_START_ATTEMPTS: usize = 5;
+
+/// Run a validator start, retrying it on a port another process took first.
+/// The port is released before the validator binds it, so the race is inherent;
+/// `build` picks fresh ports on every attempt.
+async fn start_with_port_retry<T, F>(build: F) -> T
+where
+    T: Send + 'static,
+    F: Fn() -> T + Send + Clone + 'static,
+{
+    for attempt in 1..=VALIDATOR_START_ATTEMPTS {
+        let build = build.clone();
+        match tokio::task::spawn_blocking(build).await {
+            Ok(started) => return started,
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("")
+                    .to_string();
+                if attempt < VALIDATOR_START_ATTEMPTS && message.contains("Address already in use")
+                {
+                    eprintln!(
+                        "Test validator lost a port race on attempt {attempt}, retrying on a \
+                         fresh port"
+                    );
+                    continue;
+                }
+                panic!("Failed to spawn test validator: {message}");
+            }
+            Err(e) => panic!("Failed to spawn test validator: {e}"),
+        }
+    }
+    unreachable!("the loop returns or panics on its last attempt")
 }
 
 const ESCROW_PROGRAM_PATH: &str = concat!(
@@ -194,32 +243,30 @@ fn make_program_info(program_id_bytes: [u8; 32], program_path: &str) -> Upgradea
 /// Start the solana-test-validator on free ports with geyser plugin enabled.
 /// Returns the test validator instance, the mint keypair, and the geyser port.
 pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
-    // Bind to port 0 and let the OS pick a free port for RPC and geyser.
-    // Concurrent validators (nextest runs each test in its own process) never
-    // collide: the kernel assigns OS-level sockets atomically.
-    // All other validator sockets (gossip, TPU, TVU) use port=0 as well.
-    let rpc_port = get_free_port();
-    let gossip_port = 0u16;
-    let geyser_port = get_free_port();
-
-    let rpc_config = JsonRpcConfig {
-        rpc_threads: 4,
-        rpc_blocking_threads: 4,
-        full_api: true,
-        disable_health_check: true,
-        enable_rpc_transaction_history: true,
-        // Inner instructions and logs are only persisted with this on, and the escrow
-        // programs report every deposit and withdrawal through a self-CPI event that the
-        // indexer reads out of the inner instruction list. Without it a block comes back
-        // with the top-level instruction and no event, so anything reading chain history
-        // over RPC decodes each deposit to nothing.
-        enable_extended_tx_metadata_storage: true,
-        ..Default::default()
-    };
-
     verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
-    let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
+    // Ports are picked inside the closure so a retried attempt takes fresh ones.
+    // All other validator sockets (gossip, TPU, TVU) use port=0.
+    let (test_validator, mint_keypair, geyser_port) = start_with_port_retry(|| {
+        let rpc_port = get_free_port();
+        let gossip_port = 0u16;
+        let geyser_port = get_free_port();
+
+        let rpc_config = JsonRpcConfig {
+            rpc_threads: 4,
+            rpc_blocking_threads: 4,
+            full_api: true,
+            disable_health_check: true,
+            enable_rpc_transaction_history: true,
+            // Inner instructions and logs are only persisted with this on, and the escrow
+            // programs report every deposit and withdrawal through a self-CPI event that the
+            // indexer reads out of the inner instruction list. Without it a block comes back
+            // with the top-level instruction and no event, so anything reading chain history
+            // over RPC decodes each deposit to nothing.
+            enable_extended_tx_metadata_storage: true,
+            ..Default::default()
+        };
+
         let escrow_program = make_program_info(
             PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(),
             ESCROW_PROGRAM_PATH,
@@ -248,18 +295,17 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
         let mut genesis = TestValidatorGenesis::default();
         genesis.geyser_plugin_config_files = Some(vec![temp_config_file.path().to_path_buf()]);
 
-        genesis
+        let (validator, mint) = genesis
             .rpc_config(rpc_config)
             .rpc_port(rpc_port)
             .gossip_port(gossip_port)
             .add_upgradeable_programs_with_path(&[escrow_program, withdraw_program])
-            .start()
+            .start();
+        (validator, mint, geyser_port)
     })
-    .await
-    .expect("Failed to spawn test validator");
+    .await;
 
-    let rpc_url = format!("http://127.0.0.1:{}", rpc_port);
-    let client = RpcClient::new(rpc_url);
+    let client = RpcClient::new(test_validator.rpc_url());
     if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if client.get_health().is_ok() {
@@ -283,28 +329,28 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
 /// Start the solana-test-validator without the geyser plugin enabled.
 /// Returns the test validator instance and the mint keypair.
 pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
-    // Same port strategy as start_test_validator — see the comment there.
-    let rpc_port = get_free_port();
-    let gossip_port = 0u16;
-
-    let rpc_config = JsonRpcConfig {
-        rpc_threads: 4,
-        rpc_blocking_threads: 4,
-        full_api: true,
-        disable_health_check: true,
-        enable_rpc_transaction_history: true,
-        // Inner instructions and logs are only persisted with this on, and the escrow
-        // programs report every deposit and withdrawal through a self-CPI event that the
-        // indexer reads out of the inner instruction list. Without it a block comes back
-        // with the top-level instruction and no event, so anything reading chain history
-        // over RPC decodes each deposit to nothing.
-        enable_extended_tx_metadata_storage: true,
-        ..Default::default()
-    };
-
     verify_escrow_program_features_match_indexer(Path::new(ESCROW_PROGRAM_PATH));
 
-    let (test_validator, mint_keypair) = tokio::task::spawn_blocking(move || {
+    // Same port strategy as start_test_validator — see the comment there.
+    let (test_validator, mint_keypair) = start_with_port_retry(|| {
+        let rpc_port = get_free_port();
+        let gossip_port = 0u16;
+
+        let rpc_config = JsonRpcConfig {
+            rpc_threads: 4,
+            rpc_blocking_threads: 4,
+            full_api: true,
+            disable_health_check: true,
+            enable_rpc_transaction_history: true,
+            // Inner instructions and logs are only persisted with this on, and the escrow
+            // programs report every deposit and withdrawal through a self-CPI event that the
+            // indexer reads out of the inner instruction list. Without it a block comes back
+            // with the top-level instruction and no event, so anything reading chain history
+            // over RPC decodes each deposit to nothing.
+            enable_extended_tx_metadata_storage: true,
+            ..Default::default()
+        };
+
         let escrow_program = make_program_info(
             PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_bytes(),
             ESCROW_PROGRAM_PATH,
@@ -323,8 +369,7 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
             .add_upgradeable_programs_with_path(&[escrow_program, withdraw_program])
             .start()
     })
-    .await
-    .expect("Failed to spawn test validator");
+    .await;
 
     let client = RpcClient::new(test_validator.rpc_url());
     if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(10), async {

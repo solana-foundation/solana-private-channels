@@ -395,25 +395,23 @@ pub(crate) enum SigFinality {
     Uncertain(String),
 }
 
-/// Where an endpoint's current block height comes from. Both chains report a
-/// `context.slot`, so nothing on the wire distinguishes them; the chain is known
-/// statically at every construction site and tagged there.
+/// Which chain an endpoint serves, tagged statically because nothing on the wire
+/// distinguishes them. Used only by `coverage_verdict`, to decide whether an
+/// attempt with no journaled blockhash slot may reconstruct one, and for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeightSource {
-    /// PrivateChannel: block height equals slot by construction, so the status
-    /// response's own context slot is the height. One response cannot be split
-    /// across two backends, which a separate height call can be.
-    ContextSlot,
-    /// Solana: slots and heights diverge (skipped slots), so height needs its own call.
-    BlockHeightRpc,
+pub(crate) enum Chain {
+    /// PrivateChannel, whose blockhash window is operator-tunable.
+    Channel,
+    /// Solana, whose 150-block window is protocol-fixed.
+    Solana,
 }
 
-impl HeightSource {
-    /// Metric label for the chain this height source identifies.
+impl Chain {
+    /// Metric label for this chain.
     fn chain_label(self) -> &'static str {
         match self {
-            HeightSource::ContextSlot => "channel",
-            HeightSource::BlockHeightRpc => "solana",
+            Chain::Channel => "channel",
+            Chain::Solana => "solana",
         }
     }
 }
@@ -423,8 +421,8 @@ impl HeightSource {
 pub(crate) struct FinalityRpc<'a> {
     pub primary: &'a RpcClientWithRetry,
     pub fallback: Option<&'a RpcClientWithRetry>,
-    /// How to read the current block height from these endpoints.
-    pub height_source: HeightSource,
+    /// Which chain these endpoints serve.
+    pub chain: Chain,
 }
 
 impl<'a> FinalityRpc<'a> {
@@ -438,7 +436,7 @@ impl<'a> FinalityRpc<'a> {
         Self {
             primary,
             fallback,
-            height_source: HeightSource::ContextSlot,
+            chain: Chain::Channel,
         }
     }
 
@@ -451,7 +449,7 @@ impl<'a> FinalityRpc<'a> {
         Self {
             primary,
             fallback,
-            height_source: HeightSource::BlockHeightRpc,
+            chain: Chain::Solana,
         }
     }
 }
@@ -477,9 +475,6 @@ enum EndpointVerdict {
     },
 }
 
-/// The window the retention proof must cover. Solana's is protocol-fixed and costs no
-/// call; a channel node's `max_blockhashes` can change under a running operator, so it
-/// is read fresh as `lvbh - context_slot`, with the startup value kept as a floor.
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
 /// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
 /// proves retention. Assumes a single consistent archival endpoint, not a split pool.
@@ -502,11 +497,11 @@ async fn coverage_verdict(
     min_blockhash_slot: Option<u64>,
     endpoint_label: &str,
 ) -> SigFinality {
-    let chain = finality.height_source.chain_label();
-    let bound = match (min_blockhash_slot, finality.height_source) {
+    let chain = finality.chain.chain_label();
+    let bound = match (min_blockhash_slot, finality.chain) {
         (Some(slot), _) => slot,
-        (None, HeightSource::BlockHeightRpc) => min_lvbh.saturating_sub(MAX_PROCESSING_AGE as u64),
-        (None, HeightSource::ContextSlot) => {
+        (None, Chain::Solana) => min_lvbh.saturating_sub(MAX_PROCESSING_AGE as u64),
+        (None, Chain::Channel) => {
             OPERATOR_ABSENCE_CLASSIFY
                 .with_label_values(&[chain, "uncertain"])
                 .inc();
@@ -559,11 +554,8 @@ pub(crate) async fn classify_signatures(
     finality: &FinalityRpc<'_>,
     sigs: &[PendingSig],
 ) -> SigFinality {
-    // Primary and fallback are same-chain by construction, so both endpoints read
-    // the current height the same way.
-    let height_source = finality.height_source;
     let (primary_lvbh, primary_blockhash_slot) =
-        match classify_endpoint(finality.primary, sigs, height_source).await {
+        match classify_endpoint(finality.primary, sigs).await {
             EndpointVerdict::Landed(sig) => return SigFinality::Landed(sig),
             EndpointVerdict::Live(reason) => return SigFinality::Live(reason),
             EndpointVerdict::Uncertain(reason) => return SigFinality::Uncertain(reason),
@@ -580,7 +572,7 @@ pub(crate) async fn classify_signatures(
         // Destination path: the primary is allowed to be pruned (that is why the
         // fallback exists), so we trust the fallback's verdict and coverage-check
         // the fallback, never the primary.
-        Some(fb) => match classify_endpoint(fb, sigs, height_source).await {
+        Some(fb) => match classify_endpoint(fb, sigs).await {
             EndpointVerdict::Landed(sig) => {
                 warn_fallback_override("Landed", &sig.to_string(), sigs);
                 SigFinality::Landed(sig)
@@ -614,12 +606,8 @@ pub(crate) async fn classify_signatures(
 /// Thin test-only wrapper over `classify_endpoint` mapping both `Dead` shapes to `SigFinality::Dead`.
 /// Lets the per-endpoint unit tests assert status logic without the coverage gate `classify_signatures` adds.
 #[cfg(test)]
-pub(crate) async fn classify_against(
-    rpc: &RpcClientWithRetry,
-    sigs: &[PendingSig],
-    height_source: HeightSource,
-) -> SigFinality {
-    match classify_endpoint(rpc, sigs, height_source).await {
+pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> SigFinality {
+    match classify_endpoint(rpc, sigs).await {
         EndpointVerdict::Landed(sig) => SigFinality::Landed(sig),
         EndpointVerdict::Live(reason) => SigFinality::Live(reason),
         EndpointVerdict::Uncertain(reason) => SigFinality::Uncertain(reason),
@@ -631,11 +619,7 @@ pub(crate) async fn classify_against(
 
 /// Classify `sigs` against one endpoint's `getSignatureStatuses` history, distinguishing a
 /// finalized-failed `Dead` from an absence-based one so only the latter needs a coverage proof.
-async fn classify_endpoint(
-    rpc: &RpcClientWithRetry,
-    sigs: &[PendingSig],
-    height_source: HeightSource,
-) -> EndpointVerdict {
+async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
     let response = match rpc.get_signature_statuses_with_history(&flat).await {
@@ -665,19 +649,15 @@ async fn classify_endpoint(
         return EndpointVerdict::Landed(flat[index]);
     }
 
-    // Height is needed only for the lvbh check on null-status sigs. On the channel
-    // it is already in this response, which also binds it to the same backend and
-    // the same snapshot as the statuses; on Solana it costs a second call, so a
-    // transient getBlockHeight outage isn't treated as uncertainty otherwise.
+    // Only the lvbh check on null-status sigs needs it, so it costs a call only
+    // when one is absent. It must be a height on both chains: a context slot
+    // outruns the height, and judging an lvbh against one abandons live work.
     let current_height = if response.value.iter().any(|s| s.is_none()) {
-        match height_source {
-            HeightSource::ContextSlot => response.context.slot,
-            HeightSource::BlockHeightRpc => match rpc.get_block_height().await {
-                Ok(h) => h,
-                Err(e) => {
-                    return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
-                }
-            },
+        match rpc.get_block_height().await {
+            Ok(h) => h,
+            Err(e) => {
+                return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
+            }
         }
     } else {
         // Unused: the null-status branch below only fires when some status is None.
@@ -2676,7 +2656,7 @@ mod tests {
             },
         ];
 
-        match classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await {
+        match classify_against(&rpc, &sigs).await {
             SigFinality::Landed(s) => assert_eq!(
                 s, success,
                 "must return the finalized-success sig, not the failed one"
@@ -2717,10 +2697,7 @@ mod tests {
         ];
 
         assert!(
-            matches!(
-                classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await,
-                SigFinality::Live(_)
-            ),
+            matches!(classify_against(&rpc, &sigs).await, SigFinality::Live(_)),
             "confirmed success behind a finalized failure must be Live, not Dead"
         );
     }
@@ -2759,10 +2736,7 @@ mod tests {
         ];
 
         assert!(
-            matches!(
-                classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await,
-                SigFinality::Live(_)
-            ),
+            matches!(classify_against(&rpc, &sigs).await, SigFinality::Live(_)),
             "a still-valid null after an expired null must be Live, not Dead"
         );
     }
@@ -2796,7 +2770,7 @@ mod tests {
 
         assert!(
             matches!(
-                classify_against(&rpc, &sigs, HeightSource::BlockHeightRpc).await,
+                classify_against(&rpc, &sigs).await,
                 SigFinality::Uncertain(_)
             ),
             "length mismatch must be Uncertain"
@@ -4257,14 +4231,23 @@ mod tests {
         src_send.assert_async().await;
     }
 
-    // ── channel height source (context slot) ────────────────────────
+    // ── absence classification against block height ─────────────────
 
-    /// A null status whose response context slot is `context_slot`. On the channel
-    /// that slot IS the block height, so it is the whole freshness witness.
-    fn null_status_at(context_slot: u64) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":{context_slot}}},"value":[null]}},"id":0}}"#
+    /// A null status. Its context slot sits far above every height these tests
+    /// use, so a verdict that reads the slot instead of the height shows up as a
+    /// wrong answer rather than a coincidence.
+    fn null_status() -> String {
+        r#"{"jsonrpc":"2.0","result":{"context":{"slot":9000},"value":[null]},"id":0}"#.to_string()
+    }
+
+    /// Register a `getBlockHeight` reply of `height` on `server`.
+    async fn mock_height(server: &mut mockito::Server, height: u64) {
+        mock_rpc(
+            server,
+            "getBlockHeight",
+            &format!(r#"{{"jsonrpc":"2.0","result":{height},"id":0}}"#),
         )
+        .await;
     }
 
     fn sig_with_lvbh(lvbh: u64) -> Vec<PendingSig> {
@@ -4299,12 +4282,12 @@ mod tests {
         .await;
     }
 
-    /// The channel takes its height from the status response, so `getBlockHeight` is
-    /// never mocked here: its absence from the script is part of every assertion.
+    /// An absence past `getBlockHeight` with a covered floor is Dead.
     #[tokio::test]
-    async fn channel_absence_uses_response_context_slot() {
+    async fn channel_absence_uses_block_height() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 0).await;
 
         let p = make_rpc(&server.url());
@@ -4314,36 +4297,62 @@ mod tests {
                 classify_signatures(&finality, &sig_with_slot(1000, 900)).await,
                 SigFinality::Dead
             ),
-            "a context slot past lvbh must resolve the absence without a height call"
+            "a block height past lvbh with a covered floor must resolve the absence"
+        );
+    }
+
+    /// An idle node ticks slots while producing far fewer blocks, so a status
+    /// response's context slot runs past a still-valid `lastValidBlockHeight` within
+    /// seconds. Judging an absence against it abandons live withdrawal broadcasts.
+    #[tokio::test]
+    async fn operator_does_not_declare_a_live_broadcast_dead() {
+        let mut server = mockito::Server::new_async().await;
+        // The context slot is far past lvbh 1000; the block height 900 is not.
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 900).await;
+        mock_floor(&mut server, 0).await;
+
+        let p = make_rpc(&server.url());
+        let finality = FinalityRpc::channel(&p, None);
+        assert!(
+            matches!(
+                classify_signatures(&finality, &sig_with_slot(1000, 900)).await,
+                SigFinality::Live(_)
+            ),
+            "a broadcast still inside its block-height validity must stay Live"
         );
     }
 
     #[tokio::test]
-    async fn channel_absence_never_calls_block_height() {
+    async fn channel_absence_calls_block_height() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
         mock_floor(&mut server, 0).await;
-        let never = server
+        let height = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
                 r#""method"\s*:\s*"getBlockHeight""#.into(),
             ))
-            .expect(0)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":2000,"id":0}"#)
+            .expect_at_least(1)
             .create_async()
             .await;
 
         let p = make_rpc(&server.url());
         let finality = FinalityRpc::channel(&p, None);
         let _ = classify_signatures(&finality, &sig_with_lvbh(1000)).await;
-        never.assert_async().await;
+        height.assert_async().await;
     }
 
-    /// Boundary: `context.slot == lvbh` is still within validity, matching the
-    /// strict `>` the expiry check uses.
+    /// Boundary: `height == lvbh` is still within validity, matching the strict
+    /// `>` the expiry check uses.
     #[tokio::test]
     async fn channel_absence_within_validity_is_live() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(1000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 1000).await;
 
         let p = make_rpc(&server.url());
         let finality = FinalityRpc::channel(&p, None);
@@ -4353,12 +4362,11 @@ mod tests {
         ));
     }
 
-    /// The Solana path is unchanged: heights and slots diverge there, so the
-    /// height still comes from its own call.
+    /// The Solana constructor reads the height the same way.
     #[tokio::test]
-    async fn solana_absence_still_calls_block_height() {
+    async fn solana_absence_calls_block_height() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(200)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
         mock_floor(&mut server, 0).await;
         let height = server
             .mock("POST", "/")
@@ -4403,7 +4411,8 @@ mod tests {
     #[tokio::test]
     async fn channel_absence_pruned_floor_is_uncertain() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 1000).await;
 
         let p = make_rpc(&server.url());
@@ -4427,7 +4436,8 @@ mod tests {
         // A floor of 0 retains everything, so only the missing bound can hold it back.
         for window in [150u64, 600u64] {
             let mut server = mockito::Server::new_async().await;
-            mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+            mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+            mock_height(&mut server, 2000).await;
             mock_floor(&mut server, 0).await;
             mock_window(&mut server, window).await;
 
@@ -4448,13 +4458,8 @@ mod tests {
     #[tokio::test]
     async fn solana_absence_without_a_journaled_slot_still_resolves() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
-        mock_rpc(
-            &mut server,
-            "getBlockHeight",
-            r#"{"jsonrpc":"2.0","result":2000,"id":0}"#,
-        )
-        .await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 0).await;
 
         let p = make_rpc(&server.url());
@@ -4738,14 +4743,15 @@ mod tests {
                 blockhash_slot: Some(0),
             }],
         );
-        // Source is the channel: expired absence (context slot 200 past lvbh 0) with a
-        // covered floor, so classification is Dead without a getBlockHeight call.
+        // Source is the channel: expired absence (block height 200 past lvbh 0)
+        // with a covered floor, so classification is Dead.
         mock_rpc(
             &mut source,
             "getSignatureStatuses",
             r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":0}"#,
         )
         .await;
+        mock_height(&mut source, 200).await;
         mock_rpc(
             &mut source,
             "getFirstAvailableBlock",
@@ -4821,7 +4827,8 @@ mod tests {
     async fn journaled_slot_decides_the_coverage_verdict() {
         for (slot, expect_dead) in [(900u64, true), (400u64, false)] {
             let mut server = mockito::Server::new_async().await;
-            mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+            mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+            mock_height(&mut server, 2000).await;
             mock_floor(&mut server, 800).await;
 
             let p = make_rpc(&server.url());
@@ -4842,7 +4849,8 @@ mod tests {
     #[tokio::test]
     async fn a_narrowed_window_cannot_shrink_a_journaled_bound() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 800).await;
         mock_window(&mut server, 150).await;
 
@@ -4863,7 +4871,8 @@ mod tests {
     #[tokio::test]
     async fn journaled_slot_needs_no_window_rpc() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 800).await;
 
         let p = make_rpc(&server.url());
@@ -4883,7 +4892,8 @@ mod tests {
     #[tokio::test]
     async fn one_absent_sig_without_a_slot_forfeits_the_exact_bound() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 800).await;
         mock_window(&mut server, 600).await;
 
@@ -4916,7 +4926,8 @@ mod tests {
     #[tokio::test]
     async fn lowest_journaled_slot_bounds_the_set() {
         let mut server = mockito::Server::new_async().await;
-        mock_rpc(&mut server, "getSignatureStatuses", &null_status_at(2000)).await;
+        mock_rpc(&mut server, "getSignatureStatuses", &null_status()).await;
+        mock_height(&mut server, 2000).await;
         mock_floor(&mut server, 800).await;
 
         let sigs = vec![

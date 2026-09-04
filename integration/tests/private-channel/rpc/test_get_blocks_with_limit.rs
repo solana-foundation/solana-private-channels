@@ -67,16 +67,17 @@ pub async fn run_get_blocks_with_limit_test(ctx: &PrivateChannelContext) {
     );
     println!("✓ Future slot query returns empty");
 
-    // Test 6: every listed slot is fetchable and its parent link is dense. This is
-    // the property the indexer's chain proof relies on, so it is worth pinning here
-    // rather than only in the indexer's own tests.
+    // Test 6: every listed slot is fetchable and names the previous listed slot as
+    // its parent, not the previous slot. This is the property the indexer's chain
+    // proof relies on, so it is pinned here too.
     let mut verified = 0;
-    for &slot in blocks.iter().rev().take(5) {
+    for window in blocks.windows(2).rev().take(5) {
+        let (parent, slot) = (window[0], window[1]);
         if let Ok(block) = ctx.read_client.get_block(slot).await {
             assert_eq!(
-                block.parent_slot + 1,
-                slot,
-                "Block slot should be parent_slot + 1"
+                block.parent_slot, parent,
+                "Block {} should name the previous produced block {} as its parent",
+                slot, parent
             );
             verified += 1;
         }

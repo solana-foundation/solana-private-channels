@@ -407,6 +407,19 @@ async fn mock_fill_range_carrying(
             .await,
     );
     let produced: Vec<u64> = (MOCK_START_SLOT..=MOCK_TIP).collect();
+    // The backfill floor is exclusive, so the anchor lookup that picks the range's
+    // last produced block asks from one slot below it. Same producers answer it.
+    mocks.push(
+        rpc.mock("POST", "/")
+            .match_body(Matcher::PartialJson(
+                json!({"method": "getBlocks", "params": [MOCK_START_SLOT - 1, MOCK_TIP]}),
+            ))
+            .with_status(200)
+            .with_body(json!({"jsonrpc": "2.0", "result": produced, "id": 1}).to_string())
+            .expect_at_least(1)
+            .create_async()
+            .await,
+    );
     mocks.push(
         rpc.mock("POST", "/")
             .match_body(Matcher::PartialJson(

@@ -3855,6 +3855,17 @@ mod tests {
             .create()
     }
 
+    fn mock_block_height(server: &mut mockito::ServerGuard, height: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{height},"id":1}}"#))
+            .create()
+    }
+
     fn mock_first_available_block(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
         server
             .mock("POST", "/")
@@ -3951,8 +3962,9 @@ mod tests {
     #[tokio::test]
     async fn reopened_deposit_with_live_sig_defers_without_mint() {
         let mut server = mockito::Server::new_async().await;
-        // Channel: context slot (200) <= lvbh (1000) means still live.
+        // Block height 200 is below lvbh 1000, so the sig can still land.
         let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
+        let _height = mock_block_height(&mut server, 200);
 
         let mock = MockStorage::new();
         let mint = Pubkey::new_unique();
@@ -4004,8 +4016,10 @@ mod tests {
     #[tokio::test]
     async fn reopened_deposit_with_dead_sigs_proceeds_to_mint() {
         let mut server = mockito::Server::new_async().await;
-        // Channel: context slot (200) > lvbh (100) means expired; floor 0 proves coverage.
+        // Block height 200 is past lvbh 100, so the absence is expired; floor 0
+        // proves coverage.
         let _status = mock_status_reply(&mut server, NULL_STATUS_BODY);
+        let _height = mock_block_height(&mut server, 200);
         let _floor = mock_first_available_block(&mut server, 0);
 
         let mock = MockStorage::new();

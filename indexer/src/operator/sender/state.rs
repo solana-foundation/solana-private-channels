@@ -1478,32 +1478,20 @@ mod tests {
         assert!(state.source_finality().fallback.is_none());
     }
 
-    /// The chain tag drives the height source, the retention window and the metric
-    /// label, so it must follow the role and not the field name: the two roles use
-    /// `rpc_client` and `source_rpc_client` for mirror-image chains.
+    /// The chain tag drives the retention window and the metric label, so it must
+    /// follow the role and not the field name: the two roles use `rpc_client` and
+    /// `source_rpc_client` for mirror-image chains.
     #[test]
     fn finality_chain_tags_follow_the_operator_role() {
-        use crate::operator::sender::remint::HeightSource;
+        use crate::operator::sender::remint::Chain;
 
         let withdraw = make_sender_state_with_role(MockStorage::new(), ProgramType::Withdraw);
-        assert_eq!(
-            withdraw.dest_finality().height_source,
-            HeightSource::BlockHeightRpc
-        );
-        assert_eq!(
-            withdraw.source_finality().height_source,
-            HeightSource::ContextSlot
-        );
+        assert_eq!(withdraw.dest_finality().chain, Chain::Solana);
+        assert_eq!(withdraw.source_finality().chain, Chain::Channel);
 
         let escrow = make_sender_state_with_role(MockStorage::new(), ProgramType::Escrow);
-        assert_eq!(
-            escrow.dest_finality().height_source,
-            HeightSource::ContextSlot
-        );
-        assert_eq!(
-            escrow.source_finality().height_source,
-            HeightSource::BlockHeightRpc
-        );
+        assert_eq!(escrow.dest_finality().chain, Chain::Channel);
+        assert_eq!(escrow.source_finality().chain, Chain::Solana);
     }
 
     /// Pins the SmtRootMismatch wedge: a landed release whose nonce never reaches

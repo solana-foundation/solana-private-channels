@@ -2,7 +2,7 @@
 //!
 //! The two guards at the top of `run_node` reject misconfigurations:
 //!   - `blocktime_ms == 0` on a write-mode node
-//!   - `max_blockhashes() == 0` on a write-mode node
+//!   - `max_blockhashes == 0` on a write-mode node
 //!
 //! Both are cheap to exercise by calling `run_node` with a deliberately
 //! bad `NodeConfig`. No postgres, no redis — the validation fires
@@ -35,8 +35,9 @@ fn base_config(mode: NodeMode) -> NodeConfig {
         max_svm_workers: 1,
         accountsdb_connection_url: "postgres://unused/private_channel".to_string(),
         redis_cache_url: None,
+        redis_block_ttl_secs: 3_600,
         admin_keys: vec![Keypair::new().pubkey()],
-        transaction_expiration_ms: 1_000,
+        max_blockhashes: 150,
         blocktime_ms: 100,
         perf_sample_period_secs: 60,
         metrics: Arc::new(NoopMetrics),
@@ -61,14 +62,13 @@ async fn zero_blocktime_on_write_mode_fails_validation() {
     );
 }
 
-/// `transaction_expiration_ms < blocktime_ms` forces `max_blockhashes()
-/// == 0`, tripping the second validation guard on a write node.
+/// A zero blockhash window trips the second validation guard: a read node would
+/// advertise it as `lastValidBlockHeight` and a write node would size the dedup
+/// cache with it.
 #[tokio::test(flavor = "multi_thread")]
 async fn zero_max_blockhashes_on_write_mode_fails_validation() {
     let mut config = base_config(NodeMode::Aio);
-    // transaction_expiration_ms < blocktime_ms → integer-divide gives 0.
-    config.blocktime_ms = 1_000;
-    config.transaction_expiration_ms = 100;
+    config.max_blockhashes = 0;
 
     let err = match run_node(config).await {
         Err(e) => e,
@@ -76,7 +76,8 @@ async fn zero_max_blockhashes_on_write_mode_fails_validation() {
     };
     let msg = format!("{err}");
     assert!(
-        msg.contains("transaction_expiration_ms") && msg.contains("max_blockhashes"),
-        "error must name both the violated parameter and the derived field: {msg}"
+        msg.contains("max_blockhashes must be greater than 0")
+            && msg.contains("transaction_expiration_ms"),
+        "error must name the violated parameter: {msg}"
     );
 }

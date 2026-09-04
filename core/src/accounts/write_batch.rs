@@ -1,5 +1,10 @@
 use {
     super::{
+        counter,
+        current_slot::CURRENT_SLOT_KEY,
+        get_block_height::BLOCK_HEIGHT_KEY,
+        get_latest_blockhash::LATEST_BLOCKHASH_KEY,
+        get_latest_slot::LATEST_SLOT_KEY,
         postgres::PostgresAccountsDB,
         redis::RedisAccountsDB,
         traits::{AccountsDB, BlockInfo},
@@ -234,14 +239,31 @@ async fn write_batch_postgres(
         .await
         .map_err(|e| format!("Failed to store block: {}", e))?;
 
+        // The tip blockhash and the chain counters go in one UNNEST upsert, so
+        // making slot and height durable costs no extra round trip. They commit
+        // with the block row, so a rolled-back batch leaves all three untouched.
+        let keys: Vec<&str> = vec![
+            LATEST_BLOCKHASH_KEY,
+            LATEST_SLOT_KEY,
+            CURRENT_SLOT_KEY,
+            BLOCK_HEIGHT_KEY,
+        ];
+        let values: Vec<Vec<u8>> = vec![
+            block_info.blockhash.as_ref().to_vec(),
+            counter::encode(block_info.slot).to_vec(),
+            counter::encode(block_info.slot).to_vec(),
+            counter::encode(block_info.block_height.unwrap_or(block_info.slot)).to_vec(),
+        ];
         sqlx::query(
-            "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
+            "INSERT INTO metadata (key, value)
+                 SELECT * FROM UNNEST($1::varchar[], $2::bytea[])
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
-        .bind(block_info.blockhash.as_ref())
+        .bind(&keys)
+        .bind(&values)
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
+        .map_err(|e| format!("Failed to update the chain tip metadata: {}", e))?;
 
         inserted
     } else {
@@ -359,11 +381,23 @@ pub(crate) async fn write_batch_redis(
 
     // Store block info and update latest slot
     if let Some(block) = block_info {
-        pipe.set("latest_blockhash", block.blockhash.to_string());
-        pipe.set("latest_slot", block.slot);
+        pipe.set(LATEST_BLOCKHASH_KEY, block.blockhash.to_string());
+        pipe.set(LATEST_SLOT_KEY, block.slot);
+        // The live slot moves on idle ticks too, but a block still republishes
+        // it so a replica never reports a slot behind the block it can fetch.
+        pipe.set(CURRENT_SLOT_KEY, block.slot);
+        // Mirrored so a read replica reports a height consistent with the hash
+        // it serves from the same cache.
+        pipe.set(BLOCK_HEIGHT_KEY, block.block_height.unwrap_or(block.slot));
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
-        pipe.set(key, serialized);
+        // Only block entries expire. The tip keys the coherence check reads are
+        // never given a TTL, so an expiry can neither condemn the cache nor
+        // trigger a rebuild.
+        match db.block_ttl_secs() {
+            0 => pipe.set(key, serialized),
+            ttl => pipe.set_ex(key, serialized, ttl),
+        };
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

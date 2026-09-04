@@ -34,7 +34,9 @@ use {
 };
 
 static SETUP_LOCK: Mutex<()> = Mutex::const_new(());
-const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+// Idle block production is a tenth of what it was, so every wait that counts
+// blocks takes materially longer than the same suite used to.
+const TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 // We store these only to keep the services alive for the duration of the test
 struct KeepAlive {
@@ -285,8 +287,9 @@ async fn setup(
         max_svm_workers: 4,
         accountsdb_connection_url: accountsdb_connection_url.clone(),
         redis_cache_url,
+        redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator_key.pubkey()],
-        transaction_expiration_ms: 15000,
+        max_blockhashes: 150,
         blocktime_ms: 100,
         perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
         metrics: Arc::new(NoopMetrics),
