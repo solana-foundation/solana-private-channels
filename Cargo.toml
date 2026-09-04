@@ -16,9 +16,6 @@ members = [
     "test_utils",
     "scripts/devnet",
     "bench-tps",
-    "dvp-swap-program/program",
-    "dvp-swap-program/tests/integration-tests",
-    "dvp-swap-program/tests/transfer-hook-fixture",
     "dvp-swap-program/clients/rust",
 ]
 

@@ -6,7 +6,10 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::sync::LazyLock;
 use uuid::Uuid;
+
+use dvp_swap_program_client::{accounts::SwapDvp, DVP_SWAP_PROGRAM_ID};
 
 use crate::db::is_wallet_owned_by_user;
 
@@ -163,33 +166,13 @@ const DELEGATE_END: usize = 108;
 //
 // Accounts owned by this program hold a SwapDvp struct for a P2P token swap.
 // Read access is granted to either trading party (user_a, user_b) or the
-// settlement_authority, by inspecting raw bytes (no full deserialization).
-//
-// SWAP_DVP_SIZE and SWAP_DVP_OWNER_FIELDS mirror the SwapDvp layout in
-// dvp-swap-program/program/src/state/swap_dvp.rs. They are not derived from it,
-// so if a field is added or reordered there, update them here or these checks
-// will read the wrong bytes.
+// settlement_authority. The program ID, account size, and field layout all come
+// from the vendored client (dvp-swap-program-client), so they can't drift from
+// the committed .so when the layout or program ID changes upstream.
 // ---------------------------------------------------------------------------
 
-/// DvP swap escrow program ID.
-///
-/// WARNING: the DvP swap program is NOT deployed yet. This value is the local
-/// `declare_id!` from dvp-swap-program/program/src/lib.rs and is a placeholder.
-/// Update it with the real program ID once the program is deployed, otherwise
-/// no live DvP account will match and these checks will never fire.
-const DVP_SWAP_PROGRAM: &str = "DzG1qJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC";
-
-/// Serialized size of a SwapDvp account (SwapDvp::LEN). Smaller DvP-owned
-/// accounts (e.g. the nonce tombstone PDA) are not swaps and are denied.
-const SWAP_DVP_SIZE: usize = 394;
-
-/// Byte ranges of the SwapDvp fields whose pubkey grants read access.
-/// Layout: bump(1), user_a, user_b, mint_a, mint_b, settlement_authority, ...
-const SWAP_DVP_OWNER_FIELDS: [(usize, usize); 3] = [
-    (1, 33),    // user_a (seller)
-    (33, 65),   // user_b (buyer)
-    (129, 161), // settlement_authority
-];
+/// DvP swap escrow program ID (base58), from the client's declared program ID.
+static DVP_SWAP_PROGRAM: LazyLock<String> = LazyLock::new(|| DVP_SWAP_PROGRAM_ID.to_string());
 
 // ---------------------------------------------------------------------------
 // Auth decision
@@ -296,7 +279,9 @@ pub async fn check_account_data_ownership(
         SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM => {
             check_token_account_ownership(data, method, user_id, auth_db).await
         }
-        DVP_SWAP_PROGRAM => check_swap_dvp_ownership(data, user_id, auth_db).await,
+        owner if owner == DVP_SWAP_PROGRAM.as_str() => {
+            check_swap_dvp_ownership(data, user_id, auth_db).await
+        }
         // Non-token-program account (e.g. System Program wallet, unknown PDA).
         // The account bytes don't have a meaningful owner field to inspect, so
         // fall back to checking whether the pubkey itself is a verified wallet.
@@ -366,13 +351,15 @@ async fn check_token_account_ownership(
 /// Accounts smaller than a full SwapDvp (e.g. the nonce tombstone PDA) are not
 /// swaps and are denied.
 async fn check_swap_dvp_ownership(data: &[u8], user_id: Uuid, auth_db: &PgPool) -> AuthDecision {
-    if data.len() < SWAP_DVP_SIZE {
-        return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
-    }
+    // Strict, size-checked decode from the vendored client. Anything that isn't
+    // exactly a SwapDvp (e.g. the smaller nonce tombstone PDA) is rejected.
+    let swap = match SwapDvp::try_from_bytes(data) {
+        Ok(s) => s,
+        Err(_) => return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body()),
+    };
 
-    for (start, end) in SWAP_DVP_OWNER_FIELDS {
-        let candidate = bs58::encode(&data[start..end]).into_string();
-        match is_wallet_owned_by_user(auth_db, user_id, &candidate).await {
+    for candidate in [swap.user_a, swap.user_b, swap.settlement_authority] {
+        match is_wallet_owned_by_user(auth_db, user_id, &candidate.to_string()).await {
             Ok(true) => return AuthDecision::Proceed,
             Ok(false) => {}
             Err(_) => {
@@ -856,13 +843,13 @@ mod tests {
 
     #[tokio::test]
     async fn swap_dvp_undersized_rejected_by_size() {
-        // A DvP-owned account smaller than SWAP_DVP_SIZE (e.g. the nonce
+        // A DvP-owned account smaller than a full SwapDvp (e.g. the nonce
         // tombstone PDA) is not a swap. Rejected before touching the DB.
-        let data = vec![0u8; SWAP_DVP_SIZE - 1];
+        let data = vec![0u8; dvp_swap_program_client::verify::SWAP_DVP_ACCOUNT_LEN - 1];
         let pool = lazy_pool();
         let decision = check_account_data_ownership(
             &data,
-            DVP_SWAP_PROGRAM,
+            DVP_SWAP_PROGRAM.as_str(),
             "SomePubkey",
             "getAccountInfo",
             Uuid::new_v4(),

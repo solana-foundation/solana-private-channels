@@ -58,7 +58,6 @@ jobs:
               '| Auth | - | - | - | - |',
               '| Withdraw Program | - | - | - | - |',
               '| Escrow Program | - | - | - | - |',
-              '| DvP Swap Program | - | - | - | - |',
               '| E2E Integration | - | - | - | - |',
               '| **Total** | **-** | **-** | **-** | |',
               '',
@@ -104,7 +103,6 @@ jobs:
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
               - 'private-channel-withdraw-program/**'
-              - 'dvp-swap-program/**'
               - 'auth/**'
             integration:
               - 'Cargo.toml'
@@ -119,7 +117,6 @@ jobs:
               - 'test_utils/**'
               - 'private-channel-escrow-program/**'
               - 'private-channel-withdraw-program/**'
-              - 'dvp-swap-program/**'
             core_indexer:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -130,6 +127,8 @@ jobs:
               - 'indexer/**'
               - 'gateway/**'
               - 'auth/**'
+              # Re-vendoring the DvP client runs its tests via ci-unit-coverage.
+              - 'dvp-swap-program/**'
 
   build-artifacts:
     name: Build Shared Artifacts
@@ -148,21 +147,16 @@ jobs:
         run: |
           make -C private-channel-escrow-program build
           make -C private-channel-withdraw-program build
-          make -C dvp-swap-program build
 
       - name: Package shared artifacts
         run: |
           tar -czf ci-build-artifacts.tgz \
             target/deploy/private_channel_escrow_program.so \
             target/deploy/private_channel_withdraw_program.so \
-            target/deploy/dvp_swap_program.so \
-            target/deploy/transfer_hook_fixture.so \
             private-channel-escrow-program/idl \
             private-channel-escrow-program/clients \
             private-channel-withdraw-program/idl \
-            private-channel-withdraw-program/clients \
-            dvp-swap-program/idl \
-            dvp-swap-program/clients
+            private-channel-withdraw-program/clients
 
       - name: Upload shared artifacts
         uses: actions/upload-artifact@v4
@@ -190,8 +184,6 @@ jobs:
         run: |
           mkdir -p target/deploy
           touch target/deploy/private_channel_withdraw_program.so
-          touch target/deploy/dvp_swap_program.so
-          touch target/deploy/transfer_hook_fixture.so
 
       - name: Generate clients
         run: make generate-clients
@@ -202,8 +194,7 @@ jobs:
             --exclude private-channel-core \
             --exclude private-channel-integration \
             --exclude tests-private-channel-escrow-program \
-            --exclude tests-private-channel-withdraw-program \
-            --exclude tests-dvp-swap-program
+            --exclude tests-private-channel-withdraw-program
 
   fmt:
     name: Format
@@ -229,8 +220,6 @@ jobs:
             -p tests-private-channel-escrow-program \
             -p private-channel-withdraw-program \
             -p tests-private-channel-withdraw-program \
-            -p dvp-swap-program \
-            -p tests-dvp-swap-program \
             -p private-channel-core \
             -p private-channel-gateway \
             -p private-channel-indexer \
@@ -259,8 +248,6 @@ jobs:
         run: |
           mkdir -p target/deploy
           touch target/deploy/private_channel_withdraw_program.so
-          touch target/deploy/dvp_swap_program.so
-          touch target/deploy/transfer_hook_fixture.so
 
       - name: Generate clients
         run: make generate-clients
@@ -271,7 +258,6 @@ jobs:
             --exclude private-channel-integration \
             --exclude tests-private-channel-escrow-program \
             --exclude tests-private-channel-withdraw-program \
-            --exclude tests-dvp-swap-program \
             -- -D warnings
 
   integration-tests:

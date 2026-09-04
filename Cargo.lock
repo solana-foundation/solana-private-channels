@@ -2935,23 +2935,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
-name = "dvp-swap-program"
-version = "0.1.0"
-dependencies = [
- "codama",
- "pinocchio",
- "pinocchio-associated-token-account",
- "pinocchio-log",
- "pinocchio-system",
- "pinocchio-token",
- "pinocchio-token-2022",
- "serde_json",
- "solana-address 2.1.0",
- "spl-token-2022 9.0.0",
- "thiserror 2.0.17",
-]
-
-[[package]]
 name = "dvp-swap-program-client"
 version = "0.0.1"
 dependencies = [
@@ -6523,6 +6506,7 @@ dependencies = [
  "bs58",
  "chrono",
  "clap 4.5.48",
+ "dvp-swap-program-client",
  "governor",
  "http-body-util",
  "hyper 1.7.0",
@@ -16329,23 +16313,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tests-dvp-swap-program"
-version = "0.1.0"
-dependencies = [
- "dvp-swap-program-client",
- "litesvm",
- "solana-program",
- "solana-program-pack 2.2.1",
- "solana-sdk",
- "spl-associated-token-account 4.0.0",
- "spl-pod 0.5.1",
- "spl-tlv-account-resolution 0.10.0",
- "spl-token 6.0.0",
- "spl-token-2022 9.0.0",
- "spl-transfer-hook-interface 0.10.0",
-]
-
-[[package]]
 name = "tests-private-channel-escrow-program"
 version = "0.1.0"
 dependencies = [
@@ -17084,15 +17051,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
-]
-
-[[package]]
-name = "transfer-hook-fixture"
-version = "0.1.0"
-dependencies = [
- "pinocchio",
- "pinocchio-log",
- "solana-address 2.1.0",
 ]
 
 [[package]]

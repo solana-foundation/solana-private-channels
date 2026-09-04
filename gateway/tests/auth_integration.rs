@@ -387,11 +387,11 @@ fn signature_status_response() -> String {
     .to_string()
 }
 
-/// DvP swap escrow program ID. Mirrors DVP_SWAP_PROGRAM in the gateway's auth
-/// module. Placeholder until the program is deployed; keep both in sync.
-const DVP_SWAP_PROGRAM: &str = "DzG1qJupt6Khm8s8jB3p93NkhPoiAg2M7vkEhkS15CtC";
+/// DvP swap escrow program ID (devnet). Mirrors DVP_SWAP_PROGRAM in the
+/// gateway's auth module; keep both in sync.
+const DVP_SWAP_PROGRAM: &str = "dvp34bdbcEm4f4FCUjGV4mDAkDshaQR4LkK8fdcsyZq";
 
-/// Build a getAccountInfo JSON-RPC response for a SwapDvp account (394 bytes,
+/// Build a getAccountInfo JSON-RPC response for a SwapDvp account (458 bytes,
 /// DvP program). user_a, user_b, and settlement_authority are written at their
 /// field offsets; all other fields are left zero.
 fn swap_dvp_response(
@@ -399,7 +399,7 @@ fn swap_dvp_response(
     user_b: &[u8; 32],
     settlement_authority: &[u8; 32],
 ) -> String {
-    let mut data = vec![0u8; 394];
+    let mut data = vec![0u8; 458];
     data[1..33].copy_from_slice(user_a);
     data[33..65].copy_from_slice(user_b);
     data[129..161].copy_from_slice(settlement_authority);

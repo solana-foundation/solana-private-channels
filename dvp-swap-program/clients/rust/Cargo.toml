@@ -4,12 +4,16 @@ version = "0.0.1"
 edition = "2021"
 description = "Rust client for the DvP Swap Program"
 license = "MIT"
-repository = "https://github.com/solana-foundation/contra/dvp-swap-program"
+repository = "https://github.com/solana-foundation/dvp"
 
 [dependencies]
-borsh = { workspace = true }
+borsh = { workspace = true, features = ["derive"] }
 solana-account-info = "2.2.1"
-solana-pubkey = "2.2.1"
+# `curve25519` enables the host-side PDA derivation (`find_program_address`)
+# used by the handwritten `verify` module; `borsh` provides the Borsh impls
+# the generated account/instruction structs derive against. Host-only client
+# crate, so neither reaches the on-chain program build.
+solana-pubkey = { version = "2.2.1", features = ["curve25519", "borsh"] }
 solana-instruction = "2.2.1"
 solana-cpi = "2.2.1"
 num-derive = { workspace = true }

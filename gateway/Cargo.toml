@@ -9,6 +9,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { workspace = true }
 private-channel-metrics = { path = "../metrics" }
+dvp-swap-program-client = { path = "../dvp-swap-program/clients/rust" }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }

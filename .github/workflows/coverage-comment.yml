@@ -121,7 +121,6 @@ jobs:
               '| Auth | - | - | - | - |',
               '| Withdraw Program | - | - | - | - |',
               '| Escrow Program | - | - | - | - |',
-              '| DvP Swap Program | - | - | - | - |',
               '| E2E Integration | - | - | - | - |',
               '| **Total** | **-** | **-** | **-** | |',
               '',
