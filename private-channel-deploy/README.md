@@ -32,15 +32,43 @@ Three one-time edits per environment, done before the first deploy. They tell th
 
 1. **Point at a host** ([`inventory.ini`](./inventory.ini)): IP, SSH user, key path.
 2. **Choose what to deploy** ([`vars/dev.yml`](./vars/dev.yml)): image registry/tag, target Solana network, on-host paths. Each option has an inline comment explaining what to pick.
-3. **Provide credentials**: copy the template, then fill in real values:
+3. **Provide credentials**, via one of the two backends below. For the default file backend, copy the template and fill in real values:
 
    ```bash
    cp secrets.yml.example secrets.yml
    ```
 
-   `secrets.yml` is plain text and gitignored. See the file header for required vs optional and how to generate each value.
+   `secrets.yml` is plain text and gitignored. See the file header for required vs optional and how to generate each value. Doppler-only operators skip this file entirely — preflight does not require it when the doppler backend is selected.
 
-Everything else is wired and shouldn't need routine changes. Cross-env defaults that you can override but rarely need to (db/user names, replication user, health-probe budgets) live in [`vars/common.yml`](./vars/common.yml); set the same key in [`vars/dev.yml`](./vars/dev.yml) to override per environment.
+Everything else is wired and shouldn't need routine changes.
+
+### Secrets backends
+
+The deploy reads secrets from one of two backends, chosen automatically:
+
+- **file** (default): the gitignored `secrets.yml` above. No change for existing users.
+- **doppler** (opt-in, per-operator): pulls the same keys from Doppler at deploy time. Auto-selected when `DOPPLER_TOKEN` is set in your shell; otherwise the file backend is used. Force either with `-e secrets_backend=file|doppler`.
+
+Doppler setup (one time):
+
+1. Create a Doppler project and config, and add the `secrets.yml` keys as secrets. Doppler names are the UPPERCASE of the file keys: `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, `JWT_SECRET`, `GRAFANA_ADMIN_PASSWORD`, `GHCR_USER`, `GHCR_TOKEN`, `YELLOWSTONE_TOKEN`, `RPC_URL`. Two use their rendered `.env` names instead: `DEVNET_YELLOWSTONE_ENDPOINT` (optional; overrides `yellowstone_endpoint` from `vars/<env>.yml`) and `ALERT_WEBHOOK_URL` (the webhook; `NOTIFY_WEBHOOK` is also accepted).
+2. Import your existing file in one shot (uppercases the keys, keeps values):
+   ```bash
+   # from private-channel-deploy/, with the doppler CLI installed + `doppler setup` done.
+   # Subshell keeps the plaintext in a private 0700 tempdir and wipes it on any exit
+   # (including failure or Ctrl-C), so credentials never linger in a world-readable /tmp.
+   ( set -euo pipefail
+     dir="$(mktemp -d)"; trap 'rm -rf "$dir"' EXIT
+     uv run --with pyyaml python3 -c "import yaml,json,sys; d=yaml.safe_load(open('secrets.yml')); json.dump({k.upper():('' if v is None else str(v)) for k,v in d.items()}, sys.stdout)" > "$dir/secrets.json"
+     doppler secrets upload "$dir/secrets.json" )
+   ```
+3. Mint a **read-only** service token scoped to that config, then run deploys with it in the environment:
+   ```bash
+   export DOPPLER_TOKEN=dp.st.xxxxx
+   ansible-playbook deploy.yml -l dev
+   ```
+
+The token pins the project + config, so the playbook needs nothing else. The file backend stays as a fallback: unset `DOPPLER_TOKEN` (or pass `-e secrets_backend=file`) and the deploy reads `secrets.yml` again. Cross-env defaults that you can override but rarely need to (db/user names, replication user, health-probe budgets) live in [`vars/common.yml`](./vars/common.yml); set the same key in [`vars/dev.yml`](./vars/dev.yml) to override per environment.
 
 ### Using GHCR
 
