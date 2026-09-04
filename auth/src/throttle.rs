@@ -10,7 +10,7 @@ use axum::{
 };
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 
-use crate::{error::AppError, AppState};
+use crate::{error::AppError, serve::client_key, AppState};
 
 /// `retain_recent` only reclaims replenished keys, so sweep often.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
@@ -58,7 +58,14 @@ pub async fn per_ip(
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    if state.throttle.per_ip.check_key(&addr.ip()).is_err() {
+    // Keyed by the same masked value as the connection cap, so a client holding
+    // a whole IPv6 /64 gets one budget rather than one per address in it.
+    if state
+        .throttle
+        .per_ip
+        .check_key(&client_key(addr.ip()))
+        .is_err()
+    {
         return Err(AppError::TooManyRequests);
     }
     Ok(next.run(request).await)

@@ -6,20 +6,24 @@ pub mod models;
 pub mod password;
 pub mod pool_status;
 pub mod routes;
+pub mod serve;
 pub mod throttle;
 pub mod validation;
 
 use axum::{
-    extract::{DefaultBodyLimit, FromRequestParts, State},
+    extract::{DefaultBodyLimit, FromRequestParts, Request, State},
     http::{request::Parts, HeaderValue, Method, StatusCode},
-    middleware,
+    middleware::{self, Next},
+    response::Response,
     routing::{delete, get, post},
     Json, Router,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
+use error::AppError;
 use jwt::{Claims, JwtConfig};
 use password::PasswordWorker;
 use pool_status::PoolStatus;
@@ -73,7 +77,15 @@ impl AsRef<Arc<JwtConfig>> for AppState {
     }
 }
 
-pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
+/// `request_timeout` bounds a single request once its headers are in, covering
+/// the body read and the handler. It is layered here rather than around the
+/// finished router so the CORS layer stays outermost and the response still
+/// carries its headers; a browser would otherwise see an opaque network error.
+///
+/// Keep it above every timeout it encloses. Cancelling a request before a
+/// downstream call returns discards that call's error, and the pool error is
+/// the only thing that marks `/health` unhealthy: see `POOL_ACQUIRE_TIMEOUT`.
+pub fn build_app(state: AppState, cors_allowed_origin: &str, request_timeout: Duration) -> Router {
     // Restrict CORS to only what this service actually needs.
     // CorsLayer::permissive() would allow any origin, method, and header — too broad
     // for a service that issues JWTs and handles credentials.
@@ -127,8 +139,32 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str) -> Router {
             delete(routes::wallets::delete_wallet),
         )
         .route("/health", get(health))
+        .layer(middleware::from_fn_with_state(
+            request_timeout,
+            enforce_request_timeout,
+        ))
         .layer(cors)
         .with_state(state)
+}
+
+/// Sheds a request that outran `limit`, whatever it was waiting on.
+///
+/// Reported as 503, not 408. The usual cause is server-side contention (the
+/// pool or the Argon2 queue), and 408 tells the client it may repeat the request
+/// unchanged, which turns a struggling database into a retry storm. 503 is
+/// already what this service returns when it sheds for the Argon2 cap.
+///
+/// Going through `AppError` also gives the response the `{"error": ...}` body
+/// every other failure here has; a bare status from a timeout layer would be
+/// the one response a browser could neither read nor parse.
+async fn enforce_request_timeout(
+    State(limit): State<Duration>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    tokio::time::timeout(limit, next.run(request))
+        .await
+        .map_err(|_| AppError::Unavailable)
 }
 
 /// Reads the cached pool-status flag updated by handlers; doesn't itself touch the pool.
@@ -137,5 +173,96 @@ async fn health(State(state): State<AppState>) -> StatusCode {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::routing::get;
+    use std::net::SocketAddr;
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use tower::ServiceExt;
+
+    /// A router over a pool that is never connected. The body cap rejects before
+    /// any handler runs, so these tests need no database.
+    fn app_without_a_database() -> Router {
+        let state = AppState {
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/unused")
+                .unwrap(),
+            jwt: Arc::new(JwtConfig::new("test-secret")),
+            pool_status: PoolStatus::new_healthy(),
+            passwords: PasswordWorker::new(NonZeroUsize::new(1).unwrap()),
+            throttle: Arc::new(AuthThrottle::new(
+                NonZeroU32::new(10_000).unwrap(),
+                NonZeroU32::new(10_000).unwrap(),
+                NonZeroU32::new(10_000).unwrap(),
+            )),
+        };
+        build_app(state, "*", Duration::from_secs(15))
+    }
+
+    /// The credential routes cap bodies well below anything a valid request
+    /// needs, so an oversized one is refused before it reaches Argon2 or the
+    /// database. The limit rides on a request extension, which this service now
+    /// installs by hand in `serve`.
+    #[tokio::test]
+    async fn an_oversized_credential_body_is_refused() {
+        let oversized = "x".repeat(CREDENTIAL_BODY_LIMIT + 1);
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/register")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(oversized))
+            .unwrap();
+        // The throttle ahead of the body limit reads this, as `serve` supplies it.
+        request
+            .extensions_mut()
+            .insert(ConnectInfo("127.0.0.1:9000".parse::<SocketAddr>().unwrap()));
+
+        let response = app_without_a_database().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The shed has to look like every other failure here: 503 with an `error`
+    /// body, not a bare status a browser can't parse.
+    #[tokio::test]
+    async fn outrunning_the_request_timeout_sheds_as_503_json() {
+        let app = Router::new()
+            .route(
+                "/stall",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    StatusCode::OK
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Duration::from_millis(50),
+                enforce_request_timeout,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/stall")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"error\""),
+            "expected an error body, got: {:?}",
+            String::from_utf8_lossy(&body)
+        );
     }
 }

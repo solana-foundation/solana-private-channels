@@ -16,8 +16,18 @@ pub async fn verify_wallet(
     claims: Claims,
     Json(req): Json<VerifyWalletRequest>,
 ) -> AppResult<Json<WalletResponse>> {
-    // Consume the challenge atomically — marks it used so it cannot be replayed.
-    let r = db::consume_challenge(&state.pool, claims.sub, req.nonce).await;
+    // Consuming the challenge and storing the wallet go in one transaction.
+    // Committed separately, anything that ended the request in between left the
+    // nonce spent with no wallet recorded, and the retry could only fail: the
+    // request timeout makes that deterministic, and a client hangup always could.
+    let begun = state.pool.begin().await;
+    state.pool_status.observe_sqlx(&begun);
+    let mut tx = begun?;
+
+    // The conditional UPDATE is still what enforces single use. It now holds the
+    // row until commit, so a concurrent request for the same nonce waits and
+    // then finds it spent.
+    let r = db::consume_challenge(&mut *tx, claims.sub, req.nonce).await;
     state.pool_status.observe_app(&r);
     let challenge = r?.ok_or(AppError::BadRequest("invalid or expired challenge".into()))?;
 
@@ -41,7 +51,7 @@ pub async fn verify_wallet(
         return Err(AppError::Unauthorized);
     }
 
-    let raw = db::insert_verified_wallet(&state.pool, claims.sub, &req.pubkey).await;
+    let raw = db::insert_verified_wallet(&mut *tx, claims.sub, &req.pubkey).await;
     state.pool_status.observe_app(&raw);
     let wallet = raw.map_err(|e| match e {
         // Unique constraint on (user_id, pubkey) — wallet already verified.
@@ -52,6 +62,10 @@ pub async fn verify_wallet(
         }
         other => other,
     })?;
+
+    let committed = tx.commit().await;
+    state.pool_status.observe_sqlx(&committed);
+    committed?;
 
     info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
 

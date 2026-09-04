@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -19,7 +20,12 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use private_channel_auth::{
-    build_app, db, jwt::JwtConfig, password::PasswordWorker, throttle::AuthThrottle, AppState,
+    build_app, db,
+    jwt::JwtConfig,
+    password::PasswordWorker,
+    serve::{serve, Limits},
+    throttle::AuthThrottle,
+    AppState,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -81,19 +87,21 @@ async fn start_throttled_app(
         )),
     };
 
-    let app = build_app(state, "*");
+    // The request timeout is loose for the same reason as the ones below.
+    let app = build_app(state, "*", Duration::from_secs(60));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    // Serve through the production loop so these tests cover the real path.
+    // The timeouts are loose because unoptimized Argon2 is far slower than a
+    // release build, and the concurrency tests would otherwise trip them. The
+    // limits themselves are covered by the unit tests in `serve`.
+    let limits = Limits {
+        header_read_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
+    tokio::spawn(serve(listener, app, limits));
 
     addr
 }

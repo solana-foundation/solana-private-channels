@@ -280,8 +280,11 @@ pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppR
 
 /// Mark the challenge as used and return it. Returns None if not found, already used, or expired.
 /// The atomic UPDATE prevents the same challenge from being consumed twice.
-pub async fn consume_challenge(
-    pool: &PgPool,
+///
+/// Generic over the executor so the caller can consume the challenge and store
+/// the wallet in one transaction.
+pub async fn consume_challenge<'e, E: PgExecutor<'e>>(
+    executor: E,
     user_id: Uuid,
     nonce: Uuid,
 ) -> AppResult<Option<Challenge>> {
@@ -294,7 +297,7 @@ pub async fn consume_challenge(
     )
     .bind(user_id)
     .bind(nonce)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     Ok(row.map(|(nonce, expires_at)| Challenge { nonce, expires_at }))
