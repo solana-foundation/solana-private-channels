@@ -27,6 +27,18 @@ pub struct AddressSignatureRow {
     pub signature: Vec<u8>,
 }
 
+/// Refusal message for a batch whose block does not extend the stored ledger.
+/// Names both causes: a second write-capable node, or this node retrying a slot
+/// whose commit it never saw land. The log line is what an operator sees first.
+fn stale_tip_error(slot: u64) -> String {
+    format!(
+        "Refusing to commit slot {}: a block at or above it is already stored. \
+         Either a second write-capable node is running against this database, or \
+         this batch retries a slot that already committed.",
+        slot
+    )
+}
+
 /// Bulk-insert into address_signatures inside an active PG tx.
 pub(crate) async fn upsert_address_signature_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -220,19 +232,31 @@ async fn write_batch_postgres(
     // Runs before the counter because whether this slot is new is what decides
     // whether the counter may advance.
     let slot_is_new = if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        // `xmax = 0` distinguishes a real insert from an ON CONFLICT update. It
-        // reads correctly only because the settler is the sole writer of this
-        // table, which is the same assumption the counter below already makes.
-        let inserted: bool = sqlx::query_scalar(
-            "INSERT INTO blocks (slot, data) VALUES ($1, $2)
+        // A block may only extend the stored ledger, and a slot already stored may
+        // only be rewritten with the same bytes: that admits the settler's own
+        // retry after a lost acknowledgement and rejects every other writer.
+        //
+        // `xmax = 0` then separates a real insert from such a replay, so the
+        // counter below advances once per slot however often the commit retries.
+        let inserted: Option<bool> = sqlx::query_scalar(
+            "INSERT INTO blocks (slot, data)
+                 SELECT $1, $2
+                 WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot > $1)
                  ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data
+                   WHERE blocks.data = EXCLUDED.data
                  RETURNING (xmax = 0)",
         )
         .bind(block_info.slot as i64)
         .bind(block_data)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("Failed to store block: {}", e))?;
+
+        // No row means a newer block is already stored, or this slot holds a
+        // different one. Either way another writer has passed this batch.
+        let Some(inserted) = inserted else {
+            return Err(stale_tip_error(block_info.slot));
+        };
 
         sqlx::query(
             "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
@@ -249,12 +273,12 @@ async fn write_batch_postgres(
         true
     };
 
-    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
-    // via this path and MVCC returns the caller's own last commit.
+    // Read-modify-write inside BEGIN…COMMIT. The block insert above already let
+    // only one writer past for this slot, and a rejected writer's increment rolls
+    // back with the rest of its batch.
     //
-    // Skipped when this slot already had a block. Every other write here is an
-    // idempotent upsert, so a commit replayed after a lost acknowledgement would
-    // otherwise be the one statement that counted the same batch twice.
+    // Skipped on a replayed slot: every other write here is an idempotent upsert,
+    // so this is the one statement that would count the same batch twice.
     if tx_count > 0 && slot_is_new {
         let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT value FROM metadata WHERE key = 'transaction_count'",

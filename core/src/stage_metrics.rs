@@ -33,6 +33,10 @@ pub trait StageMetrics: Send + Sync {
     /// restart until the row is repaired.
     fn executor_corrupt_account(&self);
 
+    // Writer lease
+    fn writer_lease_probe(&self, outcome: &'static str);
+    fn writer_lease_lost(&self, reason: &'static str);
+
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
     fn executor_preload_duration_ms(&self, ms: f64);
@@ -133,6 +137,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_corrupt_account(&self) {
         debug!("executor: corrupt stored account");
+    }
+    fn writer_lease_probe(&self, outcome: &'static str) {
+        debug!("writer lease: probe {}", outcome);
+    }
+    fn writer_lease_lost(&self, reason: &'static str) {
+        debug!("writer lease: lost, {}", reason);
     }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
@@ -351,6 +361,18 @@ counter_vec!(
     &[]
 );
 counter_vec!(
+    WRITER_LEASE_PROBE,
+    "private_channel_writer_lease_probe_total",
+    "Writer lease ownership probes by outcome",
+    &["outcome"]
+);
+counter_vec!(
+    WRITER_LEASE_LOST,
+    "private_channel_writer_lease_lost_total",
+    "Times the writer lease stopped being provable, by reason",
+    &["reason"]
+);
+counter_vec!(
     SETTLER_TXS_SETTLED,
     "private_channel_settler_txs_settled_total",
     "Transactions settled to DB",
@@ -558,6 +580,12 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc();
     }
+    fn writer_lease_probe(&self, outcome: &'static str) {
+        WRITER_LEASE_PROBE.with_label_values(&[outcome]).inc();
+    }
+    fn writer_lease_lost(&self, reason: &'static str) {
+        WRITER_LEASE_LOST.with_label_values(&[reason]).inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -708,6 +736,8 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_CONSERVATION_REJECTED,
         EXECUTOR_PRELOAD_FATAL,
         EXECUTOR_CORRUPT_ACCOUNT,
+        WRITER_LEASE_PROBE,
+        WRITER_LEASE_LOST,
         SETTLER_TXS_SETTLED,
         SETTLER_BACKPRESSURE_ENGAGED,
         EXECUTOR_RESULTS_CHUNKED,

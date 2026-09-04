@@ -1,8 +1,8 @@
-//! Integration tests for batch atomicity:
-//! A slot and all its account changes, transactions, and metadata MUST be written
-//! as a single DB transaction. Either the whole slot commits or nothing does.
+//! Integration tests for how a slot reaches the database:
+//! it must be written as a single DB transaction, and it must be written by one
+//! writer. Either the whole slot commits or nothing does.
 //!
-//! Three tests verify this:
+//! Four tests verify this:
 //!
 //! 1. `test_write_batch_constraint_injection` — adds a CHECK constraint that forces
 //!    `write_batch` to fail after accounts are written but before the block row is
@@ -20,6 +20,14 @@
 //!    `store_block` to fail after the block row is written but before the
 //!    `latest_blockhash` metadata is updated, then asserts the block row was
 //!    rolled back with it. This proves the fix to `store_block_postgres` is correct.
+//!
+//! 4. `two_writers_racing_one_slot_leave_a_single_ledger` forces two independent
+//!    writers to contend for the same slot and asserts exactly one commits, with
+//!    the loser leaving no accounts, block or blockhash behind.
+//!
+//! 5. `a_writer_whose_slot_was_truncated_away_is_still_rejected` deletes old
+//!    blocks the way retention truncation does, then asserts a writer holding one
+//!    of those slots still cannot commit it back over current state.
 
 use {
     private_channel_core::{
@@ -144,6 +152,26 @@ fn slot_block_info(slot: u64) -> BlockInfo {
 
 fn bare_account(lamports: u64) -> AccountSharedData {
     AccountSharedData::new(lamports, 0, &Pubkey::default())
+}
+
+/// Same as `slot_block_info`, with a caller-chosen blockhash so two writers
+/// racing one slot can be told apart by whichever block ends up stored.
+fn slot_block_info_with_hash(slot: u64, blockhash: Hash) -> BlockInfo {
+    BlockInfo {
+        blockhash,
+        ..slot_block_info(slot)
+    }
+}
+
+/// Number of backends on this database currently blocked on a lock.
+async fn backends_waiting_on_a_lock(conn: &mut PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(conn)
+    .await
+    .expect("failed to read pg_stat_activity")
 }
 
 /// Test 1: constraint injection
@@ -450,5 +478,193 @@ async fn test_store_block_atomicity() {
     assert!(
         db.get_block(1).await.unwrap().is_some(),
         "slot 1 block must exist after the clean store_block"
+    );
+}
+
+/// Test 4: two writers racing one slot
+///
+/// Two write-capable nodes at the same tip both produce slot 2. Exactly one may
+/// win: a ledger holding one writer's block alongside the other's accounts was
+/// never produced by a single serial execution.
+///
+/// The overlap is forced, not timed. A third connection holds an open transaction
+/// that already inserted slot 2, so both writers clear the extend-the-ledger guard
+/// and park on the slot primary key; rolling it back releases them into contention.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_writers_racing_one_slot_leave_a_single_ledger() {
+    let url = create_isolated_db_url("two_writers_racing_one_slot").await;
+
+    let mut db = AccountsDB::new(&url, false)
+        .await
+        .expect("Failed to create AccountsDB");
+    db.write_batch(&[], vec![], Some(slot_block_info(1)))
+        .await
+        .expect("slot 1 write_batch must succeed");
+
+    // Blocks slot 2 without committing, so both writers stall on the same row.
+    let mut blocker = PgConnection::connect(&url)
+        .await
+        .expect("Failed to open blocker connection");
+    sqlx::query("BEGIN")
+        .execute(&mut blocker)
+        .await
+        .expect("BEGIN must succeed");
+    sqlx::query("INSERT INTO blocks (slot, data) VALUES ($1, $2)")
+        .bind(2i64)
+        .bind(&[0u8; 32][..])
+        .execute(&mut blocker)
+        .await
+        .expect("placeholder blocks INSERT must succeed");
+
+    let account_a = Pubkey::new_unique();
+    let account_b = Pubkey::new_unique();
+    let blockhash_a = Hash::new_unique();
+    let blockhash_b = Hash::new_unique();
+
+    let mut writer_a = AccountsDB::new(&url, false).await.expect("writer A");
+    let mut writer_b = AccountsDB::new(&url, false).await.expect("writer B");
+
+    let task_a = tokio::spawn(async move {
+        writer_a
+            .write_batch(
+                &[(
+                    account_a,
+                    AccountSettlement {
+                        account: bare_account(1_000_000),
+                        deleted: false,
+                    },
+                )],
+                vec![],
+                Some(slot_block_info_with_hash(2, blockhash_a)),
+            )
+            .await
+            .map(|_| ())
+    });
+    let task_b = tokio::spawn(async move {
+        writer_b
+            .write_batch(
+                &[(
+                    account_b,
+                    AccountSettlement {
+                        account: bare_account(2_000_000),
+                        deleted: false,
+                    },
+                )],
+                vec![],
+                Some(slot_block_info_with_hash(2, blockhash_b)),
+            )
+            .await
+            .map(|_| ())
+    });
+
+    // Wait for both to reach the contended row rather than sleeping a guessed amount.
+    let mut observer = PgConnection::connect(&url)
+        .await
+        .expect("Failed to open observer connection");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while backends_waiting_on_a_lock(&mut observer).await < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both writers should have parked on the contended slot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut blocker)
+        .await
+        .expect("ROLLBACK must succeed");
+
+    let result_a = task_a.await.expect("writer A task panicked");
+    let result_b = task_b.await.expect("writer B task panicked");
+
+    assert_eq!(
+        result_a.is_ok() as u8 + result_b.is_ok() as u8,
+        1,
+        "exactly one writer may commit slot 2, got a={result_a:?} b={result_b:?}"
+    );
+
+    // Everything stored for slot 2 must come from the writer that won.
+    let (winner_account, winner_blockhash, loser_account) = if result_a.is_ok() {
+        (account_a, blockhash_a, account_b)
+    } else {
+        (account_b, blockhash_b, account_a)
+    };
+
+    assert_eq!(db.get_latest_slot().await.unwrap(), Some(2));
+    assert_eq!(
+        db.get_block(2).await.unwrap().unwrap().blockhash,
+        winner_blockhash
+    );
+    assert_eq!(db.get_latest_blockhash().await.unwrap(), winner_blockhash);
+    assert!(
+        db.get_accounts(&[winner_account]).await.unwrap()[0].is_some(),
+        "the winning writer's account must be stored"
+    );
+    assert!(
+        db.get_accounts(&[loser_account]).await.unwrap()[0].is_none(),
+        "the losing writer's account must have rolled back with its batch"
+    );
+}
+
+/// Test 5: a stale writer whose slot no longer exists
+///
+/// Retention truncation deletes old blocks, so a writer far enough behind finds
+/// its target slot free. A plain uniqueness check would let that batch commit and
+/// overwrite current accounts with ancient values; only comparing against the tip
+/// catches it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_whose_slot_was_truncated_away_is_still_rejected() {
+    let url = create_isolated_db_url("truncated_away_slot").await;
+    let mut db = AccountsDB::new(&url, false)
+        .await
+        .expect("Failed to create AccountsDB");
+
+    for slot in 1..=5 {
+        db.write_batch(&[], vec![], Some(slot_block_info(slot)))
+            .await
+            .unwrap_or_else(|e| panic!("slot {slot} must commit: {e}"));
+    }
+
+    // What truncation leaves behind: the old blocks are gone, the tip is not.
+    let mut conn = PgConnection::connect(&url)
+        .await
+        .expect("Failed to open the truncation connection");
+    sqlx::query("DELETE FROM blocks WHERE slot <= 3")
+        .execute(&mut conn)
+        .await
+        .expect("the truncation must succeed");
+
+    let stale_account = Pubkey::new_unique();
+    let result = db
+        .write_batch(
+            &[(
+                stale_account,
+                AccountSettlement {
+                    account: bare_account(9_000_000),
+                    deleted: false,
+                },
+            )],
+            vec![],
+            Some(slot_block_info(2)),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "a writer holding a truncated slot must still be rejected"
+    );
+    assert_eq!(
+        db.get_latest_slot().await.unwrap(),
+        Some(5),
+        "the tip must not move"
+    );
+    assert!(
+        db.get_block(2).await.unwrap().is_none(),
+        "a truncated slot must not be resurrected"
+    );
+    assert!(
+        db.get_accounts(&[stale_account]).await.unwrap()[0].is_none(),
+        "the stale writer's account must have rolled back with its batch"
     );
 }

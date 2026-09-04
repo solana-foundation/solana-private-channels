@@ -2,7 +2,7 @@ use {
     crate::{
         accounts::{
             address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
-            redis::RedisAccountsDB, AccountsDB,
+            redis::RedisAccountsDB, writer_lease::WriterLease, AccountsDB,
         },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
@@ -140,6 +140,9 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+    /// Held for the node's lifetime by write-capable modes, released on shutdown
+    /// so a replacement node can start straight away.
+    writer_lease: Option<WriterLease>,
     /// Closed first on shutdown, which is what refuses admission. `None` on a
     /// read node, which has no write pipeline to close.
     ingress_tx: Option<async_channel::Sender<SanitizedTransaction>>,
@@ -212,11 +215,66 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
 
+    // Taken after config validation so a bad config still fails without touching
+    // Postgres, and before any write-path work so a duplicate node is refused
+    // before it repairs indexes or serves RPC. Losing the lease later cancels the
+    // same token, so the node stops rather than running on without it.
+    let writer_lease = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+        Some(
+            WriterLease::acquire(
+                &config.accountsdb_connection_url,
+                shutdown_token.clone(),
+                Arc::clone(&config.metrics),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // A failure past this point must not return while the lease is still held,
+    // since a caller retrying at once would be refused by a lock nothing wants.
+    let mut workers = Vec::new();
+    let mut ingress_tx = None;
+    let started = start_services(
+        config,
+        shutdown_token.clone(),
+        &mut workers,
+        &mut ingress_tx,
+    )
+    .await;
+    let handles = NodeHandles {
+        workers,
+        shutdown_token,
+        writer_lease,
+        ingress_tx,
+    };
+
+    match started {
+        Ok(()) => Ok(handles),
+        Err(e) => {
+            // Cancels and joins whatever started, so the lease only goes back
+            // once nothing this node spawned is still running.
+            handles.shutdown().await;
+            Err(e)
+        }
+    }
+}
+
+/// Start the workers this node's mode needs, pushing each into `workers` as it is
+/// spawned and setting `ingress` once admission exists. The caller keeps both even
+/// on failure, so a partial startup is shut down in order rather than left to
+/// unwind on its own.
+async fn start_services(
+    config: NodeConfig,
+    shutdown_token: CancellationToken,
+    workers: &mut Vec<WorkerHandle>,
+    ingress: &mut Option<async_channel::Sender<SanitizedTransaction>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat registry — populated for stages that actually run, consumed by /health.
     let mut heartbeats = crate::health::HeartbeatRegistry::new();
 
     // Only create write pipeline for Write and Aio modes
-    let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
         if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
             // RPC ingress channel (receives from RPC, feeds the sigverify worker
@@ -292,7 +350,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: sigverify_hb,
             })
             .await;
-            write_workers.extend(sigverify_workers);
+            workers.extend(sigverify_workers);
 
             // Start dedup stage (drops replays after verification, keyed on the
             // message hash so signature variants of one message collapse to one).
@@ -307,7 +365,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: dedup_hb,
             })
             .await;
-            write_workers.push(dedup);
+            workers.push(dedup);
 
             // Start sequencer (produces conflict-free batches)
             let sequence = start_sequence_worker(crate::stages::SequencerArgs {
@@ -319,7 +377,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: sequencer_hb,
             })
             .await;
-            write_workers.push(sequence);
+            workers.push(sequence);
 
             // Start executor (executes and settles batches)
             let execution = start_execution_worker(crate::stages::ExecutionArgs {
@@ -333,7 +391,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 live_blockhashes: Arc::clone(&live_blockhashes),
             })
             .await;
-            write_workers.push(execution);
+            workers.push(execution);
 
             // Each item is one tick worth of (address, slot, signature) rows.
             const ADDR_SIG_QUEUE_CAPACITY: usize = 1024;
@@ -358,7 +416,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: settler_hb,
             })
             .await;
-            write_workers.push(settle);
+            workers.push(settle);
 
             // Push the writer AFTER the settler so shutdown awaits in the
             // right order: settler drains its buffer, drops its sender, the
@@ -371,7 +429,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 heartbeat: addr_index_writer_hb,
             })
             .await;
-            write_workers.push(addr_index_writer);
+            workers.push(addr_index_writer);
 
             (
                 Some(WriteDeps {
@@ -428,7 +486,7 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     };
 
     // The admission handle, kept so shutdown can close it before anything else.
-    let ingress_tx = write_deps.as_ref().map(|deps| deps.dedup_tx.clone());
+    *ingress = write_deps.as_ref().map(|deps| deps.dedup_tx.clone());
 
     let rpc_config = RpcServiceConfig {
         port: config.port,
@@ -450,15 +508,10 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     }
     info!("  Max connections: {}", config.max_connections);
 
-    // Build vector of all worker handles
-    let mut workers = vec![rpc_handle];
-    workers.extend(write_workers);
+    // RPC first, the order the shutdown loop has always joined them in.
+    workers.insert(0, rpc_handle);
 
-    Ok(NodeHandles {
-        workers,
-        shutdown_token,
-        ingress_tx,
-    })
+    Ok(())
 }
 
 impl NodeHandles {
@@ -512,6 +565,7 @@ impl NodeHandles {
         // workers overrun.
         let abort_deadline = deadline + ABORT_RESERVE;
         let mut overran = false;
+        let mut still_running = false;
         for mut worker in self.workers {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             match tokio::time::timeout(remaining, &mut worker.handle).await {
@@ -537,12 +591,25 @@ impl NodeHandles {
                             worker.name
                         );
                     } else {
+                        still_running = true;
                         error!(
                             "{} ignored the abort and is still running; an in-process restart would overlap it",
                             worker.name
                         );
                     }
                 }
+            }
+        }
+
+        // A worker that ignored its abort can still commit. Handing the lease
+        // over then would let a replacement start from the old tip and be killed
+        // by the first slot that worker writes.
+        if let Some(lease) = self.writer_lease {
+            if still_running {
+                warn!("Holding the writer lease: a worker did not stop in time");
+                lease.hold();
+            } else {
+                lease.release().await;
             }
         }
 
@@ -567,6 +634,7 @@ mod tests {
         NodeHandles {
             workers,
             shutdown_token: CancellationToken::new(),
+            writer_lease: None,
             ingress_tx: None,
         }
     }
@@ -656,6 +724,7 @@ mod tests {
         let handles = NodeHandles {
             workers: vec![WorkerHandle::new("Stuck".to_string(), stuck)],
             shutdown_token: CancellationToken::new(),
+            writer_lease: None,
             ingress_tx: None,
         };
 
@@ -685,6 +754,7 @@ mod tests {
         let handles = NodeHandles {
             workers: vec![WorkerHandle::new("Spinning".to_string(), spinning)],
             shutdown_token: CancellationToken::new(),
+            writer_lease: None,
             ingress_tx: None,
         };
 
@@ -694,6 +764,132 @@ mod tests {
             started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(3),
             "shutdown waited on a task that can never be cancelled"
         );
+    }
+
+    /// Build handles around one worker so shutdown can be driven directly; that
+    /// is the only way to exercise a worker which refuses to stop.
+    fn handles_with(
+        worker: WorkerHandle,
+        token: CancellationToken,
+        lease: WriterLease,
+    ) -> NodeHandles {
+        NodeHandles {
+            workers: vec![worker],
+            shutdown_token: token,
+            writer_lease: Some(lease),
+            ingress_tx: None,
+        }
+    }
+
+    /// Dropping the handles stops no worker: they are separate tasks holding
+    /// their own token clones. Freeing the lock there would let a replacement
+    /// start beside a pipeline that is still committing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_node_handles_without_shutdown_keeps_the_lease() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = Arc::clone(&running);
+        let worker = WorkerHandle::new(
+            "Busy".to_string(),
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        drop(handles_with(worker, token, lease));
+
+        // Long enough for a release to have landed if one were on its way.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            running.load(std::sync::atomic::Ordering::SeqCst),
+            "the worker must still be running, or the test proves nothing"
+        );
+        assert!(
+            WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+                .await
+                .is_err(),
+            "dropped handles must keep the lease while their workers run"
+        );
+    }
+
+    /// The clean path: every worker stops, so the lease is handed over at once and
+    /// a replacement node can start immediately.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_releases_the_lease_when_every_worker_stops() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let watched = token.clone();
+        let worker = WorkerHandle::new(
+            "Tidy".to_string(),
+            tokio::spawn(async move { watched.cancelled().await }),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+            .await
+            .expect("a stopped node must hand the lease over");
+    }
+
+    /// A worker that ignores its abort is still running, so it can still commit.
+    /// Handing the lease over then would let a replacement start from the old tip
+    /// and be killed by the first slot that worker writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_keeps_the_lease_when_a_worker_ignores_its_abort() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        // A blocking thread has no await point to cancel at, which is the only way
+        // a worker is still running once shutdown has returned.
+        let worker = WorkerHandle::new(
+            "Stubborn".to_string(),
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(15))),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        assert!(
+            WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+                .await
+                .is_err(),
+            "the lease must stay held while a worker could still be committing"
+        );
+    }
+
+    /// An overrunning worker that the abort does stop cannot commit again, so the
+    /// lease must still be handed over. Holding it there would cost a deployment
+    /// its writer for one slow drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_releases_the_lease_when_an_overrunning_worker_is_aborted() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let worker = WorkerHandle::new(
+            "Slow".to_string(),
+            tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+            .await
+            .expect("an aborted worker cannot commit, so the lease must be free");
     }
 
     #[tokio::test]

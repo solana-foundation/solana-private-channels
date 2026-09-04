@@ -34,6 +34,7 @@ pub mod truncate;
 pub mod types;
 pub mod utils;
 pub mod write_batch;
+pub mod writer_lease;
 
 use {
     solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState},

@@ -168,6 +168,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test test_sequencer_zero_deadline -- --nocapture
 	@cd integration && cargo test --test test_signatures_corruption_guard -- --nocapture
 	@cd integration && cargo test --test test_node_config_validation -- --nocapture
+	@cd integration && cargo test --test test_duplicate_writer -- --nocapture
 	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
 	@cd integration && cargo test --test ingress_backpressure -- --nocapture
 	@cd integration && cargo test --test test_redis_cache_path -- --nocapture --test-threads=1

@@ -346,6 +346,134 @@ async fn test_get_transaction_roundtrip() {
     assert_eq!(stored.block_time, 1_700_000_005);
 }
 
+// ── Slot Commit Guard ─────────────────────────────────────────────────────────
+
+/// A batch whose block does not extend the stored ledger must be rejected whole.
+/// This is the duplicate or stale writer trying to overwrite the tip or rewind
+/// behind it, and none of its accounts, transactions or metadata may survive.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_rejects_a_block_at_or_below_the_stored_tip() {
+    let (mut db, _pg) = start_postgres().await;
+
+    let tip_blockhash = Hash::new_unique();
+    db.write_batch(&[], vec![], Some(create_test_block_info(5, tip_blockhash)))
+        .await
+        .unwrap();
+    let count_before = db.get_transaction_count().await.unwrap();
+
+    let owner = Pubkey::new_unique();
+    let pk = Pubkey::new_unique();
+    let from = Keypair::new();
+    let to = Pubkey::new_unique();
+    let tx = create_test_sanitized_transaction(&from, &to, 42);
+    let sig = *tx.signature();
+    let processed = make_executed_tx(vec![]);
+    let settlements = vec![(
+        pk,
+        AccountSettlement {
+            account: make_account(1_000, &owner),
+            deleted: false,
+        },
+    )];
+
+    // Replaying the tip slot and rewinding behind it must both fail.
+    for slot in [5u64, 4] {
+        let result = db
+            .write_batch(
+                &settlements,
+                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await;
+
+        let err = result.expect_err("a block at or below the tip must be rejected");
+        assert!(
+            err.contains(&slot.to_string()),
+            "the error must name the rejected slot, got: {err}"
+        );
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(5));
+        assert_eq!(db.get_latest_blockhash().await.unwrap(), tip_blockhash);
+        assert_eq!(
+            db.get_block(5).await.unwrap().unwrap().blockhash,
+            tip_blockhash,
+            "the committed tip block must not be rewritten"
+        );
+        assert!(db.get_block(4).await.unwrap().is_none());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
+        assert!(db.get_transaction(&sig).await.unwrap().is_none());
+        assert_eq!(db.get_transaction_count().await.unwrap(), count_before);
+    }
+}
+
+/// A commit can succeed on the server and still fail to acknowledge, and the
+/// settler's retry then rewrites byte-identical rows for a slot already stored.
+/// That replay must be accepted, and counted once, or a lost ack stops the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_accepts_an_identical_replay_of_the_stored_tip() {
+    let (mut db, _pg) = start_postgres().await;
+
+    let blockhash = Hash::new_unique();
+    let owner = Pubkey::new_unique();
+    let pk = Pubkey::new_unique();
+    let from = Keypair::new();
+    let to = Pubkey::new_unique();
+    let tx = create_test_sanitized_transaction(&from, &to, 42);
+    let sig = *tx.signature();
+    let processed = make_executed_tx(vec![]);
+    let settlements = vec![(
+        pk,
+        AccountSettlement {
+            account: make_account(1_000, &owner),
+            deleted: false,
+        },
+    )];
+
+    for attempt in 1..=2 {
+        db.write_batch(
+            &settlements,
+            vec![(sig, &tx, 5, 1_700_000_000, &processed)],
+            Some(create_test_block_info(5, blockhash)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("attempt {attempt} must be accepted, got: {e}"));
+    }
+
+    assert_eq!(
+        db.get_transaction_count().await.unwrap(),
+        1,
+        "a replayed commit must be counted once"
+    );
+    assert_eq!(db.get_latest_slot().await.unwrap(), Some(5));
+    assert_eq!(db.get_block(5).await.unwrap().unwrap().blockhash, blockhash);
+}
+
+/// The guard rejects rewinds and overwrites, not gaps. The settler only ever
+/// extends by one slot, so gaps cost nothing to allow and keep write_batch
+/// usable for building arbitrary ledger fixtures.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_accepts_a_block_above_the_stored_tip() {
+    let (mut db, _pg) = start_postgres().await;
+
+    db.write_batch(
+        &[],
+        vec![],
+        Some(create_test_block_info(5, Hash::new_unique())),
+    )
+    .await
+    .unwrap();
+
+    for slot in [6u64, 20] {
+        let blockhash = Hash::new_unique();
+        db.write_batch(&[], vec![], Some(create_test_block_info(slot, blockhash)))
+            .await
+            .unwrap_or_else(|e| panic!("slot {slot} must commit above the tip: {e}"));
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(slot));
+        assert_eq!(db.get_latest_blockhash().await.unwrap(), blockhash);
+    }
+}
+
 // ── Blockhash + Slot Metadata ─────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]

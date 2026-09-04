@@ -221,6 +221,10 @@ path = "tests/private-channel/test_signatures_corruption_guard.rs"
 name = "test_node_config_validation"
 path = "tests/private-channel/test_node_config_validation.rs"
 
+[[test]]
+name = "test_duplicate_writer"
+path = "tests/private-channel/test_duplicate_writer.rs"
+
 # Redis-backend warm-cache + read-path coverage test. Runs independently of
 # private_channel_integration so it still contributes coverage even when the broader
 # suite is flaky.

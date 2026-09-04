@@ -8,7 +8,7 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (SMT nonce gap), deposits cannot. The dispatch table below
 routes by webhook + `transaction_type`.
 
-> **Four conditions are not webhook-routed.** The indexer's
+> **Six conditions are not webhook-routed.** The indexer's
 > **`block_unavailable`** wedge pages through Grafana instead, because it changes
 > no transaction row; see
 > [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
@@ -40,6 +40,14 @@ routes by webhook + `transaction_type`.
 > transaction row, and is detected from
 > `private_channel_executor_corrupt_account_total` plus the pubkey in the
 > executor log; see [`corrupt_account_row.md`](corrupt_account_row.md).
+>
+> **One node condition refuses to start and takes writes down with it.** A write
+> or aio node that cannot take the Postgres writer lease exits at startup, and
+> the gateway has only one write URL, so no transaction is accepted while it is
+> down. The lock is normally freed the instant the old node's socket closes; a
+> host that vanishes without closing it is the case that sticks. Recognize it
+> from the boot loop plus `already holds the writer lease` in the node log; see
+> [`writer_lease_unavailable.md`](writer_lease_unavailable.md).
 
 ## Alert dispatch
 
