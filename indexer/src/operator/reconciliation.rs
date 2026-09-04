@@ -261,17 +261,16 @@ async fn perform_reconciliation_check(
     Ok(())
 }
 
-/// Enumerate the DB mint universe (keys only) so a blocked or zero-custody mint
-/// with outstanding supply stays in scope. The ledger net values are no longer
-/// compared, so only the mint addresses are returned.
+/// Enumerate the DB mint universe so a blocked or zero-custody mint with
+/// outstanding supply stays in scope.
 async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<HashSet<Pubkey>, OperatorError> {
-    let rows = storage
-        .get_escrow_balances_by_mint()
+    let addresses = storage
+        .get_mint_addresses()
         .await
         .map_err(OperatorError::Storage)?;
     let mut out = HashSet::new();
-    for row in rows {
-        out.insert(parse_mint(&row.mint_address)?);
+    for address in addresses {
+        out.insert(parse_mint(&address)?);
     }
     Ok(out)
 }
@@ -1257,6 +1256,109 @@ mod tests {
             .await;
     }
 
+    /// Put one allowed mint in the mock's mints table, the runtime enumeration source.
+    fn seed_db_mint(mock: &MockStorage, mint: Pubkey) {
+        seed_db_mint_address(mock, &mint.to_string());
+    }
+
+    /// Same as `seed_db_mint` but takes the raw address, so a test can seed an unparseable one.
+    fn seed_db_mint_address(mock: &MockStorage, mint_address: &str) {
+        use crate::storage::common::models::DbMint;
+        mock.mints.lock().unwrap().insert(
+            mint_address.to_string(),
+            DbMint::new(mint_address.to_string(), 6, spl_token::id().to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn db_mint_set_enumerates_upserted_mints() {
+        let mock = MockStorage::new();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        seed_db_mint(&mock, a);
+        seed_db_mint(&mock, b);
+        let storage = Arc::new(Storage::Mock(mock));
+
+        let set = fetch_db_mint_set(&storage).await.unwrap();
+
+        assert_eq!(set, HashSet::from([a, b]));
+    }
+
+    #[tokio::test]
+    async fn db_mint_set_rejects_unparseable_address() {
+        let mock = MockStorage::new();
+        seed_db_mint_address(&mock, "not-a-pubkey");
+        let storage = Arc::new(Storage::Mock(mock));
+
+        let err = fetch_db_mint_set(&storage).await.unwrap_err();
+
+        match err {
+            OperatorError::InvalidPubkey { pubkey, .. } => assert_eq!(pubkey, "not-a-pubkey"),
+            other => panic!("expected InvalidPubkey, got {other:?}"),
+        }
+    }
+
+    /// A failed mint enumeration must skip the tick without halting or erasing a
+    /// building breach counter, the same way a failed supply read does.
+    #[tokio::test]
+    async fn db_mint_set_read_failure_returns_err_and_holds_counters() {
+        use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
+        use solana_sdk::commitment_config::CommitmentConfig;
+
+        let fast = || RetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        };
+
+        let mint = Pubkey::new_unique();
+        let mut custody_server = mockito::Server::new_async().await;
+        mock_custody_sweep(&mut custody_server, mint, 900).await;
+
+        let mock = MockStorage::new();
+        seed_db_mint(&mock, mint);
+        mock.set_should_fail("get_mint_addresses", true);
+        let storage = Arc::new(Storage::Mock(mock));
+
+        let custody_rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            custody_server.url(),
+            fast(),
+            CommitmentConfig::finalized(),
+        ));
+        let channel_rpc = Arc::new(RpcClientWithRetry::with_retry_config(
+            custody_server.url(),
+            fast(),
+            CommitmentConfig::finalized(),
+        ));
+
+        let config = recon_config_zero_tolerance();
+        let mut orphans = None;
+        let mut counters: HashMap<Pubkey, u32> = HashMap::from([(mint, 2)]);
+        let mut halted = false;
+
+        let res = perform_reconciliation_check(
+            &storage,
+            &config,
+            &custody_rpc,
+            &channel_rpc,
+            Pubkey::new_unique(),
+            &test_webhook_client(),
+            &None,
+            &mut orphans,
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        assert!(res.is_err(), "an enumeration failure must fail the tick");
+        assert_eq!(
+            counters.get(&mint).copied(),
+            Some(2),
+            "a failed enumeration must hold the breach counter"
+        );
+        assert!(!halted, "a failed enumeration must not halt");
+        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+    }
+
     /// A tick whose halt-input load fails (channel supply RPC down) must not
     /// halt, must not reset an existing breach counter, and must not set the
     /// flag: the evidence is held for the next finalized read rather than
@@ -1264,7 +1366,6 @@ mod tests {
     #[tokio::test]
     async fn supply_read_failure_holds_counters_and_does_not_halt() {
         use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
-        use crate::storage::common::models::MintDbBalance;
         use solana_sdk::commitment_config::CommitmentConfig;
 
         let fast = || RetryConfig {
@@ -1279,12 +1380,7 @@ mod tests {
         mock_custody_sweep(&mut custody_server, mint, 900).await;
 
         let mock = MockStorage::new();
-        mock.set_mint_balances(vec![MintDbBalance {
-            mint_address: mint.to_string(),
-            token_program: spl_token::id().to_string(),
-            total_deposits: bigdecimal::BigDecimal::from(1200u64),
-            total_withdrawals: bigdecimal::BigDecimal::from(0u64),
-        }]);
+        seed_db_mint(&mock, mint);
         let storage = Arc::new(Storage::Mock(mock));
 
         let custody_rpc = Arc::new(RpcClientWithRetry::with_retry_config(

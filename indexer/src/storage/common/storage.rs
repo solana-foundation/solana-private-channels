@@ -16,9 +16,9 @@ pub mod get_all_db_transactions;
 pub mod get_and_lock_pending_transactions;
 pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
-pub mod get_escrow_balances_by_mint;
 pub mod get_in_flight_amounts_by_mint;
 pub mod get_mint;
+pub mod get_mint_addresses;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
 pub mod get_orphan_deposit_ids;
@@ -254,8 +254,9 @@ impl Storage {
         .await
     }
 
-    /// Return per-mint aggregate balances (completed deposits minus withdrawals) for
-    /// startup reconciliation, counting only what was indexed at or below `as_of_slot`.
+    /// Return per-mint aggregate balances (all indexed deposits minus completed
+    /// withdrawals) for startup reconciliation, counting only what was indexed at
+    /// or below `as_of_slot`.
     pub async fn get_mint_balances_for_reconciliation(
         &self,
         as_of_slot: u64,
@@ -264,11 +265,9 @@ impl Storage {
             .await
     }
 
-    /// Query escrow balances by mint for continuous reconciliation checks.
-    /// Only counts **completed** transactions for both deposits and withdrawals.
-    /// Returns per-mint aggregate balances where net_balance = total_deposits - total_withdrawals.
-    pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
-        get_escrow_balances_by_mint::get_escrow_balances_by_mint(self).await
+    /// Every mint address the DB knows: the mint universe that runtime reconciliation checks.
+    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
+        get_mint_addresses::get_mint_addresses(self).await
     }
 
     /// Per-mint sum of every unsettled transaction amount (pending / processing /
@@ -1142,36 +1141,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_get_escrow_balances_by_mint_via_mock() {
-        let (storage, mock) = make_mock_storage();
+    async fn dispatch_get_mint_addresses_via_mock() {
+        let (storage, _mock) = make_mock_storage();
 
-        // Populate with mint balances
-        {
-            let balances = vec![
-                MintDbBalance {
-                    mint_address: "mint_1".to_string(),
-                    token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: BigDecimal::from(1000u64),
-                    total_withdrawals: BigDecimal::from(300u64),
-                },
-                MintDbBalance {
-                    mint_address: "mint_2".to_string(),
-                    token_program: TOKEN_PROGRAM.to_string(),
-                    total_deposits: BigDecimal::from(5000u64),
-                    total_withdrawals: BigDecimal::from(2000u64),
-                },
-            ];
-            mock.set_mint_balances(balances);
-        }
+        storage
+            .upsert_mints_batch(&[
+                DbMint::new("mint_1".to_string(), 6, TOKEN_PROGRAM.to_string()),
+                DbMint::new("mint_2".to_string(), 9, TOKEN_PROGRAM.to_string()),
+            ])
+            .await
+            .unwrap();
 
-        let balances = storage.get_escrow_balances_by_mint().await.unwrap();
-        assert_eq!(balances.len(), 2);
-        assert_eq!(balances[0].mint_address, "mint_1");
-        assert_eq!(balances[0].total_deposits, BigDecimal::from(1000u64));
-        assert_eq!(balances[0].total_withdrawals, BigDecimal::from(300u64));
-        assert_eq!(balances[1].mint_address, "mint_2");
-        assert_eq!(balances[1].total_deposits, BigDecimal::from(5000u64));
-        assert_eq!(balances[1].total_withdrawals, BigDecimal::from(2000u64));
+        let mut addresses = storage.get_mint_addresses().await.unwrap();
+        addresses.sort();
+        assert_eq!(addresses, vec!["mint_1", "mint_2"]);
     }
 
     #[tokio::test]

@@ -2540,39 +2540,14 @@ impl PostgresDb {
         .await
     }
 
-    /// Query escrow balances by mint for continuous reconciliation checks.
-    /// Only counts **completed** transactions for both deposits and withdrawals.
-    /// This provides a conservative view based on finalized database state,
-    /// suitable for comparing against on-chain escrow ATA balances.
+    /// Every mint address the DB knows: the mint universe that runtime reconciliation checks.
     ///
-    /// Returns per-mint aggregate balances where:
-    /// - `total_deposits`: sum of completed deposit amounts
-    /// - `total_withdrawals`: sum of completed withdrawal amounts
-    ///
-    /// Expected net on-chain balance = total_deposits - total_withdrawals
-    pub async fn get_escrow_balances_by_mint_internal(
-        &self,
-    ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
-        sqlx::query_as::<_, MintDbBalance>(
-            r#"
-            SELECT
-                m.mint_address,
-                m.token_program,
-                COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'deposit' AND t.status = 'completed' THEN t.amount ELSE 0 END),
-                    0
-                )::NUMERIC AS total_deposits,
-                COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
-                    0
-                )::NUMERIC AS total_withdrawals
-            FROM mints m
-            LEFT JOIN transactions t ON t.mint = m.mint_address
-            GROUP BY m.mint_address, m.token_program
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
+    /// Addresses only: runtime compares on-chain custody against on-chain channel
+    /// supply, so no ledger amount is read here and none is aggregated.
+    pub async fn get_mint_addresses_internal(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT mint_address FROM mints")
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Per-mint sum of every unsettled transaction amount (the in-flight

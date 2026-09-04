@@ -582,8 +582,10 @@ impl MockStorage {
         *self.last_reconciliation_slot.lock().unwrap()
     }
 
-    pub async fn get_escrow_balances_by_mint(&self) -> Result<Vec<MintDbBalance>, StorageError> {
-        Ok(self.mint_balances.lock().unwrap().clone())
+    /// Reads the mints map, mirroring the Postgres query's `mints` table source.
+    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
+        self.check_should_fail("get_mint_addresses")?;
+        Ok(self.mints.lock().unwrap().keys().cloned().collect())
     }
 
     pub async fn get_in_flight_amounts_by_mint(
