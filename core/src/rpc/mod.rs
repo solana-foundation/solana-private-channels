@@ -39,6 +39,9 @@ mod tests {
     use super::*;
     use crate::accounts::{traits::BlockInfo, AccountsDB};
     use crate::test_helpers::{create_test_sanitized_transaction, flush_address_signatures_sync};
+    use solana_account_decoder::MAX_BASE58_BYTES;
+    use solana_account_decoder_client_types::{UiAccountEncoding, UiDataSliceConfig};
+    use solana_client::rpc_config::RpcAccountInfoConfig;
     use solana_rpc_client_types::response::RpcPerfSample;
     use solana_sdk::{
         account::AccountSharedData,
@@ -1226,6 +1229,152 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.value.is_none());
+    }
+
+    // Derived, not hardcoded, so retuning either constant cannot move the boundary silently.
+    const EXACT_ACCOUNT_BUDGET_DATA_LEN: usize =
+        ((constants::MAX_ACCOUNT_RESPONSE_BYTES - constants::PER_ACCOUNT_JSON_OVERHEAD) / 4) * 3;
+
+    /// The budget bounds what one reply encodes to, refusing the account before
+    /// anything compresses it. A precompile ELF is the largest account this
+    /// endpoint serves today, so it has to stay on the served side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_info_response_budget() {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+
+        let at_budget = Pubkey::new_unique();
+        let over_budget = Pubkey::new_unique();
+        let owner = solana_sdk::bpf_loader::id();
+        db.set_account(
+            at_budget,
+            AccountSharedData::new(1, EXACT_ACCOUNT_BUDGET_DATA_LEN, &owner),
+        )
+        .await;
+        db.set_account(
+            over_budget,
+            AccountSharedData::new(1, EXACT_ACCOUNT_BUDGET_DATA_LEN + 3, &owner),
+        )
+        .await;
+        let deps = make_read_deps(db);
+
+        let served =
+            get_account_info_impl::get_account_info_impl(&deps, at_budget.to_string(), None)
+                .await
+                .unwrap();
+        assert!(
+            served.value.is_some(),
+            "a request landing exactly on the budget must be served"
+        );
+
+        let err =
+            get_account_info_impl::get_account_info_impl(&deps, over_budget.to_string(), None)
+                .await
+                .expect_err("an over-budget account must be refused");
+        assert_eq!(err.code(), crate::rpc::error::INVALID_PARAMS_CODE);
+
+        let zstd = RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64Zstd),
+            ..Default::default()
+        };
+        let precompile = get_account_info_impl::get_account_info_impl(
+            &deps,
+            spl_token::ID.to_string(),
+            Some(zstd),
+        )
+        .await
+        .unwrap();
+        assert!(
+            precompile.value.is_some(),
+            "the budget must not refuse a precompile read"
+        );
+
+        // A dataSlice narrows what gets encoded, so the same over-budget account
+        // is served when the caller asks for a range that fits.
+        let fitting_slice = RpcAccountInfoConfig {
+            data_slice: Some(UiDataSliceConfig {
+                offset: 0,
+                length: MAX_BASE58_BYTES,
+            }),
+            ..Default::default()
+        };
+        let sliced = get_account_info_impl::get_account_info_impl(
+            &deps,
+            over_budget.to_string(),
+            Some(fitting_slice),
+        )
+        .await
+        .unwrap();
+        assert!(
+            sliced.value.is_some(),
+            "a slice that fits must be served from an over-budget account"
+        );
+
+        // An offset past the end selects nothing, so it cannot be over budget.
+        let past_end = RpcAccountInfoConfig {
+            data_slice: Some(UiDataSliceConfig {
+                offset: EXACT_ACCOUNT_BUDGET_DATA_LEN + 99,
+                length: usize::MAX,
+            }),
+            ..Default::default()
+        };
+        let empty = get_account_info_impl::get_account_info_impl(
+            &deps,
+            over_budget.to_string(),
+            Some(past_end),
+        )
+        .await
+        .unwrap();
+        assert!(
+            empty.value.is_some(),
+            "an offset past the end must clamp to nothing, not overflow the estimate"
+        );
+    }
+
+    /// Upstream's bs58 encoder swaps oversized data for an error string inside a
+    /// success payload. Agave refuses the request instead, and so must this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_info_base58_over_cap_is_refused() {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+        let deps = make_read_deps(db);
+        let precompile = spl_token::ID.to_string();
+
+        for encoding in [UiAccountEncoding::Base58, UiAccountEncoding::Binary] {
+            let config = RpcAccountInfoConfig {
+                encoding: Some(encoding),
+                ..Default::default()
+            };
+            let err = get_account_info_impl::get_account_info_impl(
+                &deps,
+                precompile.clone(),
+                Some(config),
+            )
+            .await
+            .expect_err("a precompile ELF is far past the bs58 cap");
+            assert_eq!(
+                err.code(),
+                crate::rpc::error::INVALID_REQUEST_CODE,
+                "encoding {encoding:?}"
+            );
+        }
+
+        // The same account under a slice inside the cap stays served.
+        let capped = RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base58),
+            data_slice: Some(UiDataSliceConfig {
+                offset: 0,
+                length: MAX_BASE58_BYTES,
+            }),
+            ..Default::default()
+        };
+        let served = get_account_info_impl::get_account_info_impl(&deps, precompile, Some(capped))
+            .await
+            .unwrap();
+        assert!(
+            served.value.is_some(),
+            "a slice inside the cap must be served"
+        );
     }
 
     /// An unreadable store is a server fault. Reporting it as INVALID_PARAMS
