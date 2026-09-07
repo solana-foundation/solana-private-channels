@@ -24,6 +24,8 @@ pub mod test_hooks {
     use solana_sdk::commitment_config::CommitmentLevel;
     use std::sync::Arc;
 
+    pub use super::remint::DeferredRemintOutcome;
+
     pub fn new_sender_state(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -76,9 +78,9 @@ pub mod test_hooks {
     /// transition in isolation.
     pub async fn execute_deferred_remint(
         state: &SenderState,
-        entry: &super::types::PendingRemint,
+        entry: super::types::PendingRemint,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-    ) {
+    ) -> DeferredRemintOutcome {
         super::remint::execute_deferred_remint(state, entry, storage_tx).await
     }
 

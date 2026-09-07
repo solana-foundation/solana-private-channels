@@ -142,11 +142,15 @@ async fn recover_once(
     threshold: Duration,
     reconcile_cursor: &mut i64,
 ) -> Result<(), OperatorError> {
-    // Best-effort GC of release signatures whose parent is no longer Processing;
-    // a failure here must not block recovery.
+    // Best-effort GC of release and remint signatures whose parent left its
+    // live status; a failure here must not block recovery.
     match storage.gc_stale_release_signatures().await {
         Ok(removed) => debug!(removed, "Recovery GC'd stale release signatures"),
         Err(e) => warn!("Recovery release-signature GC failed: {}", e),
+    }
+    match storage.gc_stale_remint_signatures().await {
+        Ok(removed) => debug!(removed, "Recovery GC'd stale remint signatures"),
+        Err(e) => warn!("Recovery remint-signature GC failed: {}", e),
     }
 
     let owned_type = program_type.owned_transaction_type();
