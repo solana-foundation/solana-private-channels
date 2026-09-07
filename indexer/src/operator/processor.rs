@@ -1,9 +1,10 @@
 use crate::channel_utils::send_guaranteed;
-use crate::error::{OperatorError, ProgramError};
+use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::instruction_util::{
     mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
 };
+use crate::operator::recovery::MAX_RECOVERY_REQUEUE_ATTEMPTS;
 use crate::operator::sender::TransactionStatusUpdate;
 use crate::operator::utils::mint_util::MintCache;
 use crate::operator::{
@@ -11,6 +12,7 @@ use crate::operator::{
     MintToBuilderWithTxnId, ReleaseFundsBuilderWithNonce, SignerUtil,
 };
 use crate::storage::common::models::{DbTransaction, TransactionStatus};
+use crate::storage::common::storage::RequeueOutcome;
 use crate::storage::Storage;
 use crate::ProgramType;
 use chrono::Utc;
@@ -160,6 +162,20 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
     }
 }
 
+/// A row-specific reason to park one withdrawal without stopping the pipeline.
+/// `label` is the metric dimension and `message` lands on the row and its alert.
+/// Poison rows take the error classifier instead, which sweeps every active row.
+struct BailReason {
+    label: &'static str,
+    message: String,
+}
+
+impl BailReason {
+    fn new(label: &'static str, message: String) -> Self {
+        Self { label, message }
+    }
+}
+
 /// Emit a `ManualReview` status update for a single row via the shared storage
 /// writer channel.  Reuses `TransactionStatusUpdate` so the existing
 /// DbTransactionWriter path handles both the DB write and the alert webhook.
@@ -189,6 +205,19 @@ async fn quarantine_single(
             "Failed to send quarantine update (storage writer down): {}", e
         );
     }
+}
+
+/// Park one row in `ManualReview` and record why, leaving the pipeline running.
+async fn park_row(
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
+    transaction: &DbTransaction,
+    bail: BailReason,
+) {
+    metrics::OPERATOR_TRANSACTION_QUARANTINED
+        .with_label_values(&[pt_label, bail.label])
+        .inc();
+    quarantine_single(storage_tx, transaction, bail.message).await;
 }
 
 /// Halt the withdrawal pipeline after a poison-pill is detected.
@@ -255,6 +284,100 @@ async fn halt_withdrawal_pipeline(
                 "quarantine_active_withdrawals failed: {}", e
             );
         }
+    }
+}
+
+/// CAS one owned, unsent withdrawal `Processing -> Pending` so the fetcher can
+/// re-claim it. Safe because a transient error before the sender handoff proves
+/// nothing was broadcast and no signature was recorded. Mirrors the sender's
+/// pre-broadcast requeue: only `Requeued` flips the row, and `AtCap`,
+/// `NotProcessing` and a failed write all leave it Processing for recovery.
+async fn requeue_single_prebroadcast(
+    storage: &Storage,
+    pt_label: &str,
+    transaction: &DbTransaction,
+) {
+    match storage
+        .try_requeue_prebroadcast(transaction.id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt_label, "prebroadcast_requeued"])
+                .inc();
+            info!(
+                txn_id = transaction.id,
+                trace_id = %transaction.trace_id,
+                attempts,
+                "Requeued withdrawal to Pending after a pre-broadcast transient error"
+            );
+        }
+        Ok(RequeueOutcome::AtCap) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt_label, "prebroadcast_requeue_cap"])
+                .inc();
+            warn!(
+                txn_id = transaction.id,
+                trace_id = %transaction.trace_id,
+                "Pre-broadcast requeue skipped: recovery cap reached, row left Processing"
+            );
+        }
+        Ok(RequeueOutcome::NotProcessing) => warn!(
+            txn_id = transaction.id,
+            trace_id = %transaction.trace_id,
+            "Pre-broadcast requeue skipped: row no longer Processing"
+        ),
+        Err(e) => warn!(
+            txn_id = transaction.id,
+            trace_id = %transaction.trace_id,
+            "Pre-broadcast requeue failed, row left Processing for recovery: {e}"
+        ),
+    }
+}
+
+/// Rescue the head withdrawal after a transient error, which happened before
+/// anything was handed to the sender, instead of dropping it stranded in
+/// `Processing` on `return Err`. No DB sweep: a blanket flip could hit an
+/// in-flight sender row whose signature is not yet persisted, so only this owned
+/// row and the channel-buffered ones are provably safe.
+///
+/// Capped on the durable counter the fetched row carries, so an error that only
+/// looks transient cannot loop the operator in a restart storm; at the cap the
+/// row is quarantined for a human instead.
+async fn requeue_or_quarantine_head(
+    storage: &Storage,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    pt_label: &str,
+    transaction: &DbTransaction,
+    reason: String,
+) {
+    if transaction.recovery_requeue_attempts >= MAX_RECOVERY_REQUEUE_ATTEMPTS {
+        metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[pt_label, "prebroadcast_requeue_cap"])
+            .inc();
+        warn!(
+            txn_id = transaction.id,
+            trace_id = %transaction.trace_id,
+            attempts = transaction.recovery_requeue_attempts,
+            "Withdrawal failed after max pre-broadcast requeues; quarantining"
+        );
+        quarantine_single(storage_tx, transaction, reason).await;
+    } else {
+        requeue_single_prebroadcast(storage, pt_label, transaction).await;
+    }
+}
+
+/// Requeue every row still buffered in `fetcher_rx`. The fetcher flipped them to
+/// `Processing` but never handed them on, so nothing about them was broadcast
+/// and requeueing is always safe. Mirrors the drain in `halt_withdrawal_pipeline`
+/// but hands the rows back rather than quarantining them.
+async fn drain_and_requeue_buffered(
+    storage: &Storage,
+    fetcher_rx: &mut mpsc::Receiver<DbTransaction>,
+    pt_label: &str,
+) {
+    while let Ok(buffered) = fetcher_rx.try_recv() {
+        requeue_single_prebroadcast(storage, pt_label, &buffered).await;
     }
 }
 
@@ -433,14 +556,79 @@ async fn build_release_funds(
     )))
 }
 
+/// Reject a withdrawal the escrow would not accept a release for. The predicate is
+/// the on-chain `AllowedMint` account, the same one `release_funds` requires, so a
+/// row that fails here could never have landed and a row that passes is not blocked.
+async fn check_withdrawal_mint_supported(
+    processor_state: &mut ProcessorState,
+    transaction: &DbTransaction,
+) -> Result<Option<BailReason>, OperatorError> {
+    let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+        pubkey: transaction.mint.clone(),
+        reason: e.to_string(),
+    })?;
+
+    // A verdict already recorded for this mint stands for the process lifetime, so a
+    // busy mint costs one allowlist read rather than one per withdrawal. An admin
+    // blocking a mint mid-run is caught on the next restart.
+    if processor_state.mint_cache.has_existence_floor(&mint) {
+        return Ok(None);
+    }
+
+    let allowed_mint_pda = processor_state
+        .release_funds_state
+        .as_mut()
+        .ok_or(OperatorError::MissingBuilder)?
+        .get_allowed_mint_pda(&mint);
+
+    let rpc = processor_state
+        .mint_cache
+        .rpc_client()
+        .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
+
+    // A null only proves "never allowlisted" if the node has caught up. Anchor on the
+    // tip it reports and require the read to answer at or past it, so a lagging backend
+    // errors instead of denying an allowlist entry it simply has not seen yet.
+    let commitment = rpc.rpc_client.commitment();
+    let (ref_slot, _) = rpc
+        .get_latest_blockhash_with_context(commitment)
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?;
+
+    let response = rpc
+        .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(ref_slot))
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("get_account({allowed_mint_pda}): {e}")))?;
+
+    // Owned by anything else means the address collides with an unrelated account
+    // rather than carrying the escrow's permission, which release would reject.
+    let allowed = response
+        .value
+        .is_some_and(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
+    if !allowed {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_UNSUPPORTED_MINT,
+            format!("unsupported withdrawal mint: {mint} (no escrow allowlist account)"),
+        )));
+    }
+
+    // Creating that account required the escrow to read the mint, so the mint existed
+    // at or before this slot. Later mint reads bind to it, which is what lets a
+    // missing mint be permanent instead of a node that has not caught up.
+    processor_state
+        .mint_cache
+        .record_existence_floor(&mint, response.context.slot);
+    Ok(None)
+}
+
 /// Token-2022 pre-flight for a withdrawal.
 ///
 /// Returns:
 /// - `Ok(None)` — clean: proceed to build + dispatch.
-/// - `Ok(Some(reason))` — row-specific bail: caller routes to ManualReview
-///   via `quarantine_single` and continues the loop. Used for paused mints
-///   and permanent-delegate drains where the row's data is fine but the
-///   on-chain state would cause an immediate release-funds failure.
+/// - `Ok(Some(bail))` — row-specific bail: caller parks the row and continues
+///   the loop. Used for paused mints, permanent-delegate drains, and mints the
+///   target chain does not have, where the row's data is fine but the on-chain
+///   state would cause an immediate release-funds failure.
 /// - `Err(_)` — transient infrastructure issue (RPC failure, malformed
 ///   mint data). Caller's classifier treats as Transient and restarts the
 ///   task, which is preferable to mass-quarantining rows during an RPC
@@ -448,7 +636,28 @@ async fn build_release_funds(
 async fn check_withdrawal_preflights(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
-) -> Result<Option<String>, OperatorError> {
+) -> Result<Option<BailReason>, OperatorError> {
+    // The reads below only report a mint absent once the node has passed the slot that
+    // allowlisted it, so the account was closed rather than merely not yet visible.
+    // That is not fixed by retrying, so it parks the row instead of restarting us.
+    match check_withdrawal_preflights_inner(processor_state, transaction).await {
+        Err(OperatorError::Account(AccountError::TargetMintMissing { pubkey })) => {
+            Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_TARGET_MINT_MISSING,
+                format!("withdrawal mint absent on target chain: {pubkey}"),
+            )))
+        }
+        other => other,
+    }
+}
+
+/// The pre-flight checks themselves, wrapped above so one error shape can be
+/// turned into a bail without repeating the conversion at each call that can
+/// produce it.
+async fn check_withdrawal_preflights_inner(
+    processor_state: &mut ProcessorState,
+    transaction: &DbTransaction,
+) -> Result<Option<BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
         reason: e.to_string(),
@@ -474,7 +683,10 @@ async fn check_withdrawal_preflights(
         .await?;
 
     if is_pausable && processor_state.mint_cache.check_paused(&mint).await? {
-        return Ok(Some(format!("mint paused: {mint}")));
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_MINT_PAUSED,
+            format!("mint paused: {mint}"),
+        )));
     }
 
     if has_permanent_delegate {
@@ -491,8 +703,9 @@ async fn check_withdrawal_preflights(
             .get_ata_balance(&instance_ata)
             .await?;
         if on_chain < amount {
-            return Ok(Some(format!(
-                "insufficient escrow balance: on_chain={on_chain}, needed={amount}"
+            return Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_ESCROW_DRAINED,
+                format!("insufficient escrow balance: on_chain={on_chain}, needed={amount}"),
             )));
         }
     }
@@ -518,6 +731,16 @@ pub async fn process_release_funds(
         let span = info_span!("process", trace_id = %transaction.trace_id, txn_id = transaction.id);
 
         let outcome: Result<(), OperatorError> = async {
+            // Settle whether the escrow will accept a release for this mint before
+            // building one, so a mint it would reject costs no further work and no
+            // target-chain lookup that would read as an infrastructure failure.
+            if let Some(bail) =
+                check_withdrawal_mint_supported(processor_state, &transaction).await?
+            {
+                park_row(&storage_tx, pt_label, &transaction, bail).await;
+                return Ok(());
+            }
+
             // Build first so row-data poison, such as a NULL nonce or an
             // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
             // classifier to halt the pipeline on. Building also warms
@@ -531,9 +754,8 @@ pub async fn process_release_funds(
             // It is best-effort: a delegate can still drain between this read and
             // the on-chain CPI, leaving that to the sender retry path. RPC errors
             // bubble up as Transient and restart the task.
-            if let Some(reason) = check_withdrawal_preflights(processor_state, &transaction).await?
-            {
-                quarantine_single(&storage_tx, &transaction, reason).await;
+            if let Some(bail) = check_withdrawal_preflights(processor_state, &transaction).await? {
+                park_row(&storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
             }
 
@@ -575,8 +797,19 @@ pub async fn process_release_funds(
                     return Ok(());
                 }
                 ErrorDisposition::Transient => {
-                    // Transient: surface the error so the supervisor can
-                    // restart us cleanly.
+                    // Nothing reached the sender, for this row or for the ones
+                    // still buffered, so hand them back to the fetcher instead
+                    // of leaving them Processing until the recovery sweep.
+                    requeue_or_quarantine_head(
+                        &storage,
+                        &storage_tx,
+                        pt_label,
+                        &transaction,
+                        err.to_string(),
+                    )
+                    .await;
+                    drain_and_requeue_buffered(&storage, &mut fetcher_rx, pt_label).await;
+                    // Surface the error so the supervisor can restart us cleanly.
                     return Err(err);
                 }
                 ErrorDisposition::Fatal => {
@@ -822,6 +1055,27 @@ mod tests {
         );
     }
 
+    /// A Token-2022 `mints` row with both extension flags unresolved, so the
+    /// pre-flight has to read the mint account from the chain.
+    fn insert_token_2022_mint_row(storage: &Arc<Storage>, mint: &Pubkey) {
+        let mock_storage = match storage.as_ref() {
+            Storage::Mock(m) => m,
+            _ => unreachable!("test helper expects Storage::Mock"),
+        };
+        mock_storage.mints.lock().unwrap().insert(
+            mint.to_string(),
+            DbMint {
+                mint_address: mint.to_string(),
+                decimals: 6,
+                token_program: spl_token_2022::id().to_string(),
+                created_at: chrono::Utc::now(),
+                status: "allowed".to_string(),
+                is_pausable: None,
+                has_permanent_delegate: None,
+            },
+        );
+    }
+
     /// Mocked `getAccountInfo` response for a withdrawal bitmap account on the
     /// given generation, used to drive the boundary-rotation read.
     fn bitmap_account_response(generation: u64) -> serde_json::Value {
@@ -872,6 +1126,188 @@ mod tests {
             landed_remint_signature: None,
             release_refused_on_chain: false,
         }
+    }
+
+    /// Treat `mint` as already proved allowlisted, skipping the gate in tests
+    /// whose subject is a later step of the loop.
+    fn assume_mint_allowlisted(ps: &mut ProcessorState, mint: &Pubkey) {
+        ps.mint_cache.record_existence_floor(mint, 1);
+    }
+
+    /// Mocked `getAccountInfo` reply for an escrow-owned AllowedMint account.
+    fn allowed_mint_account_response(slot: u64) -> serde_json::Value {
+        serde_json::json!({
+            "context": {"slot": slot},
+            "value": {
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode([2u8, 255u8]), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
+    }
+
+    fn absent_account_response() -> serde_json::Value {
+        serde_json::json!({"context": {"slot": 1}, "value": null})
+    }
+
+    /// A withdrawal processor whose target chain answers every account read with
+    /// `response`, which for these tests is the allowlist account the gate reads.
+    fn processor_state_answering(
+        storage: &Arc<Storage>,
+        response: serde_json::Value,
+    ) -> ProcessorState {
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, response);
+        ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::new_mocked(mocks)),
+            ),
+        }
+    }
+
+    /// Drive one withdrawal through `process_release_funds` and return whatever
+    /// reached the storage writer and the sender, plus the loop's own result.
+    async fn run_one_withdrawal(
+        ps: &mut ProcessorState,
+        storage: Arc<Storage>,
+        txn: DbTransaction,
+    ) -> (
+        Result<(), OperatorError>,
+        Option<TransactionStatusUpdate>,
+        Option<TransactionBuilder>,
+    ) {
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let outcome = process_release_funds(
+            ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage,
+            ProgramType::Withdraw,
+        )
+        .await;
+
+        (
+            outcome,
+            storage_rx.try_recv().ok(),
+            sender_rx.try_recv().ok(),
+        )
+    }
+
+    /// A withdrawal row for `mint` at `nonce`.
+    fn withdrawal_for(mint: &Pubkey, nonce: i64) -> DbTransaction {
+        make_db_transaction(
+            9,
+            &mint.to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(nonce),
+            TransactionType::Withdrawal,
+        )
+    }
+
+    // ── escrow allowlist gate ───────────────────────────────────────
+
+    /// No escrow allowlist account means the escrow program would reject the
+    /// release, so the row is parked rather than retried forever.
+    #[tokio::test]
+    async fn unsupported_mint_is_parked_without_stopping_the_loop() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut ps = processor_state_answering(&storage, absent_account_response());
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "one bad mint must not end the loop");
+        let update = update.expect("row must be routed to ManualReview");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .expect("error_message must be set")
+            .contains("unsupported withdrawal mint:"));
+        assert!(builder.is_none(), "nothing may be dispatched");
+    }
+
+    /// An allowlisted mint passes the gate untouched, and passing records the
+    /// slot it was seen at so a later missing mint reads as permanent.
+    #[tokio::test]
+    async fn allowlisted_mint_proceeds_and_records_the_existence_floor() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let mut ps = processor_state_answering(&storage, allowed_mint_account_response(500));
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(update.is_none(), "a supported mint must not be quarantined");
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+        assert!(
+            ps.mint_cache.has_existence_floor(&mint),
+            "the gate must record what it proved"
+        );
+    }
+
+    /// An account squatting the allowlist address carries no escrow permission,
+    /// so presence alone must not open the gate.
+    #[tokio::test]
+    async fn foreign_owned_allowlist_account_is_rejected() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let mut ps = processor_state_answering(&storage, bitmap_account_response(0));
+
+        let (outcome, update, _) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(
+            update.expect("row must be parked").status,
+            TransactionStatus::ManualReview,
+            "only an escrow-owned account grants permission"
+        );
+    }
+
+    /// A mint proved to exist but absent from the target chain was closed, not
+    /// merely unseen, so the row is parked instead of restarting the operator.
+    #[tokio::test]
+    async fn a_mint_absent_from_the_target_chain_parks_the_row() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        // Token-2022 with unresolved flags, so the pre-flight has to read the chain.
+        insert_token_2022_mint_row(&storage, &mint);
+        let mut ps = processor_state_answering(&storage, absent_account_response());
+        assume_mint_allowlisted(&mut ps, &mint);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "a missing mint must not exit the task");
+        let msg = update
+            .expect("row must be parked")
+            .error_message
+            .expect("error_message must be set");
+        assert!(
+            msg.contains("withdrawal mint absent on target chain")
+                && msg.contains(&mint.to_string()),
+            "unexpected error_message: {msg}"
+        );
+        assert!(builder.is_none(), "no builder may be dispatched");
     }
 
     /// The remint reverses a burn on the private channel, so it must credit the
@@ -987,6 +1423,9 @@ mod tests {
             );
         }
 
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
+
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
         let (storage_tx, _storage_rx) = mpsc::channel(10);
@@ -1061,6 +1500,9 @@ mod tests {
                 },
             );
         }
+
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -1140,6 +1582,9 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -1236,6 +1681,129 @@ mod tests {
             sender_rx.try_recv().is_err(),
             "unexpected message on sender channel"
         );
+    }
+
+    // ── transient rescue before the sender handoff ──────────────────
+
+    /// Seed `mock` with `txn` as a Processing row, which is the state the
+    /// fetcher leaves behind when it hands a row to the processor.
+    fn seed_processing_row(storage: &Arc<Storage>, txn: &DbTransaction) {
+        let Storage::Mock(ref mock) = **storage else {
+            unreachable!("test helper expects Storage::Mock");
+        };
+        mock.pending_transactions.lock().unwrap().push(txn.clone());
+    }
+
+    fn row_status(storage: &Arc<Storage>, id: i64) -> Option<TransactionStatus> {
+        let Storage::Mock(ref mock) = **storage else {
+            unreachable!("test helper expects Storage::Mock");
+        };
+        let rows = mock.pending_transactions.lock().unwrap();
+        rows.iter().find(|txn| txn.id == id).map(|txn| txn.status)
+    }
+
+    /// A transient error stops the loop before anything reaches the sender, so
+    /// neither the head row nor the rows the fetcher already handed over were
+    /// broadcast. Leaving them Processing strands them until the recovery sweep
+    /// ages them out; requeueing hands them straight back to the fetcher.
+    #[tokio::test]
+    async fn transient_error_requeues_the_head_and_the_buffered_rows() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        // No mint row and no RPC, so the metadata read fails as transient.
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(2);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let mint = Pubkey::new_unique().to_string();
+        for id in [1, 2] {
+            let txn = make_db_transaction(
+                id,
+                &mint,
+                &Pubkey::new_unique().to_string(),
+                Some(id),
+                TransactionType::Withdrawal,
+            );
+            seed_processing_row(&storage, &txn);
+            fetcher_tx.send(txn).await.unwrap();
+        }
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            ProgramType::Withdraw,
+        )
+        .await;
+
+        assert!(result.is_err(), "a transient error still restarts the task");
+        assert_eq!(
+            row_status(&storage, 1),
+            Some(TransactionStatus::Pending),
+            "the head row never reached the sender and must be re-claimable"
+        );
+        assert_eq!(
+            row_status(&storage, 2),
+            Some(TransactionStatus::Pending),
+            "a buffered row was never even looked at"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a transient error is not a terminal verdict on any row"
+        );
+    }
+
+    /// The rescue is capped on the durable counter the fetched row carries, so
+    /// an error only looking transient cannot loop the operator forever.
+    #[tokio::test]
+    async fn a_head_row_out_of_requeues_is_quarantined_instead() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, _sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let mut txn = make_db_transaction(
+            1,
+            &Pubkey::new_unique().to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(1),
+            TransactionType::Withdrawal,
+        );
+        txn.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        seed_processing_row(&storage, &txn);
+        fetcher_tx.send(txn).await.unwrap();
+        drop(fetcher_tx);
+
+        let result = process_release_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            ProgramType::Withdraw,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let update = storage_rx
+            .try_recv()
+            .expect("a row out of requeues must be escalated");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert_eq!(update.transaction_id, 1);
     }
 
     /// A valid deposit transaction is wrapped as a Mint builder with the correct ATA and
@@ -1445,6 +2013,9 @@ mod tests {
             );
         }
 
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
+
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -1493,13 +2064,17 @@ mod tests {
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
 
+        let mint_pubkey = Pubkey::new_unique();
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
+
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, _sender_rx) = mpsc::channel(10);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         let txn = make_db_transaction(
             1,
-            &Pubkey::new_unique().to_string(),
+            &mint_pubkey.to_string(),
             &Pubkey::new_unique().to_string(),
             None, // <- the poison: withdrawals should never have a NULL nonce
             crate::storage::common::models::TransactionType::Withdrawal,
@@ -1884,6 +2459,9 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
+
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(16);
@@ -2387,6 +2965,9 @@ mod tests {
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
 
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
+
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
 
@@ -2495,6 +3076,9 @@ mod tests {
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
         };
+
+        // The allowlist gate is not this test's subject; treat the mint as proved.
+        assume_mint_allowlisted(&mut ps, &mint_pubkey);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);

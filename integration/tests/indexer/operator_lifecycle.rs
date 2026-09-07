@@ -800,13 +800,10 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     )
     .await?;
 
-    // The bad withdrawal preflights with `invalid account data for instruction`
-    // from the escrow program (the mint isn't whitelisted on the instance), so
-    // `sign_and_send` errors before any signature is broadcast. With no
-    // signatures to verify, the sender's "cannot safely remint" branch
-    // (`indexer/src/operator/sender/transaction.rs`) routes the row to
-    // `ManualReview`, NOT `Failed` — reverting that to `Failed` would risk
-    // double-reminting if the broadcast had succeeded silently.
+    // The mint has no on-chain AllowedMint account, so the withdrawal gate parks
+    // the row before a release is ever built. Nothing is broadcast and no
+    // signature is journaled, so it goes straight to `ManualReview` rather than
+    // through the sender's cannot-safely-remint branch.
     wait_for_any_transaction_status(
         &pool,
         &withdrawal_sig,

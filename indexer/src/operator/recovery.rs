@@ -53,7 +53,7 @@ pub(crate) const RECONCILE_SWEEP_BUDGET: Duration = Duration::from_secs(45);
 pub(crate) const BOOT_RECONCILE_BUDGET: Duration = Duration::from_secs(120);
 
 /// Max durable Demote requeues before a stuck row is quarantined (paged).
-const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
+pub(crate) const MAX_RECOVERY_REQUEUE_ATTEMPTS: i32 = 3;
 
 /// Deposit recovery outcome. Uncertainty must NOT demote (double-mint risk); an
 /// in-flight signature leaves the row Processing for the next sweep.

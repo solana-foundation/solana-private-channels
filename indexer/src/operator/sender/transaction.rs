@@ -4,6 +4,7 @@ use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+use crate::operator::recovery::MAX_RECOVERY_REQUEUE_ATTEMPTS;
 use crate::operator::utils::instruction_util::{TransactionBuilder, TransactionKind};
 use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
@@ -14,7 +15,7 @@ use crate::operator::{
     sign_and_send_transaction, ExtraErrorCheckPolicy, RetryPolicy, RpcClientWithRetry,
 };
 use crate::storage::common::models::TransactionStatus;
-use crate::storage::common::storage::Storage;
+use crate::storage::common::storage::{RequeueOutcome, Storage};
 use chrono::Utc;
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
 use private_channel_metrics::MetricLabel;
@@ -290,17 +291,39 @@ pub(super) async fn route_builder_error(
         | e @ OperatorError::Storage(_) => {
             // The bitmap could not be read, or an account or database read failed
             // on the way to building this transaction. Nothing was broadcast, so
-            // the row never released: leave it Processing for the recovery worker
-            // and never mark it Failed on what is only a read failure.
+            // the row never released and must never be marked Failed on what is
+            // only a read failure.
             metrics::OPERATOR_TRANSACTION_ERRORS
                 .with_label_values(&[state.program_type.as_label(), "bitmap_unavailable"])
                 .inc();
-            error!(
-                transaction_id = ctx.transaction_id,
-                nonce = ctx.withdrawal_nonce.map(|n| n as i64),
-                "Could not read chain state to build the transaction; leaving row Processing for recovery: {}",
-                e
-            );
+            match prebroadcast_requeue_target(state, ctx) {
+                // A bounded retry from Pending beats waiting for the recovery
+                // sweep, which would only quarantine what a reread can settle.
+                Some((nonce, transaction_id)) => {
+                    warn!(
+                        transaction_id,
+                        nonce, "Could not read chain state to build the transaction: {e}"
+                    );
+                    let reason = format!(
+                        "chain state unreadable after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                    );
+                    requeue_or_fail_prebroadcast(
+                        state,
+                        ctx,
+                        storage_tx,
+                        nonce,
+                        transaction_id,
+                        &reason,
+                    )
+                    .await;
+                }
+                None => error!(
+                    transaction_id = ctx.transaction_id,
+                    nonce = ctx.withdrawal_nonce.map(|n| n as i64),
+                    "Could not read chain state to build the transaction; leaving row Processing for recovery: {}",
+                    e
+                ),
+            }
         }
         e => {
             metrics::OPERATOR_TRANSACTION_ERRORS
@@ -483,7 +506,26 @@ pub(super) async fn send_and_confirm(
                     .with_label_values(&[pt, "build_sign_error"])
                     .inc();
                 error!("Failed to build/sign transaction: {}", e);
-                handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await;
+                // The failure came before a signature existed, so a withdrawal
+                // with nothing stashed from an earlier attempt provably never
+                // broadcast and can simply be retried.
+                match prebroadcast_requeue_target(state, ctx) {
+                    Some((nonce, transaction_id)) => {
+                        let reason = format!(
+                            "build/sign failed after {MAX_RECOVERY_REQUEUE_ATTEMPTS} requeues: {e}"
+                        );
+                        requeue_or_fail_prebroadcast(
+                            state,
+                            ctx,
+                            storage_tx,
+                            nonce,
+                            transaction_id,
+                            &reason,
+                        )
+                        .await;
+                    }
+                    None => handle_permanent_failure(state, ctx, storage_tx, &e.to_string()).await,
+                }
                 return;
             }
         };
@@ -1199,6 +1241,85 @@ fn leave_processing_for_recovery(
         signature = %signature,
         "{reason}; leaving row Processing for recovery to reconcile",
     );
+}
+
+/// Bounded pre-broadcast requeue for a withdrawal the caller has confirmed
+/// stashed no signature. One cap-gated write flips Processing to Pending under
+/// the cap and escalates at it; folding the cap into the write means no separate
+/// counter read can fail and let the row requeue forever. `retry_counts` is kept
+/// so `send_and_confirm`'s attempt cap still bounds the loop.
+pub(super) async fn requeue_or_fail_prebroadcast(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    nonce: u64,
+    transaction_id: i64,
+    reason_at_cap: &str,
+) {
+    let pt = state.program_type.as_label();
+
+    // Nothing was broadcast, so this nonce is not in flight and must stop
+    // holding the rotation barrier. The next attempt puts it back.
+    state.in_flight_withdrawals.remove(&nonce);
+
+    match state
+        .storage
+        .try_requeue_prebroadcast(transaction_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            // Re-inserted by handle_transaction_builder on the next attempt.
+            state.remint_cache.remove(&nonce);
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeued"])
+                .inc();
+            info!(
+                transaction_id,
+                nonce, attempts, "Requeued withdrawal to Pending after pre-broadcast failure"
+            );
+        }
+        Ok(RequeueOutcome::AtCap) => {
+            // Keep remint_cache: handle_permanent_failure consumes it to route a
+            // no-signature withdrawal to ManualReview rather than a bare Failed.
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+                .inc();
+            handle_permanent_failure(state, ctx, storage_tx, reason_at_cap).await;
+        }
+        Ok(RequeueOutcome::NotProcessing) => {
+            state.remint_cache.remove(&nonce);
+            warn!(
+                transaction_id,
+                nonce, "Pre-broadcast requeue skipped: row no longer Processing"
+            );
+        }
+        Err(e) => {
+            // Nothing was requeued, so the row stays Processing for recovery. A
+            // loop would need a successful requeue, so there is none.
+            state.remint_cache.remove(&nonce);
+            warn!(
+                transaction_id,
+                nonce, "Pre-broadcast requeue write failed, row left Processing for recovery: {e}"
+            );
+        }
+    }
+}
+
+/// The ids a pre-broadcast requeue needs, or `None` when this transaction
+/// cannot take one: it is not a withdrawal, or an earlier attempt already
+/// broadcast a signature for the nonce and the release may have landed.
+fn prebroadcast_requeue_target(
+    state: &SenderState,
+    ctx: &TransactionContext,
+) -> Option<(u64, i64)> {
+    let (Some(nonce), Some(transaction_id)) = (ctx.withdrawal_nonce, ctx.transaction_id) else {
+        return None;
+    };
+    state
+        .pending_signatures
+        .get(&nonce)
+        .is_none_or(|sigs| sigs.is_empty())
+        .then_some((nonce, transaction_id))
 }
 
 pub(super) async fn handle_permanent_failure(
@@ -2255,6 +2376,157 @@ mod tests {
             .try_recv()
             .expect("a genuine build error must send a Failed status");
         assert_eq!(update.status, TransactionStatus::Failed);
+    }
+
+    // ── pre-broadcast requeue ───────────────────────────────────────
+
+    /// Nothing is broadcast when the build or the signing fails, so the row
+    /// provably released nothing. Escalating it to a human strands a withdrawal
+    /// that an ordinary retry would settle.
+    #[tokio::test]
+    async fn build_failure_requeues_the_withdrawal_instead_of_escalating() {
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
+        state.in_flight_withdrawals.insert(7);
+        state.remint_cache.insert(7, make_remint_info(10));
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(10, 7),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            row_status(mock, 10),
+            Some(TransactionStatus::Pending),
+            "a withdrawal that never broadcast must go back on the queue"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no terminal status may be written for a row that never left"
+        );
+        assert!(
+            !state.in_flight_withdrawals.contains(&7),
+            "an unsent nonce must not hold the rotation barrier"
+        );
+    }
+
+    /// The cap lives in the same write that requeues, so a row that has spent
+    /// its budget escalates rather than cycling between Pending and Processing.
+    #[tokio::test]
+    async fn build_failure_at_the_requeue_cap_escalates_to_manual_review() {
+        let mock = mock_with_processing_row(11);
+        mock.pending_transactions.lock().unwrap()[0].recovery_requeue_attempts =
+            MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
+        state.remint_cache.insert(8, make_remint_info(11));
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(11, 8),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let update = storage_rx
+            .try_recv()
+            .expect("a row out of requeues must be escalated");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            row_status(mock, 11),
+            Some(TransactionStatus::Processing),
+            "the capped write must leave the row where it was"
+        );
+    }
+
+    /// A stashed signature means an earlier attempt did broadcast, so the row
+    /// may have released and must not be handed back to the fetcher.
+    #[tokio::test]
+    async fn a_stashed_signature_blocks_the_pre_broadcast_requeue() {
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(12));
+        state.remint_cache.insert(6, make_remint_info(12));
+        state.pending_signatures.insert(
+            6,
+            vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 1,
+            }],
+        );
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        send_and_confirm(
+            &mut state,
+            dummy_instruction(),
+            None,
+            &withdrawal_ctx(12, 6),
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            &storage_tx,
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_ne!(
+            row_status(mock, 12),
+            Some(TransactionStatus::Pending),
+            "a nonce that may already be spent must not be requeued"
+        );
+    }
+
+    /// A read that failed on the way to building the transaction is transient
+    /// and nothing was broadcast, so the row takes a bounded retry rather than
+    /// waiting for the recovery sweep to notice it.
+    #[tokio::test]
+    async fn read_failure_requeues_the_withdrawal_for_a_bounded_retry() {
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(13));
+        state.in_flight_withdrawals.insert(9);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        route_builder_error(
+            &mut state,
+            &withdrawal_ctx(13, 9),
+            &storage_tx,
+            crate::error::StorageError::DatabaseError {
+                message: "transient".to_string(),
+            }
+            .into(),
+        )
+        .await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            row_status(mock, 13),
+            Some(TransactionStatus::Pending),
+            "an unreadable chain or database must not freeze the row"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a read failure is not a terminal outcome"
+        );
+        assert!(!state.in_flight_withdrawals.contains(&9));
     }
 
     // ── handle_success ──────────────────────────────────────────────
