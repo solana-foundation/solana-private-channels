@@ -2068,6 +2068,59 @@ pub(super) async fn route_poll_results(
     }
 }
 
+/// Why a chunked status fetch was rejected. Both variants make the caller reinsert
+/// the batch and retry; the split only picks the metric reason label.
+#[derive(Debug)]
+enum StatusFetchError {
+    /// A chunk response length did not equal the request (short or oversized).
+    MalformedLength,
+    /// The RPC call itself failed after retries.
+    Rpc,
+}
+
+impl StatusFetchError {
+    fn reason(&self) -> &'static str {
+        match self {
+            StatusFetchError::MalformedLength => "malformed_status_response",
+            StatusFetchError::Rpc => "status_poll_rpc_error",
+        }
+    }
+}
+
+/// Fetch statuses in `MAX_SIGS_PER_CALL` chunks. `getSignatureStatuses` is positional, so a
+/// chunk whose length differs from the request would misalign every later status; reject it.
+/// Returns `Err` on any RPC error or length mismatch so the caller reinserts the batch and retries.
+async fn fetch_statuses_checked(
+    rpc_client: &RpcClientWithRetry,
+    signatures: &[Signature],
+) -> Result<Vec<Option<solana_transaction_status::TransactionStatus>>, StatusFetchError> {
+    let mut statuses = Vec::with_capacity(signatures.len());
+    for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
+        match rpc_client.get_signature_statuses(chunk).await {
+            Ok(resp) if resp.value.len() == chunk.len() => statuses.extend(resp.value),
+            Ok(resp) => {
+                warn!(
+                    "getSignatureStatuses returned {} statuses for {} signatures \
+                     ({} in-flight) - treating as RPC failure, will retry next tick",
+                    resp.value.len(),
+                    chunk.len(),
+                    signatures.len()
+                );
+                return Err(StatusFetchError::MalformedLength);
+            }
+            Err(e) => {
+                warn!(
+                    "getSignatureStatuses failed ({} in-flight) - will retry next tick: {}",
+                    signatures.len(),
+                    e
+                );
+                return Err(StatusFetchError::Rpc);
+            }
+        }
+    }
+    Ok(statuses)
+}
+
 /// Single-cycle poll: drain the shared queue, call `getSignatureStatuses`, then
 /// route results via `route_poll_results`.
 ///
@@ -2082,25 +2135,18 @@ pub(super) async fn poll_in_flight(
     }
     let batch = state.in_flight.drain_all();
     let signatures: Vec<Signature> = batch.iter().map(|t| t.signature).collect();
-    let mut statuses: Vec<Option<_>> = Vec::with_capacity(signatures.len());
 
-    for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
-        match state.rpc_client.get_signature_statuses(chunk).await {
-            Ok(resp) => statuses.extend(resp.value),
-            Err(e) => {
-                warn!(
-                    "getSignatureStatuses failed ({} in-flight) — will retry next tick: {}",
-                    batch.len(),
-                    e
-                );
-                // Put everything back so the next drain_in_flight iteration retries.
-                for tx in batch {
-                    state.in_flight.push(tx);
-                }
-                return;
-            }
+    let statuses = match fetch_statuses_checked(&state.rpc_client, &signatures).await {
+        Ok(s) => s,
+        Err(e) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), e.reason()])
+                .inc();
+            // Reinsert the full batch so the next drain_in_flight iteration retries.
+            state.in_flight.push_all(batch);
+            return;
         }
-    }
+    };
 
     let results: Vec<_> = batch.into_iter().zip(statuses).collect();
     route_poll_results(state, results, storage_tx).await;
@@ -2163,29 +2209,18 @@ pub(super) async fn run_poll_task(
 
         signatures.clear();
         signatures.extend(batch.iter().map(|t| t.signature));
-        let mut statuses: Vec<Option<_>> = Vec::with_capacity(signatures.len());
-        let mut rpc_ok = true;
 
-        for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
-            match rpc_client.get_signature_statuses(chunk).await {
-                Ok(resp) => statuses.extend(resp.value),
-                Err(e) => {
-                    warn!(
-                        "getSignatureStatuses failed ({} in-flight) — will retry next tick: {}",
-                        batch.len(),
-                        e
-                    );
-                    rpc_ok = false;
-                    break;
-                }
+        let statuses = match fetch_statuses_checked(&rpc_client, &signatures).await {
+            Ok(s) => s,
+            Err(e) => {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), e.reason()])
+                    .inc();
+                // Put everything back in one lock acquisition and retry next tick.
+                in_flight.push_all(batch);
+                continue;
             }
-        }
-
-        if !rpc_ok {
-            // Put everything back in one lock acquisition.
-            in_flight.push_all(batch);
-            continue;
-        }
+        };
 
         let mut results: Vec<PollTaskResult> = Vec::with_capacity(batch.len());
 
@@ -5602,28 +5637,12 @@ mod tests {
     // ── poll_in_flight: chunking ──────────────────────────────────────
 
     /// When in_flight exceeds 256 entries (the getSignatureStatuses limit), poll_in_flight
-    /// must issue multiple RPC calls — one per 256-sig chunk — and merge the results.
+    /// must issue multiple RPC calls, one per 256-sig chunk, and merge the results.
     ///
-    /// Strategy: mock returns all-null statuses (not yet confirmed) so every entry stays
-    /// in `remaining` after the call.  We seed 300 entries and assert the mock was hit
-    /// at least twice (≥ 2 chunks: 256 + 44), and that all 300 entries are still in-flight.
+    /// Each chunk response is sized to exactly the number of signatures requested (256 then
+    /// 44) so the length gate passes and the legitimate multi-chunk merge is exercised.
     #[tokio::test]
     async fn poll_in_flight_chunks_large_batch() {
-        // Build a response body with 256 null slots — enough for the largest chunk.
-        // The zip in poll_in_flight stops at the shorter of (batch, statuses), so
-        // returning 256 nulls for both the 256-sig chunk and the 44-sig chunk is fine:
-        // extra slots are ignored, missing slots cause zip to stop early (entries stay).
-        let null_statuses: Vec<serde_json::Value> = vec![serde_json::Value::Null; 256];
-        let response_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {
-                "context": {"slot": 1},
-                "value": null_statuses
-            }
-        })
-        .to_string();
-
         let mut server = mockito::Server::new_async().await;
         let _m = server
             .mock("POST", "/")
@@ -5631,8 +5650,14 @@ mod tests {
                 "method": "getSignatureStatuses"
             })))
             .with_status(200)
-            .with_body(response_body)
-            .expect_at_least(2) // 256 sigs → chunk 1; 44 sigs → chunk 2
+            .with_body_from_request(|req| {
+                let v: serde_json::Value =
+                    serde_json::from_slice(req.body().expect("request body present"))
+                        .expect("request body is json");
+                let requested = v["params"][0].as_array().map(|a| a.len()).unwrap_or(0);
+                null_value_body(requested).into_bytes()
+            })
+            .expect_at_least(2) // 256 sigs -> chunk 1; 44 sigs -> chunk 2
             .create();
 
         let total = 300usize;
@@ -5653,6 +5678,505 @@ mod tests {
             "all entries must stay in-flight"
         );
         _m.assert(); // verifies ≥ 2 RPC calls were made
+    }
+
+    // ── status fetch length gate ─────────────────────────────────────
+
+    // An RpcClientWithRetry pointed at a mockito server, failing fast.
+    fn make_rpc_client(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    // A getSignatureStatuses response body with `count` null status slots.
+    fn null_value_body(count: usize) -> String {
+        let value = vec![serde_json::Value::Null; count];
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"context": {"slot": 1}, "value": value}
+        })
+        .to_string()
+    }
+
+    // A getSignatureStatuses response body with `count` finalized-success slots.
+    fn finalized_value_body(count: usize) -> String {
+        let one = serde_json::json!({
+            "confirmationStatus": "finalized",
+            "confirmations": null,
+            "err": null,
+            "slot": 100,
+            "status": {"Ok": null}
+        });
+        let value = vec![one; count];
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"context": {"slot": 100}, "value": value}
+        })
+        .to_string()
+    }
+
+    // Mock getSignatureStatuses; the per-call counter lets a test shape one chunk
+    // while sizing the rest to their request.
+    fn mock_status_bodies<F>(server: &mut mockito::ServerGuard, f: F) -> mockito::Mock
+    where
+        F: Fn(usize, usize) -> String + Send + Sync + 'static,
+    {
+        let counter = Arc::new(AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let idx = counter.fetch_add(1, Ordering::SeqCst);
+                let body = req.body().expect("request body present");
+                let v: serde_json::Value =
+                    serde_json::from_slice(body).expect("request body is json");
+                let requested = v["params"][0].as_array().map(|a| a.len()).unwrap_or(0);
+                f(idx, requested).into_bytes()
+            })
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// An exactly-sized single chunk returns Ok with the requested length.
+    #[tokio::test]
+    async fn fetch_statuses_exact_single_chunk_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
+
+        let statuses = fetch_statuses_checked(&rpc, &sigs)
+            .await
+            .expect("exact chunk must be Ok");
+        assert_eq!(statuses.len(), 10);
+    }
+
+    /// A short single chunk (N-1 for N) is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_short_single_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req - 1));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// An oversized single chunk (N+1 for N) is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_oversized_single_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req + 1));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// An empty value array for a non-empty request is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_empty_value_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, _req| null_value_body(0));
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..5).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// Every chunk exact returns Ok, concatenated in request order.
+    #[tokio::test]
+    async fn fetch_statuses_multi_chunk_all_exact_ok_ordered() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                finalized_value_body(req)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        // 600 sigs -> chunks of 256 + 256 + 88.
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        let statuses = fetch_statuses_checked(&rpc, &sigs)
+            .await
+            .expect("all-exact multi-chunk must be Ok");
+        assert_eq!(statuses.len(), 600);
+        // First chunk finalized, remaining chunks null: proves concatenation order.
+        assert!(statuses[0].is_some());
+        assert!(statuses[255].is_some());
+        assert!(statuses[256].is_none());
+        assert!(statuses[599].is_none());
+    }
+
+    /// A short first chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_short_first_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                null_value_body(req - 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// A short middle chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_short_middle_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 1 {
+                null_value_body(req - 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// A short final chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_short_final_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 2 {
+                null_value_body(req - 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// An oversized middle chunk is rejected.
+    #[tokio::test]
+    async fn fetch_statuses_oversized_middle_chunk_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 1 {
+                null_value_body(req + 1)
+            } else {
+                null_value_body(req)
+            }
+        });
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// An RPC transport error on a chunk is surfaced as Err.
+    #[tokio::test]
+    async fn fetch_statuses_rpc_error_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32600, "message": "Internal error"}
+                })
+                .to_string(),
+            )
+            .create();
+        let rpc = make_rpc_client(&server.url());
+        let sigs: Vec<Signature> = (0..3).map(|_| Signature::new_unique()).collect();
+
+        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+    }
+
+    /// An empty signature slice returns Ok(empty) and issues no RPC call.
+    #[tokio::test]
+    async fn fetch_statuses_empty_slice_ok_no_call() {
+        let mut server = mockito::Server::new_async().await;
+        // Any call would be a bug: assert the mock is never hit.
+        let m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(null_value_body(0))
+            .expect(0)
+            .create();
+        let rpc = make_rpc_client(&server.url());
+
+        let statuses = fetch_statuses_checked(&rpc, &[])
+            .await
+            .expect("empty is Ok");
+        assert!(statuses.is_empty());
+        m.assert();
+    }
+
+    /// A short only-chunk reinserts the full batch and settles nothing.
+    #[tokio::test]
+    async fn poll_in_flight_short_chunk_full_reinsert_no_settlement() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req - 1));
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let ids: Vec<i64> = (1..=5).collect();
+        for id in &ids {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(state.in_flight.len(), 5, "all entries reinserted");
+        {
+            let guard = state.in_flight.entries.lock().unwrap();
+            let mut present: Vec<i64> = guard.iter().filter_map(|t| t.ctx.transaction_id).collect();
+            present.sort_unstable();
+            assert_eq!(present, ids, "no entry dropped");
+            assert!(
+                guard.iter().all(|t| t.poll_attempts == 0),
+                "poll_attempts not incremented on a malformed cycle"
+            );
+        }
+        assert!(storage_rx.try_recv().is_err(), "no Completed emitted");
+    }
+
+    /// 257 entries across a chunk boundary, chunk 1 confirmed and chunk 2 short:
+    /// nothing may settle and no entry may be dropped.
+    #[tokio::test]
+    async fn poll_in_flight_cross_chunk_short_no_misattribution() {
+        let mut server = mockito::Server::new_async().await;
+        // Chunk 0 (256 sigs) all finalized; chunk 1 (1 sig) returns an empty value.
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                finalized_value_body(req)
+            } else {
+                null_value_body(0)
+            }
+        });
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let ids: Vec<i64> = (1..=257).collect();
+        for id in &ids {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(300);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(state.in_flight.len(), 257, "all 257 entries reinserted");
+        {
+            let guard = state.in_flight.entries.lock().unwrap();
+            let mut present: Vec<i64> = guard.iter().filter_map(|t| t.ctx.transaction_id).collect();
+            present.sort_unstable();
+            assert_eq!(present, ids, "tail entry (id 257) not dropped");
+        }
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no Completed for any transaction on a malformed cross-chunk cycle"
+        );
+    }
+
+    /// An oversized chunk is caught by the same gate as the short-chunk cases.
+    #[tokio::test]
+    async fn poll_in_flight_oversized_chunk_full_reinsert_no_settlement() {
+        let mut server = mockito::Server::new_async().await;
+        // Chunk 0 (256) finalized; chunk 1 (1 sig) returns two statuses (oversized).
+        let _m = mock_status_bodies(&mut server, |idx, req| {
+            if idx == 0 {
+                finalized_value_body(req)
+            } else {
+                null_value_body(req + 1)
+            }
+        });
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let ids: Vec<i64> = (1..=257).collect();
+        for id in &ids {
+            state
+                .in_flight
+                .push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(300);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(state.in_flight.len(), 257, "all entries reinserted");
+        assert!(storage_rx.try_recv().is_err(), "no Completed emitted");
+    }
+
+    /// Happy-path multi-chunk: every chunk is exact, so each entry settles paired
+    /// with its own signature.
+    #[tokio::test]
+    async fn poll_in_flight_multi_chunk_confirmed_settles_with_correct_pairing() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| finalized_value_body(req));
+
+        let mut state = make_sender_state_with_server(&server.url());
+        let total = 300usize;
+        let mut sig_by_id: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        for i in 0..total {
+            let sig = Signature::new_unique();
+            let id = i as i64 + 1;
+            sig_by_id.insert(id, sig.to_string());
+            state.in_flight.push(make_in_flight_tx(sig, id));
+        }
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(total + 10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert!(state.in_flight.is_empty(), "all confirmed entries settled");
+        let mut seen = 0usize;
+        while let Ok(update) = storage_rx.try_recv() {
+            assert_eq!(update.status, TransactionStatus::Completed);
+            assert_eq!(
+                update.counterpart_signature.as_deref(),
+                sig_by_id.get(&update.transaction_id).map(|s| s.as_str()),
+                "Completed must pair each transaction with its own signature"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, total, "exactly one Completed per transaction");
+    }
+
+    /// The production poll task applies the same gate: a short chunk reinserts the
+    /// batch and settles nothing.
+    #[tokio::test]
+    async fn run_poll_task_short_chunk_reinserts_no_settlement() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| null_value_body(req - 1));
+
+        let in_flight = InFlightQueue::new();
+        let (result_tx, mut result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let rpc = Arc::new(make_rpc_client(&server.url()));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let ids: Vec<i64> = (1..=5).collect();
+        for id in &ids {
+            in_flight.push(make_in_flight_tx(Signature::new_unique(), *id));
+        }
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            5,
+            token.clone(),
+        ));
+
+        // Give the task time to drain, poll, hit the short response, and reinsert.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit after cancellation")
+            .expect("task must not panic");
+
+        assert!(
+            result_rx.try_recv().is_err(),
+            "no PollTaskResult on malformed cycle"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no Completed on malformed cycle"
+        );
+        assert_eq!(in_flight.len(), 5, "batch reinserted after short chunk");
+        let mut present: Vec<i64> = {
+            let guard = in_flight.entries.lock().unwrap();
+            guard.iter().filter_map(|t| t.ctx.transaction_id).collect()
+        };
+        present.sort_unstable();
+        assert_eq!(present, ids, "no entry dropped");
+        // Prove the task actually polled, so the negative assertions are not vacuous.
+        _m.assert();
+    }
+
+    /// Happy-path multi-chunk on the production task settles every entry with its
+    /// own signature.
+    #[tokio::test]
+    async fn run_poll_task_multi_chunk_confirmed_settles() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| finalized_value_body(req));
+
+        let in_flight = InFlightQueue::new();
+        let (result_tx, _result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(400);
+        let rpc = Arc::new(make_rpc_client(&server.url()));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let total = 300usize;
+        let mut sig_by_id: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        for i in 0..total {
+            let sig = Signature::new_unique();
+            let id = i as i64 + 1;
+            sig_by_id.insert(id, sig.to_string());
+            in_flight.push(make_in_flight_tx(sig, id));
+        }
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            5,
+            token.clone(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit after cancellation")
+            .expect("task must not panic");
+
+        assert_eq!(in_flight.len(), 0, "all confirmed entries settled");
+        let mut seen = 0usize;
+        while let Ok(update) = storage_rx.try_recv() {
+            assert_eq!(update.status, TransactionStatus::Completed);
+            assert_eq!(
+                update.counterpart_signature.as_deref(),
+                sig_by_id.get(&update.transaction_id).map(|s| s.as_str()),
+                "Completed must pair each transaction with its own signature"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, total, "exactly one Completed per transaction");
     }
 
     /// An idempotent tx that exhausts its resend_count budget must be declared a
