@@ -756,9 +756,14 @@ impl Gateway {
             _ => return Ok(false),
         };
 
-        // Public methods need neither a token nor a role check.
+        // Public methods need neither a token nor a role check, but redaction is a
+        // separate axis: getSignatureStatuses is ungated and still error-bearing.
         if !is_gated(method) {
-            return Ok(false);
+            return Ok(redacts_transaction_errors(
+                auth_header,
+                decoding_key,
+                method,
+            ));
         }
 
         let mut claims = verify_bearer(auth_header, decoding_key);
