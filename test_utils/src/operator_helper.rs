@@ -37,7 +37,7 @@ fn default_operator_config() -> OperatorConfig {
         alert_webhook_url: None,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
         confirmation_poll_interval_ms: 400,
     }
@@ -68,8 +68,10 @@ pub async fn start_solana_to_private_channel_operator(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
+        // Single-validator harness: Solana custody and the channel share one node.
+        source_rpc_url: Some(private_channel_rpc_url.clone()),
         rpc_url: private_channel_rpc_url,
-        source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -156,7 +158,7 @@ fn mock_operator_config() -> OperatorConfig {
         // to fire. Tests that do can script the relevant RPC replies.
         reconciliation_interval: Duration::from_secs(60 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         // Long feepayer monitor interval so the test isn't racing against
         // unrelated `getBalance` traffic. The first tick still happens at
         // start; tests that need it stubbed should enqueue a reply.
@@ -191,6 +193,7 @@ pub async fn start_private_channel_to_solana_operator_with_mocks(
         // Withdraw operator requires a source chain for remints; the mock harness
         // is single-server, so point it at the same scripted RPC.
         source_rpc_url: Some(rpc.url()),
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -237,8 +240,10 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
+        // Mock harness: custody and channel both point at the one mock RPC.
+        source_rpc_url: Some(rpc.url()),
         rpc_url: rpc.url(),
-        source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
@@ -265,6 +270,16 @@ pub async fn start_solana_to_private_channel_operator_with_mocks(
     })
 }
 
+/// A distinct URL for the same local validator so a withdraw-operator test satisfies the
+/// "fallback must differ from rpc_url" gate with one node. Toggling a trailing slash keeps
+/// the exact host (swapping 127.0.0.1<->localhost risks an IPv4/IPv6 bind mismatch).
+pub fn same_host_fallback_url(rpc_url: &str) -> String {
+    match rpc_url.strip_suffix('/') {
+        Some(stripped) => stripped.to_string(),
+        None => format!("{rpc_url}/"),
+    }
+}
+
 /// Start the operator that reads from PrivateChannel indexer and releases funds on Solana.
 pub async fn start_private_channel_to_solana_operator(
     solana_rpc_url: String,
@@ -280,12 +295,17 @@ pub async fn start_private_channel_to_solana_operator(
 
     let storage = Arc::new(Storage::Postgres(PostgresDb::new(&postgres_config).await?));
 
+    // The withdraw operator now requires an independent, same-cluster fallback;
+    // reuse the same validator via a distinct URL string (single-validator harness).
+    let fallback_url = same_host_fallback_url(&solana_rpc_url);
+
     let common_config = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         rpc_url: solana_rpc_url,
         // Source chain (PrivateChannel), where the burn happened and remints land.
         source_rpc_url: Some(private_channel_rpc_url),
+        fallback_rpc_url: Some(fallback_url),
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };

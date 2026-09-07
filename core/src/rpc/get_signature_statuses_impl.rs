@@ -27,9 +27,12 @@ pub async fn get_signature_statuses_impl(
         ));
     }
 
+    // Read the slot BEFORE the per-signature lookups. The lookups then observe a
+    // state at or after it, so the reported context understates freshness and a
+    // null can never claim to cover a block the response has not yet seen.
     let current_slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
         .unwrap_or(0);
@@ -37,22 +40,28 @@ pub async fn get_signature_statuses_impl(
     let mut statuses = Vec::with_capacity(signatures.len());
 
     for sig_str in signatures {
-        // Parse the signature
-        let signature = match Signature::from_str(&sig_str) {
-            Ok(sig) => sig,
-            Err(e) => {
-                warn!(
-                    signature = %sig_str.get(..20).unwrap_or(&sig_str),
-                    error = %e,
-                    "Invalid signature format in getSignatureStatuses"
-                );
-                statuses.push(None);
-                continue;
-            }
-        };
+        // An unparseable signature is a client error, not an absence: rendering it
+        // as null would make a caller read a typo as proof of non-inclusion.
+        let signature = Signature::from_str(&sig_str).map_err(|e| {
+            warn!(
+                signature = %sig_str.get(..20).unwrap_or(&sig_str),
+                error = %e,
+                "Invalid signature format in getSignatureStatuses"
+            );
+            custom_error(INVALID_PARAMS_CODE, format!("Invalid signature: {}", e))
+        })?;
 
-        // Check if transaction exists
-        let stored_tx = read_deps.accounts_db.get_transaction(&signature).await;
+        // A lookup failure is an error, never a null: absence must mean absence.
+        let stored_tx = read_deps
+            .accounts_db
+            .get_transaction(&signature)
+            .await
+            .map_err(|e| {
+                custom_error(
+                    JSON_RPC_SERVER_ERROR,
+                    format!("Failed to get transaction status: {}", e),
+                )
+            })?;
 
         match stored_tx {
             Some(tx) => {

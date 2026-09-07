@@ -3,7 +3,11 @@
 
 [common]
 program_type = "escrow"
-rpc_url = "http://gateway:8899"
+# Gateway's internal listener: this service carries no JWT, and its confirmation
+# handling routes on the exact error the public listener collapses.
+rpc_url = "http://gateway:8904"
+# fallback_rpc_url: N/A here. This operator's rpc_url is the single-provider
+# PrivateChannel gateway, which has no independent endpoint to corroborate.
 # TODO: Add devnet solana rpc url
 source_rpc_url = "your_devnet_solana_rpc_url"
 # TODO: Add escrow instance id
@@ -21,3 +25,7 @@ retry_base_delay_secs = 1
 channel_buffer_size = 1000
 # Solana Private Channels block time is ~100 ms; poll quickly to reduce per-mint latency
 confirmation_poll_interval_ms = 100
+# Required for the escrow operator: a reconciliation mismatch must always alert,
+# so the operator refuses to start without this. Override via
+# OPERATOR_RECONCILIATION_WEBHOOK_URL for a real endpoint.
+reconciliation_webhook_url = "http://localhost:9/no-op"

@@ -4,7 +4,7 @@ use {
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     sqlx::{postgres::PgPoolOptions, PgPool},
     std::sync::Arc,
-    tracing::{debug, info},
+    tracing::{debug, error, info},
 };
 
 /// Default pool size. Needs headroom so the settler's BEGIN…COMMIT doesn't
@@ -97,23 +97,38 @@ impl PostgresAccountsDB {
 impl InvokeContextCallback for PostgresAccountsDB {}
 
 impl TransactionProcessingCallback for PostgresAccountsDB {
+    // The upstream signature cannot carry a failure, so a load error is logged
+    // and collapses to `None` here. Nothing in production reaches this impl: the
+    // SVM always runs against BOB or a gasless callback, both in-memory.
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         let db = super::traits::AccountsDB::Postgres(self.clone());
         let pubkey = *pubkey;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                super::get_account_shared_data::get_account_shared_data(&db, &pubkey).await
+                super::get_account_shared_data::get_account_shared_data(&db, &pubkey)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("account load failed at the SVM callback boundary: {}", e);
+                        None
+                    })
             })
         })
     }
 
+    // Same boundary as above: an unanswerable read is logged and reads as "no
+    // match" only because the upstream signature offers nowhere else to go.
     fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
         let db = super::traits::AccountsDB::Postgres(self.clone());
         let account = *account;
         let owners = owners.to_vec();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                super::account_matches_owners::account_matches_owners(&db, &account, &owners).await
+                super::account_matches_owners::account_matches_owners(&db, &account, &owners)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("account load failed at the SVM callback boundary: {}", e);
+                        None
+                    })
             })
         })
     }
@@ -172,6 +187,18 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .execute(pool)
     .await?;
 
+    // Identifies this database, so a Redis cache carrying another deployment's
+    // ledger keys can be recognised and purged instead of served. DO NOTHING
+    // keeps an existing database's identifier stable across restarts; a fresh
+    // database, or one restored from a different ledger, gets a different one.
+    sqlx::query(
+        "INSERT INTO metadata (key, value) VALUES ('deployment_id', $1)
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind(&rand::random::<[u8; 16]>()[..])
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         r#"
             CREATE TABLE IF NOT EXISTS performance_samples (
@@ -216,6 +243,29 @@ mod tests {
     use solana_svm_callback::TransactionProcessingCallback;
 
     const ENV_VAR: &str = "PRIVATE_CHANNEL_PG_MAX_CONNECTIONS";
+
+    /// `create_tables` runs on every boot, so the deployment id must be minted
+    /// once and then left alone. Re-minting it would make the Redis cache look
+    /// like it belonged to another ledger and purge it on every restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deployment_id_survives_reopening_the_database() {
+        // Both handles point at the same database, and the second one re-runs
+        // create_tables, which is exactly what a restart does.
+        let (first, second, _pg) = start_test_postgres_with_new_instance().await;
+
+        let first_id = crate::accounts::redis_coherence::read_deployment_id(&first)
+            .await
+            .unwrap();
+        let second_id = crate::accounts::redis_coherence::read_deployment_id(&second)
+            .await
+            .unwrap();
+
+        assert_eq!(first_id.len(), 16, "deployment id must be 16 bytes");
+        assert_eq!(
+            first_id, second_id,
+            "re-running create_tables must not re-mint the deployment id"
+        );
+    }
 
     /// Snapshot the env var, run `body`, restore. `serial_test` prevents
     /// concurrent tests from racing on the shared process env.

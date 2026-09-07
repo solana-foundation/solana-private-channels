@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Gated ticks with no frontier advance before a stall warning fires (~15s at 5s/tick).
 const STALL_WARN_TICKS: u32 = 3;
@@ -18,6 +18,19 @@ const STALL_WARN_TICKS: u32 = 3;
 pub struct CheckpointUpdate {
     pub program_type: ProgramType,
     pub slot: u64,
+}
+
+/// In-band message on the checkpoint channel. `Slot` advances the durable frontier;
+/// `Regate` re-arms the per-program gate on reconnect. Both ride one FIFO channel so
+/// a re-arm always applies before the slot it precedes (no cross-channel race).
+#[derive(Debug, Clone)]
+pub enum CheckpointMsg {
+    Slot(CheckpointUpdate),
+    Regate {
+        program_type: ProgramType,
+        from: u64,
+        target: u64,
+    },
 }
 
 /// Per-program-type checkpoint progress.
@@ -33,7 +46,8 @@ struct CheckpointState {
     frontier: u64,
     // Processed-but-not-yet-contiguous slots in `(frontier, target]`, awaiting the fold.
     completed: HashSet<u64>,
-    // Backfill target `T0` while gated; `None` once handed off / ungated (plain max).
+    // Backfill/reconnect target while gated; `None` only when never gated. After the
+    // frontier reaches the target it stays `Some` but is inert (the plain-max path).
     gate: Option<u64>,
     // True when `frontier` advanced since the last successful flush (so flush has work).
     dirty: bool,
@@ -52,10 +66,10 @@ impl CheckpointState {
         }
     }
 
-    /// Gated state seeded at backfill's effective `from_slot`. Seeding the frontier
-    /// from `from_slot` (not a bare DB read) is required because a configured
-    /// `start_slot` can push `from_slot` above the stored checkpoint; seeding lower
-    /// would stall the frontier on slots that backfill will never emit.
+    /// Gated state seeded at backfill's effective `from_slot`. Seeding from `from_slot`
+    /// (not a bare DB read) is required when nothing has ever been indexed, because a
+    /// configured start slot puts the floor above zero and seeding lower would stall the
+    /// frontier on slots that backfill will never emit.
     fn gated(from_slot: u64, target: u64) -> Self {
         Self {
             frontier: from_slot,
@@ -108,6 +122,15 @@ impl CheckpointState {
         if self.frontier >= target {
             self.completed.clear();
         }
+    }
+
+    /// Re-arm the gate to hold the checkpoint until slots `(from, target]` are filled.
+    /// `from` is the durable checkpoint: pulling the frontier up to it stops a brand-new
+    /// state from gating at 0 and never folding. The frontier never moves backward, and
+    /// the newest reconnect sets the target so a lower resume slot can still hand off.
+    fn regate(&mut self, from: u64, target: u64) {
+        self.frontier = self.frontier.max(from);
+        self.gate = Some(target);
     }
 
     /// Slots left to fill while gated (`target - frontier`), saturating to 0 post-handoff.
@@ -163,7 +186,7 @@ impl CheckpointWriter {
 
     /// Start the checkpoint writer service
     /// Spawns a background task that listens for checkpoint updates and batches writes to DB
-    pub fn start(self, mut rx: mpsc::Receiver<CheckpointUpdate>) -> JoinHandle<()> {
+    pub fn start(self, mut rx: mpsc::Receiver<CheckpointMsg>) -> JoinHandle<()> {
         tokio::spawn(async move {
             info!(
                 "Starting CheckpointWriter service (batch interval: {}s, max batch size: {}, gated: {})",
@@ -182,7 +205,12 @@ impl CheckpointWriter {
                 tokio::select! {
                     update = rx.recv() => {
                         match update {
-                            Some(update) => {
+                            // A Regate is a control signal, not slot progress: re-arm the
+                            // gate and do not count it toward a batch flush.
+                            Some(CheckpointMsg::Regate { program_type, from, target }) => {
+                                self.record_regate(&mut states, program_type, from, target);
+                            }
+                            Some(CheckpointMsg::Slot(update)) => {
                                 self.record_update(&mut states, update);
 
                                 update_count += 1;
@@ -226,6 +254,25 @@ impl CheckpointWriter {
             .set(state.lag() as f64);
     }
 
+    /// Handle a reconnect Regate for one program: re-arm its gate over `(from, target]`
+    /// and refresh the lag gauge. Just in-memory state, no DB write. The gate then holds
+    /// the checkpoint until the backfill fills every slot in that window.
+    fn record_regate(
+        &self,
+        states: &mut HashMap<ProgramType, CheckpointState>,
+        program_type: ProgramType,
+        from: u64,
+        target: u64,
+    ) {
+        let state = states
+            .entry(program_type)
+            .or_insert_with(|| self.new_state());
+        state.regate(from, target);
+        metrics::INDEXER_CHECKPOINT_FRONTIER_LAG
+            .with_label_values(&[program_type.as_label()])
+            .set(state.lag() as f64);
+    }
+
     /// Re-warn every `STALL_WARN_TICKS` ticks that a gated frontier stays frozen, and refresh the lag gauge so it stays live when no updates arrive.
     fn warn_on_stall(states: &mut HashMap<ProgramType, CheckpointState>) {
         for (&program_type, state) in states.iter_mut() {
@@ -257,11 +304,9 @@ impl CheckpointWriter {
             if !state.dirty {
                 continue;
             }
-            let program_type_str = format!("{:?}", program_type).to_lowercase();
-
             match self
                 .storage
-                .update_committed_checkpoint(&program_type_str, state.frontier)
+                .update_committed_checkpoint(&program_key(program_type), state.frontier)
                 .await
             {
                 Ok(_) => {
@@ -282,19 +327,176 @@ impl CheckpointWriter {
     }
 }
 
-/// Helper to get the last checkpoint for a program type
+/// Storage key a program type's checkpoint row is stored under.
+pub(crate) fn program_key(program_type: ProgramType) -> String {
+    format!("{:?}", program_type).to_lowercase()
+}
+
+/// Read a program type's durable checkpoint, or `None` when it has never been written.
+///
+/// Absence and slot zero are deliberately kept apart. A caller that wants to catch up
+/// from the beginning can treat `None` as genesis, but reconnect repair needs to know
+/// it has no recovery anchor at all, because advancing past a gap it cannot replay
+/// would put the missed slots permanently out of reach.
 pub async fn get_last_checkpoint(
     storage: &Arc<Storage>,
     program_type: ProgramType,
-) -> Result<u64, CheckpointError> {
-    let program_type_str = format!("{:?}", program_type).to_lowercase();
+) -> Result<Option<u64>, CheckpointError> {
     let checkpoint = storage
-        .get_committed_checkpoint(&program_type_str)
-        .await?
-        .unwrap_or(0);
+        .get_committed_checkpoint(&program_key(program_type))
+        .await?;
 
-    info!("Last checkpoint for {:?}: {}", program_type, checkpoint);
+    info!("Last checkpoint for {:?}: {:?}", program_type, checkpoint);
     Ok(checkpoint)
+}
+
+/// Config key naming the first slot startup backfill should fill.
+pub const BACKFILL_START_SETTING: &str = "indexer.backfill.start_slot";
+
+/// Config key naming the first slot the RPC polling source should request.
+pub const RPC_POLLING_START_SETTING: &str = "indexer.rpc_polling.start_slot";
+
+/// Exclusive floor a configured start slot may set, or an error naming the slots it would
+/// skip.
+///
+/// A durable checkpoint is evidence of what was actually processed; a configured start slot
+/// is only intent. Intent may initialise a ledger that has never been indexed, but letting
+/// it advance past evidence would drop the slots in between with nothing recording them.
+pub fn start_floor(
+    setting: &'static str,
+    program_type: ProgramType,
+    last_checkpoint: Option<u64>,
+    configured_start: Option<u64>,
+) -> Result<u64, CheckpointError> {
+    match (last_checkpoint, configured_start) {
+        // A start slot is inclusive and a checkpoint exclusive, so compare one below it.
+        // Equal means resuming exactly where we stopped, which skips nothing.
+        (Some(checkpoint), Some(start_slot)) if start_slot.saturating_sub(1) > checkpoint => {
+            Err(CheckpointError::StartSlotAheadOfCheckpoint {
+                setting,
+                program_type: program_type.as_label(),
+                start_slot,
+                checkpoint,
+            })
+        }
+        // Below the checkpoint the configured value is silently dropped, so say so once.
+        (Some(checkpoint), Some(start_slot)) if start_slot.saturating_sub(1) < checkpoint => {
+            warn!(
+                setting,
+                program_type = program_type.as_label(),
+                start_slot,
+                checkpoint,
+                "configured start slot is below the durable checkpoint and is ignored; \
+                 re-scanning already-indexed slots needs a destructive resync, not a lower \
+                 start slot"
+            );
+            Ok(checkpoint)
+        }
+        (Some(checkpoint), _) => Ok(checkpoint),
+        // Never indexed, so the configured start picks the floor, else catch up from genesis.
+        (None, configured) => Ok(configured.unwrap_or(0).saturating_sub(1)),
+    }
+}
+
+/// Inclusive slot a live stream with no fill behind it must resume from, or `None` to
+/// leave the source its own default of the chain tip.
+///
+/// A checkpoint is exclusive, so the next unprocessed slot sits one above it. A configured
+/// start is already inclusive and passes through untouched, keeping it distinct from the
+/// slot above it on a ledger that has never been indexed.
+///
+/// Genesis is floored to slot one because proving a slot empty needs a predecessor to
+/// anchor on, and slot zero has none. Starting there would retry forever on any endpoint
+/// that no longer serves the genesis block, and no program is deployed that early anyway.
+pub fn live_resume_slot(
+    last_checkpoint: Option<u64>,
+    configured_start: Option<u64>,
+) -> Option<u64> {
+    last_checkpoint
+        .map(|checkpoint| checkpoint.saturating_add(1))
+        .or(configured_start)
+        .map(|slot| slot.max(1))
+}
+
+/// Longest startup will wait for a filled range to become durable before giving up.
+///
+/// Sized as a fail-closed backstop rather than a tuning knob. By the time the wait starts
+/// every message has already been sent, and the instruction channel holds at most a
+/// thousand of them, so what remains is the processor draining that buffer plus one flush
+/// interval. Two minutes is far above that, and exceeding it means a slot is genuinely
+/// stuck rather than slow.
+pub const CHECKPOINT_COMMIT_TIMEOUT_SECS: u64 = 120;
+
+/// How often the wait re-reads the durable checkpoint.
+const CHECKPOINT_COMMIT_POLL_MS: u64 = 200;
+
+/// Wait until the durable checkpoint for `program_type` covers `target`.
+///
+/// This is the witness that a backfilled range is both processed and persisted. It is
+/// exact rather than approximate because the writer's gate seeds its frontier at the
+/// range floor and then advances only across contiguous slots, so the checkpoint cannot
+/// reach the target until every slot in between has been fully written.
+///
+/// A read failure is a database blip and is retried; an absent row means the writer has
+/// not flushed for the first time yet, which is normal on a fresh store, so it is also
+/// retried. Only the deadline ends this unsuccessfully, and it does so by failing the
+/// boot: continuing would compare on-chain custody against a ledger still missing a slot.
+pub async fn wait_for_checkpoint_commit(
+    storage: &Arc<Storage>,
+    program_type: ProgramType,
+    target: u64,
+    timeout: Duration,
+) -> Result<(), CheckpointError> {
+    let started = tokio::time::Instant::now();
+    let key = program_key(program_type);
+    let mut last: Option<u64> = None;
+    // Only a successful read tells us anything about the frontier. Without this, a store
+    // whose reads all fail would time out reporting "no row was ever written", sending an
+    // operator after a stalled writer when the real fault is an unreachable database.
+    let mut read_ok = false;
+
+    loop {
+        // Read the row directly rather than through get_last_checkpoint, whose per-call
+        // info log would emit hundreds of lines across a long wait.
+        match storage.get_committed_checkpoint(&key).await {
+            Ok(committed) => {
+                last = committed;
+                read_ok = true;
+                if committed.is_some_and(|slot| slot >= target) {
+                    info!(
+                        "Checkpoint for {:?} committed at {:?}, covering backfill target {}",
+                        program_type, committed, target
+                    );
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Checkpoint read failed while waiting for {:?} to reach {}, retrying: {}",
+                    program_type, target, e
+                );
+            }
+        }
+
+        let waited_secs = started.elapsed().as_secs();
+        if started.elapsed() >= timeout {
+            if !read_ok {
+                error!(
+                    "Checkpoint for {:?} was never readable while waiting for {}; the store \
+                     is unreachable rather than the frontier being stalled",
+                    program_type, target
+                );
+            }
+            return Err(CheckpointError::CommitTimeout {
+                program_type: key,
+                last,
+                target,
+                waited_secs,
+            });
+        }
+
+        tokio::time::sleep(Duration::from_millis(CHECKPOINT_COMMIT_POLL_MS)).await;
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +599,154 @@ mod tests {
         drive(&mut state, &[T0 + 50]);
         // frontier (T0+50) > target (T0): saturating_sub must report 0, not wrap.
         assert_eq!(state.lag(), 0);
+    }
+
+    // ============================================================================
+    // Regate (reconnect re-arm) Tests
+    // ============================================================================
+
+    /// After a hand-off, a reconnect re-arms the gate to a new target; a hole plus
+    /// a live tip must not leapfrog the frontier, and once the residual window fills
+    /// contiguously it folds up to the new target and hands off again.
+    #[test]
+    fn regate_rearms_after_handoff_and_blocks_leapfrog() {
+        let mut state = CheckpointState::gated(FROM, T0);
+        let full: Vec<u64> = (FROM + 1..=T0).collect();
+        assert_eq!(drive(&mut state, &full), T0);
+        // Hand off to plain-max with a live slot above T0.
+        assert_eq!(drive(&mut state, &[T0 + 50]), T0 + 50);
+
+        // Reconnect observes a later resume slot and re-arms the gate.
+        state.regate(T0 + 50, T0 + 100);
+
+        // A hole (T0+51 skipped) plus a live tip cannot move the durable frontier.
+        assert_eq!(drive(&mut state, &[T0 + 52, 9_000_000]), T0 + 50);
+
+        // Filling the residual window contiguously folds to the new target.
+        let residual: Vec<u64> = (T0 + 51..=T0 + 100).collect();
+        assert_eq!(drive(&mut state, &residual), T0 + 100);
+
+        // Handed off again: a later live tip advances via plain max.
+        assert_eq!(drive(&mut state, &[9_000_001]), 9_000_001);
+    }
+
+    /// The gate target tracks the latest reconnect: a lower resume slot after a higher
+    /// one lowers the target so the fold can hand off, instead of stalling above what the
+    /// source will emit.
+    #[test]
+    fn regate_latest_target_wins() {
+        let mut state = CheckpointState::gated(FROM, T0);
+        // A first reconnect raises the target above T0.
+        state.regate(FROM, T0 + 20);
+        let upto_t0: Vec<u64> = (FROM + 1..=T0).collect();
+        assert_eq!(drive(&mut state, &upto_t0), T0, "still gated below T0+20");
+        // A later reconnect resumes LOWER; the target follows it down.
+        state.regate(FROM, T0 + 5);
+        let rest: Vec<u64> = (T0 + 1..=T0 + 5).collect();
+        assert_eq!(
+            drive(&mut state, &rest),
+            T0 + 5,
+            "hands off at the latest target"
+        );
+        assert_eq!(drive(&mut state, &[T0 + 500]), T0 + 500, "then plain max");
+    }
+
+    /// A reconnect on a fresh state seeds the frontier to the durable checkpoint, so a
+    /// Regate arriving before any Slot cannot freeze the fold at 0; a later lower `from`
+    /// never rewinds it.
+    #[test]
+    fn regate_seeds_frontier_from_durable_checkpoint() {
+        let mut state = CheckpointState::ungated();
+        assert_eq!(state.frontier, 0);
+        state.regate(5000, 5001);
+        assert_eq!(
+            state.frontier, 5000,
+            "fresh state anchors at the durable checkpoint"
+        );
+        assert_eq!(
+            drive(&mut state, &[5001]),
+            5001,
+            "folds to the target and hands off"
+        );
+        state.regate(10, 6000);
+        assert_eq!(
+            state.frontier, 5001,
+            "a lower from never rewinds the frontier"
+        );
+    }
+
+    /// A target at or below the frontier is inert: the gap is already covered, so
+    /// plain-max progress continues with no stall.
+    #[test]
+    fn regate_below_frontier_is_inert() {
+        let mut state = CheckpointState::ungated();
+        assert_eq!(drive(&mut state, &[500]), 500);
+        state.regate(400, 400);
+        assert_eq!(drive(&mut state, &[600]), 600);
+        assert_eq!(state.lag(), 0);
+    }
+
+    /// A cold-start regate carries a lower `from` and a higher target than the startup gate.
+    /// The widened gate must still fold contiguously, so neither end lets a slot through.
+    #[test]
+    fn regate_over_open_startup_gate_widens_without_skipping() {
+        let mut state = CheckpointState::gated(FROM, T0);
+        // Startup backfill is mid-flight: the gate to T0 is still open.
+        assert_eq!(drive(&mut state, &[FROM + 1, FROM + 2, FROM + 3]), FROM + 3);
+
+        // Cold start arms from the durable checkpoint, which sits below from_slot.
+        state.regate(FROM - 10, T0 + 20);
+        assert_eq!(
+            state.frontier,
+            FROM + 3,
+            "a lower from never pulls the frontier back over the unfilled startup range"
+        );
+
+        // The resume slot alone is a hole away from the frontier, so it cannot move it.
+        assert_eq!(drive(&mut state, &[T0 + 20]), FROM + 3);
+
+        // Only the full contiguous run up to the widened target hands off.
+        let rest: Vec<u64> = (FROM + 4..=T0 + 20).collect();
+        assert_eq!(drive(&mut state, &rest), T0 + 20);
+    }
+
+    /// The writer's Regate handling re-gates the correct per-program state: after
+    /// record_regate the gated frontier stays put and lag reflects the new target.
+    #[test]
+    fn record_regate_arms_gate_for_program() {
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+        let writer = CheckpointWriter::new(storage);
+        let mut states: HashMap<ProgramType, CheckpointState> = HashMap::new();
+
+        // Seed the program at frontier 100 the way the writer loop would.
+        writer.record_update(
+            &mut states,
+            CheckpointUpdate {
+                program_type: ProgramType::Escrow,
+                slot: 100,
+            },
+        );
+        writer.record_regate(&mut states, ProgramType::Escrow, 100, 110);
+
+        // A live tip and an in-gap slot must not move the gated frontier.
+        writer.record_update(
+            &mut states,
+            CheckpointUpdate {
+                program_type: ProgramType::Escrow,
+                slot: 105,
+            },
+        );
+        writer.record_update(
+            &mut states,
+            CheckpointUpdate {
+                program_type: ProgramType::Escrow,
+                slot: 2_000_000,
+            },
+        );
+
+        let state = states.get(&ProgramType::Escrow).unwrap();
+        assert_eq!(state.frontier, 100);
+        assert_eq!(state.lag(), 10);
     }
 
     // ============================================================================
@@ -507,6 +857,156 @@ mod tests {
     }
 
     // ============================================================================
+    // start_floor Tests
+    // ============================================================================
+
+    /// Every reachable pairing of a stored checkpoint and a configured start slot.
+    ///
+    /// One table covers both callers because they ask the same question of different
+    /// config keys, so a rule that holds here holds at each call site.
+    #[test]
+    fn live_resume_slot_matrix() {
+        // (checkpoint, configured start, expected inclusive start, why)
+        type Case = (Option<u64>, Option<u64>, Option<u64>, &'static str);
+
+        let cases: [Case; 7] = [
+            (
+                None,
+                None,
+                None,
+                "nothing known, source keeps its own default",
+            ),
+            (
+                None,
+                Some(0),
+                Some(1),
+                "genesis has no predecessor slot to anchor a proof on",
+            ),
+            (
+                None,
+                Some(200),
+                Some(200),
+                "configured start passes through inclusive",
+            ),
+            (
+                Some(100),
+                None,
+                Some(101),
+                "resume one above the exclusive checkpoint",
+            ),
+            (
+                Some(100),
+                Some(50),
+                Some(101),
+                "checkpoint wins over a lower start",
+            ),
+            (
+                Some(100),
+                Some(101),
+                Some(101),
+                "checkpoint and start agree",
+            ),
+            (Some(0), Some(0), Some(1), "slot zero already processed"),
+        ];
+
+        for (checkpoint, configured, want, why) in cases {
+            assert_eq!(
+                live_resume_slot(checkpoint, configured),
+                want,
+                "checkpoint {checkpoint:?} start {configured:?} ({why})"
+            );
+        }
+    }
+
+    #[test]
+    fn start_floor_matrix() {
+        // (checkpoint, configured start, expected floor or None for a refusal, why)
+        type Case = (Option<u64>, Option<u64>, Option<u64>, &'static str);
+
+        let cases: [Case; 12] = [
+            (Some(100), Some(200), None, "skips 101..=199"),
+            (Some(100), Some(102), None, "skips exactly one slot"),
+            (
+                Some(100),
+                Some(101),
+                Some(100),
+                "resumes exactly, skips nothing",
+            ),
+            (Some(100), Some(50), Some(100), "checkpoint wins, warns"),
+            (
+                Some(100),
+                Some(100),
+                Some(100),
+                "one slot below the checkpoint still warns",
+            ),
+            (
+                Some(0),
+                Some(0),
+                Some(0),
+                "genesis start matches genesis checkpoint",
+            ),
+            (Some(100), None, Some(100), "no configured start"),
+            (Some(0), Some(1), Some(0), "genesis checkpoint resumed"),
+            (Some(0), Some(2), None, "slot zero is a real checkpoint"),
+            (
+                None,
+                Some(200),
+                Some(199),
+                "empty ledger, start above the tip",
+            ),
+            (None, Some(0), Some(0), "no underflow at genesis"),
+            (None, None, Some(0), "catch up from genesis"),
+        ];
+
+        for (checkpoint, configured, want, why) in cases {
+            let got = start_floor(
+                BACKFILL_START_SETTING,
+                ProgramType::Withdraw,
+                checkpoint,
+                configured,
+            );
+            match want {
+                Some(floor) => assert_eq!(
+                    got.as_ref().ok(),
+                    Some(&floor),
+                    "checkpoint {checkpoint:?} start {configured:?} ({why})"
+                ),
+                None => assert!(
+                    matches!(got, Err(CheckpointError::StartSlotAheadOfCheckpoint { .. })),
+                    "checkpoint {checkpoint:?} start {configured:?} must refuse ({why})"
+                ),
+            }
+        }
+    }
+
+    /// The refusal names the offending key, which is how an operator knows which knob
+    /// to change and how the runbook routes to the right remedy.
+    #[test]
+    fn start_floor_error_names_the_setting_and_program() {
+        let err = start_floor(
+            RPC_POLLING_START_SETTING,
+            ProgramType::Escrow,
+            Some(100),
+            Some(200),
+        )
+        .expect_err("a start slot above the checkpoint must refuse");
+
+        let CheckpointError::StartSlotAheadOfCheckpoint {
+            setting,
+            program_type,
+            start_slot,
+            checkpoint,
+        } = err
+        else {
+            panic!("expected StartSlotAheadOfCheckpoint, got {err:?}");
+        };
+        assert_eq!(setting, "indexer.rpc_polling.start_slot");
+        assert_eq!(program_type, "escrow");
+        assert_eq!(start_slot, 200);
+        assert_eq!(checkpoint, 100);
+    }
+
+    // ============================================================================
     // get_last_checkpoint Tests
     // ============================================================================
 
@@ -520,18 +1020,34 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(checkpoint, 12345);
+        assert_eq!(checkpoint, Some(12345));
     }
 
+    /// Both halves belong in one test: the bug was that "never anchored" and
+    /// "anchored at genesis" produced the same value, so the assertion that
+    /// matters is that these two stores now read back differently. Reconnect
+    /// repair keys its fail-closed decision on exactly this distinction.
     #[tokio::test]
-    async fn test_get_last_checkpoint_defaults_to_zero() {
-        let storage: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+    async fn get_last_checkpoint_returns_none_when_absent() {
+        let absent: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+        assert_eq!(
+            get_last_checkpoint(&absent, ProgramType::Escrow)
+                .await
+                .unwrap(),
+            None,
+            "a store with no row must report absence, not slot zero"
+        );
 
-        let checkpoint = get_last_checkpoint(&storage, ProgramType::Escrow)
-            .await
-            .unwrap();
-
-        assert_eq!(checkpoint, 0);
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", 0);
+        let genesis: Arc<Storage> = Arc::new(Storage::Mock(mock));
+        assert_eq!(
+            get_last_checkpoint(&genesis, ProgramType::Escrow)
+                .await
+                .unwrap(),
+            Some(0),
+            "a durable anchor at genesis must be distinguishable from absence"
+        );
     }
 
     #[tokio::test]
@@ -548,8 +1064,115 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(escrow_checkpoint, 100);
-        assert_eq!(withdraw_checkpoint, 200);
+        assert_eq!(escrow_checkpoint, Some(100));
+        assert_eq!(withdraw_checkpoint, Some(200));
+    }
+
+    // ============================================================================
+    // wait_for_checkpoint_commit Tests
+    // ============================================================================
+
+    /// Target the wait tests aim at, and a timeout long enough that only a real
+    /// stall reaches it.
+    const WAIT_TARGET: u64 = 500;
+    const GENEROUS: Duration = Duration::from_secs(5);
+    const IMPATIENT: Duration = Duration::from_millis(400);
+
+    /// Set the escrow checkpoint after a short delay, standing in for the writer's flush.
+    fn commit_after(mock: MockStorage, slot: u64, delay: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            mock.set_checkpoint("escrow", slot);
+        })
+    }
+
+    /// Both end states belong in one test: a batch flush can land the frontier above the
+    /// target, so an equality check would wait forever on a checkpoint that already
+    /// covers everything the fill produced.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_returns_once_target_committed() {
+        for committed in [WAIT_TARGET, WAIT_TARGET + 5] {
+            let mock = MockStorage::new();
+            let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+            let writer = commit_after(mock, committed, Duration::from_millis(150));
+
+            let result =
+                wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, GENEROUS)
+                    .await;
+
+            assert!(
+                result.is_ok(),
+                "a committed checkpoint of {committed} must satisfy target {WAIT_TARGET}"
+            );
+            writer.await.unwrap();
+        }
+    }
+
+    /// A frontier one slot short means a slot in the range was never processed. Failing
+    /// the boot is the point: continuing would compare on-chain custody against a ledger
+    /// that is still missing a slot, which is the bug this wait exists to prevent.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_times_out_below_target() {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", WAIT_TARGET - 1);
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock));
+
+        let err = wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, IMPATIENT)
+            .await
+            .expect_err("a frontier below the target must not be accepted");
+
+        match err {
+            CheckpointError::CommitTimeout { last, target, .. } => {
+                assert_eq!(last, Some(WAIT_TARGET - 1));
+                assert_eq!(target, WAIT_TARGET);
+            }
+            other => panic!("expected CommitTimeout, got {other:?}"),
+        }
+    }
+
+    /// A database blip during the wait must not abort a boot that is one flush away from
+    /// succeeding.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_rides_out_transient_read_failures() {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("escrow", WAIT_TARGET);
+        mock.set_fail_times("get_committed_checkpoint", 2);
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock));
+
+        let result =
+            wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, GENEROUS).await;
+
+        assert!(
+            result.is_ok(),
+            "two failed reads must be retried, not treated as a stall: {result:?}"
+        );
+    }
+
+    /// A store with no row yet is normal for the first moments of a fresh boot, so the
+    /// wait polls on. It still has to end: absence forever is a stall like any other, and
+    /// reporting it as `None` rather than 0 tells an operator the writer never flushed.
+    #[tokio::test]
+    async fn wait_for_checkpoint_commit_treats_absent_row_as_not_yet() {
+        let absent: Arc<Storage> = Arc::new(Storage::Mock(MockStorage::new()));
+        let err = wait_for_checkpoint_commit(&absent, ProgramType::Escrow, WAIT_TARGET, IMPATIENT)
+            .await
+            .expect_err("an absent row must not be read as a satisfied target");
+
+        match err {
+            CheckpointError::CommitTimeout { last, .. } => assert_eq!(last, None),
+            other => panic!("expected CommitTimeout, got {other:?}"),
+        }
+
+        let mock = MockStorage::new();
+        let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
+        let writer = commit_after(mock, WAIT_TARGET, Duration::from_millis(150));
+        assert!(
+            wait_for_checkpoint_commit(&storage, ProgramType::Escrow, WAIT_TARGET, GENEROUS)
+                .await
+                .is_ok(),
+            "a row written mid-wait must satisfy the target"
+        );
+        writer.await.unwrap();
     }
 
     // ============================================================================
@@ -567,10 +1190,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let handle = writer.start(rx);
 
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 500,
-        })
+        }))
         .await
         .unwrap();
 
@@ -597,16 +1220,16 @@ mod tests {
         let handle = writer.start(rx);
 
         // Send 2 updates to trigger batch flush
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 100,
-        })
+        }))
         .await
         .unwrap();
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 200,
-        })
+        }))
         .await
         .unwrap();
 
@@ -633,16 +1256,16 @@ mod tests {
         let handle = writer.start(rx);
 
         // Send updates with decreasing slots - highest should win
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 300,
-        })
+        }))
         .await
         .unwrap();
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Escrow,
             slot: 100, // lower slot, should be ignored
-        })
+        }))
         .await
         .unwrap();
 
@@ -664,10 +1287,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let handle = writer.start(rx);
 
-        tx.send(CheckpointUpdate {
+        tx.send(CheckpointMsg::Slot(CheckpointUpdate {
             program_type: ProgramType::Withdraw,
             slot: 42,
-        })
+        }))
         .await
         .unwrap();
 

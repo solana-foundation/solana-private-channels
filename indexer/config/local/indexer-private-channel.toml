@@ -3,9 +3,14 @@
 [common]
 program_type = "withdraw"
 
-# Solana Private Channels gateway — polls for WithdrawFunds instructions. Overridden at runtime by
-# COMMON_RPC_URL in docker-compose; update both if the gateway address changes.
-rpc_url = "http://gateway:8898"
+# Solana Private Channels gateway, internal listener (no JWT is carried, and
+# getBlock is operator-only on the public one) — polls for WithdrawFunds
+# instructions. Overridden at runtime by COMMON_RPC_URL in docker-compose;
+# update both if the gateway address changes.
+rpc_url = "http://gateway:8904"
+# Optional archival fallback for rpc_url. Re-checks a Dead finality verdict (operator)
+# and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
 
 [storage]
 type = "postgres"
@@ -19,6 +24,7 @@ start_slot = 0
 poll_interval_ms = 1000
 error_retry_interval_ms = 5000
 batch_size = 50
+# The polling loop's missing-metadata failover reads common.fallback_rpc_url.
 
 [indexer.backfill]
 enabled = true

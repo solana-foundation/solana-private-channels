@@ -74,7 +74,6 @@ fn duplicate_keys_transaction(
     transaction.sign(&[payer], recent_blockhash);
     transaction
 }
-
 /// Create a BlockInfo with sensible defaults for a given slot.
 pub fn create_test_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
     BlockInfo {
@@ -86,6 +85,7 @@ pub fn create_test_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
         block_time: Some(1_700_000_000 + slot as i64),
         transaction_signatures: vec![],
         transaction_recent_blockhashes: vec![],
+        transaction_message_hashes: vec![],
     }
 }
 
@@ -120,6 +120,18 @@ pub(crate) async fn start_test_postgres_raw() -> (
     crate::accounts::PostgresAccountsDB,
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
 ) {
+    let (db, container, _url) = start_test_postgres_with_url().await;
+    (db, container)
+}
+
+/// Same as `start_test_postgres_raw`, but also hands back the connection URL so a
+/// test can open further independent pools against the same database.
+#[cfg(test)]
+pub(crate) async fn start_test_postgres_with_url() -> (
+    crate::accounts::PostgresAccountsDB,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+) {
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
 
@@ -136,7 +148,7 @@ pub(crate) async fn start_test_postgres_raw() -> (
     let db = crate::accounts::PostgresAccountsDB::new(&url, false)
         .await
         .unwrap();
-    (db, container)
+    (db, container, url)
 }
 
 /// Synchronously insert `address_signatures` rows that `write_batch` would
@@ -205,8 +217,17 @@ pub(crate) async fn start_test_postgres_with_new_instance() -> (
 
 /// Spin up a throwaway Redis container and return a `RedisAccountsDB` directly.
 /// Use this when testing `RedisAccountsDB`-specific methods or warm_redis_cache.
+///
+/// `fallback` is the Postgres source of truth the cache resolves misses
+/// against, so callers need a Postgres container too.
+///
+/// The cache comes back unstamped, which means reads bypass it entirely. A test
+/// that seeds keys directly and expects them to be served must stamp it first
+/// with `redis_coherence::stamp_deployment_id`.
 #[cfg(test)]
-pub(crate) async fn start_test_redis() -> (
+pub(crate) async fn start_test_redis(
+    fallback: crate::accounts::PostgresAccountsDB,
+) -> (
     crate::accounts::RedisAccountsDB,
     testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
 ) {
@@ -220,55 +241,30 @@ pub(crate) async fn start_test_redis() -> (
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let url = format!("redis://{}:{}", host, port);
-    let db = crate::accounts::RedisAccountsDB::new(&url).await.unwrap();
+    let db = crate::accounts::RedisAccountsDB::new(&url, fallback)
+        .await
+        .unwrap();
     (db, container)
 }
 
-/// A Postgres-backed AccountsDB whose pool points at a closed port with a short
-/// acquire timeout, so any query fails fast. Used to exercise the transient
-/// (fatal) load path without a 30s wait.
+/// An AccountsDB whose pool points at a bogus URL, so every query fails with a
+/// connection error. Use it to exercise the unreadable-store path.
 #[cfg(test)]
 pub(crate) fn dead_postgres_db() -> crate::accounts::AccountsDB {
     use crate::accounts::{AccountsDB, PostgresAccountsDB};
     use sqlx::postgres::PgPoolOptions;
     use std::sync::Arc;
 
+    // Without a short acquire timeout the pool spends its default 30s trying to
+    // connect, which would make every unreadable-store test a minute long.
     let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_millis(200))
-        .connect_lazy("postgres://user:pass@127.0.0.1:1/db")
+        .acquire_timeout(std::time::Duration::from_millis(50))
+        .connect_lazy("postgres://test@localhost:1/test")
         .expect("connect_lazy should not fail");
     AccountsDB::Postgres(PostgresAccountsDB {
         pool: Arc::new(pool),
         read_only: true,
     })
-}
-
-/// A Redis-backed AccountsDB whose server has been stopped. Built with a
-/// low-retry connection manager so a command fails fast rather than spending
-/// seconds on reconnect backoff.
-#[cfg(test)]
-pub(crate) async fn dead_redis_db() -> crate::accounts::RedisAccountsDB {
-    use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-
-    let (_raw, container) = start_test_redis().await;
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(6379).await.unwrap();
-    let url = format!("redis://{}:{}", host, port);
-
-    let client = redis::Client::open(url).unwrap();
-    let config = ConnectionManagerConfig::new()
-        .set_number_of_retries(1)
-        .set_factor(1)
-        .set_max_delay(5);
-    let connection = ConnectionManager::new_with_config(client, config)
-        .await
-        .unwrap();
-    let db = crate::accounts::RedisAccountsDB { connection };
-
-    // Stop the server; subsequent commands fail after a single short reconnect.
-    drop(container);
-    db
 }
 
 /// Create a BOB with empty state and a dummy (non-connecting) Postgres pool.
@@ -277,22 +273,24 @@ pub(crate) async fn dead_redis_db() -> crate::accounts::RedisAccountsDB {
 #[cfg(test)]
 pub(crate) fn create_test_bob() -> (
     crate::accounts::bob::BOB,
-    tokio::sync::mpsc::UnboundedSender<
-        Vec<(solana_sdk::pubkey::Pubkey, crate::stages::AccountSettlement)>,
-    >,
+    tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
 ) {
-    use crate::accounts::{AccountsDB, PostgresAccountsDB};
-    use sqlx::postgres::PgPoolOptions;
-    use std::sync::Arc;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let bob = crate::accounts::bob::BOB::new_test(rx, dead_postgres_db());
+    (bob, tx)
+}
 
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://test@localhost:1/test")
-        .expect("connect_lazy should not fail");
-    let db = AccountsDB::Postgres(PostgresAccountsDB {
-        pool: Arc::new(pool),
-        read_only: true,
-    });
+/// Same as `create_test_bob` but backed by a real throwaway Postgres container,
+/// so tests can exercise BOB's cache-miss path against an actual database.
+/// The container handle is returned so the caller keeps it alive.
+#[cfg(test)]
+pub(crate) async fn create_test_bob_with_postgres() -> (
+    crate::accounts::bob::BOB,
+    tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+) {
+    let (db, container) = start_test_postgres().await;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let bob = crate::accounts::bob::BOB::new_test(rx, db);
-    (bob, tx)
+    (bob, tx, container)
 }

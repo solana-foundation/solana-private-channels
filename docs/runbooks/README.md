@@ -8,7 +8,19 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (a nonce gap the chain will reject), deposits cannot. The
 dispatch table below routes by webhook + `transaction_type`.
 
-> **One halt has no dedicated alert.** The **withdrawal bitmap boot
+> **Six conditions are not webhook-routed.** The indexer's
+> **`block_unavailable`** wedge pages through Grafana instead, because it changes
+> no transaction row; see
+> [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
+>
+> **A second condition pages through Grafana, not the webhook.** The
+> **`sender-lock-lost`** alert fires when a sender cannot prove it still owns
+> its Postgres advisory lock and shuts the whole operator down to stop two
+> senders running at once. It changes no transaction row, so it is not in the
+> dispatch table; see
+> [`sender_lock_lost_runbook.md`](sender_lock_lost_runbook.md).
+>
+> **Two halts have no dedicated alert.** The **withdrawal bitmap boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
 > A chain-ahead divergence is repaired at boot and the operator starts; only
 > a database-ahead divergence makes it **refuse to start**, surfacing as a
@@ -16,6 +28,26 @@ dispatch table below routes by webhook + `transaction_type`.
 > logs. Recognize it by that pattern, not a single alert, and not via this
 > dispatch table. See
 > [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md).
+> The **`StartSlotAheadOfCheckpoint`** startup refusal is the other: a
+> configured start slot sits above the durable checkpoint, so booting would
+> skip slots nothing would ever go back for. It also shows as a boot-time
+> crash-loop, recognized by that marker in the indexer logs; see
+> [`indexer_start_slot_ahead_of_checkpoint.md`](indexer_start_slot_ahead_of_checkpoint.md).
+>
+> **One node condition crash-loops instead of alerting.** A row in the node's
+> `accounts` table that will not deserialize makes the executor refuse to run any
+> batch touching it, so the node exits and is restarted in a loop. It marks no
+> transaction row, and is detected from
+> `private_channel_executor_corrupt_account_total` plus the pubkey in the
+> executor log; see [`corrupt_account_row.md`](corrupt_account_row.md).
+>
+> **One node condition refuses to start and takes writes down with it.** A write
+> or aio node that cannot take the Postgres writer lease exits at startup, and
+> the gateway has only one write URL, so no transaction is accepted while it is
+> down. The lock is normally freed the instant the old node's socket closes; a
+> host that vanishes without closing it is the case that sticks. Recognize it
+> from the boot loop plus `already holds the writer lease` in the node log; see
+> [`writer_lease_unavailable.md`](writer_lease_unavailable.md).
 
 ## Alert dispatch
 
@@ -83,6 +115,10 @@ The runbooks call this out at every relevant site.
   Every "escalate" call-site in the recovery runbooks links here.
 - [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
   the withdrawal-bitmap startup halt (log-discovered, not paged).
+- [`indexer_block_unavailable.md`](indexer_block_unavailable.md) - the indexer
+  refusing to checkpoint past a slot whose block the RPC endpoint will not serve.
+  Paged by the `indexer-block-unavailable` Grafana alert, not by the webhook
+  dispatch table above (no transaction row changes status).
 
 ## Drills
 
@@ -97,9 +133,9 @@ pins the relevant contract.
 | Drill | Side | Verifies |
 |---|---|---|
 | `drill_1_error_message_contracts_present_in_source` | both | Source contains every `error_message` substring the dispatch tables match on. |
-| `drill_2_path_a_data_error_recovery` | withdrawal | Triage SQL orders the trigger row first; recovery SQL reaches the documented end-state. |
+| `drill_2_path_a_data_error_recovery` | withdrawal | Triage SQL orders the trigger row first; recovery SQL reaches the documented end-state, and `id <> ALL(:excluded_ids)` leaves held rows quarantined. |
 | `drill_3_path_b_landed_marks_completed_with_signature` | withdrawal | On `LANDED`, mark `completed` with the observed signature (prevents double-credit). |
-| `drill_4_path_c_not_landed_re_arms_with_same_nonce` | withdrawal | Re-arm preserves `withdrawal_nonce`; nonce-uniqueness index still enforces. |
+| `drill_4_path_c_not_landed_recovery_flows` | withdrawal | `withdrawal_manual_review.md` § Path C Step 3: burned branch re-arms preserving `withdrawal_nonce` (nonce-uniqueness index still enforces); not-burned branch terminalizes the row and never returns it to the fetcher's pending queue. |
 | `drill_5_halt_sweep_excludes_poison_only` | withdrawal | Bulk-quarantine flips every active withdrawal at or above the nonce floor except the excluded poison id. |
 | `drill_6_recovery_query_skips_terminal_statuses` | withdrawal | Recovery query skips rows already resolved to a terminal status. |
 | `drill_7_halt_sweep_does_not_touch_terminals` | withdrawal | Bulk-quarantine leaves terminal-status rows alone. |

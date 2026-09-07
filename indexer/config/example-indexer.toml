@@ -9,6 +9,13 @@ program_type = "escrow"
 # RPC endpoint URL
 rpc_url = "http://localhost:8899"
 
+# Optional archival fallback for rpc_url. Re-checks a Dead finality verdict (operator)
+# and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
+
+# Channel (gateway) RPC. Required for escrow: the startup supply invariant reads from it.
+source_rpc_url = "http://localhost:8898"
+
 # Escrow instance ID (required for escrow program type, omit for withdraw)
 # escrow_instance_id = "YourPubkeyHere..."
 
@@ -41,16 +48,13 @@ error_retry_interval_ms = 5000
 # Batch size for processing blocks
 batch_size = 50
 
+# The polling loop's missing-metadata failover reads common.fallback_rpc_url (see
+# [common] above); it must be archival. Backfill/resync ignore it and fail closed.
+
 # === Yellowstone gRPC Configuration ===
 [indexer.yellowstone]
 # Yellowstone gRPC endpoint URL
 # endpoint = "grpc://your-yellowstone-endpoint:10000"
-
-# Commitment level: "processed", "confirmed", or "finalized".
-# Keep "finalized" for escrow ingestion: deposits become irreversible
-# private-channel mints, so a "confirmed" deposit lost to a Solana reorg would
-# produce an unbacked mint with no rollback path.
-commitment = "finalized"
 
 # Token must be set via environment variable: INDEXER_YELLOWSTONE_TOKEN
 # Example: export INDEXER_YELLOWSTONE_TOKEN="your-token"

@@ -1,14 +1,17 @@
+use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_response::{Response, RpcBlockhash};
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
-use solana_rpc_client_api::config::RpcTransactionConfig;
-use solana_rpc_client_api::request::RpcError;
+use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcTransactionConfig};
+use solana_rpc_client_api::request::{RpcError, RpcRequest};
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -152,9 +155,50 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get the current block height with retry. Used by the pending-remint gate
-    /// to compare against each stored signature's `last_valid_block_height` and
-    /// decide whether a broadcast can still land.
+    /// The same blockhash read as `get_latest_blockhash_with_commitment`, at the
+    /// same commitment, but also returning the response's context slot as
+    /// `(blockhash, context_slot, last_valid_block_height)`.
+    ///
+    /// A transaction cannot land in a block older than the blockhash it was signed
+    /// with, so recording that slot alongside the broadcast gives the finality
+    /// classifier an exact lower bound on where the signature could be, one that
+    /// does not depend on what the node's blockhash window happens to be later.
+    pub async fn get_latest_blockhash_with_commitment_and_context(
+        &self,
+    ) -> Result<(Hash, u64, u64), Box<client_error::Error>> {
+        let commitment = self.rpc_client.commitment();
+        self.with_retry(
+            "get_latest_blockhash_with_commitment_and_context",
+            RetryPolicy::Idempotent,
+            || async {
+                let response = self
+                    .rpc_client
+                    .send::<Response<RpcBlockhash>>(
+                        RpcRequest::GetLatestBlockhash,
+                        serde_json::json!([commitment]),
+                    )
+                    .await?;
+                let blockhash = Hash::from_str(&response.value.blockhash).map_err(|e| {
+                    Box::new(client_error::Error::from(ErrorKind::Custom(format!(
+                        "unparseable blockhash {}: {e}",
+                        response.value.blockhash
+                    ))))
+                })?;
+                Ok::<_, Box<client_error::Error>>((
+                    blockhash,
+                    response.context.slot,
+                    response.value.last_valid_block_height,
+                ))
+            },
+        )
+        .await
+    }
+
+    /// Get the current block height with retry, to compare against each stored
+    /// signature's `last_valid_block_height` and decide whether a broadcast can
+    /// still land. Both chains need it: a response context slot is a slot on
+    /// either, and slots outrun heights, so judging an lvbh against one would
+    /// abandon broadcasts that are still live.
     pub async fn get_block_height(&self) -> Result<u64, Box<client_error::Error>> {
         self.with_retry("get_block_height", RetryPolicy::Idempotent, || async {
             self.rpc_client.get_block_height().await
@@ -168,6 +212,52 @@ impl RpcClientWithRetry {
     pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
         self.with_retry("get_slot", RetryPolicy::Idempotent, || async {
             self.rpc_client.get_slot().await
+        })
+        .await
+    }
+
+    /// Read the latest blockhash at `commitment` together with the response
+    /// context slot, returning `(context_slot, last_valid_block_height)`. One RPC
+    /// call so the slot and height come from the same backend and are mutually
+    /// consistent. The release verifier reads this at finalized to anchor a
+    /// freshness point it can then bind an account snapshot to via min_context_slot.
+    pub async fn get_latest_blockhash_with_context(
+        &self,
+        commitment: CommitmentConfig,
+    ) -> Result<(u64, u64), Box<client_error::Error>> {
+        self.with_retry(
+            "get_latest_blockhash_with_context",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .send::<Response<RpcBlockhash>>(
+                        RpcRequest::GetLatestBlockhash,
+                        serde_json::json!([commitment]),
+                    )
+                    .await
+                    .map(|resp| (resp.context.slot, resp.value.last_valid_block_height))
+            },
+        )
+        .await
+    }
+
+    /// Get the node's lowest retained slot with retry. An absence-based `Dead`
+    /// finality verdict consults this to prove the endpoint still retains the
+    /// attempt's slot range.
+    pub async fn get_first_available_block(&self) -> Result<u64, Box<client_error::Error>> {
+        self.with_retry(
+            "get_first_available_block",
+            RetryPolicy::Idempotent,
+            || async { self.rpc_client.get_first_available_block().await },
+        )
+        .await
+    }
+
+    /// Get the cluster genesis hash with retry. Used once at withdraw startup to
+    /// prove the fallback endpoint is on the same cluster as the primary.
+    pub async fn get_genesis_hash(&self) -> Result<Hash, Box<client_error::Error>> {
+        self.with_retry("get_genesis_hash", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_genesis_hash().await
         })
         .await
     }
@@ -214,6 +304,55 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Read an account at the given commitment, returning the response context
+    /// (its `slot`) with the account. An absent account is `Ok(None)`, kept
+    /// distinct from a read error (`Err`).
+    pub async fn get_account_with_context(
+        &self,
+        pubkey: &Pubkey,
+        commitment: CommitmentConfig,
+    ) -> Result<Response<Option<Account>>, Box<client_error::Error>> {
+        self.with_retry(
+            "get_account_with_context",
+            RetryPolicy::Idempotent,
+            || async {
+                self.rpc_client
+                    .get_account_with_commitment(pubkey, commitment)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Like `get_account_with_context`, but requires the node to answer from a
+    /// snapshot whose context slot is at least `min_context_slot`. If the node
+    /// cannot serve at that slot (a lagging or load-balanced backend) it returns
+    /// an RPC error rather than an older snapshot, letting the caller fail closed.
+    /// This binds the returned account to a slot the caller has already proven fresh.
+    pub async fn get_account_with_context_min_slot(
+        &self,
+        pubkey: &Pubkey,
+        commitment: CommitmentConfig,
+        min_context_slot: Option<u64>,
+    ) -> Result<Response<Option<Account>>, Box<client_error::Error>> {
+        self.with_retry(
+            "get_account_with_context_min_slot",
+            RetryPolicy::Idempotent,
+            || async {
+                let config = RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    data_slice: None,
+                    commitment: Some(commitment),
+                    min_context_slot,
+                };
+                self.rpc_client
+                    .get_account_with_config(pubkey, config)
+                    .await
+            },
+        )
+        .await
+    }
+
     /// Get token account balance with retry (read-only, safe to retry)
     pub async fn get_token_account_balance(
         &self,
@@ -233,9 +372,7 @@ impl RpcClientWithRetry {
         &self,
         signatures: &[Signature],
     ) -> Result<
-        solana_client::rpc_response::Response<
-            Vec<Option<solana_transaction_status::TransactionStatus>>,
-        >,
+        Response<Vec<Option<solana_transaction_status::TransactionStatus>>>,
         Box<client_error::Error>,
     > {
         self.with_retry(
@@ -255,9 +392,7 @@ impl RpcClientWithRetry {
         &self,
         signatures: &[Signature],
     ) -> Result<
-        solana_client::rpc_response::Response<
-            Vec<Option<solana_transaction_status::TransactionStatus>>,
-        >,
+        Response<Vec<Option<solana_transaction_status::TransactionStatus>>>,
         Box<client_error::Error>,
     > {
         self.with_retry(
@@ -298,6 +433,73 @@ impl RpcClientWithRetry {
             },
         )
         .await
+    }
+
+    /// Page `getSignaturesForAddress` to completeness via the `before` cursor.
+    ///
+    /// The bounded `get_signatures_for_address` is a fixed-window lookback; this walks
+    /// the entire signature history for an address, oldest page last, so a consumed-set
+    /// enumeration cannot miss a mint that sits beyond the first window. Any page error
+    /// propagates as `Err` so the caller can fail closed rather than treat a partial
+    /// history as complete.
+    pub async fn get_signatures_for_address_paginated(
+        &self,
+        address: &Pubkey,
+        page_limit: usize,
+    ) -> Result<
+        Vec<solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature>,
+        Box<client_error::Error>,
+    > {
+        let mut all = Vec::new();
+        let mut before: Option<Signature> = None;
+        loop {
+            let page = self
+                .with_retry(
+                    "get_signatures_for_address_paginated",
+                    RetryPolicy::Idempotent,
+                    || async {
+                        let config = GetConfirmedSignaturesForAddress2Config {
+                            before,
+                            until: None,
+                            limit: Some(page_limit),
+                            commitment: Some(CommitmentConfig::confirmed()),
+                        };
+                        self.rpc_client
+                            .get_signatures_for_address_with_config(address, config)
+                            .await
+                    },
+                )
+                .await?;
+
+            let page_len = page.len();
+            // Capture the oldest signature on this page; it becomes the next page's cursor.
+            let last_signature = page.last().map(|s| s.signature.clone());
+            all.extend(page);
+
+            // A short page is the only legitimate end of history.
+            if page_len < page_limit {
+                break;
+            }
+
+            // Full page: we must advance the cursor to keep walking. If the last signature
+            // does not parse we cannot guarantee completeness, so fail closed instead of
+            // silently returning a truncated history.
+            match last_signature
+                .as_deref()
+                .and_then(|s| Signature::from_str(s).ok())
+            {
+                Some(sig) => before = Some(sig),
+                None => {
+                    return Err(Box::new(client_error::Error::from(ErrorKind::Custom(
+                        format!(
+                            "get_signatures_for_address_paginated: full page for {address} but \
+                             last cursor signature failed to parse; cannot guarantee completeness"
+                        ),
+                    ))));
+                }
+            }
+        }
+        Ok(all)
     }
 
     /// Get a confirmed transaction in JSON-parsed encoding (read-only, safe to retry)
@@ -629,5 +831,139 @@ mod tests {
             5,
             "unrelated ForUser error must be retried"
         );
+    }
+
+    fn make_client_at(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        )
+    }
+
+    #[tokio::test]
+    async fn get_first_available_block_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":12345,"id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        assert_eq!(client.get_first_available_block().await.unwrap(), 12345);
+    }
+
+    #[tokio::test]
+    async fn get_first_available_block_rpc_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        assert!(client.get_first_available_block().await.is_err());
+    }
+
+    /// R1: a present account is returned as `Some`, and the response context
+    /// exposes the finalized snapshot slot.
+    #[tokio::test]
+    async fn get_account_with_context_some_exposes_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":4242},"value":{"owner":"11111111111111111111111111111111","lamports":1000000,"data":["","base64"],"executable":false,"rentEpoch":0}},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let resp = client
+            .get_account_with_context(&Pubkey::default(), CommitmentConfig::finalized())
+            .await
+            .unwrap();
+        assert_eq!(resp.context.slot, 4242);
+        assert!(resp.value.is_some());
+    }
+
+    /// R2: an absent account (`value: null`) is `Ok(None)`, kept distinct from a
+    /// read error so the caller reads absence as uncertainty, never non-inclusion.
+    #[tokio::test]
+    async fn get_account_with_context_null_is_none() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":7},"value":null},"id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let resp = client
+            .get_account_with_context(&Pubkey::default(), CommitmentConfig::finalized())
+            .await
+            .unwrap();
+        assert!(resp.value.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_genesis_hash_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":"11111111111111111111111111111111","id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let hash = client.get_genesis_hash().await.unwrap();
+        assert_eq!(hash, Hash::default());
+    }
+
+    #[tokio::test]
+    async fn get_genesis_hash_rpc_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getGenesisHash""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"node unavailable"},"id":0}"#,
+            )
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        assert!(client.get_genesis_hash().await.is_err());
     }
 }

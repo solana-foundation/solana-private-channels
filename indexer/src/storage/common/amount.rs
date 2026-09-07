@@ -85,7 +85,7 @@ impl Type<Postgres> for TokenAmount {
 }
 
 impl Encode<'_, Postgres> for TokenAmount {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
         let value = BigDecimal::from(self.0);
         <BigDecimal as Encode<Postgres>>::encode_by_ref(&value, buf)
     }
@@ -123,6 +123,21 @@ mod tests {
         for v in [0u64, 1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
             let bd = BigDecimal::from(v);
             assert_eq!(u64_from_big_decimal(&bd).unwrap(), v);
+        }
+    }
+
+    /// sqlx 0.8 made encoding fallible so oversized values error instead of being
+    /// truncated. A u64 amount can never be that large, so encoding must never fail
+    /// here; an Err would be a silent write failure on a money column.
+    #[test]
+    fn encode_never_fails_across_the_u64_range() {
+        for v in [0u64, 1, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+            let mut buf = PgArgumentBuffer::default();
+            let is_null = TokenAmount(v)
+                .encode_by_ref(&mut buf)
+                .unwrap_or_else(|e| panic!("encoding {v} failed: {e}"));
+            assert!(matches!(is_null, IsNull::No), "amount {v} encoded as NULL");
+            assert!(!buf.is_empty(), "amount {v} encoded to no bytes");
         }
     }
 

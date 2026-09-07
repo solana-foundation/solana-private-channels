@@ -328,6 +328,8 @@ pub(super) async fn persist_signature_or_abort(
             transaction_id,
             signature.to_string(),
             last_valid_block_height as i64,
+            // Theirs' blockhash_slot bound arrives with the #187/#192 port.
+            None,
         )
         .await
     {
@@ -470,7 +472,7 @@ pub(super) async fn send_and_confirm(
     let send_start = std::time::Instant::now();
 
     // Build and sign before broadcasting so the signature can be persisted write-ahead.
-    let (transaction, signature, last_valid_block_height) =
+    let (transaction, signature, last_valid_block_height, _blockhash_slot) =
         match build_and_sign(&state.rpc_client, instruction.clone()).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -669,7 +671,9 @@ pub(super) fn handle_confirmation_result<'a>(
                         cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                         state.mint_builders.remove(&txn_id);
                     }
-                    JitOutcome::PermanentFailure(reason) => {
+                    // Cantina #285's re-arm on a transient JIT verdict is a
+                    // follow-up port; until then this keeps ours' routing.
+                    JitOutcome::Transient(reason) => {
                         handle_permanent_failure(state, ctx, storage_tx, &reason).await;
                     }
                 }
@@ -1392,7 +1396,7 @@ pub(super) async fn fire_and_store(
     match sign_and_send_transaction(state.rpc_client.clone(), instruction.clone(), retry_policy)
         .await
     {
-        Ok((signature, _last_valid_block_height)) => {
+        Ok((signature, _last_valid_block_height, _blockhash_slot)) => {
             metrics::OPERATOR_RPC_SEND_DURATION
                 .with_label_values(&[pt, "in_flight"])
                 .observe(send_start.elapsed().as_secs_f64());
@@ -1509,7 +1513,7 @@ pub(super) async fn fire_and_store_task(
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
-    let (transaction, signature, last_valid_block_height) =
+    let (transaction, signature, last_valid_block_height, _blockhash_slot) =
         match build_and_sign(&rpc_client, instruction.clone()).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -2424,11 +2428,14 @@ mod tests {
         let stored = mock.get_release_signatures(10).await.unwrap();
         assert_eq!(stored.len(), 1, "exactly one release signature persisted");
         assert_eq!(
-            stored[0].0,
+            stored[0].signature,
             Signature::default().to_string(),
             "persisted signature must be the signed transaction's signature"
         );
-        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
+        assert_eq!(
+            stored[0].last_valid_block_height, 100,
+            "persisted lvbh must match the blockhash"
+        );
     }
 
     /// A failed write-ahead persist must NOT broadcast, must write no terminal status (row left Processing), and must stash nothing.
@@ -3292,7 +3299,7 @@ mod tests {
         // Nothing stashed in memory, everything on durable storage.
         state
             .storage
-            .insert_release_signature(70, Signature::new_unique().to_string(), 1)
+            .insert_release_signature(70, Signature::new_unique().to_string(), 1, None)
             .await
             .unwrap();
 
@@ -3443,7 +3450,7 @@ mod tests {
         let still_open = Signature::new_unique();
         let rejected = Signature::new_unique();
         for signature in [still_open, rejected] {
-            mock.insert_release_signature(REFUSED_ROW, signature.to_string(), 1)
+            mock.insert_release_signature(REFUSED_ROW, signature.to_string(), 1, None)
                 .await
                 .unwrap();
         }
@@ -3513,7 +3520,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|(signature, _)| signature)
+            .map(|stored| stored.signature)
             .collect();
         assert_eq!(
             stored,
@@ -4532,11 +4539,14 @@ mod tests {
         let stored = mock.get_release_signatures(77).await.unwrap();
         assert_eq!(stored.len(), 1, "exactly one mint signature persisted");
         assert_eq!(
-            stored[0].0,
+            stored[0].signature,
             Signature::default().to_string(),
             "persisted signature must be the broadcast signature"
         );
-        assert_eq!(stored[0].1, 100, "persisted lvbh must match the blockhash");
+        assert_eq!(
+            stored[0].last_valid_block_height, 100,
+            "persisted lvbh must match the blockhash"
+        );
         assert_eq!(
             state.in_flight.len(),
             1,

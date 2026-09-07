@@ -97,15 +97,23 @@ scrape_configs:
         labels:
           stack: private-channel
 
-  # ── Solana Private Channels write/read/gateway /metrics (only when PRIVATE_CHANNEL_METRICS=true is
-  # set on the service; otherwise these targets show as down which is
-  # correct). Listed here so flipping PRIVATE_CHANNEL_METRICS=true requires no
+  # ── Solana Private Channels write/read node /metrics (only when the node is run
+  # with --metrics / PRIVATE_CHANNEL_METRICS=true; otherwise these targets show
+  # as down which is correct). Listed here so enabling node metrics requires no
   # Prometheus config change.
   - job_name: private-channel-services
     static_configs:
       - targets:
           - 'write-node:9090'
           - 'read-node:9090'
-          - 'gateway:9090'
+        labels:
+          stack: private-channel
+
+  # ── Gateway /metrics. The gateway always serves metrics (no flag) on
+  # METRICS_PORT, default 9101. The RPC dashboard filters on job="gateway".
+  - job_name: gateway
+    static_configs:
+      - targets:
+          - 'gateway:9101'
         labels:
           stack: private-channel

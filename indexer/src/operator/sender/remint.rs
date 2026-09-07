@@ -101,7 +101,7 @@ async fn attempt_remint(
         compute_budget: None,
     };
 
-    let (signature, _) =
+    let (signature, _, _) =
         sign_and_send_transaction(state.source_rpc_client.clone(), ix, RetryPolicy::None)
             .await
             .map_err(|e| format!("Failed to send remint transaction: {}", e))?;

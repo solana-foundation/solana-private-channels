@@ -34,7 +34,9 @@ use {
 };
 
 static SETUP_LOCK: Mutex<()> = Mutex::const_new(());
-const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+// Idle block production is a tenth of what it was, so every wait that counts
+// blocks takes materially longer than the same suite used to.
+const TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 // We store these only to keep the services alive for the duration of the test
 struct KeepAlive {
@@ -81,7 +83,7 @@ async fn test_with_postgres() {
             node_host, node_port
         );
 
-        let test_context = setup(node_db_url.clone()).await.unwrap();
+        let test_context = setup(node_db_url.clone(), None).await.unwrap();
         test_suite(&test_context.private_channel_ctx, &test_context.solana_ctx).await;
         shutdown(test_context).await;
 
@@ -118,7 +120,7 @@ async fn test_signature_statuses_only_with_postgres() {
             node_host, node_port
         );
 
-        let test_context = setup(node_db_url).await.unwrap();
+        let test_context = setup(node_db_url, None).await.unwrap();
         run_get_signature_statuses_test(&test_context.private_channel_ctx).await;
         shutdown(test_context).await;
     })
@@ -131,7 +133,30 @@ async fn test_with_redis() {
     init_tracing();
 
     tokio::time::timeout(TEST_TIMEOUT, async {
-        // Start Redis container for private_channel accountsdb
+        // Redis is a cache in front of Postgres, never the accounts database, so
+        // the node needs both: the source of truth a cache miss resolves against,
+        // and the cache itself.
+        let node_postgres_container = Postgres::default()
+            .with_db_name("private_channel_node")
+            .with_user("postgres")
+            .with_password("password")
+            .start()
+            .await
+            .expect("Failed to start node PostgreSQL container");
+
+        let node_host = node_postgres_container
+            .get_host()
+            .await
+            .expect("Failed to get node host");
+        let node_port = node_postgres_container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("Failed to get node port");
+        let node_db_url = format!(
+            "postgres://postgres:password@{}:{}/private_channel_node",
+            node_host, node_port
+        );
+
         let redis_container = Redis::default()
             .with_tag("7")
             .start()
@@ -150,7 +175,7 @@ async fn test_with_redis() {
 
         println!("Redis container started at: {}", redis_url);
 
-        let test_context = setup(redis_url).await.unwrap();
+        let test_context = setup(node_db_url, Some(redis_url)).await.unwrap();
         test_suite(&test_context.private_channel_ctx, &test_context.solana_ctx).await;
 
         shutdown(test_context).await;
@@ -163,7 +188,10 @@ async fn test_with_redis() {
 ///   1. Validator + both Postgres containers  (all independent)
 ///   2. Both indexers              (each has its own DB and datasource)
 ///   3. Both operators             (independent of each other)
-async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
+async fn setup(
+    accountsdb_connection_url: String,
+    redis_cache_url: Option<String>,
+) -> Result<TestContext> {
     // Acquire global setup lock to serialize test initialization.
     // With nextest each test runs in its own process so this never blocks across
     // tests; it only guards against concurrent calls within the same process.
@@ -258,8 +286,10 @@ async fn setup(accountsdb_connection_url: String) -> Result<TestContext> {
             private_channel_core::nodes::node::DEFAULT_EXECUTION_RESULTS_CAPACITY,
         max_svm_workers: 4,
         accountsdb_connection_url: accountsdb_connection_url.clone(),
+        redis_cache_url,
+        redis_block_ttl_secs: 3_600,
         admin_keys: vec![operator_key.pubkey()],
-        transaction_expiration_ms: 15000,
+        max_blockhashes: 150,
         blocktime_ms: 100,
         perf_sample_period_secs: 10, // Collect performance samples every 10 seconds for testing
         metrics: Arc::new(NoopMetrics),
@@ -366,7 +396,9 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     run_transaction_count_test(private_channel_ctx).await;
     run_get_transaction_test(private_channel_ctx).await;
     run_first_available_block_test(private_channel_ctx).await;
+    run_get_block_height_test(private_channel_ctx).await;
     run_get_blocks_test(private_channel_ctx).await;
+    run_get_blocks_with_limit_test(private_channel_ctx).await;
     run_get_signature_statuses_test(private_channel_ctx).await;
     run_get_block_time_test(private_channel_ctx).await;
     run_get_slot_leaders_test(private_channel_ctx).await;
@@ -384,6 +416,7 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     run_blocks_in_range_boundaries_test(private_channel_ctx).await;
     run_sig_statuses_search_depth_test(private_channel_ctx).await;
     run_send_transaction_errors_test(private_channel_ctx).await;
+    run_address_lookup_rejection_test(private_channel_ctx).await;
     run_simulate_transaction_preflight_test(private_channel_ctx).await;
     run_simulate_transaction_account_writes_test(private_channel_ctx).await;
 

@@ -9,7 +9,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | ID | Invariant | Level | Status | Ref |
 |----|-----------|-------|--------|-----|
 | C1 | A slot and all of its transactions + account changes MUST be written to DB as a single transaction | MUST | Done | #16 |
-| C2 | The in-memory accounts DB MUST be in sync or ahead of the accounts DB on disk | MUST | Done | #20 |
+| C2 | The in-memory accounts DB MUST be in sync or ahead of the accounts DB on disk | MUST | Done | #20, #277 |
 | C3 | Solana Private Channels MUST NOT allow two transactions with the same signature to both execute | MUST | Done | #15 |
 | C4 | Solana Private Channels MUST NOT allow a transaction with an expired blockhash to execute | MUST | Done | #22 |
 | C5 | Solana Private Channels MUST require all transactions to be signed | MUST | Done | #22 |
@@ -21,6 +21,9 @@ This document defines the safety and correctness invariants that Solana Private 
 | C11 | Solana Private Channels SHOULD support transaction/slot truncation | SHOULD | Done | #51 |
 | C12 | If truncation is supported, Solana Private Channels MUST have a valid cold storage backup before truncating DB rows | MUST | Done | #60 |
 | C13 | Solana Private Channels DB SHOULD use database backup and recovery | SHOULD | Done | #60 |
+| C14 | A regular transaction MUST NOT increase the durable lamport supply beyond one lamport per account it creates, and MUST NOT alter any account it did not touch | MUST | Done | #115, #131 |
+| C15 | Every account key an admitted transaction can reference MUST be resolvable at admission | MUST | Done | #182 |
+| C16 | A slot MUST commit only if it extends the stored ledger, and a write-capable node MUST hold the writer lease | MUST | Done | #134 |
 
 ## On-chain Programs
 

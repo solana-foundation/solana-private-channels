@@ -1,10 +1,13 @@
 use {
     super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
     anyhow::{anyhow, Context, Result},
-    redis::AsyncCommands,
     solana_sdk::hash::Hash,
     std::str::FromStr,
+    tracing::warn,
 };
+
+/// Metadata key holding the tip blockhash.
+pub const LATEST_BLOCKHASH_KEY: &str = "latest_blockhash";
 
 pub async fn get_latest_blockhash(db: &AccountsDB) -> Result<Hash> {
     match db {
@@ -35,15 +38,18 @@ async fn get_latest_blockhash_postgres(db: &PostgresAccountsDB) -> Result<Hash> 
 }
 
 async fn get_latest_blockhash_redis(db: &RedisAccountsDB) -> Result<Hash> {
-    let mut conn = db.connection.clone();
-    let result: redis::RedisResult<Option<String>> = conn.get("latest_blockhash").await;
-    result
-        .map_err(|e| anyhow!("Failed to get latest blockhash from Redis: {}", e))
-        .and_then(|opt| {
-            opt.ok_or_else(|| anyhow!("No latest blockhash found in Redis"))
-                .and_then(|hash_str| {
-                    Hash::from_str(&hash_str)
-                        .map_err(|e| anyhow!("Invalid blockhash format: {}", e))
-                })
-        })
+    let cached = match db.get_trusted::<String>(LATEST_BLOCKHASH_KEY).await {
+        Ok(hash_str) => hash_str,
+        Err(e) => {
+            warn!("Failed to get latest blockhash from Redis: {}", e);
+            None
+        }
+    };
+
+    if let Some(hash_str) = cached {
+        return Hash::from_str(&hash_str).map_err(|e| anyhow!("Invalid blockhash format: {}", e));
+    }
+
+    // No cached blockhash is a miss, not a ledger without a tip.
+    get_latest_blockhash_postgres(&db.fallback).await
 }

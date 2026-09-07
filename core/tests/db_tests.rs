@@ -80,7 +80,7 @@ async fn test_set_and_get_account() {
 
     db.set_account(pubkey, account.clone()).await;
 
-    let retrieved = db.get_account_shared_data(&pubkey).await;
+    let retrieved = db.get_account_shared_data(&pubkey).await.unwrap();
     assert!(retrieved.is_some());
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.lamports(), 1_000_000);
@@ -91,7 +91,10 @@ async fn test_set_and_get_account() {
 async fn test_get_nonexistent_account() {
     let (db, _pg) = start_postgres().await;
 
-    let result = db.get_account_shared_data(&Pubkey::new_unique()).await;
+    let result = db
+        .get_account_shared_data(&Pubkey::new_unique())
+        .await
+        .unwrap();
     assert!(result.is_none());
 }
 
@@ -107,7 +110,7 @@ async fn test_get_multiple_accounts() {
     db.set_account(pk1, make_account(100, &owner)).await;
     db.set_account(pk2, make_account(200, &owner)).await;
 
-    let results = db.get_accounts(&[pk1, pk2, pk3]).await;
+    let results = db.get_accounts(&[pk1, pk2, pk3]).await.unwrap();
     assert_eq!(results.len(), 3);
     assert!(results[0].is_some());
     assert_eq!(results[0].as_ref().unwrap().lamports(), 100);
@@ -149,7 +152,7 @@ async fn test_store_and_get_block() {
 
     db.store_block(block).await.unwrap();
 
-    let retrieved = db.get_block(42).await;
+    let retrieved = db.get_block(42).await.unwrap();
     assert!(retrieved.is_some());
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.slot, 42);
@@ -179,7 +182,7 @@ async fn test_get_block_time() {
     let expected_time = block.block_time;
     db.store_block(block).await.unwrap();
 
-    let time = db.get_block_time(7).await;
+    let time = db.get_block_time(7).await.unwrap();
     assert_eq!(time, expected_time);
 }
 
@@ -249,16 +252,16 @@ async fn test_write_batch_accounts_and_transactions() {
     .unwrap();
 
     // Verify account stored
-    let acct = db.get_account_shared_data(&pk).await;
+    let acct = db.get_account_shared_data(&pk).await.unwrap();
     assert!(acct.is_some());
     assert_eq!(acct.unwrap().lamports(), 500);
 
     // Verify block stored
-    let blk = db.get_block(1).await;
+    let blk = db.get_block(1).await.unwrap();
     assert!(blk.is_some());
 
     // Verify transaction stored
-    let tx = db.get_transaction(&sig).await;
+    let tx = db.get_transaction(&sig).await.unwrap();
     assert!(tx.is_some());
     assert_eq!(tx.unwrap().slot, 1);
 }
@@ -272,7 +275,7 @@ async fn test_write_batch_deleted_account() {
 
     // First store the account
     db.set_account(pk, make_account(1000, &owner)).await;
-    assert!(db.get_account_shared_data(&pk).await.is_some());
+    assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
     // Delete it via write_batch
     let settlements = vec![(
@@ -286,7 +289,7 @@ async fn test_write_batch_deleted_account() {
     db.write_batch(&settlements, vec![], None).await.unwrap();
 
     // Should be gone
-    assert!(db.get_account_shared_data(&pk).await.is_none());
+    assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -338,9 +341,137 @@ async fn test_get_transaction_roundtrip() {
     .await
     .unwrap();
 
-    let stored = db.get_transaction(&sig).await.unwrap();
+    let stored = db.get_transaction(&sig).await.unwrap().unwrap();
     assert_eq!(stored.slot, 5);
     assert_eq!(stored.block_time, 1_700_000_005);
+}
+
+// ── Slot Commit Guard ─────────────────────────────────────────────────────────
+
+/// A batch whose block does not extend the stored ledger must be rejected whole.
+/// This is the duplicate or stale writer trying to overwrite the tip or rewind
+/// behind it, and none of its accounts, transactions or metadata may survive.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_rejects_a_block_at_or_below_the_stored_tip() {
+    let (mut db, _pg) = start_postgres().await;
+
+    let tip_blockhash = Hash::new_unique();
+    db.write_batch(&[], vec![], Some(create_test_block_info(5, tip_blockhash)))
+        .await
+        .unwrap();
+    let count_before = db.get_transaction_count().await.unwrap();
+
+    let owner = Pubkey::new_unique();
+    let pk = Pubkey::new_unique();
+    let from = Keypair::new();
+    let to = Pubkey::new_unique();
+    let tx = create_test_sanitized_transaction(&from, &to, 42);
+    let sig = *tx.signature();
+    let processed = make_executed_tx(vec![]);
+    let settlements = vec![(
+        pk,
+        AccountSettlement {
+            account: make_account(1_000, &owner),
+            deleted: false,
+        },
+    )];
+
+    // Replaying the tip slot and rewinding behind it must both fail.
+    for slot in [5u64, 4] {
+        let result = db
+            .write_batch(
+                &settlements,
+                vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await;
+
+        let err = result.expect_err("a block at or below the tip must be rejected");
+        assert!(
+            err.contains(&slot.to_string()),
+            "the error must name the rejected slot, got: {err}"
+        );
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(5));
+        assert_eq!(db.get_latest_blockhash().await.unwrap(), tip_blockhash);
+        assert_eq!(
+            db.get_block(5).await.unwrap().unwrap().blockhash,
+            tip_blockhash,
+            "the committed tip block must not be rewritten"
+        );
+        assert!(db.get_block(4).await.unwrap().is_none());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
+        assert!(db.get_transaction(&sig).await.unwrap().is_none());
+        assert_eq!(db.get_transaction_count().await.unwrap(), count_before);
+    }
+}
+
+/// A commit can succeed on the server and still fail to acknowledge, and the
+/// settler's retry then rewrites byte-identical rows for a slot already stored.
+/// That replay must be accepted, and counted once, or a lost ack stops the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_accepts_an_identical_replay_of_the_stored_tip() {
+    let (mut db, _pg) = start_postgres().await;
+
+    let blockhash = Hash::new_unique();
+    let owner = Pubkey::new_unique();
+    let pk = Pubkey::new_unique();
+    let from = Keypair::new();
+    let to = Pubkey::new_unique();
+    let tx = create_test_sanitized_transaction(&from, &to, 42);
+    let sig = *tx.signature();
+    let processed = make_executed_tx(vec![]);
+    let settlements = vec![(
+        pk,
+        AccountSettlement {
+            account: make_account(1_000, &owner),
+            deleted: false,
+        },
+    )];
+
+    for attempt in 1..=2 {
+        db.write_batch(
+            &settlements,
+            vec![(sig, &tx, 5, 1_700_000_000, &processed)],
+            Some(create_test_block_info(5, blockhash)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("attempt {attempt} must be accepted, got: {e}"));
+    }
+
+    assert_eq!(
+        db.get_transaction_count().await.unwrap(),
+        1,
+        "a replayed commit must be counted once"
+    );
+    assert_eq!(db.get_latest_slot().await.unwrap(), Some(5));
+    assert_eq!(db.get_block(5).await.unwrap().unwrap().blockhash, blockhash);
+}
+
+/// The guard rejects rewinds and overwrites, not gaps. The settler only ever
+/// extends by one slot, so gaps cost nothing to allow and keep write_batch
+/// usable for building arbitrary ledger fixtures.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_batch_accepts_a_block_above_the_stored_tip() {
+    let (mut db, _pg) = start_postgres().await;
+
+    db.write_batch(
+        &[],
+        vec![],
+        Some(create_test_block_info(5, Hash::new_unique())),
+    )
+    .await
+    .unwrap();
+
+    for slot in [6u64, 20] {
+        let blockhash = Hash::new_unique();
+        db.write_batch(&[], vec![], Some(create_test_block_info(slot, blockhash)))
+            .await
+            .unwrap_or_else(|e| panic!("slot {slot} must commit above the tip: {e}"));
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(slot));
+        assert_eq!(db.get_latest_blockhash().await.unwrap(), blockhash);
+    }
 }
 
 // ── Blockhash + Slot Metadata ─────────────────────────────────────────────────
@@ -434,7 +565,7 @@ async fn test_write_batch_read_only_noop() {
     ro_db.write_batch(&settlements, vec![], None).await.unwrap();
 
     // Account should not exist (write was silently skipped)
-    assert!(ro_db.get_account_shared_data(&pk).await.is_none());
+    assert!(ro_db.get_account_shared_data(&pk).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,14 +609,14 @@ async fn test_latest_blockhash_after_store_block() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_block_nonexistent() {
     let (db, _pg) = start_postgres().await;
-    assert!(db.get_block(999).await.is_none());
+    assert!(db.get_block(999).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_transaction_nonexistent() {
     let (db, _pg) = start_postgres().await;
     let sig = solana_sdk::signature::Signature::new_unique();
-    assert!(db.get_transaction(&sig).await.is_none());
+    assert!(db.get_transaction(&sig).await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -497,14 +628,22 @@ async fn test_set_account_overwrite() {
 
     db.set_account(pk, make_account(100, &owner)).await;
     assert_eq!(
-        db.get_account_shared_data(&pk).await.unwrap().lamports(),
+        db.get_account_shared_data(&pk)
+            .await
+            .unwrap()
+            .unwrap()
+            .lamports(),
         100
     );
 
     // Overwrite
     db.set_account(pk, make_account(200, &owner)).await;
     assert_eq!(
-        db.get_account_shared_data(&pk).await.unwrap().lamports(),
+        db.get_account_shared_data(&pk)
+            .await
+            .unwrap()
+            .unwrap()
+            .lamports(),
         200
     );
 }
@@ -649,8 +788,8 @@ async fn test_truncate_dry_run_with_pg_dump() {
         assert!(report.backup_check.pg_dump_ok);
 
         // Dry run: blocks should still exist
-        assert!(db.get_block(1).await.is_some());
-        assert!(db.get_block(5).await.is_some());
+        assert!(db.get_block(1).await.unwrap().is_some());
+        assert!(db.get_block(5).await.unwrap().is_some());
     }
 }
 
@@ -685,15 +824,57 @@ async fn test_truncate_actually_deletes_blocks() {
         assert_eq!(report.transactions_deleted, 0);
 
         // Old blocks should be gone
-        assert!(db.get_block(1).await.is_none());
-        assert!(db.get_block(5).await.is_none());
+        assert!(db.get_block(1).await.unwrap().is_none());
+        assert!(db.get_block(5).await.unwrap().is_none());
         // Recent blocks should still exist
-        assert!(db.get_block(6).await.is_some());
-        assert!(db.get_block(10).await.is_some());
+        assert!(db.get_block(6).await.unwrap().is_some());
+        assert!(db.get_block(10).await.unwrap().is_some());
 
         // first_available_block should be updated
         assert!(report.first_available_block.is_some());
     }
+}
+
+/// Pruning removes block rows, never the counters. Height counts blocks
+/// produced, so recomputing it from the surviving rows would make it go
+/// backwards and invalidate every deadline a client holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_height_survives_pruning() {
+    let (mut db, _pg) = start_postgres().await;
+
+    for slot in 1..=10u64 {
+        let mut block = create_test_block_info(slot, Hash::new_unique());
+        block.block_height = Some(slot);
+        db.write_batch(&[], vec![], Some(block)).await.unwrap();
+    }
+    assert_eq!(db.get_block_height().await.unwrap(), Some(10));
+
+    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
+    let opts = private_channel_core::accounts::truncate::TruncateOptions {
+        keep_slots: 5,
+        max_backup_age: std::time::Duration::from_secs(3600),
+        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
+        batch_size: 100,
+        dry_run: false,
+    };
+    let AccountsDB::Postgres(ref pg) = db else {
+        panic!("expected Postgres")
+    };
+    let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
+        .await
+        .unwrap();
+    assert_eq!(report.blocks_deleted, 5);
+
+    assert_eq!(
+        db.get_block_height().await.unwrap(),
+        Some(10),
+        "pruning must not move the height"
+    );
+    assert_eq!(
+        db.get_latest_slot().await.unwrap(),
+        Some(10),
+        "pruning must not move the slot"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

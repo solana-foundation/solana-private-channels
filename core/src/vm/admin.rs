@@ -72,6 +72,47 @@ impl AdminVm {
         account
     }
 
+    /// Preconditions canonical SPL Token execution would enforce before an
+    /// `InitializeMint` could write the mint: the SVM's account rules
+    /// (writable, non-executable, token-owned) and the processor's own
+    /// (exactly `Mint::LEN` bytes, not already initialized). Synthesizing the
+    /// post-state skips both, so without these the VM would replace any
+    /// account an admin transaction happens to reference.
+    ///
+    /// A missing target stays legal: the private channel allocates and
+    /// initializes in one step so mint addresses mirror mainnet.
+    ///
+    /// Rent exemption is deliberately not checked. Execution is gasless
+    /// (`GaslessRentCollector` reports zero rent) and `create_mint_account`
+    /// holds 1 lamport by design.
+    fn check_initialize_mint_target(
+        existing: Option<&AccountSharedData>,
+        is_writable: bool,
+    ) -> Result<(), InstructionError> {
+        if !is_writable {
+            return Err(InstructionError::ReadonlyDataModified);
+        }
+
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+
+        if existing.executable() {
+            return Err(InstructionError::ExecutableDataModified);
+        }
+        if *existing.owner() != SPL_TOKEN_ID {
+            return Err(InstructionError::ExternalAccountDataModified);
+        }
+        // `unpack_unchecked` rejects any length but `Mint::LEN`, and unlike
+        // `unpack` it still decodes an uninitialized allocation.
+        let mint = Mint::unpack_unchecked(existing.data())
+            .map_err(|_| InstructionError::InvalidAccountData)?;
+        if mint.is_initialized {
+            return Err(InstructionError::AccountAlreadyInitialized);
+        }
+        Ok(())
+    }
+
     /// Creates an ExecutedTransaction result carrying the given status.
     /// On failure (`status.is_err()`), callers pass `vec![]` so nothing persists —
     /// this matches real-SVM atomicity.
@@ -107,6 +148,10 @@ impl AdminVm {
     /// - InitializeMint empty accounts          -> InvalidAccountData
     /// - freeze authority tag=1, <32 trailing   -> InvalidAccountData
     /// - mint index out of `account_keys`       -> NotEnoughAccountKeys
+    /// - mint read-only in the message          -> ReadonlyDataModified
+    /// - existing target executable             -> ExecutableDataModified
+    /// - existing target not SPL-Token-owned    -> ExternalAccountDataModified
+    /// - existing target not `Mint::LEN` bytes  -> InvalidAccountData
     /// - mint already initialized               -> AccountAlreadyInitialized
     pub fn load_and_execute_sanitized_transactions<CB: TransactionProcessingCallback>(
         &self,
@@ -283,21 +328,15 @@ impl AdminVm {
             return Err(InstructionError::NotEnoughAccountKeys);
         };
 
-        // Refuse re-init on a live mint: if an account already exists at
-        // `mint_pubkey` and unpacks as an initialized Mint, a second
-        // InitializeMint would silently overwrite supply / decimals / authority.
-        // Zero-initialized allocations (is_initialized = false) still proceed.
-        if let Some(existing) = callbacks.get_account_shared_data(&mint_pubkey) {
-            if Mint::unpack(existing.data())
-                .map(|m| m.is_initialized)
-                .unwrap_or(false)
-            {
-                debug!(
-                    "[admin-vm] InitializeMint: {} already initialized",
-                    mint_pubkey
-                );
-                return Err(InstructionError::AccountAlreadyInitialized);
-            }
+        let existing = callbacks.get_account_shared_data(&mint_pubkey);
+        if let Err(err) =
+            Self::check_initialize_mint_target(existing.as_ref(), tx.is_writable(mint_index))
+        {
+            debug!(
+                "[admin-vm] InitializeMint: target {} rejected: {:?}",
+                mint_pubkey, err
+            );
+            return Err(err);
         }
 
         let decimals = instruction.data[1];
@@ -310,10 +349,15 @@ impl AdminVm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::account::ReadableAccount;
+    use solana_sdk::account::{Account, ReadableAccount, WritableAccount};
+    use solana_sdk::instruction::{AccountMeta, Instruction};
+    use solana_sdk::message::Message;
+    use solana_sdk::signature::{Keypair, Signer};
+    use solana_sdk::transaction::{SanitizedTransaction, Transaction};
     use solana_svm_transaction::svm_message::SVMMessage;
     use spl_token::solana_program::program_pack::Pack;
     use spl_token::state::Mint;
+    use std::collections::HashSet;
 
     /// Replicates the downstream consumer gate: keep only the account slots the
     /// transaction marks writable at their positional index (see bob.rs and
@@ -420,10 +464,7 @@ mod tests {
     impl solana_svm_callback::TransactionProcessingCallback for StubCbWithUninitialized {
         fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
             if *pubkey == self.mint {
-                // Zeroed data of Mint::LEN → is_initialized = false
-                let mut acct = AccountSharedData::new(0, Mint::LEN, &spl_token::id());
-                acct.set_data_from_slice(&[0u8; Mint::LEN]);
-                Some(acct)
+                Some(mint_allocation())
             } else {
                 None
             }
@@ -490,14 +531,6 @@ mod tests {
         program_id: Pubkey,
         data: Vec<u8>,
     ) -> (solana_sdk::transaction::SanitizedTransaction, Pubkey) {
-        use solana_sdk::{
-            instruction::{AccountMeta, Instruction},
-            message::Message,
-            signature::{Keypair, Signer},
-            transaction::Transaction,
-        };
-        use std::collections::HashSet;
-
         let payer = Keypair::new();
         let mint = Pubkey::new_unique();
         // Mint first — SPL Token InitializeMint semantics: accounts[0] is the mint.
@@ -889,6 +922,43 @@ mod tests {
         assert_eq!(mint_state.mint_authority, COption::Some(authority));
     }
 
+    /// The operator's JIT mint path, built exactly as
+    /// `InitializeMintBuilder::instruction` does: no account at the target yet,
+    /// admin as fee payer. Pins that flow against the target preconditions.
+    #[test]
+    fn test_operator_built_initialize_mint_for_missing_target_succeeds() {
+        let admin = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let decimals = 6;
+        let ix = spl_token::instruction::initialize_mint(
+            &spl_token::id(),
+            &mint,
+            &admin.pubkey(),
+            Some(&admin.pubkey()),
+            decimals,
+        )
+        .unwrap();
+        let msg = Message::new(&[ix], Some(&admin.pubkey()));
+        let tx = Transaction::new(&[&admin], msg, solana_sdk::hash::Hash::default());
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+
+        let executed =
+            assert_executed_with_status(run_admin_vm(std::slice::from_ref(&sanitized)), Ok(()));
+
+        // Accounts mirror account_keys, so the mint lands at its own index.
+        assert_eq!(
+            executed.loaded_transaction.accounts.len(),
+            sanitized.account_keys().len()
+        );
+        let mint_index = index_of(&sanitized, &mint);
+        let (pubkey, account) = &executed.loaded_transaction.accounts[mint_index];
+        assert_eq!(*pubkey, mint, "the mint meta must resolve to the mint key");
+        let mint_state = Mint::unpack(account.data()).unwrap();
+        assert_eq!(mint_state.decimals, decimals);
+        assert_eq!(mint_state.mint_authority, COption::Some(admin.pubkey()));
+    }
+
     // ─── Failure paths ──────────────────────────────────────────────────────
 
     /// An admin-routed tx whose program is not spl_token surfaces
@@ -973,6 +1043,33 @@ mod tests {
             Err(TransactionError::InstructionError(
                 0,
                 InstructionError::AccountAlreadyInitialized,
+            )),
+        );
+        assert!(executed.loaded_transaction.accounts.is_empty());
+    }
+
+    /// A read-only mint meta is rejected even with no account at the target.
+    /// BOB gates on the account's position in the returned vec, not the mint's
+    /// message index, so this has to be the VM's own check.
+    #[test]
+    fn test_readonly_mint_meta_returns_readonly_data_modified() {
+        let payer = Keypair::new();
+        let target = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![AccountMeta::new_readonly(target, false)],
+            data: valid_init_mint_data(6, Pubkey::new_unique()),
+        };
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+
+        let executed = assert_executed_with_status(
+            run_admin_vm(&[sanitized]),
+            Err(TransactionError::InstructionError(
+                0,
+                InstructionError::ReadonlyDataModified,
             )),
         );
         assert!(executed.loaded_transaction.accounts.is_empty());
@@ -1082,14 +1179,6 @@ mod tests {
         data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
         data[34] = 0; // COption::None for freeze authority
 
-        use solana_sdk::{
-            instruction::{AccountMeta, Instruction},
-            message::Message,
-            signature::{Keypair, Signer},
-            transaction::Transaction,
-        };
-        use std::collections::HashSet;
-
         let payer = Keypair::new();
         let ix = Instruction {
             program_id: spl_token::id(),
@@ -1108,5 +1197,81 @@ mod tests {
         // targeting the payer pubkey as the mint → VM succeeds.
         let output = run_admin_vm(&[sanitized]);
         assert_eq!(output.processing_results.len(), 1);
+    }
+
+    // ─── Target preconditions ───────────────────────────────────────────────
+
+    /// Token-owned, Mint::LEN, zeroed: the only pre-existing state
+    /// InitializeMint may write over.
+    fn mint_allocation() -> AccountSharedData {
+        AccountSharedData::from(Account {
+            lamports: 1,
+            data: vec![0u8; Mint::LEN],
+            owner: spl_token::id(),
+            executable: false,
+            rent_epoch: 0,
+        })
+    }
+
+    /// No account at the target is legal: the private channel allocates and
+    /// initializes in one step, which the operator's JIT path relies on.
+    #[test]
+    fn test_check_target_missing_is_allowed() {
+        assert_eq!(AdminVm::check_initialize_mint_target(None, true), Ok(()));
+    }
+
+    #[test]
+    fn test_check_target_uninitialized_allocation_is_allowed() {
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&mint_allocation()), true),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_check_target_not_writable_rejected() {
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&mint_allocation()), false),
+            Err(InstructionError::ReadonlyDataModified)
+        );
+    }
+
+    #[test]
+    fn test_check_target_executable_rejected() {
+        let mut account = mint_allocation();
+        account.set_executable(true);
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&account), true),
+            Err(InstructionError::ExecutableDataModified)
+        );
+    }
+
+    #[test]
+    fn test_check_target_foreign_owner_rejected() {
+        let mut account = mint_allocation();
+        account.set_owner(solana_sdk::system_program::id());
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&account), true),
+            Err(InstructionError::ExternalAccountDataModified)
+        );
+    }
+
+    /// A token-owned account of the wrong size, e.g. an SPL token account.
+    #[test]
+    fn test_check_target_wrong_size_rejected() {
+        let account = AccountSharedData::new(1, spl_token::state::Account::LEN, &spl_token::id());
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&account), true),
+            Err(InstructionError::InvalidAccountData)
+        );
+    }
+
+    #[test]
+    fn test_check_target_live_mint_rejected() {
+        let account = AdminVm::create_mint_account(6, &Pubkey::new_unique().to_bytes(), None);
+        assert_eq!(
+            AdminVm::check_initialize_mint_target(Some(&account), true),
+            Err(InstructionError::AccountAlreadyInitialized)
+        );
     }
 }

@@ -21,7 +21,7 @@ pub async fn run_get_signature_statuses_test(ctx: &PrivateChannelContext) {
 async fn test_signature_statuses_with_malformed_and_unknown_signatures(
     ctx: &PrivateChannelContext,
 ) {
-    println!("\n  Test 1: malformed and unknown signatures return null");
+    println!("\n  Test 1: unknown signatures return null, malformed ones fail the call");
 
     let from_keypair = Keypair::new();
     let to_pubkey = Keypair::new().pubkey();
@@ -46,31 +46,45 @@ async fn test_signature_statuses_with_malformed_and_unknown_signatures(
         .read_client
         .send::<serde_json::Value>(
             RpcRequest::GetSignatureStatuses,
-            json!([[sig.to_string(), invalid_sig, unknown_sig]]),
+            json!([[sig.to_string(), unknown_sig]]),
         )
         .await
-        .expect("getSignatureStatuses should succeed with malformed signature entries");
+        .expect("getSignatureStatuses should succeed for well-formed signatures");
 
     let statuses = response
         .get("value")
         .and_then(|value| value.as_array())
         .expect("Response should contain a status array in the value field");
 
-    assert_eq!(statuses.len(), 3, "Expected one status per input signature");
+    assert_eq!(statuses.len(), 2, "Expected one status per input signature");
     assert!(
         statuses[0].is_object(),
         "Confirmed signature should return a status object"
     );
     assert!(
         statuses[1].is_null(),
-        "Malformed signature should return null"
-    );
-    assert!(
-        statuses[2].is_null(),
         "Unknown signature should return null"
     );
 
-    println!("  ✓ malformed and unknown signatures return null");
+    // A malformed entry is a client error, so the batch fails rather than
+    // nulling that element and letting it read as proof of non-inclusion.
+    let error = ctx
+        .read_client
+        .send::<serde_json::Value>(
+            RpcRequest::GetSignatureStatuses,
+            json!([[sig.to_string(), invalid_sig]]),
+        )
+        .await
+        .expect_err("A malformed signature should fail the whole call");
+
+    let error_message = error.to_string();
+    assert!(
+        error_message.contains("Invalid signature"),
+        "Expected an invalid-signature error, got: {}",
+        error_message
+    );
+
+    println!("  ✓ unknown signatures return null, malformed ones fail the call");
 }
 
 async fn test_signature_statuses_rejects_too_many_signatures(ctx: &PrivateChannelContext) {

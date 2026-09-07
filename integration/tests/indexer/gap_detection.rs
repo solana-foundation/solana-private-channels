@@ -333,8 +333,17 @@ async fn test_gap_detection_restart_recovery() -> Result<(), Box<dyn std::error:
 /// otherwise unreachable in the integration suite (all other tests use geyser).
 /// A validator WITHOUT the geyser plugin is used — only the RPC port is needed.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "polling source races ahead of test-validator block availability \
-            (treats -32009 Ok(None) as terminal advance)"]
+// The -32009 misclassification this used to name is fixed: an absent slot the
+// enumeration listed is now Unavailable and retried, never checkpointed past.
+// What remains is a second, unrelated race in the same harness. Once getBlock
+// finally serves a recent slot, its transaction metadata can still arrive without
+// the innerInstructions that carry the escrow DepositEvent self-CPI, so the
+// deposit decodes to nothing ("No deposit event found") and the slot is completed
+// with no row written. The missing-meta guard does not catch it because `meta` is
+// present, only incomplete. Un-ignore once that guard covers a partially written
+// meta, or once the harness waits for transaction status before polling.
+#[ignore = "test-validator serves a recent block before its innerInstructions are \
+            written, so the escrow DepositEvent decodes to nothing"]
 async fn test_gap_detection_rpc_polling_fallback() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Gap Detection: RPC-Polling Fallback Test ===\n");
 

@@ -12,6 +12,15 @@ use {
 };
 
 const FIRST_AVAILABLE_BLOCK_KEY: &str = "first_available_block";
+
+/// The fewest slots a retention may keep and still hold the whole blockhash
+/// window after a restart: the window in blocks, times the slots an idle node
+/// ticks per block it produces. One slot per block is the loaded floor.
+pub fn retention_floor_slots(max_blockhashes: usize, blocktime_ms: u64) -> u64 {
+    let heartbeat_ms = crate::stages::settle::HEARTBEAT_INTERVAL.as_millis() as u64;
+    let idle_slots_per_block = (heartbeat_ms / blocktime_ms.max(1)).max(1);
+    (max_blockhashes as u64).saturating_mul(idle_slots_per_block)
+}
 const ACCOUNT_HISTORY_TABLE: &str = "account_history";
 const TRUNCATE_ADVISORY_LOCK_ID: i64 = 0x434F4E_54525543; // "CONTRUC" as hex
 const MAX_BIND_PARAMS: usize = 60_000;
@@ -289,6 +298,20 @@ async fn process_block_batches(
             .await
             .context("Failed to delete old blocks")?;
 
+        // The loop already broke on an empty fetch, so this batch has set the cursor.
+        let batch_max_slot = last_processed_slot.expect("a non-empty batch sets the cursor");
+        // Query on the batch transaction so it sees deletions this batch has not committed yet.
+        // Bound it by the cursor so the scan skips the index entries this run already deleted.
+        let remaining_floor = query_first_available_slot_above(&mut *tx, batch_max_slot)
+            .await?
+            .ok_or_else(|| {
+                // Unreachable: keep_slots is at least 1, so the newest block is never
+                // deleted and always survives above the cursor.
+                anyhow!("No blocks remain above slot {batch_max_slot} after a truncation batch")
+            })?;
+        // Advance the advertised floor in the same transaction as the deletions.
+        upsert_first_available_block(&mut *tx, remaining_floor).await?;
+
         tx.commit()
             .await
             .context("Failed to commit truncation batch transaction")?;
@@ -328,21 +351,31 @@ async fn truncate_account_history_rows(pool: &PgPool, truncate_before_slot: u64)
     Ok(result.rows_affected())
 }
 
+/// Write the advertised ledger floor, the oldest slot this node still retains.
+/// Takes any executor so a batch can write it on its own open transaction.
+async fn upsert_first_available_block<'e, E>(executor: E, slot: u64) -> Result<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO metadata (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(FIRST_AVAILABLE_BLOCK_KEY)
+    .bind(slot.to_le_bytes().to_vec())
+    .execute(executor)
+    .await
+    .context("Failed to update first_available_block metadata")?;
+    Ok(())
+}
+
 async fn set_first_available_block_metadata(
     pool: &PgPool,
     slot: Option<u64>,
 ) -> Result<Option<u64>> {
     match slot {
         Some(slot) => {
-            sqlx::query(
-                "INSERT INTO metadata (key, value) VALUES ($1, $2)
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            )
-            .bind(FIRST_AVAILABLE_BLOCK_KEY)
-            .bind(slot.to_le_bytes().to_vec())
-            .execute(pool)
-            .await
-            .context("Failed to update first_available_block metadata")?;
+            upsert_first_available_block(pool, slot).await?;
             Ok(Some(slot))
         }
         None => {
@@ -517,6 +550,24 @@ async fn query_latest_slot(pool: &PgPool) -> Result<Option<u64>> {
     Ok(latest_slot.map(|slot| slot as u64))
 }
 
+/// Oldest retained slot strictly above `slot`.
+///
+/// Deletion walks slots in ascending order, so once a batch has removed
+/// everything up to its highest slot, nothing live remains at or below it and
+/// this equals `MIN(slot)` over the whole table.
+async fn query_first_available_slot_above<'e, E>(executor: E, slot: i64) -> Result<Option<u64>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let first_available_slot =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(slot) FROM blocks WHERE slot > $1")
+            .bind(slot)
+            .fetch_one(executor)
+            .await
+            .context("Failed to query remaining first available slot")?;
+    Ok(first_available_slot.map(|slot| slot as u64))
+}
+
 async fn query_first_available_slot(pool: &PgPool) -> Result<Option<u64>> {
     let first_available_slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(slot) FROM blocks")
         .fetch_one(pool)
@@ -647,6 +698,25 @@ mod tests {
         assert_eq!(report.first_available_block, None);
     }
 
+    /// The floor is the dedup window at the widest block spacing the node has,
+    /// which moves with the blocktime and never drops below one slot per block.
+    #[test]
+    fn retention_floor_tracks_the_idle_gap() {
+        for (max_blockhashes, blocktime_ms, floor) in [
+            (150, 100, 1_500),
+            (150, 10, 15_000),
+            (150, 1_000, 150),
+            (150, 5_000, 150),
+            (1, 100, 10),
+        ] {
+            assert_eq!(
+                retention_floor_slots(max_blockhashes, blocktime_ms),
+                floor,
+                "{max_blockhashes} blockhashes at {blocktime_ms}ms"
+            );
+        }
+    }
+
     #[test]
     fn check_pg_dump_stale_file() {
         // A fresh temp file with max_backup_age=0 will always be "too old"
@@ -658,7 +728,7 @@ mod tests {
 
     // --- Integration tests requiring Postgres ---
 
-    use crate::test_helpers::start_test_postgres_raw;
+    use crate::test_helpers::{start_test_postgres_raw, start_test_postgres_with_url};
 
     async fn store_test_blocks(db: &PostgresAccountsDB, slots: &[u64]) {
         let pool = db.pool.clone();
@@ -672,6 +742,7 @@ mod tests {
                 block_time: Some(1_700_000_000 + slot as i64),
                 transaction_signatures: vec![solana_sdk::signature::Signature::new_unique()],
                 transaction_recent_blockhashes: vec![solana_sdk::hash::Hash::new_unique()],
+                transaction_message_hashes: vec![solana_sdk::hash::Hash::new_unique()],
             };
             let data = bincode::serialize(&block).unwrap();
             sqlx::query("INSERT INTO blocks (slot, data) VALUES ($1, $2) ON CONFLICT (slot) DO UPDATE SET data = $2")
@@ -692,6 +763,212 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    /// Read the advertised ledger floor exactly as the RPC read path decodes it.
+    async fn read_floor_metadata(pool: &PgPool) -> Option<u64> {
+        sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "SELECT value FROM metadata WHERE key = 'first_available_block'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
+        .map(|value| {
+            let bytes: [u8; 8] = value.as_slice().try_into().expect("floor is 8 bytes");
+            u64::from_le_bytes(bytes)
+        })
+    }
+
+    /// Ground truth for the oldest retained block, independent of the metadata key.
+    async fn min_block_slot(pool: &PgPool) -> Option<u64> {
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(slot) FROM blocks")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .map(|slot| slot as u64)
+    }
+
+    /// Make one block undeserializable so the batch loop aborts at a known slot.
+    async fn corrupt_block_data(pool: &PgPool, slot: u64) {
+        let updated = sqlx::query("UPDATE blocks SET data = $2 WHERE slot = $1")
+            .bind(slot as i64)
+            .bind(b"not-a-block".to_vec())
+            .execute(pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(updated, 1, "expected to corrupt exactly one block");
+    }
+
+    /// Run one truncation against a pool of its own, close it, and wait until the
+    /// server has actually dropped the truncation advisory lock.
+    ///
+    /// `truncate_slots` takes that lock on whichever pooled connection serves the
+    /// acquire statement and releases it on whichever connection serves the
+    /// release statement. Those are not guaranteed to be the same connection, so
+    /// a second run against a still-open pool can find the lock held by an idle
+    /// one. Closing the pool ends those sessions, but the backends exit
+    /// asynchronously, so the wait below is what makes multi-run tests
+    /// deterministic. This is test scaffolding only; the lock's connection
+    /// affinity is not part of this change.
+    async fn truncate_on_fresh_pool(
+        url: &str,
+        options: &TruncateOptions,
+        observer: &PgPool,
+    ) -> Result<TruncateReport> {
+        let db = PostgresAccountsDB::new(url, false)
+            .await
+            .expect("test pool connects");
+        let report = truncate_slots(&db, options).await;
+        db.pool.close().await;
+        await_advisory_locks_released(observer).await;
+        report
+    }
+
+    /// Block until no advisory lock is held anywhere on the test database. Each
+    /// test owns its container, so the truncation lock is the only one possible.
+    async fn await_advisory_locks_released(pool: &PgPool) {
+        for _ in 0..600 {
+            let held = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("pg_locks is readable");
+            if held == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("truncation advisory lock still held after its pool was closed");
+    }
+
+    fn apply_opts(keep_slots: u64, batch_size: usize, backup: &Path) -> TruncateOptions {
+        TruncateOptions {
+            keep_slots,
+            max_backup_age: Duration::from_secs(3600),
+            pg_dump_path: Some(backup.to_path_buf()),
+            batch_size,
+            dry_run: false,
+        }
+    }
+
+    /// Drop every block, transaction and floor entry so one container can serve
+    /// several independent truncation scenarios.
+    async fn reset_ledger(pool: &PgPool) {
+        for sql in [
+            "DELETE FROM blocks",
+            "DELETE FROM transactions",
+            "DELETE FROM metadata WHERE key = 'first_available_block'",
+        ] {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
+    }
+
+    /// U1: the advertised floor must equal the retained minimum at every batching
+    /// granularity, including single-row batches and runs that fit in one batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_floor_matches_min_slot_across_batch_sizes() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        for batch_size in [1_usize, 3, 1000] {
+            reset_ledger(&db.pool).await;
+            store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+            let report =
+                truncate_on_fresh_pool(&url, &apply_opts(5, batch_size, tmp.path()), &db.pool)
+                    .await
+                    .unwrap();
+
+            let floor = read_floor_metadata(&db.pool).await;
+            let min_slot = min_block_slot(&db.pool).await;
+            assert_eq!(
+                floor, min_slot,
+                "batch_size {batch_size}: advertised floor must equal the retained minimum"
+            );
+            assert_eq!(
+                report.first_available_block, min_slot,
+                "batch_size {batch_size}: report must carry the same floor"
+            );
+            assert_eq!(min_slot, Some(15), "batch_size {batch_size}: keep window");
+        }
+    }
+
+    /// U2: regression test. A run that aborts after committing batches must leave
+    /// the advertised floor at the retained minimum, never at the pre-run value,
+    /// because an absence-based finality verdict treats that floor as proof the
+    /// endpoint still holds the slot range it is being asked about.
+    ///
+    /// Slots 16 to 19 are deliberately absent. The batch that ends at slot 15 is
+    /// therefore followed by slot 20, so a floor derived from the batch cursor
+    /// instead of the surviving rows would claim slots that were never stored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aborted_run_leaves_floor_at_retained_minimum() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let seeded: Vec<u64> = (0..=15).chain(20..=30).collect();
+        store_test_blocks(&db, &seeded).await;
+
+        // First run establishes the metadata key; without it the reader falls back
+        // to MIN(slot) and the stale-floor window cannot be observed at all.
+        let first = truncate_on_fresh_pool(&url, &apply_opts(21, 100, tmp.path()), &db.pool)
+            .await
+            .unwrap();
+        assert_eq!(first.truncate_before_slot, Some(10));
+        assert_eq!(read_floor_metadata(&db.pool).await, Some(10));
+
+        corrupt_block_data(&db.pool, 20).await;
+
+        // Batches of 3 delete slots 10-12 and 13-15, then abort on slot 20.
+        let aborted = truncate_on_fresh_pool(&url, &apply_opts(5, 3, tmp.path()), &db.pool).await;
+        assert!(aborted.is_err(), "run must abort on the corrupt block");
+        assert!(aborted
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to deserialize block at slot 20"));
+
+        assert_eq!(min_block_slot(&db.pool).await, Some(20));
+        assert_eq!(
+            read_floor_metadata(&db.pool).await,
+            Some(20),
+            "floor must not advertise slots the aborted run already deleted"
+        );
+
+        let accounts_db = crate::accounts::AccountsDB::Postgres(db.clone());
+        assert_eq!(accounts_db.get_first_available_block().await.unwrap(), 20);
+    }
+
+    /// U3: the floor write sits inside the batch loop, one `continue` away from the
+    /// dry-run path, so a dry run must not overwrite an existing floor either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dry_run_never_writes_floor_even_when_key_exists() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        truncate_on_fresh_pool(&url, &apply_opts(10, 3, tmp.path()), &db.pool)
+            .await
+            .unwrap();
+        let floor_before = read_floor_metadata(&db.pool).await;
+        let blocks_before = min_block_slot(&db.pool).await;
+        assert_eq!(floor_before, Some(10));
+
+        let mut dry = apply_opts(2, 3, tmp.path());
+        dry.dry_run = true;
+        let report = truncate_on_fresh_pool(&url, &dry, &db.pool).await.unwrap();
+        assert!(
+            report.blocks_deleted > 0,
+            "dry run should report work to do"
+        );
+
+        assert_eq!(
+            read_floor_metadata(&db.pool).await,
+            floor_before,
+            "dry run must not move the advertised floor"
+        );
+        assert_eq!(min_block_slot(&db.pool).await, blocks_before);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -586,12 +586,13 @@ async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>
         .map_err(|e| format!("release signature lookup failed: {e}"))?;
 
     let mut pending = Vec::with_capacity(stored.len());
-    for (sig_str, lvbh) in &stored {
+    for entry in &stored {
+        let sig_str = &entry.signature;
         let signature = Signature::from_str(sig_str)
             .map_err(|e| format!("malformed stored release signature {sig_str}: {e}"))?;
         pending.push(PendingSig {
             signature,
-            last_valid_block_height: *lvbh as u64,
+            last_valid_block_height: entry.last_valid_block_height as u64,
         });
     }
     Ok(pending)
@@ -612,7 +613,10 @@ async fn stored_release_signatures(
     match storage.get_release_signatures(id).await {
         Ok(stored) if stored.is_empty() => Some((None, None)),
         Ok(stored) => {
-            let (sigs, heights): (Vec<String>, Vec<i64>) = stored.into_iter().unzip();
+            let (sigs, heights): (Vec<String>, Vec<i64>) = stored
+                .into_iter()
+                .map(|e| (e.signature, e.last_valid_block_height))
+                .unzip();
             Some((Some(sigs), Some(heights)))
         }
         Err(e) => {
@@ -669,7 +673,7 @@ async fn route_outcome(
     match action {
         RecoveryAction::Complete { signature } => {
             match storage
-                .try_complete_processing(row.id, captured_updated_at, Some(signature.clone()))
+                .try_complete_processing(row.id, captured_updated_at, Some(signature.clone()), None)
                 .await
             {
                 Ok(true) => {
@@ -1011,7 +1015,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1033,7 +1037,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1058,7 +1062,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1085,7 +1089,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1108,9 +1112,14 @@ mod tests {
     async fn deposit_malformed_stored_sig_quarantines() {
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, "not-a-valid-base58-signature".to_string(), 100)
-            .await
-            .unwrap();
+        mock.insert_release_signature(
+            row.id,
+            "not-a-valid-base58-signature".to_string(),
+            100,
+            None,
+        )
+        .await
+        .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
 
@@ -1188,7 +1197,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
         // current_height (1000) > lvbh (100) means expired/dead.
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1219,7 +1228,7 @@ mod tests {
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1260,7 +1269,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
         // current_height (50) <= lvbh (1000) means still live.
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 1000, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1286,7 +1295,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
         let recorded_sig = Signature::new_unique().to_string();
-        mock.insert_release_signature(row.id, recorded_sig.clone(), 100)
+        mock.insert_release_signature(row.id, recorded_sig.clone(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1414,10 +1423,10 @@ mod tests {
         let w_captured = seed_processing_row(&mock, withdrawal.clone()).await;
         let d_captured = seed_processing_row(&mock, deposit.clone()).await;
         let w_sig = Signature::new_unique().to_string();
-        mock.insert_release_signature(withdrawal.id, w_sig.clone(), 4242)
+        mock.insert_release_signature(withdrawal.id, w_sig.clone(), 4242, None)
             .await
             .unwrap();
-        mock.insert_release_signature(deposit.id, Signature::new_unique().to_string(), 99)
+        mock.insert_release_signature(deposit.id, Signature::new_unique().to_string(), 99, None)
             .await
             .unwrap();
 
@@ -1907,7 +1916,7 @@ mod tests {
         let mut row = make_withdrawal_row(12, Some(6));
         row.status = TransactionStatus::Processing;
         let captured = seed_processing_row(&mock, row.clone()).await;
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         mock.set_should_fail("get_release_signatures", true);
@@ -2013,7 +2022,7 @@ mod tests {
         row.updated_at = Utc::now() - chrono::Duration::minutes(10);
         mock.pending_transactions.lock().unwrap().push(row.clone());
         // A persisted signature is what an unowned sweep would classify cross-chain.
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock.clone());
@@ -2282,7 +2291,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = processing_withdrawal(1, 42);
         mock.pending_transactions.lock().unwrap().push(row.clone());
-        mock.insert_release_signature(row.id, landed_sig.to_string(), 100)
+        mock.insert_release_signature(row.id, landed_sig.to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock.clone());
@@ -2326,7 +2335,7 @@ mod tests {
         let mock = MockStorage::new();
         let row = processing_withdrawal(1, landed_nonce as i64);
         mock.pending_transactions.lock().unwrap().push(row.clone());
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         let storage = Storage::Mock(mock.clone());

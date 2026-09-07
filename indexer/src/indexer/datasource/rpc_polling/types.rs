@@ -10,6 +10,22 @@ pub struct RpcBlock {
     pub transactions: Vec<RpcTransactionWithMeta>,
 }
 
+/// Outcome of fetching one slot's block. The domain has three states:
+/// a proven-empty slot is safe to checkpoint past, but a slot the endpoint
+/// cannot serve has unknown contents and must never
+/// be checkpointed past. Transport and protocol failures stay on the outer
+/// `Result::Err` so existing error handling is untouched.
+#[derive(Debug, Clone)]
+pub enum BlockFetch {
+    Present(RpcBlock),
+    /// A later block's `parentSlot` names the previous proven slot, which proves
+    /// nothing was produced here: safe to advance.
+    Skipped,
+    /// A block exists at this slot and this endpoint will not serve it, so its
+    /// contents are unknown: must not advance.
+    Unavailable,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RpcTransactionWithMeta {
     pub transaction: EncodedTransaction,

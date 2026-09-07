@@ -43,22 +43,24 @@ pub async fn sign_and_send_transaction(
     rpc_client: Arc<RpcClientWithRetry>,
     ix_with_signers: InstructionWithSigners,
     retry_policy: RetryPolicy,
-) -> Result<(Signature, u64), TransactionError> {
-    let (transaction, signature, last_valid_block_height) =
+) -> Result<(Signature, u64, u64), TransactionError> {
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
         build_and_sign(&rpc_client, ix_with_signers).await?;
     send_signed(&rpc_client, &transaction, retry_policy).await?;
-    Ok((signature, last_valid_block_height))
+    Ok((signature, last_valid_block_height, blockhash_slot))
 }
 
 /// Build and sign a transaction without broadcasting it.
 ///
-/// Returns the signed transaction, its signature and the blockhash's
-/// `last_valid_block_height`. Splitting this from the send lets the release path
-/// persist the signature write-ahead before the broadcast.
+/// Returns the signed transaction, its signature, the blockhash's
+/// `last_valid_block_height` and the slot that blockhash was read at. Splitting
+/// this from the send lets the release path persist the signature write-ahead
+/// before the broadcast; the slot is journaled with it so a later finality
+/// verdict knows the earliest block the signature could appear in.
 pub async fn build_and_sign(
     rpc_client: &RpcClientWithRetry,
     mut ix_with_signers: InstructionWithSigners,
-) -> Result<(Transaction, Signature, u64), TransactionError> {
+) -> Result<(Transaction, Signature, u64, u64), TransactionError> {
     if let Some(compute_unit_price) = ix_with_signers.compute_unit_price {
         let compute_budget_ix =
             ComputeBudgetInstruction::set_compute_unit_price(compute_unit_price);
@@ -71,8 +73,8 @@ pub async fn build_and_sign(
         ix_with_signers.instructions.insert(0, compute_budget_ix);
     }
 
-    let (recent_blockhash, last_valid_block_height) = rpc_client
-        .get_latest_blockhash_with_commitment()
+    let (recent_blockhash, blockhash_slot, last_valid_block_height) = rpc_client
+        .get_latest_blockhash_with_commitment_and_context()
         .await
         .map_err(TransactionError::Rpc)?;
 
@@ -93,7 +95,12 @@ pub async fn build_and_sign(
 
     let signature = transaction.signatures[0];
 
-    Ok((transaction, signature, last_valid_block_height))
+    Ok((
+        transaction,
+        signature,
+        last_valid_block_height,
+        blockhash_slot,
+    ))
 }
 
 /// Broadcast an already-signed transaction.
@@ -575,7 +582,7 @@ mod tests {
 
         let result = sign_and_send_transaction(rpc_client, ix, RetryPolicy::None).await;
 
-        let (sig, _) = result.unwrap();
+        let (sig, _, _) = result.unwrap();
         assert_eq!(sig.to_string(), expected_sig);
     }
 
@@ -643,7 +650,7 @@ mod tests {
         let rpc_client = make_rpc_client_for_test(server.url());
         let ix = make_instruction_with_empty_signers();
 
-        let (transaction, signature, _lvbh) = build_and_sign(&rpc_client, ix)
+        let (transaction, signature, _lvbh, _slot) = build_and_sign(&rpc_client, ix)
             .await
             .expect("build_and_sign");
 

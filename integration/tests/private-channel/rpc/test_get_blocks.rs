@@ -65,8 +65,11 @@ pub async fn run_get_blocks_test(ctx: &PrivateChannelContext) {
         let mut successful_verifications = 0;
         let target_verifications = 3.min(blocks.len());
 
-        // Start from the end since more recent blocks are more likely to have data
-        for &slot in blocks.iter().rev().take(10) {
+        // Start from the end since more recent blocks are more likely to have data.
+        // Walk consecutive pairs: blocks are sparse relative to slots, so a block
+        // names the previous listed producer, not the previous slot.
+        for window in blocks.windows(2).rev().take(10) {
+            let (parent, slot) = (window[0], window[1]);
             match ctx.read_client.get_block(slot).await {
                 Ok(block) => {
                     println!(
@@ -75,11 +78,10 @@ pub async fn run_get_blocks_test(ctx: &PrivateChannelContext) {
                         block.transactions.len()
                     );
 
-                    // Verify the slot number matches
                     assert_eq!(
-                        block.parent_slot + 1,
-                        slot,
-                        "Block slot should be parent_slot + 1"
+                        block.parent_slot, parent,
+                        "Block {} should name the previous produced block {} as its parent",
+                        slot, parent
                     );
 
                     successful_verifications += 1;

@@ -32,7 +32,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use private_channel_gateway::{serve, Gateway};
+use private_channel_gateway::{serve, Access, Gateway};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -159,6 +159,31 @@ async fn start_mock_backend_with_body(body: impl Into<String> + Send + 'static) 
     addr
 }
 
+/// Like `start_mock_backend_with_body`, but answers each connection with the
+/// next body in `bodies` and repeats the last one after they run out. A
+/// User-role request takes two: the ownership account fetch, then the proxied
+/// call.
+async fn start_mock_backend_with_sequence(bodies: Vec<String>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut served = 0;
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let body = &bodies[served.min(bodies.len() - 1)];
+            served += 1;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        }
+    });
+    addr
+}
+
 /// Start a gateway with auth enforcement enabled.
 ///
 /// `write_url` defaults to an unreachable port when not needed — most tests
@@ -180,7 +205,36 @@ async fn start_gateway(auth_db: PgPool, write_url: String, read_url: String) -> 
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        let _ = serve(listener, gateway).await;
+        let _ = serve(listener, gateway, Access::Public).await;
+    });
+
+    addr
+}
+
+/// Start the same gateway on its internal listener: auth is configured exactly
+/// as above, and the tier is what decides it doesn't apply.
+async fn start_internal_gateway(
+    auth_db: PgPool,
+    write_url: String,
+    read_url: String,
+) -> SocketAddr {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
+    let gateway = Arc::new(Gateway::new(
+        write_url,
+        read_url,
+        "*".to_string(),
+        Some(TEST_JWT_SECRET.to_string()),
+        Some(auth_db),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let _ = serve(listener, gateway, Access::Internal).await;
     });
 
     addr
@@ -262,6 +316,72 @@ fn mint_account_response() -> String {
                 "executable": false,
                 "rentEpoch": 0
             }
+        }
+    })
+    .to_string()
+}
+
+/// A getSignaturesForAddress page carrying the two error codes that leak a
+/// balance (Custom(1) InsufficientFunds, Custom(3) MintMismatch) and one
+/// landed transaction.
+fn history_response() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": [
+            {
+                "signature": "sig1",
+                "slot": 1,
+                "err": {"InstructionError": [0, {"Custom": 1}]},
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            },
+            {
+                "signature": "sig2",
+                "slot": 2,
+                "err": {"InstructionError": [0, {"Custom": 3}]},
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            },
+            {
+                "signature": "sig3",
+                "slot": 3,
+                "err": null,
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// A getSignatureStatuses response carrying the same two probe errors, in the
+/// nested shape with the error repeated in the legacy `status` field.
+fn signature_status_response() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 3},
+            "value": [
+                {
+                    "slot": 1,
+                    "confirmations": null,
+                    "err": {"InstructionError": [0, {"Custom": 1}]},
+                    "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
+                    "confirmationStatus": "finalized"
+                },
+                {
+                    "slot": 2,
+                    "confirmations": null,
+                    "err": {"InstructionError": [0, {"Custom": 3}]},
+                    "status": {"Err": {"InstructionError": [0, {"Custom": 3}]}},
+                    "confirmationStatus": "finalized"
+                }
+            ]
         }
     })
     .to_string()
@@ -797,6 +917,51 @@ async fn test_get_token_account_balance_gated_by_ownership() {
     assert_eq!(res2.status(), 403);
 }
 
+/// A delegate may still read current state: it can spend the balance, so
+/// reading it discloses nothing the delegation did not already grant. Only the
+/// historical method is owner-only.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_token_account_balance_delegate_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate_bytes = [47u8; 32];
+    let delegate_pubkey = bs58::encode(delegate_bytes).into_string();
+    let unrelated_owner = [48u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &delegate_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([49u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &unrelated_owner,
+        Some(&delegate_bytes),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountBalance",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
 /// An expired operator JWT must be rejected with 401 on operator-only methods.
 /// Verifies that token expiry is validated before the role check.
 #[tokio::test(flavor = "multi_thread")]
@@ -1052,7 +1217,12 @@ async fn test_public_methods_pass_through_without_token() {
 
     let client = Client::new();
 
-    for method in &["sendTransaction", "getSlot", "getLatestBlockhash"] {
+    for method in &[
+        "sendTransaction",
+        "getSlot",
+        "getBlockHeight",
+        "getLatestBlockhash",
+    ] {
         let res = client
             .post(format!("http://{}", addr))
             .json(&json!({
@@ -1115,7 +1285,7 @@ async fn test_empty_jwt_secret_disables_auth() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = serve(listener, gateway).await;
+        let _ = serve(listener, gateway, Access::Public).await;
     });
 
     // A gated method with no token should get 200 (auth disabled, proxied to backend).
@@ -1179,7 +1349,7 @@ async fn test_whitespace_jwt_secret_disables_auth() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = serve(listener, gateway).await;
+        let _ = serve(listener, gateway, Access::Public).await;
     });
 
     // A gated method with no token should get 200 (auth disabled, proxied to backend).
@@ -1303,6 +1473,135 @@ async fn test_get_signatures_for_address_unowned_address_returns_403() {
     assert_eq!(res.status(), 403);
 }
 
+/// A token-account delegate must not be able to read the address' history.
+/// A delegation is a current spend authority and says nothing about who
+/// controlled the address when the returned transactions landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_delegate_returns_403() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let delegate_bytes = [44u8; 32];
+    let delegate_pubkey = bs58::encode(delegate_bytes).into_string();
+    let unrelated_owner = [45u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &delegate_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([46u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &unrelated_owner,
+        Some(&delegate_bytes),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 403);
+}
+
+/// The token-account owner still reads its own history. The owned-wallet test
+/// above goes through the System Program fallback, so this is the only cover
+/// for the token-account path.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner_bytes = [50u8; 32];
+    let owner_pubkey = bs58::encode(owner_bytes).into_string();
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &owner_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([51u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(&owner_bytes, None)).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
+/// Approving a delegate must not cost the owner access to its own history.
+/// Fails if the owner-only rejection is checked before the owner field.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let owner_bytes = [52u8; 32];
+    let owner_pubkey = bs58::encode(owner_bytes).into_string();
+    let unrelated_delegate = [53u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &owner_pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    let ata_pubkey = bs58::encode([54u8; 32]).into_string();
+    let backend = start_mock_backend_with_body(token_account_response(
+        &owner_bytes,
+        Some(&unrelated_delegate),
+    ))
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [ata_pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+}
+
 /// `getSignaturesForAddress` with an Operator JWT must be proxied for any address.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_signatures_for_address_operator_is_proxied() {
@@ -1335,6 +1634,209 @@ async fn test_get_signatures_for_address_operator_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+}
+
+/// A User must not be able to tell the two error codes apart: that difference
+/// is what turns an owned destination account into a balance oracle.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_user_gets_uniform_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let pubkey = "So11111111111111111111111111111111111111112";
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, pubkey).await;
+    let token = generate_token(user_id, "user");
+
+    // First reply clears the ownership fetch, second is the proxied page.
+    let backend =
+        start_mock_backend_with_sequence(vec![system_account_response(), history_response()]).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"], entries[1]["err"],
+        "InsufficientFunds and MintMismatch must reach a User as the same value"
+    );
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, "GenericError"]})
+    );
+    assert!(
+        entries[2]["err"].is_null(),
+        "a landed transaction keeps err: null"
+    );
+}
+
+/// An Operator keeps the raw errors, so diagnostics survive the redaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_operator_keeps_raw_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let operator_id = insert_user(&pool, "operator").await;
+    let token = generate_token(operator_id, "operator");
+
+    // An Operator skips the ownership fetch, so the page is the only reply.
+    let backend = start_mock_backend_with_body(history_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["So11111111111111111111111111111111111111112"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, {"Custom": 1}]})
+    );
+    assert_eq!(
+        entries[1]["err"],
+        json!({"InstructionError": [0, {"Custom": 3}]})
+    );
+}
+
+/// `getSignatureStatuses` needs no token at all, and the attacker holds the
+/// signature of the probe they submitted, so an anonymous caller must get the
+/// same collapsed error a User does. Otherwise the history redaction is just a
+/// door next to an open one.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signature_statuses_anonymous_gets_uniform_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let backend = start_mock_backend_with_body(signature_status_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [["sig1", "sig2"]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"]["value"].as_array().unwrap();
+    let marker = json!({"InstructionError": [0, "GenericError"]});
+    assert_eq!(
+        entries[0]["err"], entries[1]["err"],
+        "InsufficientFunds and MintMismatch must be indistinguishable here too"
+    );
+    assert_eq!(entries[0]["err"], marker);
+    assert_eq!(entries[0]["status"]["Err"], marker);
+}
+
+/// The operator's confirmation handling routes on the exact error, so the
+/// internal listener must hand back what the node said, untouched and with no
+/// token presented.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_internal_listener_keeps_raw_errors_without_a_token() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let backend = start_mock_backend_with_body(signature_status_response()).await;
+    let addr = start_internal_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [["sig1", "sig2"]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"]["value"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, {"Custom": 1}]})
+    );
+    assert_eq!(
+        entries[0]["status"]["Err"],
+        json!({"InstructionError": [0, {"Custom": 1}]})
+    );
+}
+
+/// The internal listener carries no RBAC either: the indexer polls `getBlock`,
+/// which is operator-only on the public port, and it holds no token.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_internal_listener_serves_operator_only_methods_untokened() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    let backend = start_mock_backend_with_body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).await;
+    let addr = start_internal_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "getBlock", "params": [1]}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200, "the same call is 401 on the public port");
 }
 
 // ── DvP swap escrow ──────────────────────────────────────────────────────────

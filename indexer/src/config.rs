@@ -96,7 +96,8 @@ pub struct RpcPollingConfig {
     pub batch_size: usize,
     /// RPC encoding format for getBlock calls
     pub encoding: UiTransactionEncoding,
-    /// RPC commitment level for getSlot calls
+    /// RPC commitment for block ingestion. Fixed at `finalized`: indexing is
+    /// the value-finalizing source of truth, so a forkable block must never be indexed.
     pub commitment: CommitmentLevel,
 }
 
@@ -107,8 +108,24 @@ pub struct YellowstoneConfig {
     pub endpoint: String,
     /// Token to use for authentication
     pub x_token: Option<String>,
-    /// Commitment level: "processed", "confirmed", or "finalized"
+    /// Stream commitment. Fixed at "finalized": indexing is the
+    /// value-finalizing source of truth, so a sub-finalized stream could index a forked block.
     pub commitment: String,
+}
+
+/// Floor the operator's operational RPC commitment. This knob only affects blockhash/preflight
+/// lifetime, never a settlement decision, so `confirmed` and `finalized` are both accepted;
+/// only `processed` is rejected as too weak for even operational use.
+pub fn floor_operator_commitment(level: CommitmentLevel) -> Result<CommitmentLevel, String> {
+    match level {
+        CommitmentLevel::Processed => Err(
+            "operator rpc_commitment=processed is too weak; use confirmed or finalized (this knob \
+             sets only the operational blockhash/preflight commitment, not the finalized \
+             settlement gate)"
+                .to_string(),
+        ),
+        other => Ok(other),
+    }
 }
 
 /// Backfill configuration
@@ -137,9 +154,13 @@ pub struct PrivateChannelIndexerConfig {
     pub storage_type: StorageType,
     /// RPC endpoint URL (destination chain for operators)
     pub rpc_url: String,
-    /// Source chain RPC URL for cross-chain operators (optional)
-    /// Used by escrow operator to read mint metadata from Solana
-    /// while sending mint transactions to PrivateChannel via rpc_url
+    /// Optional archival fallback RPC for `rpc_url`, used by the operator to
+    /// re-check a `Dead` verdict and by the poller for missing-block failover.
+    #[serde(default)]
+    pub fallback_rpc_url: Option<String>,
+    /// Second-chain RPC, role-dependent. Required (fatal if unset) for the escrow operator
+    /// (Solana custody), the escrow indexer (channel gateway supply check), and the withdraw
+    /// operator (remint target); unused by the withdraw indexer.
     pub source_rpc_url: Option<String>,
     /// Postgres configuration
     pub postgres: PostgresConfig,
@@ -147,17 +168,29 @@ pub struct PrivateChannelIndexerConfig {
     pub escrow_instance_id: Option<Pubkey>,
 }
 
+/// Trim an optional config string, treating blank/whitespace as unset.
+fn normalized(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
 impl PrivateChannelIndexerConfig {
     pub fn validate(&self) -> Result<(), String> {
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {
-                Err("--escrow-instance-id required when program_type is Escrow".to_string())
+                return Err("--escrow-instance-id required when program_type is Escrow".to_string())
             }
             (ProgramType::Withdraw, Some(_)) => {
-                Err("--escrow-instance-id should not be set for Withdraw program".to_string())
+                return Err(
+                    "--escrow-instance-id should not be set for Withdraw program".to_string(),
+                )
             }
-            _ => Ok(()),
+            _ => {}
         }
+        // Escrow reconciliation always reads the second-chain RPC, so require it (blank counts as unset).
+        if self.program_type == ProgramType::Escrow && normalized(&self.source_rpc_url).is_none() {
+            return Err("source_rpc_url required when program_type is Escrow".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -226,6 +259,13 @@ impl IndexerConfig {
             }
         }
 
+        // The one-shot repair only runs when backfill is also enabled. Without this the
+        // pair reads as a typo that starts a normal live indexer, which for a job the
+        // operator expects to exit means it silently never does.
+        if self.backfill.exit_after_backfill && !self.backfill.enabled {
+            return Err("backfill.backfill_only requires backfill.enabled to be true".to_string());
+        }
+
         Ok(())
     }
 }
@@ -270,7 +310,11 @@ pub struct OperatorConfig {
     pub retry_base_delay: std::time::Duration,
     /// Size of channel buffers
     pub channel_buffer_size: usize,
-    /// RPC commitment level for operator transactions
+    /// Operational RPC commitment for the operator's blockhash fetch and preflight only.
+    /// It does NOT gate settlement: the terminal Completed/FailedReminted writes and the
+    /// recovery reconcile always use a hardcoded `finalized` gate regardless of this value.
+    /// `confirmed` is a reasonable default (a finalized blockhash is ~13s stale and shortens
+    /// transaction lifetime for no safety gain); `processed` is rejected as too weak.
     pub rpc_commitment: CommitmentLevel,
     /// Webhook URL for alerting on failed transactions. Set via ALERT_WEBHOOK env var.
     pub alert_webhook_url: Option<String>,
@@ -341,6 +385,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: Some("http://localhost:8899".to_string()),
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -414,6 +459,26 @@ mod tests {
         let config = create_common_config();
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_common_config_escrow_missing_source_rpc_url() {
+        let config = PrivateChannelIndexerConfig {
+            source_rpc_url: None,
+            ..create_common_config()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("source_rpc_url required"));
+    }
+
+    #[test]
+    fn test_validate_common_config_escrow_blank_source_rpc_url() {
+        let config = PrivateChannelIndexerConfig {
+            source_rpc_url: Some("   ".to_string()),
+            ..create_common_config()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("source_rpc_url required"));
     }
 
     // ============================================================================
@@ -497,5 +562,43 @@ mod tests {
             let result = config.validate();
             assert!(result.is_ok());
         }
+    }
+
+    /// backfill_only on its own would start a live indexer that never exits, which is the
+    /// opposite of the one-shot repair the flag names, so the pair is rejected up front.
+    #[cfg(feature = "datasource-rpc")]
+    #[test]
+    fn validate_rejects_backfill_only_without_backfill_enabled() {
+        let mut config = create_indexer_config();
+        config.backfill.enabled = false;
+        config.backfill.exit_after_backfill = true;
+
+        let err = config
+            .validate()
+            .expect_err("backfill_only without enabled must not validate");
+        assert!(
+            err.contains("backfill.enabled"),
+            "error must name the missing flag, got: {err}"
+        );
+
+        config.backfill.enabled = true;
+        assert!(config.validate().is_ok(), "the enabled pair must validate");
+    }
+
+    // ── operator operational commitment floor ───────────────────────────
+
+    /// Operator rpc_commitment rejects only `processed`; confirmed/finalized pass.
+    /// (Indexing commitment is not configurable, so it has no validation test.)
+    #[test]
+    fn operator_commitment_rejects_only_processed() {
+        assert!(floor_operator_commitment(CommitmentLevel::Processed).is_err());
+        assert_eq!(
+            floor_operator_commitment(CommitmentLevel::Confirmed).unwrap(),
+            CommitmentLevel::Confirmed
+        );
+        assert_eq!(
+            floor_operator_commitment(CommitmentLevel::Finalized).unwrap(),
+            CommitmentLevel::Finalized
+        );
     }
 }

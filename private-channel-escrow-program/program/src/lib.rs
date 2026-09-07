@@ -11,4 +11,4 @@ pub mod state;
 pub mod entrypoint;
 
 use pinocchio::address::declare_id;
-declare_id!("GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83");
+declare_id!("9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU");

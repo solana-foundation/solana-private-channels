@@ -50,15 +50,13 @@ pub async fn run_blocks_in_range_boundaries_test(ctx: &PrivateChannelContext) {
 
 // ── Case A: [N, N] → [N] (iff N is a valid produced block) ─────────────────
 async fn case_a_single_slot(ctx: &PrivateChannelContext, n: u64) {
-    // N might be a skipped slot on the test validator; probe a small range
-    // [N-3, N+3] first to find a real produced slot near N.
-    let nearby = ctx
-        .get_blocks(n.saturating_sub(3), Some(n + 3))
-        .await
-        .unwrap();
+    // N is very likely a slot with no block: an idle node ticks the slot about
+    // ten times per block it produces. Ask for the first produced slot at or
+    // after N, which is exact whatever the gap happens to be.
+    let nearby = ctx.get_blocks_with_limit(n, 1).await.unwrap();
     assert!(
         !nearby.is_empty(),
-        "need at least one produced slot near {n} to anchor the single-slot test"
+        "need at least one produced slot at or after {n} to anchor the single-slot test"
     );
     let real_slot = nearby[0];
 

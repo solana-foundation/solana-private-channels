@@ -35,8 +35,8 @@ x-default-logging: &default-logging
 # All such services share one byte-identical image; per-service tags would be
 # 9 copies of the same artifact differing only in compose metadata. Each service
 # overrides only `command:` (and per-service env). Pin in CI via
-# PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus,
-# grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
+# PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus
+# and grafana use their own Dockerfiles and keep their own build blocks.
 x-private-channel-app: &private-channel-app
   image: private-channel-app:${PRIVATE_CHANNEL_VERSION:-latest}
   build:
@@ -111,7 +111,6 @@ services:
       - RUST_LOG=info
       - PRIVATE_CHANNEL_PORT=${PRIVATE_CHANNEL_WRITE_PORT}
       - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
-      - PRIVATE_CHANNEL_ENABLE_READ=false
       - PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE=${PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE}
       - PRIVATE_CHANNEL_SIGVERIFY_WORKERS=${PRIVATE_CHANNEL_SIGVERIFY_WORKERS}
       - PRIVATE_CHANNEL_MAX_CONNECTIONS=${PRIVATE_CHANNEL_WRITE_MAX_CONNECTIONS}
@@ -208,8 +207,6 @@ services:
       - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
       - PRIVATE_CHANNEL_MAX_CONNECTIONS=${PRIVATE_CHANNEL_READ_MAX_CONNECTIONS}
       - PRIVATE_CHANNEL_PG_MAX_CONNECTIONS=${PRIVATE_CHANNEL_PG_MAX_CONNECTIONS:-32}
-      - PRIVATE_CHANNEL_ENABLE_WRITE=false
-      - PRIVATE_CHANNEL_ENABLE_READ=true
       - PRIVATE_CHANNEL_LOG_LEVEL=info
       - PRIVATE_CHANNEL_JSON_LOGS=false
       - PRIVATE_CHANNEL_MODE=read
@@ -239,6 +236,10 @@ services:
     environment:
       - RUST_LOG=info
       - GATEWAY_PORT=${GATEWAY_PORT}
+      # Second listener for internal services. Deliberately absent from `ports:`
+      # below: it must stay reachable only from this Docker network, since it
+      # serves raw transaction errors with no RBAC.
+      - GATEWAY_INTERNAL_PORT=${GATEWAY_INTERNAL_PORT:-8904}
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9101
@@ -267,6 +268,13 @@ services:
     container_name: private-channel-auth
     restart: unless-stopped
     logging: *default-logging
+    # Must stay above AUTH_MAX_CONNECTIONS plus the DB pool, or accept() hits
+    # EMFILE before the connection cap engages and the listener stalls instead
+    # of shedding.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -277,6 +285,16 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
+      - AUTH_ARGON2_MAX_CONCURRENCY=${AUTH_ARGON2_MAX_CONCURRENCY:-4}
+      - AUTH_RATE_LIMIT_PER_SECOND=${AUTH_RATE_LIMIT_PER_SECOND:-5}
+      - AUTH_RATE_LIMIT_BURST=${AUTH_RATE_LIMIT_BURST:-10}
+      - AUTH_USERNAME_ATTEMPTS_PER_MINUTE=${AUTH_USERNAME_ATTEMPTS_PER_MINUTE:-5}
+      - AUTH_MAX_CONNECTIONS=${AUTH_MAX_CONNECTIONS:-1024}
+      - AUTH_MAX_CONNECTIONS_PER_IP=${AUTH_MAX_CONNECTIONS_PER_IP:-64}
+      - AUTH_HEADER_READ_TIMEOUT_SECS=${AUTH_HEADER_READ_TIMEOUT_SECS:-10}
+      - AUTH_REQUEST_TIMEOUT_SECS=${AUTH_REQUEST_TIMEOUT_SECS:-15}
+      - AUTH_TCP_KEEPALIVE_IDLE_SECS=${AUTH_TCP_KEEPALIVE_IDLE_SECS:-60}
+      - AUTH_TCP_KEEPALIVE_INTERVAL_SECS=${AUTH_TCP_KEEPALIVE_INTERVAL_SECS:-15}
     ports:
       - "${AUTH_PORT}:${AUTH_PORT}"
     command: ["/usr/local/bin/auth"]
@@ -372,7 +390,11 @@ services:
       --url https://api.mainnet-beta.solana.com
       --geyser-plugin-config /config/yellowstone-config.json
     networks:
-      - private-channel-network
+      # Second alias so the withdraw operator's mandatory fallback is a distinct
+      # URL reaching this same single local validator (no independent node exists).
+      private-channel-network:
+        aliases:
+          - validator-fallback
     healthcheck:
       test: ["CMD-SHELL", "solana cluster-version || exit 1"]
       interval: 10s
@@ -432,6 +454,10 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
+      # source_rpc_url = channel handle for the startup supply invariant
+      # (supply <= custody). Required for escrow: the indexer refuses to start without it.
+      # Read-only, so it goes straight to the read-node and skips the gateway.
+      - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
       - INDEXER_YELLOWSTONE_ENDPOINT=http://validator:10000
       - METRICS_PORT=9100
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
@@ -478,8 +504,9 @@ services:
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      # rpc_url = Solana Private Channels gateway — polls for WithdrawFunds (burn) instructions on Solana Private Channels.
-      - COMMON_RPC_URL=http://gateway:${GATEWAY_PORT}
+      # rpc_url = channel read-node, polls for WithdrawFunds (burn) instructions.
+      # Read-only, so it skips the gateway. The read-node has no auth gate.
+      - COMMON_RPC_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9100
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     volumes:
@@ -514,8 +541,10 @@ services:
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      # rpc_url = Solana Private Channels gateway (routes reads→read-node, writes→write-node)
-      - COMMON_RPC_URL=http://gateway:${GATEWAY_PORT}
+      # rpc_url = gateway internal listener. Sends mints, so it needs the gateway's
+      # routing (writes to the write-node, reads to the read-node). The internal
+      # listener because it carries no JWT and routes on the exact error.
+      - COMMON_RPC_URL=${GATEWAY_INTERNAL_URL:-http://gateway:8904}
       # source_rpc_url = Solana Solana validator 
       - COMMON_SOURCE_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
       # Injected by bench-tps/scripts/run.sh, the full-stack orchestration script that
@@ -523,12 +552,21 @@ services:
       # When absent (e.g. manual `docker compose up`), the TOML config's
       # escrow_instance_id is used — update that value to match your deployment.
       - COMMON_ESCROW_INSTANCE_ID
+      # Channel admin, not the escrow Instance.admin (a separate offline key that
+      # never reaches this stack). The operator alias is deliberate: both roles are
+      # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
+      # distinct key without also fixing feepayer_monitor.rs, which watches
+      # get_operator_pubkey() while the real fee payer is the admin key.
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - METRICS_PORT=9102
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      # Required for the escrow operator: a reconciliation mismatch must always
+      # alert, so the operator refuses to start without this. Dev/devnet may point
+      # at any sink (presence is checked at startup, delivery failures are logged).
+      - OPERATOR_RECONCILIATION_WEBHOOK_URL=${RECONCILIATION_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:
       # Exposed to host so bench-tps can scrape private_channel_operator_mints_sent_total
       # from outside Docker for e2e deposit measurement (BENCH_INDEXER_METRICS_URL).
@@ -567,8 +605,17 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # rpc_url = Solana Solana validator (where ReleaseFunds transactions are sent)
       - COMMON_RPC_URL=${LOCAL_VALIDATOR_RPC_URL}
-      # source_rpc_url = Solana Private Channels gateway (source of withdrawal/burn state)
-      - COMMON_SOURCE_RPC_URL=http://gateway:${GATEWAY_PORT}
+      # Mandatory fallback for the withdraw operator; same validator via its distinct
+      # alias since local has no independent node. Use a real archival provider in prod.
+      - COMMON_FALLBACK_RPC_URL=http://validator-fallback:8899
+      # source_rpc_url = channel read-node (source of withdrawal/burn state).
+      # Read-only, so it skips the gateway.
+      - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
+      # Channel admin, not the escrow Instance.admin (a separate offline key that
+      # never reaches this stack). The operator alias is deliberate: both roles are
+      # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
+      # distinct key without also fixing feepayer_monitor.rs, which watches
+      # get_operator_pubkey() while the real fee payer is the admin key.
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
@@ -747,6 +794,10 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      # External URL for Grafana-generated links (alert notifications, shares).
+      # Without it Grafana emits localhost links. Set GRAFANA_ROOT_URL to the
+      # reachable Grafana address for the deployment.
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
     networks:
       - private-channel-network
     healthcheck:

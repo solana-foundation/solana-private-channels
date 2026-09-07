@@ -5,7 +5,8 @@ use {
     solana_sdk::{
         account::AccountSharedData,
         hash::Hash,
-        message::{v0, Message, VersionedMessage},
+        instruction::CompiledInstruction,
+        message::{v0, v0::MessageAddressTableLookup, Message, MessageHeader, VersionedMessage},
         program_pack::Pack,
         pubkey::Pubkey,
         signature::Keypair,
@@ -106,6 +107,51 @@ pub fn transfer_tokens_transaction(
         &[from],
         recent_blockhash,
     )
+}
+
+/// Builds a signed v0 System transfer carrying `num_lookups` declared address
+/// table lookups. Only admission is under test, so the payer needs no funding.
+///
+/// With `ix_uses_lookup` the transfer's recipient is taken from the first
+/// lookup-supplied key, the shape whose account index nothing can resolve here.
+pub fn v0_system_transfer(
+    from: &Keypair,
+    to: &Pubkey,
+    lamports: u64,
+    recent_blockhash: Hash,
+    num_lookups: usize,
+    ix_uses_lookup: bool,
+) -> VersionedTransaction {
+    assert!(
+        !ix_uses_lookup || num_lookups > 0,
+        "indexing a lookup-supplied key needs at least one declared lookup"
+    );
+    let address_table_lookups = (0..num_lookups)
+        .map(|_| MessageAddressTableLookup {
+            account_key: Pubkey::new_unique(),
+            writable_indexes: vec![0],
+            readonly_indexes: vec![],
+        })
+        .collect();
+    // Index 3 is the first lookup-supplied key; 1 is the static recipient.
+    let recipient_index = if ix_uses_lookup { 3 } else { 1 };
+    let message = VersionedMessage::V0(v0::Message {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        },
+        account_keys: vec![from.pubkey(), *to, system_program::ID],
+        recent_blockhash,
+        instructions: vec![CompiledInstruction {
+            program_id_index: 2,
+            accounts: vec![0, recipient_index],
+            // System Transfer: 4-byte variant tag 2 followed by a u64 amount.
+            data: [2u32.to_le_bytes().as_slice(), &lamports.to_le_bytes()].concat(),
+        }],
+        address_table_lookups,
+    });
+    VersionedTransaction::try_new(message, &[from]).unwrap()
 }
 
 pub fn transfer_tokens_versioned_transaction(

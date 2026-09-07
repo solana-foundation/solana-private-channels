@@ -165,6 +165,21 @@ counter_vec!(
     &["program_type", "reason"]
 );
 
+/// Reason labels for the withdrawal bails that park one row and leave the
+/// pipeline running. Kept here so the emitting code and the pre-registration
+/// below read one list and a label cannot exist in only one of them.
+pub const BAIL_REASON_UNSUPPORTED_MINT: &str = "unsupported_mint";
+pub const BAIL_REASON_TARGET_MINT_MISSING: &str = "target_mint_missing";
+pub const BAIL_REASON_MINT_PAUSED: &str = "mint_paused";
+pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
+
+pub const BAIL_REASONS: [&str; 4] = [
+    BAIL_REASON_UNSUPPORTED_MINT,
+    BAIL_REASON_TARGET_MINT_MISSING,
+    BAIL_REASON_MINT_PAUSED,
+    BAIL_REASON_ESCROW_DRAINED,
+];
+
 // Supervision: a critical task inside the operator exited.  The supervisor
 // aborts the process immediately when this increments; the counter exists
 // so dashboards can alert even if the restart is fast.
@@ -191,6 +206,73 @@ counter_vec!(
     &["program_type", "outcome", "type"]
 );
 
+// Reopened-deposit gate: a deposit picked up with persisted write-ahead mint
+// signatures was resolved by classifying them on the channel before minting.
+// `outcome` ∈ {completed, complete_raced, complete_write_failed, deferred_live,
+// deferred_unverifiable}; the normal proceed path is the plain mint flow and is
+// not counted. The gate never quarantines; an unresolved row is left Processing
+// for the recovery sweep.
+counter_vec!(
+    OPERATOR_REOPENED_DEPOSIT_GATE,
+    "private_channel_operator_reopened_deposit_gate_total",
+    "Reopened deposits resolved by the pre-mint signature gate",
+    &["program_type", "outcome"]
+);
+
+// Release-side SMT confirmation gate: the on-chain root verdict wherever a
+// release consumer needs to know whether a nonce actually released. `site` is one
+// of {recovery, remint, presend}; `verdict` is one of {landed, not_landed,
+// uncertain}, plus `journal_unavailable` on `presend` only. `recovery` and
+// `remint` are the terminal Dead branch of a recorded signature; `presend` is a
+// Processing withdrawal with no recorded signature at all, where the verdict
+// decides whether the row is re-armed. A rising `uncertain` rate is a stuck
+// DB-vs-chain divergence worth alerting on, and on `presend` it also means rows
+// are waiting out the escalation window. `journal_unavailable` is the same wait
+// for a row whose signature journal could not be read at all.
+counter_vec!(
+    OPERATOR_RELEASE_VERIFY,
+    "private_channel_operator_release_verify_total",
+    "Release-side SMT confirmation verdicts",
+    &["site", "verdict"]
+);
+
+// A sender signed a remint but lost the pre-send claim on its transaction, which
+// is only possible if a second sender is running against the same database. Zero
+// under correct single-sender operation, so any increment is proof the sender's
+// advisory lock was lost and is the detection mechanism for that whole class of
+// problem. Alert-routed as critical.
+counter_vec!(
+    OPERATOR_REMINT_CLAIM_LOST,
+    "private_channel_operator_remint_claim_lost_total",
+    "Remint broadcasts abandoned because another sender owned the claim",
+    &["program_type"]
+);
+
+// The sender could not prove it still owns its advisory lock, so it cancelled
+// the whole operator. `reason` is one of {not_held, probe_error, probe_timeout,
+// fenced_write}: `not_held` is a successful probe that proved the lock is gone,
+// `probe_error` and `probe_timeout` are a heartbeat probe that failed or hung on
+// the pinned session, and `fenced_write` is a sender-owned write that could not
+// be proven to have run inside the lock's own session. Zero in steady state, so
+// any increment means the singleton guarantee was broken.
+counter_vec!(
+    OPERATOR_SENDER_LOCK_LOST,
+    "private_channel_operator_sender_lock_lost_total",
+    "Sender shutdowns triggered by unprovable advisory-lock ownership",
+    &["program_type", "reason"]
+);
+
+// Absence-based finality classification: how a null status past blockhash
+// validity resolved once the ledger-floor retention proof ran. `chain` is one of
+// {channel, solana}; `outcome` is one of {dead, uncertain}. Sized before and after
+// deploy to see how much of the newly-reachable channel `dead` population is real.
+counter_vec!(
+    OPERATOR_ABSENCE_CLASSIFY,
+    "private_channel_operator_absence_classify_total",
+    "Absence-based finality verdicts after the ledger-floor retention proof",
+    &["chain", "outcome"]
+);
+
 pub fn init_labels(program_type: &str) {
     INDEXER_MINTS_SAVED.with_label_values(&[program_type]);
     INDEXER_TRANSACTIONS_SAVED.with_label_values(&[program_type]);
@@ -204,13 +286,22 @@ pub fn init_labels(program_type: &str) {
     INDEXER_CHECKPOINT_FRONTIER_LAG.with_label_values(&[program_type]);
     INDEXER_SLOT_PROCESSING_DURATION.with_label_values(&[program_type]);
 
-    for error_type in &["stream", "get_slots", "get_block"] {
+    for error_type in &[
+        "stream",
+        "get_slots",
+        "get_block",
+        "missing_meta",
+        "block_unavailable",
+        "gap_fill",
+        "missing_anchor",
+    ] {
         INDEXER_RPC_ERRORS.with_label_values(&[program_type, error_type]);
     }
 
     OPERATOR_TRANSACTIONS_FETCHED.with_label_values(&[program_type]);
     OPERATOR_MINTS_SENT.with_label_values(&[program_type]);
     OPERATOR_DB_UPDATE_ERRORS.with_label_values(&[program_type]);
+    OPERATOR_REMINT_CLAIM_LOST.with_label_values(&[program_type]);
 
     for status in &["Pending", "Processing", "Completed", "Failed"] {
         OPERATOR_DB_UPDATES.with_label_values(&[program_type, status]);
@@ -243,6 +334,12 @@ pub fn init_labels(program_type: &str) {
         "confirmation_timeout",
         "program_error",
         "confirmation_error",
+        "deposit_ownership_lost",
+        "release_claim_lost",
+        "release_missing_claim_lease",
+        "jit_missing_claim_lease",
+        "malformed_status_response",
+        "status_poll_rpc_error",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }
@@ -251,10 +348,29 @@ pub fn init_labels(program_type: &str) {
     FEEPAYER_BALANCE_LAMPORTS.with_label_values(&[program_type]);
 
     // Quarantine reasons must match the string constants returned by
-    // `classify_processor_error` in processor.rs — any mismatch is a dead
+    // `classify_processor_error` in processor.rs - any mismatch is a dead
     // label (visible in Prometheus, never incremented).
-    for reason in &["invalid_pubkey", "invalid_builder", "program_error"] {
+    for reason in &[
+        "invalid_pubkey",
+        "invalid_builder",
+        "program_error",
+        "mint_not_allowed",
+    ] {
         OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
+    }
+
+    for reason in &BAIL_REASONS {
+        OPERATOR_TRANSACTION_QUARANTINED.with_label_values(&[program_type, reason]);
+    }
+
+    for outcome in &[
+        "completed",
+        "complete_raced",
+        "complete_write_failed",
+        "deferred_live",
+        "deferred_unverifiable",
+    ] {
+        OPERATOR_REOPENED_DEPOSIT_GATE.with_label_values(&[program_type, outcome]);
     }
 
     for task in &[
@@ -290,6 +406,29 @@ pub fn init_labels(program_type: &str) {
             "withdrawal",
         ]);
     }
+
+    // Release-verify gate labels are program-independent (site, verdict); the
+    // idempotent pre-registration is harmless across repeated init_labels calls.
+    for site in &["recovery", "remint", "presend"] {
+        for verdict in &["landed", "not_landed", "uncertain"] {
+            OPERATOR_RELEASE_VERIFY.with_label_values(&[site, verdict]);
+        }
+    }
+    // Only presend reads the journal before proving anything, so this pair is
+    // registered on its own rather than widening the grid with dead series.
+    OPERATOR_RELEASE_VERIFY.with_label_values(&["presend", "journal_unavailable"]);
+
+    // Pre-register every reason so the alert query sees a zero series, not nothing.
+    for reason in &["not_held", "probe_error", "probe_timeout", "fenced_write"] {
+        OPERATOR_SENDER_LOCK_LOST.with_label_values(&[program_type, reason]);
+    }
+
+    // Chain/outcome labels are program-independent; both roles classify both chains.
+    for chain in &["channel", "solana"] {
+        for outcome in &["dead", "uncertain"] {
+            OPERATOR_ABSENCE_CLASSIFY.with_label_values(&[chain, outcome]);
+        }
+    }
 }
 
 pub fn init() {
@@ -317,6 +456,11 @@ pub fn init() {
         OPERATOR_TRANSACTION_QUARANTINED,
         OPERATOR_TASK_EXIT,
         OPERATOR_STALE_PROCESSING_RECOVERED,
+        OPERATOR_REOPENED_DEPOSIT_GATE,
+        OPERATOR_RELEASE_VERIFY,
+        OPERATOR_ABSENCE_CLASSIFY,
+        OPERATOR_REMINT_CLAIM_LOST,
+        OPERATOR_SENDER_LOCK_LOST,
     );
 }
 
@@ -366,6 +510,7 @@ mod tests {
             "private_channel_operator_mints_sent_total",
             "private_channel_operator_backlog_depth",
             "private_channel_feepayer_balance_lamports",
+            "private_channel_operator_remint_claim_lost_total",
         ];
 
         for name in single_label_metrics {
@@ -406,6 +551,9 @@ mod tests {
             "private_channel_operator_transaction_quarantined_total",
             "private_channel_operator_task_exit_total",
             "private_channel_operator_stale_processing_recovered_total",
+            "private_channel_operator_reopened_deposit_gate_total",
+            "private_channel_operator_remint_claim_lost_total",
+            "private_channel_operator_sender_lock_lost_total",
         ];
 
         let families = prometheus::gather();

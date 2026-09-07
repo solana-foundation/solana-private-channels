@@ -7,7 +7,7 @@
 //! staleness window. Idle (no backlog, no progress) stays healthy.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy)]
@@ -58,12 +58,19 @@ pub struct HealthState {
     last_progress_at: AtomicI64,
     /// Service-defined backlog metric (slot lag for indexer, queue depth for operator).
     pending: AtomicU64,
+    /// Deliberate sticky-unhealthy latch (`Some(reason)`); never self-clears,
+    /// recovery is manual so a solvency incident stays visible. Read on /health.
+    forced_unhealthy: Mutex<Option<String>>,
     config: HealthConfig,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HealthOutcome {
     Healthy,
+    /// A service latched itself unhealthy via `force_unhealthy`.
+    ForcedUnhealthy {
+        reason: String,
+    },
     /// Backlog has exceeded the configured ceiling.
     BacklogExceeded {
         pending: u64,
@@ -81,12 +88,23 @@ impl HealthState {
         Arc::new(Self {
             last_progress_at: AtomicI64::new(0),
             pending: AtomicU64::new(0),
+            forced_unhealthy: Mutex::new(None),
             config,
         })
     }
 
     pub fn record_progress(&self) {
         self.last_progress_at.store(now_unix(), Ordering::Relaxed);
+    }
+
+    /// Latch the service unhealthy with a durable reason. Idempotent: once
+    /// latched it keeps the first reason, so the original incident stays visible
+    /// even if a caller re-invokes it every poll.
+    pub fn force_unhealthy(&self, reason: impl Into<String>) {
+        let mut latched = self.forced_unhealthy.lock().unwrap();
+        if latched.is_none() {
+            *latched = Some(reason.into());
+        }
     }
 
     pub fn set_pending(&self, value: u64) {
@@ -103,9 +121,14 @@ impl HealthState {
         self.check_at(now_unix())
     }
 
-    /// Variant used by tests to inject a deterministic "now". Production code
-    /// should call `check()`.
-    pub fn check_at(&self, now: i64) -> HealthOutcome {
+    /// Variant that takes an injected "now" so tests are deterministic. Private:
+    /// production calls `check()`, tests reach this directly from the child module.
+    fn check_at(&self, now: i64) -> HealthOutcome {
+        // The latch wins over every derived signal so a forced-unhealthy state
+        // is never masked by an idle/healthy backlog reading.
+        if let Some(reason) = self.forced_unhealthy.lock().unwrap().clone() {
+            return HealthOutcome::ForcedUnhealthy { reason };
+        }
         let pending = self.pending.load(Ordering::Relaxed);
         if pending > self.config.max_pending {
             return HealthOutcome::BacklogExceeded {
@@ -297,6 +320,60 @@ mod tests {
         h.last_progress_at.store(1000, Ordering::Relaxed);
         h.set_pending(0);
         assert_eq!(h.check_at(1010), HealthOutcome::Healthy);
+    }
+
+    #[test]
+    fn force_unhealthy_flips_check_and_is_healthy_false() {
+        let h = HealthState::new(cfg(10, 30));
+        // A fresh state with no backlog is Healthy until the latch is set.
+        assert!(h.is_healthy());
+        h.force_unhealthy("proven insolvency");
+        assert!(!h.is_healthy());
+        assert!(matches!(
+            h.check_at(1000),
+            HealthOutcome::ForcedUnhealthy { .. }
+        ));
+    }
+
+    #[test]
+    fn forced_reason_surfaced() {
+        let h = HealthState::new(cfg(10, 30));
+        h.force_unhealthy("mint ABC insolvent");
+        match h.check_at(1000) {
+            HealthOutcome::ForcedUnhealthy { reason } => {
+                assert_eq!(reason, "mint ABC insolvent");
+            }
+            other => panic!("expected ForcedUnhealthy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn force_unhealthy_overrides_otherwise_healthy_idle() {
+        // Idle-with-old-progress is normally Healthy; the latch must win.
+        let h = HealthState::new(cfg(10, 30));
+        h.last_progress_at.store(1, Ordering::Relaxed);
+        h.set_pending(0);
+        assert_eq!(h.check_at(1_000_000), HealthOutcome::Healthy);
+        h.force_unhealthy("halt");
+        assert!(matches!(
+            h.check_at(1_000_000),
+            HealthOutcome::ForcedUnhealthy { .. }
+        ));
+    }
+
+    #[test]
+    fn not_forced_preserves_derived_outcomes() {
+        // Without the latch, the derived backlog/staleness outcomes are unchanged.
+        let h = HealthState::new(cfg(10, 30));
+        h.last_progress_at.store(1000, Ordering::Relaxed);
+        h.set_pending(11);
+        assert_eq!(
+            h.check_at(1001),
+            HealthOutcome::BacklogExceeded {
+                pending: 11,
+                ceiling: 10
+            }
+        );
     }
 
     #[test]

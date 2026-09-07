@@ -9,5 +9,5 @@ pub mod reconciliation;
 pub mod resync;
 pub mod transaction_processor;
 
-pub use checkpoint::CheckpointUpdate;
+pub use checkpoint::{CheckpointMsg, CheckpointUpdate};
 pub use indexer::run;

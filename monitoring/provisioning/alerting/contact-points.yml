@@ -1,10 +1,26 @@
 apiVersion: 1
 contactPoints:
   - orgId: 1
-    name: webhook-alerts
+    name: default
     receivers:
-      - uid: webhook-alerts
-        type: webhook
+      - uid: default
+        # Vendor-neutral by default. The contact type and endpoint are
+        # deployment-configured via Grafana env-var substitution (these files are
+        # consumed as-is by the Ansible deploy, the dev compose, and the baked
+        # Grafana image, so env substitution is the only parameterization that
+        # works everywhere):
+        #   ALERT_CONTACT_TYPE  - grafana receiver type (default: webhook).
+        #   ALERT_WEBHOOK_URL   - endpoint URL (default: a no-op URL).
+        # The settings block below only provides `url`, so it covers the receiver
+        # types whose required setting IS a url: webhook, slack, teams. Other
+        # types need their own settings added here (pagerduty: integrationKey,
+        # email: addresses, opsgenie: apiKey/apiUrl) — a bare url would create an
+        # invalid contact point that notifies nowhere. Defaults give a fresh
+        # deploy a harmless no-op webhook with no external dependency. For Slack:
+        # set ALERT_CONTACT_TYPE=slack and point ALERT_WEBHOOK_URL at a Slack
+        # Incoming Webhook (Grafana's slack receiver formats the payload; a
+        # generic webhook does not). Message format is left to Grafana's per-type
+        # defaults.
+        type: ${ALERT_CONTACT_TYPE}
         settings:
           url: ${ALERT_WEBHOOK_URL}
-          httpMethod: POST

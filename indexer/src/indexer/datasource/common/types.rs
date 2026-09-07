@@ -69,6 +69,14 @@ pub enum ProcessorMessage {
         slot: u64,
         program_type: ProgramType,
     },
+    /// Re-arm the checkpoint gate on reconnect over the durable range `(from, target]`.
+    /// Rides the same FIFO pipeline as the slots it protects, so the gate is set before
+    /// the first live slot at `target` can leapfrog the unfilled residual window.
+    Regate {
+        program_type: ProgramType,
+        from: u64,
+        target: u64,
+    },
 }
 
 // Channel types for sending/receiving messages to transaction processor

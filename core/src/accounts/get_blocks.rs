@@ -1,7 +1,6 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
+    super::{postgres::PostgresAccountsDB, traits::AccountsDB},
     anyhow::{anyhow, Context, Result},
-    redis::AsyncCommands,
 };
 
 /// Maximum number of blocks that can be returned (per Solana spec)
@@ -16,7 +15,13 @@ pub async fn get_blocks(
         AccountsDB::Postgres(postgres_db) => {
             get_blocks_postgres(postgres_db, start_slot, end_slot).await
         }
-        AccountsDB::Redis(redis_db) => get_blocks_redis(redis_db, start_slot, end_slot).await,
+        // Served from the source of truth, never the cache. A range answered
+        // from a partial mirror is indistinguishable from a complete one, so a
+        // cached miss would silently drop finalized blocks instead of surfacing
+        // as a miss.
+        AccountsDB::Redis(redis_db) => {
+            get_blocks_postgres(&redis_db.fallback, start_slot, end_slot).await
+        }
     }
 }
 
@@ -57,45 +62,4 @@ async fn get_blocks_postgres(
 
     // Convert i64 slots to u64
     Ok(slots.into_iter().map(|s| s as u64).collect())
-}
-
-async fn get_blocks_redis(
-    db: &RedisAccountsDB,
-    start_slot: u64,
-    end_slot: Option<u64>,
-) -> Result<Vec<u64>> {
-    let mut conn = db.connection.clone();
-
-    let end_slot = match end_slot {
-        Some(end) => end,
-        None => {
-            let latest_slot: redis::RedisResult<Option<u64>> = conn.get("latest_slot").await;
-            latest_slot
-                .map_err(|e| anyhow!("Failed to get latest slot from Redis: {}", e))?
-                .context("No latest slot found in Redis")?
-        }
-    };
-
-    // Enforce maximum range constraint
-    if end_slot > start_slot && (end_slot - start_slot) > MAX_BLOCKS_RANGE {
-        return Err(anyhow!(
-            "Range too large: {} slots (max: {})",
-            end_slot - start_slot,
-            MAX_BLOCKS_RANGE
-        ));
-    }
-
-    // ZRANGE ... BYSCORE queries only the requested range in O(log N + M),
-    // where N is total slots indexed and M is the number of results returned.
-    // Results are returned in ascending score order (slot order) by default.
-    let slots: Vec<u64> = redis::cmd("ZRANGE")
-        .arg("block_slot_index")
-        .arg(start_slot)
-        .arg(end_slot)
-        .arg("BYSCORE")
-        .query_async(&mut conn)
-        .await
-        .map_err(|e| anyhow!("Failed to query block slot index in Redis: {}", e))?;
-
-    Ok(slots)
 }

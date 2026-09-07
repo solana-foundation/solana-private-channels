@@ -73,6 +73,9 @@ impl DbTransactionWriter {
                 update.status,
                 update.counterpart_signature.clone(),
                 update.processed_at.unwrap_or_else(Utc::now),
+                // Theirs' release_signatures provenance column is out of scope
+                // for this merge, so nothing is written to it yet.
+                None,
             )
             .await
         {

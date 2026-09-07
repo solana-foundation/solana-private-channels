@@ -15,6 +15,8 @@
 // this same test binary so they share compile state.
 #[path = "test_truncate_backup_failure.rs"]
 mod backup_failure;
+#[path = "test_truncate_floor_atomicity.rs"]
+mod floor_atomicity;
 #[path = "test_truncate_lock_contention.rs"]
 mod lock_contention;
 
@@ -106,6 +108,7 @@ fn build_block(slot: u64, previous_blockhash: Hash, signature: Signature) -> Blo
         block_time: Some(slot as i64),
         transaction_signatures: vec![signature],
         transaction_recent_blockhashes: vec![blockhash],
+        transaction_message_hashes: vec![Hash::new_unique()],
     }
 }
 

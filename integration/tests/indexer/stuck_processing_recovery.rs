@@ -195,7 +195,7 @@ async fn it1_deposit_landed_promoted_to_completed() {
 
     // The mint persisted this signature write-ahead before broadcast; it then landed.
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -290,7 +290,7 @@ async fn it2b_deposit_dead_signature_demoted() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // Persisted write-ahead before broadcast; the mint never landed and the blockhash expired.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -329,7 +329,7 @@ async fn it3_withdrawal_dead_signature_demoted() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 7);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -373,7 +373,7 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -422,7 +422,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 2);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000, None)
         .await
         .unwrap();
 
@@ -511,7 +511,7 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 4);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -582,10 +582,10 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
         .execute(&pool)
         .await
         .unwrap();
-    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1)
+    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1, None)
         .await
         .unwrap();
-    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2)
+    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2, None)
         .await
         .unwrap();
 
@@ -639,7 +639,7 @@ async fn it4f_gc_retains_manual_review_release_sigs() {
     .execute(&pool)
     .await
     .unwrap();
-    db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 7)
+    db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 7, None)
         .await
         .unwrap();
 
@@ -680,7 +680,7 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 500);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -736,7 +736,7 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 700);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100)
+    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100, None)
         .await
         .unwrap();
 
@@ -891,6 +891,7 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
         private_channel_indexer::storage::common::models::TransactionStatus::Completed,
         Some("lagging-sig".to_string()),
         Utc::now(),
+        None,
     )
     .await
     .unwrap();
@@ -1252,7 +1253,7 @@ async fn withdraw_recovery_never_touches_escrow_deposit() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // The persisted mint signature is what a cross-role sweep would classify.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -1311,7 +1312,7 @@ async fn withdraw_boot_reconcile_ignores_foreign_processing_rows() {
         );
         let id = db.insert_transaction_internal(&tx).await.unwrap();
         seed_backdated_processing(&pool, id, ChronoDuration::minutes(10)).await;
-        db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 100)
+        db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         ids.push(id);
@@ -1443,7 +1444,7 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 

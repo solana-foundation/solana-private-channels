@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::error::AppError;
+use crate::error::{is_communication_error, AppError};
 
 /// Tracks whether the Postgres pool is reachable, updated by handlers after
 /// each DB call. Read by the /health endpoint so the probe doesn't take a
@@ -28,9 +28,7 @@ impl PoolStatus {
     pub fn observe_sqlx<T>(&self, result: &Result<T, sqlx::Error>) {
         match result {
             Ok(_) => self.healthy.store(true, Ordering::Relaxed),
-            Err(e) if Self::is_communication_error(e) => {
-                self.healthy.store(false, Ordering::Relaxed)
-            }
+            Err(e) if is_communication_error(e) => self.healthy.store(false, Ordering::Relaxed),
             Err(_) => self.healthy.store(true, Ordering::Relaxed),
         }
     }
@@ -39,20 +37,10 @@ impl PoolStatus {
     pub fn observe_app<T>(&self, result: &Result<T, AppError>) {
         match result {
             Ok(_) => self.healthy.store(true, Ordering::Relaxed),
-            Err(AppError::Db(e)) if Self::is_communication_error(e) => {
+            Err(AppError::Db(e)) if is_communication_error(e) => {
                 self.healthy.store(false, Ordering::Relaxed)
             }
             Err(_) => self.healthy.store(true, Ordering::Relaxed),
         }
-    }
-
-    fn is_communication_error(e: &sqlx::Error) -> bool {
-        matches!(
-            e,
-            sqlx::Error::Io(_)
-                | sqlx::Error::PoolTimedOut
-                | sqlx::Error::PoolClosed
-                | sqlx::Error::WorkerCrashed
-        )
     }
 }

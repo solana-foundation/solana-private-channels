@@ -5,9 +5,11 @@ use {
         rpc::{
             error::{read_not_enabled, write_not_enabled},
             get_account_info_impl::get_account_info_impl,
+            get_block_height_impl::get_block_height_impl,
             get_block_impl::get_block_impl,
             get_block_time_impl::get_block_time_impl,
             get_blocks_impl::get_blocks_impl,
+            get_blocks_with_limit_impl::get_blocks_with_limit_impl,
             get_epoch_info_impl::get_epoch_info_impl,
             get_epoch_schedule_impl::get_epoch_schedule_impl,
             get_first_available_block_impl::get_first_available_block_impl,
@@ -53,7 +55,6 @@ use {
         collections::LinkedList,
         sync::{Arc, RwLock},
     },
-    tokio::sync::mpsc,
 };
 
 pub struct ReadDeps {
@@ -65,7 +66,8 @@ pub struct ReadDeps {
 }
 
 pub struct WriteDeps {
-    pub dedup_tx: mpsc::Sender<SanitizedTransaction>,
+    /// RPC ingress sender feeding the sigverify worker pool (the first stage).
+    pub dedup_tx: async_channel::Sender<SanitizedTransaction>,
     pub metrics: SharedMetrics,
 }
 
@@ -110,6 +112,11 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     async fn get_slot(&self, _config: Option<RpcContextConfig>) -> RpcResult<u64> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_slot_impl(read_deps, _config).await
+    }
+
+    async fn get_block_height(&self, _config: Option<RpcContextConfig>) -> RpcResult<u64> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_block_height_impl(read_deps, _config).await
     }
 
     async fn get_block(
@@ -179,6 +186,16 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     ) -> RpcResult<Vec<u64>> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_blocks_impl(read_deps, start_slot, end_slot, _config).await
+    }
+
+    async fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: u64,
+        _config: Option<RpcContextConfig>,
+    ) -> RpcResult<Vec<u64>> {
+        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
+        get_blocks_with_limit_impl(read_deps, start_slot, limit, _config).await
     }
 
     async fn get_epoch_info(&self, _config: Option<RpcEpochConfig>) -> RpcResult<EpochInfo> {

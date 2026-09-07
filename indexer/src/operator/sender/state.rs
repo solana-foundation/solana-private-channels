@@ -239,12 +239,12 @@ pub(super) async fn load_persisted_release_signatures(
     match storage.get_release_signatures(transaction_id).await {
         Ok(stored) => stored
             .iter()
-            .filter_map(|(signature, last_valid_block_height)| {
-                Signature::from_str(signature)
+            .filter_map(|entry| {
+                Signature::from_str(&entry.signature)
                     .ok()
                     .map(|signature| PendingSig {
                         signature,
-                        last_valid_block_height: (*last_valid_block_height).max(0) as u64,
+                        last_valid_block_height: entry.last_valid_block_height.max(0) as u64,
                     })
             })
             .collect(),
@@ -1227,6 +1227,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -1332,10 +1333,14 @@ mod tests {
             });
 
         if let Some(sig) = signature {
-            mock.release_signatures
-                .lock()
-                .unwrap()
-                .insert(id, vec![(sig.to_string(), 1)]);
+            mock.release_signatures.lock().unwrap().insert(
+                id,
+                vec![crate::storage::common::models::StoredSig {
+                    signature: sig.to_string(),
+                    last_valid_block_height: 1,
+                    blockhash_slot: None,
+                }],
+            );
         }
     }
 

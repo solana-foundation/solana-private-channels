@@ -4,6 +4,9 @@
 program_type = "withdraw"
 # Solana Solana validator — where ReleaseFunds transactions are sent
 rpc_url = "http://localhost:18899"
+# REQUIRED for the withdraw operator: require an independent, same-cluster, reachable fallback or it refuses to start.
+# Local reuses the validator via a distinct host string (COMMON_FALLBACK_RPC_URL overrides in docker); use a real archival provider in prod.
+fallback_rpc_url = "http://127.0.0.1:18899"
 
 # Solana Private Channels gateway — source of withdrawal/burn state and mint account data
 source_rpc_url = "http://localhost:8898"

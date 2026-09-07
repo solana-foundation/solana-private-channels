@@ -11,6 +11,7 @@ pub async fn update_transaction_status(
     status: TransactionStatus,
     counterpart_signature: Option<String>,
     processed_at: DateTime<Utc>,
+    release_signatures: Option<Vec<String>>,
 ) -> Result<bool, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db
@@ -19,6 +20,7 @@ pub async fn update_transaction_status(
                 status,
                 counterpart_signature,
                 processed_at,
+                release_signatures,
             )
             .await?),
         #[cfg(any(test, feature = "test-mock-storage"))]
@@ -29,6 +31,7 @@ pub async fn update_transaction_status(
                     status,
                     counterpart_signature,
                     processed_at,
+                    release_signatures,
                 )
                 .await
         }

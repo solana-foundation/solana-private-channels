@@ -11,7 +11,6 @@ use {
     sqlx::{postgres::PgPoolOptions, PgPool},
     std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, time::Instant},
-    tokio_util::sync::CancellationToken,
     tracing::{debug, error, info, warn},
 };
 
@@ -30,7 +29,6 @@ pub struct AddressIndexWriterArgs {
     pub rows_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
     pub accountsdb_connection_url: String,
     pub flush_chunk_size: usize,
-    pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<StageHeartbeat>,
 }
@@ -40,7 +38,6 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
         mut rows_rx,
         accountsdb_connection_url,
         flush_chunk_size,
-        shutdown_token,
         metrics,
         heartbeat,
     } = args;
@@ -70,46 +67,42 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
         let mut flat: Vec<AddressSignatureRow> = Vec::with_capacity(flush_chunk_size * 2);
 
         loop {
-            tokio::select! {
-                biased;
+            // Last stage in the drain, so it exits only when the settler has
+            // finished and dropped its sender. Exiting on a signal instead would
+            // strand rows the settler was still emitting.
+            let n = rows_rx.recv_many(&mut buf, 64).await;
+            if n == 0 {
+                info!("Address-index writer input channel closed");
+                break;
+            }
+            heartbeat.record_input();
+            // From permits, not `len()`: that one subtracts a closed flag from
+            // the queue position and underflows when the settler drops its
+            // sender right after this drained the last batch, which is how an
+            // ordered drain normally ends.
+            let depth = rows_rx.max_capacity().saturating_sub(rows_rx.capacity());
+            metrics.address_signatures_queue_depth(depth);
 
-                _ = shutdown_token.cancelled() => {
-                    info!("Address-index writer received shutdown signal");
-                    break;
+            for batch in buf.drain(..) {
+                flat.extend(batch);
+                // Flush in chunk-sized COMMITs so a single tick worth
+                // of work never produces an oversized transaction.
+                while flat.len() >= flush_chunk_size {
+                    let take = flat.split_off(flush_chunk_size);
+                    let chunk = std::mem::replace(&mut flat, take);
+                    if let Err(e) =
+                        flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await
+                    {
+                        error!(?e, "address_signatures flush failed; exiting");
+                        return;
+                    }
                 }
-
-                n = rows_rx.recv_many(&mut buf, 64) => {
-                    if n == 0 {
-                        info!("Address-index writer input channel closed");
-                        break;
-                    }
-                    heartbeat.record_input();
-                    metrics.address_signatures_queue_depth(rows_rx.len());
-
-                    for batch in buf.drain(..) {
-                        flat.extend(batch);
-                        // Flush in chunk-sized COMMITs so a single tick worth
-                        // of work never produces an oversized transaction.
-                        while flat.len() >= flush_chunk_size {
-                            let take = flat.split_off(flush_chunk_size);
-                            let chunk = std::mem::replace(&mut flat, take);
-                            if let Err(e) =
-                                flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await
-                            {
-                                error!(?e, "address_signatures flush failed; exiting");
-                                return;
-                            }
-                        }
-                    }
-                    if !flat.is_empty() {
-                        let chunk = std::mem::take(&mut flat);
-                        if let Err(e) =
-                            flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await
-                        {
-                            error!(?e, "address_signatures flush failed; exiting");
-                            return;
-                        }
-                    }
+            }
+            if !flat.is_empty() {
+                let chunk = std::mem::take(&mut flat);
+                if let Err(e) = flush_and_record(&pool, &chunk, &flat, &metrics, &heartbeat).await {
+                    error!(?e, "address_signatures flush failed; exiting");
+                    return;
                 }
             }
         }
@@ -270,12 +263,10 @@ mod tests {
         let url = postgres_container_url(&pg, "test_db").await;
 
         let (tx, rx) = mpsc::channel(8);
-        let shutdown = CancellationToken::new();
         let handle = start_address_index_writer(AddressIndexWriterArgs {
             rows_rx: rx,
             accountsdb_connection_url: url.clone(),
             flush_chunk_size: 100,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: StageHeartbeat::new(),
         })
@@ -306,12 +297,10 @@ mod tests {
         let url = postgres_container_url(&pg, "test_db").await;
 
         let (tx, rx) = mpsc::channel(4);
-        let shutdown = CancellationToken::new();
         let handle = start_address_index_writer(AddressIndexWriterArgs {
             rows_rx: rx,
             accountsdb_connection_url: url.clone(),
             flush_chunk_size: 200,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: StageHeartbeat::new(),
         })
@@ -344,12 +333,10 @@ mod tests {
         let bad_url = "postgres://nope:nope@127.0.0.1:1/nonexistent_db".to_string();
 
         let (tx, rx) = mpsc::channel(4);
-        let shutdown = CancellationToken::new();
         let handle = start_address_index_writer(AddressIndexWriterArgs {
             rows_rx: rx,
             accountsdb_connection_url: bad_url,
             flush_chunk_size: 100,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: StageHeartbeat::new(),
         })
@@ -378,12 +365,10 @@ mod tests {
             .unwrap();
 
         let (tx, rx) = mpsc::channel(4);
-        let shutdown = CancellationToken::new();
         let handle = start_address_index_writer(AddressIndexWriterArgs {
             rows_rx: rx,
             accountsdb_connection_url: url.clone(),
             flush_chunk_size: 100,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: StageHeartbeat::new(),
         })
@@ -399,45 +384,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn writer_shutdown_flushes_in_flight_buffer() {
+    async fn writer_flushes_every_queued_row_before_exiting() {
         let (_db, pg) = start_test_postgres().await;
         let url = postgres_container_url(&pg, "test_db").await;
 
         let (tx, rx) = mpsc::channel(64);
-        let shutdown = CancellationToken::new();
         let handle = start_address_index_writer(AddressIndexWriterArgs {
             rows_rx: rx,
             accountsdb_connection_url: url.clone(),
             flush_chunk_size: 100,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: StageHeartbeat::new(),
         })
         .await;
 
-        // Fill the channel before signaling shutdown so several batches are
-        // still queued when the cancellation arm fires.
+        // Queue several batches, then close: the writer is the last stage in the
+        // drain, so it must land all of them rather than a racy subset.
         for slot in 0..10i64 {
             tx.send(vec![make_row(slot as u8 + 10, slot, slot as u8 + 10)])
                 .await
                 .unwrap();
         }
-        shutdown.cancel();
         drop(tx);
 
         let join = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
         assert!(join.is_ok(), "writer should shut down within timeout");
 
-        // Drain on shutdown is best-effort over try_recv; verify the rows that
-        // arrived before cancel completed all landed (cancellation is racy
-        // so we only guarantee at-least-one row landed plus the in-flight
-        // buffer was flushed).
         let n = count_rows(&url).await;
-        assert!(
-            n > 0,
-            "at least the in-flight buffer must be flushed on shutdown, got {}",
-            n
-        );
+        assert_eq!(n, 10, "every queued row must be flushed before exit");
     }
 
     /// Watermark = max flushed slot when buffer drains.
@@ -447,12 +421,10 @@ mod tests {
         let url = postgres_container_url(&pg, "test_db").await;
 
         let (tx, rx) = mpsc::channel(8);
-        let shutdown = CancellationToken::new();
         let handle = start_address_index_writer(AddressIndexWriterArgs {
             rows_rx: rx,
             accountsdb_connection_url: url.clone(),
             flush_chunk_size: 100,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: StageHeartbeat::new(),
         })

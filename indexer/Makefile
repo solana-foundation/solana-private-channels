@@ -13,7 +13,7 @@
 # on signal::ctrl_c(); no logic of their own and covered by integration tests.
 COV_IGNORE := --ignore-filename-regex '(error/|constants\.rs|bin/|models\.rs|shutdown_utils\.rs|types\.rs|indexer/indexer\.rs|operator/operator\.rs)'
 
-PRIVATE_CHANNEL_ESCROW_PROGRAM_ID ?= GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+PRIVATE_CHANNEL_ESCROW_PROGRAM_ID ?= 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU
 PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID ?= J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 PRIVATE_CHANNEL_ESCROW_PROGRAM_SO ?= ../target/deploy/private_channel_escrow_program.so
 PRIVATE_CHANNEL_WITHDRAW_PROGRAM_SO ?= ../target/deploy/private_channel_withdraw_program.so

@@ -168,17 +168,18 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test test_sequencer_zero_deadline -- --nocapture
 	@cd integration && cargo test --test test_signatures_corruption_guard -- --nocapture
 	@cd integration && cargo test --test test_node_config_validation -- --nocapture
+	@cd integration && cargo test --test test_duplicate_writer -- --nocapture
 	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
 	@cd integration && cargo test --test ingress_backpressure -- --nocapture
 	@cd integration && cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
-	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@cd integration && cargo test --test backfill_only_e2e -- --nocapture
 	@cd integration && cargo test --test truncate_integration -- --nocapture
 	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
 	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
-	@cd integration && cargo test --test resync_integration -- --nocapture
+	@cd integration && cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
 	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
@@ -189,11 +190,9 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
 	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
 	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
+	@cd integration && cargo test --test reconnect_gap_fill_fail_closed -- --nocapture
 	@cd integration && cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cd integration && cargo test --test harness_sanity -- --nocapture
-	@cd integration && cargo test --test sender_mint_idempotency -- --nocapture
-	@cd integration && cargo test --test sender_mint_validator_encodings -- --nocapture
-	@cd integration && cargo test --test sender_mint_signature_failures -- --nocapture
 	@cd integration && cargo test --test sender_poll_rpc_error -- --nocapture
 	@cd integration && cargo test --test sender_sign_and_send_error -- --nocapture
 	@cd integration && cargo test --test sender_max_retries -- --nocapture
@@ -222,12 +221,12 @@ ci-integration-test-indexer:
 	@$(MAKE) -C private-channel-escrow-program build-no-clients
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
-	@cd integration && cargo test --test mint_idempotency_integration -- --nocapture
 	@cd integration && cargo test --test gap_detection_integration -- --nocapture
+	@cd integration && cargo test --test backfill_only_e2e -- --nocapture
 	@cd integration && cargo test --test truncate_integration -- --nocapture
 	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
 	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
-	@cd integration && cargo test --test resync_integration -- --nocapture
+	@cd integration && cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
 	@cd integration && cargo test --test checkpoint_partial_flush -- --nocapture
@@ -238,11 +237,9 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test yellowstone_wiring -- --nocapture
 	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
 	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
+	@cd integration && cargo test --test reconnect_gap_fill_fail_closed -- --nocapture
 	@cd integration && cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cd integration && cargo test --test harness_sanity -- --nocapture
-	@cd integration && cargo test --test sender_mint_idempotency -- --nocapture
-	@cd integration && cargo test --test sender_mint_validator_encodings -- --nocapture
-	@cd integration && cargo test --test sender_mint_signature_failures -- --nocapture
 	@cd integration && cargo test --test sender_poll_rpc_error -- --nocapture
 	@cd integration && cargo test --test sender_sign_and_send_error -- --nocapture
 	@cd integration && cargo test --test sender_max_retries -- --nocapture

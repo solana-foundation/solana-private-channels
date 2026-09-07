@@ -13,4 +13,10 @@ pub enum DataSourceRpcError {
 
     #[error("RPC protocol error: {reason}")]
     Protocol { reason: String },
+
+    /// The classifier could not determine a slot's contents. Distinct from a
+    /// transport failure: it wedges the checkpoint until an operator acts, so it
+    /// carries its own metric label and its own alert.
+    #[error("slot contents could not be proven: {reason}")]
+    Unproven { reason: String },
 }

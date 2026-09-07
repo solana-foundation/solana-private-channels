@@ -10,7 +10,6 @@ use {
         sync::Arc,
     },
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
     tracing::{debug, info, warn},
 };
 
@@ -104,8 +103,9 @@ pub struct SigverifyArgs {
     pub num_workers: usize,
     pub admin_keys: Vec<Pubkey>,
     pub rx: async_channel::Receiver<SanitizedTransaction>,
-    pub sequencer_tx: mpsc::Sender<SanitizedTransaction>,
-    pub shutdown_token: CancellationToken,
+    /// Verified transactions are forwarded here to the single dedup consumer.
+    /// Sigverify runs before dedup so only verified transactions are ever cached.
+    pub output_tx: mpsc::Sender<SanitizedTransaction>,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<crate::health::StageHeartbeat>,
 }
@@ -143,8 +143,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
         num_workers,
         admin_keys,
         rx,
-        sequencer_tx,
-        shutdown_token,
+        output_tx,
         metrics,
         heartbeat,
     } = args;
@@ -153,8 +152,7 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
     // metrics is already an Arc; clone it for each worker
     for worker_id in 0..num_workers {
         let rx = rx.clone();
-        let tx = sequencer_tx.clone();
-        let shutdown = shutdown_token.clone();
+        let tx = output_tx.clone();
         let admin_keys = admin_keys.clone();
         let metrics = Arc::clone(&metrics);
         let heartbeat = Arc::clone(&heartbeat);
@@ -162,75 +160,61 @@ pub async fn start_sigverify_workerpool(args: SigverifyArgs) -> Vec<WorkerHandle
         let handle = tokio::spawn(async move {
             info!("Sigverify worker {} started", worker_id);
 
+            // Exits only once the channel is closed and drained, so every
+            // transaction admitted before the close is still verified. This is
+            // the ingress edge of the drain: dropping the sender below closes
+            // the next stage, and so on down the pipeline.
             loop {
-                tokio::select! {
-                    // Process transactions
-                    result = rx.recv() => {
+                match rx.recv().await {
+                    Ok(transaction) => {
+                        heartbeat.record_input();
+                        let result = sigverify_transaction(&transaction, &admin_keys).await;
+                        // Each verify (forward or reject) counts as progress — the stage isn't wedged.
+                        heartbeat.record_progress();
                         match result {
-                            Ok(transaction) => {
-                                heartbeat.record_input();
-                                let result = sigverify_transaction(&transaction, &admin_keys).await;
-                                // Each verify (forward or reject) counts as progress — the stage isn't wedged.
-                                heartbeat.record_progress();
-                                match result {
-                                    SigverifyResult::Valid(_) => {
-                                        metrics.sigverify_forwarded();
-                                        // Bounded send applies backpressure; race shutdown so a
-                                        // full sequencer queue never wedges worker exit.
-                                        tokio::select! {
-                                            send_result = tx.send(transaction) => {
-                                                match send_result {
-                                                    Ok(_) => {
-                                                        debug!("Worker {} sent transaction to sequencer", worker_id);
-                                                    }
-                                                    Err(_) => {
-                                                        warn!(
-                                                            "Worker {} failed to send to sequencer - channel closed",
-                                                            worker_id
-                                                        );
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            _ = shutdown.cancelled() => {
-                                                debug!("Worker {} shutdown while sending to sequencer", worker_id);
-                                                break;
-                                            }
-                                        }
+                            SigverifyResult::Valid(_) => {
+                                metrics.sigverify_forwarded();
+                                // A verified transaction in hand is finished, never
+                                // abandoned: dedup drains until this stage drops its
+                                // sender, so waiting here cannot wedge the exit.
+                                match tx.send(transaction).await {
+                                    Ok(_) => {
+                                        debug!("Worker {} sent transaction to dedup", worker_id);
                                     }
-                                    SigverifyResult::InvalidTransaction(transaction_type) => {
-                                        metrics.sigverify_rejected("invalid");
+                                    Err(_) => {
                                         warn!(
-                                            "Worker {} rejected invalid transaction {}: {:?}",
-                                            worker_id,
-                                            transaction.signature(),
-                                            transaction_type.to_string()
+                                            "Worker {} failed to send to dedup - channel closed",
+                                            worker_id
                                         );
-                                    }
-                                    SigverifyResult::NotSignedByAdmin => {
-                                        metrics.sigverify_rejected("not_admin");
-                                        warn!(
-                                            "Worker {} rejected admin transaction not signed by admin: {}",
-                                            worker_id,
-                                            transaction.signature()
-                                        );
-                                    }
-                                    SigverifyResult::SigverifyFailed(e) => {
-                                        metrics.sigverify_rejected("sig_failed");
-                                        warn!("Worker {} sigverify failed: {}", worker_id, e);
+                                        break;
                                     }
                                 }
                             }
-                            Err(_) => {
-                                debug!("Worker {} channel closed", worker_id);
-                                break;
+                            SigverifyResult::InvalidTransaction(transaction_type) => {
+                                metrics.sigverify_rejected("invalid");
+                                warn!(
+                                    "Worker {} rejected invalid transaction {}: {:?}",
+                                    worker_id,
+                                    transaction.signature(),
+                                    transaction_type.to_string()
+                                );
+                            }
+                            SigverifyResult::NotSignedByAdmin => {
+                                metrics.sigverify_rejected("not_admin");
+                                warn!(
+                                    "Worker {} rejected admin transaction not signed by admin: {}",
+                                    worker_id,
+                                    transaction.signature()
+                                );
+                            }
+                            SigverifyResult::SigverifyFailed(e) => {
+                                metrics.sigverify_rejected("sig_failed");
+                                warn!("Worker {} sigverify failed: {}", worker_id, e);
                             }
                         }
                     }
-
-                    // Handle shutdown signal
-                    _ = shutdown.cancelled() => {
-                        debug!("Worker {} received shutdown signal", worker_id);
+                    Err(_) => {
+                        debug!("Worker {} channel closed", worker_id);
                         break;
                     }
                 }
@@ -419,7 +403,6 @@ mod tests {
     async fn worker_forwards_valid_tx_to_sequencer() {
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
         let (sequencer_tx, mut sequencer_rx) = mpsc::channel(SEQ_CAP);
-        let shutdown = CancellationToken::new();
 
         let payer = Keypair::new();
         let from_ata = Pubkey::new_unique();
@@ -432,8 +415,7 @@ mod tests {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown.clone(),
+            output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -448,9 +430,91 @@ mod tests {
             .expect("sequencer channel closed");
         assert_eq!(received.signature(), &expected_sig);
 
-        shutdown.cancel();
+        sigverify_tx.close();
         for h in handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+        }
+    }
+
+    /// Closing the ingress channel must not strand what is already buffered:
+    /// admission stops at the close, so anything past it was accepted and has
+    /// to be verified. Exiting on the token instead would abandon this buffer.
+    #[tokio::test]
+    async fn closing_the_ingress_drains_what_was_already_accepted() {
+        let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(64);
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(SEQ_CAP);
+
+        let mut expected = Vec::new();
+        for _ in 0..16 {
+            let payer = Keypair::new();
+            let ix = spl_transfer_ix(
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &payer.pubkey(),
+            );
+            let tx = sanitize(&[ix], &payer, &[&payer]);
+            expected.push(*tx.signature());
+            sigverify_tx.send(tx).await.unwrap();
+        }
+
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 2,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            output_tx: sequencer_tx,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        sigverify_tx.close();
+
+        let mut seen = Vec::new();
+        while seen.len() < expected.len() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sequencer_rx.recv()).await
+            {
+                Ok(Some(tx)) => seen.push(*tx.signature()),
+                _ => break,
+            }
+        }
+        seen.sort();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "every accepted transaction must be verified"
+        );
+
+        for h in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.handle)
+                .await
+                .expect("worker must exit once the drained channel closes")
+                .unwrap();
+        }
+    }
+
+    /// Termination: a closed empty channel ends the worker, so the node drain
+    /// cannot hang waiting on a stage with nothing left to do.
+    #[tokio::test]
+    async fn closing_an_empty_ingress_exits_the_worker() {
+        let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(4);
+        let (sequencer_tx, _sequencer_rx) = mpsc::channel(SEQ_CAP);
+
+        let handles = start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 1,
+            admin_keys: vec![],
+            rx: sigverify_rx,
+            output_tx: sequencer_tx,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        sigverify_tx.close();
+        for h in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(5), h.handle)
+                .await
+                .expect("worker must exit promptly")
+                .unwrap();
         }
     }
 
@@ -458,7 +522,6 @@ mod tests {
     async fn worker_drops_invalid_tx() {
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
         let (sequencer_tx, mut sequencer_rx) = mpsc::channel(SEQ_CAP);
-        let shutdown = CancellationToken::new();
 
         // empty transaction → InvalidTransaction(Empty)
         let payer = Keypair::new();
@@ -468,8 +531,7 @@ mod tests {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown.clone(),
+            output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -514,7 +576,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(50), sequencer_rx.recv()).await;
         assert!(extra.is_err(), "only sentinel should have been forwarded");
 
-        shutdown.cancel();
+        sigverify_tx.close();
         for h in handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
         }
@@ -522,23 +584,21 @@ mod tests {
 
     #[tokio::test]
     async fn worker_shutdown_signal_stops_worker() {
-        let (_sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
+        let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
         let (sequencer_tx, _sequencer_rx) = mpsc::channel(SEQ_CAP);
-        let shutdown = CancellationToken::new();
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 2,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown.clone(),
+            output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
         assert_eq!(handles.len(), 2);
 
-        shutdown.cancel();
+        sigverify_tx.close();
         for h in handles {
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
             assert!(result.is_ok(), "worker should exit promptly after shutdown");
@@ -650,14 +710,12 @@ mod tests {
     async fn worker_exits_when_input_channel_closed() {
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(10);
         let (sequencer_tx, _sequencer_rx) = mpsc::channel(SEQ_CAP);
-        let shutdown = CancellationToken::new();
 
         let mut handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown.clone(),
+            output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -687,15 +745,14 @@ mod tests {
         let total_txs = sequencer_cap * 3;
 
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(256);
+        let stopper = sigverify_tx.clone();
         let (sequencer_tx, mut sequencer_rx) = mpsc::channel(sequencer_cap);
-        let shutdown = CancellationToken::new();
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown.clone(),
+            output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -735,7 +792,7 @@ mod tests {
             "every tx must reach the sequencer under backpressure (no drops)"
         );
 
-        shutdown.cancel();
+        stopper.close();
         for h in handles {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
         }
@@ -744,42 +801,59 @@ mod tests {
     // A full sequencer queue with no consumer must not wedge worker shutdown:
     // the worker's send is raced against the shutdown token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sigverify_worker_exits_on_shutdown_with_full_sequencer() {
-        let sequencer_cap = SEQ_CAP;
+    async fn a_verified_transaction_is_never_abandoned_on_shutdown() {
+        // Capacity one, so the worker's second send has to wait for room.
         let (sigverify_tx, sigverify_rx) = async_channel::bounded::<SanitizedTransaction>(256);
-        let (sequencer_tx, _sequencer_rx) = mpsc::channel(sequencer_cap);
-        let shutdown = CancellationToken::new();
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(1);
 
         let handles = start_sigverify_workerpool(SigverifyArgs {
             num_workers: 1,
             admin_keys: vec![],
             rx: sigverify_rx,
-            sequencer_tx,
-            shutdown_token: shutdown.clone(),
+            output_tx: sequencer_tx,
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
 
-        // Fill the sequencer queue so the worker's next send blocks. Never drain.
-        for _ in 0..(sequencer_cap + 4) {
+        let mut expected = Vec::new();
+        for _ in 0..2 {
             let payer = Keypair::new();
-            let from_ata = Pubkey::new_unique();
-            let to_ata = Pubkey::new_unique();
-            let ix = spl_transfer_ix(&from_ata, &to_ata, &payer.pubkey());
-            sigverify_tx
-                .send(sanitize(&[ix], &payer, &[&payer]))
-                .await
-                .unwrap();
+            let ix = spl_transfer_ix(
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &payer.pubkey(),
+            );
+            let tx = sanitize(&[ix], &payer, &[&payer]);
+            expected.push(*tx.signature());
+            sigverify_tx.send(tx).await.unwrap();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        shutdown.cancel();
+        // Shutdown starts while a verified transaction is parked on a full send.
+        sigverify_tx.close();
+        drop(sigverify_tx);
+
+        let mut seen = Vec::new();
+        while seen.len() < expected.len() {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), sequencer_rx.recv()).await
+            {
+                Ok(Some(tx)) => seen.push(*tx.signature()),
+                _ => break,
+            }
+        }
+        for sig in expected {
+            assert!(
+                seen.contains(&sig),
+                "verified transaction {sig} was dropped instead of delivered"
+            );
+        }
+
         for h in handles {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.handle).await;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), h.handle).await;
             assert!(
                 result.is_ok(),
-                "worker must exit promptly even with a full sequencer queue"
+                "worker must exit once its work is delivered"
             );
         }
     }

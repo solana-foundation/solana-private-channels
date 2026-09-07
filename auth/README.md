@@ -11,6 +11,56 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
+| `AUTH_ARGON2_MAX_CONCURRENCY` | `4` | Concurrent Argon2 hashes. Hashing is CPU-bound, so past the core count this costs memory without adding throughput. |
+| `AUTH_RATE_LIMIT_PER_SECOND` | `5` | Sustained per-IP request rate for `/auth/register` and `/auth/login`. |
+| `AUTH_RATE_LIMIT_BURST` | `10` | Burst allowance above the sustained per-IP rate. |
+| `AUTH_USERNAME_ATTEMPTS_PER_MINUTE` | `5` | Credential attempts per minute against a single username, across all IPs. |
+| `AUTH_MAX_CONNECTIONS` | `1024` | Maximum concurrent client connections. Past this, a new connection is dropped rather than queued. |
+| `AUTH_MAX_CONNECTIONS_PER_IP` | `64` | Maximum concurrent connections from one client IP, so one host cannot take the whole budget. |
+| `AUTH_HEADER_READ_TIMEOUT_SECS` | `10` | Seconds a client may take to send a full request header block (slowloris protection). Doubles as the idle timeout: see below. |
+| `AUTH_REQUEST_TIMEOUT_SECS` | `15` | Seconds a request may take once its headers are in, covering the body read and the handler. Shed as `503`. Must stay above the 5s pool acquire timeout, or pool exhaustion is cancelled before `/health` can observe it. |
+| `AUTH_TCP_KEEPALIVE_IDLE_SECS` | `60` | Idle seconds before the OS starts sending TCP keepalive probes. A backstop: the header timeout closes an idle connection first, so this only bites once that value is raised. |
+| `AUTH_TCP_KEEPALIVE_INTERVAL_SECS` | `15` | Seconds between TCP keepalive probes. |
+
+The credential routes run Argon2, which is deliberately CPU and memory heavy. They are
+rate limited per IP and per username, capped at `AUTH_ARGON2_MAX_CONCURRENCY` concurrent
+hashes, and limited to a 4 KB request body. Over-budget requests get `429`; requests that
+wait too long for a hashing slot, outrun `AUTH_REQUEST_TIMEOUT_SECS`, or find the database
+unreachable, get `503`. A `500` means the database answered and we asked it wrong.
+
+Those budgets are per request, so they are only charged once a request arrives. Connections
+are bounded separately by `AUTH_MAX_CONNECTIONS` and `AUTH_MAX_CONNECTIONS_PER_IP`, and the
+header and request timeouts close clients that connect and then stall. These hold whether or
+not an ingress proxy adds limits of its own, so a proxy bypass still meets a bounded listener.
+
+`AUTH_MAX_CONNECTIONS` only binds if the process may open that many descriptors. Keep
+`RLIMIT_NOFILE` (`ulimit -n`) above it plus `AUTH_DATABASE_MAX_CONNECTIONS`, or `accept` hits
+`EMFILE` first and the listener backs off for 100 ms at a time — refusing everyone — instead
+of shedding the one connection over the cap. The Compose files set `nofile` to 65536; a
+common 1024 default is below the cap.
+
+`AUTH_HEADER_READ_TIMEOUT_SECS` is also the idle timeout. The header deadline is re-armed for
+each request on a kept-alive connection, so an idle connection is closed that many seconds
+after the previous response. Keep a pooled client's idle timeout below it: a client that
+reuses a connection the server has just closed sees `connection closed before message
+completed`, and a `POST` in that race is not safely retryable. Raise this value if a client
+you don't control pools for longer.
+
+Because the per-IP limit keys on the peer address, the service must be reached directly.
+Putting it behind a proxy without forwarding the client address would bucket every user
+into the proxy's IP.
+
+Both per-IP budgets key on that address masked to a /64 for IPv6, so a client handed a whole
+/64 gets one budget rather than one per address in it. Where addresses are aggregated — an
+ingress proxy, IPv4 CGNAT, an office /64 — the connection cap is the harsher of the two and
+needs raising. An over-budget *request* gets a `429` the client can retry, but an over-cap
+*connection* is dropped with no response at all, which a browser reports as a network error.
+`AUTH_MAX_CONNECTIONS_PER_IP=64` is roughly ten browsers.
+
+The in-container health probe reaches `/health` over loopback, so it competes for
+`AUTH_MAX_CONNECTIONS` with everyone else. Under Compose that is harmless, but a Kubernetes
+liveness probe would turn a connection flood into a restart loop: give the probe its own
+listener or budget before relying on one.
 
 ## API
 
@@ -26,7 +76,7 @@ Create a new account. All users are registered with the `user` role.
 
 Username requirements: 5–32 characters, ASCII alphanumeric plus underscores and hyphens only.
 
-Password requirements: 6–72 characters (Argon2's input limit — inputs beyond 72 bytes are silently truncated, so longer passwords are rejected outright).
+Password requirements: 6–128 characters. The cap is measured in characters, not bytes.
 
 Returns the created user. Passwords are hashed with Argon2 and never returned.
 
@@ -40,7 +90,7 @@ Authenticate and receive a signed JWT (valid for 24 hours).
 { "username": "alice", "password": "hunter2" }
 ```
 
-Returns `{ "token": "<jwt>" }`. Both wrong username and wrong password return `401` to prevent username enumeration.
+Returns `{ "token": "<jwt>" }`. Both wrong username and wrong password return `401` to prevent username enumeration. Credentials over the length caps also return `401` rather than a validation error, so the response surface stays uniform.
 
 ---
 
@@ -97,22 +147,55 @@ There are two roles: `user` (default) and `operator`.
 | `user` | Standard role. All registered accounts start as `user`. |
 | `operator` | Elevated role. Can call operator-only methods on the gateway without ownership checks. |
 
-**Operators must be provisioned directly in the database** — there is no API to assign or escalate to the operator role. This is intentional: operator access is an infrastructure-level concern, not a self-service one.
+**Operators must be provisioned with the admin CLI** — there is no API to assign or escalate to the operator role. This is intentional: operator access is an infrastructure-level concern, not a self-service one.
 
-```sql
-UPDATE private_channel_auth.users SET role = 'operator' WHERE username = 'alice';
-```
+Never provision by username. Usernames are claimed first-come on `/auth/register`, so anyone who registers the intended operator's name before you promote it receives the operator role instead. The admin CLI takes the immutable user id for exactly this reason.
 
 ## Admin CLI
 
-Operator-only commands for managing users directly against the auth database. Requires `AUTH_DATABASE_URL` (same DB the auth service uses).
+Operator-only commands for managing users directly against the auth database.
+
+| Variable | Description |
+|---|---|
+| `AUTH_DATABASE_URL` | Same DB the auth service uses. |
+| `AUTH_ADMIN_ACTOR` | Who is running the command. Required for `set-role` and `attach-wallet`; recorded in the audit trail. |
+
+Both mutating commands print the target's id, username, current role and creation time and wait for a typed `yes` before proceeding. `--yes` skips the prompt for scripted use.
+
+### Provisioning flow
+
+Ask the account owner for their user id out of band — the registration response and the JWT `sub` claim both carry it. Look that id up and check the username and creation time match the account you mean to grant:
+
+```bash
+AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin auth-admin -- show-user --user-id <uuid>
+```
+
+Do not go the other way. `show-user --username alice` resolves a name to whoever holds it, which answers "is this name taken" but not "is this the person" — deriving the id from a name reintroduces exactly the confusion the id-based commands exist to prevent.
+
+### Set a user's role
+
+```bash
+AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p auth --bin auth-admin -- set-role --user-id <uuid> --role operator
+```
 
 ### Attach a wallet to a user
 
 Inserts a row into `private_channel_auth.verified_wallets` without running the challenge/signature flow — the operator is asserting trust, the user does not prove ownership. Use this for provisioning or recovery, not as a substitute for the normal verification flow.
 
 ```bash
-AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin admin -- attach-wallet --username alice --pubkey <base58>
+AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p auth --bin auth-admin -- attach-wallet --user-id <uuid> --pubkey <base58>
+```
+
+### Audit trail
+
+Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). The `set-role` detail is read by the same statement that performs the update, so it records the role actually replaced.
+
+This is the trail of privileged grants — one account acting on another. Self-service wallet changes are not in it: verification proves key ownership before it stores anything, and removal only ever touches the caller's own wallets.
+
+Nothing in the service updates or deletes from that table. The CLI only runs DDL when the schema is missing, so it works under a role with no create rights; if the trail needs to survive a compromised admin credential, that role should also have `INSERT` but not `UPDATE`/`DELETE` on the audit table.
+
+```sql
+SELECT * FROM private_channel_auth.admin_audit ORDER BY created_at DESC;
 ```
 
 ## Wallet verification flow
@@ -129,7 +212,7 @@ Wallets are not trusted on assertion — the user must cryptographically prove t
    ← { pubkey, created_at }
 ```
 
-Once verified, the gateway allows that user to query accounts owned or delegated by that wallet (ATAs, token accounts, etc.).
+Once verified, the gateway allows that user to query accounts owned or delegated by that wallet (ATAs, token accounts, etc.). Transaction history is the exception: `getSignaturesForAddress` requires the wallet to be the token account's owner, not its delegate.
 
 ## JWT format
 

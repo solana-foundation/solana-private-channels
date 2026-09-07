@@ -55,7 +55,9 @@ pub async fn verify_wallet(
 
     if !signature.verify(pubkey.as_ref(), message.as_bytes()) {
         // Commit so a bad signature still burns the challenge: one attempt per nonce.
-        tx.commit().await?;
+        let committed = tx.commit().await;
+        state.pool_status.observe_sqlx(&committed);
+        committed?;
         warn!(user_id = %claims.sub, pubkey = %req.pubkey, "wallet verification failed: invalid signature");
         return Err(AppError::Unauthorized);
     }
@@ -73,7 +75,9 @@ pub async fn verify_wallet(
         other => other,
     })?;
 
-    tx.commit().await?;
+    let committed = tx.commit().await;
+    state.pool_status.observe_sqlx(&committed);
+    committed?;
 
     info!(user_id = %claims.sub, pubkey = %wallet.pubkey, "wallet verified");
 

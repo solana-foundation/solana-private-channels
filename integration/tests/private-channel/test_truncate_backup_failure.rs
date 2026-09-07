@@ -95,6 +95,7 @@ async fn seed_minimal_blocks(pool: &PgPool) -> Result<()> {
             block_time: Some(slot as i64),
             transaction_signatures: vec![sig],
             transaction_recent_blockhashes: vec![prev],
+            transaction_message_hashes: vec![Hash::new_unique()],
         };
         prev = block.blockhash;
         let data = bincode::serialize(&block)?;

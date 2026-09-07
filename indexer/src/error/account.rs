@@ -6,6 +6,11 @@ pub enum AccountError {
     #[error("Account {pubkey} not found")]
     AccountNotFound { pubkey: Pubkey },
 
+    /// The node answered and the mint is genuinely absent from the target chain.
+    /// Kept apart from `AccountNotFound`, which a read that may heal also produces.
+    #[error("Mint {pubkey} not found on target chain")]
+    TargetMintMissing { pubkey: Pubkey },
+
     #[error("Instance {instance} not found")]
     InstanceNotFound { instance: Pubkey },
 

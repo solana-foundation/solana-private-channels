@@ -3,7 +3,9 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
-use private_channel_indexer::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
+use private_channel_indexer::config::{
+    floor_operator_commitment, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+};
 use private_channel_indexer::{
     BackfillConfig, DatasourceType, IndexerConfig, OperatorConfig, PostgresConfig,
     PrivateChannelIndexerConfig, ProgramType, ReconciliationConfig, RpcPollingConfig, StorageType,
@@ -24,6 +26,8 @@ use std::time::Duration;
 struct CommonSection {
     program_type: ProgramType,
     rpc_url: String,
+    #[serde(default)]
+    fallback_rpc_url: Option<String>,
     source_rpc_url: Option<String>,
     escrow_instance_id: Option<String>,
 }
@@ -59,14 +63,11 @@ struct RpcPollingSection {
     batch_size: usize,
     #[serde(default)]
     encoding: Option<UiTransactionEncoding>,
-    #[serde(default)]
-    commitment: Option<CommitmentLevel>,
 }
 
 #[derive(Deserialize)]
 struct YellowstoneSection {
     endpoint: Option<String>,
-    commitment: String,
     x_token: Option<String>,
 }
 
@@ -146,6 +147,10 @@ enum Mode {
         /// Genesis slot to start from (default: 0)
         #[arg(long, default_value = "0")]
         genesis_slot: u64,
+        /// PrivateChannel RPC URL to reconcile rebuilt rows against. Required: resync
+        /// refuses to run without it so it cannot rebuild without fail-closed reconciliation.
+        #[arg(long)]
+        channel_rpc_url: Option<String>,
     },
 }
 
@@ -207,7 +212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.mode {
         Mode::Indexer => run_indexer(figment, args.verbose).await,
         Mode::Operator => run_operator(figment, args.verbose).await,
-        Mode::Resync { genesis_slot } => run_resync(figment, args.verbose, genesis_slot).await,
+        Mode::Resync {
+            genesis_slot,
+            channel_rpc_url,
+        } => run_resync(figment, args.verbose, genesis_slot, channel_rpc_url).await,
     }
 }
 
@@ -248,7 +256,9 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 batch_size: rpc.batch_size,
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
-                commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                // Ingestion is the value-finalizing source of truth; fixed at finalized,
+                // so a forked block can never be indexed into an unbacked mint.
+                commitment: CommitmentLevel::Finalized,
             };
             (Some(config), None)
         }
@@ -268,7 +278,8 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
             let config = YellowstoneConfig {
                 endpoint,
                 x_token: token,
-                commitment: ys.commitment,
+                // Fixed at finalized; the gap poller below inherits it.
+                commitment: "finalized".to_string(),
             };
 
             // Parse RPC polling config if provided (needed for backfill)
@@ -278,7 +289,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
                 batch_size: rpc.batch_size,
                 from_slot: rpc.start_slot,
                 encoding: rpc.encoding.unwrap_or(UiTransactionEncoding::Json),
-                commitment: rpc.commitment.unwrap_or(CommitmentLevel::Finalized),
+                commitment: CommitmentLevel::Finalized,
             });
 
             (rpc_config, Some(config))
@@ -316,6 +327,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
         storage_type: storage.storage_type,
         postgres: postgres_config,
         rpc_url: common.rpc_url,
+        fallback_rpc_url: common.fallback_rpc_url,
         source_rpc_url: common.source_rpc_url,
         escrow_instance_id,
     };
@@ -399,6 +411,7 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         storage_type: storage_section.storage_type,
         postgres: postgres_config,
         rpc_url: common.rpc_url,
+        fallback_rpc_url: common.fallback_rpc_url,
         source_rpc_url: common.source_rpc_url,
         escrow_instance_id,
     };
@@ -409,9 +422,11 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
         retry_max_attempts: operator.retry_max_attempts,
         retry_base_delay: Duration::from_secs(operator.retry_base_delay_secs),
         channel_buffer_size: operator.channel_buffer_size,
-        rpc_commitment: operator
-            .rpc_commitment
-            .unwrap_or(CommitmentLevel::Confirmed),
+        rpc_commitment: floor_operator_commitment(
+            operator
+                .rpc_commitment
+                .unwrap_or(CommitmentLevel::Confirmed),
+        )?,
         alert_webhook_url: std::env::var("ALERT_WEBHOOK_URL").ok(),
         reconciliation_interval: Duration::from_secs(operator.reconciliation_interval_secs),
         reconciliation_tolerance_bps: operator.reconciliation_tolerance_bps,
@@ -433,6 +448,7 @@ async fn run_resync(
     figment: Figment,
     verbose: bool,
     genesis_slot: u64,
+    channel_rpc_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
@@ -474,11 +490,8 @@ async fn run_resync(
         .as_ref()
         .and_then(|rpc| rpc.encoding)
         .unwrap_or(UiTransactionEncoding::Json);
-    let rpc_commitment = indexer
-        .rpc_polling
-        .as_ref()
-        .and_then(|rpc| rpc.commitment)
-        .unwrap_or(CommitmentLevel::Finalized);
+    // Resync reads Solana blocks, so it uses the same fixed finalized ingestion commitment.
+    let rpc_commitment = CommitmentLevel::Finalized;
 
     let rpc_poller = Arc::new(
         private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller::new(
@@ -513,6 +526,25 @@ async fn run_resync(
         common.program_type,
         backfill_config_base,
         escrow_instance_id,
+    );
+
+    // Reconcile-on-rebuild is mandatory: each already-serviced deposit or remint must be
+    // rebuilt in its terminal state rather than as a fresh pending row the operator would
+    // replay (mass double-mint). The channel RPC is the PrivateChannel whose confirmed
+    // mints carry the idempotency memos; its authority is the admin mint authority. Fail
+    // closed if it is not supplied rather than rebuild without reconciliation.
+    let Some(channel_rpc_url) = channel_rpc_url else {
+        return Err(
+            "resync requires --channel-rpc-url to reconcile against the PrivateChannel; \
+                    refusing to rebuild without it"
+                .into(),
+        );
+    };
+    let resync_service = resync_service.with_channel_reconcile(
+        private_channel_indexer::indexer::resync::ChannelReconcileConfig {
+            channel_rpc_url,
+            authority: private_channel_indexer::operator::SignerUtil::get_admin_pubkey(),
+        },
     );
 
     // Run resync

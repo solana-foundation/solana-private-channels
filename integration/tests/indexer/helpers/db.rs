@@ -174,13 +174,14 @@ pub async fn get_checkpoint_slot(
     pool: &PgPool,
     program_type: &str,
 ) -> Result<Option<u64>, sqlx::Error> {
-    let row: Option<(i64,)> =
+    // The column is nullable, so a row can exist before any slot has been committed.
+    let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
             .bind(program_type)
             .fetch_optional(pool)
             .await?;
 
-    Ok(row.map(|(slot,)| slot as u64))
+    Ok(row.and_then(|(slot,)| slot).map(|slot| slot as u64))
 }
 
 pub async fn get_max_slot_from_transactions(pool: &PgPool) -> Result<Option<u64>, sqlx::Error> {

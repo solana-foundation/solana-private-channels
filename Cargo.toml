@@ -41,13 +41,14 @@ const-crypto = "0.3.0"
 enum_dispatch = "0.3.13"
 figment = { version = "0.10", features = ["toml", "env"] }
 futures = "0.3"
+governor = "0.6"
 hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1.7.0", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["http2", "webpki-roots", "ring"] }
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 litesvm = "=0.7.0"
 num-derive = "0.4.1"
 once_cell = "1.20"
@@ -115,11 +116,12 @@ solana-transaction-error = "2.2.1"
 solana-transaction-status = "2.3.0"
 solana-transaction-status-client-types = "2.3.0"
 solana-timings = "2.3.0"
+socket2 = "0.6"
 spl-associated-token-account = "7.0.0"
 spl-memo = "6.0.0"
 spl-token = "8.0.0"
 spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 tempfile = "3.14"
 testcontainers = "0.25"
 testcontainers-modules = { version = "0.13", features = ["postgres", "redis"] }
@@ -129,6 +131,7 @@ tokio-util = { version = "0.7", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2.5.7"
 wiremock = "0.6"

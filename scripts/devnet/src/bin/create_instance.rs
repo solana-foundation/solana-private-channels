@@ -38,9 +38,9 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: {} <rpc-url> <admin-keypair-path>", args[0]);
+        eprintln!("Usage: {} <rpc-url> <escrow-admin-keypair-path>", args[0]);
         eprintln!(
-            "Example: {} https://api.devnet.solana.com ./keypairs/admin.json",
+            "Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json",
             args[0]
         );
         std::process::exit(1);

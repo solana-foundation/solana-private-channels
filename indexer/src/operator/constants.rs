@@ -1,7 +1,10 @@
+pub const MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
 pub const DEFAULT_CU_RELEASE_FUNDS: Option<u32> = Some(600_000);
 pub const DEFAULT_CU_MINT: Option<u32> = None;
 pub const MINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:mint-idempotency:";
-pub const MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT: usize = 1000;
+/// Per-page signature limit (getSignaturesForAddress max) used when the resync
+/// consumed-set enumeration pages the channel authority's mint history.
+pub const CONSUMED_SET_PAGE_SIZE: usize = 1000;
 
 // Withdrawal bitmap geometry, which must match the on-chain program exactly.
 // The operator derives a nonce's generation from these numbers, and the program

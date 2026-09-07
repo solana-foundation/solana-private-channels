@@ -11,7 +11,7 @@ pub async fn get_slot_impl(
 ) -> RpcResult<u64> {
     read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map(|opt| opt.unwrap_or(0))
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))

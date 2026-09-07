@@ -3,16 +3,75 @@ use crate::operator::{
     is_mint_already_initialized_error, is_mint_not_initialized_error, ConfirmationResult,
     SignerUtil, DEFAULT_CU_MINT, DEFAULT_CU_RELEASE_FUNDS, MINT_IDEMPOTENCY_MEMO_PREFIX,
 };
+use crate::storage::common::models::DbTransaction;
 use private_channel_escrow_program_client::instructions::{
     ReleaseFundsBuilder, RotateBitmapBuilder,
 };
 use solana_keychain::Signer;
+use solana_sdk::hash::hashv;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
 use std::fmt::Display;
 
 pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:remint:";
+
+/// Inner-instruction sentinel used when a source event is a top-level instruction.
+/// Matches the DB natural key's `COALESCE(inner_index, -1)` so the id derived from a
+/// rebuilt row equals the one derived when the mint was first sent.
+const NO_INNER_INDEX: i32 = -1;
+
+/// Length in bytes of the SHA256 digest a current-scheme source-event-id encodes.
+pub const SOURCE_EVENT_ID_DIGEST_LEN: usize = 32;
+
+/// Durable, chain-reproducible identity for a single source economic event.
+///
+/// Derived as `base58(SHA256(signature || instruction_index || inner_index))` from the
+/// event's on-chain coordinates. Because it depends only on chain-visible identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SourceEventId(String);
+
+impl SourceEventId {
+    pub fn new(signature: &str, instruction_index: i32, inner_index: Option<i32>) -> Self {
+        let digest = hashv(&[
+            signature.as_bytes(),
+            &instruction_index.to_le_bytes(),
+            &inner_index.unwrap_or(NO_INNER_INDEX).to_le_bytes(),
+        ]);
+        SourceEventId(bs58::encode(digest.as_ref()).into_string())
+    }
+
+    /// Derive the id from a persisted transaction row's on-chain coordinates.
+    pub fn from_row(transaction: &DbTransaction) -> Self {
+        Self::new(
+            &transaction.signature,
+            transaction.instruction_index,
+            transaction.inner_index,
+        )
+    }
+
+    /// Wrap a memo value already present on-chain, accepting it only if it parses as a
+    /// current-scheme id (base58 of a 32-byte digest). `None` flags a legacy/foreign
+    /// scheme the reconcile cannot match, so callers can fail closed.
+    pub fn from_encoded(value: &str) -> Option<Self> {
+        match bs58::decode(value).into_vec() {
+            Ok(bytes) if bytes.len() == SOURCE_EVENT_ID_DIGEST_LEN => {
+                Some(SourceEventId(value.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for SourceEventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /*
 Mint initialization is going to be done outside of the operator. There's a command that will add to the allowed mints on Solana mainnet

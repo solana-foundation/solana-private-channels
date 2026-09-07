@@ -1,5 +1,5 @@
 use crate::rpc::{
-    error::{custom_error, INVALID_PARAMS_CODE},
+    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     ReadDeps,
 };
 use jsonrpsee::core::RpcResult;
@@ -20,8 +20,19 @@ pub async fn get_transaction_impl(
     // Extract encoding from config (default to "json")
     let config = config.map(|c| c.convert_to_current()).unwrap_or_default();
 
-    // Check if the transaction exists using the trait method
-    if let Some(stored_tx) = read_deps.accounts_db.get_transaction(&sig).await {
+    // A lookup failure is an error, never a "not found".
+    let stored = read_deps
+        .accounts_db
+        .get_transaction(&sig)
+        .await
+        .map_err(|e| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!("Failed to get transaction: {}", e),
+            )
+        })?;
+
+    if let Some(stored_tx) = stored {
         let encoded_tx = stored_tx
             .encoded_transaction(
                 &config.encoding.unwrap_or(UiTransactionEncoding::Json),

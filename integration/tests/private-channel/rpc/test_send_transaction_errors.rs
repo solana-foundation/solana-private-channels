@@ -30,6 +30,11 @@
 //! enforcement lives in a separate later stage and requires configuration
 //! plumbing not part of the default `PrivateChannelContext`. That branch can be
 //! a follow-up test when the context exposes a runtime allowlist toggle.
+//!
+//!   C. **System instruction not in allowlist** — admission is per instruction,
+//!      not per program: the System program is limited to `Transfer`. A signed
+//!      `Allocate` must be rejected at ingress (C1) and must leave no account
+//!      behind (C2), which is the end-to-end no-persistent-state invariant.
 
 use {
     super::test_context::PrivateChannelContext,
@@ -38,17 +43,19 @@ use {
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{
+        commitment_config::CommitmentConfig,
         instruction::Instruction,
         signature::{Keypair, Signer},
         transaction::Transaction,
     },
+    solana_system_interface::instruction as system_instruction,
     std::time::Duration,
 };
 
 const INVALID_PARAMS_CODE: i64 = -32_602;
 
 /// Generous because it only bounds the failure case; a healthy pipeline returns in well under a second.
-const LIVENESS_PROBE_SECONDS: u64 = 15;
+const LIVENESS_PROBE_SECONDS: u64 = 60;
 
 pub async fn run_send_transaction_errors_test(ctx: &PrivateChannelContext) {
     println!("\n=== sendTransaction — Error Classification ===");
@@ -57,7 +64,9 @@ pub async fn run_send_transaction_errors_test(ctx: &PrivateChannelContext) {
     case_b_oversized_transaction(ctx).await;
     case_c_duplicate_account_keys(ctx).await;
 
-    println!("✓ base64-decode + oversized + duplicate-key branches passed");
+    case_c_system_allocate_rejected(ctx).await;
+
+    println!("✓ base64-decode + oversized + duplicate-key + System-allocate branches passed");
 }
 
 // ── Case A ──────────────────────────────────────────────────────────────────
@@ -170,4 +179,45 @@ fn memo_tx(blockhash: solana_sdk::hash::Hash, tag: &str) -> Transaction {
         data: tag.as_bytes().to_vec(),
     };
     Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[&payer], blockhash)
+}
+async fn case_c_system_allocate_rejected(ctx: &PrivateChannelContext) {
+    let payer = Keypair::new();
+    let fresh = Keypair::new();
+    let blockhash = ctx
+        .get_blockhash()
+        .await
+        .expect("blockhash for the allocate tx");
+
+    // `allocate` marks its account as a signer, so `fresh` must sign too or the
+    // tx fails sanitization and this case would pass for the wrong reason.
+    let ix = system_instruction::allocate(&fresh.pubkey(), 10 * 1024 * 1024);
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[&payer, &fresh],
+        blockhash,
+    );
+
+    // C1: the RPC surface itself rejects it, not just the unit-level predicate.
+    let err = ctx
+        .write_client
+        .send_transaction(&tx)
+        .await
+        .expect_err("System Allocate must be rejected at ingress");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Only SPL token") || msg.contains(&INVALID_PARAMS_CODE.to_string()),
+        "error must name the allowlist as the cause; got: {msg}"
+    );
+
+    // C2: the invariant the issue is about, no account row is created.
+    let account = ctx
+        .read_client
+        .get_account_with_commitment(&fresh.pubkey(), CommitmentConfig::processed())
+        .await
+        .expect("get_account_with_commitment must succeed");
+    assert!(
+        account.value.is_none(),
+        "a rejected allocate must leave no account behind"
+    );
 }

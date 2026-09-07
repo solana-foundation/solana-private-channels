@@ -35,7 +35,6 @@ use {
     solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
 };
 
 /// `batch_deadline_ms = 0` must route the per-batch collection through
@@ -48,7 +47,6 @@ use {
 async fn sequencer_zero_deadline_drains_nonblocking() {
     let (input_tx, input_rx) = mpsc::channel(DEFAULT_SEQUENCER_QUEUE_CAPACITY);
     let (batch_tx, mut batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-    let shutdown = CancellationToken::new();
 
     // Use distinct payers so the two txs don't write-conflict — the
     // scheduler will emit a single conflict-free batch carrying both.
@@ -71,7 +69,6 @@ async fn sequencer_zero_deadline_drains_nonblocking() {
         batch_deadline_ms: 0, // ← the configuration that selects the drain arm
         rx: input_rx,
         batch_tx,
-        shutdown_token: shutdown.clone(),
         metrics,
         heartbeat: private_channel_core::health::StageHeartbeat::new(),
     })
@@ -105,6 +102,5 @@ async fn sequencer_zero_deadline_drains_nonblocking() {
          the zero-deadline drain"
     );
 
-    shutdown.cancel();
     drop(input_tx);
 }

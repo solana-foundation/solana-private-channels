@@ -88,6 +88,7 @@ fn make_config() -> PrivateChannelIndexerConfig {
         // actual RPC call in these tests, so a non-routable URL is fine.
         rpc_url: "http://127.0.0.1:1".to_string(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: PostgresConfig {
             database_url: "postgres://placeholder/none".to_string(),
             max_connections: 1,

@@ -1688,7 +1688,7 @@
     "kind": "programNode",
     "name": "privateChannelEscrowProgram",
     "pdas": [],
-    "publicKey": "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83",
+    "publicKey": "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU",
     "version": "0.1.0"
   },
   "standard": "codama",

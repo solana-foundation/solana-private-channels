@@ -1,16 +1,18 @@
 use {
     super::{
-        postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB,
-        transaction_count::TransactionCount,
+        postgres::PostgresAccountsDB, traits::AccountsDB, transaction_count::TransactionCount,
     },
-    anyhow::{anyhow, Context, Result},
-    redis::AsyncCommands,
+    anyhow::{Context, Result},
 };
 
 pub async fn get_transaction_count(db: &AccountsDB) -> Result<u64> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_transaction_count_postgres(postgres_db).await,
-        AccountsDB::Redis(redis_db) => get_transaction_count_redis(redis_db).await,
+        // Served from the source of truth, and no counter is cached at all. One
+        // could only be built by INCR, which is not idempotent: a single dropped
+        // cache write would leave it permanently short, with nothing to detect
+        // the gap against.
+        AccountsDB::Redis(redis_db) => get_transaction_count_postgres(&redis_db.fallback).await,
     }
 }
 
@@ -29,12 +31,4 @@ async fn get_transaction_count_postgres(db: &PostgresAccountsDB) -> Result<u64> 
         .unwrap_or_default();
 
     Ok(count.count())
-}
-
-async fn get_transaction_count_redis(db: &RedisAccountsDB) -> Result<u64> {
-    let mut conn = db.connection.clone();
-    let result: redis::RedisResult<Option<u64>> = conn.get("transaction_count").await;
-    result
-        .map_err(|e| anyhow!("Failed to get transaction count from Redis: {}", e))
-        .map(|opt| opt.unwrap_or(0))
 }

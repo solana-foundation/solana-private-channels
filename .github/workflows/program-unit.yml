@@ -41,6 +41,13 @@ jobs:
         with:
           rust-components: llvm-tools-preview
 
+      # Pre-pull once: make unit-coverage also runs the RUST_DIRS container-backed
+      # tests, which otherwise race to pull the same image ("bytes remaining on stream").
+      - name: Warm testcontainers images
+        run: |
+          docker image inspect postgres:11-alpine >/dev/null 2>&1 || docker pull postgres:11-alpine
+          docker image inspect redis:7.0 >/dev/null 2>&1 || docker pull redis:7.0
+
       - name: Run unit tests with coverage
         run: |
           echo "🧪 Running unit tests with coverage..."
