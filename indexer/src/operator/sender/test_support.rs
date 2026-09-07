@@ -16,6 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+use spl_token::solana_program::program_pack::Pack;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -92,6 +93,7 @@ pub(super) fn sender_state_with_storage_and_role(
         program_type,
         remint_cache: HashMap::new(),
         pending_signatures: HashMap::new(),
+        release_leases: HashMap::new(),
         pending_remints: Vec::new(),
         in_flight: InFlightQueue::new(),
         semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -115,6 +117,14 @@ pub(super) fn push_processing_row(mock: &MockStorage, transaction_id: i64) {
             transaction_id,
             TransactionStatus::Processing,
         ));
+}
+
+/// Add a `Processing` deposit row, the state a mint the sender owns starts from.
+pub(super) fn push_processing_deposit_row(mock: &MockStorage, transaction_id: i64) {
+    let mut row = withdrawal_row(transaction_id, TransactionStatus::Processing);
+    row.transaction_type = TransactionType::Deposit;
+    row.withdrawal_nonce = None;
+    mock.pending_transactions.lock().unwrap().push(row);
 }
 
 /// A mock holding one already-`Parked` withdrawal row, the state the drain
@@ -250,6 +260,46 @@ pub(super) fn mock_bitmap_account_counted(
             body.clone().into_bytes()
         })
         .expect_at_least(0)
+        .create()
+}
+
+/// Answer `getAccountInfo` with an initialized SPL mint owned by `authority`,
+/// which is the verdict that sends the JIT path down its retry arm.
+pub(super) fn mock_initialized_mint(
+    server: &mut mockito::ServerGuard,
+    authority: Pubkey,
+) -> mockito::Mock {
+    let mint = spl_token::state::Mint {
+        mint_authority: solana_sdk::program_option::COption::Some(authority),
+        supply: 0,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: solana_sdk::program_option::COption::None,
+    };
+    let mut data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(mint, &mut data).expect("pack mint");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "context": {"slot": 1},
+            "value": {
+                "owner": spl_token::id().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&data), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }
+    })
+    .to_string();
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getAccountInfo""#.into(),
+        ))
+        .with_status(200)
+        .with_body(body)
         .create()
 }
 

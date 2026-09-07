@@ -214,6 +214,16 @@ impl TransactionBuilder {
         }
     }
 
+    /// The fetch-time ownership token, present only for a deposit `Mint`. A
+    /// release carries its own token on the builder and arms it as a lease at
+    /// submission, so it is not reported here.
+    pub fn fetched_updated_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Mint(b) => Some(b.fetched_updated_at),
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
+        }
+    }
+
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.nonce),
@@ -243,15 +253,19 @@ impl TransactionBuilder {
 
     pub fn extra_error_checks_policy(&self) -> ExtraErrorCheckPolicy {
         match self {
-            Self::Mint(_) => {
-                ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
-            }
+            Self::Mint(_) => mint_extra_error_checks_policy(),
             Self::InitializeMint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_already_initialized_error)])
             }
             Self::ReleaseFunds(_) | Self::RotateBitmap(_) => ExtraErrorCheckPolicy::None,
         }
     }
+}
+
+// One source for the Mint error-check policy so every caller stays in sync.
+// Rebuilt on demand because the policy holds boxed closures and is not Clone.
+pub(crate) fn mint_extra_error_checks_policy() -> ExtraErrorCheckPolicy {
+    ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +275,10 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub transaction_id: i64,
     pub trace_id: String,
     pub remint_info: Option<WithdrawalRemintInfo>,
+    /// The row's `updated_at` at fetch time. The sender CASes on it when it
+    /// persists the write-ahead signature, proving the release still owns the
+    /// same `Processing` incarnation it was handed.
+    pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Builder for simple SPL token mint instructions (deposit flow)
@@ -431,6 +449,9 @@ pub struct MintToBuilderWithTxnId {
     pub builder: MintToBuilder,
     pub txn_id: i64,
     pub trace_id: String,
+    /// The row's `updated_at` at fetch time, the ownership token the sender
+    /// CASes on when it persists the write-ahead signature.
+    pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Builder for initialize_mint instruction (sent before first mint)
@@ -610,6 +631,7 @@ mod tests {
             transaction_id: 7,
             trace_id: "trace-rf".to_string(),
             remint_info: None,
+            fetched_updated_at: chrono::Utc::now(),
         }))
     }
 
@@ -618,6 +640,7 @@ mod tests {
             builder: fully_configured_builder(),
             txn_id: 10,
             trace_id: "trace-mint".to_string(),
+            fetched_updated_at: chrono::Utc::now(),
         }))
     }
 

@@ -1769,6 +1769,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
             transaction_id: Some(transaction_id),
             withdrawal_nonce: Some(0),
             trace_id: Some(trace_id.clone()),
+            deposit_claim_lease: None,
         },
         remint_info: WithdrawalRemintInfo {
             transaction_id,

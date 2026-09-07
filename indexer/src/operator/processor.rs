@@ -552,6 +552,8 @@ async fn build_release_funds(
             transaction_id: transaction.id,
             trace_id: transaction.trace_id.clone(),
             remint_info: Some(remint_info),
+            // The post-lock token the sender proves ownership against.
+            fetched_updated_at: transaction.updated_at,
         },
     )))
 }
@@ -890,6 +892,8 @@ pub async fn process_deposit_funds(
                 builder,
                 txn_id: transaction.id,
                 trace_id: transaction.trace_id.clone(),
+                // The post-lock token the sender proves ownership against.
+                fetched_updated_at: transaction.updated_at,
             }));
 
             let send_t0 = tokio::time::Instant::now();

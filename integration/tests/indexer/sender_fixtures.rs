@@ -167,6 +167,7 @@ pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
         transaction_id: Some(transaction_id),
         withdrawal_nonce: None,
         trace_id: Some(format!("trace-{transaction_id}")),
+        deposit_claim_lease: None,
     }
 }
 
@@ -208,6 +209,7 @@ pub fn withdrawal_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
         transaction_id: Some(transaction_id),
         withdrawal_nonce: Some(nonce),
         trace_id: Some(format!("trace-{transaction_id}")),
+        deposit_claim_lease: None,
     }
 }
 

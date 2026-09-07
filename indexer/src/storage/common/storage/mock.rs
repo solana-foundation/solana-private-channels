@@ -268,6 +268,8 @@ impl MockStorage {
             for id in ids {
                 if let Some(txn) = pending.iter_mut().find(|t| t.id == id) {
                     txn.status = TransactionStatus::Processing;
+                    // Hand back the post-lock token, as the RETURNING does.
+                    txn.updated_at = Utc::now();
                     matched.push(txn.clone());
                 }
             }

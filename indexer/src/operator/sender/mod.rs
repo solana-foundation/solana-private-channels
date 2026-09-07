@@ -475,9 +475,11 @@ pub(super) async fn drain_rotation_retry_queue(
         }
 
         match state.storage.try_unpark_to_processing(transaction_id).await {
-            // Some(_) carries the claim timestamp the ownership lease uses; this
-            // sender does not read it until the #197 port lands.
-            Ok(Some(_)) => {}
+            // The park heartbeat and this unpark both bumped the row, so the token
+            // the entry arrived with is dead; carry the one we just won.
+            Ok(Some(lease)) => {
+                state.release_leases.insert(nonce, lease);
+            }
             // Another actor took the row, so this sender no longer owns the
             // work and must stop rather than broadcast it a second time.
             Ok(None) => {
@@ -610,6 +612,7 @@ mod tests {
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: None,
+                deposit_claim_lease: None,
             },
             instruction: InstructionWithSigners {
                 instructions: vec![],
@@ -842,6 +845,7 @@ mod tests {
                 transaction_id: Some(QUEUED_ROW),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("trace-70".to_string()),
+                deposit_claim_lease: None,
             },
             InstructionWithSigners {
                 instructions: vec![],

@@ -605,6 +605,7 @@ async fn mint_not_initialized_no_txn_id_routes_to_failed() {
         transaction_id: None,
         withdrawal_nonce: None,
         trace_id: None,
+        deposit_claim_lease: None,
     };
 
     test_hooks::handle_confirmation_result(

@@ -79,6 +79,9 @@ pub struct TransactionContext {
     pub trace_id: Option<String>,
     /// What this transaction is; an InitializeMint and a rotation carry identical empty ids.
     pub kind: TransactionKind,
+    /// Ownership lease from this deposit's most recent successful claim (the
+    /// row's `updated_at`). A re-fire of the same deposit presents it again.
+    pub deposit_claim_lease: Option<DateTime<Utc>>,
 }
 
 /// Transaction status update to send to storage
@@ -190,6 +193,10 @@ pub struct SenderState {
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
     /// Signatures sent per withdrawal nonce (with lvbh), used for finality checks before reminting.
     pub pending_signatures: HashMap<u64, Vec<PendingSig>>,
+    /// Ownership lease per withdrawal nonce: the row's `updated_at` as of this
+    /// sender's most recent successful claim. Every release attempt presents the
+    /// lease and adopts the one the claim returns.
+    pub release_leases: HashMap<u64, DateTime<Utc>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.

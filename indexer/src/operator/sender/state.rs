@@ -70,6 +70,7 @@ impl SenderState {
             program_type: config.program_type,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
@@ -595,6 +596,7 @@ impl SenderState {
                 // Carried so logs and the bitmap gate can name this withdrawal.
                 withdrawal_nonce: tx.withdrawal_nonce.map(|n| n as u64),
                 trace_id: Some(tx.trace_id.clone()),
+                deposit_claim_lease: None,
             };
 
             let remint_info = WithdrawalRemintInfo {

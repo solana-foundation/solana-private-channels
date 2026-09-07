@@ -1382,7 +1382,7 @@ impl PostgresDb {
         let mut tx = self.pool.begin().await?;
 
         // Lock rows with FOR UPDATE SKIP LOCKED
-        let transactions = sqlx::query_as::<_, DbTransaction>(&format!(
+        let mut transactions = sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
@@ -1431,18 +1431,30 @@ impl PostgresDb {
         .fetch_all(&mut *tx)
         .await?;
 
-        // Update status to Processing in a single query
+        // Update status to Processing, returning the trigger-bumped `updated_at`
+        // so the fetched row carries its true post-lock token; the sender CASes
+        // on that at broadcast, not on the stale Pending value.
         if !transactions.is_empty() {
             let ids: Vec<i64> = transactions.iter().map(|txn| txn.id).collect();
-            sqlx::query(&format!(
-                "UPDATE transactions SET {} = $1 WHERE {} = ANY($2)",
+            let bumped: Vec<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(
+                "UPDATE transactions SET {} = $1 WHERE {} = ANY($2) RETURNING {}",
                 transaction_cols::STATUS,
-                transaction_cols::ID
+                transaction_cols::ID,
+                transaction_cols::UPDATED_AT,
             ))
             .bind(TransactionStatus::Processing)
             .bind(&ids)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
+
+            // NOW() is constant across this transaction, so every locked row got
+            // the same post-lock timestamp; apply that one value to all of them.
+            if let Some(&post_lock_updated_at) = bumped.first() {
+                for txn in transactions.iter_mut() {
+                    txn.status = TransactionStatus::Processing;
+                    txn.updated_at = post_lock_updated_at;
+                }
+            }
         }
 
         // Commit to release locks with Processing status

@@ -71,6 +71,7 @@ fn make_in_flight_tx(
             transaction_id: Some(txn_id),
             withdrawal_nonce: None,
             trace_id: Some(format!("trace-{txn_id}")),
+            deposit_claim_lease: None,
         },
         instruction: make_instruction(),
         compute_unit_price: None,
