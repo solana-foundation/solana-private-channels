@@ -32,7 +32,7 @@ use super::mint::{cleanup_mint_builder, try_jit_mint_initialization, JitOutcome}
 use super::proof::cleanup_failed_transaction;
 use super::types::{
     InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
-    SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
+    SendDurability, SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
 };
 use super::{classify_signatures, SigFinality};
 
@@ -202,10 +202,15 @@ pub async fn handle_transaction_submission(
                 // ReleaseFunds and RotateBitmap block so a rotation never overtakes a release.
                 match &tx_builder {
                     TransactionBuilder::Mint(_) | TransactionBuilder::InitializeMint(_) => {
-                        // Only a real user-fund Mint persists write-ahead, and it
-                        // is the only builder carrying an ownership token;
-                        // InitializeMint mints no balance and is on-chain
-                        // idempotent, so it is excluded.
+                        // Only a real user-fund Mint is Recoverable, and it is the
+                        // only builder carrying an ownership token; InitializeMint
+                        // mints no balance and is on-chain idempotent.
+                        let durability = match tx_builder.fetched_updated_at() {
+                            Some(deposit_expected_updated_at) => SendDurability::Recoverable {
+                                deposit_expected_updated_at,
+                            },
+                            None => SendDurability::Terminal,
+                        };
                         spawn_fire_and_store(
                             state,
                             instruction,
@@ -214,7 +219,7 @@ pub async fn handle_transaction_submission(
                             retry_policy,
                             extra_error_checks_policy,
                             storage_tx.clone(),
-                            tx_builder.fetched_updated_at(),
+                            durability,
                         );
                     }
                     _ => {
@@ -337,6 +342,24 @@ pub(super) async fn route_builder_error(
                     e
                 ),
             }
+        }
+        // A deposit mint that fails to build never signed and never broadcast, so
+        // the source funds are escrowed with nothing minted against them. Failed is
+        // a status no worker re-claims, so the row stays Processing for recovery.
+        e if ctx.kind == TransactionKind::Mint => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[state.program_type.as_label(), "build_error"])
+                .inc();
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    state.program_type.as_label(),
+                    "left_processing_for_recovery",
+                ])
+                .inc();
+            error!(
+                transaction_id = ctx.transaction_id,
+                "Failed to build deposit mint; leaving row Processing for recovery: {}", e
+            );
         }
         e => {
             metrics::OPERATOR_TRANSACTION_ERRORS
@@ -779,7 +802,9 @@ pub(super) fn handle_confirmation_result<'a>(
                             retry_policy,
                             mint_extra_error_checks_policy(),
                             storage_tx.clone(),
-                            Some(lease),
+                            SendDurability::Recoverable {
+                                deposit_expected_updated_at: lease,
+                            },
                             permit,
                         )
                         .await;
@@ -813,10 +838,12 @@ pub(super) fn handle_confirmation_result<'a>(
                         cleanup_failed_transaction(state, ctx.withdrawal_nonce);
                         state.mint_builders.remove(&txn_id);
                     }
-                    // Cantina #285's re-arm on a transient JIT verdict is a
-                    // follow-up port; until then this keeps ours' routing.
+                    // Only deposits reach this block: the guard above proves a
+                    // cached mint builder, and those are cached for the deposit
+                    // mint alone. So there is no nonce-keyed state to unwind
+                    // and no withdrawal remint to compensate here.
                     JitOutcome::Transient(reason) => {
-                        handle_permanent_failure(state, ctx, storage_tx, &reason).await;
+                        requeue_deposit_after_jit(state, txn_id, &signature, &reason).await;
                     }
                 }
             }
@@ -1385,6 +1412,79 @@ pub(super) async fn requeue_or_fail_prebroadcast(
     }
 }
 
+/// Re-arm a deposit whose JIT mint initialization could not be completed yet.
+/// The `mint_to` was already broadcast and failed on chain, and its signature is
+/// still journaled; the helper only adds an `InitializeMint`, which moves no
+/// balance and is idempotent, so re-arming sends nothing value-bearing.
+///
+/// No status is written on any branch: the cap, a raced row and a failed write
+/// all leave the row to the recovery sweep, which classifies the deposit
+/// on-chain before escalating to a human.
+pub(super) async fn requeue_deposit_after_jit(
+    state: &mut SenderState,
+    txn_id: i64,
+    signature: &Signature,
+    reason: &str,
+) {
+    let pt = state.program_type.as_label();
+    metrics::OPERATOR_TRANSACTION_ERRORS
+        .with_label_values(&[pt, "mint_jit_transient"])
+        .inc();
+
+    // The row leaves this task on every branch below and the next pickup builds
+    // its own builder, so the cached one would only go stale here.
+    state.mint_builders.remove(&txn_id);
+
+    match state
+        .storage
+        .try_requeue_prebroadcast(txn_id, MAX_RECOVERY_REQUEUE_ATTEMPTS)
+        .await
+    {
+        Ok(RequeueOutcome::Requeued { attempts }) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeued"])
+                .inc();
+            warn!(
+                transaction_id = txn_id,
+                attempts, "JIT verdict: transient - requeued deposit to Pending: {reason}"
+            );
+        }
+        // The capped write still matches the row, so its `updated_at` trigger
+        // fires and the staleness clock restarts. That delays the recovery sweep
+        // by one window, the cost of keeping the cap inside a single statement.
+        Ok(RequeueOutcome::AtCap) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "prebroadcast_requeue_cap"])
+                .inc();
+            leave_processing_for_recovery(
+                pt,
+                Some(txn_id),
+                signature,
+                &format!("JIT mint initialization still failing at the requeue cap ({reason})"),
+            );
+        }
+        // Someone else advanced the row, so it is not Processing and the recovery
+        // sweep will not look at it. Reporting it as left-for-recovery would send
+        // an on-call after a reconciliation that never runs.
+        Ok(RequeueOutcome::NotProcessing) => {
+            metrics::OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[pt, "mint_jit_requeue_raced"])
+                .inc();
+            warn!(
+                transaction_id = txn_id,
+                signature = %signature,
+                "JIT requeue skipped, row no longer Processing and now owned elsewhere: {reason}",
+            );
+        }
+        Err(e) => leave_processing_for_recovery(
+            pt,
+            Some(txn_id),
+            signature,
+            &format!("JIT requeue write failed ({e}); underlying verdict: {reason}"),
+        ),
+    }
+}
+
 /// The ids a pre-broadcast requeue needs, or `None` when this transaction
 /// cannot take one: it is not a withdrawal, or an earlier attempt already
 /// broadcast a signature for the nonce and the release may have landed.
@@ -1754,8 +1854,7 @@ pub(super) fn spawn_fire_and_store(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    // Set only for a real user-fund Mint: the token its claim CASes on.
-    deposit_expected_updated_at: Option<chrono::DateTime<Utc>>,
+    durability: SendDurability,
 ) -> bool {
     let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
         Ok(p) => p,
@@ -1788,16 +1887,16 @@ pub(super) fn spawn_fire_and_store(
         retry_policy,
         extra_error_checks_policy,
         storage_tx,
-        deposit_expected_updated_at,
+        durability,
         permit,
     ));
 
     true
 }
 
-/// Build, sign, claim the row and persist the signature when a lease is given, then
-/// broadcast and stash the in-flight tx. A lost claim or a failed persist aborts
-/// before broadcast and leaves the row Processing for recovery. Split from
+/// Build, sign, claim the row and persist the signature when `durability` is
+/// `Recoverable`, then broadcast and stash the in-flight tx. Every pre-broadcast
+/// failure on that path leaves the row Processing for recovery. Split from
 /// `spawn_fire_and_store` so tests can await it directly without `tokio::spawn`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fire_and_store_task(
@@ -1811,63 +1910,87 @@ pub(super) async fn fire_and_store_task(
     retry_policy: RetryPolicy,
     extra_error_checks_policy: ExtraErrorCheckPolicy,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
-    deposit_expected_updated_at: Option<chrono::DateTime<Utc>>,
+    durability: SendDurability,
     permit: OwnedSemaphorePermit,
 ) {
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
-    let (transaction, signature, last_valid_block_height, blockhash_slot) =
-        match build_and_sign(&rpc_client, instruction.clone()).await {
-            Ok(signed) => signed,
-            Err(e) => {
-                drop(permit);
-                metrics::OPERATOR_RPC_SEND_DURATION
-                    .with_label_values(&[pt, "error"])
-                    .observe(send_start.elapsed().as_secs_f64());
-                metrics::OPERATOR_TRANSACTION_ERRORS
-                    .with_label_values(&[pt, "build_sign_error"])
-                    .inc();
-                error!("Failed to build/sign transaction (fire-and-forget): {}", e);
-                send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
-                return;
-            }
-        };
-
-    let persisted = if let Some(expected_updated_at) = deposit_expected_updated_at {
-        // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
-        let Some(txid) = ctx.transaction_id else {
+    let (transaction, signature, last_valid_block_height, blockhash_slot) = match build_and_sign(
+        &rpc_client,
+        instruction.clone(),
+    )
+    .await
+    {
+        Ok(signed) => signed,
+        Err(e) => {
             drop(permit);
+            metrics::OPERATOR_RPC_SEND_DURATION
+                .with_label_values(&[pt, "error"])
+                .observe(send_start.elapsed().as_secs_f64());
             metrics::OPERATOR_TRANSACTION_ERRORS
-                .with_label_values(&[pt, "pre_send_persist_error"])
+                .with_label_values(&[pt, "build_sign_error"])
                 .inc();
-            error!("Persist required but transaction has no id; aborting before broadcast");
-            return;
-        };
-        match claim_and_persist_or_abort(
-            &storage,
-            pt,
-            txid,
-            expected_updated_at,
-            &signature,
-            last_valid_block_height,
-            blockhash_slot,
-            "deposit_ownership_lost",
-        )
-        .await
-        {
-            // A re-fire of this same deposit presents the token this claim won.
-            SignatureClaim::Owned(lease) => {
-                ctx.deposit_claim_lease = Some(lease);
-                true
+            // Blockhash fetch and signing both run before any signature exists,
+            // so a Recoverable mint that fails here minted nothing; Failed is a
+            // status no worker re-claims, which would strand the funded deposit.
+            match durability {
+                SendDurability::Recoverable { .. } => {
+                    metrics::OPERATOR_TRANSACTION_ERRORS
+                        .with_label_values(&[pt, "left_processing_for_recovery"])
+                        .inc();
+                    warn!(
+                            transaction_id = ctx.transaction_id,
+                            "Build/sign failed for a recoverable mint before broadcast; leaving row Processing for recovery: {}",
+                            e
+                        );
+                }
+                SendDurability::Terminal => {
+                    error!("Failed to build/sign transaction (fire-and-forget): {}", e);
+                    send_fatal_error(&storage_tx, &ctx, &e.to_string()).await;
+                }
             }
-            SignatureClaim::Lost | SignatureClaim::Failed => {
+            return;
+        }
+    };
+
+    let persisted = match durability {
+        SendDurability::Recoverable {
+            deposit_expected_updated_at,
+        } => {
+            // Persist required but no transaction_id to key on: abort before broadcasting an unrecoverable mint.
+            let Some(txid) = ctx.transaction_id else {
                 drop(permit);
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "pre_send_persist_error"])
+                    .inc();
+                error!("Persist required but transaction has no id; aborting before broadcast");
                 return;
+            };
+            match claim_and_persist_or_abort(
+                &storage,
+                pt,
+                txid,
+                deposit_expected_updated_at,
+                &signature,
+                last_valid_block_height,
+                blockhash_slot,
+                "deposit_ownership_lost",
+            )
+            .await
+            {
+                // A re-fire of this same deposit presents the token this claim won.
+                SignatureClaim::Owned(lease) => {
+                    ctx.deposit_claim_lease = Some(lease);
+                    true
+                }
+                SignatureClaim::Lost | SignatureClaim::Failed => {
+                    drop(permit);
+                    return;
+                }
             }
         }
-    } else {
-        false
+        SendDurability::Terminal => false,
     };
 
     match send_signed(&rpc_client, &transaction, retry_policy).await {
@@ -6306,7 +6429,9 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            Some(lease),
+            SendDurability::Recoverable {
+                deposit_expected_updated_at: lease,
+            },
             permit,
         )
         .await;
@@ -6367,7 +6492,9 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            Some(lease),
+            SendDurability::Recoverable {
+                deposit_expected_updated_at: lease,
+            },
             permit,
         )
         .await;
@@ -6427,7 +6554,9 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            Some(lease),
+            SendDurability::Recoverable {
+                deposit_expected_updated_at: lease,
+            },
             permit,
         )
         .await;
@@ -6502,7 +6631,7 @@ mod tests {
             RetryPolicy::Idempotent,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            None,
+            SendDurability::Terminal,
             permit,
         )
         .await;
@@ -6519,6 +6648,176 @@ mod tests {
             1,
             "broadcast still stashes in-flight"
         );
+    }
+
+    /// A blockhash fetch that fails, so `build_and_sign` returns before any
+    /// signature exists. Paired with a `sendTransaction` mock that must stay unused.
+    fn mock_blockhash_failure(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getLatestBlockhash"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": -32603, "message": "node behind"}
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    fn mock_send_never_called(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create()
+    }
+
+    /// Build and sign run before any signature exists, so a failure there broadcast
+    /// nothing and minted nothing. A terminal Failed would strand a deposit whose
+    /// source funds are already escrowed and that no worker re-claims.
+    #[tokio::test]
+    async fn recoverable_mint_build_sign_failure_leaves_processing() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+        let send = mock_send_never_called(&mut server);
+
+        let (state, lease) = mint_state_with_lease(&server.url(), 78);
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(78),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            SendDurability::Recoverable {
+                deposit_expected_updated_at: lease,
+            },
+            permit,
+        )
+        .await;
+
+        send.assert();
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a funded deposit must not be terminalized on a build/sign failure"
+        );
+        assert!(state.in_flight.is_empty(), "nothing was broadcast");
+        assert_eq!(
+            state.semaphore.available_permits(),
+            before + 1,
+            "permit must be dropped on abort"
+        );
+    }
+
+    /// An InitializeMint moves no balance and is on-chain idempotent, so its
+    /// build/sign failure still fails fast rather than waiting for recovery.
+    #[tokio::test]
+    async fn terminal_send_build_sign_failure_still_fails_fast() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash_failure(&mut server);
+        let send = mock_send_never_called(&mut server);
+
+        let state = make_sender_state_with_server(&server.url());
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::InitializeMint,
+            transaction_id: Some(910),
+            withdrawal_nonce: None,
+            trace_id: Some("trace-init".to_string()),
+            deposit_claim_lease: None,
+        };
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            ctx,
+            RetryPolicy::Idempotent,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            SendDurability::Terminal,
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let update = storage_rx.try_recv().expect("terminal send must escalate");
+        assert_eq!(update.transaction_id, 910);
+        assert_eq!(update.status, TransactionStatus::Failed);
+    }
+
+    /// The catch-all builder-error arm runs before anything is signed or sent, so
+    /// a deposit reaching it is unspent on this side and still funded on the other.
+    /// Marking it Failed hands the row to no worker and hides the escrowed funds.
+    #[tokio::test]
+    async fn builder_error_on_a_deposit_mint_writes_no_terminal_status() {
+        let mut state = make_sender_state();
+        let (tx, mut rx) = mpsc::channel(10);
+
+        route_builder_error(
+            &mut state,
+            &mint_ctx(79),
+            &tx,
+            ProgramError::InvalidBuilder {
+                reason: "No signers provided".to_string(),
+            }
+            .into(),
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a funded deposit must not be terminalized on a build error"
+        );
+    }
+
+    /// The same arm still escalates a withdrawal: nothing about it is funded on
+    /// the source side, and its remint path owns the compensation.
+    #[tokio::test]
+    async fn builder_error_on_a_withdrawal_still_escalates() {
+        let mut state = make_sender_state();
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(80),
+            withdrawal_nonce: Some(5),
+            trace_id: Some("trace-80".to_string()),
+            deposit_claim_lease: None,
+        };
+
+        route_builder_error(
+            &mut state,
+            &ctx,
+            &tx,
+            ProgramError::InvalidBuilder {
+                reason: "No signers provided".to_string(),
+            }
+            .into(),
+        )
+        .await;
+
+        let update = rx.try_recv().expect("a build error still escalates here");
+        assert_eq!(update.transaction_id, 80);
     }
 
     // ── spawn_fire_and_store: cap enforcement ─────────────────────────
@@ -6554,7 +6853,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            None,
+            SendDurability::Terminal,
         );
 
         assert!(!result, "must return false when at capacity");
@@ -6589,7 +6888,7 @@ mod tests {
             RetryPolicy::None,
             ExtraErrorCheckPolicy::None,
             storage_tx,
-            None,
+            SendDurability::Terminal,
         );
 
         assert!(result, "must return true when capacity is available");

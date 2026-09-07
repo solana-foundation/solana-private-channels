@@ -362,9 +362,8 @@ async fn drive_caller_arm_with_jit_setup(
     state
         .mint_builders
         .insert(txn_id, make_mint_builder_for_caller_arm(mint));
-    // The #197 claim lease is a follow-up port, so every arm uses the plain ctx.
-    let _ = claim_lease;
-    let ctx = deposit_ctx(txn_id);
+    let mut ctx = deposit_ctx(txn_id);
+    ctx.deposit_claim_lease = claim_lease;
     test_hooks::handle_confirmation_result(
         state,
         Ok(ConfirmationResult::MintNotInitialized),

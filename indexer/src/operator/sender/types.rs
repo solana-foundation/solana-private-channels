@@ -85,6 +85,20 @@ pub struct TransactionContext {
     pub deposit_claim_lease: Option<DateTime<Utc>>,
 }
 
+/// How a fire-and-store send is handled, decided by whether it carries user value.
+///
+/// `Recoverable` (a user `Mint`) claims the row and persists the signature before
+/// broadcasting, and every pre-broadcast failure leaves the row Processing so
+/// recovery re-mints it. `Terminal` (`InitializeMint`) mints no balance and is
+/// on-chain idempotent, so it journals nothing and fails fast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendDurability {
+    Recoverable {
+        deposit_expected_updated_at: DateTime<Utc>,
+    },
+    Terminal,
+}
+
 /// Transaction status update to send to storage
 #[derive(Debug, Clone)]
 pub struct TransactionStatusUpdate {
