@@ -48,6 +48,16 @@ pub(super) fn sender_state(rpc_url: &str) -> SenderState {
 /// Same, but with a caller-prepared `MockStorage` so a test can seed rows or
 /// arm a simulated failure before the state is built.
 pub(super) fn sender_state_with_storage(rpc_url: &str, mock: MockStorage) -> SenderState {
+    sender_state_with_storage_and_role(rpc_url, mock, ProgramType::Escrow)
+}
+
+/// Same, with the operator role chosen by the caller. Role-gated paths need a
+/// state on both sides of the gate.
+pub(super) fn sender_state_with_storage_and_role(
+    rpc_url: &str,
+    mock: MockStorage,
+    program_type: ProgramType,
+) -> SenderState {
     let storage = Arc::new(Storage::Mock(mock));
     // One attempt with negligible backoff: tests that expect an RPC failure
     // should not pay the production retry schedule for it.
@@ -79,7 +89,7 @@ pub(super) fn sender_state_with_storage(rpc_url: &str, mock: MockStorage) -> Sen
         confirmation_poll_interval_ms: 1,
         rotation_retry_queue: Vec::new(),
         pending_rotation: None,
-        program_type: ProgramType::Escrow,
+        program_type,
         remint_cache: HashMap::new(),
         pending_signatures: HashMap::new(),
         pending_remints: Vec::new(),

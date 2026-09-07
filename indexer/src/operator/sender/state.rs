@@ -490,6 +490,12 @@ impl SenderState {
         &mut self,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
+        // Deferred remints are Withdraw-only; another role sharing the database
+        // must never claim a row it would classify against the wrong chain.
+        if self.program_type != ProgramType::Withdraw {
+            return Ok(());
+        }
+
         let transactions = self.storage.get_pending_remint_transactions().await?;
 
         if transactions.is_empty() {
@@ -654,7 +660,7 @@ mod tests {
     use super::*;
     use crate::operator::sender::test_support::{
         mock_bitmap_account, mock_bitmap_sequence, mock_bitmap_then_read_failure,
-        sender_state_with_storage,
+        sender_state_with_storage, sender_state_with_storage_and_role,
     };
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
@@ -665,7 +671,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_sender_state(mock: MockStorage) -> SenderState {
-        sender_state_with_storage("http://localhost:8899", mock)
+        make_sender_state_with_role(mock, ProgramType::Withdraw)
+    }
+
+    fn make_sender_state_with_role(mock: MockStorage, role: ProgramType) -> SenderState {
+        sender_state_with_storage_and_role("http://localhost:8899", mock, role)
     }
 
     /// Build a minimal DbTransaction representing a PendingRemint row.
@@ -1100,6 +1110,42 @@ mod tests {
             "row with mismatched array lengths must not be queued"
         );
         assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// The deferred remint queue belongs to the Withdraw role. An Escrow sender
+    /// sharing the transactions database must not hydrate a PendingRemint row:
+    /// it would later classify the release signature against the wrong chain.
+    #[tokio::test]
+    async fn recover_pending_remints_noop_for_escrow_role() {
+        let mock = MockStorage::new();
+        let sig = Signature::new_unique();
+        let deadline = Utc::now() - chrono::Duration::seconds(10);
+
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(make_pending_remint_row(
+                70,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &sig,
+                deadline,
+            ));
+
+        let mut state = make_sender_state_with_role(mock, ProgramType::Escrow);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "Escrow must not claim a Withdraw remint row"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the row must be left untouched for the Withdraw sender"
+        );
     }
 
     /// On a clean startup with no PendingRemint rows in the database,

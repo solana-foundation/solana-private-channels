@@ -328,6 +328,12 @@ pub async fn process_pending_remints(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
+    // Deferred remints are Withdraw-only; another role would classify the
+    // release signatures against the wrong chain.
+    if state.program_type != ProgramType::Withdraw {
+        return;
+    }
+
     let now = Utc::now();
 
     // Drain the queue and split: due now vs. wait longer.
@@ -812,7 +818,7 @@ mod tests {
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: crate::config::ProgramType::Withdraw,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -912,6 +918,13 @@ mod tests {
     }
 
     fn make_sender_state_with_rpc(rpc_url: &str) -> (SenderState, MockStorage) {
+        make_sender_state_with_role(rpc_url, crate::config::ProgramType::Withdraw)
+    }
+
+    fn make_sender_state_with_role(
+        rpc_url: &str,
+        role: crate::config::ProgramType,
+    ) -> (SenderState, MockStorage) {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
@@ -941,7 +954,7 @@ mod tests {
             confirmation_poll_interval_ms: 400,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: role,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -1005,7 +1018,7 @@ mod tests {
             confirmation_poll_interval_ms: 1,
             rotation_retry_queue: Vec::new(),
             pending_rotation: None,
-            program_type: crate::config::ProgramType::Escrow,
+            program_type: crate::config::ProgramType::Withdraw,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
             pending_remints: Vec::new(),
@@ -1105,6 +1118,58 @@ mod tests {
         // but the requests still prove which chain the remint targeted.
         src_lookup.assert_async().await;
         src_send.assert_async().await;
+    }
+
+    /// The deferred remint queue belongs to the Withdraw role. An Escrow sender
+    /// must neither classify nor remint a queued entry: it would send RPC on the
+    /// wrong chain and could escalate the row to ManualReview.
+    #[tokio::test]
+    async fn process_pending_remints_noop_for_escrow_role() {
+        let mut server = mockito::Server::new_async().await;
+
+        // A catch-all expecting zero hits, so any RPC the processor makes fails.
+        let no_calls = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let (mut state, _mock) =
+            make_sender_state_with_role(&server.url(), crate::config::ProgramType::Escrow);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.pending_remints.push(PendingRemint {
+            ctx: TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
+                transaction_id: Some(88),
+                withdrawal_nonce: Some(4),
+                trace_id: Some("trace-88".to_string()),
+            },
+            remint_info: make_remint_info(88),
+            signatures: vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+            original_error: "release_funds failed".to_string(),
+            deadline: Utc::now() - chrono::Duration::seconds(1),
+            finality_check_attempts: 0,
+            release_refused_on_chain: false,
+            coverage_slot: None,
+        });
+
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        no_calls.assert_async().await;
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "Escrow must not emit any status update from the remint processor"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the entry must be left in place, not consumed"
+        );
     }
 
     #[tokio::test]
