@@ -79,12 +79,18 @@ and will also initialize that mint on PrivateChannel. This simplifies our operat
 validate mint existence on PrivateChannel.
 */
 
-pub fn mint_idempotency_memo(transaction_id: impl Display) -> String {
-    format!("{MINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
+/// Single encoding for both idempotency memos so the mint and remint variants
+/// cannot drift apart from what the consumed-set parser expects.
+fn idempotency_memo(prefix: &str, id: &SourceEventId) -> String {
+    format!("{prefix}{id}")
 }
 
-pub fn remint_idempotency_memo(transaction_id: impl Display) -> String {
-    format!("{REMINT_IDEMPOTENCY_MEMO_PREFIX}{transaction_id}")
+pub fn mint_idempotency_memo(source_event_id: &SourceEventId) -> String {
+    idempotency_memo(MINT_IDEMPOTENCY_MEMO_PREFIX, source_event_id)
+}
+
+pub fn remint_idempotency_memo(source_event_id: &SourceEventId) -> String {
+    idempotency_memo(REMINT_IDEMPOTENCY_MEMO_PREFIX, source_event_id)
 }
 
 /// Info needed to remint PrivateChannel tokens back to user on permanent withdrawal failure.
@@ -93,6 +99,9 @@ pub fn remint_idempotency_memo(transaction_id: impl Display) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WithdrawalRemintInfo {
     pub transaction_id: i64,
+    /// Durable id of the source withdrawal, used to build the remint memo so a
+    /// reminted-then-resynced withdrawal is recognized from chain and not paid twice.
+    pub source_event_id: SourceEventId,
     pub trace_id: String,
     pub mint: Pubkey,
     pub user: Pubkey,
@@ -760,11 +769,84 @@ mod tests {
         ));
     }
 
+    fn make_source_event_id() -> SourceEventId {
+        SourceEventId::new("sig-aaa", 0, None)
+    }
+
+    /// The keystone property: the same on-chain coordinates always derive the same id,
+    /// which is what survives the resync table wipe.
     #[test]
-    fn remint_idempotency_memo_format() {
+    fn source_event_id_is_deterministic() {
+        let a = SourceEventId::new("sig-xyz", 3, Some(2));
+        let b = SourceEventId::new("sig-xyz", 3, Some(2));
+        assert_eq!(a, b);
+    }
+
+    /// Each identity field independently changes the derived id (no field is ignored).
+    #[test]
+    fn source_event_id_differs_per_field() {
+        let base = SourceEventId::new("sig-xyz", 3, Some(2));
+        let cases = [
+            SourceEventId::new("sig-zzz", 3, Some(2)),
+            SourceEventId::new("sig-xyz", 4, Some(2)),
+            SourceEventId::new("sig-xyz", 3, Some(9)),
+            SourceEventId::new("sig-xyz", 3, None),
+        ];
+        for (i, other) in cases.iter().enumerate() {
+            assert_ne!(base, *other, "case {i} should differ from base");
+        }
+    }
+
+    /// A top-level instruction (inner_index None) and an inner instruction at the
+    /// coalesced sentinel position (-1) must collapse to the same id, matching the DB
+    /// natural key's COALESCE(inner_index, -1).
+    #[test]
+    fn source_event_id_coalesces_none_inner_index() {
+        let none = SourceEventId::new("sig", 0, None);
+        let sentinel = SourceEventId::new("sig", 0, Some(NO_INNER_INDEX));
+        assert_eq!(none, sentinel);
+    }
+
+    /// A current-scheme memo value round-trips through from_encoded; a legacy serial-id
+    /// value does not parse, so the reconcile can fail closed on it.
+    #[test]
+    fn source_event_id_from_encoded_rejects_legacy_scheme() {
+        let id = make_source_event_id();
+        assert_eq!(SourceEventId::from_encoded(id.as_str()), Some(id));
+        assert_eq!(SourceEventId::from_encoded("99"), None);
+        assert_eq!(SourceEventId::from_encoded(""), None);
+    }
+
+    #[test]
+    fn mint_and_remint_memos_use_source_event_id() {
+        let id = make_source_event_id();
+        let mint_memo = mint_idempotency_memo(&id);
+        let remint_memo = remint_idempotency_memo(&id);
         assert_eq!(
-            remint_idempotency_memo(99_i64),
-            "private_channel:remint:99".to_string()
+            mint_memo,
+            format!("{MINT_IDEMPOTENCY_MEMO_PREFIX}{}", id.as_str())
         );
+        assert_eq!(
+            remint_memo,
+            format!("{REMINT_IDEMPOTENCY_MEMO_PREFIX}{}", id.as_str())
+        );
+        // Both prefixes survive and the parsed value re-derives the same id.
+        let mint_value = mint_memo
+            .strip_prefix(MINT_IDEMPOTENCY_MEMO_PREFIX)
+            .unwrap();
+        let remint_value = remint_memo
+            .strip_prefix(REMINT_IDEMPOTENCY_MEMO_PREFIX)
+            .unwrap();
+        assert_eq!(SourceEventId::from_encoded(mint_value), Some(id.clone()));
+        assert_eq!(SourceEventId::from_encoded(remint_value), Some(id));
+    }
+
+    /// The encoded id and both memos stay well within the 566-byte SPL Memo limit.
+    #[test]
+    fn memo_within_spl_memo_limit() {
+        const SPL_MEMO_LIMIT: usize = 566;
+        let id = make_source_event_id();
+        assert!(mint_idempotency_memo(&id).len() < SPL_MEMO_LIMIT);
+        assert!(remint_idempotency_memo(&id).len() < SPL_MEMO_LIMIT);
     }
 }

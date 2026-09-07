@@ -7,7 +7,9 @@ use crate::operator::{
     fetch_bitmap_generation, fetch_consumed_nonces, find_withdrawal_bitmap_pda, BitmapState,
     RetryConfig, RpcClientWithRetry,
 };
-use crate::operator::{MintCache, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo};
+use crate::operator::{
+    MintCache, SourceEventId, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo,
+};
 use crate::storage::common::storage::Storage;
 use crate::storage::TransactionStatus;
 use crate::{PrivateChannelIndexerConfig, ProgramType};
@@ -714,6 +716,13 @@ impl SenderState {
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
+                // Built from the fields rather than the row: `tx.remint_signatures` was
+                // moved out above, so the whole-row borrow `from_row` needs is gone.
+                source_event_id: SourceEventId::new(
+                    &tx.signature,
+                    tx.instruction_index,
+                    tx.inner_index,
+                ),
                 trace_id: tx.trace_id.clone(),
                 mint,
                 user: initiator,

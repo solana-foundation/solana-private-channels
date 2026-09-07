@@ -2,7 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::instruction_util::{
-    mint_idempotency_memo, MintToBuilder, TransactionBuilder, WithdrawalRemintInfo,
+    mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawalRemintInfo,
 };
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
 use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
@@ -543,6 +543,7 @@ async fn build_release_funds(
     );
     let remint_info = WithdrawalRemintInfo {
         transaction_id: transaction.id,
+        source_event_id: SourceEventId::from_row(transaction),
         trace_id: transaction.trace_id.clone(),
         mint,
         user: initiator,
@@ -979,7 +980,11 @@ pub async fn process_deposit_funds(
                 .mint_authority(processor_state.admin_pubkey)
                 .token_program(token_program)
                 .amount(transaction.amount.value())
-                .idempotency_memo(mint_idempotency_memo(transaction.id));
+                // Chain-derived so the marker still matches after a resync renumbers
+                // rows; the row id would not.
+                .idempotency_memo(mint_idempotency_memo(&SourceEventId::from_row(
+                    &transaction,
+                )));
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
             info!(proc_elapsed_ms, "Processing deposit");
@@ -1479,6 +1484,48 @@ mod tests {
         );
     }
 
+    /// The remint's memo has to outlive a resync too, so the withdrawal carries the
+    /// durable id of its source event rather than the row id the wipe renumbers.
+    #[tokio::test]
+    async fn build_release_funds_carries_the_durable_source_event_id() {
+        let mint_pubkey = Pubkey::new_unique();
+
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        insert_mint_row(&storage, &mint_pubkey);
+
+        let mut processor_state = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(make_release_funds_state()),
+            mint_cache: crate::operator::MintCache::new(storage),
+        };
+
+        let mut txn = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &Pubkey::new_unique().to_string(),
+            Some(3),
+            TransactionType::Withdrawal,
+        );
+        txn.signature = "withdrawal-source-signature".to_string();
+        txn.instruction_index = 4;
+        txn.inner_index = Some(2);
+
+        let builder = build_release_funds(&mut processor_state, &txn)
+            .await
+            .expect("a valid withdrawal row must build");
+        let TransactionBuilder::ReleaseFunds(release) = builder else {
+            panic!("a withdrawal must build a ReleaseFunds builder");
+        };
+        let remint = release
+            .remint_info
+            .expect("a withdrawal must carry remint info");
+
+        let mut rebuilt = txn.clone();
+        rebuilt.id = 4242;
+        assert_eq!(remint.source_event_id, SourceEventId::from_row(&rebuilt));
+    }
+
     #[tokio::test]
     async fn process_release_funds_missing_state_errors() {
         let mock = MockStorage::new();
@@ -1974,6 +2021,77 @@ mod tests {
         };
         assert_eq!(b.txn_id, 1);
         assert_eq!(b.trace_id, "trace-1");
+    }
+
+    /// The deposit mint's on-chain memo must key on the event's chain coordinates,
+    /// not on the local row id. A resync renumbers rows, so a serial-id memo stops
+    /// matching the rebuilt row and the same deposit is minted a second time.
+    #[tokio::test]
+    async fn deposit_mint_memo_carries_the_durable_source_event_id() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let mint_pubkey = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        insert_mint_row(&storage, &mint_pubkey);
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        let mut txn = make_db_transaction(
+            1,
+            &mint_pubkey.to_string(),
+            &recipient.to_string(),
+            None,
+            TransactionType::Deposit,
+        );
+        txn.signature = "deposit-source-signature".to_string();
+        txn.instruction_index = 2;
+        txn.inner_index = Some(1);
+
+        fetcher_tx.send(txn.clone()).await.unwrap();
+        drop(fetcher_tx);
+
+        process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            Arc::new(unreachable_rpc()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await
+        .expect("a valid deposit row must process");
+
+        let TransactionBuilder::Mint(b) = sender_rx.recv().await.unwrap() else {
+            panic!("expected Mint, got a different variant");
+        };
+        let instructions = b.builder.instructions().expect("mint must build");
+        let memo = instructions
+            .iter()
+            .find(|ix| ix.program_id == spl_memo::id())
+            .expect("a deposit mint must carry an idempotency memo");
+        let value = String::from_utf8(memo.data.clone()).expect("memo must be utf8");
+        let encoded = value
+            .strip_prefix(crate::operator::MINT_IDEMPOTENCY_MEMO_PREFIX)
+            .expect("memo must carry the mint idempotency prefix");
+
+        // Same on-chain event, fresh row id after a resync wipe: the memo must still
+        // resolve to the rebuilt row's id, which is what the reconcile keys on.
+        let mut rebuilt = txn.clone();
+        rebuilt.id = 4242;
+        assert_eq!(
+            SourceEventId::from_encoded(encoded),
+            Some(SourceEventId::from_row(&rebuilt))
+        );
     }
 
     /// Seed a Processing deposit the gate can CAS, plus one journalled write-ahead

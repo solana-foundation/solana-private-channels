@@ -2445,7 +2445,7 @@ mod tests {
         sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
-    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+    use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::SignerUtil;
     use crate::storage::common::models::DbObservedRelease;
@@ -2475,6 +2475,7 @@ mod tests {
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
+            source_event_id: SourceEventId::new(&format!("sig-{txn_id}"), 0, None),
             trace_id: format!("trace-{txn_id}"),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             user: solana_sdk::pubkey::Pubkey::new_unique(),

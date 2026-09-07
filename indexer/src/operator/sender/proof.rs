@@ -443,7 +443,7 @@ mod tests {
     };
     use crate::operator::sender::transaction::handle_nonce_outside_generation;
     use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
-    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+    use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
@@ -455,6 +455,7 @@ mod tests {
     fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id,
+            source_event_id: SourceEventId::new(&format!("sig-{transaction_id}"), 0, None),
             trace_id: trace_id.to_string(),
             mint: Pubkey::new_unique(),
             user: Pubkey::new_unique(),

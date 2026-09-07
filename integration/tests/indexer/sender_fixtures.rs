@@ -31,7 +31,7 @@ use {
                     TransactionStatusUpdate,
                 },
             },
-            utils::instruction_util::{TransactionKind, WithdrawalRemintInfo},
+            utils::instruction_util::{SourceEventId, TransactionKind, WithdrawalRemintInfo},
             SignerUtil,
         },
         storage::{common::storage::mock::MockStorage, Storage},
@@ -224,6 +224,7 @@ pub fn make_remint_info(transaction_id: i64) -> WithdrawalRemintInfo {
     let user_ata = get_associated_token_address_with_program_id(&user, &mint, &token_program);
     WithdrawalRemintInfo {
         transaction_id,
+        source_event_id: SourceEventId::new(&format!("sig-{transaction_id}"), 0, None),
         trace_id: format!("trace-{transaction_id}"),
         mint,
         user,

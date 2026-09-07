@@ -134,7 +134,9 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         }
     }
 
-    let memo = remint_idempotency_memo(info.transaction_id);
+    // Chain-derived so the marker survives a resync wipe; the journaled signature
+    // remains the live idempotency control.
+    let memo = remint_idempotency_memo(&info.source_event_id);
     let admin_pubkey = SignerUtil::admin_signer().pubkey();
 
     // The memo is an on-chain marker only; the journaled signature is the
@@ -1231,6 +1233,7 @@ mod tests {
     use crate::operator::sender::types::{
         PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
+    use crate::operator::utils::instruction_util::SourceEventId;
     use crate::operator::utils::instruction_util::{TransactionKind, WithdrawalRemintInfo};
     use crate::operator::MintCache;
     use crate::operator::RetryConfig;
@@ -1374,6 +1377,7 @@ mod tests {
     fn make_remint_info(txn_id: i64) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id: txn_id,
+            source_event_id: SourceEventId::new(&format!("sig-{txn_id}"), 0, None),
             trace_id: format!("trace-{txn_id}"),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             user: solana_sdk::pubkey::Pubkey::new_unique(),
