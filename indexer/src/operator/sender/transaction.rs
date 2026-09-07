@@ -2061,7 +2061,10 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_failure_withdrawal_with_cache_defers_remint() {
-        let mut state = make_sender_state();
+        // `set_pending_remint` is a compare-and-set from Processing, so the row
+        // has to be there for the deferral to persist.
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         // Populate remint cache and some pending signatures
@@ -2548,7 +2551,10 @@ mod tests {
     ///      time rather than firing the remint immediately on restart.
     #[tokio::test]
     async fn permanent_failure_calls_set_pending_remint_with_correct_args() {
-        let mut state = make_sender_state();
+        // `set_pending_remint` is a compare-and-set from Processing, so the row
+        // has to be there for the deferral to persist.
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
         let (storage_tx, _storage_rx) = mpsc::channel(10);
 
         // Two signatures — simulating a withdrawal that was retried once before
@@ -3163,7 +3169,8 @@ mod tests {
             .with_body(status_body)
             .create();
 
-        let mut state = make_sender_state_with_server(&server.url());
+        // A deferral compare-and-sets the row from Processing, so it has to exist.
+        let mut state = sender_state_with_storage(&server.url(), mock_with_processing_row(70));
         state.instance_pda = Some(Pubkey::new_unique());
         state.remint_cache.insert(4, make_remint_info(70));
         if stash_signature {
@@ -3667,7 +3674,8 @@ mod tests {
     /// burned nor the funds they were owed.
     #[tokio::test]
     async fn withheld_release_behind_the_window_is_compensated() {
-        let mut state = make_sender_state();
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(91));
         state.remint_cache.insert(1, make_remint_info(91));
         state.pending_signatures.insert(
             1,
@@ -3708,7 +3716,8 @@ mod tests {
     /// back without a human, and the refund stalls in manual review instead.
     #[tokio::test]
     async fn a_withheld_release_persists_the_refusal_with_the_pending_remint() {
-        let mut state = make_sender_state();
+        let mut state =
+            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(91));
         state.remint_cache.insert(1, make_remint_info(91));
         state.pending_signatures.insert(
             1,

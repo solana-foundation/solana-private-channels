@@ -1189,8 +1189,9 @@ mod tests {
         let mint = Pubkey::new_unique();
         // DB expects 1000, on-chain has 980 => shortfall 20 > threshold 10 => err
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
-        // Healthy supply, so the ledger comparison stays the thing under test.
-        mock_channel_supply(&mut server, 1_000).await;
+        // Supply matches custody, so the supply invariant passes and the ledger
+        // comparison is the only thing left to fail.
+        mock_channel_supply(&mut server, 980).await;
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);

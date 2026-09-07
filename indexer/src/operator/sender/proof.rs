@@ -1265,7 +1265,9 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(1, Vec::new())]);
 
-        let mut state = sender_state(&server.url());
+        // The deferral is a compare-and-set against a Processing row, so the row
+        // has to exist for the rejection path to persist anything.
+        let mut state = sender_state_with_storage(&server.url(), mock_with_processing_row(1));
         state.instance_pda = Some(Pubkey::new_unique());
         // The chain rotated to generation 1 without the cache hearing about it.
         state.cached_generation = Some(0);
