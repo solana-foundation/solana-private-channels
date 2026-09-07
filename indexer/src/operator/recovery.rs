@@ -7,6 +7,7 @@ use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
 use crate::operator::sender::types::PendingSig;
 use crate::operator::sender::{classify_release_signatures, SigFinality};
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::TransactionStatusUpdate;
 use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
 use crate::storage::common::storage::Storage;
@@ -576,12 +577,15 @@ async fn check_withdrawal(
 }
 
 /// Load and parse a row's persisted broadcast signatures into `PendingSig`s for the
-/// finality classifier. Shared by deposit and withdrawal recovery. A read error or a
-/// malformed stored signature returns a quarantine reason (uncertainty, never "dead"),
-/// so callers never demote a row whose signatures could not be read or parsed.
-async fn load_pending_sigs(storage: &Storage, id: i64) -> Result<Vec<PendingSig>, String> {
-    let stored = storage
-        .get_release_signatures(id)
+/// finality classifier. Shared by recovery and the sender's permanent-failure path.
+/// A read error or a malformed stored signature returns a reason (uncertainty, never
+/// "dead"), so callers never demote a row whose signatures could not be read.
+pub(crate) async fn load_pending_sigs(
+    storage: &Storage,
+    id: i64,
+) -> Result<Vec<PendingSig>, String> {
+    // Absorbs a brief blip only; a longer outage is the caller's to wait out.
+    let stored = with_storage_backoff("journal read", id, || storage.get_release_signatures(id))
         .await
         .map_err(|e| format!("release signature lookup failed: {e}"))?;
 

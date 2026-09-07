@@ -4,8 +4,11 @@ use crate::error::TransactionError;
 use crate::error::{OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::bitmap_constants::NONCES_PER_GENERATION;
-use crate::operator::recovery::MAX_RECOVERY_REQUEUE_ATTEMPTS;
-use crate::operator::utils::instruction_util::{TransactionBuilder, TransactionKind};
+use crate::operator::recovery::{load_pending_sigs, MAX_RECOVERY_REQUEUE_ATTEMPTS};
+use crate::operator::utils::instruction_util::{
+    TransactionBuilder, TransactionKind, WithdrawalRemintInfo,
+};
+use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
     build_and_sign, check_transaction_status, send_signed, ConfirmationResult,
@@ -1355,8 +1358,10 @@ async fn defer_remint_after_failure(
         .withdrawal_nonce
         .and_then(|nonce| state.remint_cache.remove(&nonce));
 
-    // Collect stashed signatures for finality check
-    let signatures = ctx
+    // Clear the per-nonce stash. It is no longer what the finality gate reads,
+    // so it is only in-memory bookkeeping here, restored below if this failure
+    // cannot be handed off.
+    let stashed = ctx
         .withdrawal_nonce
         .and_then(|nonce| state.pending_signatures.remove(&nonce))
         .unwrap_or_default();
@@ -1369,6 +1374,37 @@ async fn defer_remint_after_failure(
         return;
     };
 
+    // Guard before the journal read below, which is keyed by transaction_id.
+    // `transaction_id` is always `Some` for a withdrawal: only `ReleaseFunds`
+    // populates `remint_cache`, and it always carries a DB row. This prevents
+    // queuing a `PendingRemint` with no record, which a restart would lose.
+    let Some(transaction_id) = ctx.transaction_id else {
+        error!(
+            "Cannot defer remint for nonce {:?}, no transaction_id, entry would be unrecoverable on restart",
+            ctx.withdrawal_nonce,
+        );
+        return;
+    };
+
+    // Every attempt is journaled before its send, so the journal is the only
+    // complete record of what may still land: a send that errored ambiguously
+    // never reaches the stash, and classifying the stash alone can call a live
+    // release dead and remint on top of it. Recovery reads the same table.
+    let signatures = match load_pending_sigs(&state.storage, transaction_id).await {
+        Ok(sigs) => sigs,
+        // Without the broadcast set there is nothing to prove the release dead
+        // against, so leave the row Processing for recovery, which reads the
+        // same journal.
+        Err(reason) => {
+            error!(
+                transaction_id,
+                "Cannot read the release-signature journal, leaving the row to recovery: {reason}"
+            );
+            restore_remint_material(state, ctx, info, stashed);
+            return;
+        }
+    };
+
     // Zero signatures means there is nothing of our own to classify, and the RPC
     // may still have broadcast before erroring. Nothing available here is
     // positive evidence that no payout occurred: an absent release record only
@@ -1379,27 +1415,25 @@ async fn defer_remint_after_failure(
             "No signatures to verify for nonce {:?}, cannot safely remint, sending to ManualReview",
             ctx.withdrawal_nonce,
         );
-        if let Some(transaction_id) = ctx.transaction_id {
-            send_guaranteed(
-                storage_tx,
-                TransactionStatusUpdate {
-                    transaction_id,
-                    trace_id: ctx.trace_id.clone(),
-                    status: TransactionStatus::ManualReview,
-                    counterpart_signature: None,
-                    processed_at: Some(Utc::now()),
-                    error_message: Some(format!(
-                        "{} | no signatures to verify, remint unsafe",
-                        error_msg
-                    )),
-                    remint_signature: None,
-                    remint_attempted: false,
-                },
-                "transaction status update",
-            )
-            .await
-            .ok();
-        }
+        send_guaranteed(
+            storage_tx,
+            TransactionStatusUpdate {
+                transaction_id,
+                trace_id: ctx.trace_id.clone(),
+                status: TransactionStatus::ManualReview,
+                counterpart_signature: None,
+                processed_at: Some(Utc::now()),
+                error_message: Some(format!(
+                    "{} | no signatures to verify, remint unsafe",
+                    error_msg
+                )),
+                remint_signature: None,
+                remint_attempted: false,
+            },
+            "transaction status update",
+        )
+        .await
+        .ok();
         return;
     }
 
@@ -1409,67 +1443,116 @@ async fn defer_remint_after_failure(
     // needed for the finality check. This replaces the previous Failed write —
     // keeping status as Processing until the remint resolves avoids partial state
     // if the operator crashes during the finality window.
-    if let Some(transaction_id) = ctx.transaction_id {
-        let sig_strings: Vec<String> = signatures
-            .iter()
-            .map(|pending_sig| pending_sig.signature.to_string())
-            .collect();
-        let lvbhs: Vec<i64> = signatures
-            .iter()
-            .map(|pending_sig| pending_sig.last_valid_block_height as i64)
-            .collect();
+    let sig_strings: Vec<String> = signatures
+        .iter()
+        .map(|pending_sig| pending_sig.signature.to_string())
+        .collect();
+    let lvbhs: Vec<i64> = signatures
+        .iter()
+        .map(|pending_sig| pending_sig.last_valid_block_height as i64)
+        .collect();
 
-        if let Err(e) = state
-            .storage
-            .set_pending_remint(
-                transaction_id,
-                sig_strings,
-                lvbhs,
-                deadline,
-                release_refused_on_chain,
-            )
-            .await
-        {
-            error!(
-                "Failed to persist PendingRemint for transaction {} - sending to manual review: {}",
-                transaction_id, e
-            );
-            send_guaranteed(
-                storage_tx,
-                TransactionStatusUpdate {
+    // Retry the handoff: a statement timeout, deadlock or dropped connection is
+    // transient, and the compensation material is still held in the locals
+    // above, so nothing is given up while retrying.
+    let write_result = with_storage_backoff("pending remint transition", transaction_id, || {
+        state.storage.set_pending_remint(
+            transaction_id,
+            sig_strings.clone(),
+            lvbhs.clone(),
+            deadline,
+            release_refused_on_chain,
+        )
+    })
+    .await;
+
+    if let Err(e) = write_result {
+        // The error is ambiguous: the write may or may not have committed.
+        // Read the row back; its status says who owns this withdrawal now.
+        let observed = with_storage_backoff("pending remint status read", transaction_id, || {
+            state.storage.get_transaction_status(transaction_id)
+        })
+        .await;
+
+        match observed {
+            // It committed and only the acknowledgement was lost, so this sender
+            // still owns the remint. Fall through and queue it.
+            Ok(Some(TransactionStatus::PendingRemint)) => {
+                warn!(
                     transaction_id,
-                    trace_id: ctx.trace_id.clone(),
-                    status: TransactionStatus::ManualReview,
-                    counterpart_signature: None,
-                    processed_at: Some(Utc::now()),
-                    error_message: Some(format!(
-                        "{} | failed to persist pending remint: {}",
-                        error_msg, e
-                    )),
-                    remint_signature: None,
-                    remint_attempted: false,
-                },
-                "transaction status update",
-            )
-            .await
-            .ok();
-            return;
+                    "set_pending_remint failed but the row is PendingRemint, treating the handoff as committed: {e}"
+                );
+            }
+            // Nothing committed. Leave the row Processing for the recovery
+            // worker, which reloads the same journal and completes, requeues or
+            // quarantines it. Queuing the remint here as well could pay twice.
+            Ok(Some(TransactionStatus::Processing)) => {
+                error!(
+                    transaction_id,
+                    "Failed to persist PendingRemint, leaving the row to recovery: {e}"
+                );
+                restore_remint_material(state, ctx, info, stashed);
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[
+                        state.program_type.as_label(),
+                        "pending_remint_persist_failed",
+                    ])
+                    .inc();
+                return;
+            }
+            // Another writer already moved the row, so it owns the outcome.
+            Ok(Some(status)) => {
+                warn!(
+                    transaction_id,
+                    "Failed to persist PendingRemint and the row is already {status:?}, leaving it alone: {e}"
+                );
+                return;
+            }
+            // Neither state can be established, so retry the write itself: it is
+            // idempotent for this payload, which makes it the only probe that is
+            // safe whichever state committed. A terminal status would strand the
+            // withdrawal instead, since no sweep selects ManualReview and the
+            // material pulled from the caches above is the only live copy.
+            unresolved => {
+                error!(
+                    "Failed to persist PendingRemint for transaction {transaction_id} and could not read it back ({unresolved:?}), retrying the handoff: {e}"
+                );
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[
+                        state.program_type.as_label(),
+                        "pending_remint_state_unknown",
+                    ])
+                    .inc();
+                match state
+                    .storage
+                    .set_pending_remint(
+                        transaction_id,
+                        sig_strings,
+                        lvbhs,
+                        deadline,
+                        release_refused_on_chain,
+                    )
+                    .await
+                {
+                    Ok(()) => warn!(
+                        transaction_id,
+                        "The handoff retry committed against an unreadable row; driving the remint from this sender"
+                    ),
+                    // Either the row is no longer ours to take or the database is
+                    // still unreachable. Both leave it where it is, so hold the
+                    // material: a row that never left Processing belongs to the
+                    // recovery sweep, which classifies the release on-chain first.
+                    Err(retry_err) => {
+                        error!(
+                            transaction_id,
+                            "Could not establish the PendingRemint handoff, holding the remint info and signature stash for recovery: {retry_err}"
+                        );
+                        restore_remint_material(state, ctx, info, stashed);
+                        return;
+                    }
+                }
+            }
         }
-    }
-
-    // `transaction_id` is always `Some` at this point in practice — only
-    // `ReleaseFunds` transactions populate `remint_cache`, and `ReleaseFunds`
-    // always carries a DB transaction_id (see `TransactionBuilder::transaction_id`
-    // in instruction_util.rs). `InitializeMint` and `RotateBitmap` return `None`
-    // there and would have exited early above via `send_fatal_error`. This guard
-    // exists to prevent silently enqueuing a `PendingRemint` with no DB record,
-    // which would be lost on restart since recovery reads from the DB.
-    if ctx.transaction_id.is_none() {
-        error!(
-            "Cannot defer remint for nonce {:?} — no transaction_id, entry would be unrecoverable on restart",
-            ctx.withdrawal_nonce,
-        );
-        return;
     }
 
     info!(
@@ -1489,6 +1572,21 @@ async fn defer_remint_after_failure(
         release_refused_on_chain,
         coverage_slot: None,
     });
+}
+
+/// Put back the compensation material a failed handoff pulled out of the caches,
+/// so a later attempt on the same nonce still has it. A stale entry is only ever
+/// read by such an attempt, so holding it costs nothing.
+fn restore_remint_material(
+    state: &mut SenderState,
+    ctx: &TransactionContext,
+    info: WithdrawalRemintInfo,
+    stashed: Vec<PendingSig>,
+) {
+    if let Some(nonce) = ctx.withdrawal_nonce {
+        state.remint_cache.insert(nonce, info);
+        state.pending_signatures.insert(nonce, stashed);
+    }
 }
 
 /// Sign, send, and store a Mint or InitializeMint tx in `state.in_flight`.
@@ -2095,7 +2193,7 @@ mod tests {
     use super::*;
     use crate::config::ProgramType;
     use crate::operator::sender::test_support::{
-        mock_bitmap_account, mock_with_processing_row, row_status,
+        mock_bitmap_account, mock_with_processing_row, push_withdrawal_with_nonce, row_status,
         sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
@@ -2184,13 +2282,17 @@ mod tests {
     async fn permanent_failure_withdrawal_with_cache_defers_remint() {
         // `set_pending_remint` is a compare-and-set from Processing, so the row
         // has to be there for the deferral to persist.
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
+        let mock = mock_with_processing_row(10);
+        let sig = Signature::new_unique();
+        // The finality gate reads the journal the broadcast wrote.
+        mock.insert_release_signature(10, sig.to_string(), 0, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
 
         // Populate remint cache and some pending signatures
         state.remint_cache.insert(5, make_remint_info(10));
-        let sig = Signature::new_unique();
         state.pending_signatures.insert(
             5,
             vec![PendingSig {
@@ -2263,6 +2365,414 @@ mod tests {
         assert!(
             state.pending_remints.is_empty(),
             "should not queue deferred remint with zero sigs"
+        );
+    }
+
+    /// A `Processing` withdrawal row carrying `nonce`, the state every release
+    /// the deferred-remint handoff acts on starts from.
+    fn processing_withdrawal_mock(transaction_id: i64, nonce: u64) -> MockStorage {
+        let mock = MockStorage::new();
+        push_withdrawal_with_nonce(
+            &mock,
+            transaction_id,
+            nonce as i64,
+            TransactionStatus::Processing,
+        );
+        mock
+    }
+
+    fn release_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
+        TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(transaction_id),
+            withdrawal_nonce: Some(nonce),
+            trace_id: Some(format!("trace-{transaction_id}")),
+        }
+    }
+
+    /// Every attempt is journaled before its send, so a send that errored
+    /// ambiguously never reaches the in-memory stash. Classifying the stash
+    /// alone can call a live release dead and remint on top of it.
+    #[tokio::test]
+    async fn permanent_failure_gate_includes_ambiguously_sent_attempt() {
+        let txn_id = 20;
+        let nonce = 15;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        let stashed_attempt = Signature::new_unique();
+        let ambiguous_attempt = Signature::new_unique();
+        for (signature, lvbh) in [(stashed_attempt, 100), (ambiguous_attempt, 200)] {
+            mock.insert_release_signature(txn_id, signature.to_string(), lvbh, None)
+                .await
+                .unwrap();
+        }
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        // Only attempt 1 reached the stash: the push runs in the send's Ok arm.
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: stashed_attempt,
+                last_valid_block_height: 100,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        let (_, persisted_sigs, persisted_lvbhs, _, _) =
+            mock.pending_remint_signatures.lock().unwrap()[0].clone();
+        assert!(
+            persisted_sigs.contains(&ambiguous_attempt.to_string()),
+            "the ambiguously-sent attempt must be persisted for the finality check: {persisted_sigs:?}"
+        );
+        assert_eq!(
+            persisted_lvbhs.iter().max(),
+            Some(&200),
+            "the deadline bound must cover the ambiguously-sent attempt"
+        );
+        let queued: Vec<Signature> = state.pending_remints[0]
+            .signatures
+            .iter()
+            .map(|pending_sig| pending_sig.signature)
+            .collect();
+        assert!(
+            queued.contains(&ambiguous_attempt),
+            "the in-process gate must classify the ambiguously-sent attempt too: {queued:?}"
+        );
+    }
+
+    /// Without the broadcast set there is nothing to prove the release dead
+    /// against, so the compensation material goes back and the row stays
+    /// Processing for recovery, which reads the same journal.
+    #[tokio::test]
+    async fn permanent_failure_unreadable_journal_leaves_row_to_recovery() {
+        let txn_id = 21;
+        let nonce = 16;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        mock.insert_release_signature(txn_id, Signature::new_unique().to_string(), 0, None)
+            .await
+            .unwrap();
+        mock.set_should_fail("get_release_signatures", true);
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: Signature::new_unique(),
+                last_valid_block_height: 0,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status on an unreadable journal"
+        );
+        assert!(state.pending_remints.is_empty(), "no remint may be queued");
+        assert!(state.remint_cache.contains_key(&nonce));
+        assert!(state.pending_signatures.contains_key(&nonce));
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing),
+            "the row must stay Processing so the recovery sweep owns it"
+        );
+    }
+
+    /// A failed `set_pending_remint` whose row still reads `Processing` proves
+    /// nothing committed. Escalating here would strand a row recovery resolves
+    /// on its own, so the caches go back instead.
+    #[tokio::test]
+    async fn permanent_failure_leaves_processing_row_to_recovery() {
+        let txn_id = 22;
+        let nonce = 17;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        mock.set_should_fail("set_pending_remint", true);
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status while the row is still Processing"
+        );
+        assert!(
+            state.pending_remints.is_empty(),
+            "must not queue a remint without a durable PendingRemint row"
+        );
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be restored for a later attempt"
+        );
+        assert!(
+            state.pending_signatures.contains_key(&nonce),
+            "release signatures must be restored for a later attempt"
+        );
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            3,
+            "the transient write must be retried before the row is read back"
+        );
+    }
+
+    /// The write can commit and still return an error when the acknowledgement
+    /// is lost. A row that reads back PendingRemint is durable, so this sender
+    /// keeps driving the remint instead of escalating.
+    #[tokio::test]
+    async fn permanent_failure_adopts_committed_pending_remint_row() {
+        let txn_id = 23;
+        let nonce = 18;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        mock.set_should_fail("set_pending_remint", true);
+        mock.pending_transactions.lock().unwrap()[0].status = TransactionStatus::PendingRemint;
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "a committed PendingRemint row must be driven by this sender"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not overwrite a committed PendingRemint with a terminal status"
+        );
+    }
+
+    /// The write can commit while every read-back also fails, so no read can say
+    /// who owns the row. Replaying the idempotent write is the only safe probe:
+    /// it succeeds against the committed handoff and proves it durable.
+    #[tokio::test]
+    async fn permanent_failure_adopts_committed_handoff_when_reads_fail() {
+        let txn_id = 24;
+        let nonce = 19;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        // The three write attempts fail; the retry after them finds the database
+        // reachable and replays the identical payload against the committed row.
+        mock.set_fail_times("set_pending_remint", 3);
+        mock.set_should_fail("get_transaction_status", true);
+        {
+            let mut rows = mock.pending_transactions.lock().unwrap();
+            rows[0].status = TransactionStatus::PendingRemint;
+            rows[0].remint_signatures = Some(vec![broadcast.to_string()]);
+        }
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not queue a terminal status the writer would apply to a committed PendingRemint"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "a committed PendingRemint has no other driver until a restart, so it must be queued here"
+        );
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            4,
+            "the three backoff attempts must be followed by the retry that resolves ownership"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::PendingRemint),
+            "the committed handoff must survive"
+        );
+    }
+
+    /// The retry can also miss because another writer moved the row: a recovery
+    /// demote leaves it Pending. Adopting it would drive a remint the processor
+    /// is about to re-release against, so the guard miss leaves it alone.
+    #[tokio::test]
+    async fn permanent_failure_does_not_adopt_row_moved_by_another_writer() {
+        let txn_id = 25;
+        let nonce = 20;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        mock.set_fail_times("set_pending_remint", 3);
+        mock.set_should_fail("get_transaction_status", true);
+        // Recovery demoted the row while the handoff was being retried, so the
+        // PendingRemint write never committed and the retry finds no row to take.
+        mock.pending_transactions.lock().unwrap()[0].status = TransactionStatus::Pending;
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "must not drive a remint for a row another writer owns"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status over another writer's row"
+        );
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be held when the retry cannot prove the row moved on"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Pending),
+            "the other writer's status must survive"
+        );
+    }
+
+    /// When neither the write nor the read-back establishes the row's state, the
+    /// remint info and signature stash stay in memory and the row keeps its
+    /// status. ManualReview here strands a still-Processing withdrawal that no
+    /// sweep selects, after discarding the only live copy of both.
+    #[tokio::test]
+    async fn permanent_failure_holds_remint_info_and_stash_when_state_undeterminable() {
+        let txn_id = 26;
+        let nonce = 21;
+        let mock = processing_withdrawal_mock(txn_id, nonce);
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(txn_id, broadcast.to_string(), 0, None)
+            .await
+            .unwrap();
+        mock.set_should_fail("set_pending_remint", true);
+        mock.set_should_fail("get_transaction_status", true);
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        state.remint_cache.insert(nonce, make_remint_info(txn_id));
+        state.pending_signatures.insert(
+            nonce,
+            vec![PendingSig {
+                signature: broadcast,
+                last_valid_block_height: 0,
+            }],
+        );
+
+        handle_permanent_failure(
+            &mut state,
+            &release_ctx(txn_id, nonce),
+            &storage_tx,
+            "release_funds failed",
+        )
+        .await;
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "must not write a terminal status over a row whose state is unknown"
+        );
+        assert!(
+            state.pending_remints.is_empty(),
+            "must not queue a remint when the row state is unknown"
+        );
+        assert!(
+            state.remint_cache.contains_key(&nonce),
+            "remint info must be held for recovery or a later attempt"
+        );
+        assert!(
+            state.pending_signatures.contains_key(&nonce),
+            "release signatures must be held for recovery or a later attempt"
+        );
+        assert_eq!(
+            mock.calls("set_pending_remint"),
+            4,
+            "the handoff must be retried once more before the caches are restored"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(TransactionStatus::Processing),
+            "the row must stay Processing so the recovery sweep owns it"
         );
     }
 
@@ -2758,12 +3268,12 @@ mod tests {
         );
     }
 
-    /// The in-memory stash happens only after a successful broadcast, so a send that
-    /// never reached the network leaves no signature to verify and routes to
-    /// ManualReview, not a deferred remint. The write-ahead DB persist (for crash
-    /// recovery) does not change this.
+    /// The node answered the send with an error, so the release may still have
+    /// reached the network. The stash is written only after a successful send and
+    /// knows nothing about this attempt, but the write-ahead journal does, so the
+    /// withdrawal takes the finality-checked remint path instead of escalating.
     #[tokio::test]
-    async fn send_failure_routes_to_manual_review() {
+    async fn send_failure_defers_remint_on_journaled_signature() {
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
         let _send = server
@@ -2782,7 +3292,9 @@ mod tests {
             )
             .create();
 
-        let mut state = make_sender_state_with_server(&server.url());
+        // The PendingRemint transition is a compare-and-set from Processing.
+        let mock = mock_with_processing_row(10);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
         state.remint_cache.insert(5, make_remint_info(10));
 
         let (storage_tx, mut storage_rx) = mpsc::channel(10);
@@ -2800,13 +3312,25 @@ mod tests {
         .await;
 
         assert!(
-            state.pending_remints.is_empty(),
-            "a never-broadcast send must not defer a remint"
+            storage_rx.try_recv().is_err(),
+            "an ambiguously-sent release must not be terminalized"
         );
-        let update = storage_rx
-            .try_recv()
-            .expect("send failure must surface a status update");
-        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let journaled = mock.get_release_signatures(10).await.unwrap();
+        assert_eq!(
+            journaled.len(),
+            1,
+            "the send was preceded by a write-ahead persist"
+        );
+        assert!(
+            !state.pending_signatures.contains_key(&5),
+            "the failed send never stashed its signature"
+        );
+        assert_eq!(state.pending_remints.len(), 1);
+        assert_eq!(
+            state.pending_remints[0].signatures[0].signature.to_string(),
+            journaled[0].signature,
+            "the gate must carry the journaled signature"
+        );
     }
 
     // ── set_pending_remint persistence ───────────────────────────────
@@ -2825,9 +3349,7 @@ mod tests {
     async fn permanent_failure_calls_set_pending_remint_with_correct_args() {
         // `set_pending_remint` is a compare-and-set from Processing, so the row
         // has to be there for the deferral to persist.
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(10));
-        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        let mock = mock_with_processing_row(10);
 
         // Two signatures — simulating a withdrawal that was retried once before
         // failing permanently. Both must be persisted for a complete finality check.
@@ -2835,6 +3357,14 @@ mod tests {
         let sig2 = Signature::new_unique();
         let sig1_lvbh: u64 = 100;
         let sig2_lvbh: u64 = 200;
+        for (signature, lvbh) in [(sig1, sig1_lvbh), (sig2, sig2_lvbh)] {
+            mock.insert_release_signature(10, signature.to_string(), lvbh as i64, None)
+                .await
+                .unwrap();
+        }
+
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
         state.remint_cache.insert(5, make_remint_info(10));
         state.pending_signatures.insert(
             5,
@@ -3442,14 +3972,23 @@ mod tests {
             .create();
 
         // A deferral compare-and-sets the row from Processing, so it has to exist.
-        let mut state = sender_state_with_storage(&server.url(), mock_with_processing_row(70));
+        let mock = mock_with_processing_row(70);
+        let broadcast = Signature::new_unique();
+        if stash_signature {
+            // Every broadcast is journaled before its send, which is what the
+            // deferral's finality gate reads.
+            mock.insert_release_signature(70, broadcast.to_string(), 0, None)
+                .await
+                .unwrap();
+        }
+        let mut state = sender_state_with_storage(&server.url(), mock);
         state.instance_pda = Some(Pubkey::new_unique());
         state.remint_cache.insert(4, make_remint_info(70));
         if stash_signature {
             state.pending_signatures.insert(
                 4,
                 vec![PendingSig {
-                    signature: Signature::new_unique(),
+                    signature: broadcast,
                     last_valid_block_height: 0,
                 }],
             );
@@ -3643,20 +4182,25 @@ mod tests {
             let _bitmap = mock_bitmap_account(server, generation, &[]);
         }
 
+        // The release was broadcast before the program refused it, so in
+        // production neither the journal nor the stash is empty on this path.
+        //
+        // Without them the remint path exits early on "no signatures to verify".
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(REFUSED_ROW, broadcast.to_string(), 1, None)
+            .await
+            .unwrap();
+
         let mut state = sender_state_with_storage(&server.url(), mock);
         state.instance_pda = Some(Pubkey::new_unique());
         state.in_flight_withdrawals.insert(nonce);
         state
             .remint_cache
             .insert(nonce, make_remint_info(REFUSED_ROW));
-        // The release was broadcast before the program refused it, so in
-        // production the signature stash is never empty on this path.
-        //
-        // Without it the remint path exits early on "no signatures to verify".
         state.pending_signatures.insert(
             nonce,
             vec![PendingSig {
-                signature: Signature::new_unique(),
+                signature: broadcast,
                 last_valid_block_height: 1,
             }],
         );
@@ -3946,13 +4490,19 @@ mod tests {
     /// burned nor the funds they were owed.
     #[tokio::test]
     async fn withheld_release_behind_the_window_is_compensated() {
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(91));
+        let mock = mock_with_processing_row(91);
+        // An earlier attempt on this nonce reached the network, and its journaled
+        // signature is what the compensating remint has to classify first.
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(91, broadcast.to_string(), 1, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
         state.remint_cache.insert(1, make_remint_info(91));
         state.pending_signatures.insert(
             1,
             vec![PendingSig {
-                signature: Signature::new_unique(),
+                signature: broadcast,
                 last_valid_block_height: 1,
             }],
         );
@@ -3988,13 +4538,19 @@ mod tests {
     /// back without a human, and the refund stalls in manual review instead.
     #[tokio::test]
     async fn a_withheld_release_persists_the_refusal_with_the_pending_remint() {
-        let mut state =
-            sender_state_with_storage("http://localhost:8899", mock_with_processing_row(91));
+        let mock = mock_with_processing_row(91);
+        // An earlier attempt on this nonce reached the network, and its journaled
+        // signature is what the compensating remint has to classify first.
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(91, broadcast.to_string(), 1, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
         state.remint_cache.insert(1, make_remint_info(91));
         state.pending_signatures.insert(
             1,
             vec![PendingSig {
-                signature: Signature::new_unique(),
+                signature: broadcast,
                 last_valid_block_height: 1,
             }],
         );

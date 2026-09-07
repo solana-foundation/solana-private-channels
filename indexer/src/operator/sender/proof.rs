@@ -1267,7 +1267,14 @@ mod tests {
 
         // The deferral is a compare-and-set against a Processing row, so the row
         // has to exist for the rejection path to persist anything.
-        let mut state = sender_state_with_storage(&server.url(), mock_with_processing_row(1));
+        let mock = mock_with_processing_row(1);
+        // The compensating remint classifies the journaled attempt, so the row
+        // needs the write-ahead record an earlier broadcast left behind.
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(1, broadcast.to_string(), 1, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage(&server.url(), mock);
         state.instance_pda = Some(Pubkey::new_unique());
         // The chain rotated to generation 1 without the cache hearing about it.
         state.cached_generation = Some(0);
@@ -1275,7 +1282,7 @@ mod tests {
         state.pending_signatures.insert(
             0,
             vec![PendingSig {
-                signature: Signature::new_unique(),
+                signature: broadcast,
                 last_valid_block_height: 1,
             }],
         );
