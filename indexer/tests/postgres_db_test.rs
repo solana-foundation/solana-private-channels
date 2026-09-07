@@ -438,11 +438,12 @@ async fn lock_pending_second_call_empty() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Withdrawals dequeue under a nonce frontier: a lower active (non-Pending)
-/// nonce blocks every higher nonce, so a boundary can't be handed out ahead of
-/// an unresolved lower withdrawal.
+/// Bitmap bits are independent, so an unresolved lower nonce must not withhold
+/// higher ones. This pins the rejection of the SMT-era dequeue frontier: a
+/// frontier would be a liveness cost here, not a safety property.
 #[tokio::test(flavor = "multi_thread")]
-async fn withdrawal_dequeue_respects_nonce_frontier() -> Result<(), Box<dyn std::error::Error>> {
+async fn withdrawal_dequeue_ignores_lower_active_nonces() -> Result<(), Box<dyn std::error::Error>>
+{
     let (pool, storage, _pg) = start_postgres().await?;
 
     // Sequential inserts get sequential nonces (0, 1, 2) from the trigger.
@@ -452,7 +453,7 @@ async fn withdrawal_dequeue_respects_nonce_frontier() -> Result<(), Box<dyn std:
     let w1 = storage
         .insert_db_transaction(&make_db_transaction("w1", TransactionType::Withdrawal))
         .await?;
-    storage
+    let w2 = storage
         .insert_db_transaction(&make_db_transaction("w2", TransactionType::Withdrawal))
         .await?;
 
@@ -462,17 +463,15 @@ async fn withdrawal_dequeue_respects_nonce_frontier() -> Result<(), Box<dyn std:
         .execute(&pool)
         .await?;
 
-    // Only Pending nonces below the parked one are eligible → just w0.
-    // w2 is Pending but sits above the frontier, so it must be withheld.
     let locked = storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let ids: Vec<i64> = locked.iter().map(|txn| txn.id).collect();
     assert_eq!(
-        locked.len(),
-        1,
-        "only the nonce below the frontier is dequeued"
+        ids,
+        vec![w0, w2],
+        "a parked lower nonce must not hold back a higher pending one"
     );
-    assert_eq!(locked[0].id, w0);
 
     Ok(())
 }
