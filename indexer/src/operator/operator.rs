@@ -187,6 +187,7 @@ pub async fn run(
     // the sender uses for status updates.
     let processor_storage = storage.clone();
     let processor_rpc = rpc_client.clone();
+    let processor_fallback_rpc = fallback_rpc_client.clone();
     let processor_source_rpc = source_rpc_client.clone();
     let processor_storage_tx = storage_tx.clone();
     let processor_handle = tokio::spawn(async move {
@@ -198,6 +199,7 @@ pub async fn run(
             instance_pda,
             processor_storage,
             processor_rpc,
+            processor_fallback_rpc,
             processor_source_rpc,
         )
         .await;

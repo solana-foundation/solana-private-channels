@@ -71,7 +71,7 @@ pub(crate) const RELEASE_PROOF_ESCALATE_AFTER: Duration =
 
 /// Deposit recovery outcome. Uncertainty must NOT demote (double-mint risk); an
 /// in-flight signature leaves the row Processing for the next sweep.
-enum DepositOutcome {
+pub(crate) enum DepositOutcome {
     Landed { signature: String },
     NotLanded,
     Live { reason: String },
@@ -553,7 +553,7 @@ async fn decide_action(
 /// where a withdrawal Quarantines: the pre-broadcast persist makes "no signature" mean
 /// "never broadcast", so re-minting cannot double-mint, and quarantining every such row
 /// would flood manual review at deposit volume.
-async fn check_deposit(
+pub(crate) async fn check_deposit(
     row: &DbTransaction,
     storage: &Storage,
     finality: &FinalityRpc<'_>,
