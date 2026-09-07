@@ -36,7 +36,7 @@ use super::types::{
     InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, PendingSig, PollTaskResult,
     SenderState, TransactionContext, TransactionStatusUpdate, MAX_IN_FLIGHT,
 };
-use super::{classify_release_signatures, SigFinality};
+use super::{classify_signatures, SigFinality};
 
 use std::sync::Arc;
 
@@ -369,6 +369,7 @@ pub(super) enum SignatureClaim {
 /// CASes the same `updated_at` column, so a demote and a claim can never both
 /// win, whereas a row that was demoted and re-fetched is `Processing` again and
 /// would pass a status test.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn claim_and_persist_or_abort(
     storage: &Storage,
     pt: &str,
@@ -376,6 +377,7 @@ pub(super) async fn claim_and_persist_or_abort(
     expected_updated_at: chrono::DateTime<Utc>,
     signature: &Signature,
     last_valid_block_height: u64,
+    blockhash_slot: u64,
     lost_label: &str,
 ) -> SignatureClaim {
     match storage
@@ -384,8 +386,7 @@ pub(super) async fn claim_and_persist_or_abort(
             expected_updated_at,
             signature.to_string(),
             last_valid_block_height as i64,
-            // Theirs' blockhash_slot bound arrives with the #187/#192 port.
-            None,
+            i64::try_from(blockhash_slot).ok(),
         )
         .await
     {
@@ -541,7 +542,7 @@ pub(super) async fn send_and_confirm(
     let send_start = std::time::Instant::now();
 
     // Build and sign before broadcasting so the signature can be persisted write-ahead.
-    let (transaction, signature, last_valid_block_height, _blockhash_slot) =
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
         match build_and_sign(&state.rpc_client, instruction.clone()).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -601,6 +602,7 @@ pub(super) async fn send_and_confirm(
             expected_updated_at,
             &signature,
             last_valid_block_height,
+            blockhash_slot,
             "release_claim_lost",
         )
         .await
@@ -637,6 +639,7 @@ pub(super) async fn send_and_confirm(
                     .push(PendingSig {
                         signature,
                         last_valid_block_height,
+                        blockhash_slot: Some(blockhash_slot),
                     });
             }
 
@@ -1013,7 +1016,7 @@ pub(super) async fn handle_nonce_already_used(
         return;
     }
 
-    match classify_release_signatures(&state.rpc_client, &signatures).await {
+    match classify_signatures(&state.dest_finality(), &signatures).await {
         SigFinality::Landed(landed) => {
             info!(
                 nonce = ctx.withdrawal_nonce.map(|n| n as i64),
@@ -1829,7 +1832,7 @@ pub(super) async fn fire_and_store_task(
     let pt = program_type.as_label();
     let send_start = std::time::Instant::now();
 
-    let (transaction, signature, last_valid_block_height, _blockhash_slot) =
+    let (transaction, signature, last_valid_block_height, blockhash_slot) =
         match build_and_sign(&rpc_client, instruction.clone()).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -1863,6 +1866,7 @@ pub(super) async fn fire_and_store_task(
             expected_updated_at,
             &signature,
             last_valid_block_height,
+            blockhash_slot,
             "deposit_ownership_lost",
         )
         .await
@@ -2403,6 +2407,7 @@ mod tests {
             vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2523,6 +2528,7 @@ mod tests {
             vec![PendingSig {
                 signature: stashed_attempt,
                 last_valid_block_height: 100,
+                blockhash_slot: None,
             }],
         );
 
@@ -2577,6 +2583,7 @@ mod tests {
             vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2624,6 +2631,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2681,6 +2689,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2733,6 +2742,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2791,6 +2801,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2845,6 +2856,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -2896,6 +2908,7 @@ mod tests {
             vec![PendingSig {
                 signature: sig,
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
         let (tx, _rx) = mpsc::channel(10);
@@ -3087,6 +3100,7 @@ mod tests {
             vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
         let (storage_tx, _storage_rx) = mpsc::channel(10);
@@ -3170,6 +3184,7 @@ mod tests {
             vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -3208,6 +3223,7 @@ mod tests {
             .push(PendingSig {
                 signature: sig,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             });
 
         assert!(state.pending_signatures.contains_key(&nonce));
@@ -3223,6 +3239,7 @@ mod tests {
             .push(PendingSig {
                 signature: sig2,
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             });
         assert_eq!(state.pending_signatures[&nonce].len(), 2);
     }
@@ -3635,10 +3652,12 @@ mod tests {
                 PendingSig {
                     signature: sig1,
                     last_valid_block_height: sig1_lvbh,
+                    blockhash_slot: None,
                 },
                 PendingSig {
                     signature: sig2,
                     last_valid_block_height: sig2_lvbh,
+                    blockhash_slot: None,
                 },
             ],
         );
@@ -3749,6 +3768,7 @@ mod tests {
             vec![PendingSig {
                 signature: Signature::new_unique(),
                 last_valid_block_height: 0,
+                blockhash_slot: None,
             }],
         );
 
@@ -4376,6 +4396,7 @@ mod tests {
                 vec![PendingSig {
                     signature: broadcast,
                     last_valid_block_height: 0,
+                    blockhash_slot: None,
                 }],
             );
         }
@@ -4590,6 +4611,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
         // As if send_and_confirm had just counted this attempt against the nonce.
@@ -4679,10 +4701,12 @@ mod tests {
                 PendingSig {
                     signature: still_open,
                     last_valid_block_height: 1,
+                    blockhash_slot: None,
                 },
                 PendingSig {
                     signature: rejected,
                     last_valid_block_height: 1,
+                    blockhash_slot: None,
                 },
             ],
         );
@@ -4895,6 +4919,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
         let (tx, mut rx) = mpsc::channel(10);
@@ -4944,6 +4969,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
         let (tx, _rx) = mpsc::channel(10);

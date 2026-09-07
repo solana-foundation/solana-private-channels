@@ -1786,6 +1786,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         signatures: vec![PendingSig {
             signature: Signature::new_unique(),
             last_valid_block_height: 1,
+            blockhash_slot: None,
         }],
         original_error: "release_funds failed".to_string(),
         deadline: Utc::now() - chrono::Duration::seconds(1),

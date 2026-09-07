@@ -1287,6 +1287,7 @@ mod tests {
             vec![PendingSig {
                 signature: broadcast,
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
 

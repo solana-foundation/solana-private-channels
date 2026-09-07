@@ -1325,6 +1325,7 @@ async fn withdraw_boot_reconcile_ignores_foreign_processing_rows() {
     boot_reconcile_processing(
         &storage,
         &client,
+        None,
         ProgramType::Withdraw,
         &storage_tx,
         &CancellationToken::new(),

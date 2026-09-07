@@ -390,6 +390,7 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
         vec![PendingSig {
             signature: prior_attempt,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         }],
     );
 
@@ -465,6 +466,7 @@ async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
         vec![PendingSig {
             signature: prior_attempt,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         }],
     );
     mock_storage.set_should_fail("set_pending_remint", true);

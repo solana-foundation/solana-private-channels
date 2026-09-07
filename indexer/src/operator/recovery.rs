@@ -5,7 +5,7 @@ use crate::config::ProgramType;
 use crate::error::OperatorError;
 use crate::metrics::OPERATOR_STALE_PROCESSING_RECOVERED;
 use crate::operator::sender::types::PendingSig;
-use crate::operator::sender::{classify_release_signatures, SigFinality};
+use crate::operator::sender::{classify_signatures, FinalityRpc, SigFinality};
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use crate::operator::utils::storage_util::with_storage_backoff;
 use crate::operator::TransactionStatusUpdate;
@@ -78,6 +78,31 @@ enum WithdrawalAction {
     Quarantine { reason: String },
 }
 
+/// The recovery worker's endpoint pair, tagged per row type at the call site.
+/// Recovery handles both deposits and withdrawals, so the chain cannot be fixed
+/// once for the whole worker.
+pub(crate) struct RecoveryFinality<'a> {
+    primary: &'a RpcClientWithRetry,
+    fallback: Option<&'a RpcClientWithRetry>,
+}
+
+impl<'a> RecoveryFinality<'a> {
+    pub(crate) fn new(
+        primary: &'a RpcClientWithRetry,
+        fallback: Option<&'a RpcClientWithRetry>,
+    ) -> Self {
+        Self { primary, fallback }
+    }
+
+    fn channel(&self) -> FinalityRpc<'a> {
+        FinalityRpc::channel(self.primary, self.fallback)
+    }
+
+    fn solana(&self) -> FinalityRpc<'a> {
+        FinalityRpc::solana(self.primary, self.fallback)
+    }
+}
+
 /// Unified action for the storage router.
 enum RecoveryAction {
     Complete {
@@ -97,11 +122,13 @@ enum RecoveryAction {
 pub async fn run_recovery_worker(
     storage: Arc<Storage>,
     rpc_client: Arc<RpcClientWithRetry>,
+    fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     program_type: ProgramType,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: CancellationToken,
 ) -> Result<(), OperatorError> {
     info!("Starting recovery worker");
+    let finality = RecoveryFinality::new(&rpc_client, fallback_rpc_client.as_deref());
     let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
     // Lives across ticks so a sweep that stops on its budget resumes where it
     // left off, rather than rescanning the same prefix every minute.
@@ -115,7 +142,7 @@ pub async fn run_recovery_worker(
             _ = interval.tick() => {
                 if let Err(e) = recover_once(
                     &storage,
-                    &rpc_client,
+                    &finality,
                     program_type,
                     &storage_tx,
                     &cancellation_token,
@@ -135,7 +162,7 @@ pub async fn run_recovery_worker(
 
 async fn recover_once(
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &RecoveryFinality<'_>,
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
@@ -177,7 +204,7 @@ async fn recover_once(
         }
         // Capture `updated_at` before the RPC so the write below CAS-checks it.
         let captured = row.updated_at;
-        let action = decide_action(&row, storage, rpc_client).await;
+        let action = decide_action(&row, storage, finality).await;
         route_outcome(storage, &row, captured, action, program_type, storage_tx).await;
     }
 
@@ -209,7 +236,7 @@ async fn recover_once(
     if program_type == ProgramType::Withdraw {
         if let Err(e) = reconcile_landed_withdrawals(
             storage,
-            rpc_client,
+            finality,
             TransactionStatus::ManualReview,
             RECONCILE_SWEEP_BUDGET,
             reconcile_cursor,
@@ -259,7 +286,7 @@ fn role_owns(program_type: ProgramType, row: &DbTransaction) -> bool {
 /// degraded endpoint.
 pub(crate) async fn reconcile_landed_withdrawals(
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &RecoveryFinality<'_>,
     from_status: TransactionStatus,
     budget: Duration,
     cursor: &mut i64,
@@ -272,7 +299,7 @@ pub(crate) async fn reconcile_landed_withdrawals(
     // statement, so it either committed or it did not.
     match tokio::time::timeout(
         budget,
-        reconcile_sweep(storage, rpc_client, from_status, cursor, cancellation_token),
+        reconcile_sweep(storage, finality, from_status, cursor, cancellation_token),
     )
     .await
     {
@@ -294,7 +321,7 @@ pub(crate) async fn reconcile_landed_withdrawals(
 /// ceiling on it as a whole.
 async fn reconcile_sweep(
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &RecoveryFinality<'_>,
     from_status: TransactionStatus,
     cursor: &mut i64,
     cancellation_token: &CancellationToken,
@@ -353,7 +380,7 @@ async fn reconcile_sweep(
                 continue;
             };
             let SigFinality::Landed(signature) =
-                classify_release_signatures(rpc_client, &pending).await
+                classify_signatures(&finality.solana(), &pending).await
             else {
                 continue;
             };
@@ -418,6 +445,9 @@ fn row_pending_sigs(row: &DbTransaction) -> Option<Vec<PendingSig>> {
         pending.push(PendingSig {
             signature,
             last_valid_block_height,
+            // The transactions-row mirror never carried a slot; the journal is
+            // the authority for one.
+            blockhash_slot: None,
         });
     }
     Some(pending)
@@ -467,21 +497,23 @@ async fn promote_stalled_row(
 async fn decide_action(
     row: &DbTransaction,
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &RecoveryFinality<'_>,
 ) -> RecoveryAction {
     let action = match row.transaction_type {
-        TransactionType::Deposit => match check_deposit(row, storage, rpc_client).await {
+        TransactionType::Deposit => match check_deposit(row, storage, &finality.channel()).await {
             DepositOutcome::Landed { signature } => RecoveryAction::Complete { signature },
             DepositOutcome::NotLanded => RecoveryAction::Demote,
             DepositOutcome::Live { reason } => RecoveryAction::NoAction { reason },
             DepositOutcome::Ambiguous { reason } => RecoveryAction::Quarantine { reason },
         },
-        TransactionType::Withdrawal => match check_withdrawal(row, storage, rpc_client).await {
-            WithdrawalAction::Complete { signature } => RecoveryAction::Complete { signature },
-            WithdrawalAction::Demote => RecoveryAction::Demote,
-            WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
-            WithdrawalAction::Quarantine { reason } => RecoveryAction::Quarantine { reason },
-        },
+        TransactionType::Withdrawal => {
+            match check_withdrawal(row, storage, &finality.solana()).await {
+                WithdrawalAction::Complete { signature } => RecoveryAction::Complete { signature },
+                WithdrawalAction::Demote => RecoveryAction::Demote,
+                WithdrawalAction::LeaveProcessing { reason } => RecoveryAction::NoAction { reason },
+                WithdrawalAction::Quarantine { reason } => RecoveryAction::Quarantine { reason },
+            }
+        }
     };
     // Cap recovery requeue attempts. Rows that fail to make progress after
     // MAX_RECOVERY_REQUEUE_ATTEMPTS are quarantined (and paged) rather than
@@ -506,7 +538,7 @@ async fn decide_action(
 async fn check_deposit(
     row: &DbTransaction,
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
 ) -> DepositOutcome {
     let pending = match load_pending_sigs(storage, row.id).await {
         Ok(p) => p,
@@ -521,7 +553,7 @@ async fn check_deposit(
         return DepositOutcome::NotLanded;
     }
 
-    match classify_release_signatures(rpc_client, &pending).await {
+    match classify_signatures(finality, &pending).await {
         SigFinality::Landed(sig) => DepositOutcome::Landed {
             signature: sig.to_string(),
         },
@@ -540,7 +572,7 @@ async fn check_deposit(
 async fn check_withdrawal(
     row: &DbTransaction,
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
 ) -> WithdrawalAction {
     if row.withdrawal_nonce.is_none() {
         return WithdrawalAction::Quarantine {
@@ -561,7 +593,7 @@ async fn check_withdrawal(
         };
     }
 
-    match classify_release_signatures(rpc_client, &pending).await {
+    match classify_signatures(finality, &pending).await {
         SigFinality::Landed(sig) => WithdrawalAction::Complete {
             signature: sig.to_string(),
         },
@@ -601,6 +633,7 @@ pub(crate) async fn load_pending_sigs(
         pending.push(PendingSig {
             signature,
             last_valid_block_height: entry.last_valid_block_height as u64,
+            blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
         });
     }
     Ok(pending)
@@ -807,16 +840,18 @@ async fn route_outcome(
 pub async fn boot_reconcile_processing(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
+    fallback_rpc_client: Option<&RpcClientWithRetry>,
     program_type: ProgramType,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     cancellation_token: &CancellationToken,
     max_passes: u32,
 ) -> Result<(), OperatorError> {
+    let finality = RecoveryFinality::new(rpc_client, fallback_rpc_client);
     let mut reconcile_cursor = 0i64;
     for pass in 0..max_passes {
         recover_once(
             storage,
-            rpc_client,
+            &finality,
             program_type,
             storage_tx,
             cancellation_token,
@@ -861,13 +896,14 @@ pub mod test_hooks {
         program_type: ProgramType,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
+        let finality = RecoveryFinality::new(rpc_client, None);
         // Fresh, never-cancelled token; tests run to completion. Uses the periodic
         // worker's STALE_THRESHOLD; the ZERO boot threshold is exercised by calling
         // recover_once directly.
         let token = CancellationToken::new();
         recover_once(
             storage,
-            rpc_client,
+            &finality,
             program_type,
             storage_tx,
             &token,
@@ -886,9 +922,10 @@ pub mod test_hooks {
         from_status: TransactionStatus,
     ) -> Result<(), OperatorError> {
         let token = CancellationToken::new();
+        let finality = RecoveryFinality::new(rpc_client, None);
         reconcile_landed_withdrawals(
             storage,
-            rpc_client,
+            &finality,
             from_status,
             RECONCILE_SWEEP_BUDGET,
             &mut 0,
@@ -983,6 +1020,18 @@ mod tests {
             .create()
     }
 
+    /// Ledger floor low enough to prove the endpoint still retains the attempt's window.
+    fn mock_ledger_floor(server: &mut mockito::ServerGuard, floor: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_body(format!(r#"{{"jsonrpc":"2.0","result":{floor},"id":1}}"#))
+            .create()
+    }
+
     /// The keystone divergence from withdrawal: a deposit with no persisted signature is
     /// provably never broadcast (pre-broadcast persist), so it Demotes for a safe re-mint
     /// rather than Quarantining. No RPC is consulted.
@@ -991,14 +1040,14 @@ mod tests {
         let storage = Storage::Mock(MockStorage::new());
         let client = make_rpc_client("http://localhost:1");
         let row = make_deposit_row(1);
-        let outcome = check_deposit(&row, &storage, &client).await;
+        let outcome = check_deposit(&row, &storage, &FinalityRpc::channel(&client, None)).await;
         assert!(
             matches!(outcome, DepositOutcome::NotLanded),
             "empty sigs must map to NotLanded (Demote), not Ambiguous/Quarantine"
         );
         // Same state on the withdrawal side Quarantines; assert the difference.
         let wrow = make_withdrawal_row(2, Some(42));
-        let waction = check_withdrawal(&wrow, &storage, &client).await;
+        let waction = check_withdrawal(&wrow, &storage, &FinalityRpc::solana(&client, None)).await;
         assert!(
             matches!(waction, WithdrawalAction::Quarantine { .. }),
             "withdrawal with no sigs must Quarantine - the deliberate deposit divergence"
@@ -1029,7 +1078,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        match check_deposit(&row, &storage, &client).await {
+        match check_deposit(&row, &storage, &FinalityRpc::channel(&client, None)).await {
             DepositOutcome::Landed { signature } => assert_eq!(signature, landed_sig.to_string()),
             _ => panic!("expected Landed"),
         }
@@ -1042,10 +1091,12 @@ mod tests {
         let _status = mock_null_status(&mut server);
         // current_height (1000) > lvbh (100) means expired/dead.
         let _height = mock_block_height(&mut server, 1000);
+        // Floor below the journaled blockhash slot: the absence is covered, so Dead stands.
+        let _floor = mock_ledger_floor(&mut server, 400);
 
         let mock = MockStorage::new();
         let row = make_deposit_row(1);
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, Some(500))
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
@@ -1053,7 +1104,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_deposit(&row, &storage, &client).await,
+                check_deposit(&row, &storage, &FinalityRpc::channel(&client, None)).await,
                 DepositOutcome::NotLanded
             ),
             "dead sigs map to NotLanded (Demote)"
@@ -1078,7 +1129,7 @@ mod tests {
 
         assert!(
             matches!(
-                check_deposit(&row, &storage, &client).await,
+                check_deposit(&row, &storage, &FinalityRpc::channel(&client, None)).await,
                 DepositOutcome::Live { .. }
             ),
             "a still-live sig must leave the row Processing, not demote"
@@ -1103,7 +1154,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        match check_deposit(&row, &storage, &client).await {
+        match check_deposit(&row, &storage, &FinalityRpc::channel(&client, None)).await {
             DepositOutcome::Ambiguous { reason } => {
                 assert!(
                     reason.contains("could not verify mint landed"),
@@ -1131,7 +1182,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
 
-        match check_deposit(&row, &storage, &client).await {
+        match check_deposit(&row, &storage, &FinalityRpc::channel(&client, None)).await {
             DepositOutcome::Ambiguous { reason } => {
                 assert!(
                     reason.contains("malformed stored release signature"),
@@ -1151,7 +1202,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, None);
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None)).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(reason.contains("withdrawal row missing nonce"));
@@ -1167,7 +1218,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client("http://localhost:1");
         let row = make_withdrawal_row(1, Some(42));
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None)).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -1201,17 +1252,19 @@ mod tests {
             .with_status(200)
             .with_body(r#"{"jsonrpc":"2.0","result":1000,"id":1}"#)
             .create();
+        // Floor below the journaled blockhash slot: the absence is covered, so Dead stands.
+        let _floor = mock_ledger_floor(&mut server, 400);
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
         // current_height (1000) > lvbh (100) means expired/dead.
-        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, None)
+        mock.insert_release_signature(row.id, Signature::new_unique().to_string(), 100, Some(500))
             .await
             .unwrap();
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None)).await;
         assert!(
             matches!(action, WithdrawalAction::Demote),
             "expected Demote"
@@ -1242,7 +1295,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None)).await;
         match action {
             WithdrawalAction::Complete { signature } => {
                 assert_eq!(signature, landed_sig.to_string());
@@ -1283,7 +1336,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None)).await;
         assert!(
             matches!(action, WithdrawalAction::LeaveProcessing { .. }),
             "expected LeaveProcessing"
@@ -1309,7 +1362,7 @@ mod tests {
         let storage = Storage::Mock(mock);
         let client = make_rpc_client(&server.url());
 
-        let action = check_withdrawal(&row, &storage, &client).await;
+        let action = check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None)).await;
         match action {
             WithdrawalAction::Quarantine { reason } => {
                 assert!(
@@ -1517,7 +1570,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             RECONCILE_SWEEP_BUDGET,
             &mut 0,
@@ -1577,7 +1630,7 @@ mod tests {
         let started = std::time::Instant::now();
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::PendingRemint,
             Duration::from_millis(150),
             &mut 0,
@@ -1637,7 +1690,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             Duration::from_millis(200),
             &mut cursor,
@@ -1654,7 +1707,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             Duration::from_millis(200),
             &mut cursor,
@@ -1713,7 +1766,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             RECONCILE_SWEEP_BUDGET,
             &mut 0,
@@ -1757,7 +1810,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             RECONCILE_SWEEP_BUDGET,
             &mut 0,
@@ -1834,7 +1887,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             RECONCILE_SWEEP_BUDGET,
             &mut 0,
@@ -1871,7 +1924,7 @@ mod tests {
 
         reconcile_landed_withdrawals(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             TransactionStatus::ManualReview,
             RECONCILE_SWEEP_BUDGET,
             &mut 0,
@@ -1900,7 +1953,7 @@ mod tests {
 
         let result = recover_once(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             ProgramType::Withdraw,
             &storage_tx,
             &CancellationToken::new(),
@@ -2192,14 +2245,14 @@ mod tests {
         let mut row = make_deposit_row(52);
         // One below the cap still demotes (requeues) - pins the off-by-one boundary.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS - 1;
-        let below = decide_action(&row, &storage, &client).await;
+        let below = decide_action(&row, &storage, &RecoveryFinality::new(&client, None)).await;
         assert!(
             matches!(below, RecoveryAction::Demote),
             "one below the cap must still Demote (requeue)"
         );
         // At the cap, the demote is converted to Quarantine.
         row.recovery_requeue_attempts = MAX_RECOVERY_REQUEUE_ATTEMPTS;
-        let at_cap = decide_action(&row, &storage, &client).await;
+        let at_cap = decide_action(&row, &storage, &RecoveryFinality::new(&client, None)).await;
         assert!(
             matches!(at_cap, RecoveryAction::Quarantine { .. }),
             "demote at the cap must become Quarantine"
@@ -2308,7 +2361,7 @@ mod tests {
 
         recover_once(
             &storage,
-            &client,
+            &RecoveryFinality::new(&client, None),
             ProgramType::Withdraw,
             &storage_tx,
             &CancellationToken::new(),
@@ -2354,6 +2407,7 @@ mod tests {
         boot_reconcile_processing(
             &storage,
             &client,
+            None,
             ProgramType::Withdraw,
             &storage_tx,
             &token,
@@ -2362,9 +2416,14 @@ mod tests {
         .await
         .unwrap();
 
-        let validated =
-            validate_bitmap_consistency(&storage, &client, Some(Pubkey::new_unique()), &storage_tx)
-                .await;
+        let validated = validate_bitmap_consistency(
+            &storage,
+            &client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await;
         assert!(
             validated.is_ok(),
             "validate must pass once the landed nonce is reconciled: {validated:?}"
@@ -2399,6 +2458,7 @@ mod tests {
         boot_reconcile_processing(
             &storage,
             &client,
+            None,
             ProgramType::Withdraw,
             &storage_tx,
             &token,
@@ -2407,9 +2467,14 @@ mod tests {
         .await
         .unwrap();
 
-        let validated =
-            validate_bitmap_consistency(&storage, &client, Some(Pubkey::new_unique()), &storage_tx)
-                .await;
+        let validated = validate_bitmap_consistency(
+            &storage,
+            &client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await;
         assert!(
             matches!(
                 validated,

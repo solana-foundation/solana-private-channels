@@ -75,6 +75,7 @@ pub(super) fn sender_state_with_storage_and_role(
     SenderState {
         rpc_client: rpc_client.clone(),
         source_rpc_client: rpc_client,
+        fallback_rpc_client: None,
         storage: storage.clone(),
         instance_pda: None,
         in_flight_withdrawals: HashSet::new(),

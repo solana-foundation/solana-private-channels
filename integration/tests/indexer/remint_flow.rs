@@ -149,6 +149,7 @@ fn make_pending_remint(
         .map(|signature| PendingSig {
             signature,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         })
         .collect();
     PendingRemint {
@@ -181,6 +182,7 @@ fn make_pending_remint_with_lvbh(
         signatures: vec![PendingSig {
             signature,
             last_valid_block_height,
+            blockhash_slot: None,
         }],
         original_error: "release_funds failed".to_string(),
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),

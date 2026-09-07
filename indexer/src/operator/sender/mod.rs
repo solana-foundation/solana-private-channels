@@ -11,7 +11,7 @@ pub use mint::{
     enumerate_consumed_mints, find_existing_mint_signature_with_memo, ConsumedMintKind,
     ConsumedSet, JitOutcome,
 };
-pub(crate) use remint::{classify_release_signatures, SigFinality};
+pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
 pub(crate) use state::validate_bitmap_consistency;
 pub use types::TransactionStatusUpdate;
 

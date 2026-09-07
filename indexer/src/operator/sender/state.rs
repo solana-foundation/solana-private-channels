@@ -23,8 +23,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
+use super::remint::FinalityRpc;
 use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
-use super::{classify_release_signatures, SigFinality};
+use super::{classify_signatures, SigFinality};
 
 impl SenderState {
     pub(super) fn new(
@@ -48,10 +49,27 @@ impl SenderState {
         let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
         let mint_cache = MintCache::with_rpc(storage.clone(), mint_rpc_client.clone());
 
+        // Optional destination fallback, same retry/commitment as its primary.
+        // Empty means unset (env renders unconfigured as ""), so it maps to None.
+        let fallback_rpc_client = config
+            .fallback_rpc_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|url| {
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    url.to_string(),
+                    RetryConfig::default(),
+                    CommitmentConfig {
+                        commitment: operator_commitment,
+                    },
+                ))
+            });
+
         Ok(Self {
             rpc_client,
             // Source chain client (also used by MintCache). Remints broadcast here.
             source_rpc_client: mint_rpc_client,
+            fallback_rpc_client,
             storage,
             instance_pda,
             in_flight_withdrawals: HashSet::new(),
@@ -86,6 +104,7 @@ impl SenderState {
 pub(crate) async fn validate_bitmap_consistency(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
+    fallback_rpc_client: Option<&RpcClientWithRetry>,
     instance_pda: Option<Pubkey>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) -> Result<(), OperatorError> {
@@ -160,10 +179,12 @@ pub(crate) async fn validate_bitmap_consistency(
         nonces = ?chain_only,
         "Releases landed on-chain without a Completed row; resolving from broadcast signatures"
     );
+    // The bitmap is the withdraw role's, so its releases were broadcast to Solana.
+    let finality = FinalityRpc::solana(rpc_client, fallback_rpc_client);
     let mut paid_twice = Vec::new();
     for nonce in &chain_only {
         if let ChainAheadOutcome::DoublePayout =
-            resolve_chain_ahead_nonce(storage, rpc_client, storage_tx, *nonce).await
+            resolve_chain_ahead_nonce(storage, &finality, storage_tx, *nonce).await
         {
             paid_twice.push(*nonce);
         }
@@ -246,6 +267,7 @@ pub(super) async fn load_persisted_release_signatures(
                     .map(|signature| PendingSig {
                         signature,
                         last_valid_block_height: entry.last_valid_block_height.max(0) as u64,
+                        blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
                     })
             })
             .collect(),
@@ -291,7 +313,7 @@ fn report_unrepaired(nonce: u64) {
 /// dropped is how a real divergence disappears into an info log.
 async fn resolve_chain_ahead_nonce(
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     nonce: u64,
 ) -> ChainAheadOutcome {
@@ -342,7 +364,7 @@ async fn resolve_chain_ahead_nonce(
     let verdict = if signatures.is_empty() {
         None
     } else {
-        match classify_release_signatures(rpc_client, &signatures).await {
+        match classify_signatures(finality, &signatures).await {
             SigFinality::Landed(sig) => Some(sig),
             SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
                 warn!(nonce, transaction_id = row.id, "Unresolved: {reason}");
@@ -575,6 +597,9 @@ impl SenderState {
                         Ok(PendingSig {
                             signature,
                             last_valid_block_height,
+                            // The transactions-row mirror never carried a slot;
+                            // the journal table is the authority for one.
+                            blockhash_slot: None,
                         })
                     })
                     .collect()
@@ -1403,6 +1428,7 @@ mod tests {
             &state.storage,
             &state.rpc_client,
             None,
+            None,
             &storage_tx,
         )
         .await
@@ -1433,6 +1459,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1484,6 +1511,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1512,6 +1540,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1532,9 +1561,13 @@ mod tests {
         let state = make_sender_state(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        let outcome =
-            super::resolve_chain_ahead_nonce(&state.storage, &state.rpc_client, &storage_tx, 2)
-                .await;
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            2,
+        )
+        .await;
 
         assert!(
             matches!(outcome, super::ChainAheadOutcome::Unrepaired),
@@ -1580,9 +1613,13 @@ mod tests {
         let state = sender_state_with_storage(&server.url(), mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        let outcome =
-            super::resolve_chain_ahead_nonce(&state.storage, &state.rpc_client, &storage_tx, 2)
-                .await;
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            2,
+        )
+        .await;
 
         assert!(
             matches!(outcome, super::ChainAheadOutcome::Repaired),
@@ -1610,6 +1647,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1672,6 +1710,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1708,6 +1747,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1740,6 +1780,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1771,6 +1812,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1806,6 +1848,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1838,6 +1881,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
