@@ -336,9 +336,15 @@ async fn recovery_requeues_stale_parked_to_pending() {
         .get();
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, id).await,
@@ -400,9 +406,15 @@ async fn recovery_requeues_an_orphaned_rotation_wait_instead_of_quarantining_it(
     backdate(&pool, unrecorded, ChronoDuration::minutes(10)).await;
 
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, parked).await,
@@ -435,9 +447,15 @@ async fn escrow_recovery_never_unparks_withdrawal() {
     backdate(&pool, id, ChronoDuration::minutes(10)).await;
 
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Escrow, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Escrow,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, id).await,
@@ -469,9 +487,15 @@ async fn recovery_leaves_fresh_parked_untouched() {
     set_status(&pool, id, "parked").await; // updated_at ~ now -> within threshold
 
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, id).await,

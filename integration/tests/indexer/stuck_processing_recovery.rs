@@ -218,7 +218,7 @@ async fn it1_deposit_landed_promoted_to_completed() {
 
     let metric_before = snapshot_recovered("escrow", "completed", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -256,7 +256,7 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -306,7 +306,7 @@ async fn it2b_deposit_dead_signature_demoted() {
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -345,7 +345,7 @@ async fn it3_withdrawal_dead_signature_demoted() {
 
     let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -396,7 +396,7 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
 
     let metric_before = snapshot_recovered("withdraw", "completed", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -436,7 +436,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -473,7 +473,7 @@ async fn it4c_withdrawal_no_signatures_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -530,7 +530,7 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -594,7 +594,7 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // recover_once runs gc_stale_release_signatures at the top of the sweep.
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -647,7 +647,7 @@ async fn it4f_gc_retains_manual_review_release_sigs() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -699,7 +699,7 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -746,7 +746,7 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -798,7 +798,7 @@ async fn it7_fresh_processing_row_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -880,7 +880,7 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
@@ -955,7 +955,7 @@ async fn it10_backlog_batched_across_ticks() {
 
     // Tick 1: should heal exactly RECOVERY_BATCH_LIMIT (100) rows.
     let t0 = std::time::Instant::now();
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     assert!(
@@ -970,10 +970,10 @@ async fn it10_backlog_batched_across_ticks() {
     assert_eq!(pending_count, 100, "tick 1 must heal exactly the batch cap");
 
     // Ticks 2-3: drain the rest. Healed rows are excluded (trigger bumped updated_at).
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     let pending_count: i64 =
@@ -1034,7 +1034,7 @@ async fn it11_pending_remint_rows_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1071,7 +1071,7 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1132,7 +1132,7 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1261,7 +1261,7 @@ async fn withdraw_recovery_never_touches_escrow_deposit() {
     let client = test_client(mock.url());
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1327,6 +1327,7 @@ async fn withdraw_boot_reconcile_ignores_foreign_processing_rows() {
         &client,
         None,
         ProgramType::Withdraw,
+        None,
         &storage_tx,
         &CancellationToken::new(),
         2,
@@ -1455,7 +1456,7 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1492,7 +1493,7 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
 
     let metric_before = snapshot_recovered("withdraw", "manual_review_cleared", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1531,7 +1532,7 @@ async fn it15_manual_review_without_signatures_stays_quarantined() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     for pass in 1..=2 {
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
             .await
             .unwrap();
         assert_eq!(

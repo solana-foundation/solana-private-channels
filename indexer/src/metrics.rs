@@ -219,7 +219,7 @@ counter_vec!(
     &["program_type", "outcome"]
 );
 
-// Release-side SMT confirmation gate: the on-chain root verdict wherever a
+// Release-side confirmation gate: the on-chain bitmap verdict wherever a
 // release consumer needs to know whether a nonce actually released. `site` is one
 // of {recovery, remint, presend}; `verdict` is one of {landed, not_landed,
 // uncertain}, plus `journal_unavailable` on `presend` only. `recovery` and
@@ -232,7 +232,7 @@ counter_vec!(
 counter_vec!(
     OPERATOR_RELEASE_VERIFY,
     "private_channel_operator_release_verify_total",
-    "Release-side SMT confirmation verdicts",
+    "Release-side on-chain confirmation verdicts",
     &["site", "verdict"]
 );
 

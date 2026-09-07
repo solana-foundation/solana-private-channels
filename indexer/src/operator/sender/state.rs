@@ -13,6 +13,7 @@ use crate::storage::TransactionStatus;
 use crate::{PrivateChannelIndexerConfig, ProgramType};
 use chrono::Utc;
 use private_channel_metrics::MetricLabel;
+use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -96,6 +97,93 @@ impl SenderState {
     }
 }
 
+/// Three-way outcome of asking the chain whether a nonce's release landed.
+///
+/// `Uncertain` fails closed: every read, freshness and coverage ambiguity maps
+/// here and never to `NotLanded`, because only `NotLanded` authorises paying the
+/// user again.
+pub(crate) enum ReleaseVerdict {
+    /// The bit is set: the release landed, in the generation carried here.
+    Landed { generation: u64 },
+    /// The bit is clear inside the window the bitmap currently covers.
+    NotLanded,
+    /// The chain could not answer, which is not the same as answering "no".
+    Uncertain(String),
+}
+
+/// Prove on-chain whether withdrawal `nonce` was released, before anything acts
+/// on a verdict that would pay the user a second time.
+///
+/// The hard part is proving the snapshot is fresh behind a load-balanced RPC
+/// where two calls can hit different backends. The finalized blockhash and its
+/// response context slot come from one call, so the slot and the tip height it
+/// implies agree; the tip must be strictly past every attempt's last valid block
+/// height, since at that height a release can still land. The bitmap is then read
+/// bound to that slot, so a lagging backend errors instead of serving an older
+/// snapshot whose clear bit would read as proof of non-release.
+pub(crate) async fn verify_release_landed(
+    rpc: &RpcClientWithRetry,
+    instance_pda: Option<Pubkey>,
+    nonce: u64,
+    max_lvbh: u64,
+) -> ReleaseVerdict {
+    let Some(instance_pda) = instance_pda else {
+        return ReleaseVerdict::Uncertain("no instance pda configured".to_string());
+    };
+
+    let (ref_slot, lvbh) = match rpc
+        .get_latest_blockhash_with_context(CommitmentConfig::finalized())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}"))
+        }
+    };
+    // A blockhash stays valid for MAX_PROCESSING_AGE blocks past the tip it was
+    // taken at, so its lvbh minus that window is the tip height at `ref_slot`.
+    let Some(tip_height) = lvbh.checked_sub(MAX_PROCESSING_AGE as u64) else {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized last valid block height {lvbh} below MAX_PROCESSING_AGE; \
+             cannot derive a tip height"
+        ));
+    };
+    if tip_height <= max_lvbh {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized tip height {tip_height} is not past the attempt's last valid block \
+             height {max_lvbh}, so the bits are too stale to prove non-release"
+        ));
+    }
+
+    let bitmap = match fetch_consumed_nonces(
+        rpc,
+        &find_withdrawal_bitmap_pda(&instance_pda),
+        Some(ref_slot),
+    )
+    .await
+    {
+        Ok(bitmap) => bitmap,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("bitmap read failed: {e}")),
+    };
+
+    // Rotation clears every bit, so outside the current window a clear bit is
+    // indistinguishable from a release that happened and was then wiped.
+    if !bitmap.covers(nonce) {
+        return ReleaseVerdict::Uncertain(format!(
+            "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
+            bitmap.generation
+        ));
+    }
+
+    if bitmap.is_consumed(nonce) {
+        ReleaseVerdict::Landed {
+            generation: bitmap.generation,
+        }
+    } else {
+        ReleaseVerdict::NotLanded
+    }
+}
+
 /// Boot pre-flight diffing the current generation's released nonces against the
 /// ones the database calls Completed. A consumed nonce with no Completed row is
 /// lost bookkeeping for a release that did land, so it is repaired in place and
@@ -119,7 +207,7 @@ pub(crate) async fn validate_bitmap_consistency(
         "Validating withdrawal bitmap against completed withdrawals"
     );
 
-    let bitmap = fetch_consumed_nonces(rpc_client, &bitmap_pda).await?;
+    let bitmap = fetch_consumed_nonces(rpc_client, &bitmap_pda, None).await?;
     let (mut db_only, mut chain_only) = diff_bitmap(storage, &bitmap).await?;
 
     // The bitmap and the database are read at different instants, so a release
@@ -218,7 +306,7 @@ async fn confirm_divergence(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
 ) -> Result<(Vec<u64>, Vec<u64>), OperatorError> {
-    let bitmap = fetch_consumed_nonces(rpc_client, bitmap_pda).await?;
+    let bitmap = fetch_consumed_nonces(rpc_client, bitmap_pda, None).await?;
     diff_bitmap(storage, &bitmap).await
 }
 

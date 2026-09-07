@@ -140,7 +140,7 @@ pub async fn fetch_bitmap_generation(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
 ) -> Result<u64, OperatorError> {
-    Ok(fetch_consumed_nonces(rpc_client, bitmap_pda)
+    Ok(fetch_consumed_nonces(rpc_client, bitmap_pda, None)
         .await?
         .generation)
 }
@@ -149,21 +149,38 @@ pub async fn fetch_bitmap_generation(
 ///
 /// Generation and bits come from one `getAccountInfo`, so the returned view is
 /// internally consistent even if a release lands while it is in flight.
+///
+/// `min_context_slot` binds the answer to a slot the caller has already proven
+/// fresh. A backend that cannot serve there errors instead of returning an older
+/// snapshot, which is what stops a clear bit on a lagging node from reading as
+/// proof that a release never happened.
 pub async fn fetch_consumed_nonces(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
+    min_context_slot: Option<u64>,
 ) -> Result<BitmapState, OperatorError> {
     // Named as a bitmap failure rather than a generic transport one because
     // callers branch on it. An unreadable bitmap leaves a withdrawal row alone
     // for the recovery worker, where an error they do not recognise marks the
     // row permanently failed for what was only a read that did not answer.
-    let data = rpc_client.get_account_data(bitmap_pda).await.map_err(|e| {
-        ProgramError::BitmapUnavailable {
-            reason: format!("get_account_data({bitmap_pda}): {e}"),
-        }
-    })?;
+    let response = rpc_client
+        .get_account_with_context_min_slot(
+            bitmap_pda,
+            rpc_client.rpc_client.commitment(),
+            min_context_slot,
+        )
+        .await
+        .map_err(|e| ProgramError::BitmapUnavailable {
+            reason: format!("get_account_info({bitmap_pda}): {e}"),
+        })?;
 
-    parse_withdrawal_bitmap(&data)
+    let account = response
+        .value
+        .ok_or_else(|| ProgramError::BitmapUnavailable {
+            reason: format!("bitmap {bitmap_pda} not found"),
+        })?;
+
+    parse_withdrawal_bitmap(&account.data)
         .map_err(|e| match e {
             AccountError::AccountDeserializationFailed { reason, .. } => {
                 AccountError::AccountDeserializationFailed {
@@ -406,7 +423,7 @@ mod tests {
             CommitmentConfig::confirmed(),
         );
 
-        let err = fetch_consumed_nonces(&rpc, &pk(9)).await.unwrap_err();
+        let err = fetch_consumed_nonces(&rpc, &pk(9), None).await.unwrap_err();
 
         assert!(
             matches!(

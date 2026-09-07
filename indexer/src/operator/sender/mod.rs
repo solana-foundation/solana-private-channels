@@ -12,7 +12,7 @@ pub use mint::{
     ConsumedSet, JitOutcome,
 };
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
-pub(crate) use state::validate_bitmap_consistency;
+pub(crate) use state::{validate_bitmap_consistency, verify_release_landed, ReleaseVerdict};
 pub use types::TransactionStatusUpdate;
 
 #[cfg(any(test, feature = "test-mock-storage"))]

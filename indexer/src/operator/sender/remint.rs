@@ -2,12 +2,14 @@
 use super::types::InFlightQueue;
 use super::types::SenderState;
 use crate::config::ProgramType;
-use crate::metrics::{OPERATOR_ABSENCE_CLASSIFY, OPERATOR_REMINT_CLAIM_LOST};
+use crate::metrics::{
+    OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
+};
+use crate::operator::sender::{verify_release_landed, ReleaseVerdict};
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
-        check_transaction_status, fetch_consumed_nonces, find_withdrawal_bitmap_pda,
-        remint_idempotency_memo,
+        check_transaction_status, remint_idempotency_memo,
         sender::{
             transaction::FINALITY_SAFETY_DELAY,
             types::{InstructionWithSigners, PendingRemint, PendingSig},
@@ -27,7 +29,7 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Cap on total deferrals of a single pending remint. Covers both transient
 /// RPC errors during the finality check AND liveness extensions when a stored
@@ -915,43 +917,38 @@ async fn bitmap_verdict(state: &SenderState, entry: &PendingRemint) -> BitmapVer
         return BitmapVerdict::Clear;
     };
 
-    let bitmap = match fetch_consumed_nonces(
-        &state.rpc_client,
-        &find_withdrawal_bitmap_pda(&instance_pda),
-    )
-    .await
-    {
-        Ok(bitmap) => bitmap,
-        Err(e) => {
-            warn!("Could not read the bitmap before reminting nonce {nonce}: {e}");
-            return BitmapVerdict::Unknown(format!("bitmap read failed: {e}"));
-        }
+    // The read is bound past the highest attempt's validity window, so a backend
+    // still behind that point errors rather than answering with bits that predate
+    // the release it is being asked about.
+    let max_lvbh = entry
+        .signatures
+        .iter()
+        .map(|p| p.last_valid_block_height)
+        .max()
+        .unwrap_or(0);
+
+    let verdict =
+        verify_release_landed(&state.rpc_client, Some(instance_pda), nonce, max_lvbh).await;
+    let label = match &verdict {
+        ReleaseVerdict::Landed { .. } => "landed",
+        ReleaseVerdict::NotLanded => "not_landed",
+        ReleaseVerdict::Uncertain(_) => "uncertain",
     };
+    OPERATOR_RELEASE_VERIFY
+        .with_label_values(&["remint", label])
+        .inc();
 
-    // Rotation clears every bit, so outside the current window a clear bit is
-    // indistinguishable from a release that happened and was then wiped. Of the
-    // two readings available here, treating it as "free" is the only one that
-    // can pay a user twice, so the window is reported as unanswerable instead.
-    if !bitmap.covers(nonce) {
-        debug!(
-            "Bitmap is on generation {} and cannot answer for nonce {nonce}",
-            bitmap.generation
-        );
-        return BitmapVerdict::Unknown(format!(
-            "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
-            bitmap.generation
-        ));
+    match verdict {
+        ReleaseVerdict::Landed { generation } => BitmapVerdict::Blocked(format!(
+            "nonce {nonce} is consumed on-chain in generation {generation}, so the release \
+             landed despite every signature looking dead; reminting would credit it twice"
+        )),
+        ReleaseVerdict::NotLanded => BitmapVerdict::Clear,
+        ReleaseVerdict::Uncertain(reason) => {
+            warn!("Could not prove nonce {nonce} unreleased before reminting: {reason}");
+            BitmapVerdict::Unknown(reason)
+        }
     }
-
-    if bitmap.is_consumed(nonce) {
-        return BitmapVerdict::Blocked(format!(
-            "nonce {nonce} is consumed on-chain in generation {}, so the release landed \
-             despite every signature looking dead; reminting would credit it twice",
-            bitmap.generation
-        ));
-    }
-
-    BitmapVerdict::Clear
 }
 
 /// What the indexer's record of releases can say about this nonce.
@@ -2075,6 +2072,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 0, &[3]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, _mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2129,6 +2127,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_read_failure(&mut server);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2157,6 +2156,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_read_failure(&mut server);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, _mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2188,6 +2188,7 @@ mod tests {
         let _dead = mock_dead_signature(&mut server).await;
         // Generation 1 covers a later window than nonce 3.
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2293,6 +2294,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
         let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
@@ -2329,8 +2331,8 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
-        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
         let _blockhash = mock_remint_blockhash(&mut server).await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2359,6 +2361,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
         let (_slot, calls) = mock_get_slot(&mut server, 9_000);
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
@@ -2395,6 +2398,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
         let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
@@ -2423,6 +2427,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2456,6 +2461,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());
@@ -2482,6 +2488,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let _dead = mock_dead_signature(&mut server).await;
         let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
 
         let (mut state, mock) = make_sender_state_with_rpc(&server.url());
         state.instance_pda = Some(Pubkey::new_unique());

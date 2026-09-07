@@ -282,6 +282,7 @@ pub async fn run(
         let recovery_rpc = rpc_client.clone();
         let recovery_fallback = fallback_rpc_client.clone();
         let recovery_program_type = common_config.program_type;
+        let recovery_instance = instance_pda;
         let recovery_token = cancellation_token.clone();
         tokio::spawn(async move {
             if let Err(e) = recovery::run_recovery_worker(
@@ -289,6 +290,7 @@ pub async fn run(
                 recovery_rpc,
                 recovery_fallback,
                 recovery_program_type,
+                recovery_instance,
                 recovery_storage_tx,
                 recovery_token,
             )
@@ -417,6 +419,7 @@ async fn run_withdraw_preflight(
         rpc_client,
         fallback_rpc_client,
         crate::config::ProgramType::Withdraw,
+        Some(instance_pda),
         storage_tx,
         cancellation_token,
         MAX_RECONCILE_PASSES,
