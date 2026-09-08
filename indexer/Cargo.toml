@@ -77,9 +77,11 @@ yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
-solana-keychain = { version = "0.1.0", features = ["all"] }
+solana-keychain = { workspace = true }
 
 [dev-dependencies]
+google-cloud-auth = "1.4.0"
+google-cloud-kms-v1 = "1.9.0"
 bigdecimal = "0.4"
 figment = { workspace = true, features = ["test"] }
 tokio = { workspace = true, features = ["test-util"] }

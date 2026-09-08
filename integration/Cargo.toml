@@ -264,7 +264,7 @@ jsonrpsee = { workspace = true }
 serde_json = { workspace = true }
 solana-account-decoder-client-types = "2.3.10"
 solana-client = { version = "2.3.10" }
-solana-keychain = { version = "0.1.0", features = ["all"] }
+solana-keychain = { workspace = true }
 solana-pubkey = "2.4.0"
 solana-sdk = { workspace = true }
 solana-sdk-ids = { workspace = true }

@@ -2,6 +2,7 @@ use once_cell::sync::Lazy;
 use solana_keychain::{Signer, SignerError, SolanaSigner};
 use solana_sdk::pubkey::Pubkey;
 use std::env;
+use std::future::Future;
 use tracing::{info, warn};
 
 /// Environment variables for admin signer
@@ -44,25 +45,42 @@ const OPERATOR_PRIVY_APP_ID: &str = "OPERATOR_PRIVY_APP_ID";
 const OPERATOR_PRIVY_APP_SECRET: &str = "OPERATOR_PRIVY_APP_SECRET";
 const OPERATOR_PRIVY_WALLET_ID: &str = "OPERATOR_PRIVY_WALLET_ID";
 
-#[derive(Debug, Clone, Copy)]
+// GCP KMS references are non-secret; credentials come from ADC.
+const ADMIN_GCP_KMS_KEY_NAME: &str = "ADMIN_GCP_KMS_KEY_NAME";
+const ADMIN_GCP_KMS_PUBLIC_KEY: &str = "ADMIN_GCP_KMS_PUBLIC_KEY";
+const OPERATOR_GCP_KMS_KEY_NAME: &str = "OPERATOR_GCP_KMS_KEY_NAME";
+const OPERATOR_GCP_KMS_PUBLIC_KEY: &str = "OPERATOR_GCP_KMS_PUBLIC_KEY";
+
+#[derive(Debug, thiserror::Error)]
+enum SignerConfigError {
+    // Only locally constructed messages naming variables, never their values.
+    #[error("{0}")]
+    InvalidConfig(String),
+    // Preserve Keychain's redaction of backend errors and private key material.
+    #[error(transparent)]
+    Signer(#[from] SignerError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SignerType {
     Memory,
     Vault,
     Turnkey,
     Privy,
+    GcpKms,
 }
 
 impl SignerType {
-    fn from_str(s: &str) -> Result<Self, SignerError> {
+    fn from_str(s: &str) -> Result<Self, SignerConfigError> {
         match s.to_lowercase().as_str() {
             "memory" => Ok(Self::Memory),
             "vault" => Ok(Self::Vault),
             "turnkey" => Ok(Self::Turnkey),
             "privy" => Ok(Self::Privy),
-            other => Err(SignerError::InvalidPrivateKey(format!(
-                "Unsupported signer type: {}. Supported: memory, vault, turnkey, privy",
-                other
-            ))),
+            "gcp_kms" => Ok(Self::GcpKms),
+            _ => Err(SignerConfigError::InvalidConfig(
+                "Unsupported signer type. Supported: memory, vault, turnkey, privy, gcp_kms".into(),
+            )),
         }
     }
 }
@@ -80,23 +98,84 @@ static ADMIN_SIGNER_INSTANCE: Lazy<Signer> =
 
 /// Global operator signer (optional, only for release funds)
 static OPERATOR_SIGNER_INSTANCE: Lazy<Option<Signer>> =
-    Lazy::new(|| match load_signer(SignerRole::Operator) {
-        Ok(signer) => Some(signer),
-        Err(_) => {
+    Lazy::new(|| load_operator_signer().expect("OPERATOR_SIGNER configuration is invalid"));
+
+fn load_operator_signer() -> Result<Option<Signer>, SignerConfigError> {
+    match env::var(OPERATOR_SIGNER) {
+        Err(env::VarError::NotPresent) => {
             warn!("OPERATOR_SIGNER not configured - release funds will use admin as operator");
-            None
+            Ok(None)
         }
-    });
+        // A configured signer must never silently fall back to a different key.
+        _ => load_signer(SignerRole::Operator).map(Some),
+    }
+}
+
+fn required_env(name: &str) -> Result<String, SignerConfigError> {
+    let value = env::var(name)
+        .map_err(|_| SignerConfigError::InvalidConfig(format!("{} not set", name)))?;
+    if value.trim().is_empty() {
+        return Err(SignerConfigError::InvalidConfig(format!(
+            "{} is set but empty",
+            name
+        )));
+    }
+    Ok(value)
+}
+
+fn gcp_kms_config(
+    role: SignerRole,
+) -> Result<solana_keychain::GcpKmsSignerConfig, SignerConfigError> {
+    let (key_name_var, public_key_var) = match role {
+        SignerRole::Admin => (ADMIN_GCP_KMS_KEY_NAME, ADMIN_GCP_KMS_PUBLIC_KEY),
+        SignerRole::Operator => (OPERATOR_GCP_KMS_KEY_NAME, OPERATOR_GCP_KMS_PUBLIC_KEY),
+    };
+    let key_name = required_env(key_name_var)?;
+    // Pin a concrete version: rotating a KMS version changes the Solana address.
+    let parts: Vec<_> = key_name.split('/').collect();
+    if !matches!(parts.as_slice(),
+        ["projects", project, "locations", location, "keyRings", ring,
+         "cryptoKeys", key, "cryptoKeyVersions", version]
+        if [project, location, ring, key].iter().all(|part| !part.is_empty())
+            && version.bytes().all(|byte| byte.is_ascii_digit())
+            && version.parse::<u64>().is_ok_and(|version| version > 0))
+    {
+        return Err(SignerConfigError::InvalidConfig(format!(
+            "{} must be a full GCP KMS cryptoKeyVersions/<number> resource name",
+            key_name_var
+        )));
+    }
+    let public_key = required_env(public_key_var)?;
+    public_key.parse::<Pubkey>().map_err(|_| {
+        SignerConfigError::InvalidConfig(format!(
+            "{} must be a base58 Solana public key",
+            public_key_var
+        ))
+    })?;
+    Ok(solana_keychain::GcpKmsSignerConfig {
+        key_name,
+        public_key,
+    })
+}
+
+fn initialize_remote_signer(
+    future: impl Future<Output = Result<Signer, SignerError>>,
+) -> Result<Signer, SignerError> {
+    // Signer accessors are synchronous; initialization runs once during operator
+    // startup on the binary's multi-thread Tokio runtime. Yield its worker before
+    // waiting for async initialization (plain Handle::block_on would panic here).
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
 
 /// Load signer from environment variables
-fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
+fn load_signer(role: SignerRole) -> Result<Signer, SignerConfigError> {
     let (role_name, type_var) = match role {
         SignerRole::Admin => ("admin", ADMIN_SIGNER),
         SignerRole::Operator => ("operator", OPERATOR_SIGNER),
     };
 
     let signer_type_str = env::var(type_var)
-        .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", type_var)))?;
+        .map_err(|_| SignerConfigError::InvalidConfig(format!("{} not set", type_var)))?;
     let signer_type = SignerType::from_str(&signer_type_str)?;
 
     let signer = match signer_type {
@@ -106,11 +185,11 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 SignerRole::Operator => OPERATOR_PRIVATE_KEY,
             };
             let private_key = env::var(private_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", private_key_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", private_key_var))
             })?;
             // Reject a set-but-empty value: env::var returns Ok("") for a blank var.
             if private_key.trim().is_empty() {
-                return Err(SignerError::InvalidPrivateKey(format!(
+                return Err(SignerConfigError::InvalidConfig(format!(
                     "{} is set but empty",
                     private_key_var
                 )));
@@ -134,17 +213,18 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 ),
             };
             let vault_addr = env::var(vault_addr_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", vault_addr_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", vault_addr_var))
             })?;
             let vault_token = env::var(vault_token_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", vault_token_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", vault_token_var))
             })?;
 
-            let key_name = env::var(key_name_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", key_name_var)))?;
+            let key_name = env::var(key_name_var).map_err(|_| {
+                SignerConfigError::InvalidConfig(format!("{} not set", key_name_var))
+            })?;
             let pubkey = env::var(pubkey_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
-            Signer::from_vault(vault_addr, vault_token, key_name, pubkey)?
+                .map_err(|_| SignerConfigError::InvalidConfig(format!("{} not set", pubkey_var)))?;
+            Signer::from_vault(vault_addr, vault_token, key_name, pubkey, None)?
         }
         SignerType::Turnkey => {
             let (
@@ -170,18 +250,18 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 ),
             };
             let api_public_key = env::var(api_public_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", api_public_key_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", api_public_key_var))
             })?;
             let api_private_key = env::var(api_private_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", api_private_key_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", api_private_key_var))
             })?;
             let organization_id = env::var(organization_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", organization_id_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", organization_id_var))
             })?;
             let public_key = env::var(pubkey_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
+                .map_err(|_| SignerConfigError::InvalidConfig(format!("{} not set", pubkey_var)))?;
             let private_key_id = env::var(private_key_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", private_key_id_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", private_key_id_var))
             })?;
             Signer::from_turnkey(
                 api_public_key,
@@ -189,6 +269,7 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 organization_id,
                 private_key_id,
                 public_key,
+                None,
             )?
         }
         SignerType::Privy => {
@@ -205,17 +286,19 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 ),
             };
             let app_id = env::var(app_id_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", app_id_var)))?;
+                .map_err(|_| SignerConfigError::InvalidConfig(format!("{} not set", app_id_var)))?;
             let app_secret = env::var(app_secret_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", app_secret_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", app_secret_var))
             })?;
             let wallet_id = env::var(wallet_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", wallet_id_var))
+                SignerConfigError::InvalidConfig(format!("{} not set", wallet_id_var))
             })?;
 
-            // Block on async initialization
-            tokio::runtime::Handle::current()
-                .block_on(Signer::from_privy(app_id, app_secret, wallet_id))?
+            initialize_remote_signer(Signer::from_privy(app_id, app_secret, wallet_id, None))?
+        }
+        SignerType::GcpKms => {
+            let config = gcp_kms_config(role)?;
+            initialize_remote_signer(Signer::from_gcp_kms(config.key_name, config.public_key))?
         }
     };
 
@@ -251,6 +334,10 @@ impl SignerUtil {
 }
 
 #[cfg(test)]
+#[path = "signer_util_gcp_kms_tests.rs"]
+mod gcp_kms_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     // serial_test ensures env-var-mutating tests run sequentially; cargo test
@@ -258,8 +345,8 @@ mod tests {
     // environment variables (set_var / remove_var).
     use serial_test::serial;
 
-    /// Only "memory", "vault", "turnkey", and "privy" are valid signer types; any other
-    /// string — including an empty one — must return an InvalidPrivateKey error.
+    /// Only "memory", "vault", "turnkey", "privy", and "gcp_kms" are valid signer types; any other
+    /// string — including an empty one — must return a configuration error.
     #[test]
     fn signer_type_from_str_unknown_errors() {
         let err = SignerType::from_str("unknown").unwrap_err();
