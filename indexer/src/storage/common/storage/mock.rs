@@ -216,79 +216,24 @@ impl MockStorage {
     ) -> Result<Vec<DbTransaction>, StorageError> {
         let mut pending = self.pending_transactions.lock().unwrap();
 
-        // Withdrawals: mirror the Postgres frontier dequeue. Return Pending
-        // withdrawals in nonce order, only those below the lowest active
-        // (non-Pending) nonce, and mark them Processing in place (kept in the
-        // store so they act as the barrier on the next call).
-        if matches!(transaction_type, TransactionType::Withdrawal) {
-            let barrier = pending
-                .iter()
-                .filter(|t| {
-                    t.transaction_type == TransactionType::Withdrawal
-                        && matches!(
-                            t.status,
-                            TransactionStatus::Processing
-                                | TransactionStatus::Parked
-                                | TransactionStatus::PendingRemint
-                                | TransactionStatus::ManualReview
-                        )
-                })
-                .filter_map(|t| t.withdrawal_nonce)
-                .min();
+        // Mirror the Postgres dequeue: Pending rows of this type in created_at
+        // order, with no nonce frontier. Locked rows stay in the store as
+        // Processing so a later claim's CAS can find them, and are handed back
+        // carrying the post-lock token the RETURNING clause supplies.
+        let mut order: Vec<usize> = (0..pending.len())
+            .filter(|&i| {
+                pending[i].transaction_type == transaction_type
+                    && pending[i].status == TransactionStatus::Pending
+            })
+            .collect();
+        order.sort_by_key(|&i| pending[i].created_at);
+        order.truncate(limit.max(0) as usize);
 
-            // Numbered nonces below the frontier, in nonce order.
-            let mut numbered: Vec<(i64, i64)> = pending
-                .iter()
-                .filter(|t| {
-                    t.transaction_type == TransactionType::Withdrawal
-                        && t.status == TransactionStatus::Pending
-                })
-                .filter_map(|t| t.withdrawal_nonce.map(|nonce| (nonce, t.id)))
-                .filter(|(nonce, _)| barrier.is_none_or(|b| *nonce < b))
-                .collect();
-            numbered.sort_by_key(|(nonce, _)| *nonce);
-
-            // NULL-nonce rows are poison; the frontier doesn't apply. Dequeue them
-            // (sorted last, mirroring SQL ORDER BY ... ASC) so the processor can
-            // quarantine them.
-            let null_nonce_ids = pending
-                .iter()
-                .filter(|t| {
-                    t.transaction_type == TransactionType::Withdrawal
-                        && t.status == TransactionStatus::Pending
-                        && t.withdrawal_nonce.is_none()
-                })
-                .map(|t| t.id);
-
-            let mut ids: Vec<i64> = numbered.into_iter().map(|(_, id)| id).collect();
-            ids.extend(null_nonce_ids);
-            ids.truncate(limit.max(0) as usize);
-
-            let mut matched = Vec::new();
-            for id in ids {
-                if let Some(txn) = pending.iter_mut().find(|t| t.id == id) {
-                    txn.status = TransactionStatus::Processing;
-                    // Hand back the post-lock token, as the RETURNING does.
-                    txn.updated_at = Utc::now();
-                    matched.push(txn.clone());
-                }
-            }
-            return Ok(matched);
-        }
-
-        // Deposits: FIFO by insertion order. Mirror Postgres: lock only Pending
-        // rows, flip them to Processing in place (keep them in the store so a
-        // later claim's CAS can find the row), and hand back the post-lock token.
         let mut matched = Vec::new();
-        for txn in pending.iter_mut() {
-            if txn.transaction_type == transaction_type
-                && txn.status == TransactionStatus::Pending
-                && (matched.len() as i64) < limit
-            {
-                txn.status = TransactionStatus::Processing;
-                txn.updated_at = Utc::now();
-                matched.push(txn.clone());
-            }
+        for i in order {
+            pending[i].status = TransactionStatus::Processing;
+            pending[i].updated_at = Utc::now();
+            matched.push(pending[i].clone());
         }
         Ok(matched)
     }
@@ -695,6 +640,7 @@ impl MockStorage {
             row.remint_signatures = Some(remint_signatures.clone());
             row.remint_last_valid_block_heights = Some(remint_last_valid_block_heights.clone());
             row.pending_remint_deadline_at = Some(deadline_at);
+            row.release_refused_on_chain = release_refused_on_chain;
             row.updated_at = Utc::now();
 
             // Keep the rehydration list in step, so `get_pending_remint_transactions`
@@ -714,18 +660,6 @@ impl MockStorage {
             deadline_at,
             release_refused_on_chain,
         ));
-        // Mirror the single-row Postgres write. A seeded row for this id is the
-        // one recovery reads back later, so the refusal has to land on it here or
-        // the two halves of the mock would disagree about what was persisted.
-        if let Some(row) = self
-            .pending_remint_transactions
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .find(|t| t.id == transaction_id)
-        {
-            row.release_refused_on_chain = release_refused_on_chain;
-        }
         Ok(())
     }
 

@@ -880,6 +880,82 @@ mod tests {
         );
     }
 
+    /// The resolved dequeue has no nonce frontier and orders by `created_at`.
+    /// Seeded so nonce order and insertion order disagree, the mock must follow
+    /// `created_at` and must not let the quarantined lower nonce withhold anything.
+    #[tokio::test]
+    async fn get_and_lock_withdrawals_ignores_lower_active_nonces_and_orders_by_created_at() {
+        let (storage, mock) = make_mock_storage();
+        let base = Utc::now();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            for (id, nonce, status, age_secs) in [
+                (1_i64, 5_i64, TransactionStatus::ManualReview, 0_i64),
+                (2, 7, TransactionStatus::Pending, 1),
+                (3, 6, TransactionStatus::Pending, 2),
+            ] {
+                let mut txn = make_db_transaction();
+                txn.id = id;
+                txn.transaction_type = TransactionType::Withdrawal;
+                txn.status = status;
+                txn.withdrawal_nonce = Some(nonce);
+                txn.created_at = base + chrono::Duration::seconds(age_secs);
+                pending.push(txn);
+            }
+        }
+
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = locked.iter().map(|txn| txn.id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "both Pending withdrawals above the quarantined nonce are dequeued, oldest first"
+        );
+    }
+
+    /// `set_pending_remint` is one row in Postgres, so the refusal flag has to be
+    /// readable through every path, not just the rehydration list.
+    #[tokio::test]
+    async fn set_pending_remint_refusal_is_visible_by_nonce() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            let mut txn = make_db_transaction();
+            txn.id = 42;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Processing;
+            txn.withdrawal_nonce = Some(9);
+            pending.push(txn);
+        }
+
+        storage
+            .set_pending_remint(
+                42,
+                vec!["sig1".to_string()],
+                vec![100],
+                Utc::now() + chrono::Duration::seconds(32),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let by_nonce = storage.get_withdrawal_by_nonce(9).await.unwrap().unwrap();
+        assert!(
+            by_nonce.release_refused_on_chain,
+            "the authoritative row carries the on-chain refusal"
+        );
+
+        let rehydrated = storage.get_pending_remint_transactions().await.unwrap();
+        assert_eq!(rehydrated.len(), 1);
+        assert!(
+            rehydrated[0].release_refused_on_chain,
+            "the rehydration copy still carries it too"
+        );
+    }
+
     // ── claim_and_persist_signature disposition matrix ────────────────
 
     /// Seed one row directly with an explicit type, status and `updated_at` so
