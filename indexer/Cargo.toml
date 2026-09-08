@@ -80,8 +80,6 @@ rustls = { workspace = true, optional = true }
 solana-keychain = { workspace = true }
 
 [dev-dependencies]
-google-cloud-auth = "1.4.0"
-google-cloud-kms-v1 = "1.9.0"
 bigdecimal = "0.4"
 figment = { workspace = true, features = ["test"] }
 tokio = { workspace = true, features = ["test-util"] }

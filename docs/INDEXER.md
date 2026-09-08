@@ -139,34 +139,21 @@ OPERATOR_GCP_KMS_KEY_NAME=projects/PROJECT/locations/us-central1/keyRings/RING/c
 OPERATOR_GCP_KMS_PUBLIC_KEY=BASE58_SOLANA_PUBLIC_KEY
 ```
 
-- The key must have purpose `ASYMMETRIC_SIGN` and algorithm `EC_SIGN_ED25519`.
-  Pin a numeric key version, not a mutable alias. The configured public key must
-  match that version; Keychain verifies each returned signature against it.
-- Credentials come from Google Application Default Credentials (ADC). On GCE or
-  Cloud Run, use the attached runtime service account with `roles/cloudkms.signer`
-  scoped to this key. No exported private key or service-account JSON key is
-  needed. Local development can use ADC with service-account impersonation.
-- `ADMIN_PRIVATE_KEY` and `OPERATOR_PRIVATE_KEY` are unused for KMS signing.
-  Never mount the offline escrow instance administrator key into either operator.
-  `ADMIN_*` here is the **channel admin service identity** (receipt mint authority
-  and fee payer), not `Instance.admin`.
-- Both Compose files intentionally use the `ADMIN_*` signer settings for both
-  runtime roles, preserving their existing shared service identity. Set
-  `ADMIN_SIGNER`, `ADMIN_GCP_KMS_KEY_NAME`, and `ADMIN_GCP_KMS_PUBLIC_KEY` in `.env`;
-  also set `PRIVATE_CHANNEL_ADMIN_KEYS` to this public key. Ensure the container
-  can reach GCP's metadata server and KMS API. Direct binary deployments can
-  configure the two role prefixes independently.
-- Omitting `OPERATOR_SIGNER` still uses the channel admin signer. Explicit but
-  invalid operator configuration now stops startup instead of falling back.
-  KMS authentication/permission failures during signing are returned to the
-  operator's existing retry/error handling; they never select a different key.
-- A new KMS version means a **new Solana address**. Authorize it onchain, update
-  the channel admin allowlist, and fund its fee payer before switching versions.
-  Changing environment variables alone does not rotate existing mint authorities.
-
-Remote signers initialize once during operator startup on the binary's
-multi-thread Tokio runtime. Signing remains asynchronous. GCP-backed live flow
-testing is a separate deployment step; unit tests use a local mock KMS service.
+- Use `ASYMMETRIC_SIGN` / `EC_SIGN_ED25519`, a numeric key version, and its matching
+  Solana public key. Keychain verifies returned signatures against that public key.
+- Credentials use ADC: attach a runtime service account with key-scoped
+  `roles/cloudkms.signer` and allow access to GCP metadata and KMS. No exported
+  private key or service-account JSON key is needed.
+- Compose uses `ADMIN_*` settings for both roles; also set
+  `PRIVATE_CHANNEL_ADMIN_KEYS` to this public key. Direct binary deployments may
+  configure roles independently. Omitted `OPERATOR_SIGNER` uses the admin signer;
+  explicitly invalid configuration fails startup. Signing errors never select a fallback key.
+- `ADMIN_*` is the **channel admin service identity** (receipt mint authority and
+  fee payer), not `Instance.admin`. Never mount the offline escrow administrator.
+  `ADMIN_PRIVATE_KEY` and `OPERATOR_PRIVATE_KEY` are unused with KMS.
+- A new key version means a **new Solana address**. Authorize it onchain, update
+  the channel admin allowlist, and fund it before switching. Environment changes
+  alone do not rotate existing mint authorities.
 
 ### Three-Stage Pipeline
 

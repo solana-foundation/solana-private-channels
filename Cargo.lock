@@ -6956,8 +6956,6 @@ dependencies = [
  "const-crypto",
  "figment",
  "futures 0.3.31",
- "google-cloud-auth",
- "google-cloud-kms-v1",
  "mockito",
  "once_cell",
  "private-channel-core",
