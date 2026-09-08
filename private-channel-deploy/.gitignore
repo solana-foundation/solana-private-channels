@@ -6,9 +6,16 @@ ansible.log
 *.retry
 .ansible/
 
-# Plain-text secrets file — must never be committed. See README "Future
+# Plain-text secrets files — must never be committed. See README "Future
 # improvements" for the SOPS upgrade path that lets this go in git encrypted.
 secrets.yml
+*-secrets.yml
+
+# Per-environment vars files carry host IPs, instance ids and keypair paths for
+# stacks that aren't the reference ones. Only common.yml and dev.yml are tracked.
+vars/*.yml
+!vars/common.yml
+!vars/dev.yml
 
 # Reserved for the SOPS upgrade. Keys must never live in the repo.
 age.key
