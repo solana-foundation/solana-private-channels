@@ -1824,6 +1824,52 @@ async fn test_get_signature_statuses_anonymous_gets_uniform_errors() {
     assert_eq!(entries[0]["status"]["Err"], marker);
 }
 
+/// `getSignatureStatuses` is ungated, so the role check used to be skipped for it
+/// entirely and redaction was decided from the JWT's own claim. A demoted operator
+/// therefore kept raw errors on the one public method that carries them, until the
+/// token expired. The DB is the authority on both methods.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_demoted_operator_loses_raw_errors_on_ungated_status() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    // DB says `user`; only the stale token still claims `operator`.
+    let user_id = insert_user(&pool, "user").await;
+    let stale_operator_token = generate_token(user_id, "operator");
+
+    let backend = start_mock_backend_with_body(signature_status_response()).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(&stale_operator_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [["sig1", "sig2"]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"]["value"].as_array().unwrap();
+    let marker = json!({"InstructionError": [0, "GenericError"]});
+    assert_eq!(
+        entries[0]["err"], entries[1]["err"],
+        "a demoted operator must not tell InsufficientFunds from MintMismatch here either"
+    );
+    assert_eq!(entries[0]["err"], marker);
+    assert_eq!(entries[0]["status"]["Err"], marker);
+}
+
 /// The operator's confirmation handling routes on the exact error, so the
 /// internal listener must hand back what the node said, untouched and with no
 /// token presented.

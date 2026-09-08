@@ -4,8 +4,8 @@ pub mod metrics;
 
 use crate::auth::{
     auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, is_gated, redacts_transaction_errors, redacts_transaction_errors_for,
-    role_check_error_body, verify_bearer, AuthDecision, Role,
+    forbidden_body, is_gated, redacts_transaction_errors_for, role_check_error_body, verify_bearer,
+    AuthDecision, Role,
 };
 use crate::db::get_user_role;
 use clap::Parser;
@@ -756,20 +756,12 @@ impl Gateway {
             _ => return Ok(false),
         };
 
-        // Public methods need neither a token nor a role check, but redaction is a
-        // separate axis: getSignatureStatuses is ungated and still error-bearing.
-        if !is_gated(method) {
-            return Ok(redacts_transaction_errors(
-                auth_header,
-                decoding_key,
-                method,
-            ));
-        }
-
         let mut claims = verify_bearer(auth_header, decoding_key);
 
-        // Re-check an Operator claim against the DB and downgrade to User when
-        // the role was revoked. Fail closed if the DB can't be reached.
+        // Re-check an Operator claim against the DB and downgrade to User when the
+        // role was revoked. This runs before the ungated branch below so redaction
+        // is decided from the confirmed role on every method, not the JWT's claim.
+        let mut role_check_failed = false;
         if let Some(caller) = claims.as_mut() {
             if caller.role == Role::Operator {
                 let confirmed = match Uuid::parse_str(&caller.sub) {
@@ -781,15 +773,29 @@ impl Gateway {
                     Ok(true) => {}                         // still an operator
                     Ok(false) => caller.role = Role::User, // demoted -> effective User
                     Err(_) => {
-                        return Err(self.reject_with_metrics(
-                            method_label,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            role_check_error_body(),
-                            start,
-                        ));
+                        // Unreachable DB: treat as non-operator so redaction fails
+                        // closed, and let the gated branch reject the request.
+                        caller.role = Role::User;
+                        role_check_failed = true;
                     }
                 }
             }
+        }
+
+        // Public methods need neither a token nor a role check, but redaction is a
+        // separate axis: getSignatureStatuses is ungated and still error-bearing.
+        // A public method stays available when the auth DB is down; it just redacts.
+        if !is_gated(method) {
+            return Ok(redacts_transaction_errors_for(claims.as_ref(), method));
+        }
+
+        if role_check_failed {
+            return Err(self.reject_with_metrics(
+                method_label,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                role_check_error_body(),
+                start,
+            ));
         }
 
         let decision = check_request_auth(claims.as_ref(), method, params);
