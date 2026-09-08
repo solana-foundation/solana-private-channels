@@ -4,8 +4,8 @@ pub mod metrics;
 
 use crate::auth::{
     auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, is_gated, redacts_transaction_errors, role_check_error_body, verify_bearer,
-    AuthDecision, Role,
+    forbidden_body, is_gated, redacts_transaction_errors, redacts_transaction_errors_for,
+    role_check_error_body, verify_bearer, AuthDecision, Role,
 };
 use crate::db::get_user_role;
 use clap::Parser;
@@ -795,7 +795,7 @@ impl Gateway {
         let decision = check_request_auth(claims.as_ref(), method, params);
         // Independent of the decision: authorizing the request says nothing
         // about whether the caller may see why execution failed.
-        let redact = redacts_transaction_errors(auth_header, decoding_key, method);
+        let redact = redacts_transaction_errors_for(claims.as_ref(), method);
 
         let (status, body) = match decision {
             AuthDecision::Proceed => return Ok(redact),

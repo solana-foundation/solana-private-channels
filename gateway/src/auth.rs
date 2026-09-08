@@ -112,13 +112,18 @@ pub fn redacts_transaction_errors(
     decoding_key: &DecodingKey,
     method: &str,
 ) -> bool {
+    redacts_transaction_errors_for(verify_bearer(auth_header, decoding_key).as_ref(), method)
+}
+
+/// Same rule, decided from claims already resolved against the auth DB. Gated
+/// methods must use this form so a demoted operator loses the raw diagnostics
+/// at the same moment it loses access, not when its token expires.
+pub fn redacts_transaction_errors_for(claims: Option<&Claims>, method: &str) -> bool {
     if !ERROR_BEARING_METHODS.contains(&method) {
         return false;
     }
 
-    let role = verify_bearer(auth_header, decoding_key).map(|claims| claims.role);
-
-    role != Some(Role::Operator)
+    claims.map(|c| &c.role) != Some(&Role::Operator)
 }
 
 // ---------------------------------------------------------------------------

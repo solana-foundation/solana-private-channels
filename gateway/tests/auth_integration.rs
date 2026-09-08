@@ -1732,6 +1732,57 @@ async fn test_get_signatures_for_address_operator_keeps_raw_errors() {
     );
 }
 
+/// Redaction follows the DB-resolved role, not the token. A demoted operator is
+/// authorized as a User, so it must also lose the raw diagnostics at that moment
+/// rather than when its 24h token expires.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_demoted_operator_loses_raw_errors() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+
+    // DB says `user` and the wallet is theirs, so the request is authorized;
+    // only the stale token still claims `operator`.
+    let pubkey = "So11111111111111111111111111111111111111112";
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, pubkey).await;
+    let stale_operator_token = generate_token(user_id, "operator");
+
+    // First reply clears the ownership fetch, second is the proxied page.
+    let backend =
+        start_mock_backend_with_sequence(vec![system_account_response(), history_response()]).await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(&stale_operator_token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [pubkey]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let entries = body["result"].as_array().unwrap();
+    assert_eq!(
+        entries[0]["err"], entries[1]["err"],
+        "a demoted operator must not tell InsufficientFunds from MintMismatch"
+    );
+    assert_eq!(
+        entries[0]["err"],
+        json!({"InstructionError": [0, "GenericError"]})
+    );
+}
+
 /// `getSignatureStatuses` needs no token at all, and the attacker holds the
 /// signature of the probe they submitted, so an anonymous caller must get the
 /// same collapsed error a User does. Otherwise the history redaction is just a
