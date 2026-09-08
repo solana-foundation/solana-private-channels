@@ -756,7 +756,17 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
 
-    wait_for_any_transaction_status(&pool, &mint_fail_sig, &["failed"], *WAIT_TIMEOUT_SECS).await?;
+    // A write-ahead-persisted mint is never terminalized in the sender: the send
+    // error leaves the row Processing for recovery to reconcile against the
+    // persisted signature, so it journals its signature and never reaches Failed.
+    wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
+    let mint_row = db::get_transaction(&pool, &mint_fail_sig)
+        .await?
+        .expect("the deposit row must exist");
+    assert_eq!(
+        mint_row.status, "processing",
+        "a preflight-failed mint is deferred to recovery, not marked Failed"
+    );
 
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();
