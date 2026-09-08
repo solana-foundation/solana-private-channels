@@ -1718,6 +1718,89 @@ mod tests {
         }
     }
 
+    /// The halt sweep must carry the journalled release signatures onto the
+    /// row, otherwise the reconcile sweep that repairs a landed release can
+    /// never select it and the nonce stays diverged forever.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_mirrors_release_journal() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut txn = make_db_transaction();
+            txn.id = 100;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Processing;
+            txn.withdrawal_nonce = Some(100);
+            txn.remint_signatures = None;
+            txn.remint_last_valid_block_heights = None;
+            db.push(txn);
+        }
+        mock.insert_release_signature(100, "release-sig".to_string(), 4242, None)
+            .await
+            .unwrap();
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        {
+            let rows = mock.pending_transactions.lock().unwrap();
+            let row = rows.iter().find(|t| t.id == 100).expect("row present");
+            assert_eq!(row.status, TransactionStatus::ManualReview);
+            assert_eq!(
+                row.remint_signatures.as_deref(),
+                Some(["release-sig".to_string()].as_slice())
+            );
+            assert_eq!(
+                row.remint_last_valid_block_heights.as_deref(),
+                Some([4242i64].as_slice())
+            );
+        }
+
+        let stalled = mock
+            .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(stalled.len(), 1, "quarantined row must stay reconcilable");
+        assert_eq!(stalled[0].id, 100);
+    }
+
+    /// An empty journal leaves the columns alone, mirroring the SQL COALESCE:
+    /// a row quarantined before anything was broadcast keeps its NULLs.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_keeps_existing_signatures_when_journal_empty() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut txn = make_db_transaction();
+            txn.id = 7;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Processing;
+            txn.withdrawal_nonce = Some(7);
+            txn.remint_signatures = Some(vec!["kept".to_string()]);
+            txn.remint_last_valid_block_heights = Some(vec![9]);
+            db.push(txn);
+        }
+
+        storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        let row = rows.iter().find(|t| t.id == 7).expect("row present");
+        assert_eq!(
+            row.remint_signatures.as_deref(),
+            Some(["kept".to_string()].as_slice())
+        );
+        assert_eq!(
+            row.remint_last_valid_block_heights.as_deref(),
+            Some([9i64].as_slice())
+        );
+    }
+
     // ── insert_mint_statuses_batch ────────────────────────────────────
 
     #[tokio::test]

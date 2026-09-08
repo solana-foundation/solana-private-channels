@@ -790,6 +790,9 @@ impl MockStorage {
         min_nonce: Option<i64>,
     ) -> Result<u64, StorageError> {
         self.check_should_fail("quarantine_active_withdrawals")?;
+        // Snapshot the journal before taking the row lock so the two guards are
+        // never held at once.
+        let journal = self.release_signatures.lock().unwrap().clone();
         let mut pending = self.pending_transactions.lock().unwrap();
         let mut affected = 0u64;
         for txn in pending.iter_mut() {
@@ -811,6 +814,16 @@ impl MockStorage {
                 && above_floor
             {
                 txn.status = TransactionStatus::ManualReview;
+                // Mirror the SQL COALESCE: journalled release signatures are
+                // carried onto the row so the reconcile sweep can still see it.
+                if let Some(stored) = journal.get(&txn.id).filter(|s| !s.is_empty()) {
+                    let (sigs, heights): (Vec<String>, Vec<i64>) = stored
+                        .iter()
+                        .map(|e| (e.signature.clone(), e.last_valid_block_height))
+                        .unzip();
+                    txn.remint_signatures = Some(sigs);
+                    txn.remint_last_valid_block_heights = Some(heights);
+                }
                 affected += 1;
             }
         }

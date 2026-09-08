@@ -2452,6 +2452,10 @@ impl PostgresDb {
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
     ///
+    /// Journalled release signatures are copied onto the row in the same
+    /// UPDATE. The journal is GC'd once the row leaves `Processing`, and the
+    /// reconcile sweep only fetches rows carrying those columns.
+    ///
     /// Scope is intentionally DB-wide over `transaction_type = 'withdrawal'`
     /// to match the fetcher's own scope. The data model assumes a single
     /// withdrawal operator per database; multi-instance isolation would
@@ -2472,7 +2476,20 @@ impl PostgresDb {
         let result = sqlx::query(
             r#"
             UPDATE transactions
-            SET status = 'manual_review', updated_at = NOW()
+            SET status = 'manual_review',
+                updated_at = NOW(),
+                remint_signatures = COALESCE(
+                    (SELECT array_agg(p.signature ORDER BY p.id)
+                     FROM pending_release_signatures p
+                     WHERE p.transaction_id = transactions.id),
+                    remint_signatures
+                ),
+                remint_last_valid_block_heights = COALESCE(
+                    (SELECT array_agg(p.last_valid_block_height ORDER BY p.id)
+                     FROM pending_release_signatures p
+                     WHERE p.transaction_id = transactions.id),
+                    remint_last_valid_block_heights
+                )
             WHERE transaction_type = 'withdrawal'
               AND status IN ('pending', 'processing', 'parked')
               AND ($1::BIGINT IS NULL OR id <> $1)
