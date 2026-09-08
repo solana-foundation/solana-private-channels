@@ -2058,6 +2058,10 @@ pub(super) async fn route_poll_results(
     for (mut tx, status_opt) in results {
         match status_opt {
             Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
+                // Free this finalized tx's in-flight slot now so a continuation (the JIT
+                // mint retry) can reuse it instead of being refused when in-flight is full.
+                drop(tx.permit);
+
                 let result = if let Some(err) = &status.err {
                     let mut extra_result = None;
                     if let ExtraErrorCheckPolicy::Extra(ref checks) = tx.extra_error_checks_policy {
@@ -4391,6 +4395,79 @@ mod tests {
         .await;
 
         send.assert();
+    }
+
+    /// The confirmed arm must release the finalized entry's in-flight slot before the
+    /// JIT retry asks for one. With the semaphore saturated the retry would otherwise
+    /// be refused against this very entry's own permit and never re-mint.
+    #[tokio::test]
+    async fn jit_mint_retry_reuses_slot_of_finalized_entry_when_saturated() {
+        ensure_test_signer();
+        let txn_id = 23;
+        let mut server = mockito::Server::new_async().await;
+        let _account = mock_initialized_mint(&mut server, SignerUtil::admin_signer().pubkey());
+        let _hash = mock_blockhash(&mut server);
+        let _send = mock_send_ok(&mut server);
+
+        let mock = MockStorage::new();
+        push_processing_deposit_row(&mock, txn_id);
+        let lease = row_updated_at(&mock, txn_id).expect("seeded row present");
+        let mut state = sender_state_with_storage(&server.url(), mock);
+
+        let mut builder = MintToBuilder::new();
+        builder.mint(Pubkey::new_unique());
+        state.mint_builders.insert(txn_id, builder);
+
+        // Every slot but this entry's is held by other in-flight work.
+        let _others: Vec<_> = (0..MAX_IN_FLIGHT - 1)
+            .map(|_| state.semaphore.clone().try_acquire_owned().unwrap())
+            .collect();
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        assert_eq!(state.semaphore.available_permits(), 0);
+
+        let tx = InFlightTx {
+            signature: Signature::new_unique(),
+            ctx: TransactionContext {
+                kind: TransactionKind::Mint,
+                transaction_id: Some(txn_id),
+                withdrawal_nonce: None,
+                trace_id: None,
+                deposit_claim_lease: Some(lease),
+            },
+            instruction: dummy_instruction(),
+            compute_unit_price: None,
+            retry_policy: RetryPolicy::None,
+            extra_error_checks_policy: mint_extra_error_checks_policy(),
+            poll_attempts: 0,
+            resend_count: 0,
+            persisted: true,
+            permit,
+        };
+
+        let err = solana_sdk::transaction::TransactionError::InstructionError(
+            0,
+            solana_sdk::instruction::InstructionError::UninitializedAccount,
+        );
+        let status = solana_transaction_status::TransactionStatus {
+            slot: 100,
+            confirmations: None,
+            status: Err(err.clone()),
+            err: Some(err),
+            confirmation_status: Some(
+                solana_transaction_status::TransactionConfirmationStatus::Finalized,
+            ),
+        };
+
+        route_poll_results(&mut state, vec![(tx, Some(status))], &mpsc::channel(10).0).await;
+
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert_eq!(
+            mock.get_release_signatures(txn_id).await.unwrap().len(),
+            1,
+            "the JIT retry must take the slot the finalized entry gave back and broadcast"
+        );
     }
 
     /// `MintNotInitialized` with no transaction_id means there is nothing to report to storage;
