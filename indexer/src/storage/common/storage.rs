@@ -2094,7 +2094,17 @@ mod tests {
             let mut no_heights = stalled(7, Some(vec!["sig-e".to_string()]));
             no_heights.remint_last_valid_block_heights = None;
             db.push(no_heights);
+
+            // Refund already landed, and refund already claimed: promoting
+            // either on release evidence would pay the nonce twice.
+            let mut landed_refund = stalled(8, Some(vec!["sig-f".to_string()]));
+            landed_refund.landed_remint_signature = Some("sig-refund".to_string());
+            db.push(landed_refund);
+            db.push(stalled(9, Some(vec!["sig-g".to_string()])));
         }
+        mock.claim_remint_attempt(9, "sig-claim".to_string(), 0, None, &[])
+            .await
+            .unwrap();
 
         let found = storage
             .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)

@@ -1843,6 +1843,10 @@ impl PostgresDb {
     /// are index-paired, and they arrived in separate migrations, so a row can
     /// legitimately carry signatures with no heights; that is unclassifiable too.
     ///
+    /// A row whose refund was already claimed or landed is excluded as well:
+    /// completing it on release evidence alone would pay the nonce twice and
+    /// then let the GC drop the claim. The bitmap check adjudicates those.
+    ///
     /// Paging is keyed on `id` rather than offset by `updated_at`. A row that
     /// does not classify is left untouched by design, so its `updated_at` never
     /// moves; ordering on it would return the same blocked rows on every sweep
@@ -1866,6 +1870,11 @@ impl PostgresDb {
               AND {} IS NOT NULL
               AND array_length({}, 1) > 0
               AND {} IS NOT NULL
+              AND {} IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_remint_signatures p
+                  WHERE p.transaction_id = transactions.{}
+              )
               AND {} > $2
             ORDER BY {} ASC
             LIMIT $3
@@ -1902,6 +1911,9 @@ impl PostgresDb {
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_SIGNATURES,
             transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            // Refund interlock
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::ID,
             // Keyset cursor
             transaction_cols::ID,
             // Ordering must match the cursor so paging cannot repeat or skip

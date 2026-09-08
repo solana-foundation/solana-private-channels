@@ -1006,7 +1006,8 @@ impl MockStorage {
     /// Mirror `get_stalled_withdrawals_with_signatures_internal`, including the
     /// evidence predicates: a missing nonce, an absent/empty signature array, or
     /// a missing heights array makes the row unclassifiable, so it is not
-    /// returned.
+    /// returned. A row whose refund was already claimed or landed is excluded
+    /// too, so a release promotion cannot pay the nonce a second time.
     pub async fn get_stalled_withdrawals_with_signatures(
         &self,
         status: TransactionStatus,
@@ -1014,6 +1015,7 @@ impl MockStorage {
         limit: i64,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stalled_withdrawals_with_signatures")?;
+        let claimed = self.remint_signatures.lock().unwrap();
         let pending = self.pending_transactions.lock().unwrap();
         let mut matched: Vec<DbTransaction> = pending
             .iter()
@@ -1021,6 +1023,8 @@ impl MockStorage {
             .filter(|t| t.withdrawal_nonce.is_some())
             .filter(|t| t.remint_signatures.as_ref().is_some_and(|s| !s.is_empty()))
             .filter(|t| t.remint_last_valid_block_heights.is_some())
+            .filter(|t| t.landed_remint_signature.is_none())
+            .filter(|t| claimed.get(&t.id).is_none_or(|sigs| sigs.is_empty()))
             .filter(|t| t.id > after_id)
             .cloned()
             .collect();
@@ -1349,14 +1353,22 @@ impl MockStorage {
         self.check_should_fail("gc_stale_remint_signatures")?;
         // Mirror the Postgres predicate: keep sigs whose parent is still
         // `PendingRemint`; an unknown transaction id counts as non-pending.
-        let pending_remint_ids: std::collections::HashSet<i64> = self
-            .pending_remint_transactions
-            .lock()
-            .unwrap()
+        // The SQL reads one table, so the live mirror wins over the rehydration
+        // list for any row that appears in both.
+        let live = self.pending_transactions.lock().unwrap();
+        let rehydrate = self.pending_remint_transactions.lock().unwrap();
+        let pending_remint_ids: std::collections::HashSet<i64> = live
             .iter()
+            .chain(
+                rehydrate
+                    .iter()
+                    .filter(|t| !live.iter().any(|l| l.id == t.id)),
+            )
             .filter(|t| t.status == TransactionStatus::PendingRemint)
             .map(|t| t.id)
             .collect();
+        drop(live);
+        drop(rehydrate);
         let mut map = self.remint_signatures.lock().unwrap();
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {

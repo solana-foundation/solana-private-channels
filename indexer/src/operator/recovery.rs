@@ -2215,6 +2215,57 @@ mod tests {
         );
     }
 
+    /// A refund the previous process already claimed and broadcast blocks the
+    /// promotion: paying the release too would double-pay the nonce. The claim
+    /// must also outlive the next GC tick, since it is the only evidence left.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_landed_leaves_a_row_with_an_outstanding_remint_claim() {
+        let landed_sig = Signature::new_unique().to_string();
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+
+        let mock = MockStorage::new();
+        let row = stalled_withdrawal(
+            1,
+            TransactionStatus::PendingRemint,
+            std::slice::from_ref(&landed_sig),
+        );
+        mock.pending_transactions.lock().unwrap().push(row.clone());
+        mock.pending_remint_transactions.lock().unwrap().push(row);
+        assert!(
+            mock.claim_remint_attempt(1, Signature::new_unique().to_string(), 100, None, &[])
+                .await
+                .unwrap(),
+            "the previous process owns the refund claim"
+        );
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &RecoveryFinality::new(&client, None),
+            TransactionStatus::PendingRemint,
+            RECONCILE_SWEEP_BUDGET,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::PendingRemint,
+            "a claimed refund must not be promoted on release evidence alone"
+        );
+        storage.gc_stale_remint_signatures().await.unwrap();
+        assert_eq!(
+            mock.get_remint_signatures(1).await.unwrap().len(),
+            1,
+            "the claim record must survive for the bitmap check to adjudicate"
+        );
+    }
+
     /// Seed one stalled row, serve `setup`'s RPC shape, and assert nothing moved.
     async fn assert_not_promoted(
         label: &str,
