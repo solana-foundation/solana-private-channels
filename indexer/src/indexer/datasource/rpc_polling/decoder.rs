@@ -36,6 +36,41 @@ pub struct UndecodableInstruction {
     pub source: ParserError,
 }
 
+/// Why a fetched block cannot be turned into rows. Both variants mean the slot's contents
+/// are unknown, so no caller may complete the slot; they differ in which endpoint problem
+/// an operator has to chase, which is why they keep separate metric labels.
+#[derive(Debug)]
+pub enum SlotRejection {
+    /// A transaction carries no `meta`, so it cannot be proven successful or in scope.
+    MissingMeta { signature: String },
+    /// An instruction the indexer supports would not decode.
+    Undecodable(UndecodableInstruction),
+}
+
+impl SlotRejection {
+    /// Label for `INDEXER_RPC_ERRORS`, kept distinct because each condition has its own
+    /// alert and runbook.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::MissingMeta { .. } => "missing_meta",
+            Self::Undecodable(_) => "parse_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for SlotRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingMeta { signature } => write!(f, "transaction {signature} is missing meta"),
+            Self::Undecodable(failure) => write!(
+                f,
+                "transaction {} instruction {} (inner {:?}) will not decode: {}",
+                failure.signature, failure.instruction_index, failure.inner_index, failure.source
+            ),
+        }
+    }
+}
+
 /// Returns a label for the first `meta`-less
 /// transaction in `block`, or `None` if all carry metadata; a single `meta: null`
 /// tx makes the slot unverifiable, so callers MUST fail closed on `Some(_)`.
@@ -110,6 +145,22 @@ pub fn parse_block(
         })
         .collect()),
     }
+}
+
+/// Decode a whole slot, or reject it. Applies both guards in order, so a block re-fetched
+/// from another endpoint is judged exactly as the first one was: a fallback can only be
+/// accepted if it actually yields rows, never merely because its meta is present.
+pub fn decode_slot(
+    block: &RpcBlock,
+    slot: u64,
+    program_type: ProgramType,
+    escrow_instance_id: Option<&Pubkey>,
+) -> Result<Vec<InstructionWithMetadata>, SlotRejection> {
+    if let Some(signature) = first_missing_meta(block) {
+        return Err(SlotRejection::MissingMeta { signature });
+    }
+
+    parse_block(block, slot, program_type, escrow_instance_id).map_err(SlotRejection::Undecodable)
 }
 
 /// First byte (Anchor-style discriminator) of an instruction's base58 data, or `None` if empty/undecodable.

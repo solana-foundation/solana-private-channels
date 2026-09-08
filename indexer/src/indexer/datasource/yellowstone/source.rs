@@ -48,6 +48,8 @@ pub struct YellowstoneSource {
     #[cfg(feature = "datasource-rpc")]
     rpc_poller: Option<Arc<RpcPoller>>,
     #[cfg(feature = "datasource-rpc")]
+    fallback_rpc_poller: Option<Arc<RpcPoller>>,
+    #[cfg(feature = "datasource-rpc")]
     max_gap_slots: u64,
     #[cfg(feature = "datasource-rpc")]
     batch_size: usize,
@@ -78,6 +80,8 @@ impl YellowstoneSource {
             #[cfg(feature = "datasource-rpc")]
             rpc_poller: None,
             #[cfg(feature = "datasource-rpc")]
+            fallback_rpc_poller: None,
+            #[cfg(feature = "datasource-rpc")]
             max_gap_slots: 0,
             #[cfg(feature = "datasource-rpc")]
             batch_size: 0,
@@ -105,10 +109,12 @@ impl YellowstoneSource {
     pub fn with_gap_detection(
         mut self,
         rpc_poller: Arc<RpcPoller>,
+        fallback_rpc_poller: Option<Arc<RpcPoller>>,
         max_gap_slots: u64,
         batch_size: usize,
     ) -> Self {
         self.rpc_poller = Some(rpc_poller);
+        self.fallback_rpc_poller = fallback_rpc_poller;
         self.max_gap_slots = max_gap_slots;
         self.batch_size = batch_size;
         self
@@ -172,6 +178,7 @@ async fn fill_reconnect_gap_to<F, Fut>(
     floor: Option<u64>,
     get_checkpoint: F,
     rpc_poller: &RpcPoller,
+    fallback_poller: Option<&RpcPoller>,
     max_gap_slots: u64,
     batch_size: usize,
     program_type: ProgramType,
@@ -271,6 +278,7 @@ where
 
         match fill_slot_range(
             rpc_poller,
+            fallback_poller,
             replay_anchor,
             target,
             batch_size,
@@ -304,6 +312,9 @@ where
 #[cfg(feature = "datasource-rpc")]
 struct ReconnectGapCtx {
     poller: Arc<RpcPoller>,
+    /// Re-fetches a slot the primary served in an unusable state. `None` disables the
+    /// failover, leaving the fill to hold the checkpoint until an operator repoints it.
+    fallback_poller: Option<Arc<RpcPoller>>,
     storage: Arc<Storage>,
     max_gap_slots: u64,
     batch_size: usize,
@@ -380,6 +391,7 @@ async fn arm_reconnect_gap(
     }
 
     let poller = ctx.poller.clone();
+    let fallback_poller = ctx.fallback_poller.clone();
     let storage = ctx.storage.clone();
     let program_type = ctx.program_type;
     let escrow_instance_id = ctx.escrow_instance_id;
@@ -394,6 +406,7 @@ async fn arm_reconnect_gap(
             floor_slot,
             || get_last_checkpoint(&storage, program_type),
             &poller,
+            fallback_poller.as_deref(),
             max_gap_slots,
             batch_size,
             program_type,
@@ -469,6 +482,8 @@ impl DataSource for YellowstoneSource {
         #[cfg(feature = "datasource-rpc")]
         let rpc_poller = self.rpc_poller.clone();
         #[cfg(feature = "datasource-rpc")]
+        let fallback_rpc_poller = self.fallback_rpc_poller.clone();
+        #[cfg(feature = "datasource-rpc")]
         let max_gap_slots = self.max_gap_slots;
         #[cfg(feature = "datasource-rpc")]
         let batch_size = self.batch_size;
@@ -483,6 +498,7 @@ impl DataSource for YellowstoneSource {
             let gap_ctx_opt = match (rpc_poller, storage) {
                 (Some(poller), Some(storage)) => Some(ReconnectGapCtx {
                     poller,
+                    fallback_poller: fallback_rpc_poller,
                     storage,
                     max_gap_slots,
                     batch_size,
@@ -882,6 +898,7 @@ mod tests {
     fn test_gap_ctx(server: &Server, storage: Arc<Storage>, max_gap_slots: u64) -> ReconnectGapCtx {
         ReconnectGapCtx {
             poller: Arc::new(test_poller(server)),
+            fallback_poller: None,
             storage,
             max_gap_slots,
             batch_size: 10,
@@ -910,6 +927,7 @@ mod tests {
             None,
             checkpoint_ok(100),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -948,6 +966,7 @@ mod tests {
             None,
             checkpoint_ok(100),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -987,6 +1006,7 @@ mod tests {
                 None,
                 checkpoint_absent(),
                 &poller,
+                None,
                 1000,
                 10,
                 ProgramType::Escrow,
@@ -1038,6 +1058,7 @@ mod tests {
             None,
             checkpoint_ok(0),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -1090,6 +1111,7 @@ mod tests {
             None,
             get_checkpoint,
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -1144,6 +1166,7 @@ mod tests {
                 None,
                 checkpoint_ok(100),
                 &poller,
+                None,
                 1000,
                 10,
                 ProgramType::Escrow,
@@ -1208,6 +1231,7 @@ mod tests {
                 None,
                 checkpoint_ok(100),
                 &poller,
+                None,
                 10,
                 10,
                 ProgramType::Escrow,
@@ -1258,6 +1282,7 @@ mod tests {
                 None,
                 get_checkpoint,
                 &poller,
+                None,
                 1000,
                 10,
                 ProgramType::Escrow,
@@ -1432,6 +1457,7 @@ mod tests {
                     Some(100),
                     checkpoint_shared(checkpoint),
                     &poller,
+                    None,
                     10,
                     10,
                     ProgramType::Escrow,
@@ -1500,6 +1526,7 @@ mod tests {
             Some(100),
             checkpoint_ok(10),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,

@@ -774,6 +774,15 @@ pub async fn run(
                     commitment,
                 ));
 
+                // The gap-fill is this datasource's only way back to a slot the stream
+                // failed closed on, and it runs unattended, so it gets the archival
+                // fallback. Empty means unset (env renders an unconfigured var as "").
+                let gap_fallback_poller = common_config
+                    .fallback_rpc_url
+                    .clone()
+                    .filter(|url| !url.trim().is_empty())
+                    .map(|url| Arc::new(RpcPoller::new(url, encoding, commitment)));
+
                 info!(
                     "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
                     indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
@@ -799,6 +808,7 @@ pub async fn run(
                     .with_startup_floor(startup_floor)
                     .with_gap_detection(
                         gap_rpc_poller,
+                        gap_fallback_poller,
                         indexer_config.backfill.max_gap_slots,
                         indexer_config.backfill.batch_size,
                     )

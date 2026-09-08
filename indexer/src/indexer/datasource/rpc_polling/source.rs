@@ -1,5 +1,5 @@
 use super::rpc::RpcPoller;
-use super::types::{BlockFetch, RpcBlock};
+use super::types::BlockFetch;
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::{DataSourceError, DataSourceRpcError};
@@ -13,7 +13,7 @@ use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct RpcPollingSource {
     rpc_url: String,
@@ -68,27 +68,42 @@ impl RpcPollingSource {
     }
 }
 
-/// Re-fetches `slot` once from the fallback RPC, returning the block only if it now
-/// passes the missing-meta guard AND its blockhash matches `expected_blockhash` (the
+/// Re-fetches `slot` once from the fallback RPC, returning its decoded instructions only
+/// if the block now decodes in full AND its blockhash matches `expected_blockhash` (the
 /// primary's). The blockhash check prevents a misconfigured (wrong-cluster, pruned) or
 /// compromised fallback from substituting a divergent-fork or fabricated block for the
-/// same slot number. Any error, absent slot, hash mismatch, or still-missing meta yields None.
+/// same slot number. It does not stand in the way of a legitimate recovery: a blockhash
+/// covers the block's contents, not how much metadata an endpoint chose to serialize, so a
+/// fuller copy of the same block still matches. Any error, absent slot, hash mismatch, or
+/// repeated rejection yields None.
+/// Decoding (not just the meta guard) is what qualifies the block, so a fallback serving
+/// the same undecodable instruction is rejected here rather than accepted and failed later.
 /// Uses the single-block entry point, not the batch classifier: one arbitrary slot has
 /// no anchor to prove absence from, and this caller only ever wanted contents or nothing.
-async fn refetch_missing_meta_via_fallback(
+pub(crate) async fn refetch_slot_via_fallback(
     fallback: &RpcPoller,
     slot: u64,
     expected_blockhash: &str,
-) -> Option<RpcBlock> {
-    match fallback.get_block_present(slot).await {
-        Ok(Some(block))
-            if block.blockhash == expected_blockhash
-                && decoder::first_missing_meta(&block).is_none() =>
-        {
-            Some(block)
+    program_type: ProgramType,
+    escrow_instance_id: Option<&solana_sdk::pubkey::Pubkey>,
+) -> Option<Vec<InstructionWithMetadata>> {
+    let block = match fallback.get_block_present(slot).await {
+        Ok(Some(block)) if block.blockhash == expected_blockhash => block,
+        // A different hash for the same slot means the fallback is on another cluster or a
+        // divergent fork, so it can never substitute. Said out loud because the rejection
+        // is otherwise invisible: a misconfigured fallback looks exactly like a correctly
+        // configured one that happens never to help.
+        Ok(Some(block)) => {
+            warn!(
+                "Fallback RPC served slot {} as blockhash {} but the primary served {}; rejecting it (wrong cluster or divergent fork)",
+                slot, block.blockhash, expected_blockhash
+            );
+            return None;
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+
+    decoder::decode_slot(&block, slot, program_type, escrow_instance_id).ok()
 }
 
 #[async_trait]
@@ -177,39 +192,49 @@ impl DataSource for RpcPollingSource {
                 for (slot, block_result) in blocks {
                     match block_result {
                         Ok(BlockFetch::Present(block)) => {
-                            // A missing-meta block is unverifiable: try one fallback re-fetch, and if that
-                            // is unavailable or also incomplete, fail closed (no SlotComplete, no advance).
-                            let block = match decoder::first_missing_meta(&block) {
-                                None => block,
-                                Some(signature) => {
+                            // A block with incomplete meta, or holding a supported instruction
+                            // that will not decode, leaves the slot's contents unknown. Try
+                            // one fallback re-fetch; if that is unconfigured, unavailable or
+                            // also rejected, fail closed like an unavailable block: no
+                            // SlotComplete, no advance, re-fetch on the next poll.
+                            let instructions_with_meta = match decoder::decode_slot(
+                                &block,
+                                slot,
+                                program_type,
+                                escrow_instance_id.as_ref(),
+                            ) {
+                                Ok(instructions) => instructions,
+                                Err(rejection) => {
                                     let recovered = match &fallback_poller {
-                                        Some(fb) => {
-                                            refetch_missing_meta_via_fallback(
-                                                fb,
+                                        Some(fallback) => {
+                                            refetch_slot_via_fallback(
+                                                fallback,
                                                 slot,
                                                 &block.blockhash,
+                                                program_type,
+                                                escrow_instance_id.as_ref(),
                                             )
                                             .await
                                         }
                                         None => None,
                                     };
                                     match recovered {
-                                        Some(clean) => {
+                                        Some(instructions) => {
                                             info!(
-                                                "Slot {} recovered from fallback RPC after primary returned transaction {} missing meta",
-                                                slot, signature
+                                                "Slot {} recovered from fallback RPC after primary returned {}",
+                                                slot, rejection
                                             );
-                                            clean
+                                            instructions
                                         }
                                         None => {
                                             error!(
-                                                "Slot {} has transaction {} missing meta; refusing to checkpoint past an incomplete block",
-                                                slot, signature
+                                                "Slot {} {}; refusing to checkpoint past unknown contents",
+                                                slot, rejection
                                             );
                                             metrics::INDEXER_RPC_ERRORS
                                                 .with_label_values(&[
                                                     program_type.as_label(),
-                                                    "missing_meta",
+                                                    rejection.metric_label(),
                                                 ])
                                                 .inc();
                                             tokio::time::sleep(Duration::from_millis(
@@ -219,40 +244,6 @@ impl DataSource for RpcPollingSource {
                                             break;
                                         }
                                     }
-                                }
-                            };
-
-                            // Parse program-specific instructions from block with metadata.
-                            // A supported instruction that will not decode leaves the slot's
-                            // contents unknown, so fail closed exactly like an unavailable
-                            // block: no SlotComplete, no advance, re-fetch on the next poll.
-                            let instructions_with_meta = match decoder::parse_block(
-                                &block,
-                                slot,
-                                program_type,
-                                escrow_instance_id.as_ref(),
-                            ) {
-                                Ok(instructions) => instructions,
-                                Err(failure) => {
-                                    error!(
-                                        "Slot {} transaction {} instruction {} (inner {:?}) will not decode: {}; refusing to checkpoint past unknown contents",
-                                        slot,
-                                        failure.signature,
-                                        failure.instruction_index,
-                                        failure.inner_index,
-                                        failure.source
-                                    );
-                                    metrics::INDEXER_RPC_ERRORS
-                                        .with_label_values(&[
-                                            program_type.as_label(),
-                                            "parse_failed",
-                                        ])
-                                        .inc();
-                                    tokio::time::sleep(Duration::from_millis(
-                                        error_retry_interval_ms,
-                                    ))
-                                    .await;
-                                    break;
                                 }
                             };
 
@@ -1141,6 +1132,175 @@ mod tests {
         assert!(
             !emitted_instruction,
             "a fallback block with a mismatched blockhash must not be indexed"
+        );
+    }
+
+    /// The primary serves an instruction it cannot decode, but the fallback serves the same
+    /// block with a payload that does decode (the case where the primary strips metadata).
+    /// The slot is then indexed, completed, and polling advances.
+    #[tokio::test]
+    async fn undecodable_instruction_recovers_from_fallback() {
+        let mut primary = Server::new_async().await;
+        let mut fallback = Server::new_async().await;
+
+        let _m_slot = mock_get_slot(&mut primary, 103);
+        let _m_enum = mock_get_blocks(&mut primary, 100, 102, &[100, 101, 102]);
+        let _m_primary = mock_get_block_undecodable_withdraw(&mut primary, 100, 1);
+        // Later slots resolve cleanly so the loop can advance past 100.
+        let _m_p101 = mock_get_block_success(&mut primary, 101, 1);
+        let _m_p102 = mock_get_block_success(&mut primary, 102, 1);
+        let m_fallback = mock_get_block_complete_withdraw(&mut fallback, 100, 1);
+
+        let mut source = RpcPollingSource::new(
+            primary.url(),
+            Some(100),
+            10,
+            10,
+            10,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            Some(fallback.url()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        let mut saw_slot_100 = false;
+        let mut saw_instruction = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
+        while tokio::time::Instant::now() < deadline && !(saw_slot_100 && saw_instruction) {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(ProcessorMessage::SlotComplete { slot: 100, .. })) => saw_slot_100 = true,
+                Ok(Some(ProcessorMessage::Instruction(_))) => saw_instruction = true,
+                Ok(Some(_)) => {}
+                _ => {}
+            }
+        }
+        cancel.cancel();
+        let _ = handle.await;
+
+        m_fallback.assert();
+        assert!(
+            saw_slot_100,
+            "SlotComplete{{slot:100}} must be emitted after fallback recovery"
+        );
+        assert!(
+            saw_instruction,
+            "the fallback block's WithdrawFunds must be indexed"
+        );
+    }
+
+    /// Both endpoints serve the same undecodable instruction. The fallback is consulted and
+    /// rejected on decoding, not merely on its meta being present, so the slot fails closed.
+    #[tokio::test]
+    async fn undecodable_instruction_fallback_also_undecodable_fails_closed() {
+        let mut primary = Server::new_async().await;
+        let mut fallback = Server::new_async().await;
+
+        let _m_slot = mock_get_slot(&mut primary, 105);
+        let _m_enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let m_primary = mock_get_block_undecodable_withdraw(&mut primary, 100, 2);
+        let m_fallback = mock_get_block_undecodable_withdraw(&mut fallback, 100, 1);
+
+        let mut source = RpcPollingSource::new(
+            primary.url(),
+            Some(100),
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            Some(fallback.url()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        // Primary re-requested (no advance) and the fallback was consulted.
+        m_primary.assert();
+        m_fallback.assert();
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        let emitted_slot_complete = messages
+            .iter()
+            .any(|message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100));
+        assert!(
+            !emitted_slot_complete,
+            "SlotComplete{{slot:100}} must not be emitted when both endpoints serve an undecodable instruction"
+        );
+    }
+
+    /// The fallback serves a decodable block, but for a different blockhash: a divergent fork
+    /// or wrong cluster. It must be rejected rather than indexed, so the slot fails closed.
+    #[tokio::test]
+    async fn undecodable_instruction_fallback_wrong_blockhash_fails_closed() {
+        let mut primary = Server::new_async().await;
+        let mut fallback = Server::new_async().await;
+
+        let _m_slot = mock_get_slot(&mut primary, 105);
+        let _m_enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let m_primary = mock_get_block_undecodable_withdraw(&mut primary, 100, 2);
+        let m_fallback = mock_get_block_complete_withdraw_with_hash(
+            &mut fallback,
+            100,
+            "DifferentBlockHash2222222222222222222222222",
+            1,
+        );
+
+        let mut source = RpcPollingSource::new(
+            primary.url(),
+            Some(100),
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            Some(fallback.url()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.await;
+
+        m_primary.assert();
+        m_fallback.assert();
+
+        let mut messages = vec![];
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+        let emitted_slot_complete = messages
+            .iter()
+            .any(|message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100));
+        let emitted_instruction = messages
+            .iter()
+            .any(|message| matches!(message, ProcessorMessage::Instruction(_)));
+        assert!(
+            !emitted_slot_complete,
+            "SlotComplete{{slot:100}} must not be emitted when the fallback blockhash differs"
+        );
+        assert!(
+            !emitted_instruction,
+            "a fallback block on a different fork must not be indexed"
         );
     }
 

@@ -11,6 +11,11 @@ row changes status); paged by the Grafana alert `indexer-parse-failed`, same sha
 **Retrying cannot clear this.** Replaying the slot re-parses the same bytes and fails
 the same way. Only a fuller data source or a code fix will.
 
+When `COMMON_FALLBACK_RPC_URL` is set, the indexer has already re-fetched the slot from it
+and that copy was rejected too, so this alert firing means the fallback is unset, serves
+the same thin metadata, or is on a different chain or fork (grep for `wrong cluster or
+divergent fork`). Yellowstone reaches the fallback through the gap-fill, not the stream.
+
 An unrecognized discriminator is ignored on purpose, so a program gaining a new
 instruction never causes this. Two causes only:
 

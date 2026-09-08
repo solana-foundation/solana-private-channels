@@ -179,6 +179,36 @@ impl PrivateChannelIndexerConfig {
     }
 }
 
+/// Refuse a fallback that is the same node as the one serving blocks: failing over to it
+/// re-fetches from the endpoint that just served the slot unusably, so it can never help
+/// while still making the deploy look like it has a failover.
+///
+/// Which URL is the block source depends on the datasource. Live polling fetches from
+/// `common.rpc_url`, while Yellowstone streams its blocks and reaches RPC only through the
+/// reconnect gap-fill, which uses `backfill.rpc_url`.
+pub fn validate_fallback_endpoint(
+    common: &PrivateChannelIndexerConfig,
+    indexer: &IndexerConfig,
+) -> Result<(), String> {
+    let Some(fallback) = normalized(&common.fallback_rpc_url) else {
+        return Ok(());
+    };
+
+    let primary = match indexer.datasource_type {
+        DatasourceType::RpcPolling => common.rpc_url.trim(),
+        DatasourceType::Yellowstone => indexer.backfill.rpc_url.trim(),
+    };
+
+    if fallback == primary {
+        return Err(format!(
+            "fallback_rpc_url must differ from the block source ({primary}): failing over to the \
+             same node re-fetches from the endpoint that just failed"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Configuration for startup reconciliation against on-chain state.
 ///
 /// Only applies when `program_type = escrow`. Skipped for `withdraw` indexers.
@@ -402,6 +432,63 @@ mod tests {
             },
             reconciliation: ReconciliationConfig::default(),
         }
+    }
+
+    // ============================================================================
+    // Fallback endpoint validation
+    // ============================================================================
+
+    /// A fallback pointed at the polling datasource's own block source cannot help, so the
+    /// config is refused rather than starting with a failover that is a no-op.
+    #[test]
+    fn fallback_equal_to_the_polling_block_source_is_refused() {
+        let mut common = create_common_config();
+        common.fallback_rpc_url = Some(common.rpc_url.clone());
+        let indexer = create_indexer_config();
+
+        let err = validate_fallback_endpoint(&common, &indexer).unwrap_err();
+
+        assert!(
+            err.contains("must differ from the block source"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Yellowstone streams its blocks and reaches RPC only through the gap-fill, so the
+    /// URL its fallback must differ from is `backfill.rpc_url`, not `common.rpc_url`.
+    /// Comparing against the wrong one would let this config through.
+    #[test]
+    fn fallback_equal_to_the_gap_fill_block_source_is_refused() {
+        let mut common = create_common_config();
+        common.rpc_url = "http://primary-is-unused-here:8899".to_string();
+        let mut indexer = create_indexer_config();
+        indexer.datasource_type = DatasourceType::Yellowstone;
+        common.fallback_rpc_url = Some(indexer.backfill.rpc_url.clone());
+
+        let err = validate_fallback_endpoint(&common, &indexer).unwrap_err();
+
+        assert!(
+            err.contains(&indexer.backfill.rpc_url),
+            "the error must name the gap-fill block source: {err}"
+        );
+    }
+
+    /// An independent endpoint is the whole point, and an unset or blank fallback is a
+    /// supported deploy, so neither may be refused.
+    #[test]
+    fn independent_or_absent_fallback_is_accepted() {
+        let indexer = create_indexer_config();
+
+        let mut independent = create_common_config();
+        independent.fallback_rpc_url = Some("http://archival:8899".to_string());
+        assert!(validate_fallback_endpoint(&independent, &indexer).is_ok());
+
+        let absent = create_common_config();
+        assert!(validate_fallback_endpoint(&absent, &indexer).is_ok());
+
+        let mut blank = create_common_config();
+        blank.fallback_rpc_url = Some("   ".to_string());
+        assert!(validate_fallback_endpoint(&blank, &indexer).is_ok());
     }
 
     // ============================================================================

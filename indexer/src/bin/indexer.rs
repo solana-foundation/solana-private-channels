@@ -346,6 +346,9 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
 
     common_config.validate()?;
     indexer_config.validate()?;
+    // Needs both halves: the fallback is configured on `common`, the block source it must
+    // differ from depends on the datasource.
+    private_channel_indexer::config::validate_fallback_endpoint(&common_config, &indexer_config)?;
 
     private_channel_indexer::run(common_config, indexer_config, Some(health)).await?;
 
