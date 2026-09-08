@@ -694,8 +694,16 @@ async fn check_withdrawal(
         // The classifier calls the release dead by absence of its signatures. The
         // bit is the release, so it decides whether the nonce may be re-armed.
         SigFinality::Dead => {
+            // With no instance there is no bitmap to corroborate the re-arm against,
+            // and the release may have landed under a signature never recorded, so
+            // this fails closed the way the signatureless branch above does.
             if instance_pda.is_none() {
-                return WithdrawalAction::Demote;
+                return WithdrawalAction::Quarantine {
+                    reason: format!(
+                        "every recorded signature for nonce {nonce} is dead and there is \
+                         no escrow instance configured to verify the release against"
+                    ),
+                };
             }
             // pending is non-empty here, so max() is always Some.
             let max_lvbh = pending
@@ -1659,30 +1667,13 @@ mod tests {
         }
     }
 
-    /// Null-status signature past blockhash validity is dead → demote.
+    /// Dead signatures with no configured instance: there is no bitmap to
+    /// corroborate the re-arm, and the release may have landed under a signature
+    /// that was never recorded, so the row must be held rather than re-sent.
     #[tokio::test]
-    async fn check_withdrawal_demotes_when_signature_dead() {
+    async fn check_withdrawal_dead_signature_quarantines_when_no_instance_configured() {
         let mut server = mockito::Server::new_async().await;
-        let _status = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
-            ))
-            .with_status(200)
-            .with_body(
-                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[null]},"id":1}"#,
-            )
-            .create();
-        let _height = server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getBlockHeight""#.into(),
-            ))
-            .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","result":1000,"id":1}"#)
-            .create();
-        // Floor below the journaled blockhash slot: the absence is covered, so Dead stands.
-        let _floor = mock_ledger_floor(&mut server, 400);
+        let _dead = mock_dead_signature(&mut server);
 
         let mock = MockStorage::new();
         let row = make_withdrawal_row(1, Some(42));
@@ -1695,10 +1686,13 @@ mod tests {
 
         let action =
             check_withdrawal(&row, &storage, &FinalityRpc::solana(&client, None), None).await;
-        assert!(
-            matches!(action, WithdrawalAction::Demote),
-            "expected Demote"
-        );
+        match action {
+            WithdrawalAction::Quarantine { reason } => assert!(
+                reason.contains("no escrow instance configured"),
+                "reason must name the missing instance: {reason}"
+            ),
+            _ => panic!("an uncorroborated dead signature set must not Demote"),
+        }
     }
 
     /// Finalized-success signature → Complete with that sig.
