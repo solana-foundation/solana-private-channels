@@ -28,6 +28,20 @@ instruction never causes this. Two causes only:
 2. **Layout drift** (a code problem). A program's instruction changed on chain and
    the parser was not updated.
 
+### Two labels, two situations
+
+| label | meaning | severity |
+|---|---|---|
+| `parse_failed` | the checkpoint is held and nothing is being indexed for that program | critical, act now |
+| `parse_failed_stream` | only the geyser stream could not decode; the reconnect gap-fill re-read the slot over RPC and the checkpoint is advancing | warning, act this week |
+
+`parse_failed_stream` loses no data. What it costs is the feed: failing a block is how the
+stream withholds a slot, so a systematic cause tears the connection down once per affected
+block, the geyser feed contributes nothing, and the backfill RPC carries the whole load. Fix
+it by repointing the geyser provider at one that emits `stackHeight` on inner instructions,
+or by switching to the RPC-polling datasource and dropping the feed. Everything below is
+about `parse_failed`.
+
 ### Detection
 
 Keys off the error counter, not `private_channel_indexer_checkpoint_frontier_lag`

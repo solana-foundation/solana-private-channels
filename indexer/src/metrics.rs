@@ -275,6 +275,7 @@ pub fn init_labels(program_type: &str) {
         "get_block",
         "missing_meta",
         "parse_failed",
+        "parse_failed_stream",
         "block_unavailable",
         "block_unproven",
         "gap_fill",

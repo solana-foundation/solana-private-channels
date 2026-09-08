@@ -264,6 +264,45 @@ groups:
               refId: C
 
   - orgId: 1
+    name: indexer-parse-failed-stream-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-parse-failed-stream
+        title: "Indexer geyser stream cannot decode and is reconnecting continuously"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} keeps hitting instructions its geyser stream cannot decode. No data is lost and the checkpoint is advancing: the reconnect gap-fill re-reads each slot over RPC, which has fuller metadata. The problem is that failing a block is how the stream withholds a slot, so a systematic cause (most often a feed that omits stackHeight on inner instructions, which makes every CPI deposit undecodable) tears the stream down once per affected block. The geyser feed is then contributing nothing while the backfill RPC does its work, at the cost of continuous reconnects and archival traffic. Not an emergency, unlike parse_failed, which means the checkpoint is actually stuck. Repoint the geyser provider at one that emits stackHeight, or drop to the RPC-polling datasource and stop paying for the feed. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="parse_failed_stream"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
     name: indexer-block-unproven-alerts
     folder: Solana Private Channels Alerts
     interval: 1m

@@ -2797,16 +2797,22 @@ async fn parse_and_send(
         // unknown. Failing the block here skips its SlotComplete, so the checkpoint holds
         // and the reconnect gap-fill replays the slot over RPC.
         //
-        // Deliberately not counted as `parse_failed`: that label means the checkpoint is
-        // stuck, and the gap-fill usually decodes the slot from an endpoint with fuller
-        // metadata. Counting here would page critical on the self-healing path. When the
-        // RPC copy fails too the fill counts it, and that is the real wedge. The repeated
-        // teardown this causes stays visible through the reconnect metric.
+        // Counted under its own label rather than `parse_failed`, because the two need
+        // different responses. `parse_failed` means the checkpoint is stuck and nothing is
+        // being indexed. Here the gap-fill usually decodes the slot from an endpoint with
+        // fuller metadata, so no data is lost and the checkpoint keeps moving; what is wrong
+        // is that a systematic cause (a feed that cannot express CPI stack heights) makes
+        // this recur per block, so the stream tears down continuously and contributes
+        // nothing while RPC quietly does its job. That is worth knowing about, but it is not
+        // an emergency, and paging `parse_failed` for it would cry wolf on a healthy slot.
         Err(e) => {
             error!(
                 "Slot {slot} transaction {signature} instruction {} (inner {inner_index:?}) will not decode: {e}; refusing to complete the slot",
                 location.top_level_index
             );
+            metrics::INDEXER_RPC_ERRORS
+                .with_label_values(&[program_type.as_label(), "parse_failed_stream"])
+                .inc();
             return Err(DataSourceRpcError::Protocol {
                 reason: format!(
                     "slot {slot} transaction {signature} instruction {} will not decode: {e}",
