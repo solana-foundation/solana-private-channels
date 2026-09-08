@@ -245,7 +245,7 @@ mod tests {
         let new_root = [1u8; 32];
         let transaction_nonce = 42u64;
         let amount = 1000u64;
-        let sibling_proofs = [2u8; 512];
+        let sibling_proofs = [2u8; TREE_HEIGHT * 32];
 
         let mut instruction_data = vec![];
 
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(args.transaction_nonce, transaction_nonce);
         assert_eq!(args.amount, amount);
         assert_eq!(args.user, user_key);
-        let expected_sibling_proofs = [[2u8; 32]; 16];
+        let expected_sibling_proofs = [[2u8; 32]; TREE_HEIGHT];
         assert_eq!(args.sibling_proofs, expected_sibling_proofs);
     }
 
