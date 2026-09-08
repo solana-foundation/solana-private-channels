@@ -2057,7 +2057,7 @@ pub(super) async fn route_poll_results(
 ) {
     for (mut tx, status_opt) in results {
         match status_opt {
-            Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+            Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
                 let result = if let Some(err) = &status.err {
                     let mut extra_result = None;
                     if let ExtraErrorCheckPolicy::Extra(ref checks) = tx.extra_error_checks_policy {
@@ -2349,7 +2349,7 @@ pub(super) async fn run_poll_task(
 
         for (mut tx, status_opt) in batch.into_iter().zip(statuses) {
             match status_opt {
-                Some(status) if status.satisfies_commitment(CommitmentConfig::confirmed()) => {
+                Some(status) if status.satisfies_commitment(CommitmentConfig::finalized()) => {
                     if status.err.is_none() {
                         // ── Confirmed success (hot path) ──────────────────────────────
                         // Handle entirely here — no need to wake the sender loop.
@@ -5455,10 +5455,10 @@ mod tests {
         }
     }
 
-    /// A confirmed signature in the batch must route to handle_success, emitting
+    /// A finalized signature in the batch must route to handle_success, emitting
     /// a Completed status and removing the entry from in_flight.
     #[tokio::test]
-    async fn poll_in_flight_confirmed_tx_emits_completed() {
+    async fn poll_in_flight_finalized_tx_emits_completed() {
         let mut server = mockito::Server::new_async().await;
 
         let sig = Signature::new_unique();
@@ -5476,8 +5476,8 @@ mod tests {
                     "result": {
                         "context": {"slot": 100},
                         "value": [{
-                            "confirmationStatus": "confirmed",
-                            "confirmations": 1,
+                            "confirmationStatus": "finalized",
+                            "confirmations": null,
                             "err": null,
                             "slot": 100,
                             "status": {"Ok": null}
@@ -5690,7 +5690,7 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
-    /// A mixed batch (one confirmed, one pending) must resolve the confirmed entry while
+    /// A mixed batch (one finalized, one pending) must resolve the finalized entry while
     /// keeping the pending entry in in_flight with an incremented poll_attempts.
     #[tokio::test]
     async fn poll_in_flight_mixed_batch_partial_resolution() {
@@ -5712,10 +5712,10 @@ mod tests {
                     "result": {
                         "context": {"slot": 200},
                         "value": [
-                            // sig1 confirmed
+                            // sig1 finalized
                             {
-                                "confirmationStatus": "confirmed",
-                                "confirmations": 1,
+                                "confirmationStatus": "finalized",
+                                "confirmations": null,
                                 "err": null,
                                 "slot": 200,
                                 "status": {"Ok": null}
@@ -5835,6 +5835,25 @@ mod tests {
         let one = serde_json::json!({
             "confirmationStatus": "finalized",
             "confirmations": null,
+            "err": null,
+            "slot": 100,
+            "status": {"Ok": null}
+        });
+        let value = vec![one; count];
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"context": {"slot": 100}, "value": value}
+        })
+        .to_string()
+    }
+
+    // A getSignatureStatuses response body with `count` confirmed-success slots
+    // that have not yet finalized, so a fork can still drop them.
+    fn confirmed_value_body(count: usize) -> String {
+        let one = serde_json::json!({
+            "confirmationStatus": "confirmed",
+            "confirmations": 1,
             "err": null,
             "slot": 100,
             "status": {"Ok": null}
@@ -6246,6 +6265,81 @@ mod tests {
         present.sort_unstable();
         assert_eq!(present, ids, "no entry dropped");
         // Prove the task actually polled, so the negative assertions are not vacuous.
+        _m.assert();
+    }
+
+    /// A confirmed-but-not-finalized status can still be forked out, so routing it
+    /// as settled would credit a mint the chain never kept. It must stay in flight.
+    #[tokio::test]
+    async fn poll_in_flight_confirmed_not_finalized_does_not_settle() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| confirmed_value_body(req));
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state
+            .in_flight
+            .push(make_in_flight_tx(Signature::new_unique(), 91));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        poll_in_flight(&mut state, &storage_tx).await;
+
+        assert_eq!(
+            state.in_flight.len(),
+            1,
+            "a non-finalized entry must remain in flight"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no Completed may be written before finalization"
+        );
+        _m.assert();
+    }
+
+    /// The production poll task applies the same finality gate as poll_in_flight.
+    #[tokio::test]
+    async fn run_poll_task_confirmed_not_finalized_does_not_settle() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_status_bodies(&mut server, |_idx, req| confirmed_value_body(req));
+
+        let in_flight = InFlightQueue::new();
+        let (result_tx, mut result_rx) = mpsc::channel::<Vec<PollTaskResult>>(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        let rpc = Arc::new(make_rpc_client(&server.url()));
+        let token = tokio_util::sync::CancellationToken::new();
+
+        in_flight.push(make_in_flight_tx(Signature::new_unique(), 92));
+
+        let handle = tokio::spawn(run_poll_task(
+            in_flight.clone(),
+            result_tx,
+            rpc,
+            storage_tx,
+            ProgramType::Escrow,
+            5,
+            token.clone(),
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("task must exit after cancellation")
+            .expect("task must not panic");
+
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no Completed may be written before finalization"
+        );
+        // Repeated polls eventually hand the entry over on the timeout path; what
+        // must never happen is the task calling it a settled success.
+        while let Ok(batch) = result_rx.try_recv() {
+            for result in batch {
+                assert!(
+                    matches!(result, PollTaskResult::NeedsRouting(_, None)),
+                    "a non-finalized status must not be routed as confirmed"
+                );
+            }
+        }
         _m.assert();
     }
 

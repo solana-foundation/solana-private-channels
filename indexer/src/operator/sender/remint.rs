@@ -234,7 +234,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
     let result = match check_transaction_status(
         state.source_rpc_client.clone(),
         &signature,
-        CommitmentConfig::confirmed(),
+        CommitmentConfig::finalized(),
         &ExtraErrorCheckPolicy::None,
         state.confirmation_poll_interval_ms,
     )
@@ -2598,6 +2598,136 @@ mod tests {
             "the recorded remint must be the journaled attempt, not a fresh one"
         );
         no_send.assert_async().await;
+    }
+
+    /// Answers sendTransaction with the signature the request actually carries.
+    /// The RPC client rejects any other value, so a fixed one cannot model a
+    /// successful broadcast.
+    async fn mock_send_echoing_signature(server: &mut mockito::Server) -> mockito::Mock {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |req| {
+                let v: serde_json::Value =
+                    serde_json::from_slice(req.body().expect("request body present"))
+                        .expect("request body is json");
+                let raw = STANDARD
+                    .decode(v["params"][0].as_str().expect("encoded transaction"))
+                    .expect("transaction is base64");
+                // Wire layout: a one-byte signature count, then the first signature.
+                let sig = bs58::encode(&raw[1..65]).into_string();
+                format!(r#"{{"jsonrpc":"2.0","result":"{sig}","id":0}}"#).into_bytes()
+            })
+            .create_async()
+            .await
+    }
+
+    /// A freshly broadcast remint that is only confirmed can still be forked out.
+    /// Terminalizing it would delete the journal the next pass needs, so the row
+    /// must stay PendingRemint with its signature on file.
+    #[tokio::test]
+    async fn execute_deferred_remint_confirmed_not_finalized_does_not_terminalize() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        state.confirmation_poll_interval_ms = 1;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let _blockhash = mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let _send = mock_send_echoing_signature(&mut rpc_server).await;
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":1,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"confirmed"}]},"id":0}"#,
+        )
+        .await;
+
+        seed_pending_remint_row(&mock, 714, 0);
+
+        let entry = make_matured_remint(714, 75);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::DeferInFlight(..)),
+            "a non-finalized remint must be re-queued, not resolved"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "no FailedReminted may be written before finalization"
+        );
+        assert_eq!(
+            mock.remint_signatures
+                .lock()
+                .unwrap()
+                .get(&714)
+                .map(|s| s.len())
+                .unwrap_or(0),
+            1,
+            "the journal must survive so a later pass can reclassify the attempt"
+        );
+    }
+
+    /// The same path with a finalized status does terminalize and clears the journal.
+    #[tokio::test]
+    async fn execute_deferred_remint_finalized_terminalizes_and_clears_the_journal() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (mut state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        state.confirmation_poll_interval_ms = 1;
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let _blockhash = mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let _send = mock_send_echoing_signature(&mut rpc_server).await;
+        let _status = mock_rpc(
+            &mut rpc_server,
+            "getSignatureStatuses",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":null,"err":null,
+                "status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":0}"#,
+        )
+        .await;
+
+        seed_pending_remint_row(&mock, 715, 0);
+
+        let entry = make_matured_remint(715, 76);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::Resolved),
+            "a finalized remint resolves the entry"
+        );
+        let update = storage_rx
+            .try_recv()
+            .expect("a finalized remint must resolve the row");
+        assert_eq!(update.status, TransactionStatus::FailedReminted);
+        assert_eq!(
+            mock.remint_signatures
+                .lock()
+                .unwrap()
+                .get(&715)
+                .map(|s| s.len())
+                .unwrap_or(0),
+            0,
+            "the journal is cleared once the row is durably terminal"
+        );
     }
 
     /// The signature has to reach the journal before it reaches the network, or
