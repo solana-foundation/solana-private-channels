@@ -179,9 +179,14 @@ impl PrivateChannelIndexerConfig {
     }
 }
 
-/// Refuse a fallback that is the same node as the one serving blocks: failing over to it
+/// Refuse a fallback that is spelled the same as the node serving blocks: failing over to it
 /// re-fetches from the endpoint that just served the slot unusably, so it can never help
 /// while still making the deploy look like it has a failover.
+///
+/// Catches an identical endpoint only, ignoring a trailing slash. It cannot prove two
+/// endpoints are independent nodes: an alias, an IP for a hostname, or a load-balancer VIP
+/// all read as different here. Treat it as a guard against the obvious copy-paste, not as
+/// an independence check.
 ///
 /// Which URL is the block source depends on the datasource. Live polling fetches from
 /// `common.rpc_url`, while Yellowstone streams its blocks and reaches RPC only through the
@@ -193,11 +198,13 @@ pub fn validate_fallback_endpoint(
     let Some(fallback) = normalized(&common.fallback_rpc_url) else {
         return Ok(());
     };
+    let fallback = fallback.trim_end_matches('/');
 
     let primary = match indexer.datasource_type {
         DatasourceType::RpcPolling => common.rpc_url.trim(),
         DatasourceType::Yellowstone => indexer.backfill.rpc_url.trim(),
-    };
+    }
+    .trim_end_matches('/');
 
     if fallback == primary {
         return Err(format!(
@@ -451,6 +458,13 @@ mod tests {
         assert!(
             err.contains("must differ from the block source"),
             "unexpected error: {err}"
+        );
+
+        // The same endpoint with a trailing slash is the same endpoint.
+        common.fallback_rpc_url = Some(format!("{}/", common.rpc_url));
+        assert!(
+            validate_fallback_endpoint(&common, &indexer).is_err(),
+            "a trailing slash must not smuggle the block source past the check"
         );
     }
 

@@ -163,6 +163,26 @@ pub fn decode_slot(
     parse_block(block, slot, program_type, escrow_instance_id).map_err(SlotRejection::Undecodable)
 }
 
+/// Whether this instruction names the configured escrow instance among its own accounts.
+/// Instance admission is transaction-wide, so a transaction of ours also carries other
+/// instances' instructions, and only ours are worth failing a slot on. `None` (withdraw) and
+/// an unresolvable index count as in scope, so an unreadable instruction still fails closed.
+pub(crate) fn targets_configured_instance(
+    instruction: &CompiledInstruction,
+    account_keys: &[Pubkey],
+    escrow_instance_id: Option<&Pubkey>,
+) -> bool {
+    let Some(instance_id) = escrow_instance_id else {
+        return true;
+    };
+
+    instruction.accounts.iter().any(|index| {
+        account_keys
+            .get(*index as usize)
+            .is_none_or(|key| key == instance_id)
+    })
+}
+
 /// First byte (Anchor-style discriminator) of an instruction's base58 data, or `None` if empty/undecodable.
 fn instruction_discriminator(instruction: &CompiledInstruction) -> Option<u8> {
     bs58::decode(&instruction.data)
@@ -274,6 +294,14 @@ where
                     // A discriminator we support that will not decode leaves this slot's
                     // contents unknown, so fail the whole slot rather than drop the row.
                     Err(source) => {
+                        if !targets_configured_instance(
+                            instruction,
+                            &account_pubkeys,
+                            escrow_instance_id,
+                        ) {
+                            debug!("Skipped undecodable instruction for a foreign instance");
+                            continue;
+                        }
                         return Err(UndecodableInstruction {
                             signature: signature.clone(),
                             instruction_index: location.top_level_index,
@@ -319,6 +347,14 @@ where
                         debug!("Skipped unsupported inner instruction");
                     }
                     Err(source) => {
+                        if !targets_configured_instance(
+                            &inner.instruction,
+                            &account_pubkeys,
+                            escrow_instance_id,
+                        ) {
+                            debug!("Skipped undecodable inner instruction for a foreign instance");
+                            continue;
+                        }
                         return Err(UndecodableInstruction {
                             signature: signature.clone(),
                             instruction_index: location.top_level_index,
@@ -637,6 +673,61 @@ mod tests {
         assert!(
             failure.inner_index.is_none(),
             "a top-level instruction has no inner index"
+        );
+    }
+
+    /// Instance admission is transaction-wide, so a transaction of ours also carries other
+    /// instances' instructions. Only our own may fail the slot: rejecting on a foreign one
+    /// would wedge a slot whose own rows are complete, and the processor discards those rows.
+    #[test]
+    fn undecodable_instruction_for_a_foreign_instance_does_not_fail_the_slot() {
+        let our_instance = crate::test_utils::pubkey::test_pubkey(200);
+        // Discriminator 6 (Deposit) with no borsh body: recognized, undecodable.
+        let undecodable_deposit = bs58::encode([6u8]).into_string();
+
+        // Key 0 is the escrow program, key 1 is our instance, keys 2..=13 are the twelve
+        // accounts of a deposit that belongs to a different instance.
+        let mut account_keys = vec![
+            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+            our_instance.to_string(),
+        ];
+        for seed in 2u8..14 {
+            account_keys.push(crate::test_utils::pubkey::test_pubkey(seed).to_string());
+        }
+
+        let mut block = create_test_block();
+        block.transactions.push(create_successful_transaction(
+            "sig_foreign".to_string(),
+            account_keys.clone(),
+            vec![create_instruction(
+                0,
+                (2u8..14).collect(),
+                undecodable_deposit.clone(),
+            )],
+        ));
+
+        let result = parse_block(&block, 7, ProgramType::Escrow, Some(&our_instance))
+            .expect("a foreign instance's undecodable deposit must not fail the slot");
+        assert!(
+            result.is_empty(),
+            "no row belongs to our instance in this transaction"
+        );
+
+        // The same undecodable deposit naming our instance still fails the slot.
+        let mut block = create_test_block();
+        block.transactions.push(create_successful_transaction(
+            "sig_ours".to_string(),
+            account_keys,
+            vec![create_instruction(
+                0,
+                (1u8..13).collect(),
+                undecodable_deposit,
+            )],
+        ));
+
+        assert!(
+            parse_block(&block, 7, ProgramType::Escrow, Some(&our_instance)).is_err(),
+            "our own undecodable deposit must fail the slot"
         );
     }
 

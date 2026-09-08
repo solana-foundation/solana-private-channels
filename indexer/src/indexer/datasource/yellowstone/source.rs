@@ -22,6 +22,7 @@ use crate::error::{DataSourceError, DataSourceRpcError};
 use crate::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
 use crate::indexer::datasource::common::parser::withdraw::parse_withdraw_instruction;
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
+use crate::indexer::datasource::rpc_polling::decoder::targets_configured_instance;
 use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
 use crate::storage::Storage;
 
@@ -2692,6 +2693,7 @@ async fn handle_transaction_info(
             &inner_instructions_vec,
             location,
             program_type,
+            escrow_instance_id,
             slot,
             &signature,
             channel,
@@ -2724,6 +2726,7 @@ async fn handle_transaction_info(
                 &inner_instructions_vec,
                 location,
                 program_type,
+                escrow_instance_id,
                 slot,
                 &signature,
                 channel,
@@ -2771,6 +2774,7 @@ async fn parse_and_send(
     inner_instructions: &[InnerInstructions],
     location: InstructionLocation,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     slot: u64,
     signature: &str,
     channel: &InstructionSender,
@@ -2806,6 +2810,11 @@ async fn parse_and_send(
         // nothing while RPC quietly does its job. That is worth knowing about, but it is not
         // an emergency, and paging `parse_failed` for it would cry wolf on a healthy slot.
         Err(e) => {
+            if !targets_configured_instance(compiled_ix, account_keys, escrow_instance_id.as_ref())
+            {
+                debug!("Yellowstone: skipped undecodable instruction for a foreign instance");
+                return Ok(());
+            }
             error!(
                 "Slot {slot} transaction {signature} instruction {} (inner {inner_index:?}) will not decode: {e}; refusing to complete the slot",
                 location.top_level_index
