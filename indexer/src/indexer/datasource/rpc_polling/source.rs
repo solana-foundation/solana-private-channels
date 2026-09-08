@@ -119,13 +119,22 @@ impl DataSource for RpcPollingSource {
             self.commitment,
         ));
 
-        // Built once, used only on the rare missing-meta path. Empty means unset
-        // (env renders unconfigured as ""), so no poller is aimed at "".
+        // Built once, used only when a slot arrives unusable. Blank means unset (env renders
+        // an unconfigured var as ""), and the value is trimmed rather than merely tested, so
+        // a whitespace-only setting reads as absent everywhere instead of aiming a poller at
+        // "   " and spending one doomed request per rejected slot.
         let fallback_poller = self
             .fallback_rpc_url
-            .clone()
+            .as_deref()
+            .map(str::trim)
             .filter(|url| !url.is_empty())
-            .map(|url| Arc::new(RpcPoller::new(url, self.encoding, self.commitment)));
+            .map(|url| {
+                Arc::new(RpcPoller::new(
+                    url.to_string(),
+                    self.encoding,
+                    self.commitment,
+                ))
+            });
 
         // Current slot is either the from slot or the latest slot
         let mut current_slot = if let Some(slot) = self.from_slot {

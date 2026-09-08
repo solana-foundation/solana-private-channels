@@ -473,8 +473,8 @@ impl DataSource for YellowstoneSource {
         let endpoint = self.endpoint.clone();
         let x_token = self.x_token.clone();
         let program_type = self.program_type;
-        // Only the reconnect gap-fill (RPC path) still needs the instance id.
-        #[cfg(feature = "datasource-rpc")]
+        // Scopes the live parse to our own escrow instance, exactly as the RPC decoder does,
+        // and anchors the reconnect gap-fill.
         let escrow_instance_id = self.escrow_instance_id;
         let health = self.health.clone();
         let stall_timeout = self.stall_timeout;
@@ -525,6 +525,7 @@ impl DataSource for YellowstoneSource {
                     x_token.clone(),
                     commitment_level,
                     program_type,
+                    escrow_instance_id,
                     tx.clone(),
                     cancellation_token.clone(),
                     health.as_ref(),
@@ -583,6 +584,7 @@ async fn connect_and_stream(
     x_token: Option<String>,
     commitment: CommitmentLevel,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     health: Option<&Arc<private_channel_metrics::HealthState>>,
@@ -776,7 +778,10 @@ async fn connect_and_stream(
 
                     // Fail-closed: any parse/send failure returns Err (reconnect + gap-fill
                     // replays the slot) and no SlotComplete is emitted for it.
-                    if let Err(e) = handle_block(block, &program_id, program_type, &tx).await {
+                    if let Err(e) =
+                        handle_block(block, &program_id, program_type, escrow_instance_id, &tx)
+                            .await
+                    {
                         error!("Error handling block: {}", e);
                         return Err(DataSourceError::Rpc(e));
                     }
@@ -816,6 +821,7 @@ async fn connect_and_stream(
 mod tests {
     use super::*;
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+    use crate::test_utils::escrow_fixtures::deposit_ix_bytes as escrow_deposit_ix_bytes;
     use crate::test_utils::rpc_mocks::mock_get_blocks;
     use mockito::Server;
     use serde_json::json;
@@ -1770,7 +1776,7 @@ mod tests {
         let tx_update = withdraw_tx_update(signature.clone(), &program_id, 2);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -1804,7 +1810,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -1848,7 +1854,7 @@ mod tests {
         });
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -1981,7 +1987,7 @@ mod tests {
             escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &escrow, ProgramType::Escrow, &tx)
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2060,7 +2066,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &escrow, ProgramType::Escrow, &tx)
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2114,7 +2120,7 @@ mod tests {
         let block = block_update(500, vec![tx_a, tx_b]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2153,7 +2159,7 @@ mod tests {
         let block = block_update(700, vec![]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2181,7 +2187,7 @@ mod tests {
         let block = block_update(800, vec![foreign]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2220,7 +2226,7 @@ mod tests {
         let block = block_update(900, vec![bad]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, None, &tx).await;
         assert!(res.is_err(), "a malformed tx must fail the block");
         drop(tx);
 
@@ -2247,7 +2253,7 @@ mod tests {
         let block = block_update(1000, vec![tx]);
 
         let (chan, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &chan)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &chan)
             .await
             .unwrap();
         drop(chan);
@@ -2282,7 +2288,7 @@ mod tests {
         let block = block_update(1100, vec![failed]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2317,7 +2323,7 @@ mod tests {
         let block = block_update(1200, vec![no_meta]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, None, &tx).await;
         assert!(res.is_err(), "a tx without meta must fail the block");
         drop(tx);
 
@@ -2328,6 +2334,108 @@ mod tests {
             }
         }
         assert!(!saw_complete, "slot must not complete when a tx lacks meta");
+    }
+
+    /// A deposit belonging to someone else's escrow instance must be skipped, not fail the
+    /// block. The RPC gap-fill that recovers a failed block filters foreign instances out
+    /// before parsing, so failing here would tear the stream down for a slot the recovery
+    /// path then completes without objection: reconnect, recover, hit the next foreign
+    /// deposit, forever. The same block still fails closed when it is in scope, which is
+    /// what makes this a scope check rather than a hole.
+    #[tokio::test]
+    async fn foreign_instance_undecodable_deposit_is_skipped_not_failed() {
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        let mut account_keys: Vec<Vec<u8>> = (0u8..12)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i + 1;
+                b.to_vec()
+            })
+            .collect();
+        account_keys[0] = escrow.to_bytes().to_vec();
+        let in_scope_instance = Pubkey::try_from(account_keys[1].as_slice()).unwrap();
+
+        // A foreign top-level instruction that CPIs one escrow deposit.
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: vec![],
+        }];
+        // The deposit carries no DepositEvent in its subtree, so the parser cannot resolve
+        // an amount for it. This is the runbook's "cause 1", the realistic trigger.
+        let inner_set = vec![proto::InnerInstructions {
+            index: 0,
+            instructions: vec![proto::InnerInstruction {
+                program_id_index: 0,
+                accounts: (0u8..12).collect(),
+                data: escrow_deposit_ix_bytes(1000, None),
+                stack_height: Some(2),
+            }],
+        }];
+
+        let foreign_block = block_update(
+            1400,
+            vec![escrow_tx_update(
+                vec![9u8; 64],
+                account_keys.clone(),
+                top.clone(),
+                inner_set.clone(),
+                vec![],
+                vec![],
+            )
+            .transaction
+            .unwrap()],
+        );
+
+        // Out of scope: skipped, and the slot completes so the stream keeps running.
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(
+            foreign_block,
+            &escrow,
+            ProgramType::Escrow,
+            Some(Pubkey::new_unique()),
+            &tx,
+        )
+        .await
+        .expect("a foreign instance's undecodable deposit must not fail the block");
+        drop(tx);
+
+        let mut completed = false;
+        let mut indexed = 0;
+        while let Some(message) = rx.recv().await {
+            match message {
+                ProcessorMessage::SlotComplete { .. } => completed = true,
+                ProcessorMessage::Instruction(_) => indexed += 1,
+                ProcessorMessage::Regate { .. } => panic!("no Regate expected here"),
+            }
+        }
+        assert!(completed, "an out-of-scope slot must still complete");
+        assert_eq!(indexed, 0, "a foreign instance's deposit is never indexed");
+
+        // In scope: the same block fails closed.
+        let in_scope_block = block_update(
+            1400,
+            vec![
+                escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![])
+                    .transaction
+                    .unwrap(),
+            ],
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        let res = handle_block(
+            in_scope_block,
+            &escrow,
+            ProgramType::Escrow,
+            Some(in_scope_instance),
+            &tx,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "an in-scope undecodable deposit must still fail the block"
+        );
     }
 
     /// An instruction the indexer claims to support but cannot decode leaves the slot's
@@ -2355,7 +2463,7 @@ mod tests {
         let block = block_update(1300, vec![tx_info]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, None, &tx).await;
         assert!(
             res.is_err(),
             "an undecodable supported instruction must fail the block"
@@ -2388,12 +2496,21 @@ async fn handle_block(
     block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
     program_id: &Pubkey,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
     let slot = block.slot;
 
     for tx_info in block.transactions {
-        handle_transaction_info(tx_info, slot, program_id, program_type, channel).await?;
+        handle_transaction_info(
+            tx_info,
+            slot,
+            program_id,
+            program_type,
+            escrow_instance_id,
+            channel,
+        )
+        .await?;
     }
 
     send_guaranteed(
@@ -2416,6 +2533,7 @@ async fn handle_transaction(
     tx_update: yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
     program_id: &Pubkey,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
     let slot = tx_update.slot;
@@ -2426,7 +2544,15 @@ async fn handle_transaction(
             reason: "Missing transaction info".to_string(),
         })?;
 
-    handle_transaction_info(tx_info, slot, program_id, program_type, channel).await
+    handle_transaction_info(
+        tx_info,
+        slot,
+        program_id,
+        program_type,
+        escrow_instance_id,
+        channel,
+    )
+    .await
 }
 
 async fn handle_transaction_info(
@@ -2434,6 +2560,7 @@ async fn handle_transaction_info(
     slot: u64,
     program_id: &Pubkey,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
     // A tx without meta cannot be proven successful or in scope (it loses its revert status,
@@ -2519,6 +2646,16 @@ async fn handle_transaction_info(
     // Full account list (static message keys, then loaded writable, then readonly) that inner and v0 top-level account indices reference.
     let mut account_keys = static_keys;
     account_keys.extend(loaded_pubkeys);
+
+    // Scope to our own escrow instance before parsing anything, matching the RPC decoder.
+    // Without this the live stream fails the block on a foreign instance's undecodable
+    // instruction while the gap-fill that recovers the slot skips that transaction
+    // outright, so the stream would tear down and reconnect on every one of them.
+    if let Some(instance_id) = escrow_instance_id {
+        if !account_keys.contains(&instance_id) {
+            return Ok(());
+        }
+    }
 
     info!(
         "Yellowstone received transaction at slot {}, signature: {}, {} instructions",
@@ -2658,15 +2795,18 @@ async fn parse_and_send(
         }
         // A discriminator we support that will not decode leaves this slot's contents
         // unknown. Failing the block here skips its SlotComplete, so the checkpoint holds
-        // and the reconnect gap-fill replays the slot.
+        // and the reconnect gap-fill replays the slot over RPC.
+        //
+        // Deliberately not counted as `parse_failed`: that label means the checkpoint is
+        // stuck, and the gap-fill usually decodes the slot from an endpoint with fuller
+        // metadata. Counting here would page critical on the self-healing path. When the
+        // RPC copy fails too the fill counts it, and that is the real wedge. The repeated
+        // teardown this causes stays visible through the reconnect metric.
         Err(e) => {
             error!(
                 "Slot {slot} transaction {signature} instruction {} (inner {inner_index:?}) will not decode: {e}; refusing to complete the slot",
                 location.top_level_index
             );
-            metrics::INDEXER_RPC_ERRORS
-                .with_label_values(&[program_type.as_label(), "parse_failed"])
-                .inc();
             return Err(DataSourceRpcError::Protocol {
                 reason: format!(
                     "slot {slot} transaction {signature} instruction {} will not decode: {e}",

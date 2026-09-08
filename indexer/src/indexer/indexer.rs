@@ -230,13 +230,31 @@ fn build_backfill_service(
         rpc_polling_config.commitment,
     ));
 
+    // Startup backfill runs unattended on every process start and its failure exits the
+    // process, so it needs the same archival re-fetch the live paths have; without it a
+    // recoverable slot becomes a boot loop. Empty means unset (env renders "" for an
+    // unconfigured var).
+    let fallback_poller = common_config
+        .fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| {
+            Arc::new(RpcPoller::new(
+                url.to_string(),
+                rpc_polling_config.encoding,
+                rpc_polling_config.commitment,
+            ))
+        });
+
     Ok(BackfillService::new(
         storage,
         rpc_poller,
         common_config.program_type,
         indexer_config.backfill.clone(),
         common_config.escrow_instance_id,
-    ))
+    )
+    .with_fallback_poller(fallback_poller))
 }
 
 /// Spawn the processor that turns decoded instructions into rows and checkpoint updates.
@@ -377,6 +395,12 @@ pub async fn run(
     info!("Storage: {:?}", common_config.storage_type);
     info!("RPC URL: {}", common_config.rpc_url);
     info!("Backfill enabled: {}", indexer_config.backfill.enabled);
+
+    // Checked here rather than in the binary so every entry point is covered, including
+    // embedders that call run() directly. Needs both halves: the fallback is configured on
+    // `common`, the block source it must differ from depends on the datasource.
+    crate::config::validate_fallback_endpoint(&common_config, &indexer_config)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
 
     // 1. Initialize storage
     let storage: Arc<Storage> = match common_config.storage_type {
@@ -779,9 +803,10 @@ pub async fn run(
                 // fallback. Empty means unset (env renders an unconfigured var as "").
                 let gap_fallback_poller = common_config
                     .fallback_rpc_url
-                    .clone()
-                    .filter(|url| !url.trim().is_empty())
-                    .map(|url| Arc::new(RpcPoller::new(url, encoding, commitment)));
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .map(|url| Arc::new(RpcPoller::new(url.to_string(), encoding, commitment)));
 
                 info!(
                     "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",

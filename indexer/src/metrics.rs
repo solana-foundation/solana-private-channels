@@ -274,7 +274,9 @@ pub fn init_labels(program_type: &str) {
         "get_slots",
         "get_block",
         "missing_meta",
+        "parse_failed",
         "block_unavailable",
+        "block_unproven",
         "gap_fill",
         "missing_anchor",
     ] {

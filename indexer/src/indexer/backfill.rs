@@ -167,6 +167,7 @@ fn rejected_slot_error(slot: u64, rejection: SlotRejection) -> IndexerError {
 /// `fallback_poller` re-fetches a slot the primary served in an unusable state; `None`
 /// disables that failover.
 /// Returns the number of processed slots.
+#[allow(clippy::too_many_arguments)]
 pub async fn fill_slot_range(
     rpc_poller: &RpcPoller,
     fallback_poller: Option<&RpcPoller>,
@@ -426,6 +427,10 @@ pub struct StartupRange {
 pub struct BackfillService {
     storage: Arc<Storage>,
     rpc_poller: Arc<RpcPoller>,
+    /// Re-fetches a slot the primary served in an unusable state. Startup backfill runs
+    /// unattended on every process start and its failure exits the process, so without this
+    /// a slot the live poller would heal in one round-trip becomes a boot loop.
+    fallback_poller: Option<Arc<RpcPoller>>,
     program_type: ProgramType,
     config: BackfillConfig,
     escrow_instance_id: Option<Pubkey>,
@@ -442,10 +447,17 @@ impl BackfillService {
         Self {
             storage,
             rpc_poller,
+            fallback_poller: None,
             program_type,
             config,
             escrow_instance_id,
         }
+    }
+
+    /// Arms the archival re-fetch for slots the primary serves in an unusable state.
+    pub fn with_fallback_poller(mut self, fallback_poller: Option<Arc<RpcPoller>>) -> Self {
+        self.fallback_poller = fallback_poller;
+        self
     }
 
     /// Work out which slots backfill needs to fill: `Some((from_slot, target))`, or
@@ -539,13 +551,9 @@ impl BackfillService {
         to_slot: u64,
         instruction_tx: InstructionSender,
     ) -> Result<(), IndexerError> {
-        // No fallback here: the paths that reach this (startup backfill, backfill-only
-        // mode, resync) are operator-run or human-watched, and their documented recovery
-        // is repointing the endpoint. Only the reconnect gap-fill, which runs unattended,
-        // carries one.
         fill_slot_range(
             &self.rpc_poller,
-            None,
+            self.fallback_poller.as_deref(),
             from_slot,
             to_slot,
             self.config.batch_size,
@@ -1174,7 +1182,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let err = result.unwrap_err();
             let message = err.to_string();
@@ -1208,7 +1216,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 103, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 103, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 3);
             drop(tx);
@@ -1248,7 +1256,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 2);
             drop(tx);
@@ -1282,7 +1290,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let err = result.unwrap_err();
             let msg = err.to_string();
@@ -1311,7 +1319,7 @@ mod tests {
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 101, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 101, 10, ProgramType::Escrow, None, &tx).await;
 
             assert!(result.is_err());
         }
@@ -1337,7 +1345,7 @@ mod tests {
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             assert!(result.is_err());
             // Every attempt was made, not just the first.
@@ -1357,7 +1365,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let msg = result.unwrap_err().to_string();
             assert!(msg.contains("unwitnessed"), "unexpected error: {msg}");
@@ -1387,7 +1395,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let err = result.unwrap_err();
             let msg = err.to_string();
@@ -1414,7 +1422,7 @@ mod tests {
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, None,100, 100, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 100, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 0);
             untouched.assert();

@@ -83,7 +83,7 @@ impl std::fmt::Display for SlotRejection {
 /// An escrow deposit whose event self-CPI is absent still passes this guard, which
 /// cannot tell it apart from a chain that records no inner instructions. The parser
 /// catches that case instead, and `parse_block` fails the slot closed on it.
-pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
+fn first_missing_meta(block: &RpcBlock) -> Option<String> {
     for (index, tx_with_meta) in block.transactions.iter().enumerate() {
         if tx_with_meta.meta.is_none() {
             return Some(
@@ -103,7 +103,7 @@ pub fn first_missing_meta(block: &RpcBlock) -> Option<String> {
 ///
 /// Precondition: every transaction in `block` must carry `meta`. Errs when a supported
 /// instruction will not decode, leaving the slot's contents unknown.
-pub fn parse_block(
+fn parse_block(
     block: &RpcBlock,
     slot: u64,
     program_type: ProgramType,
@@ -173,7 +173,7 @@ fn instruction_discriminator(instruction: &CompiledInstruction) -> Option<u8> {
 
 /// Parse a block and return (signature, location, instruction) for every
 /// instruction of the given program.
-pub fn parse_block_for_program<T>(
+fn parse_block_for_program<T>(
     block: &RpcBlock,
     filter_program_id: &str,
     parse_instruction: ParseInstructionFn<T>,
