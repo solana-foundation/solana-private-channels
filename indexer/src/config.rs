@@ -188,9 +188,10 @@ impl PrivateChannelIndexerConfig {
 /// all read as different here. Treat it as a guard against the obvious copy-paste, not as
 /// an independence check.
 ///
-/// Which URL is the block source depends on the datasource. Live polling fetches from
-/// `common.rpc_url`, while Yellowstone streams its blocks and reaches RPC only through the
-/// reconnect gap-fill, which uses `backfill.rpc_url`.
+/// Which URLs serve blocks depends on the datasource. Live polling fetches from
+/// `common.rpc_url` and its startup backfill from `backfill.rpc_url`, so both count.
+/// Yellowstone streams its blocks and reaches RPC only through `backfill.rpc_url`, which
+/// serves both its reconnect gap-fill and its startup backfill.
 pub fn validate_fallback_endpoint(
     common: &PrivateChannelIndexerConfig,
     indexer: &IndexerConfig,
@@ -200,13 +201,15 @@ pub fn validate_fallback_endpoint(
     };
     let fallback = fallback.trim_end_matches('/');
 
-    let primary = match indexer.datasource_type {
-        DatasourceType::RpcPolling => common.rpc_url.trim(),
-        DatasourceType::Yellowstone => indexer.backfill.rpc_url.trim(),
-    }
-    .trim_end_matches('/');
+    let sources: &[&str] = match indexer.datasource_type {
+        DatasourceType::RpcPolling => &[common.rpc_url.trim(), indexer.backfill.rpc_url.trim()],
+        DatasourceType::Yellowstone => &[indexer.backfill.rpc_url.trim()],
+    };
 
-    if fallback == primary {
+    if let Some(primary) = sources
+        .iter()
+        .find(|source| source.trim_end_matches('/') == fallback)
+    {
         return Err(format!(
             "fallback_rpc_url must differ from the block source ({primary}): failing over to the \
              same node re-fetches from the endpoint that just failed"
@@ -484,6 +487,26 @@ mod tests {
         assert!(
             err.contains(&indexer.backfill.rpc_url),
             "the error must name the gap-fill block source: {err}"
+        );
+    }
+
+    /// Startup backfill fetches from `backfill.rpc_url` whatever the datasource, so under
+    /// polling that is a second block source. A fallback pointed at it re-fetches from the
+    /// endpoint that just served the slot unusably, which is the boot loop this check exists
+    /// to prevent, with a failover in the config making it look handled.
+    #[test]
+    fn fallback_equal_to_the_startup_fill_source_is_refused() {
+        let startup_fill_url = "http://backfill-node:8899";
+        let mut common = create_common_config();
+        common.fallback_rpc_url = Some(startup_fill_url.to_string());
+        let mut indexer = create_indexer_config();
+        indexer.backfill.rpc_url = startup_fill_url.to_string();
+
+        let err = validate_fallback_endpoint(&common, &indexer).unwrap_err();
+
+        assert!(
+            err.contains(startup_fill_url),
+            "the error must name the startup fill's block source: {err}"
         );
     }
 
