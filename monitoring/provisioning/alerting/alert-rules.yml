@@ -374,3 +374,76 @@ groups:
                     type: gt
                     params: [0]
               refId: C
+
+  - orgId: 1
+    name: bitmap-rotation-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: rotation-lost
+        title: "Bitmap rotation abandoned; a generation stays shut"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) gave up on a bitmap rotation after repeated send failures. Nothing else re-dispatches one, so every withdrawal nonce in the unopened generation is unreleasable until a rotation lands. Check the destination RPC, the signers and the fee payer balance, then restart the operator: the rotation driver re-derives what is owed from the unreleased nonce bounds at boot."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_lost"}[10m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: rotation-blocked-by-lower-nonce
+        title: "Bitmap rotation withheld: a lower nonce still owes a release"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) is withholding a rotation because a withdrawal on the current generation has not released yet. Withholding is the safe outcome, not a fault: rotating would shut the generation that release must land on. It only pages when it persists, which means the blocking withdrawal is stuck. The blocking nonce is in the sender log. Resolve that withdrawal, by releasing it or letting its remint finish, and the rotation proceeds on its own."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}[15m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
