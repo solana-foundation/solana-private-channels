@@ -24,3 +24,7 @@ keys.txt
 # Editor / OS noise.
 .DS_Store
 *.swp
+
+# Per-environment inventories carry real host IPs. inventory.ini stays the
+# tracked placeholder.
+inventory.*.ini
