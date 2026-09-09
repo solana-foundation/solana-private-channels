@@ -9,6 +9,7 @@
 
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
+    private_channel_indexer::operator::utils::instruction_util::TransactionBuilder,
     private_channel_indexer::{
         config::{PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator::{
@@ -23,7 +24,10 @@ use {
     },
     serde_json::json,
     solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey},
-    std::sync::{Arc, Once},
+    std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, Once,
+    },
     test_utils::mock_rpc::{MockRpcServer, Reply},
 };
 
@@ -253,5 +257,187 @@ async fn rotation_is_re_derived_after_a_restart_that_dropped_the_arm() {
     assert!(
         restarted.pending_rotation.is_some(),
         "a restart must rebuild the rotation from the database and the chain"
+    );
+}
+
+/// The chain, as far as the sender can tell: a generation, and a record of the
+/// generation every rotation was signed against.
+#[derive(Clone, Default)]
+struct FakeChain {
+    generation: Arc<AtomicU64>,
+    signed: Arc<Mutex<Vec<u64>>>,
+    last_refused: Arc<AtomicBool>,
+}
+
+/// The one argument of the `RotateBitmap` instruction in a signed transaction,
+/// little-endian after the one-byte discriminator. Compute-budget instructions
+/// share that shape, so the program id is what picks the rotation out.
+fn signed_generation(encoded_tx: &str) -> u64 {
+    let bytes = STANDARD
+        .decode(encoded_tx)
+        .expect("valid base64 transaction");
+    let tx: solana_sdk::transaction::VersionedTransaction =
+        bincode::deserialize(&bytes).expect("valid wire transaction");
+    let keys = tx.message.static_account_keys();
+    let data = tx
+        .message
+        .instructions()
+        .iter()
+        .find(|ix| keys[ix.program_id_index as usize] != solana_sdk::compute_budget::id())
+        .map(|ix| ix.data.clone())
+        .expect("the transaction must carry a rotation instruction");
+    u64::from_le_bytes(data[1..9].try_into().unwrap())
+}
+
+/// Script the whole send path against `chain`, enough times for two dispatches
+/// and their confirmation polls.
+fn script_chain(rpc: &MockRpcServer, chain: &FakeChain) {
+    const ROUNDS: usize = 64;
+
+    let gen_for_account = chain.generation.clone();
+    rpc.enqueue_sequence(
+        "getAccountInfo",
+        std::iter::repeat_with(|| {
+            let generation = gen_for_account.clone();
+            Reply::dynamic(move |_| {
+                let data = bitmap_account_bytes(generation.load(Ordering::SeqCst), &[], 255);
+                json!({
+                    "context": { "slot": 100 },
+                    "value": {
+                        "data": [STANDARD.encode(&data), "base64"],
+                        "executable": false,
+                        "lamports": 1_461_600u64,
+                        "owner": Pubkey::new_unique().to_string(),
+                        "rentEpoch": 0u64,
+                        "space": data.len(),
+                    }
+                })
+            })
+        })
+        .take(ROUNDS),
+    );
+
+    rpc.enqueue_sequence(
+        "getLatestBlockhash",
+        std::iter::repeat_with(|| {
+            Reply::result(json!({
+                "context": { "slot": 100 },
+                "value": {
+                    "blockhash": "GHtXQBsoZHjzkAm2Sdm6FTyFHBCqBnLanJJhZFCFJXoe",
+                    "lastValidBlockHeight": 1_000u64
+                }
+            }))
+        })
+        .take(ROUNDS),
+    );
+
+    // Stands in for the program's generation check: a rotation bound to the
+    // generation the chain is on lands and advances it, anything else is a
+    // duplicate the program refuses.
+    let send_chain = chain.clone();
+    rpc.enqueue_sequence(
+        "sendTransaction",
+        std::iter::repeat_with(move || {
+            let chain = send_chain.clone();
+            Reply::dynamic(move |req| {
+                let encoded = req["params"][0].as_str().expect("encoded transaction");
+                let signed = signed_generation(encoded);
+                chain.signed.lock().unwrap().push(signed);
+                let accepted = chain
+                    .generation
+                    .compare_exchange(signed, signed + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+                chain.last_refused.store(!accepted, Ordering::SeqCst);
+                let bytes = STANDARD.decode(encoded).unwrap();
+                json!(bs58::encode(&bytes[1..65]).into_string())
+            })
+        })
+        .take(ROUNDS),
+    );
+
+    // A refused rotation comes back as UnexpectedGeneration (custom code 14).
+    // An accepted one is never observed at all, which is the case that drives
+    // the sender into its re-arm while the rotation has in fact landed.
+    let status_chain = chain.clone();
+    rpc.enqueue_sequence(
+        "getSignatureStatuses",
+        std::iter::repeat_with(move || {
+            let refused = status_chain.last_refused.clone();
+            Reply::dynamic(move |_| {
+                let value = if refused.load(Ordering::SeqCst) {
+                    json!([{
+                        "slot": 100,
+                        "confirmations": null,
+                        "confirmationStatus": "finalized",
+                        "err": { "InstructionError": [0, { "Custom": 14 }] },
+                        "status": { "Err": { "InstructionError": [0, { "Custom": 14 }] } }
+                    }])
+                } else {
+                    json!([null])
+                };
+                json!({ "context": { "slot": 100 }, "value": value })
+            })
+        })
+        .take(ROUNDS),
+    );
+}
+
+/// A rotation can land and still be reported failed, because the operator only
+/// ever sees the confirmation. Re-binding the re-armed rotation to the chain's
+/// new generation would make that replay look legitimate and close a second
+/// window nobody opened, stranding every nonce numbered into it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotation_reported_failed_after_it_landed_is_refused_not_rebound() {
+    let (storage, pool, _pg) = start_pg("rotation_landed_but_reported_failed").await;
+    let rpc = MockRpcServer::start().await;
+    let chain = FakeChain::default();
+    script_chain(&rpc, &chain);
+
+    seed_withdrawal(&storage, &pool, "w1", next_generation_nonce(1), "pending").await;
+
+    let mut state = build_sender(storage, rpc.url());
+    let (storage_tx, _storage_rx) = tokio::sync::mpsc::channel(16);
+
+    test_hooks::originate_rotation_if_needed(&mut state).await;
+    let first = test_hooks::take_pending_rotation_if_ready(&mut state)
+        .await
+        .expect("a rotation must be armed");
+    test_hooks::submit_transaction(
+        &mut state,
+        TransactionBuilder::RotateBitmap(first),
+        &storage_tx,
+    )
+    .await;
+
+    assert_eq!(
+        chain.generation.load(Ordering::SeqCst),
+        1,
+        "the first rotation must land on chain"
+    );
+    let rearmed = state
+        .pending_rotation
+        .take()
+        .expect("an unconfirmed rotation must be re-armed");
+
+    test_hooks::submit_transaction(
+        &mut state,
+        TransactionBuilder::RotateBitmap(rearmed),
+        &storage_tx,
+    )
+    .await;
+
+    assert_eq!(
+        *chain.signed.lock().unwrap(),
+        vec![0, 0],
+        "the re-armed rotation must be signed against its original generation"
+    );
+    assert_eq!(
+        chain.generation.load(Ordering::SeqCst),
+        1,
+        "the replay must be refused, leaving the chain one generation ahead, not two"
+    );
+    assert!(
+        state.pending_rotation.is_none() && state.rotation_in_flight.is_none(),
+        "a rotation refused as a duplicate is settled, not owed"
     );
 }

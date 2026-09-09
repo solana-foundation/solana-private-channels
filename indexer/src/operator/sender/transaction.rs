@@ -126,21 +126,28 @@ impl SenderState {
                 // a replayed rotation is rejected rather than skipping a whole
                 // generation of nonces that could then never be released.
                 //
-                // Read fresh every time rather than taking the cached value.
-                // This is the one place a wrong generation would be written on
-                // chain and left there, instead of being handed straight back
-                // by the program as a refusal the sender can act on.
-                let expected_generation = match self.refresh_generation().await {
-                    Ok(generation) => generation,
-                    // Nothing re-dispatches a rotation once the boundary row has
-                    // been processed, so dropping it here would leave the next
-                    // generation closed and every withdrawal in it refused.
-                    // Park it for the tick to retry instead.
-                    Err(e) => {
-                        self.pending_rotation = Some(builder);
-                        return Err(e);
-                    }
+                // A re-arm keeps the binding it already has. A rotation reported
+                // failed may still have landed, and rebinding it to the chain's
+                // new generation is what would turn that replay into a skip.
+                let expected_generation = match self.rotation_bound_generation {
+                    Some(bound) => bound,
+                    // Read fresh rather than taking the cached value. This is the
+                    // one place a wrong generation would be written on chain and
+                    // left there, instead of being handed straight back by the
+                    // program as a refusal the sender can act on.
+                    None => match self.refresh_generation().await {
+                        Ok(generation) => generation,
+                        // Nothing re-dispatches a rotation once the boundary row
+                        // has been processed, so dropping it here would leave the
+                        // next generation closed and every withdrawal in it
+                        // refused. Park it for the tick to retry instead.
+                        Err(e) => {
+                            self.pending_rotation = Some(builder);
+                            return Err(e);
+                        }
+                    },
                 };
+                self.rotation_bound_generation = Some(expected_generation);
                 builder.expected_generation(expected_generation);
 
                 // Kept because a rotation that fails has nothing else to rebuild it from.
@@ -471,6 +478,7 @@ fn clear_rotation_retry_state(state: &mut SenderState, ctx: &TransactionContext)
         state.rotation_retry_attempts = 0;
         state.rotation_rearm_attempts = 0;
         state.rotation_in_flight = None;
+        state.rotation_bound_generation = None;
     }
 }
 
@@ -491,6 +499,9 @@ fn rearm_failed_rotation(state: &mut SenderState, error_msg: &str) {
              unopened generation stays unreleasable until a rotation lands."
         );
         state.rotation_in_flight = None;
+        // The replacement rotation is a different one, so it must bind from its
+        // own read rather than inherit the abandoned rotation's generation.
+        state.rotation_bound_generation = None;
         // The driver starts a fresh rotation once nothing is in flight, and a
         // count left at the limit would abandon that one on its first failure.
         state.rotation_rearm_attempts = 0;
@@ -2444,8 +2455,9 @@ mod tests {
     use super::*;
     use crate::config::ProgramType;
     use crate::operator::sender::test_support::{
-        ensure_test_signer, mock_bitmap_account, mock_initialized_mint, mock_with_processing_row,
-        push_processing_deposit_row, push_withdrawal_with_nonce, row_status, row_updated_at,
+        ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
+        mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
+        push_withdrawal_with_nonce, row_status, row_updated_at,
         sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
@@ -7296,6 +7308,108 @@ mod tests {
             "the rotation must carry the generation the chain reported"
         );
         bitmap.assert();
+    }
+
+    /// A rotation that lands but is reported failed comes back through the
+    /// re-arm. Rebinding it to the generation it just created would make the
+    /// duplicate look legitimate and close a whole window nobody opened.
+    #[tokio::test]
+    async fn a_re_armed_rotation_keeps_the_generation_it_was_bound_to() {
+        let mut server = mockito::Server::new_async().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        // Answers the generation the landed rotation moved the chain to.
+        let _bitmap = mock_bitmap_account_counted(&mut server, 4, reads.clone());
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.program_type = ProgramType::Withdraw;
+        state.rotation_in_flight = Some(rotation_builder());
+        state.rotation_bound_generation = Some(3);
+
+        rearm_failed_rotation(&mut state, "reported failed after it landed");
+        let parked = state
+            .pending_rotation
+            .take()
+            .expect("the failed rotation must be re-armed");
+
+        let instruction = state
+            .handle_transaction_builder(TransactionBuilder::RotateBitmap(parked))
+            .await
+            .expect("a re-armed rotation must still dispatch");
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "a re-armed rotation must not re-read the chain for a generation"
+        );
+        let data = &instruction.instructions[0].data;
+        assert_eq!(
+            u64::from_le_bytes(data[1..9].try_into().unwrap()),
+            3,
+            "the re-armed rotation must carry its original generation, so the program refuses it"
+        );
+    }
+
+    /// The first dispatch of a rotation has nothing bound yet, so it must read
+    /// the chain and remember what it bound for any later re-arm.
+    #[tokio::test]
+    async fn a_fresh_rotation_reads_the_chain_and_records_what_it_bound() {
+        let mut server = mockito::Server::new_async().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let _bitmap = mock_bitmap_account_counted(&mut server, 7, reads.clone());
+
+        let mut state = make_sender_state_with_server(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+
+        state
+            .handle_transaction_builder(TransactionBuilder::RotateBitmap(rotation_builder()))
+            .await
+            .expect("a readable bitmap must produce a rotation");
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "an unbound rotation must read the chain exactly once"
+        );
+        assert_eq!(
+            state.rotation_bound_generation,
+            Some(7),
+            "the binding must be recorded so a re-arm can reuse it"
+        );
+    }
+
+    /// A settled rotation must not lend its binding to the next one, or the
+    /// rotation after it is sent against a generation the chain has left.
+    #[tokio::test]
+    async fn a_settled_rotation_releases_its_binding() {
+        let mut state = make_sender_state();
+        state.rotation_bound_generation = Some(3);
+
+        clear_rotation_retry_state(&mut state, &rotation_ctx());
+
+        assert_eq!(
+            state.rotation_bound_generation, None,
+            "the next rotation must read the chain rather than inherit a binding"
+        );
+    }
+
+    /// Abandoning a rotation ends its life just as completing one does, so the
+    /// fresh rotation the driver starts next has to bind from a real read.
+    #[tokio::test]
+    async fn abandoning_a_rotation_releases_its_binding() {
+        let mut state = make_sender_state();
+        state.program_type = ProgramType::Withdraw;
+        state.rotation_in_flight = Some(rotation_builder());
+        state.rotation_bound_generation = Some(3);
+        state.rotation_rearm_attempts = MAX_ROTATION_REARMS;
+
+        rearm_failed_rotation(&mut state, "send failed");
+
+        assert!(state.pending_rotation.is_none());
+        assert_eq!(
+            state.rotation_bound_generation, None,
+            "an abandoned rotation must not bind the one that replaces it"
+        );
     }
 
     /// A confirmed rotation is the one event that moves the window without a

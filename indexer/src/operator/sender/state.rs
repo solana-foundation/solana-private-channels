@@ -80,6 +80,7 @@ impl SenderState {
             retry_counts: HashMap::new(),
             rotation_retry_attempts: 0,
             rotation_in_flight: None,
+            rotation_bound_generation: None,
             rotation_rearm_attempts: 0,
             rotation_blocked_passes: 0,
             mint_cache,
@@ -209,7 +210,12 @@ pub(crate) async fn validate_bitmap_consistency(
         "Validating withdrawal bitmap against completed withdrawals"
     );
 
-    let bitmap = fetch_consumed_nonces(rpc_client, &bitmap_pda, None).await?;
+    let bitmap = fetch_consumed_nonces(
+        rpc_client,
+        &bitmap_pda,
+        Some(finalized_anchor(rpc_client).await?),
+    )
+    .await?;
     let (mut db_only, mut chain_only) = diff_bitmap(storage, &bitmap).await?;
 
     // The bitmap and the database are read at different instants, so a release
@@ -302,13 +308,38 @@ pub(crate) async fn validate_bitmap_consistency(
     Ok(())
 }
 
+/// The finalized context slot to bind a bitmap read to. Behind a load balancer
+/// two calls can land on different backends, and a lagging one shows clear bits
+/// for nonces that were released; bound to this slot it errors instead.
+async fn finalized_anchor(rpc_client: &RpcClientWithRetry) -> Result<u64, OperatorError> {
+    rpc_client
+        .get_latest_blockhash_with_context(CommitmentConfig::finalized())
+        .await
+        .map(|(slot, _)| slot)
+        .map_err(|e| {
+            crate::error::ProgramError::BitmapUnavailable {
+                reason: format!("finalized anchor read failed: {e}"),
+            }
+            .into()
+        })
+}
+
 /// Take the confirmatory second read and re-diff it against the database.
+///
+/// The anchor is taken fresh here on purpose. The re-read exists to give a
+/// release racing the first read a chance to land, and reusing the first slot
+/// would return the identical snapshot.
 async fn confirm_divergence(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
 ) -> Result<(Vec<u64>, Vec<u64>), OperatorError> {
-    let bitmap = fetch_consumed_nonces(rpc_client, bitmap_pda, None).await?;
+    let bitmap = fetch_consumed_nonces(
+        rpc_client,
+        bitmap_pda,
+        Some(finalized_anchor(rpc_client).await?),
+    )
+    .await?;
     diff_bitmap(storage, &bitmap).await
 }
 
@@ -783,8 +814,9 @@ impl SenderState {
 mod tests {
     use super::*;
     use crate::operator::sender::test_support::{
-        mock_bitmap_account, mock_bitmap_sequence, mock_bitmap_then_read_failure,
-        sender_state_with_storage, sender_state_with_storage_and_role,
+        mock_bitmap_account, mock_bitmap_at_slot, mock_bitmap_sequence,
+        mock_bitmap_then_read_failure, mock_finalized_anchor, sender_state_with_storage,
+        sender_state_with_storage_and_role,
     };
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
@@ -1544,6 +1576,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_identical_sets_pass() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[1, 3]);
 
         let mock = MockStorage::new();
@@ -1572,6 +1605,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_chain_ahead_completes_and_starts() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let landed = Signature::new_unique();
         let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
         let _statuses = server
@@ -1626,6 +1660,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_chain_ahead_without_signatures_escalates() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
 
         let mock = MockStorage::new();
@@ -1733,6 +1768,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_reminted_row_with_consumed_nonce_halts() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
 
         let mock = MockStorage::new();
@@ -1771,6 +1807,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_chain_ahead_on_terminal_row_alerts() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let landed = Signature::new_unique();
         let _bitmap = mock_bitmap_account(&mut server, 0, &[2]);
         let _statuses = server
@@ -1834,6 +1871,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_db_ahead_halts_when_the_reread_fails() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let (_bitmap, reads) = mock_bitmap_then_read_failure(&mut server, 0, &[]);
 
         let mock = MockStorage::new();
@@ -1866,6 +1904,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_db_ahead_halts() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
 
         let mock = MockStorage::new();
@@ -1898,6 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_both_directions_halts() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let _bitmap = mock_bitmap_account(&mut server, 0, &[6]);
 
         let mock = MockStorage::new();
@@ -1934,6 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_db_ahead_rereads_before_halting() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         // First read predates the release, second sees it. That is the race.
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(0, vec![]), (0, vec![4])]);
 
@@ -1968,6 +2009,7 @@ mod tests {
     #[tokio::test]
     async fn validate_bitmap_consistency_db_ahead_halts_after_reread_confirms() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![1]);
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(0, vec![])]);
 
         let mock = MockStorage::new();
@@ -1990,5 +2032,78 @@ mod tests {
             OperatorError::Program(crate::error::ProgramError::BitmapDivergence { .. })
         ));
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    /// Behind a load balancer the bitmap can come from a backend that has not
+    /// caught up, and its clear bits read as a database claiming releases the
+    /// chain never made. Binding both reads to a proven slot makes a lagging
+    /// backend error instead. The confirmation takes its own anchor, because
+    /// re-reading at the first slot would return the identical snapshot.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_binds_both_reads_to_a_proven_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500, 900]);
+        let boot = mock_bitmap_at_slot(&mut server, 500, 0, &[]);
+        let reread = mock_bitmap_at_slot(&mut server, 900, 0, &[4]);
+
+        let mock = MockStorage::new();
+        seed_withdrawal(&mock, 5, 4, TransactionStatus::Completed, None);
+        let state = sender_state_with_storage(&server.url(), mock);
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        let result = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a re-read at a fresh anchor must clear the divergence: {result:?}"
+        );
+        boot.assert();
+        reread.assert();
+    }
+
+    /// The anchor is what makes the bitmap trustworthy, so without one there is
+    /// nothing to diff against. The check reports that it could not run, the
+    /// same way an unreadable bitmap does, rather than clearing a boot on bits
+    /// no one proved were current.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_gives_no_verdict_when_the_anchor_read_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _down = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(500)
+            .with_body("boom")
+            .create();
+        // Agrees with the database, so an unanchored read would start cleanly.
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let state = sender_state_with_storage(&server.url(), MockStorage::new());
+        let (storage_tx, _rx) = mpsc::channel(8);
+
+        let err = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                OperatorError::Program(crate::error::ProgramError::BitmapUnavailable { .. })
+            ),
+            "an unanchored bitmap must yield no verdict: {err:?}"
+        );
     }
 }

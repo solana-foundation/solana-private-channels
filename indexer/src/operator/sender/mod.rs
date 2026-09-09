@@ -153,6 +153,17 @@ pub mod test_hooks {
         .await
     }
 
+    /// Drives a whole submission: builds the instruction and then sends and
+    /// confirms it. This is the only path that binds a rotation to a generation,
+    /// so it is what a re-arm has to be driven through.
+    pub async fn submit_transaction(
+        state: &mut SenderState,
+        tx_builder: TransactionBuilder,
+        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ) {
+        super::transaction::handle_transaction_submission(state, tx_builder, storage_tx).await
+    }
+
     /// Drives one pass of the rotation driver: reads what is still unreleased,
     /// compares it against the chain, and arms a rotation if one is owed.
     pub async fn originate_rotation_if_needed(state: &mut SenderState) {

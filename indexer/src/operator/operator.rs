@@ -585,6 +585,33 @@ mod tests {
         )
     }
 
+    /// The finalized anchor the boot bitmap read is bound to. Without it the
+    /// read is refused as unanchored and the pre-flight never runs its diff.
+    fn mock_finalized_anchor(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 900},
+                        "value": {
+                            "blockhash": "11111111111111111111111111111111",
+                            "lastValidBlockHeight": 1_000u64
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create()
+    }
+
     fn mock_bitmap_account(
         server: &mut mockito::ServerGuard,
         generation: u64,
@@ -675,6 +702,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_starts_when_bitmap_agrees_with_db() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[]);
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(result.is_ok(), "agreeing state must start: {result:?}");
@@ -686,6 +714,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_starts_when_bitmap_not_found() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_not_found(&mut server);
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(
@@ -699,6 +728,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_starts_when_chain_is_ahead() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let result = run_preflight(make_rpc_client(&server.url())).await;
         assert!(
@@ -712,6 +742,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_refuses_to_start_when_db_is_ahead() {
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[]);
 
         let mock = MockStorage::new();
@@ -826,6 +857,7 @@ mod tests {
         let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
         let mock = preflight_fixture(7, &landed_sig);
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let _status = mock_signature_statuses(&mut server, 200, FINALIZED_SUCCESS);
 
@@ -857,6 +889,7 @@ mod tests {
         let landed_sig = solana_sdk::signature::Signature::new_unique().to_string();
         let mock = preflight_fixture(7, &landed_sig);
         let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server);
         let _account = mock_bitmap_account(&mut server, 0, &[7]);
         let _status = mock_signature_statuses(&mut server, 500, "internal server error");
 

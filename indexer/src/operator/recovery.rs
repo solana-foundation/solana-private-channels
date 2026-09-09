@@ -2872,6 +2872,7 @@ mod tests {
         let landed_nonce: u64 = 3;
 
         let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_finalized_blockhash(&mut server, 1000);
         let _status = mock_finalized_status(&mut server);
         let _account = mock_bitmap_account(&mut server, &[landed_nonce]);
 
@@ -2926,6 +2927,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_refuses_start_on_unreconcilable_mismatch() {
         let mut server = mockito::Server::new_async().await;
+        let _blockhash = mock_finalized_blockhash(&mut server, 1000);
         // Nothing consumed on-chain, so the Completed row below has no bit.
         let _account = mock_bitmap_account(&mut server, &[]);
 

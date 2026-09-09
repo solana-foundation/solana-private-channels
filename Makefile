@@ -258,6 +258,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test mint_builder_validation -- --nocapture
 	@cd integration && cargo test --test sender_channel_close -- --nocapture
 	@cd integration && cargo test --test sender_cancellation_drain -- --nocapture
+	@cd integration && cargo test --test rotation_driver_e2e -- --nocapture
 
 # Backward-compatible aliases.
 unit-test-ci: ci-unit-test

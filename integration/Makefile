@@ -78,6 +78,7 @@ integration-test:
 	@cargo test --test mint_builder_validation -- --nocapture
 	@cargo test --test sender_channel_close -- --nocapture
 	@cargo test --test sender_cancellation_drain -- --nocapture
+	@cargo test --test rotation_driver_e2e -- --nocapture
 
 # Format and lint code
 fmt:
@@ -305,6 +306,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test sender_channel_close -- --nocapture
 	@echo "Running sender cancellation-drain tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_cancellation_drain -- --nocapture
+	@echo "Running rotation-driver E2E tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test rotation_driver_e2e -- --nocapture
 
 integration-coverage-report:
 	@echo "Generating combined integration E2E coverage report..."

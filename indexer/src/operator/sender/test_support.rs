@@ -83,6 +83,7 @@ pub(super) fn sender_state_with_storage_and_role(
         retry_counts: HashMap::new(),
         rotation_retry_attempts: 0,
         rotation_in_flight: None,
+        rotation_bound_generation: None,
         rotation_rearm_attempts: 0,
         rotation_blocked_passes: 0,
         mint_builders: HashMap::new(),
@@ -239,6 +240,60 @@ pub(super) fn mock_bitmap_account(
         ))
         .with_status(200)
         .with_body(bitmap_account_response(generation, consumed))
+        .create()
+}
+
+/// A finalized `getLatestBlockhash` whose context slot is the anchor an
+/// anchored bitmap read has to carry. Successive calls walk `slots`, so a test
+/// can prove a re-read takes a fresh anchor instead of reusing the first.
+pub(super) fn mock_finalized_anchor(
+    server: &mut mockito::ServerGuard,
+    slots: Vec<u64>,
+) -> mockito::Mock {
+    let calls = Arc::new(AtomicUsize::new(0));
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+        ))
+        .with_status(200)
+        .with_body_from_request(move |_| {
+            let i = calls.fetch_add(1, Ordering::SeqCst).min(slots.len() - 1);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "context": {"slot": slots[i]},
+                    "value": {
+                        "blockhash": "11111111111111111111111111111111",
+                        "lastValidBlockHeight": 1_000u64
+                    }
+                }
+            })
+            .to_string()
+            .into_bytes()
+        })
+        .expect_at_least(1)
+        .create()
+}
+
+/// A bitmap that answers only a read bound to `slot`. An unanchored read finds
+/// no matching mock and errors, which is what a lagging backend would do.
+pub(super) fn mock_bitmap_at_slot(
+    server: &mut mockito::ServerGuard,
+    slot: u64,
+    generation: u64,
+    consumed: &[u64],
+) -> mockito::Mock {
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+            mockito::Matcher::Regex(format!(r#""minContextSlot"\s*:\s*{slot}\b"#)),
+        ]))
+        .with_status(200)
+        .with_body(bitmap_account_response(generation, consumed))
+        .expect(1)
         .create()
 }
 

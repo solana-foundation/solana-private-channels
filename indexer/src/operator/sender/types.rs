@@ -188,6 +188,10 @@ pub struct SenderState {
     pub rotation_retry_attempts: u32,
     /// The rotation last dispatched, kept because nothing else can re-dispatch one that failed.
     pub rotation_in_flight: Option<Box<RotateBitmapBuilder>>,
+    /// The generation that rotation was bound to. It survives a re-arm on
+    /// purpose: rebinding a rotation that already landed would make the replay
+    /// look legitimate and close a generation nobody ever opened.
+    pub rotation_bound_generation: Option<u64>,
     /// Times that rotation has been put back on the tick, so a hopeless one stops being retried.
     pub rotation_rearm_attempts: u32,
     /// Consecutive gate passes that withheld a rotation. Crossing a boundary
