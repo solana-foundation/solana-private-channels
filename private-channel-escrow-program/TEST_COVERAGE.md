@@ -6,16 +6,16 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                       |
-| ----------------------------- | ------------ | ------------------------------------------------------------- |
-| Instruction handlers          | 100% (9/9)   | All handlers have success + error tests                       |
-| Account validation paths      | 95% (19/20)  | Signer, PDA, owner, mutability, ATA program, system program   |
-| Business logic error branches | 93% (14/15)  | Nonce replay, balance verification, Token2022 extensions      |
-| Custom error codes exercised  | 100% (13/13) | All custom errors tested                                      |
-| State & trait coverage (unit) | 100% (14/14) | Instruction data parsing for all handlers                     |
-| Event coverage                | 100% (9/9)   | All events emitted in integration tests                       |
+| Category                      | Coverage     | Details                                                        |
+| ----------------------------- | ------------ | -------------------------------------------------------------- |
+| Instruction handlers          | 100% (9/9)   | All handlers have success + error tests                        |
+| Account validation paths      | 95% (19/20)  | Signer, PDA, owner, mutability, ATA program, system program    |
+| Business logic error branches | 93% (14/15)  | Nonce replay, balance verification, Token2022 extensions       |
+| Custom error codes exercised  | 100% (13/13) | All custom errors tested                                       |
+| State & trait coverage (unit) | 100% (14/14) | Instruction data parsing for all handlers                      |
+| Event coverage                | 100% (9/9)   | All events emitted in integration tests                        |
 | Security edge cases           | 100% (14/14) | Double-spend, foreign bitmap, Token2022, generation boundaries |
-| **Overall (risk-weighted)**   | **~95%**     |                                                               |
+| **Overall (risk-weighted)**   | **~95%**     |                                                                |
 
 > The percentages above predate the SMT-to-bitmap migration and have not been
 > re-derived against the current surface. The inventory below is accurate.

@@ -8,11 +8,11 @@ Stateful fuzz tests for the escrow program using [Trident](https://github.com/Ac
 
 Tests the core escrow lifecycle in a single bitmap generation.
 
-| Flow                | Description                                                                                                |
-| ------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `fuzz_deposit`      | Deposits a random amount. Asserts exact ATA balance movement.                                              |
-| `fuzz_release`      | 50% valid release / 50% release against a foreign bitmap. Asserts success/failure and balance invariants.  |
-| `fuzz_double_spend` | Replays a previously successful release verbatim — must always be rejected.                                |
+| Flow                | Description                                                                                               |
+| ------------------- | --------------------------------------------------------------------------------------------------------- |
+| `fuzz_deposit`      | Deposits a random amount. Asserts exact ATA balance movement.                                             |
+| `fuzz_release`      | 50% valid release / 50% release against a foreign bitmap. Asserts success/failure and balance invariants. |
+| `fuzz_double_spend` | Replays a previously successful release verbatim — must always be rejected.                               |
 
 **Final invariant:** `escrow_balance == total_deposited - total_released`
 
@@ -20,13 +20,13 @@ Tests the core escrow lifecycle in a single bitmap generation.
 
 Tests the bitmap rotation lifecycle across multiple generations.
 
-| Flow                 | Description                                                                                      |
-| -------------------- | -------------------------------------------------------------------------------------------------- |
-| `fuzz_deposit`       | Deposits a random amount.                                                                        |
-| `fuzz_release`       | Valid release within the current generation. Skipped silently if preconditions aren't met.       |
-| `fuzz_replay_nonce`  | Replays a nonce already consumed in this generation — must always be rejected.                   |
-| `fuzz_rotate_bitmap` | Clears the on-chain bitmap and advances the generation. Asserts balances are unaffected.         |
-| `fuzz_stale_nonce`   | Attempts a release with a nonce from the previous generation — must always be rejected.          |
+| Flow                 | Description                                                                                |
+| -------------------- | ------------------------------------------------------------------------------------------ |
+| `fuzz_deposit`       | Deposits a random amount.                                                                  |
+| `fuzz_release`       | Valid release within the current generation. Skipped silently if preconditions aren't met. |
+| `fuzz_replay_nonce`  | Replays a nonce already consumed in this generation — must always be rejected.             |
+| `fuzz_rotate_bitmap` | Clears the on-chain bitmap and advances the generation. Asserts balances are unaffected.   |
+| `fuzz_stale_nonce`   | Attempts a release with a nonce from the previous generation — must always be rejected.    |
 
 **Final invariant:** `escrow_balance == total_deposited - total_released`
 
