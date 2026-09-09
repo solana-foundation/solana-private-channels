@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
 // PrivateChannel Escrow Program ID
-pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
+pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK";
 
 // Instruction discriminators (from IDL)
 const CREATE_INSTANCE: u8 = 0;

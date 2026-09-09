@@ -178,7 +178,7 @@ Within the payment channel, transactions are processed through a **five-stage pi
 
 ### Solana Private Channels Escrow/Withdrawal Programs
 
-- **Solana Private Channels Escrow Program**: Mainnet token custody with on-chain nonce replay protection (Program ID: `9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU`)
+- **Solana Private Channels Escrow Program**: Mainnet token custody with on-chain nonce replay protection (Program ID: `8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK`)
 - **Solana Private Channels Withdrawal Program**: Channel withdrawal processing (token burning) (Program ID: `J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi`)
 
 ### Indexer

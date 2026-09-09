@@ -55,7 +55,7 @@ const DISC_RELEASE_FUNDS: u8 = 7;
 const DISC_ROTATE_BITMAP: u8 = 8;
 
 /// Known program IDs
-const ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
+const ESCROW_PROGRAM_ID: &str = "8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 // ---------------------------------------------------------------------------

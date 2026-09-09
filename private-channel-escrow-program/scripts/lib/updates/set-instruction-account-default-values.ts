@@ -11,11 +11,11 @@ import {
     setInstructionAccountDefaultValuesVisitor,
 } from 'codama';
 
-const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID = '9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU';
+const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID = '8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK';
 const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-const EVENT_AUTHORITY_PDA = 'FngERuuhrF13VUpEVuTgVrBH9TM861Wwzr9d6qMSVjMd';
+const EVENT_AUTHORITY_PDA = '8WtLfmC99djequwMiicZij6p6t1hsyhUDqSSwJoAvJEK';
 
 function createAtaPdaValueNode(ownerAccount: string, mintAccount: string, tokenProgram: string) {
     return pdaValueNode(

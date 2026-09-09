@@ -2,5 +2,5 @@
 enabled = true
 
 [[fuzz.programs]]
-address = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU"
+address = "8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK"
 program = "../../../target/deploy/private_channel_escrow_program.so"

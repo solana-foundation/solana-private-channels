@@ -37,7 +37,7 @@ const MIN_LAMPORTS: u64 = 500_000_000;
 
 pub const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: Pubkey =
-    pubkey!("9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU");
+    pubkey!("8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK");
 pub const TOKEN_2022_PROGRAM_ID: Pubkey = spl_token_2022::ID;
 
 // PrivateChannel Escrow Program Error Codes (using generated error enum)

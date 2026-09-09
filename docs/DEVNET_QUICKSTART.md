@@ -8,7 +8,7 @@ Solana Private Channels is a private payment channel with direct access to Solan
 
 **Architecture Overview:**
 
-- **Escrow Program**: On-chain Solana program that holds deposited tokens (Devnet Program ID: `9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU`)
+- **Escrow Program**: On-chain Solana program that holds deposited tokens (Devnet Program ID: `8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK`)
 - **Solana Private Channels Payment Channel**: Private execution environment (write node, read node, gateway)
 - **Indexer** (2 instances): `indexer-solana` watches the Escrow program on Solana for deposits; `indexer-private-channel` watches the Withdraw program on the Solana Private Channels payment channel for withdrawals
 - **Operator** (2 instances): `operator-solana` processes deposits (mints on the Solana Private Channels payment channel); `operator-private-channel` processes withdrawals (releases from escrow on Solana)
@@ -42,7 +42,7 @@ The escrow/withdraw programs are already deployed on Devnet at their canonical I
 **Check staleness** — compare the on-chain deploy point to your source:
 
 ```shell
-solana program show 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU --url devnet   # note "Last Deployed In Slot"
+solana program show 8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK --url devnet   # note "Last Deployed In Slot"
 solana block-time <that-slot> --url devnet                                       # -> deploy date
 git log -1 --format="%ci %s" -- private-channel-escrow-program/program           # source last-changed date
 ```
@@ -54,7 +54,7 @@ If the source date is newer than the deploy date, the on-chain program is stale.
 ```shell
 make build-devnet          # rebuild both program .so files from current source
 solana program deploy target/deploy/private_channel_escrow_program.so \
-  --program-id 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU \
+  --program-id 8msahYFvfeiiz3C2NzAorhfhAes5GaEThzmLWSLUHNkK \
   --upgrade-authority <authority.json> --url devnet
 solana program deploy target/deploy/private_channel_withdraw_program.so \
   --program-id J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi \
