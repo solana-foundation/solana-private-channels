@@ -12,16 +12,20 @@ name = "ingress_backpressure"
 path = "tests/private-channel/test_ingress_backpressure.rs"
 
 [[test]]
+name = "ordered_shutdown_e2e"
+path = "tests/private-channel/test_ordered_shutdown_e2e.rs"
+
+[[test]]
+name = "settle_retry_recovery"
+path = "tests/private-channel/test_settle_retry_recovery.rs"
+
+[[test]]
 name = "indexer_integration"
 path = "tests/indexer/integration.rs"
 
 [[test]]
 name = "reconciliation_integration"
 path = "tests/indexer/reconciliation.rs"
-
-[[test]]
-name = "mint_idempotency_integration"
-path = "tests/indexer/mint_idempotency.rs"
 
 [[test]]
 name = "gap_detection_integration"
@@ -42,6 +46,10 @@ path = "tests/indexer/resync.rs"
 [[test]]
 name = "reconciliation_e2e_test"
 path = "tests/indexer/reconciliation_e2e.rs"
+
+[[test]]
+name = "unsupported_withdrawal_mint_integration"
+path = "tests/indexer/unsupported_withdrawal_mint.rs"
 
 [[test]]
 name = "pausable_mint_integration"
@@ -88,6 +96,10 @@ name = "test_health_endpoint_standalone"
 path = "tests/private-channel/rpc/test_health_endpoint_standalone.rs"
 
 [[test]]
+name = "test_account_read_failures"
+path = "tests/private-channel/rpc/test_account_read_failures.rs"
+
+[[test]]
 name = "bootstrap_validation"
 path = "tests/indexer/bootstrap_validation.rs"
 
@@ -111,6 +123,25 @@ path = "tests/indexer/malformed_yellowstone_update.rs"
 name = "yellowstone_reconnect_gap"
 path = "tests/indexer/yellowstone_reconnect_gap.rs"
 
+[[test]]
+name = "reconnect_gap_fill_fail_closed"
+path = "tests/indexer/reconnect_gap_fill_fail_closed.rs"
+
+# Startup anchor persisted by `run` before the Yellowstone stream starts.
+[[test]]
+name = "startup_anchor"
+path = "tests/indexer/startup_anchor.rs"
+
+# One-shot backfill repair: records its range, verifies it, fails closed on write errors.
+[[test]]
+name = "backfill_only_e2e"
+path = "tests/indexer/backfill_only_e2e.rs"
+
+# Startup ordering: backfill completes and commits before escrow reconciliation.
+[[test]]
+name = "startup_backfill_reconcile"
+path = "tests/indexer/startup_backfill_reconcile.rs"
+
 # Yellowstone inner_instructions + unknown-discriminator arms.
 [[test]]
 name = "yellowstone_inner_and_unknown"
@@ -125,18 +156,6 @@ name = "harness_sanity"
 path = "tests/indexer/harness_sanity.rs"
 
 # RPC-error + storage-failure fault-injection tests.
-[[test]]
-name = "sender_mint_idempotency"
-path = "tests/indexer/sender_mint_idempotency.rs"
-
-[[test]]
-name = "sender_mint_validator_encodings"
-path = "tests/indexer/sender_mint_validator_encodings.rs"
-
-[[test]]
-name = "sender_mint_signature_failures"
-path = "tests/indexer/sender_mint_signature_failures.rs"
-
 [[test]]
 name = "sender_poll_rpc_error"
 path = "tests/indexer/sender_poll_rpc_error.rs"
@@ -202,6 +221,15 @@ path = "tests/private-channel/test_signatures_corruption_guard.rs"
 name = "test_node_config_validation"
 path = "tests/private-channel/test_node_config_validation.rs"
 
+[[test]]
+name = "test_duplicate_writer"
+path = "tests/private-channel/test_duplicate_writer.rs"
+
+# Slot/height divergence, sparse-chain indexer walk and block-counted expiry.
+[[test]]
+name = "test_sparse_chain"
+path = "tests/private-channel/test_sparse_chain.rs"
+
 # Redis-backend warm-cache + read-path coverage test. Runs independently of
 # private_channel_integration so it still contributes coverage even when the broader
 # suite is flaky.
@@ -215,6 +243,7 @@ test-tree = ["private-channel-indexer/test-tree"]
 [dependencies]
 anyhow = "1.0.100"
 base64 = { workspace = true }
+borsh = { workspace = true }
 bs58 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }

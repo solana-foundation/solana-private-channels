@@ -582,3 +582,81 @@ async fn test_withdrawals_exceed_deposits() -> Result<(), Box<dyn std::error::Er
 
     Ok(())
 }
+
+// ── reconciliation halt flag + in-flight envelope ───────────────────────────
+
+/// Round-trip the durable halt flag: absent -> set -> re-set (idempotent) ->
+/// clear -> absent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconciliation_halt_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+
+    assert!(
+        storage.is_reconciliation_halted().await?.is_none(),
+        "fresh schema must read as not halted"
+    );
+
+    storage.set_reconciliation_halt("mint X insolvent").await?;
+    let info = storage.is_reconciliation_halted().await?.expect("halt set");
+    assert_eq!(info.reason, "mint X insolvent");
+
+    // Idempotent re-set overwrites the reason on the single row.
+    storage.set_reconciliation_halt("mint Y insolvent").await?;
+    let info = storage
+        .is_reconciliation_halted()
+        .await?
+        .expect("halt still set");
+    assert_eq!(info.reason, "mint Y insolvent");
+
+    storage.clear_reconciliation_halt().await?;
+    assert!(
+        storage.is_reconciliation_halted().await?.is_none(),
+        "cleared halt must read as not halted"
+    );
+
+    Ok(())
+}
+
+/// The envelope query sums only in-flight statuses, grouped per mint; terminal
+/// rows are excluded.
+#[tokio::test(flavor = "multi_thread")]
+async fn in_flight_envelope_sums_unsettled_per_mint() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let mint_a = Pubkey::new_unique().to_string();
+    let mint_b = Pubkey::new_unique().to_string();
+
+    // mint_a: pending 100 + processing 200 + parked 400 + pending_remint 800 = 1500.
+    insert_transaction(&pool, "a_pend", &mint_a, 100, "deposit", "pending", 1).await?;
+    insert_transaction(&pool, "a_proc", &mint_a, 200, "deposit", "processing", 2).await?;
+    insert_transaction(&pool, "a_park", &mint_a, 400, "withdrawal", "parked", 3).await?;
+    insert_transaction(
+        &pool,
+        "a_remint",
+        &mint_a,
+        800,
+        "withdrawal",
+        "pending_remint",
+        4,
+    )
+    .await?;
+    // Terminal rows on mint_a must be excluded.
+    insert_transaction(&pool, "a_done", &mint_a, 1, "deposit", "completed", 5).await?;
+    insert_transaction(&pool, "a_fail", &mint_a, 2, "withdrawal", "failed", 6).await?;
+
+    // mint_b: a single pending 250.
+    insert_transaction(&pool, "b_pend", &mint_b, 250, "deposit", "pending", 7).await?;
+
+    let mut rows = storage.get_in_flight_amounts_by_mint().await?;
+    rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
+
+    let mut by_mint: std::collections::HashMap<String, BigDecimal> = rows
+        .into_iter()
+        .map(|r| (r.mint_address, r.in_flight_amount))
+        .collect();
+    assert_eq!(by_mint.remove(&mint_a), Some(BigDecimal::from(1500u64)));
+    assert_eq!(by_mint.remove(&mint_b), Some(BigDecimal::from(250u64)));
+    assert!(by_mint.is_empty(), "no unexpected mints in the envelope");
+
+    Ok(())
+}

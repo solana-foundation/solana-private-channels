@@ -195,7 +195,7 @@ async fn it1_deposit_landed_promoted_to_completed() {
 
     // The mint persisted this signature write-ahead before broadcast; it then landed.
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -218,7 +218,7 @@ async fn it1_deposit_landed_promoted_to_completed() {
 
     let metric_before = snapshot_recovered("escrow", "completed", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -256,7 +256,7 @@ async fn it2_deposit_not_landed_demoted_to_pending() {
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -290,7 +290,9 @@ async fn it2b_deposit_dead_signature_demoted() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // Persisted write-ahead before broadcast; the mint never landed and the blockhash expired.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    // Journal the blockhash slot the attempt was built against: absence is only
+    // proof of non-inclusion when the ledger is known to cover that window.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, Some(50))
         .await
         .unwrap();
 
@@ -301,12 +303,14 @@ async fn it2b_deposit_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor below the journaled slot, so the window is covered.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(1)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     let metric_before = snapshot_recovered("escrow", "requeued", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -317,11 +321,14 @@ async fn it2b_deposit_dead_signature_demoted() {
     mock.shutdown().await;
 }
 
-// IT-3: withdrawal whose recorded release signature is dead (null status, blockhash expired) → demote.
+// IT-3: withdrawal whose recorded release signature is dead (null status, blockhash
+// expired) and no escrow instance is configured → quarantine, not demote. With no
+// bitmap to check the nonce against, the release may have landed under a signature
+// that was never journaled, so re-arming could pay twice.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it3_withdrawal_dead_signature_demoted() {
-    let (db, url, _container) = start_pg("it3_wd_demote").await;
+async fn it3_withdrawal_dead_signature_quarantines_without_instance() {
+    let (db, url, _container) = start_pg("it3_wd_quarantine").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -329,7 +336,9 @@ async fn it3_withdrawal_dead_signature_demoted() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 7);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    // Journal the blockhash slot the attempt was built against: absence is only
+    // proof of non-inclusion when the ledger is known to cover that window.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, Some(50))
         .await
         .unwrap();
 
@@ -340,23 +349,31 @@ async fn it3_withdrawal_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor below the journaled slot, so the window is covered.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(1)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
+    let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
-    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
     let fresh = updated_at_of(&pool, tx_id).await;
     assert!(
         fresh > Utc::now() - ChronoDuration::seconds(5),
         "updated_at should be fresh"
     );
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("withdraw", "requeued", "withdrawal", metric_before, "IT-3");
+    assert_recovered_increment(
+        "withdraw",
+        "quarantined",
+        "withdrawal",
+        metric_before,
+        "IT-3",
+    );
     mock.shutdown().await;
 }
 
@@ -373,7 +390,7 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -396,7 +413,7 @@ async fn it4_withdrawal_landed_signature_completed_no_resend() {
 
     let metric_before = snapshot_recovered("withdraw", "completed", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -422,7 +439,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 2);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     let _captured = seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 1000, None)
         .await
         .unwrap();
 
@@ -436,7 +453,7 @@ async fn it4b_withdrawal_live_signature_left_processing() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -473,7 +490,7 @@ async fn it4c_withdrawal_no_signatures_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -511,7 +528,7 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 4);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -530,7 +547,7 @@ async fn it4d_withdrawal_rpc_uncertain_quarantined() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -582,10 +599,10 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
         .execute(&pool)
         .await
         .unwrap();
-    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1)
+    db.insert_release_signature_internal(proc_id, Signature::new_unique().to_string(), 1, None)
         .await
         .unwrap();
-    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2)
+    db.insert_release_signature_internal(done_id, Signature::new_unique().to_string(), 2, None)
         .await
         .unwrap();
 
@@ -594,7 +611,7 @@ async fn it4e_gc_reclaims_non_processing_release_sigs() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     // recover_once runs gc_stale_release_signatures at the top of the sweep.
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -639,7 +656,7 @@ async fn it4f_gc_retains_manual_review_release_sigs() {
     .execute(&pool)
     .await
     .unwrap();
-    db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 7)
+    db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 7, None)
         .await
         .unwrap();
 
@@ -647,7 +664,7 @@ async fn it4f_gc_retains_manual_review_release_sigs() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -680,7 +697,7 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 500);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -699,7 +716,7 @@ async fn it5_rpc_failure_deposit_quarantines_to_manual_review() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -736,7 +753,7 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
     let tx = make_deposit(&Signature::new_unique().to_string(), mint, recipient, 700);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100)
+    db.insert_release_signature_internal(tx_id, "not-a-valid-signature".to_string(), 100, None)
         .await
         .unwrap();
 
@@ -746,7 +763,7 @@ async fn it6_malformed_stored_sig_quarantines_deposit() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -798,7 +815,7 @@ async fn it7_fresh_processing_row_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -880,7 +897,7 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     assert_eq!(status_of(&pool, tx_id).await, "pending");
@@ -891,6 +908,7 @@ async fn it9_lagging_terminal_write_no_ops_after_recovery_demote() {
         private_channel_indexer::storage::common::models::TransactionStatus::Completed,
         Some("lagging-sig".to_string()),
         Utc::now(),
+        None,
     )
     .await
     .unwrap();
@@ -954,7 +972,7 @@ async fn it10_backlog_batched_across_ticks() {
 
     // Tick 1: should heal exactly RECOVERY_BATCH_LIMIT (100) rows.
     let t0 = std::time::Instant::now();
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     assert!(
@@ -969,10 +987,10 @@ async fn it10_backlog_batched_across_ticks() {
     assert_eq!(pending_count, 100, "tick 1 must heal exactly the batch cap");
 
     // Ticks 2-3: drain the rest. Healed rows are excluded (trigger bumped updated_at).
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
     let pending_count: i64 =
@@ -1033,7 +1051,7 @@ async fn it11_pending_remint_rows_untouched() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1070,7 +1088,7 @@ async fn it12_withdrawal_missing_nonce_quarantines() {
 
     let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1131,7 +1149,7 @@ async fn it13_recovery_requeue_cap_quarantines_after_max() {
 
     let metric_before = snapshot_recovered("escrow", "quarantined", "deposit");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Escrow, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1252,7 +1270,7 @@ async fn withdraw_recovery_never_touches_escrow_deposit() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // The persisted mint signature is what a cross-role sweep would classify.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100)
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
         .await
         .unwrap();
 
@@ -1260,7 +1278,7 @@ async fn withdraw_recovery_never_touches_escrow_deposit() {
     let client = test_client(mock.url());
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1311,7 +1329,7 @@ async fn withdraw_boot_reconcile_ignores_foreign_processing_rows() {
         );
         let id = db.insert_transaction_internal(&tx).await.unwrap();
         seed_backdated_processing(&pool, id, ChronoDuration::minutes(10)).await;
-        db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 100)
+        db.insert_release_signature_internal(id, Signature::new_unique().to_string(), 100, None)
             .await
             .unwrap();
         ids.push(id);
@@ -1324,7 +1342,9 @@ async fn withdraw_boot_reconcile_ignores_foreign_processing_rows() {
     boot_reconcile_processing(
         &storage,
         &client,
+        None,
         ProgramType::Withdraw,
+        None,
         &storage_tx,
         &CancellationToken::new(),
         2,
@@ -1443,7 +1463,7 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     let landed_sig = Signature::new_unique();
-    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100)
+    db.insert_release_signature_internal(tx_id, landed_sig.to_string(), 100, None)
         .await
         .unwrap();
 
@@ -1453,7 +1473,7 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1490,7 +1510,7 @@ async fn it14_manual_review_landed_release_clears_to_completed() {
 
     let metric_before = snapshot_recovered("withdraw", "manual_review_cleared", "withdrawal");
 
-    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+    test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
@@ -1529,7 +1549,7 @@ async fn it15_manual_review_without_signatures_stays_quarantined() {
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
     for pass in 1..=2 {
-        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, &storage_tx)
+        test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
             .await
             .unwrap();
         assert_eq!(

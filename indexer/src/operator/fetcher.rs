@@ -33,6 +33,27 @@ pub async fn run_fetcher(
             info!("Fetcher received cancellation signal, stopping...");
             break;
         }
+
+        // Durable cross-process freeze: a reconciliation halt stops BOTH operators'
+        // fetchers here, the single point that moves rows pending -> processing.
+        // A read error falls through (fail-open on the read only): the flag is
+        // re-checked next poll and quarantine already blunts the pipeline, so a
+        // transient DB blip must not wedge an otherwise-healthy operator.
+        match storage.is_reconciliation_halted().await {
+            Ok(Some(halt)) => {
+                warn!(reason = %halt.reason, "Reconciliation halt active; skipping fetch");
+                if let Some(h) = &health {
+                    h.force_unhealthy(halt.reason.clone());
+                }
+                tokio::time::sleep(config.db_poll_interval).await;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!("Failed to read reconciliation halt flag; proceeding: {}", e);
+            }
+        }
+
         match storage.count_pending_transactions(transaction_type).await {
             Ok(count) => {
                 metrics::OPERATOR_BACKLOG_DEPTH
@@ -204,6 +225,84 @@ mod tests {
         token.cancel();
         let result = handle.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetcher_skips_fetch_when_halted() {
+        use private_channel_metrics::{HealthConfig, HealthState};
+        let mock = MockStorage::new();
+        // A pending deposit is present, but the halt flag must stop it being fetched.
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(make_test_transaction("sig_halt"));
+        mock.set_reconciliation_halt("test halt").await.unwrap();
+
+        let storage = Arc::new(Storage::Mock(mock));
+        let (tx, mut rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+        let health_state = HealthState::new(HealthConfig::operator());
+        let token_clone = token.clone();
+        let health_clone = Some(health_state.clone());
+        let handle = tokio::spawn(async move {
+            run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                ProgramType::Escrow,
+                token_clone,
+                health_clone,
+            )
+            .await
+        });
+
+        // Nothing should be forwarded while halted.
+        let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(got.is_err(), "halted fetcher must not forward transactions");
+        assert!(
+            !health_state.is_healthy(),
+            "halted fetcher must force itself unhealthy"
+        );
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetcher_halt_read_error_falls_through() {
+        let mock = MockStorage::new();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(make_test_transaction("sig_err"));
+        // The halt read errors; the fetcher must proceed (fail-open on the read).
+        mock.set_should_fail("is_reconciliation_halted", true);
+
+        let storage = Arc::new(Storage::Mock(mock));
+        let (tx, mut rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+
+        let token_clone = token.clone();
+        let handle = tokio::spawn(async move {
+            run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                ProgramType::Escrow,
+                token_clone,
+                None,
+            )
+            .await
+        });
+
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for transaction")
+            .expect("channel closed");
+        assert_eq!(received.signature, "sig_err");
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
     }
 
     #[tokio::test]

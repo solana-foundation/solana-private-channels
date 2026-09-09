@@ -15,7 +15,7 @@ The Solana Private Channels Escrow Program manages token deposits to and withdra
 
 ### Program Address
 ```
-GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU
 ```
 
 ### Installation
@@ -226,7 +226,9 @@ const setAdminIx = getSetNewAdminInstruction({
 **Important:**
 - Both current admin and new admin must sign the transaction
 - Change is immediate and irreversible
-- Old admin loses all privileges once confirmed
+- Old admin loses its `Instance.admin` privileges once confirmed. It does **not** lose anything else: this instruction rewrites one field and nothing more
+- Operator PDAs survive the handover. Any wallet added via `AddOperator` can still sign `ReleaseFunds` and `RotateBitmap` until the new admin calls `RemoveOperator` for it, including the old admin itself if it was ever registered
+- If the old admin was also used as the channel admin, it keeps SPL mint and freeze authority over every already-initialized receipt mint. Migrate those with SPL `SetAuthority` before treating the rotation as complete. Keeping the two keys separate from the start avoids this entirely
 - Verify new admin address carefully (typos = permanent loss of control)
 
 

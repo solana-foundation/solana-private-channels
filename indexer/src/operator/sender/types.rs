@@ -1,4 +1,5 @@
 use crate::config::ProgramType;
+use crate::operator::sender::remint::FinalityRpc;
 use crate::operator::utils::instruction_util::{
     ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, TransactionKind, WithdrawalRemintInfo,
 };
@@ -79,6 +80,23 @@ pub struct TransactionContext {
     pub trace_id: Option<String>,
     /// What this transaction is; an InitializeMint and a rotation carry identical empty ids.
     pub kind: TransactionKind,
+    /// Ownership lease from this deposit's most recent successful claim (the
+    /// row's `updated_at`). A re-fire of the same deposit presents it again.
+    pub deposit_claim_lease: Option<DateTime<Utc>>,
+}
+
+/// How a fire-and-store send is handled, decided by whether it carries user value.
+///
+/// `Recoverable` (a user `Mint`) claims the row and persists the signature before
+/// broadcasting, and every pre-broadcast failure leaves the row Processing so
+/// recovery re-mints it. `Terminal` (`InitializeMint`) mints no balance and is
+/// on-chain idempotent, so it journals nothing and fails fast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendDurability {
+    Recoverable {
+        deposit_expected_updated_at: DateTime<Utc>,
+    },
+    Terminal,
 }
 
 /// Transaction status update to send to storage
@@ -149,6 +167,9 @@ pub struct SenderState {
     /// burn happened. Remints broadcast here to restore the burned balance.
     /// rpc_client is the destination chain (Solana) for ReleaseFunds.
     pub source_rpc_client: Arc<RpcClientWithRetry>,
+    /// Independent destination-chain endpoint that re-checks a Dead verdict.
+    /// One node's missing status can be a prune rather than proof of absence.
+    pub fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
     /// Withdrawal nonces broadcast but not yet settled. The rotation barrier reads
@@ -190,6 +211,10 @@ pub struct SenderState {
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
     /// Signatures sent per withdrawal nonce (with lvbh), used for finality checks before reminting.
     pub pending_signatures: HashMap<u64, Vec<PendingSig>>,
+    /// Ownership lease per withdrawal nonce: the row's `updated_at` as of this
+    /// sender's most recent successful claim. Every release attempt presents the
+    /// lease and adopts the one the claim returns.
+    pub release_leases: HashMap<u64, DateTime<Utc>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
     /// Mint/InitializeMint transactions sent but awaiting on-chain confirmation.
@@ -203,12 +228,41 @@ pub struct SenderState {
     pub semaphore: Arc<Semaphore>,
 }
 
-/// Withdrawal signature + its blockhash's `last_valid_block_height`, so the
-/// remint gate can prove the signature can no longer land.
+impl SenderState {
+    /// Finality oracle for the destination `rpc_client`, carrying the optional
+    /// fallback used to re-check a `Dead` verdict (the prunable Solana path).
+    ///
+    /// Which chain `rpc_client` points at follows the role, not the field name:
+    /// a withdraw operator releases on Solana, an escrow operator mints on the
+    /// channel. A wrong tag reads an lvbh against the wrong height scale.
+    pub(crate) fn dest_finality(&self) -> FinalityRpc<'_> {
+        let fallback = self.fallback_rpc_client.as_deref();
+        match self.program_type {
+            ProgramType::Withdraw => FinalityRpc::solana(&self.rpc_client, fallback),
+            ProgramType::Escrow => FinalityRpc::channel(&self.rpc_client, fallback),
+        }
+    }
+
+    /// Finality oracle for `source_rpc_client`, single-endpoint: neither chain
+    /// has a second node configured for this role's source. The ledger-floor
+    /// check is therefore the whole protection on this path.
+    pub(crate) fn source_finality(&self) -> FinalityRpc<'_> {
+        match self.program_type {
+            ProgramType::Withdraw => FinalityRpc::channel(&self.source_rpc_client, None),
+            ProgramType::Escrow => FinalityRpc::solana(&self.source_rpc_client, None),
+        }
+    }
+}
+
+/// Withdrawal signature, its blockhash's `last_valid_block_height`, and the slot
+/// that blockhash was read at, so the remint gate can prove both that the
+/// signature can no longer land and that the endpoint still retains its window.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingSig {
     pub signature: Signature,
     pub last_valid_block_height: u64,
+    /// `None` for an attempt journaled before the column existed.
+    pub blockhash_slot: Option<u64>,
 }
 
 /// A remint deferred until Solana finality window passes, allowing us to verify

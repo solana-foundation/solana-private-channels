@@ -15,11 +15,6 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
-// Pure-function coverage of `compare_balances` branches that aren't hit
-// by the end-to-end reconciliation tests below.
-#[path = "reconciliation_compare.rs"]
-mod compare_balances;
-
 // DB migration idempotency + insert-race safety on PostgresDb.
 #[path = "db_migration_race.rs"]
 mod db_migration_race;
@@ -68,6 +63,30 @@ fn instance_pda(seed: &Pubkey) -> Pubkey {
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
     .0
+}
+
+/// Slot the seeded rows below are written at.
+const SEEDED_ROW_SLOT: u64 = 1;
+
+/// Wait until the node's finalized slot covers `slot`.
+///
+/// Reconciliation compares custody against the ledger as of the slot the custody read
+/// reflects, so rows above that slot are outside the comparison by design. A validator
+/// that has just started can still report a finalized slot of 0, which would put the
+/// seeded rows out of range and leave the test asserting against an empty comparison.
+async fn wait_for_finalized_to_cover(rpc_url: &str, slot: u64) {
+    let client = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::finalized());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if client.get_slot().await.map(|s| s >= slot).unwrap_or(false) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the finalized slot to reach {slot}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// Register a mint in the `mints` table and insert a single `pending` deposit of
@@ -146,6 +165,8 @@ async fn test_reconciliation_empty_db_passes() -> Result<(), Box<dyn std::error:
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
     )
     .await;
@@ -163,6 +184,7 @@ async fn test_reconciliation_blocks_on_phantom_deposit() -> Result<(), Box<dyn s
 
     let mint = Pubkey::new_unique();
     seed_mint_and_deposit(&pool, &mint.to_string(), 1_000_000).await?;
+    wait_for_finalized_to_cover(&test_validator.rpc_url(), SEEDED_ROW_SLOT).await;
 
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
@@ -171,6 +193,8 @@ async fn test_reconciliation_blocks_on_phantom_deposit() -> Result<(), Box<dyn s
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
     )
     .await;
@@ -198,6 +222,7 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
     // DB expects 500_000; ATA absent → on-chain = 0; mismatch = 500_000 ≤ threshold 1_000_000
     let mint = Pubkey::new_unique();
     seed_mint_and_deposit(&pool, &mint.to_string(), 500_000).await?;
+    wait_for_finalized_to_cover(&test_validator.rpc_url(), SEEDED_ROW_SLOT).await;
 
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
@@ -206,6 +231,8 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &Keypair::new().pubkey(),
     )
     .await;
@@ -295,6 +322,8 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &pda,
     )
     .await;
@@ -389,6 +418,8 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
         ProgramType::Escrow,
         &storage,
         &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
         &pda,
     )
     .await;

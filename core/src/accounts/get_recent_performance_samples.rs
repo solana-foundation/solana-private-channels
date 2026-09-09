@@ -1,7 +1,6 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
+    super::{postgres::PostgresAccountsDB, traits::AccountsDB},
     anyhow::{Context, Result},
-    redis::AsyncCommands,
     solana_rpc_client_types::response::RpcPerfSample,
 };
 
@@ -13,7 +12,13 @@ pub async fn get_recent_performance_samples(
         AccountsDB::Postgres(postgres_db) => {
             get_recent_performance_samples_postgres(postgres_db, limit).await
         }
-        AccountsDB::Redis(redis_db) => get_recent_performance_samples_redis(redis_db, limit).await,
+        // Served from the source of truth, and no samples are cached. A cached
+        // list would be trimmed to a fixed length and hold only samples written
+        // since the cache attached, so a short answer would read as a complete
+        // one.
+        AccountsDB::Redis(redis_db) => {
+            get_recent_performance_samples_postgres(&redis_db.fallback, limit).await
+        }
     }
 }
 
@@ -50,28 +55,6 @@ async fn get_recent_performance_samples_postgres(
             },
         )
         .collect();
-
-    Ok(performance_samples)
-}
-
-async fn get_recent_performance_samples_redis(
-    db: &RedisAccountsDB,
-    limit: usize,
-) -> Result<Vec<RpcPerfSample>> {
-    let mut conn = db.connection.clone();
-
-    // Get the most recent samples from the list (0 to limit-1)
-    let sample_jsons: Vec<String> = conn
-        .lrange("performance_samples", 0, (limit - 1) as isize)
-        .await
-        .context("Failed to get performance samples from Redis")?;
-
-    let mut performance_samples = Vec::new();
-    for sample_json in sample_jsons {
-        if let Ok(sample) = serde_json::from_str::<RpcPerfSample>(&sample_json) {
-            performance_samples.push(sample);
-        }
-    }
 
     Ok(performance_samples)
 }

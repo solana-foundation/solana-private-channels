@@ -21,7 +21,11 @@
 //!      rows are filtered out by `get_pending_remint_transactions`).
 //!   C. Multiple pending remints are all returned; ordering does not
 //!      matter for correctness but set equivalence must hold.
+//!   E. Write-ahead `pending_remint_signatures` round-trip: one live attempt
+//!      per transaction, reads back in order, and GC keeps rows while
+//!      PendingRemint but sweeps them once the parent is terminal.
 
+use private_channel_indexer::storage::common::models::StoredSig;
 use {
     chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
@@ -301,4 +305,104 @@ async fn test_finality_check_attempts_persisted_across_restart() {
         matches!(result, Err(sqlx::Error::RowNotFound)),
         "bump must reject non-PendingRemint rows, got {result:?}"
     );
+}
+
+// ── Case E ──────────────────────────────────────────────────────────────────
+/// The write-ahead `pending_remint_signatures` table: one live attempt per
+/// transaction, reads back in insertion order including superseded attempts, and
+/// GC keeps rows while the parent is PendingRemint but sweeps them once terminal.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_remint_signatures_round_trip_and_gc() {
+    let (db, url, _container) = start_pg("t12_remint_sigs").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let sig = Signature::new_unique().to_string();
+    let tx = make_withdrawal(&sig, 0);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+
+    // Park the parent in PendingRemint so GC treats its sigs as live.
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    db.set_pending_remint_internal(
+        tx_id,
+        vec![sig.clone()],
+        vec![0],
+        Utc::now() + ChronoDuration::minutes(10),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // First attempt takes the one live slot.
+    let attempt_a = Signature::new_unique().to_string();
+    let attempt_b = Signature::new_unique().to_string();
+    assert!(db
+        .claim_remint_attempt_internal(tx_id, attempt_a.clone(), 100, None, &[])
+        .await
+        .unwrap());
+    // A second attempt only takes it by naming the one it proved dead.
+    assert!(!db
+        .claim_remint_attempt_internal(tx_id, attempt_b.clone(), 200, None, &[])
+        .await
+        .unwrap());
+    assert!(db
+        .claim_remint_attempt_internal(
+            tx_id,
+            attempt_b.clone(),
+            200,
+            None,
+            std::slice::from_ref(&attempt_a)
+        )
+        .await
+        .unwrap());
+
+    let stored = db.get_remint_signatures_internal(tx_id).await.unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            StoredSig {
+                signature: attempt_a.clone(),
+                last_valid_block_height: 100,
+                blockhash_slot: None,
+            },
+            StoredSig {
+                signature: attempt_b.clone(),
+                last_valid_block_height: 200,
+                blockhash_slot: None,
+            },
+        ],
+        "both attempts must round-trip in insertion order; a superseded one stays classifiable"
+    );
+
+    // GC keeps rows whose parent is still PendingRemint.
+    let removed = db.gc_stale_remint_signatures_internal().await.unwrap();
+    assert_eq!(removed, 0, "live PendingRemint rows must be kept");
+    assert_eq!(
+        db.get_remint_signatures_internal(tx_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Once the parent goes terminal, GC sweeps its write-ahead rows.
+    sqlx::query(
+        "UPDATE transactions SET status = 'failed_reminted'::transaction_status WHERE id = $1",
+    )
+    .bind(tx_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let removed = db.gc_stale_remint_signatures_internal().await.unwrap();
+    assert_eq!(removed, 2, "terminal parent's rows must be swept");
+    assert!(db
+        .get_remint_signatures_internal(tx_id)
+        .await
+        .unwrap()
+        .is_empty());
 }

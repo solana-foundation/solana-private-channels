@@ -57,6 +57,13 @@ impl PrivateChannelContext {
             .map_err(anyhow::Error::from)
     }
 
+    pub async fn get_block_height(&self) -> Result<u64> {
+        self.read_client
+            .get_block_height()
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
     pub async fn get_blockhash(&self) -> Result<Hash> {
         let (blockhash, _) = self
             .read_client
@@ -158,6 +165,13 @@ impl PrivateChannelContext {
     pub async fn get_blocks(&self, start_slot: Slot, end_slot: Option<Slot>) -> Result<Vec<Slot>> {
         self.read_client
             .get_blocks(start_slot, end_slot)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub async fn get_blocks_with_limit(&self, start_slot: Slot, limit: usize) -> Result<Vec<Slot>> {
+        self.read_client
+            .get_blocks_with_limit(start_slot, limit)
             .await
             .map_err(anyhow::Error::from)
     }

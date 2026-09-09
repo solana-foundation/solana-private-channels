@@ -6,7 +6,9 @@
 //! Run with: `cd auth && cargo test --test integration -- --test-threads=1`
 
 use std::net::SocketAddr;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -17,7 +19,14 @@ use testcontainers_modules::postgres::Postgres;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use private_channel_auth::{build_app, db, jwt::JwtConfig, AppState};
+use private_channel_auth::{
+    build_app, db,
+    jwt::JwtConfig,
+    password::PasswordWorker,
+    serve::{serve, Limits},
+    throttle::AuthThrottle,
+    AppState,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -40,7 +49,20 @@ async fn start_postgres() -> (String, testcontainers::ContainerAsync<Postgres>) 
 }
 
 /// Start the auth Axum app on a random port and return its address.
+///
+/// Rate limits are set high enough not to interfere. Tests that exercise
+/// throttling call `start_throttled_app` with the limits they need.
 async fn start_app(db_url: &str) -> SocketAddr {
+    let generous = NonZeroU32::new(10_000).unwrap();
+    start_throttled_app(db_url, generous, generous, generous).await
+}
+
+async fn start_throttled_app(
+    db_url: &str,
+    ip_per_second: NonZeroU32,
+    ip_burst: NonZeroU32,
+    username_per_minute: NonZeroU32,
+) -> SocketAddr {
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(db_url)
@@ -53,16 +75,33 @@ async fn start_app(db_url: &str) -> SocketAddr {
         pool,
         jwt: Arc::new(JwtConfig::new("test-secret")),
         pool_status: private_channel_auth::pool_status::PoolStatus::new_healthy(),
+        // Well above any test's concurrency. Argon2 is much slower unoptimized,
+        // so a production-sized cap would shed here on the permit wait and mask
+        // what these tests are actually asserting. The cap itself is covered by
+        // the password unit tests.
+        passwords: PasswordWorker::new(NonZeroUsize::new(64).unwrap()),
+        throttle: Arc::new(AuthThrottle::new(
+            ip_per_second,
+            ip_burst,
+            username_per_minute,
+        )),
     };
 
-    let app = build_app(state, "*");
+    // The request timeout is loose for the same reason as the ones below.
+    let app = build_app(state, "*", Duration::from_secs(60));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    // Serve through the production loop so these tests cover the real path.
+    // The timeouts are loose because unoptimized Argon2 is far slower than a
+    // release build, and the concurrency tests would otherwise trip them. The
+    // limits themselves are covered by the unit tests in `serve`.
+    let limits = Limits {
+        header_read_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
+    tokio::spawn(serve(listener, app, limits));
 
     addr
 }
@@ -1052,6 +1091,136 @@ async fn test_register_concurrent_same_username_returns_409_not_500() {
         "all other requests should get 409, not 500"
     );
     assert_eq!(errors, 0, "no request should return 500");
+}
+
+/// Login measures the password cap in characters like register does. Measuring
+/// bytes would lock out any account whose password registered with multibyte
+/// characters.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_login_accepts_max_length_multibyte_password() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    // 128 characters, 512 bytes.
+    let password = "é".repeat(128);
+
+    let registered = client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "multibyte", "password": password }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registered.status(), 200);
+
+    let res = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "multibyte", "password": password }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200, "a password that registered must log in");
+}
+
+/// The username budget is charged on the outcome, so an attacker spending it
+/// with wrong passwords cannot lock the real owner out.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_exhausted_username_budget_does_not_block_the_owner() {
+    let (db_url, _container) = start_postgres().await;
+    let generous = NonZeroU32::new(10_000).unwrap();
+    let attempts = NonZeroU32::new(3).unwrap();
+    let addr = start_throttled_app(&db_url, generous, generous, attempts).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "victim", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    let mut statuses = Vec::new();
+    for _ in 0..attempts.get() + 2 {
+        let res = client
+            .post(format!("{}/auth/login", base_url(addr)))
+            .json(&json!({ "username": "victim", "password": "wrongpassword" }))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(res.status().as_u16());
+    }
+    assert!(
+        statuses.contains(&429),
+        "the budget should run out: {statuses:?}"
+    );
+
+    let res = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "victim", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        200,
+        "the owner must still log in with the correct password"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_login_over_budget_ip_is_shed() {
+    let (db_url, _container) = start_postgres().await;
+    let burst = NonZeroU32::new(3).unwrap();
+    let addr = start_throttled_app(
+        &db_url,
+        NonZeroU32::new(1).unwrap(),
+        burst,
+        NonZeroU32::new(10_000).unwrap(),
+    )
+    .await;
+    // Fired concurrently. Sent one at a time, the bucket refills faster than
+    // debug-build Argon2 completes and nothing is ever shed.
+    let url = format!("{}/auth/login", base_url(addr));
+    let attempts: Vec<_> = (0..burst.get() + 3)
+        .map(|attempt| {
+            let url = url.clone();
+            tokio::spawn(async move {
+                Client::new()
+                    .post(&url)
+                    .json(&json!({
+                        "username": format!("ghost{attempt}"),
+                        "password": "password123",
+                    }))
+                    .send()
+                    .await
+                    .expect("request failed")
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+
+    let statuses: Vec<u16> = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .map(|joined| joined.expect("task panicked"))
+        .collect();
+
+    let served = statuses.iter().filter(|&&s| s == 401).count();
+    assert!(
+        served > 0,
+        "the burst allowance should be served: {statuses:?}"
+    );
+    assert!(
+        served <= burst.get() as usize,
+        "no more than the burst should be served: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&429),
+        "requests past the burst should be shed: {statuses:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

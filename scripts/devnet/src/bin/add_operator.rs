@@ -32,10 +32,10 @@ fn main() -> Result<()> {
 
     if args.len() < 5 {
         eprintln!(
-            "Usage: {} <rpc-url> <admin-keypair-path> <instance-id> <operator-pubkey>",
+            "Usage: {} <rpc-url> <escrow-admin-keypair-path> <instance-id> <operator-pubkey>",
             args[0]
         );
-        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 5s3eemaoNZ4mW39w6ACBuy84EGo4UKMvXTTZxBkur6ma", args[0]);
+        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 5s3eemaoNZ4mW39w6ACBuy84EGo4UKMvXTTZxBkur6ma", args[0]);
         std::process::exit(1);
     }
 

@@ -1,8 +1,7 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
+    super::{postgres::PostgresAccountsDB, traits::AccountsDB},
     crate::accounts::types::StoredTransaction,
     anyhow::Result,
-    redis::AsyncCommands,
     solana_rpc_client_api::response::RpcConfirmedTransactionStatusWithSignature,
     solana_sdk::{pubkey::Pubkey, signature::Signature},
     solana_transaction_status::{extract_memos::extract_and_fmt_memos, TransactionWithStatusMeta},
@@ -10,14 +9,6 @@ use {
     sqlx::{PgPool, Row},
     std::sync::Arc,
 };
-
-/// Decodes a hex-encoded signature string into a base58 string.
-/// Signatures are stored as hex in Redis sorted sets to preserve byte ordering.
-fn hex_to_b58(hex_str: &str) -> Result<String> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| anyhow::anyhow!("Invalid hex signature {}: {}", hex_str, e))?;
-    Ok(bs58::encode(bytes).into_string())
-}
 
 pub async fn get_signatures_for_address(
     db: &AccountsDB,
@@ -30,8 +21,13 @@ pub async fn get_signatures_for_address(
         AccountsDB::Postgres(postgres_db) => {
             get_signatures_for_address_postgres(postgres_db, address, limit, before, until).await
         }
+        // Served from the source of truth, and no address index is cached. One
+        // would hold only signatures written since the cache attached, so a
+        // short history would read as a complete one. The cached form also
+        // never supported before/until cursors.
         AccountsDB::Redis(redis_db) => {
-            get_signatures_for_address_redis(redis_db, address, limit, before, until).await
+            get_signatures_for_address_postgres(&redis_db.fallback, address, limit, before, until)
+                .await
         }
     }
 }
@@ -206,98 +202,6 @@ async fn get_signatures_for_address_postgres(
         results.push(RpcConfirmedTransactionStatusWithSignature {
             signature: signature.to_string(),
             slot: slot as u64,
-            err,
-            memo,
-            block_time: Some(stored_tx.block_time),
-            confirmation_status: Some(TransactionConfirmationStatus::Finalized),
-        });
-    }
-
-    Ok(results)
-}
-
-async fn get_signatures_for_address_redis(
-    db: &RedisAccountsDB,
-    address: &Pubkey,
-    limit: usize,
-    before: Option<&Signature>,
-    until: Option<&Signature>,
-) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-    // before/until cursor pagination is not yet implemented for Redis.
-    // Clients hitting a Redis-backed node with cursor params will receive an error.
-    // Implementing cursors requires same-slot tiebreaking which is non-trivial
-    // with a score-only sorted set index — left as a TODO.
-    if before.is_some() || until.is_some() {
-        return Err(anyhow::anyhow!(
-            "before/until cursors are not yet supported by the Redis backend"
-        ));
-    }
-
-    let mut conn = db.connection.clone();
-    let key = format!("addr_sigs:{}", address);
-
-    // ZRANGE ... BYSCORE REV returns members with the highest score (most recent
-    // slot) first, matching the Postgres ORDER BY slot DESC behaviour.
-    // Requires Redis 6.2+. Members are hex-encoded so same-slot lex ordering
-    // matches Postgres's ORDER BY signature DESC (raw bytes).
-    let sig_strings: Vec<String> = redis::cmd("ZRANGE")
-        .arg(&key)
-        .arg("+inf")
-        .arg("-inf")
-        .arg("BYSCORE")
-        .arg("REV")
-        .arg("LIMIT")
-        .arg(0i64)
-        .arg(limit as i64)
-        .query_async(&mut conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to query addr_sigs for {}: {}", address, e))?;
-
-    if sig_strings.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let sig_b58_strings: Vec<String> = sig_strings
-        .iter()
-        .map(|s| hex_to_b58(s))
-        .collect::<Result<Vec<String>>>()?;
-
-    // Fetch all transaction blobs in a single MGET to avoid N round trips.
-    let tx_keys: Vec<String> = sig_b58_strings
-        .iter()
-        .map(|s| format!("tx:{}", s))
-        .collect();
-    let tx_blobs: Vec<Option<Vec<u8>>> = conn
-        .mget(&tx_keys)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to MGET transactions for {}: {}", address, e))?;
-
-    let mut results = Vec::with_capacity(sig_b58_strings.len());
-    for (sig_str, blob) in sig_b58_strings.iter().zip(tx_blobs) {
-        let data = match blob {
-            Some(d) => d,
-            // addr_sigs and tx:{sig} are written in the same pipeline MULTI/EXEC,
-            // so a missing transaction blob indicates data corruption.
-            None => {
-                return Err(anyhow::anyhow!(
-                    "Transaction data missing for signature {} — addr_sigs index is inconsistent",
-                    sig_str
-                ))
-            }
-        };
-
-        let stored_tx = bincode::deserialize::<StoredTransaction>(&data)
-            .map_err(|e| anyhow::anyhow!("Failed to deserialize transaction {}: {}", sig_str, e))?;
-
-        let err = stored_tx.meta.err.clone();
-        let memo = match stored_tx.transaction_with_status_meta() {
-            TransactionWithStatusMeta::Complete(versioned) => extract_and_fmt_memos(&versioned),
-            _ => None,
-        };
-
-        results.push(RpcConfirmedTransactionStatusWithSignature {
-            signature: sig_str.clone(),
-            slot: stored_tx.slot,
             err,
             memo,
             block_time: Some(stored_tx.block_time),

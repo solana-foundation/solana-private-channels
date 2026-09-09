@@ -43,6 +43,7 @@ fn mock_config() -> PrivateChannelIndexerConfig {
         storage_type: StorageType::Postgres,
         rpc_url: "http://127.0.0.1:1".to_string(),
         source_rpc_url: None,
+        fallback_rpc_url: None,
         postgres: PostgresConfig {
             database_url: "mock://unused".to_string(),
             max_connections: 1,
@@ -97,6 +98,7 @@ async fn run_sender_exits_on_cancellation_with_empty_channel() {
             /* retry_max_attempts */ 3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             /* source_rpc_client */ None,
+            /* sender_lock_heartbeat_interval */ Duration::from_secs(5),
         ),
     )
     .await

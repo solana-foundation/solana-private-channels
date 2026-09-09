@@ -23,7 +23,7 @@ store.
 Pull the row's DB-side state:
 
 ```sql
-SELECT id, withdrawal_nonce, status, counterpart_signature,
+SELECT id, signature, slot, withdrawal_nonce, status, counterpart_signature,
        remint_signatures, updated_at
   FROM transactions
  WHERE id = :transaction_id;
@@ -40,12 +40,17 @@ have prefixes.
 | (empty `error_message`, status flipped without a quarantine update) | A.halting (collateral row) | yes | `quarantine_active_withdrawals` |
 | `mint paused:` | A.non-halting | no | pre-flight |
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
+| `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
+| `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
-| `failed to persist pending remint:` | C - ambiguous (DB lost the sig) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
-| `no broadcast signatures recorded; cannot verify release landed` | C - ambiguous (recovery cannot prove outcome) | no | recovery worker quarantine |
+| `released on-chain with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
+| `release verification still uncertain after` | C - ambiguous (proof unavailable past the escalation window) | no | recovery worker quarantine |
+| `release signature journal still unreadable after` | C - ambiguous (database unreadable past the escalation window; check Postgres first) | no | recovery worker quarantine |
+| `malformed stored release signature` | C - ambiguous (journal corrupt, so a signature was recorded) | no | recovery worker quarantine |
+| `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
 
@@ -127,13 +132,16 @@ every active withdrawal is collateral.
       SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
     WHERE transaction_type = 'withdrawal'
       AND status = 'manual_review'
-      AND id <> :poison_id;
+      AND id <> ALL(:excluded_ids);
    ```
+   `:excluded_ids` is `:poison_id` plus every row a prior escalation left
+   held in `manual_review` (each recorded in its own incident record).
+   Re-arming a held row releases escrowed funds against a burn nobody
+   proved happened.
    The `transactions` table does not store `error_message` - it lives in the
    alert payload only. Distinguishing trigger from collateral happens in
    triage (Step 2: oldest `updated_at` is the trigger), not in the re-arm
-   query. If you have *multiple* unresolved trigger rows from different
-   incidents, recover them one at a time and exclude each via `id <> :id`.
+   query.
 5. **Restart the withdraw operator** (Docker, from the repo root: `docker compose
    restart operator-private-channel`; or by container: `docker restart
    private-channel-operator-private-channel`). The fetcher picks up `pending` rows and
@@ -141,13 +149,21 @@ every active withdrawal is collateral.
 6. **Confirm recovery** by watching for new `Completed` webhooks for
    the re-armed rows.
 
-## Path A.non-halting - pre-flight bail (paused mint, escrow drain)
+## Path A.non-halting - row-specific bail (allowlist gate, paused mint, escrow drain)
 
-The pre-flight check (`processor.rs::check_withdrawal_preflights`) bailed
-on a row whose mint is paused or whose target ATA does not have enough
-on-chain balance. The processor quarantined **only this row** and
-**continued the loop** - there is no halt and no collateral. Other
-withdrawals are unaffected.
+One of two checks bailed on this row. `processor.rs::check_withdrawal_mint_supported`
+runs first and emits `unsupported withdrawal mint:`;
+`processor.rs::check_withdrawal_preflights` runs after it and emits
+`mint paused:`, `insufficient escrow balance:`, and
+`withdrawal mint absent on target chain:`. Either way the processor parked
+**only this row** and **continued the loop** - there is no halt and no
+collateral. Other withdrawals are unaffected.
+
+Note that parking is not a refund. `WithdrawFunds` burns the user's channel
+tokens before the row exists, and a row parked here never reaches the
+sender, so the compensating remint that normally restores those tokens
+after a permanent release failure never runs. Every disposition below has
+to say explicitly what the user is owed.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for this row. Expected: `NOT_LANDED` (pre-flight aborted before send).
@@ -161,6 +177,36 @@ withdrawals are unaffected.
    - `insufficient escrow balance:` - check the escrow ATA balance vs.
      the row's amount. A permanent delegate may have drained the ATA. If
      the deficit is permanent, refund out-of-band; do not re-arm.
+   - `unsupported withdrawal mint:` - the escrow has no `AllowedMint` account for
+     this mint, which is the same account `release_funds` requires, so the release
+     could not have landed. Two causes, and they need opposite responses. Confirm
+     which with `solana account $(allowed-mint-pda <instance> <mint>) --url
+     <target-rpc>`, then:
+     - **Never allowlisted.** No escrowed funds back the row. Do not re-arm; mark
+       `failed`. The user's channel tokens were burned to create the row, so decide
+       and record whether to restore them by an admin mint on the channel.
+       [Escalate](_escalation.md) (Tier 3): a burn of an unsupported mint means one
+       was created or distributed on the channel without a matching `AllowMint`.
+     - **Allowlisted, then blocked.** `BlockMint` closes the account, and escrowed
+       funds are still held. The withdrawal cannot proceed while the mint is blocked,
+       because the escrow program rejects the release. Either re-allow the mint and
+       re-arm the row, or refund out-of-band from the escrow.
+       [Escalate](_escalation.md) (Tier 2).
+
+     Either way, if the parked row's `withdrawal_nonce` is a multiple of the tree
+     size, marking it `failed` releases later withdrawals onto a tree generation
+     that was never rotated, so rotate before you terminalize it. This applies to
+     any terminalized boundary row, not just this one.
+   - `withdrawal mint absent on target chain:` - the mint was allowlisted, so its
+     account existed then, and the node answered from a slot at or past that allow
+     before reporting nothing. A lagging node cannot produce this message; it
+     errors and the operator retries instead. So the account was closed, or
+     `rpc_url` points at a different cluster from the one the escrow is deployed
+     on. Check `solana account <mint> --url <target-rpc>` and confirm the cluster.
+     If the cluster is wrong, correct `rpc_url`, restart the operator, and re-arm
+     the parked rows. If it is right and the account is gone, do not re-arm;
+     refund out-of-band, and note that the channel tokens were burned too.
+     [Escalate](_escalation.md) (Tier 2).
 3. **If the condition has cleared, re-arm just this row:**
    ```sql
    UPDATE transactions
@@ -243,12 +289,35 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > the remint flow uses) *before* deciding. A finalized-success signature is
 > promoted to `Completed` (never re-sent); a dead/expired signature is
 > demoted to `Pending`; a still-live signature is left in `Processing` for
-> the next sweep. It only quarantines when it cannot prove the outcome:
-> either **no broadcast signatures were recorded** (`no broadcast signatures
-> recorded; cannot verify release landed`) or **the RPC could not classify
-> them** (`could not verify release landed (...)`, with the signature list
-> appended). Both land here in Path C — verify on-chain and act on the
-> verdict; never blindly re-arm a row whose release may already be on-chain.
+> the next sweep.
+>
+> **A row with no recorded signature is no longer quarantined on sight.**
+> The signature is written in the same transaction that claims the row, so
+> an empty journal means the release never broadcast. Recovery corroborates
+> that against the on-chain withdrawal bitmap - a fresh read of the
+> generation and the consumed-nonce bits - and re-arms the row to `pending`
+> automatically when the nonce's bit is provably unset; this is the manual
+> `NOT_LANDED` decision in Step 3 below, now automated with the same proof.
+> Such rows never reach manual review, so a signatureless row that does
+> arrive here means a read it depends on stayed broken for 10 minutes of
+> sweeps: either the on-chain proof (`... release verification still
+> uncertain after ...`) or the signature journal itself (`release signature
+> journal still unreadable after ...`). The second points at the database
+> rather than the chain, so check Postgres health before triaging the row.
+> Verify on-chain and act on the verdict; never blindly re-arm a row whose
+> release may already be on-chain.
+>
+> A journal that reads back *corrupt* is different and arrives immediately
+> (`malformed stored release signature ...`): a signature was recorded, so
+> the release may have broadcast, and re-reading only returns the same bytes.
+>
+> The RPC-could-not-classify case for a row that *does* have recorded
+> signatures (`could not verify release landed (...)`, with the signature
+> list appended) still lands here unchanged.
+>
+> A sender that could not establish the `PendingRemint` handoff leaves the row
+> `Processing` (metric `pending_remint_state_unknown`) rather than quarantining
+> it, so it reaches this path through the recovery sweep above.
 
 > **Some Path C rows resolve themselves; check before you act.** The
 > quarantine now copies the broadcast signatures onto the row
@@ -279,16 +348,51 @@ committing the row to manual review. Sub-triggers below; same recovery.
    ```
 3. **If `NOT_LANDED`:** withdrawal did not happen. The user's private channel tokens
    may or may not be burned (depends on the trigger sub-site). Confirm burn
-   state via channel read node before deciding:
+   state before deciding - `signature` is the originating PrivateChannel
+   burn:
+   ```bash
+   solana confirm -v <signature> --url <private-channel-rpc>
+   ```
+   `Finalized` with no error means burned. A `not found` is **not** proof of
+   non-inclusion. It counts only if the endpoint observed the row's `slot`,
+   which takes both bounds against `<private-channel-rpc>`:
+   `solana first-available-block` at or below the row's `slot`, else the slot
+   was pruned away, **and** `solana slot --commitment finalized` at or above
+   it, else the node never reached it. Either bound alone is worthless: a
+   pruned node and a lagging node return the same `not found` for a burn that
+   did land. The operator enforces both before calling a signature dead by
+   absence, the top via the blockhash-expiry check that produces
+   `DeadByAbsence` and the bottom via the ledger floor in
+   `sender/remint.rs::coverage_verdict`. Honor both here.
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
-   - Not burned → no user impact; close the alert and re-arm.
+   - Not burned, proven absent → **do not re-arm.** Nothing backs the
+     row: a re-arm releases escrowed target-chain funds against a burn
+     that never happened, and neither the builder nor the escrow program
+     can detect it. Capture the row, its `signature` and the
+     `solana confirm` output in the incident record, then mark the row
+     terminal:
+     ```sql
+     UPDATE transactions SET status = 'failed', updated_at = NOW()
+      WHERE id = :transaction_id;
+     ```
+     No refund is owed - the user still holds their channel tokens.
+     [Escalate](_escalation.md) (Tier 3): a row with no finalized burn
+     means the ingestion or write path has a defect.
+   - Burn state unproven (RPC error, or `not found` with either bound
+     unmet: floor above the row's `slot`, or finalized tip below it) →
+     stop. [Escalate](_escalation.md) (Tier 2).
+     Do not terminalize: marking a genuinely burned row `failed` strands
+     the user's tokens with no restoration path. Re-run once the endpoint
+     covers the slot, or from an archival node. Record the id as held in
+     the incident record - it stays in `manual_review`, so a later halt's
+     Path A Step 4 must exclude it.
 4. **If `AMBIGUOUS`:** stop. [Escalate](_escalation.md) (Tier 2). Wait
    for RPC visibility to recover. Do not act.
 
 > **If the quarantined release actually landed** (verdict `LANDED`, but
-> the row was quarantined with `no broadcast signatures recorded; cannot
-> verify release landed` and never written `Completed`), the consumed
+> the row was quarantined with `released on-chain with no recorded
+> broadcast signature` and never written `Completed`), the consumed
 > nonce is missing from the DB. The boot pre-flight normally reconciles
 > this from the durable release signature; only if it cannot will the
 > operator refuse to start. See
@@ -308,7 +412,7 @@ re-arm.** The processor would reject the row identically on every tick.
 ### Step 1 - confirm the corruption
 
 ```sql
-SELECT id, signature, withdrawal_nonce, mint, amount, recipient,
+SELECT id, signature, slot, withdrawal_nonce, mint, amount, recipient,
        created_at, updated_at
   FROM transactions
  WHERE id = :transaction_id;
@@ -332,6 +436,11 @@ Otherwise proceed.
 solana confirm -v <signature> --url <private-channel-rpc>
 ```
 
+`not found` proves non-inclusion only if the endpoint observed the row's
+`slot`: first-available-block at or below it **and** finalized tip at or
+above it. A pruned node and a lagging node both return the same `not found`
+for a burn that did land. Same two bounds as Path C Step 3.
+
 ### Step 3 - branch on burn verdict
 
 #### Burn landed
@@ -354,6 +463,16 @@ write-or-classify path has a defect. Capture the row, then delete:
 ```sql
 DELETE FROM transactions WHERE id = :transaction_id;
 ```
+
+#### Burn state unproven
+
+The RPC failed, or `not found` came back without ledger coverage of the
+row's `slot`. Stop. [Escalate](_escalation.md) (Tier 2). **Do not delete
+the row** - the burn may have landed, and this row is the only record of
+it. Re-run Step 2 once the endpoint covers the slot, or against an
+archival node. Record the id as held in the incident record, as in Path C
+Step 3: the row stays in `manual_review`, so a later halt's Path A Step 4
+must exclude it.
 
 ## Path G - requeue cap exhausted (release never landed)
 
@@ -422,6 +541,8 @@ Capture in the incident record:
 - Full `error_message` content.
 - Trigger site (which row of the dispatch table).
 - On-chain verdict (`LANDED <sig>` / `NOT_LANDED` / `AMBIGUOUS`).
+- Burn verdict on the source side (`signature` + `solana confirm` output),
+  when the path branched on it.
 - Recovery action taken (SQL run, sig used, escalation path).
 - RPC endpoint used for verification.
 

@@ -8,7 +8,7 @@ use spl_associated_token_account::get_associated_token_address_with_program_id;
 use trident_fuzz::fuzzing::*;
 
 pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: Pubkey =
-    pubkey!("GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83");
+    pubkey!("9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU");
 pub const SPL_TOKEN_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 /// Clamp raw fuzz amounts to [1, 999_999].

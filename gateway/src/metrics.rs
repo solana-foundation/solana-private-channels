@@ -21,10 +21,18 @@ counter_vec!(
     &["error_type"]
 );
 
+counter_vec!(
+    GATEWAY_REJECTED_TOTAL,
+    "private_channel_gateway_rejected_total",
+    "Connections or requests rejected by a resource guard, by reason",
+    &["reason"]
+);
+
 pub fn init() {
     private_channel_metrics::init_metrics!(
         GATEWAY_REQUESTS_TOTAL,
         GATEWAY_REQUEST_DURATION,
         GATEWAY_ERRORS_TOTAL,
+        GATEWAY_REJECTED_TOTAL,
     );
 }

@@ -1,5 +1,10 @@
 use {
     super::{
+        counter,
+        current_slot::CURRENT_SLOT_KEY,
+        get_block_height::BLOCK_HEIGHT_KEY,
+        get_latest_blockhash::LATEST_BLOCKHASH_KEY,
+        get_latest_slot::LATEST_SLOT_KEY,
         postgres::PostgresAccountsDB,
         redis::RedisAccountsDB,
         traits::{AccountsDB, BlockInfo},
@@ -25,6 +30,18 @@ pub struct AddressSignatureRow {
     pub address: Vec<u8>,
     pub slot: i64,
     pub signature: Vec<u8>,
+}
+
+/// Refusal message for a batch whose block does not extend the stored ledger.
+/// Names both causes: a second write-capable node, or this node retrying a slot
+/// whose commit it never saw land. The log line is what an operator sees first.
+fn stale_tip_error(slot: u64) -> String {
+    format!(
+        "Refusing to commit slot {}: a block at or above it is already stored. \
+         Either a second write-capable node is running against this database, or \
+         this batch retries a slot that already committed.",
+        slot
+    )
 }
 
 /// Bulk-insert into address_signatures inside an active PG tx.
@@ -216,9 +233,75 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
 
-    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
-    // via this path and MVCC returns the caller's own last commit.
-    if tx_count > 0 {
+    // ── Block info: at most 2 queries (block row + chain tip metadata) ──
+    // Runs before the counter because whether this slot is new is what decides
+    // whether the counter may advance.
+    let slot_is_new = if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
+        // A block may only extend the stored ledger, and a slot already stored may
+        // only be rewritten with the same bytes: that admits the settler's own
+        // retry after a lost acknowledgement and rejects every other writer.
+        //
+        // `xmax = 0` then separates a real insert from such a replay, so the
+        // counter below advances once per slot however often the commit retries.
+        let inserted: Option<bool> = sqlx::query_scalar(
+            "INSERT INTO blocks (slot, data)
+                 SELECT $1, $2
+                 WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot > $1)
+                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data
+                   WHERE blocks.data = EXCLUDED.data
+                 RETURNING (xmax = 0)",
+        )
+        .bind(block_info.slot as i64)
+        .bind(block_data)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to store block: {}", e))?;
+
+        // No row means a newer block is already stored, or this slot holds a
+        // different one. Either way another writer has passed this batch.
+        let Some(inserted) = inserted else {
+            return Err(stale_tip_error(block_info.slot));
+        };
+
+        // The tip blockhash and the chain counters go in one UNNEST upsert, so
+        // making slot and height durable costs no extra round trip. They commit
+        // with the block row, so a rolled-back batch leaves all three untouched.
+        let keys: Vec<&str> = vec![
+            LATEST_BLOCKHASH_KEY,
+            LATEST_SLOT_KEY,
+            CURRENT_SLOT_KEY,
+            BLOCK_HEIGHT_KEY,
+        ];
+        let values: Vec<Vec<u8>> = vec![
+            block_info.blockhash.as_ref().to_vec(),
+            counter::encode(block_info.slot).to_vec(),
+            counter::encode(block_info.slot).to_vec(),
+            counter::encode(block_info.block_height.unwrap_or(block_info.slot)).to_vec(),
+        ];
+        sqlx::query(
+            "INSERT INTO metadata (key, value)
+                 SELECT * FROM UNNEST($1::varchar[], $2::bytea[])
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&keys)
+        .bind(&values)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("Failed to update the chain tip metadata: {}", e))?;
+
+        inserted
+    } else {
+        // No slot to key on, so there is nothing to suppress.
+        true
+    };
+
+    // Read-modify-write inside BEGIN…COMMIT. The block insert above already let
+    // only one writer past for this slot, and a rejected writer's increment rolls
+    // back with the rest of its batch.
+    //
+    // Skipped on a replayed slot: every other write here is an idempotent upsert,
+    // so this is the one statement that would count the same batch twice.
+    if tx_count > 0 && slot_is_new {
         let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT value FROM metadata WHERE key = 'transaction_count'",
         )
@@ -242,34 +325,41 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to update transaction count: {}", e))?;
     }
 
-    // ── Block info: at most 2 queries (block row + latest_blockhash) ──
-    if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        sqlx::query(
-            "INSERT INTO blocks (slot, data) VALUES ($1, $2)
-                 ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data",
-        )
-        .bind(block_info.slot as i64)
-        .bind(block_data)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to store block: {}", e))?;
-
-        sqlx::query(
-            "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(block_info.blockhash.as_ref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
-    }
-
     // Commit — if this fails, the entire batch is rolled back.
     tx.commit()
         .await
         .map_err(|e| format!("Failed to commit transaction: {}", e))?;
 
     Ok(addr_sig_rows)
+}
+
+/// Drops the cache keys a failed `write_batch_redis` left holding pre-batch
+/// values, so reads miss and resolve against Postgres rather than being served
+/// something stale.
+///
+/// Only the account keys need it. A new `tx:` or `block:` key had no previous
+/// value, so a skipped write leaves it absent, which already reads as a miss.
+/// `latest_slot` and `latest_blockhash` are stale for at most one block, until
+/// the next successful write overwrites them. An account key, by contrast, keeps
+/// its pre-batch balance until that account is next touched, which may be never.
+///
+/// This narrows the window rather than being the only repair: the failed write
+/// also left the cached tip behind, so the next batch's continuity check takes
+/// the whole cache out of service and rebuilds it.
+pub(crate) async fn invalidate_batch_redis(
+    db: &mut RedisAccountsDB,
+    account_settlements: &[(Pubkey, AccountSettlement)],
+) {
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+
+    for (pubkey, _) in account_settlements {
+        pipe.del(format!("account:{}", pubkey));
+    }
+
+    if let Err(e) = pipe.query_async::<()>(&mut db.connection).await {
+        warn!("Failed to invalidate Redis keys after a failed cache write: {e}");
+    }
 }
 
 pub(crate) async fn write_batch_redis(
@@ -300,45 +390,38 @@ pub(crate) async fn write_batch_redis(
         }
     }
 
-    // Store transactions and build the address→signatures index used by
-    // getSignaturesForAddress. For each account key touched by the transaction
-    // we ZADD one entry to a per-address sorted set:
-    //   key:    addr_sigs:{pubkey}
-    //   score:  tx_slot as f64  (enables ZRANGE BYSCORE REV ordering by recency)
-    //   member: hex-encoded signature (preserves byte ordering for same-slot DESC sort)
-    // Mirrors what address_signatures does in Postgres.
-    // redis-rs 0.27: zadd(key, member, score) — member first, score second.
-    let tx_count = transactions.len();
+    // Only the families a read can actually be served from are mirrored:
+    // point lookups by pubkey, signature and slot, plus the chain tip. The
+    // address index, slot index and transaction counter used to be written here
+    // too, but nothing reads them from the cache any more: a range, a history
+    // or a counter cannot express a cache miss, so those reads go straight to
+    // Postgres. Writing them was work whose only effect was to be purged later.
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         let key = format!("tx:{}", signature);
         let serialized = bincode::serialize(&stored_tx).unwrap();
         pipe.set(key, serialized);
-
-        for pubkey in transaction.message().account_keys().iter() {
-            let addr_key = format!("addr_sigs:{}", pubkey);
-            pipe.zadd(addr_key, hex::encode(signature.as_ref()), tx_slot as f64);
-        }
-    }
-
-    // Increment transaction count
-    if tx_count > 0 {
-        pipe.incr("transaction_count", tx_count);
     }
 
     // Store block info and update latest slot
     if let Some(block) = block_info {
-        pipe.set("latest_blockhash", block.blockhash.to_string());
-        pipe.set("latest_slot", block.slot);
+        pipe.set(LATEST_BLOCKHASH_KEY, block.blockhash.to_string());
+        pipe.set(LATEST_SLOT_KEY, block.slot);
+        // The live slot moves on idle ticks too, but a block still republishes
+        // it so a replica never reports a slot behind the block it can fetch.
+        pipe.set(CURRENT_SLOT_KEY, block.slot);
+        // Mirrored so a read replica reports a height consistent with the hash
+        // it serves from the same cache.
+        pipe.set(BLOCK_HEIGHT_KEY, block.block_height.unwrap_or(block.slot));
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
-        pipe.set(key, serialized);
-        // Index all slots in a sorted set (score = slot value) for two purposes:
-        // 1. getBlocks: ZRANGE block_slot_index start end BYSCORE for O(log N + M) range queries.
-        // 2. getFirstAvailableBlock: ZRANGE block_slot_index 0 0 returns the minimum slot.
-        // ZADD is idempotent for the same (member, score) pair, so replays are safe.
-        // redis-rs 0.27: zadd(key, member, score) — member first, score second.
-        pipe.zadd("block_slot_index", block.slot, block.slot as f64);
+        // Only block entries expire. The tip keys the coherence check reads are
+        // never given a TTL, so an expiry can neither condemn the cache nor
+        // trigger a rebuild.
+        match db.block_ttl_secs() {
+            0 => pipe.set(key, serialized),
+            ttl => pipe.set_ex(key, serialized, ttl),
+        };
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

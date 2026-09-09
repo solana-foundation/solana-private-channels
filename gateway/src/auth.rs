@@ -64,7 +64,7 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 ///
 /// Known limitation for `getSignaturesForAddress`: ownership is derived from
 /// the current on-chain account state. If a TokenAccount has been closed, the
-/// account fetch returns `None` and the User is rejected with 403 — even for
+/// account fetch returns `NotFound` and the User is rejected with 403 — even for
 /// signatures from when they owned the account. We accept this: closing a
 /// TokenAccount is rare in our context (no rent to reclaim for users), and the
 /// alternatives (snapshotting ownership at ingest, or deriving ATAs from a
@@ -72,7 +72,7 @@ const OPERATOR_ONLY_METHODS: &[&str] = &["getBlock", "getTransaction", "simulate
 const ACCOUNT_GATED_METHODS: &[&str] = &[
     "getAccountInfo",
     "getTokenAccountBalance",
-    "getSignaturesForAddress",
+    GET_SIGNATURES_FOR_ADDRESS,
 ];
 
 /// Whether `method` requires any auth check (operator-only or account-gated).
@@ -80,6 +80,50 @@ const ACCOUNT_GATED_METHODS: &[&str] = &[
 /// public methods.
 pub fn is_gated(method: &str) -> bool {
     OPERATOR_ONLY_METHODS.contains(&method) || ACCOUNT_GATED_METHODS.contains(&method)
+}
+
+/// Transaction history. Gated like the two above.
+pub const GET_SIGNATURES_FOR_ADDRESS: &str = "getSignaturesForAddress";
+
+/// Gated methods that a token-account delegate must not unlock. A delegate is a
+/// current spend authority, often temporary and allowance-scoped, so it may read
+/// the balance it can spend. It says nothing about who controlled the address
+/// when past transactions landed, so it cannot open a history page.
+const OWNER_ONLY_METHODS: &[&str] = &[GET_SIGNATURES_FOR_ADDRESS];
+
+/// Signature status lookup. Ungated, since any caller may poll a signature it
+/// already holds, but its response carries the same execution errors as a
+/// history page.
+const GET_SIGNATURE_STATUSES: &str = "getSignatureStatuses";
+
+/// Methods whose response carries per-transaction execution errors. A stored
+/// transaction is indexed under every account it touched, and its status is
+/// readable by anyone holding the signature, so neither method's authorization
+/// proves the caller may see which account made execution fail.
+const ERROR_BEARING_METHODS: &[&str] = &[GET_SIGNATURES_FOR_ADDRESS, GET_SIGNATURE_STATUSES];
+
+/// Whether `method`'s response must have its transaction errors collapsed before
+/// it reaches this caller. Only an Operator keeps the raw diagnostics; a User
+/// and an anonymous caller are treated alike, because the attack works with no
+/// token at all. Callers reaching the gateway's internal listener never get
+/// here: see `Access` in lib.rs.
+pub fn redacts_transaction_errors(
+    auth_header: Option<&str>,
+    decoding_key: &DecodingKey,
+    method: &str,
+) -> bool {
+    redacts_transaction_errors_for(verify_bearer(auth_header, decoding_key).as_ref(), method)
+}
+
+/// Same rule, decided from claims already resolved against the auth DB. Gated
+/// methods must use this form so a demoted operator loses the raw diagnostics
+/// at the same moment it loses access, not when its token expires.
+pub fn redacts_transaction_errors_for(claims: Option<&Claims>, method: &str) -> bool {
+    if !ERROR_BEARING_METHODS.contains(&method) {
+        return false;
+    }
+
+    claims.map(|c| &c.role) != Some(&Role::Operator)
 }
 
 // ---------------------------------------------------------------------------
@@ -247,16 +291,19 @@ pub fn check_request_auth(claims: Option<&Claims>, method: &str, params: &Value)
 /// - DvP swap escrow: `check_swap_dvp_ownership`.
 /// - Anything else (e.g. a System Program wallet account): falls back to
 ///   checking whether the `pubkey` itself is a verified wallet.
+///
+/// `method` narrows the token-account check only: see `OWNER_ONLY_METHODS`.
 pub async fn check_account_data_ownership(
     data: &[u8],
     program_owner: &str,
     pubkey: &str,
+    method: &str,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> AuthDecision {
     match program_owner {
         SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM => {
-            check_token_account_ownership(data, user_id, auth_db).await
+            check_token_account_ownership(data, method, user_id, auth_db).await
         }
         DVP_SWAP_PROGRAM => check_swap_dvp_ownership(data, user_id, auth_db).await,
         // Non-token-program account (e.g. System Program wallet, unknown PDA).
@@ -272,13 +319,15 @@ pub async fn check_account_data_ownership(
 
 /// Ownership check for SPL Token and Token-2022 accounts. Both programs share
 /// the same base layout, so this checks the `owner` field (bytes 32-63) and,
-/// if it doesn't match, the `delegate` field (bytes 76-107) when present — a
-/// delegate has spend authority and counts as ownership for read access.
+/// if it doesn't match, the `delegate` field (bytes 76-107) when present. The
+/// delegate grants read access for a current-state method, but is skipped for
+/// an `OWNER_ONLY_METHODS` one.
 ///
 /// Mints are owned by the same programs but are only 82 bytes, below
 /// `TOKEN_ACCOUNT_SIZE`; they are not user accounts and are denied.
 async fn check_token_account_ownership(
     data: &[u8],
+    method: &str,
     user_id: Uuid,
     auth_db: &PgPool,
 ) -> AuthDecision {
@@ -292,8 +341,14 @@ async fn check_token_account_ownership(
 
     match is_wallet_owned_by_user(auth_db, user_id, &owner).await {
         Ok(true) => return AuthDecision::Proceed,
-        Ok(false) => {} // fall through to delegate check
+        Ok(false) => {} // not the owner
         Err(_) => return AuthDecision::Reject(StatusCode::INTERNAL_SERVER_ERROR, db_error_body()),
+    }
+
+    // Checked after the owner so delegating an account never costs the owner
+    // access to its own history.
+    if OWNER_ONLY_METHODS.contains(&method) {
+        return AuthDecision::Reject(StatusCode::FORBIDDEN, forbidden_body());
     }
 
     // Check the `delegate` field if one is set.
@@ -372,6 +427,7 @@ pub fn verify_bearer(auth_header: Option<&str>, decoding_key: &DecodingKey) -> O
 //   -32002  Forbidden   — account not owned by the calling user
 //   -32003  Forbidden   — method requires operator role
 //   -32603  Internal    — a DB lookup (ownership or role) failed
+//   -32004  Unavailable — ownership check could not reach the read node
 // ---------------------------------------------------------------------------
 
 fn unauthorized_body() -> Bytes {
@@ -423,6 +479,18 @@ pub fn role_check_error_body() -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": { "code": -32603, "message": "Internal error: could not verify caller role" }
+        })
+        .to_string(),
+    )
+}
+
+/// 503 body for a gated request whose ownership check could not be completed.
+/// Distinct from `forbidden_body`: the caller may well own the account, we just
+/// could not find out.
+pub fn auth_unavailable_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32004, "message": "Service unavailable: could not verify account ownership" }
         })
         .to_string(),
     )
@@ -663,6 +731,63 @@ mod tests {
         ));
     }
 
+    /// An owner-only method that is not account-gated never reaches the token
+    /// account check, leaving the policy silently dead.
+    #[test]
+    fn owner_only_methods_are_account_gated() {
+        for method in OWNER_ONLY_METHODS {
+            assert!(
+                ACCOUNT_GATED_METHODS.contains(method),
+                "{method} is owner-only but not account-gated"
+            );
+        }
+    }
+
+    // ── redacts_transaction_errors ────────────────────────────────────────────
+
+    /// `getSignatureStatuses` is ungated, so the anonymous caller (the shape the
+    /// balance probe actually takes) must be redacted just like a User.
+    #[test]
+    fn error_bearing_methods_redact_for_everyone_but_operator() {
+        let user = format!("Bearer {}", forge_token(Role::User, 3600));
+        let operator = format!("Bearer {}", forge_token(Role::Operator, 3600));
+
+        for method in ["getSignaturesForAddress", "getSignatureStatuses"] {
+            assert!(redacts_transaction_errors(None, &decoding_key(), method));
+            assert!(redacts_transaction_errors(
+                Some(&user),
+                &decoding_key(),
+                method
+            ));
+            assert!(!redacts_transaction_errors(
+                Some(&operator),
+                &decoding_key(),
+                method
+            ));
+        }
+    }
+
+    /// An expired operator token is not an operator, so it must not unlock the
+    /// raw errors.
+    #[test]
+    fn expired_operator_token_still_redacts() {
+        let expired = format!("Bearer {}", forge_token(Role::Operator, -3600));
+        assert!(redacts_transaction_errors(
+            Some(&expired),
+            &decoding_key(),
+            "getSignatureStatuses"
+        ));
+    }
+
+    #[test]
+    fn methods_without_transaction_errors_are_untouched() {
+        assert!(!redacts_transaction_errors(
+            None,
+            &decoding_key(),
+            "getAccountInfo"
+        ));
+    }
+
     // ── decode_account_data ───────────────────────────────────────────────────
 
     #[test]
@@ -688,6 +813,7 @@ mod tests {
             &data,
             SPL_TOKEN_PROGRAM,
             "SomePubkey",
+            "getAccountInfo",
             Uuid::new_v4(),
             &pool,
         )
@@ -706,6 +832,7 @@ mod tests {
             &data,
             SPL_TOKEN_2022_PROGRAM,
             "SomePubkey",
+            "getAccountInfo",
             Uuid::new_v4(),
             &pool,
         )
@@ -726,6 +853,7 @@ mod tests {
             &data,
             DVP_SWAP_PROGRAM,
             "SomePubkey",
+            "getAccountInfo",
             Uuid::new_v4(),
             &pool,
         )

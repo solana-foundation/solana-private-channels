@@ -128,6 +128,36 @@ pub struct MintDbBalance {
     pub total_withdrawals: BigDecimal,
 }
 
+/// One journaled broadcast attempt, written ahead of the send so a crash cannot
+/// lose it. `blockhash_slot` is the slot the signing blockhash was read at, which
+/// lower-bounds where the signature could have landed; it is `None` on rows
+/// written before that was recorded, and those fall back to deriving the bound
+/// from the endpoint's blockhash window.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StoredSig {
+    pub signature: String,
+    pub last_valid_block_height: i64,
+    pub blockhash_slot: Option<i64>,
+}
+
+/// Durable reconciliation-halt state. Its presence (a single row) is the
+/// cross-process, restart-surviving signal that freezes both operators'
+/// fetchers after a proven insolvency; absence means not halted.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HaltInfo {
+    pub reason: String,
+    pub halted_at: DateTime<Utc>,
+}
+
+/// Per-mint sum of every in-flight (unsettled) transaction amount. This bounds
+/// the maximum transient balance swing reconciliation may observe, so a gap
+/// larger than it cannot be explained by pending work alone.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MintInFlightAmount {
+    pub mint_address: String,
+    pub in_flight_amount: BigDecimal,
+}
+
 /// Mint metadata stored
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct DbMint {

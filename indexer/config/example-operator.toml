@@ -8,6 +8,12 @@ program_type = "escrow"
 
 # RPC endpoint URL for transaction submission
 rpc_url = "http://localhost:8899"
+# Archival Solana fallback for rpc_url (re-checks a Dead finality verdict). REQUIRED for the withdraw
+# operator (independent, same-cluster, reachable) or it refuses to start; optional for escrow. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
+
+# Solana custody RPC. Required for escrow: the reconciliation solvency check reads custody from it.
+source_rpc_url = "http://localhost:18899"
 
 # Escrow instance ID (required for escrow program type, omit for withdraw)
 # escrow_instance_id = "YourPubkeyHere..."
@@ -38,6 +44,12 @@ retry_base_delay_secs = 1
 
 # Channel buffer size for internal queues
 channel_buffer_size = 100
+
+# Operational RPC commitment for blockhash fetch and preflight ONLY. It does not gate
+# settlement: terminal Completed/FailedReminted writes and the recovery reconcile always
+# use a hardcoded `finalized` gate regardless of this value. "confirmed" (default) or
+# "finalized" are accepted; "processed" is rejected at startup as too weak.
+# rpc_commitment = "confirmed"
 
 # === Signer Configuration (via Environment Variables) ===
 #
@@ -92,7 +104,10 @@ reconciliation_interval_secs = 300
 # Default: 10 bps (0.1%)
 reconciliation_tolerance_bps = 10
 
-# Webhook URL for reconciliation alerts (optional)
+# Webhook URL for reconciliation alerts.
+# REQUIRED for the escrow operator: a detected reconciliation mismatch must
+# always alert, so the escrow operator refuses to start without this set. The
+# withdraw operator does not run reconciliation and ignores it.
 # POST requests will be sent to this URL when balance mismatches exceed the tolerance threshold
 #
 # Webhook Payload Format (JSON):
@@ -110,10 +125,8 @@ reconciliation_tolerance_bps = 10
 # - Retry Logic: 3 attempts with exponential backoff (500ms base delay, capped at 5s)
 # - Timeout: Standard reqwest defaults
 #
-# If webhook URL is not set, mismatches will only be logged (no HTTP requests sent).
-#
-# Uncomment and set to enable webhook alerts:
-# reconciliation_webhook_url = "https://your-webhook-endpoint.com/alerts"
+# The escrow operator will not start until this is set (required for escrow).
+reconciliation_webhook_url = "https://your-webhook-endpoint.com/alerts"
 
 # Feepayer balance monitoring interval (seconds)
 # Only applies to escrow operators (ReleaseFunds feepayer on Solana mainnet)

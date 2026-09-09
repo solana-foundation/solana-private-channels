@@ -1,5 +1,8 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, types::StoredTransaction},
+    super::{
+        get_accounts::AccountLoadError, postgres::PostgresAccountsDB, redis::RedisAccountsDB,
+        types::StoredTransaction,
+    },
     crate::stages::AccountSettlement,
     anyhow::Result,
     serde::{Deserialize, Serialize},
@@ -25,17 +28,25 @@ pub struct BlockInfo {
     /// The recent_blockhash each transaction referenced, parallel to transaction_signatures.
     /// Used to rebuild the dedup cache on restart.
     pub transaction_recent_blockhashes: Vec<Hash>,
+    /// The message hash of each transaction, parallel to transaction_signatures.
+    /// This is the dedup replay identity, rebuilt into the cache on restart so a
+    /// bounce cannot reopen the replay window within blockhash validity.
+    pub transaction_message_hashes: Vec<Hash>,
 }
 
-/// AccountsDB enum supporting multiple backend storage options
+/// How a node reaches stored state.
 ///
 /// # Variants
 ///
-/// * `Postgres` - PostgreSQL database only. Provides ACID transactions and is the
-///   source of truth for all finalized state.
+/// * `Postgres`: the source of truth for all finalized state, with ACID
+///   transactions. Every node has one.
 ///
-/// * `Redis` - Redis cache only. Fast in-memory storage but lacks true transaction
-///   support. Uses MULTI/EXEC which can fail partway through without rollback.
+/// * `Redis`: a cache in front of that same Postgres, which it carries so a key
+///   the cache cannot answer is resolved rather than reported absent. Only the
+///   reads where a miss is detectable are served from it: point lookups by
+///   pubkey, signature and slot, plus the chain tip. Ranges, history and counters
+///   go to Postgres, because a short answer from a partial mirror is
+///   indistinguishable from a complete one.
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum AccountsDB {
@@ -44,7 +55,10 @@ pub enum AccountsDB {
 }
 
 impl AccountsDB {
-    pub async fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+    pub async fn get_account_shared_data(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Result<Option<AccountSharedData>, AccountLoadError> {
         super::get_account_shared_data::get_account_shared_data(self, pubkey).await
     }
 
@@ -52,7 +66,10 @@ impl AccountsDB {
         super::set_account::set_account(self, pubkey, account).await
     }
 
-    pub async fn get_transaction(&self, signature: &Signature) -> Option<StoredTransaction> {
+    pub async fn get_transaction(
+        &self,
+        signature: &Signature,
+    ) -> Result<Option<StoredTransaction>> {
         super::get_transaction::get_transaction(self, signature).await
     }
 
@@ -73,15 +90,19 @@ impl AccountsDB {
         super::get_latest_slot::get_latest_slot(self).await
     }
 
-    pub async fn set_latest_slot(&mut self, slot: u64) -> Result<(), String> {
-        super::set_latest_slot::set_latest_slot(self, slot).await
+    pub async fn get_block_height(&self) -> Result<Option<u64>> {
+        super::get_block_height::get_block_height(self).await
+    }
+
+    pub async fn get_current_slot(&self) -> Result<Option<u64>> {
+        super::current_slot::get_current_slot(self).await
     }
 
     pub async fn store_block(&mut self, block_info: BlockInfo) -> Result<(), String> {
         super::store_block::store_block(self, block_info).await
     }
 
-    pub async fn get_block(&self, slot: u64) -> Option<BlockInfo> {
+    pub async fn get_block(&self, slot: u64) -> Result<Option<BlockInfo>> {
         super::get_block::get_block(self, slot).await
     }
 
@@ -101,12 +122,20 @@ impl AccountsDB {
         super::get_blocks::get_blocks(self, start_slot, end_slot).await
     }
 
+    pub async fn get_blocks_with_limit(&self, start_slot: u64, limit: u64) -> Result<Vec<u64>> {
+        super::get_blocks_with_limit::get_blocks_with_limit(self, start_slot, limit).await
+    }
+
     pub async fn get_blocks_in_range(
         &self,
         start_slot: u64,
         end_slot: u64,
     ) -> Result<Vec<BlockInfo>> {
         super::get_blocks_in_range::get_blocks_in_range(self, start_slot, end_slot).await
+    }
+
+    pub async fn get_last_blocks(&self, limit: usize) -> Result<Vec<BlockInfo>> {
+        super::get_last_blocks::get_last_blocks(self, limit).await
     }
 
     pub async fn get_epoch_info(&self) -> Result<crate::rpc::api::EpochInfo> {
@@ -128,17 +157,11 @@ impl AccountsDB {
         super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
-    pub async fn get_accounts(&self, accounts: &[Pubkey]) -> Vec<Option<AccountSharedData>> {
-        super::get_accounts::get_accounts(self, accounts).await
-    }
-
-    /// Load used by preload: `Some` per found account, `None` for an absent one,
-    /// and a typed `Err` for a fatal failure (transient outage or a corrupt row).
-    pub async fn load_accounts(
+    pub async fn get_accounts(
         &self,
         accounts: &[Pubkey],
-    ) -> Result<Vec<Option<AccountSharedData>>, super::get_accounts::AccountLoadError> {
-        super::get_accounts::load_accounts(self, accounts).await
+    ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
+        super::get_accounts::get_accounts(self, accounts).await
     }
 
     pub async fn store_performance_sample(
@@ -155,7 +178,7 @@ impl AccountsDB {
         super::get_recent_performance_samples::get_recent_performance_samples(self, limit).await
     }
 
-    pub async fn get_block_time(&self, slot: u64) -> Option<i64> {
+    pub async fn get_block_time(&self, slot: u64) -> Result<Option<i64>> {
         super::get_block_time::get_block_time(self, slot).await
     }
 }
@@ -171,10 +194,13 @@ impl AccountsDB {
                     .map_err(|e| anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e))?,
             ))
         } else if accountsdb_connection_url.starts_with("redis://") {
-            Ok(AccountsDB::Redis(
-                RedisAccountsDB::new(accountsdb_connection_url)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?,
+            // Redis is a cache, never a source of truth: on its own it cannot
+            // tell a missing key from a deleted one, and nothing verifies its
+            // contents belong to this ledger. A caching node passes a Postgres
+            // URL here and its Redis URL separately.
+            Err(anyhow::anyhow!(
+                "Redis cannot be used as the accounts database; pass the Postgres URL here and \
+                 configure Redis as a cache in front of it"
             ))
         } else {
             Err(anyhow::anyhow!(
@@ -193,7 +219,8 @@ mod tests {
         create_test_block_info, create_test_sanitized_transaction, flush_address_signatures_sync,
         start_test_postgres, start_test_redis,
     };
-    use solana_sdk::account::AccountSharedData;
+    use redis::AsyncCommands;
+    use solana_sdk::account::{AccountSharedData, ReadableAccount};
     use solana_sdk::signature::{Keypair, Signer};
     use solana_svm::account_loader::LoadedTransaction;
     use solana_svm::transaction_execution_result::{
@@ -213,6 +240,20 @@ mod tests {
         );
     }
 
+    /// Redis on its own cannot tell a missing key from a deleted one, and
+    /// nothing verifies its contents belong to this ledger, so it is never the
+    /// accounts database. It is configured as a cache in front of Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_rejected_as_the_accounts_database() {
+        let result = AccountsDB::new("redis://localhost:6379", true).await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.err().unwrap());
+        assert!(
+            msg.contains("Redis cannot be used as the accounts database"),
+            "expected Redis rejection, got: {msg}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn set_and_get_account_round_trip() {
         let (mut db, _pg) = start_test_postgres().await;
@@ -222,11 +263,11 @@ mod tests {
         let account = AccountSharedData::new(42_000, 0, &owner);
 
         // miss before set
-        assert!(db.get_account_shared_data(&pubkey).await.is_none());
+        assert!(db.get_account_shared_data(&pubkey).await.unwrap().is_none());
 
         db.set_account(pubkey, account.clone()).await;
 
-        let loaded = db.get_account_shared_data(&pubkey).await;
+        let loaded = db.get_account_shared_data(&pubkey).await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(
             solana_sdk::account::ReadableAccount::lamports(&loaded.unwrap()),
@@ -245,11 +286,46 @@ mod tests {
 
         db.set_account(pk2, acct.clone()).await;
 
-        let results = db.get_accounts(&[pk1, pk2, pk3]).await;
+        let results = db.get_accounts(&[pk1, pk2, pk3]).await.unwrap();
         assert_eq!(results.len(), 3);
         assert!(results[0].is_none(), "pk1 was never stored");
         assert!(results[1].is_some(), "pk2 should be found");
         assert!(results[2].is_none(), "pk3 was never stored");
+    }
+
+    /// Both read paths must report absence at zero lamports and still return the
+    /// 1-lamport floor. `get_accounts` is positional, so indices stay aligned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn zero_lamport_row_reads_as_absent() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let zero = Pubkey::new_unique();
+        let floor = Pubkey::new_unique();
+        let never_stored = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+
+        db.set_account(zero, AccountSharedData::new(0, 8, &owner))
+            .await;
+        db.set_account(floor, AccountSharedData::new(1, 8, &owner))
+            .await;
+
+        assert!(
+            db.get_account_shared_data(&zero).await.unwrap().is_none(),
+            "a zero-lamport row must read as absent"
+        );
+        assert!(
+            db.get_account_shared_data(&floor).await.unwrap().is_some(),
+            "an account on the 1-lamport floor must still read back"
+        );
+
+        let results = db.get_accounts(&[zero, floor, never_stored]).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_none(), "the zero-lamport row is filtered out");
+        assert!(
+            results[1].is_some(),
+            "the floor account survives the filter"
+        );
+        assert!(results[2].is_none(), "never_stored was never written");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -261,7 +337,7 @@ mod tests {
 
         db.store_block(block.clone()).await.unwrap();
 
-        let loaded = db.get_block(10).await;
+        let loaded = db.get_block(10).await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.slot, 10);
@@ -271,7 +347,48 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn get_block_miss_returns_none() {
         let (db, _pg) = start_test_postgres().await;
-        assert!(db.get_block(999).await.is_none());
+        assert!(db.get_block(999).await.unwrap().is_none());
+    }
+
+    /// The chain counters are read back from `metadata`, which is what lets the
+    /// slot keep advancing while blocks are sparse and the height count blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_batch_persists_the_chain_counters() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let mut block = create_test_block_info(40, Hash::new_unique());
+        block.block_height = Some(7);
+        db.write_batch(&[], vec![], Some(block)).await.unwrap();
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(40));
+        assert_eq!(db.get_block_height().await.unwrap(), Some(7));
+    }
+
+    /// A node upgrading in place has no counters yet. Both fall back to the last
+    /// stored block, whose height was its slot before this change, so the live
+    /// counters continue the old sequence rather than restarting it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_counters_fall_back_to_the_last_stored_block() {
+        let (mut db, _pg) = start_test_postgres().await;
+        db.store_block(create_test_block_info(12, Hash::new_unique()))
+            .await
+            .unwrap();
+
+        // Delete the counters to reproduce a ledger written by the old build,
+        // which stored blocks but no counters at all.
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        sqlx::query(
+            "DELETE FROM metadata WHERE key IN ('latest_slot', 'current_slot', 'block_height')",
+        )
+        .execute(postgres_db.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(12));
+        assert_eq!(db.get_current_slot().await.unwrap(), Some(12));
+        assert_eq!(db.get_block_height().await.unwrap(), Some(12));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -327,23 +444,495 @@ mod tests {
         assert_eq!(slots, vec![1, 3, 7, 10]);
     }
 
+    /// A read replica has no live blockhash window and answers both the hash and
+    /// the height from the same mirrored tip, so the deadline it publishes matches
+    /// the hash it just served.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_blocks_redis_returns_slot_numbers_in_order() {
-        let (redis_raw, _redis) = start_test_redis().await;
-        let mut db = AccountsDB::Redis(redis_raw);
+    async fn read_replica_reports_a_consistent_height() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
 
-        for slot in [3u64, 7, 1, 10] {
-            db.write_batch(
-                &[],
-                vec![],
-                Some(create_test_block_info(slot, Hash::new_unique())),
+        let blockhash = Hash::new_unique();
+        let mut block = create_test_block_info(40, blockhash);
+        block.block_height = Some(7);
+        pg_db
+            .write_batch(&[], vec![], Some(block.clone()))
+            .await
+            .unwrap();
+        crate::accounts::write_batch::write_batch_redis(
+            &mut redis_raw,
+            &[],
+            vec![],
+            Some(block.clone()),
+        )
+        .await
+        .unwrap();
+
+        let replica = AccountsDB::Redis(redis_raw);
+        assert_eq!(replica.get_latest_blockhash().await.unwrap(), blockhash);
+        assert_eq!(replica.get_block_height().await.unwrap(), Some(7));
+        assert_eq!(replica.get_latest_slot().await.unwrap(), Some(40));
+        assert_eq!(replica.get_current_slot().await.unwrap(), Some(40));
+    }
+
+    /// Point lookups resolve a cache miss against Postgres instead of reporting
+    /// the data absent. A key missing from the cache is indistinguishable from a
+    /// deleted one, which is how a cache-backed node could serve a real funded
+    /// account as nonexistent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn point_lookups_through_cache_resolve_against_postgres() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment. Unstamped,
+        // these reads would skip Redis instead of missing in it, which is not
+        // the path under test.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let cache_db = AccountsDB::Redis(redis_raw);
+
+        let pubkey = Pubkey::new_unique();
+        let lamports = 500;
+        let account = AccountSharedData::new(lamports, 0, &Pubkey::new_unique());
+        let keypair = Keypair::new();
+        let tx = create_test_sanitized_transaction(&keypair, &Pubkey::new_unique(), 1);
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        let slot = 7u64;
+        let blockhash = Hash::new_unique();
+
+        // Written to Postgres only, never to the cache.
+        pg_db
+            .write_batch(
+                &[(
+                    pubkey,
+                    AccountSettlement {
+                        account,
+                        deleted: false,
+                    },
+                )],
+                vec![(*tx.signature(), &tx, slot, 1_700_000_000, &processed)],
+                Some(create_test_block_info(slot, blockhash)),
             )
             .await
             .unwrap();
+
+        assert_eq!(
+            cache_db
+                .get_account_shared_data(&pubkey)
+                .await
+                .unwrap()
+                .map(|account| account.lamports()),
+            Some(lamports),
+            "a cached miss must not read as a nonexistent account"
+        );
+        assert_eq!(
+            cache_db.get_accounts(&[pubkey]).await.unwrap()[0]
+                .as_ref()
+                .map(|account| account.lamports()),
+            Some(lamports)
+        );
+        assert!(cache_db
+            .get_transaction(tx.signature())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(cache_db.get_block(slot).await.unwrap().is_some());
+        assert_eq!(cache_db.get_latest_slot().await.unwrap(), Some(slot));
+        assert_eq!(cache_db.get_latest_blockhash().await.unwrap(), blockhash);
+        assert_eq!(cache_db.get_transaction_count().await.unwrap(), 1);
+    }
+
+    /// A batch read where only some keys are cached must resolve the rest
+    /// against Postgres and keep every result on its original key. Distinct
+    /// balances make a positional mix-up visible: returning the right accounts
+    /// against the wrong keys is the failure this guards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partially_cached_batch_read_stays_aligned_with_its_keys() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment, and this
+        // test needs the one cached entry to actually be served.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        let owner = Pubkey::new_unique();
+        let first = (Pubkey::new_unique(), 100u64);
+        let second = (Pubkey::new_unique(), 200u64);
+        let third = (Pubkey::new_unique(), 300u64);
+        let absent = Pubkey::new_unique();
+        // The cached balance differs from the row behind it, so the assertion
+        // can tell a cache hit from a fallback read at the same position.
+        let second_cached_lamports = 250u64;
+
+        for (pubkey, lamports) in [first, second, third] {
+            pg_db
+                .set_account(pubkey, AccountSharedData::new(lamports, 0, &owner))
+                .await;
         }
 
-        let slots = db.get_blocks(0, Some(20)).await.unwrap();
-        assert_eq!(slots, vec![1, 3, 7, 10]);
+        // Only the middle account is cached, so the batch is a hit sandwiched
+        // between two misses.
+        redis_raw
+            .set_account(
+                second.0,
+                AccountSharedData::new(second_cached_lamports, 0, &owner),
+            )
+            .await;
+        let cache_db = AccountsDB::Redis(redis_raw);
+
+        let results = cache_db
+            .get_accounts(&[first.0, second.0, third.0, absent])
+            .await
+            .unwrap();
+
+        let lamports: Vec<Option<u64>> = results
+            .iter()
+            .map(|account| account.as_ref().map(|account| account.lamports()))
+            .collect();
+        assert_eq!(
+            lamports,
+            vec![
+                Some(first.1),
+                Some(second_cached_lamports),
+                Some(third.1),
+                None
+            ],
+            "each result must stay on the key it was asked for"
+        );
+    }
+
+    /// The write node condemns a cache it has stopped maintaining by clearing the
+    /// deployment stamp. That only helps if read nodes look again: one that
+    /// checked at startup and never rechecked would keep serving the stale keys
+    /// until someone restarted it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_condemned_cache_stops_being_served() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let settled_lamports = 900;
+        let stale_lamports = 100;
+        pg_db
+            .set_account(pubkey, AccountSharedData::new(settled_lamports, 0, &owner))
+            .await;
+        redis_raw
+            .set_account(pubkey, AccountSharedData::new(stale_lamports, 0, &owner))
+            .await;
+
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+        let cache_db = AccountsDB::Redis(redis_raw);
+        assert_eq!(
+            cache_db
+                .get_account_shared_data(&pubkey)
+                .await
+                .unwrap()
+                .map(|account| account.lamports()),
+            Some(stale_lamports),
+            "a stamped cache is served, stale value and all"
+        );
+
+        let AccountsDB::Redis(ref redis_db) = cache_db else {
+            panic!("expected Redis variant")
+        };
+        crate::accounts::redis_coherence::clear_deployment_id(redis_db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache_db
+                .get_account_shared_data(&pubkey)
+                .await
+                .unwrap()
+                .map(|account| account.lamports()),
+            Some(settled_lamports),
+            "once condemned, reads must bypass the cache and reach Postgres"
+        );
+    }
+
+    /// A cache entry that will not deserialize is a miss, and it stays a miss
+    /// forever unless it is removed: every later read would pay both the Redis
+    /// hop and the Postgres hop. Reading it once must evict it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_corrupt_cache_entry_is_evicted_when_it_is_read() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment, and this test
+        // needs the corrupt entry to actually be read.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        let pubkey = Pubkey::new_unique();
+        let lamports = 700;
+        pg_db
+            .set_account(
+                pubkey,
+                AccountSharedData::new(lamports, 0, &Pubkey::new_unique()),
+            )
+            .await;
+
+        let key = format!("account:{}", pubkey);
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set(&key, vec![0xffu8; 8]).await.unwrap();
+
+        let cache_db = AccountsDB::Redis(redis_raw);
+        assert_eq!(
+            cache_db
+                .get_account_shared_data(&pubkey)
+                .await
+                .unwrap()
+                .map(|account| account.lamports()),
+            Some(lamports),
+            "a corrupt entry must fall through to Postgres"
+        );
+
+        let still_cached: bool = conn.exists(&key).await.unwrap();
+        assert!(
+            !still_cached,
+            "a corrupt entry must be evicted, not re-read on every request"
+        );
+    }
+
+    /// A cached block or transaction that will not decode must read through to
+    /// Postgres, the same as a missing one.
+    ///
+    /// The stamp tracks the database, not the build, so adding a field to
+    /// BlockInfo or StoredTransaction leaves a correctly stamped cache full of
+    /// entries the new binary cannot read. Failing the request instead of
+    /// falling through would make those slots and signatures error for as long
+    /// as the entries sat there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cached_block_or_transaction_that_cannot_be_decoded_falls_through() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        // A cache is only read from while it names this deployment, and these
+        // entries have to actually be read for the fallthrough to be exercised.
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        let keypair = Keypair::new();
+        let tx = create_test_sanitized_transaction(&keypair, &Pubkey::new_unique(), 1);
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        let slot = 7u64;
+        let blockhash = Hash::new_unique();
+
+        pg_db
+            .write_batch(
+                &[],
+                vec![(*tx.signature(), &tx, slot, 1_700_000_000, &processed)],
+                Some(create_test_block_info(slot, blockhash)),
+            )
+            .await
+            .unwrap();
+
+        // Stand in for entries an older build wrote in a layout this one cannot
+        // read.
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn
+            .set(format!("block:{}", slot), vec![0xffu8; 8])
+            .await
+            .unwrap();
+        let _: () = conn
+            .set(format!("tx:{}", tx.signature()), vec![0xffu8; 8])
+            .await
+            .unwrap();
+
+        let cache_db = AccountsDB::Redis(redis_raw);
+        assert_eq!(
+            cache_db.get_block(slot).await.unwrap().map(|b| b.blockhash),
+            Some(blockhash),
+            "an undecodable cached block must fall through to Postgres"
+        );
+        assert!(
+            cache_db
+                .get_transaction(tx.signature())
+                .await
+                .unwrap()
+                .is_some(),
+            "an undecodable cached transaction must fall through to Postgres"
+        );
+    }
+
+    /// A failed cache write leaves account keys holding pre-batch balances.
+    /// Invalidating them turns a stale hit into a miss, which then resolves
+    /// against Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalidating_a_failed_batch_write_stops_serving_stale_balances() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let settled_lamports = 900u64;
+        let stale_lamports = 100u64;
+
+        // Postgres committed the batch; the cache still holds the pre-batch
+        // balance, which is what a failed cache write leaves behind.
+        pg_db
+            .set_account(pubkey, AccountSharedData::new(settled_lamports, 0, &owner))
+            .await;
+        redis_raw
+            .set_account(pubkey, AccountSharedData::new(stale_lamports, 0, &owner))
+            .await;
+
+        let settlement = AccountSettlement {
+            account: AccountSharedData::new(settled_lamports, 0, &owner),
+            deleted: false,
+        };
+        crate::accounts::write_batch::invalidate_batch_redis(
+            &mut redis_raw,
+            &[(pubkey, settlement)],
+        )
+        .await;
+
+        let cache_db = AccountsDB::Redis(redis_raw);
+        assert_eq!(
+            cache_db
+                .get_account_shared_data(&pubkey)
+                .await
+                .unwrap()
+                .map(|account| account.lamports()),
+            Some(settled_lamports),
+            "the stale cached balance must no longer be served"
+        );
+    }
+
+    /// Range reads resolve against Postgres even when the cache holds nothing.
+    /// A cached slot index would cover only blocks written since the cache
+    /// attached, and a short range is indistinguishable from a complete one,
+    /// which is how a Redis-backed streamer could silently skip finalized
+    /// blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_reads_through_cache_resolve_against_postgres() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        let cache_db = AccountsDB::Redis(redis_raw);
+
+        for slot in [3u64, 7, 1, 10] {
+            pg_db
+                .store_block(create_test_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+
+        // Nothing was ever written to Redis, so every read below has to reach
+        // the source of truth rather than report an empty ledger.
+        assert_eq!(
+            cache_db.get_blocks(0, Some(20)).await.unwrap(),
+            vec![1, 3, 7, 10]
+        );
+        assert_eq!(
+            cache_db.get_blocks_with_limit(0, 10).await.unwrap(),
+            vec![1, 3, 7, 10]
+        );
+        assert_eq!(
+            cache_db.get_blocks_with_limit(0, 2).await.unwrap(),
+            vec![1, 3]
+        );
+        assert_eq!(cache_db.get_first_available_block().await.unwrap(), 1);
+    }
+
+    /// Postgres and Redis must agree exactly here: they are two hand-written
+    /// queries against different index structures, which is where they can
+    /// silently diverge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_blocks_with_limit_returns_slots_in_order() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        for slot in [3, 7, 1, 10] {
+            db.store_block(create_test_block_info(slot, Hash::new_unique()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.get_blocks_with_limit(0, 10).await.unwrap(),
+            vec![1, 3, 7, 10]
+        );
+        assert_eq!(db.get_blocks_with_limit(0, 2).await.unwrap(), vec![1, 3]);
+        assert_eq!(db.get_blocks_with_limit(4, 10).await.unwrap(), vec![7, 10]);
+        assert!(db.get_blocks_with_limit(0, 0).await.unwrap().is_empty());
+        assert!(db.get_blocks_with_limit(11, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -379,7 +968,7 @@ mod tests {
     async fn get_transaction_miss() {
         let (db, _pg) = start_test_postgres().await;
         let sig = Signature::new_unique();
-        assert!(db.get_transaction(&sig).await.is_none());
+        assert!(db.get_transaction(&sig).await.unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -445,7 +1034,7 @@ mod tests {
         let expected_time = block.block_time;
         db.store_block(block).await.unwrap();
 
-        let time = db.get_block_time(7).await;
+        let time = db.get_block_time(7).await.unwrap();
         assert_eq!(time, expected_time);
     }
 
@@ -468,10 +1057,10 @@ mod tests {
             .unwrap();
 
         // account was stored
-        assert!(db.get_account_shared_data(&pk).await.is_some());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
         // block was stored
-        let loaded = db.get_block(1).await;
+        let loaded = db.get_block(1).await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().blockhash, bh);
 
@@ -497,7 +1086,7 @@ mod tests {
         // Empty batch must not error and must not mutate any observable state.
         db.write_batch(&[], vec![], None).await.unwrap();
         assert_eq!(db.get_latest_blockhash().await.unwrap(), seeded_bh);
-        assert!(db.get_block(7).await.is_some());
+        assert!(db.get_block(7).await.unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -768,80 +1357,174 @@ mod tests {
             .contains("'until' is unavailable"));
     }
 
-    /// Verifies that Redis and Postgres return same-slot signatures in identical order.
-    /// Redis stores members as hex-encoded signatures so that sorted-set lex ordering
-    /// matches Postgres's `ORDER BY signature DESC` (raw bytes). This test catches
-    /// any regression where the member encoding no longer preserves byte ordering.
+    /// Address history resolves against Postgres even when the cache holds
+    /// nothing. The cached index only carries signatures written since the cache
+    /// attached, so a truncated history would read as a complete one.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_signatures_for_address_redis_same_slot_ordering_matches_postgres() {
+    async fn address_history_through_cache_resolves_against_postgres() {
         let (mut pg_db, _pg) = start_test_postgres().await;
-        let (redis_raw, _redis) = start_test_redis().await;
-        let mut redis_db = AccountsDB::Redis(redis_raw);
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        let cache_db = AccountsDB::Redis(redis_raw);
 
         let to = Pubkey::new_unique();
         let slot = 42u64;
         let block_time = 1_700_000_000;
 
-        let make_processed = || {
-            ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
-                loaded_transaction: LoadedTransaction {
-                    accounts: vec![],
-                    ..Default::default()
-                },
-                execution_details: TransactionExecutionDetails {
-                    status: Ok(()),
-                    log_messages: None,
-                    inner_instructions: None,
-                    return_data: None,
-                    executed_units: 0,
-                    accounts_data_len_delta: 0,
-                },
-                programs_modified_by_tx: HashMap::new(),
-            }))
-        };
-
         let txs: Vec<_> = (0..10)
             .map(|_| {
-                let kp = Keypair::new();
+                let keypair = Keypair::new();
+                let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+                    loaded_transaction: LoadedTransaction {
+                        accounts: vec![],
+                        ..Default::default()
+                    },
+                    execution_details: TransactionExecutionDetails {
+                        status: Ok(()),
+                        log_messages: None,
+                        inner_instructions: None,
+                        return_data: None,
+                        executed_units: 0,
+                        accounts_data_len_delta: 0,
+                    },
+                    programs_modified_by_tx: HashMap::new(),
+                }));
                 (
-                    create_test_sanitized_transaction(&kp, &to, 1),
-                    make_processed(),
+                    create_test_sanitized_transaction(&keypair, &to, 1),
+                    processed,
                 )
             })
             .collect();
 
         let batch_refs: Vec<_> = txs
             .iter()
-            .map(|(tx, p)| (*tx.signature(), tx, slot, block_time, p))
+            .map(|(tx, processed)| (*tx.signature(), tx, slot, block_time, processed))
             .collect();
 
+        // Written to Postgres only, never to the cache.
         let block = create_test_block_info(slot, Hash::new_unique());
         let pg_addr_sig_rows = pg_db
-            .write_batch(&[], batch_refs.clone(), Some(block.clone()))
-            .await
-            .unwrap();
-        flush_address_signatures_sync(&pg_db, &pg_addr_sig_rows).await;
-        redis_db
             .write_batch(&[], batch_refs, Some(block))
             .await
             .unwrap();
+        flush_address_signatures_sync(&pg_db, &pg_addr_sig_rows).await;
 
         let pg_sigs = pg_db
             .get_signatures_for_address(&to, 10, None, None)
             .await
             .unwrap();
-        let redis_sigs = redis_db
+        let cache_sigs = cache_db
             .get_signatures_for_address(&to, 10, None, None)
             .await
             .unwrap();
 
         assert_eq!(pg_sigs.len(), 10);
-        let pg_order: Vec<&str> = pg_sigs.iter().map(|s| s.signature.as_str()).collect();
-        let redis_order: Vec<&str> = redis_sigs.iter().map(|s| s.signature.as_str()).collect();
+        let pg_order: Vec<&str> = pg_sigs.iter().map(|sig| sig.signature.as_str()).collect();
+        let cache_order: Vec<&str> = cache_sigs
+            .iter()
+            .map(|sig| sig.signature.as_str())
+            .collect();
         assert_eq!(
-            pg_order, redis_order,
-            "Redis and Postgres must return same-slot signatures in identical order"
+            pg_order, cache_order,
+            "a cache-backed handle must return the full Postgres history"
         );
+    }
+
+    /// One executed transaction, reusable by the counter cases below.
+    fn counted_tx(to: &Pubkey) -> (SanitizedTransaction, ProcessedTransaction) {
+        let keypair = Keypair::new();
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+        (
+            create_test_sanitized_transaction(&keypair, to, 1),
+            processed,
+        )
+    }
+
+    /// A commit whose acknowledgement is lost is retried with the same slot and
+    /// the same rows. Every other write is an upsert, so only the counter can
+    /// double-apply, and an inflated getTransactionCount never self-heals.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replaying_a_committed_batch_counts_it_once() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+        let txs = [counted_tx(&to), counted_tx(&to)];
+        let block = create_test_block_info(1, Hash::new_unique());
+
+        for _ in 0..2 {
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 1u64, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(&[], refs, Some(block.clone()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.get_transaction_count().await.unwrap(),
+            2,
+            "a replayed slot must not advance the counter twice"
+        );
+    }
+
+    /// The gate must key on the slot being new, not on the batch looking
+    /// familiar: distinct slots are ordinary traffic and must both count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn distinct_slots_each_advance_the_counter() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        for slot in 1..=3u64 {
+            let txs = [counted_tx(&to)];
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(
+                &[],
+                refs,
+                Some(create_test_block_info(slot, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(db.get_transaction_count().await.unwrap(), 3);
+    }
+
+    /// A batch with no block has no slot to key the gate on, so it keeps
+    /// counting unconditionally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blockless_batch_still_counts() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let to = Pubkey::new_unique();
+
+        for _ in 0..2 {
+            let txs = [counted_tx(&to)];
+            let refs: Vec<_> = txs
+                .iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 0u64, 1_700_000_000i64, p))
+                .collect();
+            db.write_batch(&[], refs, None).await.unwrap();
+        }
+
+        assert_eq!(db.get_transaction_count().await.unwrap(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -853,7 +1536,7 @@ mod tests {
 
         // first store an account
         db.set_account(pk, acct.clone()).await;
-        assert!(db.get_account_shared_data(&pk).await.is_some());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_some());
 
         // now write_batch with deleted=true
         let settlement = AccountSettlement {
@@ -865,6 +1548,6 @@ mod tests {
             .unwrap();
 
         // account is gone
-        assert!(db.get_account_shared_data(&pk).await.is_none());
+        assert!(db.get_account_shared_data(&pk).await.unwrap().is_none());
     }
 }

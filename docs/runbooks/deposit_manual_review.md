@@ -55,7 +55,7 @@ to the right Path below.
 | `program_error` | Generic builder error not covered by the specific variants. |
 | `could not verify mint landed` | The recovery worker could not determine whether the deposit's mint landed: the PrivateChannel RPC was uncertain, or a stored signature could not be read or parsed. Quarantined on uncertainty rather than risk a double-mint. See **Path E**. |
 | `legacy in-flight deposit, verify on-chain before re-mint` | A one-time upgrade quarantine: this deposit was already `processing` when the pre-broadcast-persist code was deployed, so it has no persisted signature and recovery cannot prove it never minted. Verify on-chain before re-arming. See **Path E** (treat as `AMBIGUOUS` until the on-chain check resolves). |
-| `recovery requeues without progress` | The recovery worker demoted this `processing` deposit 3 times (mint never landed each cycle) and quarantined rather than loop forever. Row data is fine; the mint keeps failing to land. See **Path G**. |
+| `recovery requeues without progress` | The deposit was re-armed 3 times without the mint landing, and recovery quarantined rather than loop forever. Two things spend that counter: the recovery worker demoting a stale `processing` row, and the sender re-arming a deposit whose just-in-time `InitializeMint` could not be completed. Row data is fine; the mint keeps failing to land. See **Path G**. |
 
 ### Sender-side post-JIT surface (`sender/mint.rs`)
 
@@ -168,6 +168,10 @@ Treat as a **configuration alarm**, not a transient.
 in `manual_review` (not `failed`) specifically because JIT's structural
 check distinguished it from generic program errors — the on-chain mint
 state needs human investigation before any retry can succeed.
+
+Note: the JIT retry's journal is ownership-checked; a retry that loses
+its lease surfaces as `deposit_ownership_lost` (see
+[`deposit_failed.md`](deposit_failed.md)), not as manual review.
 
 #### Step 1 - verify on-chain
 
@@ -425,12 +429,26 @@ can review the finality timing.
 
 #### Step 2 - find why the mint never lands
 
-The deposit mint is fire-and-forget (`spawn_fire_and_store`), so a
-repeating failure points at a deterministic mint rejection (paused/frozen
-mint, `mint_authority` mismatch, compute) or the sender never
-broadcasting. Read the operator logs for this `transaction_id`'s mint send
-error. A deterministic cause means re-arming will loop again ->
-[escalate](_escalation.md) (Tier 2) to engineering.
+There are two shapes to separate first. Check
+`OPERATOR_TRANSACTION_ERRORS{error_reason="mint_jit_transient"}` and the
+operator logs for this `transaction_id`:
+
+- **Mint never initialized.** The logs carry `JIT` lines for this row, ending in
+  `still failing at the requeue cap`. The `mint_to` reached the chain and came
+  back saying the mint account is not a usable mint, and the just-in-time
+  `InitializeMint` that would fix it could not be completed either. Check
+  channel RPC health and that the mint account exists on the private channel
+  with the operator's admin as `mint_authority`. This is environmental, not row
+  data.
+- **Mint rejected.** No JIT lines in the logs. The deposit mint is
+  fire-and-forget (`spawn_fire_and_store`), so a repeating failure points at a
+  deterministic mint rejection (paused/frozen mint, `mint_authority` mismatch,
+  compute) or the sender never broadcasting. Read this `transaction_id`'s mint
+  send error.
+
+Either way a deterministic cause means re-arming will loop again, so
+[escalate](_escalation.md) (Tier 2) to engineering rather than re-arming
+against an unfixed condition.
 
 #### Step 3 - resolve, then re-arm
 

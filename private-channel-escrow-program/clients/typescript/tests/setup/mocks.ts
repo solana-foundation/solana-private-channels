@@ -46,7 +46,7 @@ export const TEST_ADDRESSES = {
     MINT: 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL' as Address,
     ALLOWED_MINT: '8MKrYq1F8xKhXp4FJWfYSgYZNgPqvP3DQa2Jv7rXfQN8' as Address,
     INSTANCE_ATA: '9LqZxwCF5N4FdpTJGcZpYPvT2GcLXMdNzQf5EyN5DhYx' as Address,
-    EVENT_AUTHORITY: 'G9CCHrvvmKuoM9vqcEWCxmbFiyJqXTLJBJjpSFv5v3Fm' as Address,
+    EVENT_AUTHORITY: 'FngERuuhrF13VUpEVuTgVrBH9TM861Wwzr9d6qMSVjMd' as Address,
 } as const;
 
 /**
@@ -57,4 +57,4 @@ export const TEST_TRANSACTION_NONCE = 1;
 /**
  * Expected program address for all instructions
  */
-export const EXPECTED_PROGRAM_ADDRESS = 'GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83';
+export const EXPECTED_PROGRAM_ADDRESS = '9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU';

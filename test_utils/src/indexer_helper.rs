@@ -74,6 +74,7 @@ pub async fn start_private_channel_indexer(
         postgres: postgres_config,
         rpc_url,
         source_rpc_url: None,
+        fallback_rpc_url: None,
         escrow_instance_id: None,
     };
 
@@ -150,8 +151,10 @@ pub async fn start_solana_indexer_rpc_polling(
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
+        // Single-validator harness: the channel RPC is the same node.
+        source_rpc_url: Some(rpc_url.clone()),
         rpc_url,
-        source_rpc_url: None,
+        fallback_rpc_url: None,
         escrow_instance_id,
     };
 
@@ -219,7 +222,7 @@ pub async fn start_solana_indexer(
     let backfill_config = BackfillConfig {
         enabled: true,
         batch_size: 100,
-        max_gap_slots: 100,
+        max_gap_slots: 1_000,
         exit_after_backfill: false,
         rpc_url: rpc_url.clone(),
         start_slot: None,
@@ -229,8 +232,10 @@ pub async fn start_solana_indexer(
         program_type: ProgramType::Escrow,
         storage_type: StorageType::Postgres,
         postgres: postgres_config,
+        // Single-validator harness: the channel RPC is the same node.
+        source_rpc_url: Some(rpc_url.clone()),
         rpc_url,
-        source_rpc_url: None,
+        fallback_rpc_url: None,
         escrow_instance_id,
     };
 

@@ -5,6 +5,7 @@ pub async fn insert_release_signature(
     transaction_id: i64,
     signature: String,
     last_valid_block_height: i64,
+    blockhash_slot: Option<i64>,
 ) -> Result<(), StorageError> {
     match storage {
         Storage::Postgres(db) => {
@@ -12,14 +13,20 @@ pub async fn insert_release_signature(
                 transaction_id,
                 signature,
                 last_valid_block_height,
+                blockhash_slot,
             )
             .await?;
             Ok(())
         }
         #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock) => {
-            mock.insert_release_signature(transaction_id, signature, last_valid_block_height)
-                .await
+            mock.insert_release_signature(
+                transaction_id,
+                signature,
+                last_valid_block_height,
+                blockhash_slot,
+            )
+            .await
         }
     }
 }

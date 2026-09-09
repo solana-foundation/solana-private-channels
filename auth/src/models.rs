@@ -14,6 +14,17 @@ pub enum Role {
     User,
 }
 
+impl Role {
+    /// The wire and database spelling. Must stay lowercase to match the postgres
+    /// `user_role` enum and the gateway's role claim.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Operator => "operator",
+            Role::User => "user",
+        }
+    }
+}
+
 // DB rows
 
 #[derive(Debug, Clone, Serialize)]

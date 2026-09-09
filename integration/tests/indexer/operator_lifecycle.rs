@@ -8,10 +8,12 @@
 //! 1. Single deposit mint: operator mints channel tokens for one pending deposit.
 //! 2. Issuance idempotency: duplicate deposit row does not trigger a double-mint.
 //! 3. Withdrawal nonce idempotency: duplicate withdrawal row releases funds only once.
-//! 4. Failure alerts: failed mint and failed withdrawal each fire a webhook POST.
+//! 4. Failure alerts: a failed withdrawal fires a webhook POST; a preflight-failed
+//!    mint is left Processing for recovery rather than terminalized.
 //! 5. Batch deposits: operator processes 5 deposits for distinct recipients in one sweep.
 //! 6. Idle operator: no phantom records created when the DB has no pending work.
-//! 7. Periodic reconciliation: mismatch between DB totals and on-chain ATA fires a webhook.
+//! 7. Runtime reconciliation halt: channel supply over-issued beyond escrow custody
+//!    trips the durable halt, forced-unhealthy latch, quarantine, and webhook alert.
 //! 8. Sequential withdrawals: two consecutive withdrawal nonces both complete correctly.
 //! 9. Boot bitmap diff: a database that claims a release the chain never made must
 //!    refuse to start, while a release the chain made but the database never
@@ -26,6 +28,7 @@ mod helpers;
 mod setup;
 
 use chrono::Utc;
+use helpers::private_channel_node::start_private_channel_node;
 use helpers::test_types::WAIT_TIMEOUT_SECS;
 use helpers::{db, generate_mint, get_token_balance, mint_to_owner, operator_util};
 use mockito::Server;
@@ -41,6 +44,7 @@ use private_channel_indexer::storage::common::models::{
 };
 use private_channel_indexer::storage::{PostgresDb, Storage, TransactionType};
 use private_channel_indexer::PostgresConfig;
+use private_channel_metrics::{HealthConfig, HealthState};
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -48,6 +52,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::sync::Arc;
 use std::time::Duration;
+use test_utils::operator_helper::same_host_fallback_url;
 use test_utils::operator_helper::start_solana_to_private_channel_operator;
 use test_utils::operator_helper::OperatorHandle;
 use test_utils::validator_helper::start_test_validator_no_geyser;
@@ -84,7 +89,10 @@ fn default_operator_config(alert_url: Option<String>) -> OperatorConfig {
         alert_webhook_url: alert_url,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
-        reconciliation_webhook_url: None,
+        // Escrow operators refuse to start without a reconciliation webhook; a
+        // placeholder satisfies the startup gate for harnesses that don't assert
+        // delivery. Tests that check delivery override this with a mock URL.
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
         confirmation_poll_interval_ms: 400,
     }
@@ -119,7 +127,11 @@ async fn start_operator_with_alert(
         rpc_url: rpc_url.clone(),
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
-        source_rpc_url: Some(rpc_url),
+        source_rpc_url: Some(rpc_url.clone()),
+        // The withdraw operator now requires an independent, same-cluster fallback.
+        // Reach the same node via a distinct host string so the URL differs while
+        // the genesis hash matches. Harmless for Escrow callers (never validated).
+        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -166,7 +178,11 @@ async fn start_operator_with_config(
         rpc_url: rpc_url.clone(),
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
-        source_rpc_url: Some(rpc_url),
+        source_rpc_url: Some(rpc_url.clone()),
+        // The withdraw operator now requires an independent, same-cluster fallback.
+        // Reach the same node via a distinct host string so the URL differs while
+        // the genesis hash matches. Harmless for Escrow callers (never validated).
+        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -184,24 +200,61 @@ async fn start_operator_with_config(
     })
 }
 
-async fn wait_for_transaction_status(
+/// Poll until the row reaches one of `expected_statuses`, returning the one it
+/// reached. A permanently-failed withdrawal is resolved by the deferred-remint
+/// gate, which can land on either a completed remint or an escalation, so the
+/// caller must accept both.
+async fn wait_for_any_transaction_status(
     pool: &sqlx::PgPool,
     signature: &str,
-    expected_status: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let timeout_secs = *WAIT_TIMEOUT_SECS;
+    expected_statuses: &[&str],
+    timeout_secs: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < timeout_secs {
         if let Some(tx) = db::get_transaction(pool, signature).await? {
-            if tx.status == expected_status {
-                return Ok(());
+            if expected_statuses.contains(&tx.status.as_str()) {
+                return Ok(tx.status);
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     Err(format!(
-        "Transaction {} did not reach status {} within {}s",
-        signature, expected_status, timeout_secs
+        "Transaction {signature} did not reach any of {expected_statuses:?} within {timeout_secs}s"
+    )
+    .into())
+}
+
+/// Poll until the deposit's write-ahead mint signature is journaled in
+/// `pending_release_signatures`. The journal is written right before broadcast,
+/// so a non-empty journal proves the mint reached the send step.
+///
+/// Unused until the ownership-checked write-ahead persist lands; the assertion
+/// it serves currently expects the send error to terminalize the mint instead.
+#[allow(dead_code)]
+async fn wait_for_release_signature_journaled(
+    pool: &sqlx::PgPool,
+    signature: &str,
+    timeout_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < timeout_secs {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pending_release_signatures prs \
+             JOIN transactions t ON t.id = prs.transaction_id \
+             WHERE t.signature = $1",
+        )
+        .bind(signature)
+        .fetch_one(pool)
+        .await?;
+        if count > 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "deposit {} did not journal a write-ahead mint signature within {}s",
+        signature, timeout_secs
     )
     .into())
 }
@@ -375,10 +428,16 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 
     storage.insert_db_transaction(&deposit_txn).await?;
 
-    // 3. Start start_solana_to_private_channel_operator()
+    // 3. Start a PrivateChannel core node as the mint target. It reports every
+    // found transaction as `finalized` instantly, so the operator's finalized
+    // mint gate completes on the first poll - mirroring production, where mints
+    // land on the PC node rather than slow Solana.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let pc_node = start_private_channel_node(operator_keypair.pubkey()).await?;
+
+    // rpc_url (mint target) = PC node; the escrow instance stays on Solana.
     let operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        pc_node.url.clone(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -396,6 +455,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     assert!(db_tx.counterpart_signature.is_some());
 
     operator_handle.shutdown().await;
+    pc_node.shutdown().await;
 
     Ok(())
 }
@@ -466,11 +526,18 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     // Duplicate insert with same signature should not create a second mint.
     storage.insert_db_transaction(&deposit_txn).await?;
 
-    let balance_before = get_token_balance(&client, &user_pubkey, &env.mint).await?;
-
+    // Mint target is the PrivateChannel node (instant finality), so balances are
+    // checked there, not on the Solana validator. The recipient ATA does not
+    // exist on the PC node until the first mint, so treat "before" as 0.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let pc_node = start_private_channel_node(operator_keypair.pubkey()).await?;
+    let pc_client = RpcClient::new(pc_node.url.clone());
+    let balance_before = get_token_balance(&pc_client, &user_pubkey, &env.mint)
+        .await
+        .unwrap_or(0);
+
     let operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        pc_node.url.clone(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -479,7 +546,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
 
     operator_util::wait_for_transaction_completion(&pool, &signature).await?;
 
-    let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    let balance_after = get_token_balance(&pc_client, &user_pubkey, &env.mint).await?;
     assert_eq!(
         balance_after,
         balance_before + amount,
@@ -487,6 +554,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     );
 
     operator_handle.shutdown().await;
+    pc_node.shutdown().await;
     Ok(())
 }
 
@@ -580,17 +648,20 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     Ok(())
 }
 
-/// Triggers one failed mint (wrong-authority `mint_to`, rejected at preflight)
-/// and one bad withdrawal (mint not whitelisted on the instance, escalated to
-/// `ManualReview` because the burn never produced a verifiable signature) and
-/// asserts that the configured `alert_webhook_url` receives exactly two POST
-/// requests — `db_transaction_writer::send_webhook_alert` fires for both
-/// `Failed` and `ManualReview` dispositions.
+/// Triggers one preflight-failing mint (wrong-authority `mint_to`) and one bad
+/// withdrawal (mint never allowlisted on the escrow).
+///
+/// Neither terminalizes the operator: the mint journals its signature write-ahead
+/// and is left Processing for recovery with no alert, while the withdrawal is
+/// parked by the mint gate before a release is built. Only that parking fires a
+/// webhook, so the configured `alert_webhook_url` receives exactly one POST via
+/// `db_transaction_writer::send_webhook_alert`.
 ///
 /// Uses a `mockito` HTTP server as the webhook endpoint so no external service
 /// is required.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Operator Lifecycle: Alerts on Failure ===");
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
@@ -624,11 +695,13 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
 
     let mut server = Server::new_async().await;
+    // Only the withdrawal's ManualReview disposition fires a webhook; the
+    // preflight-failed mint is deferred to recovery and writes no status.
     let alert_mock = server
         .mock("POST", "/")
         .match_header("content-type", "application/json")
         .with_status(200)
-        .expect(2)
+        .expect(1)
         .create_async()
         .await;
 
@@ -650,9 +723,9 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     .await?;
 
     // Create a valid SPL mint with a *different* mint authority than the operator's
-    // admin key.  When the operator calls mint_to using the admin key, the SPL token
-    // program rejects it (wrong authority) → preflight fails → deposit reaches "failed"
-    // without going through the JIT initialization loop.
+    // admin key. When the operator calls mint_to using the admin key, the SPL token
+    // program rejects it (wrong authority), so the mint fails at preflight after the
+    // write-ahead signature is persisted.
     let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let bad_authority = Keypair::new(); // NOT the operator admin — intentionally wrong
     let bad_mint = Keypair::new();
@@ -683,7 +756,17 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     .build();
     storage.insert_db_transaction(&bad_deposit).await?;
 
-    wait_for_transaction_status(&pool, &mint_fail_sig, "failed").await?;
+    // A write-ahead-persisted mint is never terminalized in the sender: the send
+    // error leaves the row Processing for recovery to reconcile against the
+    // persisted signature, so it journals its signature and never reaches Failed.
+    wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
+    let mint_row = db::get_transaction(&pool, &mint_fail_sig)
+        .await?
+        .expect("the deposit row must exist");
+    assert_eq!(
+        mint_row.status, "processing",
+        "a preflight-failed mint is deferred to recovery, not marked Failed"
+    );
 
     // Seed a separate mint that is NOT allowed on the instance to force withdrawal failure.
     let bad_withdraw_mint = Keypair::new();
@@ -727,14 +810,17 @@ async fn test_failed_withdrawals_and_mints_fire_alerts() -> Result<(), Box<dyn s
     )
     .await?;
 
-    // The bad withdrawal preflights with `invalid account data for instruction`
-    // from the escrow program (the mint isn't whitelisted on the instance), so
-    // `sign_and_send` errors before any signature is broadcast. With no
-    // signatures to verify, the sender's "cannot safely remint" branch
-    // (`indexer/src/operator/sender/transaction.rs`) routes the row to
-    // `ManualReview`, NOT `Failed` — reverting that to `Failed` would risk
-    // double-reminting if the broadcast had succeeded silently.
-    wait_for_transaction_status(&pool, &withdrawal_sig, "manual_review").await?;
+    // The mint has no on-chain AllowedMint account, so the withdrawal gate parks
+    // the row before a release is ever built. Nothing is broadcast and no
+    // signature is journaled, so it goes straight to `ManualReview` rather than
+    // through the sender's cannot-safely-remint branch.
+    wait_for_any_transaction_status(
+        &pool,
+        &withdrawal_sig,
+        &["manual_review"],
+        *WAIT_TIMEOUT_SECS,
+    )
+    .await?;
 
     alert_mock.assert();
 
@@ -812,10 +898,14 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
         signatures.push(sig);
     }
 
-    // Start the Solana → PrivateChannel operator and wait for all deposits to be processed.
+    // Start the Solana -> PrivateChannel operator and wait for all deposits to be processed.
+    // The mint target is a PrivateChannel node (instant finality), so balances
+    // are verified there rather than on the Solana validator.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let pc_node = start_private_channel_node(operator_keypair.pubkey()).await?;
+    let pc_client = RpcClient::new(pc_node.url.clone());
     let operator_handle = start_solana_to_private_channel_operator(
-        test_validator.rpc_url(),
+        pc_node.url.clone(),
         db_url.clone(),
         operator_keypair,
         env.instance,
@@ -836,7 +926,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
             "Deposit {i} missing counterpart signature"
         );
 
-        let balance = get_token_balance(&client, &env.users[i].pubkey(), &env.mint).await?;
+        let balance = get_token_balance(&pc_client, &env.users[i].pubkey(), &env.mint).await?;
         assert_eq!(
             balance, DEPOSIT_AMOUNT,
             "User {i} balance mismatch after deposit"
@@ -844,6 +934,7 @@ async fn test_batch_deposits_multiple_recipients() -> Result<(), Box<dyn std::er
     }
 
     operator_handle.shutdown().await;
+    pc_node.shutdown().await;
     Ok(())
 }
 
@@ -911,22 +1002,21 @@ async fn test_operator_idle_no_pending_transactions() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-/// (periodic reconciliation): the reconciliation loop fires a webhook
-/// alert when on-chain escrow balances diverge from the DB's completed totals.
-///
-/// Approach:
-/// 1. `AllowMint` creates an escrow ATA with 0 on-chain balance.
-/// 2. A completed deposit is seeded in the DB so the DB shows a positive balance.
-/// 3. The operator runs with `reconciliation_interval = 500 ms` and
-///    `reconciliation_tolerance_bps = 0`, guaranteeing that any delta triggers
-///    the alert.
-/// 4. We verify the mock webhook received at least one POST request.
+/// Runtime reconciliation must fail closed when on-chain channel-token supply
+/// exceeds escrow custody beyond the in-flight envelope (the custody-vs-supply
+/// invariant, which no other end-to-end test exercises). Supply is over-issued to a
+/// non-escrow holder so custody stays 0, then the durable halt flag, the
+/// forced-unhealthy latch, and quarantine of an active withdrawal are all
+/// asserted. The halt flag is polled with a timeout rather than slept on: it is
+/// monotonic (once set it stays set) and the mismatch is persistent, so every
+/// tick breaches and the 3-tick confirmation can never race.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
+async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Operator Lifecycle: Reconciliation Webhook on Mismatch ===");
+    println!("=== Operator Lifecycle: Reconciliation Halts on Supply Over-Issuance ===");
 
-    const SEEDED_AMOUNT: u64 = 50_000;
+    const OVER_ISSUED: u64 = 100_000;
+    const WITHDRAWAL_AMOUNT: u64 = 1_000;
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
@@ -954,40 +1044,36 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
     );
     storage.init_schema().await?;
 
-    // AllowMint creates an escrow ATA with 0 on-chain balance — no real tokens
-    // are transferred, so the on-chain balance stays at 0 throughout the test.
+    // Escrow instance + allowed mint, escrow ATA custody 0, mint supply 0.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 0, 0, None).await?;
+    let mint = env.mint;
+    let instance = env.instance;
 
-    // Register the mint in the indexer DB so the reconciliation query includes it.
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    let mint_meta = DbMint::new(mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
-    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+    seed_mint_status_allowed(&storage, &mint.to_string()).await?;
 
-    // Insert a deposit and mark it completed: DB now shows SEEDED_AMOUNT deposited,
-    // while on-chain remains 0 — a guaranteed mismatch with tolerance_bps = 0.
-    let sig = Signature::new_unique().to_string();
-    let deposit_txn =
-        DbTransactionBuilder::new(sig.clone(), 1, env.mint.to_string(), SEEDED_AMOUNT)
+    // Over-issue: mint supply to a NON-escrow holder so Mint.supply rises while
+    // the escrow custody stays 0. This is supply exceeding custody with no
+    // backing deposit, the operator-key over-issuance the invariant must catch.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])
+        .map_err(|e| format!("Failed to create admin keypair: {}", e))?;
+    let holder = Keypair::new();
+    mint_to_owner(&client, &admin, mint, holder.pubkey(), &admin, OVER_ISSUED).await?;
+
+    // One active (pending) withdrawal so the halt's quarantine has a row to flip.
+    // Its amount joins the mint's in-flight envelope but stays well under the gap.
+    let wd_sig = Signature::new_unique().to_string();
+    let withdrawal =
+        DbTransactionBuilder::new(wd_sig.clone(), 1, mint.to_string(), WITHDRAWAL_AMOUNT)
             .initiator(Pubkey::new_unique().to_string())
             .recipient(Pubkey::new_unique().to_string())
-            .transaction_type(TransactionType::Deposit)
+            .transaction_type(TransactionType::Withdrawal)
             .build();
-    storage.insert_db_transaction(&deposit_txn).await?;
+    storage.insert_db_transaction(&withdrawal).await?;
 
-    // Bypass the operator pipeline and set the status directly — the reconciliation
-    // query only counts rows with status = 'completed'.
-    let pool = db::connect(&db_url).await?;
-    sqlx::query(
-        "UPDATE transactions SET status = 'completed'::transaction_status WHERE signature = $1",
-    )
-    .bind(&sig)
-    .execute(&pool)
-    .await?;
-
-    // Start a mock HTTP server; expect at least one reconciliation POST.
-    // No content-type constraint here — the reconciliation webhook client sends
-    // `Content-Type: application/json` via reqwest, but we only care that a POST
-    // arrived (matching the reconciliation unit-test mock convention).
+    // The halt's alert POST is the only webhook under the single-invariant design;
+    // assert it fired once the halt is observed.
     let mut mock_server = Server::new_async().await;
     let recon_mock = mock_server
         .mock("POST", "/")
@@ -996,24 +1082,24 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         .create_async()
         .await;
 
-    // Short reconciliation interval so the first check fires almost immediately.
-    // Zero tolerance means any non-zero delta triggers an alert.
     let recon_config = OperatorConfig {
-        reconciliation_interval: Duration::from_millis(500),
+        reconciliation_interval: Duration::from_millis(200),
         reconciliation_tolerance_bps: 0,
         reconciliation_webhook_url: Some(mock_server.url()),
         ..default_operator_config(None)
     };
 
-    // Build a dedicated RPC client for the reconciliation task — mirrors what
-    // `operator::run` does when it spawns the reconciliation sub-task.
     let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
         test_validator.rpc_url(),
         RetryConfig::default(),
         CommitmentConfig::confirmed(),
     ));
+    // Single-validator test: custody and channel-supply reads both hit the same RPC.
+    let channel_rpc_client = rpc_client.clone();
 
-    let cancellation_token = CancellationToken::new();
+    let health = HealthState::new(HealthConfig::operator());
+    let health_for_task = Some(health.clone());
+
     let recon_storage = Arc::new(Storage::Postgres(
         PostgresDb::new(&PostgresConfig {
             database_url: db_url.clone(),
@@ -1022,15 +1108,16 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         .await?,
     ));
 
-    // Spawn `run_reconciliation` directly so the test exercises the exact same
-    // code path that the operator uses, without the ctrl_c() gate in `operator::run`.
+    let cancellation_token = CancellationToken::new();
     let recon_token_clone = cancellation_token.clone();
     let recon_handle: JoinHandle<()> = tokio::spawn(async move {
         if let Err(e) = run_reconciliation(
             recon_storage,
             recon_config,
             rpc_client,
-            env.instance,
+            channel_rpc_client,
+            instance,
+            health_for_task,
             recon_token_clone,
         )
         .await
@@ -1039,15 +1126,57 @@ async fn test_periodic_reconciliation_fires_webhook_on_mismatch(
         }
     });
 
-    // Give the reconciliation loop time to complete several cycles (interval = 500 ms).
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Poll the monotonic halt flag with a deadline rather than sleeping a fixed
+    // window, so a slow CI just takes a few more ticks instead of going flaky.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let halt = loop {
+        if let Some(info) = storage.is_reconciliation_halted().await? {
+            break info;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reconciliation did not halt within the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
 
-    // Stop the reconciliation loop gracefully before asserting.
     cancellation_token.cancel();
     let _ = recon_handle.await;
 
-    // Confirm the reconciliation loop fired the webhook at least once.
+    // The reason names the mint and cites the supply gap, proving the custody-vs-supply
+    // invariant tripped the halt.
+    assert!(
+        halt.reason.contains(&mint.to_string()),
+        "halt reason should name the mint: {}",
+        halt.reason
+    );
+    assert!(
+        halt.reason.contains("supply by"),
+        "halt reason should cite the supply gap: {}",
+        halt.reason
+    );
+
+    // The halt fired the webhook alert, the only alert under the single invariant.
     recon_mock.assert_async().await;
+
+    // The forced-unhealthy latch is set so /health reports 503 for orchestration.
+    assert!(
+        !health.is_healthy(),
+        "operator health must be forced unhealthy after a halt"
+    );
+
+    // The active withdrawal was quarantined to manual_review by the halt.
+    let pool = db::connect(&db_url).await?;
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+            .bind(&wd_sig)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        status, "manual_review",
+        "active withdrawal must be quarantined when the pipeline halts"
+    );
+
     Ok(())
 }
 
@@ -1535,7 +1664,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     use private_channel_indexer::operator::sender::types::{
         TransactionContext, TransactionStatusUpdate,
     };
-    use private_channel_indexer::operator::{TransactionKind, WithdrawalRemintInfo};
+    use private_channel_indexer::operator::{SourceEventId, TransactionKind, WithdrawalRemintInfo};
     use solana_sdk::commitment_config::CommitmentLevel;
 
     println!("=== Operator Lifecycle: Landed Release With Dead Signatures ===");
@@ -1626,6 +1755,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
         rpc_url: test_validator.rpc_url(),
+        fallback_rpc_url: None,
         source_rpc_url: None,
         postgres: PostgresConfig {
             database_url: db_url.clone(),
@@ -1649,9 +1779,11 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
             transaction_id: Some(transaction_id),
             withdrawal_nonce: Some(0),
             trace_id: Some(trace_id.clone()),
+            deposit_claim_lease: None,
         },
         remint_info: WithdrawalRemintInfo {
             transaction_id,
+            source_event_id: SourceEventId::new(&format!("sig-{transaction_id}"), 0, None),
             trace_id: trace_id.clone(),
             mint: env.mint,
             user: user_pubkey,
@@ -1665,6 +1797,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         signatures: vec![PendingSig {
             signature: Signature::new_unique(),
             last_valid_block_height: 1,
+            blockhash_slot: None,
         }],
         original_error: "release_funds failed".to_string(),
         deadline: Utc::now() - chrono::Duration::seconds(1),

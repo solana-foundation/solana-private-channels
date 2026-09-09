@@ -232,7 +232,7 @@ describe('rotateBitmap', () => {
             expect(instruction.accounts[5].address).toBe(TEST_ADDRESSES.EVENT_AUTHORITY);
 
             // Verify default privateChannelEscrowProgram is used
-            expect(instruction.accounts[6].address).toBe('GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83');
+            expect(instruction.accounts[6].address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
 
         it('should use provided PDAs when supplied (override auto-derivation)', async () => {

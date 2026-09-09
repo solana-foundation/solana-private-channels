@@ -1,4 +1,11 @@
 apiVersion: 1
 policies:
   - orgId: 1
-    receiver: webhook-alerts
+    receiver: default
+    # Batch related alerts and avoid re-nagging too often. Tune per deployment.
+    # Group by job too so simultaneous incidents on different services (e.g. two
+    # operators) stay distinct notifications instead of collapsing into one.
+    group_by: ['alertname', 'job']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h

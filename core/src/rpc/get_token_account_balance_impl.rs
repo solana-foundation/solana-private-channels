@@ -19,10 +19,13 @@ pub async fn get_token_account_balance_impl(
     let pubkey = Pubkey::from_str(&pubkey)
         .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid pubkey: {}", e)))?;
 
+    // A missing account is the caller's mistake; a store that cannot answer is
+    // ours, and must not be coded so the caller gives up instead of retrying.
     let account = read_deps
         .accounts_db
         .get_account_shared_data(&pubkey)
         .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| custom_error(INVALID_PARAMS_CODE, "Account not found"))?;
 
     if *account.owner() != spl_token::id() {
@@ -48,6 +51,7 @@ pub async fn get_token_account_balance_impl(
         .accounts_db
         .get_account_shared_data(&mint_pubkey)
         .await
+        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| custom_error(INVALID_PARAMS_CODE, "Mint account not found"))?;
 
     let mint = Mint::unpack(mint_account.data()).map_err(|e| {
@@ -66,7 +70,7 @@ pub async fn get_token_account_balance_impl(
 
     let slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
         .unwrap_or(0);

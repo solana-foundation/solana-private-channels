@@ -21,8 +21,9 @@ use {
     about = "PrivateChannel node that can run in read, write, or all-in-one mode"
 )]
 struct Args {
-    /// Node operation mode
-    #[arg(short, long, default_value = "aio", env = "PRIVATE_CHANNEL_MODE")]
+    /// Node operation mode. Required: a defaulted mode would silently start a
+    /// read deployment as a writer whenever the variable is dropped.
+    #[arg(short, long, env = "PRIVATE_CHANNEL_MODE")]
     mode: NodeMode,
 
     /// Port to listen on for RPC requests
@@ -103,18 +104,32 @@ struct Args {
     #[arg(long, env = "PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL")]
     accountsdb_connection_url: String,
 
+    /// Optional Redis cache in front of the read path. Misses fall through to
+    /// the accounts database.
+    #[arg(long, env = "PRIVATE_CHANNEL_REDIS_CACHE_URL")]
+    redis_cache_url: Option<String>,
+
     /// Admin public keys that can bypass certain restrictions (comma-separated base58 strings)
     /// Example: --admin-keys "11111111111111111111111111111111,22222222222222222222222222222222"
     #[arg(long, env = "PRIVATE_CHANNEL_ADMIN_KEYS", value_delimiter = ',')]
     admin_keys: Vec<String>,
 
-    /// Transaction expiration time in milliseconds
+    /// Expiry in seconds on cached Redis block entries; 0 disables it
     #[arg(
         long,
-        default_value_t = 15000,
-        env = "PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS"
+        default_value_t = 3600,
+        env = "PRIVATE_CHANNEL_REDIS_BLOCK_TTL_SECS"
     )]
-    transaction_expiration_ms: u64,
+    redis_block_ttl_secs: u64,
+
+    /// How many blocks a blockhash stays valid for
+    #[arg(long, default_value_t = 150, env = "PRIVATE_CHANNEL_MAX_BLOCKHASHES")]
+    max_blockhashes: usize,
+
+    /// Deprecated: transaction expiration as a duration in milliseconds. Mapped
+    /// to a block count and removed after the next release.
+    #[arg(long, env = "PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS")]
+    transaction_expiration_ms: Option<u64>,
 
     /// Block time in milliseconds
     #[arg(long, default_value_t = 100, env = "PRIVATE_CHANNEL_BLOCKTIME_MS")]
@@ -193,8 +208,16 @@ async fn run_node_with_args(args: Args) -> Result<(), Box<dyn std::error::Error>
         execution_results_capacity: args.execution_results_capacity,
         max_svm_workers: args.max_svm_workers,
         accountsdb_connection_url: args.accountsdb_connection_url,
+        // Blank means no cache. Without this the env var set to "" reads as a
+        // URL and the read node refuses to start.
+        redis_cache_url: args.redis_cache_url.filter(|url| !url.trim().is_empty()),
+        redis_block_ttl_secs: args.redis_block_ttl_secs,
         admin_keys,
-        transaction_expiration_ms: args.transaction_expiration_ms,
+        max_blockhashes: private_channel_core::nodes::node::resolve_max_blockhashes(
+            args.max_blockhashes,
+            args.transaction_expiration_ms,
+            args.blocktime_ms,
+        ),
         blocktime_ms: args.blocktime_ms,
         perf_sample_period_secs: args.perf_sample_period_secs,
         metrics,
@@ -237,6 +260,22 @@ fn init_logging(log_level: &str, json_logs: bool) {
 
 #[tokio::main]
 async fn main() {
+    // Legacy names that read like independent role switches but were never
+    // wired up. Checked before parsing, and printed to stderr, because clap
+    // exits on a missing --mode before any logging exists.
+    for var_name in [
+        "PRIVATE_CHANNEL_ENABLE_READ",
+        "PRIVATE_CHANNEL_ENABLE_WRITE",
+    ] {
+        if std::env::var_os(var_name).is_some() {
+            eprintln!(
+                "warning: {} is set but not honored; the node role comes from \
+                 --mode / PRIVATE_CHANNEL_MODE",
+                var_name
+            );
+        }
+    }
+
     let args = Args::parse();
 
     // Initialize logging
@@ -275,5 +314,25 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the removal of `--mode`'s `aio` default: restoring it would let a
+    /// read deployment start as a writer whenever the variable is dropped.
+    #[test]
+    fn mode_is_required() {
+        let err = Args::try_parse_from([
+            "private-channel-node",
+            "--accountsdb-connection-url",
+            "postgres://localhost/private_channel",
+        ])
+        .expect_err("a node with no mode must not start");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--mode"));
     }
 }

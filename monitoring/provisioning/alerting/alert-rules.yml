@@ -61,7 +61,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job=~"gateway|indexer-solana|indexer-private-channel|operator-solana|operator-private-channel"}
+              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway"}
               instant: true
               refId: A
           - refId: C
@@ -134,7 +134,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -168,7 +168,7 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: private_channel_feepayer_balance_lamports{job=~"operator-.*"} / 1e9
+              expr: private_channel_feepayer_balance_lamports{job="private-channel-operator-solana"} / 1e9
               instant: true
               refId: A
           - refId: C
@@ -183,4 +183,267 @@ groups:
                 - evaluator:
                     type: lt
                     params: [0.5]
+              refId: C
+
+  - orgId: 1
+    name: indexer-missing-meta-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-missing-meta
+        title: "Indexer slot stuck on missing transaction metadata"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} is rejecting a slot whose transactions are missing metadata (meta: null); the checkpoint cannot advance past it. Repoint the datasource RPC (or configure an archival fallback_rpc_url) at a full-history endpoint. This catches the sustained live-polling wedge; a backfill or resync hitting missing metadata instead aborts loudly with a MissingMeta error in the logs rather than sustaining this metric."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="missing_meta"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-block-unproven-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-block-unproven
+        title: "Indexer cannot prove a slot's contents and will not advance"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} cannot determine what a slot contains, so it is refusing to checkpoint past it. Unlike block_unavailable this is not a positive proof that a block exists: the classifier could not obtain the witness it needs, most often a trailing run of non-producers whose first block past the batch the endpoint will not serve. The indexer retries forever and reports zero lag while wedged, so this keys off the error counter. Repoint the datasource at a full-history archival endpoint and restart. See docs/runbooks/indexer_block_unavailable.md."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="block_unproven"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-block-unavailable-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-block-unavailable
+        title: "Indexer slot stuck on a block the RPC will not serve"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} has proven that a block exists at a slot the datasource RPC will not serve, so the checkpoint cannot advance past it. This is a positive proof from a later block's parentSlot link, not a guess: the slot is not a skip. Repoint COMMON_RPC_URL (or COMMON_FALLBACK_RPC_URL) at a full-history archival endpoint and restart. This keys off the error counter rather than the checkpoint frontier-lag gauge, because an ungated RPC-polling indexer reports zero lag while wedged. See docs/runbooks/indexer_block_unavailable.md."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="block_unavailable"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: remint-claim-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: remint-claim-lost
+        title: "Remint pre-send claim lost (second sender detected)"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) lost a remint claim, which is only possible if a second sender is running against the same database. The loser refused to broadcast, so no double mint happened yet; stop the duplicate operator and re-check the sender advisory lock before the next pending remint matures. With the sender lock heartbeat enabled a second sender should be killed within about 7s, so this firing means the heartbeat is disabled or misconfigured, or the two senders are on different databases."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_remint_claim_lost_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: sender-lock-lost
+        title: "Sender advisory lock ownership could not be proven"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) could not prove it still owns its sender advisory lock (reason {{ $labels.reason }}) and shut itself down. Runbook: docs/runbooks/sender_lock_lost_runbook.md. Confirm the operator restarted and that exactly one sender holds each role key; note that OPERATOR_TASK_EXIT will normally be labelled fetcher, not sender, on this shutdown."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_sender_lock_lost_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: bitmap-rotation-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: rotation-lost
+        title: "Bitmap rotation abandoned; a generation stays shut"
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) gave up on a bitmap rotation after repeated send failures. Nothing else re-dispatches one, so every withdrawal nonce in the unopened generation is unreleasable until a rotation lands. Check the destination RPC, the signers and the fee payer balance, then restart the operator: the rotation driver re-derives what is owed from the unreleased nonce bounds at boot."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_lost"}[10m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: rotation-blocked-by-lower-nonce
+        title: "Bitmap rotation withheld: a lower nonce still owes a release"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) is withholding a rotation because a withdrawal on the current generation has not released yet. Withholding is the safe outcome, not a fault: rotating would shut the generation that release must land on. It only pages when it persists, which means the blocking withdrawal is stuck. The blocking nonce is in the sender log. Resolve that withdrawal, by releasing it or letting its remint finish, and the rotation proceeds on its own."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}[15m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
               refId: C

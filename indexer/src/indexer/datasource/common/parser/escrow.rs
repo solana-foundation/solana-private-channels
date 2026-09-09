@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
 // PrivateChannel Escrow Program ID
-pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83";
+pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
 
 // Instruction discriminators (from IDL)
 const CREATE_INSTANCE: u8 = 0;
@@ -24,6 +24,7 @@ const ROTATE_BITMAP: u8 = 8;
 // Only the post-bitmap layouts are decoded. A pre-bitmap release can only name
 // the instance this design abandons, and every escrow instruction whose instance
 // is not the configured one is dropped before it reaches storage.
+const CREATE_INSTANCE_ACCOUNTS: usize = 8;
 const RELEASE_FUNDS_ACCOUNTS: usize = 13;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
 
@@ -77,6 +78,7 @@ pub struct CreateInstanceAccounts {
     pub admin: Pubkey,
     pub instance_seed: Pubkey,
     pub instance: Pubkey,
+    pub withdrawal_bitmap: Pubkey,
     pub system_program: Pubkey,
     pub event_authority: Pubkey,
     pub private_channel_escrow_program: Pubkey,
@@ -315,10 +317,11 @@ fn parse_create_instance(
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let ix_data = <CreateInstanceData as borsh::BorshDeserialize>::deserialize(&mut &data[..])?;
 
-    // Expected 7 accounts
-    if instruction.accounts.len() < 7 {
+    // The bitmap redesign added `withdrawalBitmap` at index 4, so every account
+    // after `instance` sits one slot later than in the pre-bitmap layout.
+    if instruction.accounts.len() < CREATE_INSTANCE_ACCOUNTS {
         return Err(AccountError::InsufficientAccounts {
-            required: 7,
+            required: CREATE_INSTANCE_ACCOUNTS,
             actual: instruction.accounts.len(),
         }
         .into());
@@ -329,9 +332,10 @@ fn parse_create_instance(
         admin: resolve_account(instruction, account_keys, 1)?,
         instance_seed: resolve_account(instruction, account_keys, 2)?,
         instance: resolve_account(instruction, account_keys, 3)?,
-        system_program: resolve_account(instruction, account_keys, 4)?,
-        event_authority: resolve_account(instruction, account_keys, 5)?,
-        private_channel_escrow_program: resolve_account(instruction, account_keys, 6)?,
+        withdrawal_bitmap: resolve_account(instruction, account_keys, 4)?,
+        system_program: resolve_account(instruction, account_keys, 5)?,
+        event_authority: resolve_account(instruction, account_keys, 6)?,
+        private_channel_escrow_program: resolve_account(instruction, account_keys, 7)?,
     };
 
     Ok(Some(EscrowInstruction::CreateInstance {
@@ -723,8 +727,8 @@ mod tests {
     #[test]
     fn test_create_instance_valid_accounts() {
         let data = encode_instruction_data(CREATE_INSTANCE, create_create_instance_borsh_data());
-        let instruction = create_instruction_with_accounts(7, data);
-        let account_keys = create_n_account_keys(7);
+        let instruction = create_instruction_with_accounts(8, data);
+        let account_keys = create_n_account_keys(8);
 
         let result = parse_create_instance(&[42], &instruction, &account_keys);
 
@@ -736,14 +740,37 @@ mod tests {
     #[test]
     fn test_create_instance_insufficient_accounts() {
         let data = encode_instruction_data(CREATE_INSTANCE, create_create_instance_borsh_data());
-        let instruction = create_instruction_with_accounts(6, data); // Only 6 accounts (need 7)
-        let account_keys = create_n_account_keys(6);
+        let instruction = create_instruction_with_accounts(7, data); // Only 7 accounts (need 8)
+        let account_keys = create_n_account_keys(7);
 
         let result = parse_create_instance(&[42], &instruction, &account_keys);
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Insufficient accounts"), "Error: {}", err);
+    }
+
+    #[test]
+    fn test_create_instance_maps_bitmap_era_account_layout() {
+        let data = encode_instruction_data(CREATE_INSTANCE, create_create_instance_borsh_data());
+        let instruction = create_instruction_with_accounts(8, data);
+        let account_keys = create_n_account_keys(8);
+
+        let parsed = parse_create_instance(&[42], &instruction, &account_keys)
+            .expect("parse succeeds")
+            .expect("instruction recognised");
+        let EscrowInstruction::CreateInstance { accounts, .. } = parsed else {
+            panic!("expected CreateInstance");
+        };
+
+        assert_eq!(accounts.payer, account_keys[0]);
+        assert_eq!(accounts.admin, account_keys[1]);
+        assert_eq!(accounts.instance_seed, account_keys[2]);
+        assert_eq!(accounts.instance, account_keys[3]);
+        assert_eq!(accounts.withdrawal_bitmap, account_keys[4]);
+        assert_eq!(accounts.system_program, account_keys[5]);
+        assert_eq!(accounts.event_authority, account_keys[6]);
+        assert_eq!(accounts.private_channel_escrow_program, account_keys[7]);
     }
 
     // ============================================================================

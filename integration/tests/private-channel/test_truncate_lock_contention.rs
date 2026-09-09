@@ -100,6 +100,7 @@ async fn seed_blocks(pool: &PgPool, n: u64) -> Result<()> {
             block_time: Some(slot as i64),
             transaction_signatures: vec![sig],
             transaction_recent_blockhashes: vec![prev],
+            transaction_message_hashes: vec![Hash::new_unique()],
         };
         prev = block.blockhash;
         let data = bincode::serialize(&block)?;

@@ -31,8 +31,8 @@ x-default-logging: &default-logging
 # All such services share one byte-identical image; per-service tags would be 8
 # copies of the same artifact differing only in compose metadata. Each service
 # overrides only `command:` (and per-service env). Pin in CI via
-# PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus,
-# grafana and admin-ui use their own Dockerfiles and keep their own build blocks.
+# PRIVATE_CHANNEL_VERSION; defaults to `latest` for local dev. Validator, prometheus
+# and grafana use their own Dockerfiles and keep their own build blocks.
 x-private-channel-app: &private-channel-app
   image: private-channel-app:${PRIVATE_CHANNEL_VERSION:-latest}
   build:
@@ -107,7 +107,6 @@ services:
       - RUST_LOG=info
       - PRIVATE_CHANNEL_PORT=${PRIVATE_CHANNEL_WRITE_PORT}
       - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
-      - PRIVATE_CHANNEL_ENABLE_READ=false
       - PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE=${PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE}
       - PRIVATE_CHANNEL_SIGVERIFY_WORKERS=${PRIVATE_CHANNEL_SIGVERIFY_WORKERS}
       - PRIVATE_CHANNEL_MAX_CONNECTIONS=${PRIVATE_CHANNEL_WRITE_MAX_CONNECTIONS}
@@ -202,8 +201,6 @@ services:
       - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
       - PRIVATE_CHANNEL_MAX_CONNECTIONS=${PRIVATE_CHANNEL_READ_MAX_CONNECTIONS}
       - PRIVATE_CHANNEL_PG_MAX_CONNECTIONS=${PRIVATE_CHANNEL_PG_MAX_CONNECTIONS:-32}
-      - PRIVATE_CHANNEL_ENABLE_WRITE=false
-      - PRIVATE_CHANNEL_ENABLE_READ=true
       - PRIVATE_CHANNEL_LOG_LEVEL=info
       - PRIVATE_CHANNEL_JSON_LOGS=false
       - PRIVATE_CHANNEL_MODE=read
@@ -232,6 +229,10 @@ services:
     environment:
       - RUST_LOG=info
       - GATEWAY_PORT=${GATEWAY_PORT}
+      # Second listener for internal services. Deliberately absent from `ports:`
+      # below: it must stay reachable only from this Docker network, since it
+      # serves raw transaction errors with no RBAC.
+      - GATEWAY_INTERNAL_PORT=${GATEWAY_INTERNAL_PORT:-8904}
       - GATEWAY_WRITE_URL=${GATEWAY_WRITE_URL}
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
       # Optional — omit or leave blank to disable RBAC enforcement.
@@ -254,6 +255,13 @@ services:
     container_name: private-channel-auth
     restart: unless-stopped
     logging: *default-logging
+    # Must stay above AUTH_MAX_CONNECTIONS plus the DB pool, or accept() hits
+    # EMFILE before the connection cap engages and the listener stalls instead
+    # of shedding.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -264,6 +272,16 @@ services:
       - JWT_SECRET=${JWT_SECRET}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
+      - AUTH_ARGON2_MAX_CONCURRENCY=${AUTH_ARGON2_MAX_CONCURRENCY:-4}
+      - AUTH_RATE_LIMIT_PER_SECOND=${AUTH_RATE_LIMIT_PER_SECOND:-5}
+      - AUTH_RATE_LIMIT_BURST=${AUTH_RATE_LIMIT_BURST:-10}
+      - AUTH_USERNAME_ATTEMPTS_PER_MINUTE=${AUTH_USERNAME_ATTEMPTS_PER_MINUTE:-5}
+      - AUTH_MAX_CONNECTIONS=${AUTH_MAX_CONNECTIONS:-1024}
+      - AUTH_MAX_CONNECTIONS_PER_IP=${AUTH_MAX_CONNECTIONS_PER_IP:-64}
+      - AUTH_HEADER_READ_TIMEOUT_SECS=${AUTH_HEADER_READ_TIMEOUT_SECS:-10}
+      - AUTH_REQUEST_TIMEOUT_SECS=${AUTH_REQUEST_TIMEOUT_SECS:-15}
+      - AUTH_TCP_KEEPALIVE_IDLE_SECS=${AUTH_TCP_KEEPALIVE_IDLE_SECS:-60}
+      - AUTH_TCP_KEEPALIVE_INTERVAL_SECS=${AUTH_TCP_KEEPALIVE_INTERVAL_SECS:-15}
     ports:
       - "${AUTH_PORT}:${AUTH_PORT}"
     command: ["/usr/local/bin/auth"]
@@ -318,6 +336,12 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      # source_rpc_url = channel read-node for the startup supply invariant
+      # (supply <= custody). Required for escrow: the indexer refuses to start without it.
+      - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
+      # Archival fallback for the poller's missing getBlock-metadata failover.
+      # Empty is treated as unset (single-endpoint).
+      - COMMON_FALLBACK_RPC_URL=${DEVNET_FALLBACK_RPC_URL}
       - METRICS_PORT=9100
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
       - INDEXER_YELLOWSTONE_ENDPOINT=${DEVNET_YELLOWSTONE_ENDPOINT}
@@ -358,10 +382,11 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # Read channel blocks straight from the read-node, not the gateway. The
-      # gateway enforces JWT auth on getBlock/getSignaturesForAddress when
-      # JWT_SECRET is set, and internal services carry no token, so routing them
-      # through the gateway would 401 and stall indexing. The read-node serves
-      # the same RPC without the auth gate.
+      # gateway's public port enforces JWT auth on getBlock/getSignaturesForAddress
+      # when JWT_SECRET is set, and internal services carry no token, so routing
+      # them through it would 401 and stall indexing. The read-node serves the
+      # same RPC without the auth gate. GATEWAY_INTERNAL_URL would work too; this
+      # is read-only traffic, so it doesn't need the gateway's write routing.
       - COMMON_RPC_URL=${GATEWAY_READ_URL}
       - INDEXER_BACKFILL_RPC_URL=${GATEWAY_READ_URL}
       - METRICS_PORT=9100
@@ -395,15 +420,27 @@ services:
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
-      - COMMON_RPC_URL=${GATEWAY_URL}
+      # Mints go through the gateway (only it routes writes to the write node and
+      # reads to the read node), on the internal listener: this operator carries
+      # no JWT, and its confirmation handling routes on the exact error the
+      # public listener collapses.
+      - COMMON_RPC_URL=${GATEWAY_INTERNAL_URL:-http://gateway:8904}
       - COMMON_SOURCE_RPC_URL=${DEVNET_RPC_URL}
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
+      # Channel admin, not the escrow Instance.admin (a separate offline key that
+      # never reaches this stack). The operator alias is deliberate: both roles are
+      # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
+      # distinct key without also fixing feepayer_monitor.rs, which watches
+      # get_operator_pubkey() while the real fee payer is the admin key.
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
       - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - METRICS_PORT=9102
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      # Required for the escrow operator: it refuses to start without a
+      # reconciliation alert webhook so a mismatch can never silently log.
+      - OPERATOR_RECONCILIATION_WEBHOOK_URL=${RECONCILIATION_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:
       # Exposed to host so bench-tps can scrape private_channel_operator_mints_sent_total
       # from outside Docker (matches the local stack).
@@ -440,11 +477,19 @@ services:
       - RUST_LOG=info,private_channel_indexer=debug
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
+      # Archival Solana fallback that re-checks a Dead finality verdict before a remint.
+      # Empty is treated as unset (single-endpoint).
+      - COMMON_FALLBACK_RPC_URL=${DEVNET_FALLBACK_RPC_URL}
       # Channel-side reads go direct to the read-node, not the gateway, so they
       # aren't blocked by gateway JWT enforcement (see indexer-private-channel).
       # COMMON_RPC_URL above stays on devnet — that's where releases are sent.
       - COMMON_SOURCE_RPC_URL=${GATEWAY_READ_URL}
       - COMMON_ESCROW_INSTANCE_ID=${ESCROW_INSTANCE_ID}
+      # Channel admin, not the escrow Instance.admin (a separate offline key that
+      # never reaches this stack). The operator alias is deliberate: both roles are
+      # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
+      # distinct key without also fixing feepayer_monitor.rs, which watches
+      # get_operator_pubkey() while the real fee payer is the admin key.
       - ADMIN_SIGNER=memory
       - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
       - OPERATOR_SIGNER=memory
@@ -611,6 +656,11 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
+      - ALERT_CONTACT_TYPE=${ALERT_CONTACT_TYPE:-webhook}
+      # External URL for Grafana-generated links (alert notifications, shares).
+      # Without it Grafana emits localhost links. Set GRAFANA_ROOT_URL to the
+      # reachable Grafana address for the deployment.
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
     networks:
       - private-channel-network
     healthcheck:

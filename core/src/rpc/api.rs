@@ -41,9 +41,13 @@ pub trait PrivateChannelRpc {
         config: Option<RpcAccountInfoConfig>,
     ) -> RpcResult<Response<Option<UiAccount>>>;
 
-    /// Get the current slot
+    /// Get the current slot, which ticks whether or not a block is produced
     #[method(name = "getSlot")]
     async fn get_slot(&self, config: Option<RpcContextConfig>) -> RpcResult<u64>;
+
+    /// Get the count of blocks produced, which trails the slot while idle
+    #[method(name = "getBlockHeight")]
+    async fn get_block_height(&self, config: Option<RpcContextConfig>) -> RpcResult<u64>;
 
     /// Get block information
     #[method(name = "getBlock")]
@@ -102,6 +106,15 @@ pub trait PrivateChannelRpc {
         &self,
         start_slot: u64,
         end_slot: Option<u64>,
+        config: Option<RpcContextConfig>,
+    ) -> RpcResult<Vec<u64>>;
+
+    /// Get the first `limit` confirmed blocks at or after `start_slot`
+    #[method(name = "getBlocksWithLimit")]
+    async fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: u64,
         config: Option<RpcContextConfig>,
     ) -> RpcResult<Vec<u64>>;
 

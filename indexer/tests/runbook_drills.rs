@@ -19,7 +19,7 @@
 
 use chrono::Utc;
 use private_channel_indexer::{
-    storage::{PostgresDb, Storage},
+    storage::{PostgresDb, Storage, TransactionType},
     PostgresConfig,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -227,6 +227,14 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/processor.rs",
         ),
         (
+            "unsupported withdrawal mint:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
+            "withdrawal mint absent on target chain:",
+            "indexer/src/operator/processor.rs",
+        ),
+        (
             "withdrawal pipeline halted after poison-pill",
             "indexer/src/operator/processor.rs",
         ),
@@ -237,12 +245,31 @@ fn drill_1_error_message_contracts_present_in_source() {
             "indexer/src/operator/sender/remint.rs",
         ),
         (
-            "failed to persist pending remint:",
-            "indexer/src/operator/sender/transaction.rs",
-        ),
-        (
             "no signatures to verify — remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
+        ),
+        // Withdrawal, recovery worker. The signatureless-row verdicts; the
+        // proof-gated requeue never reaches manual review, so only the two
+        // terminal ones are dispatchable.
+        (
+            "released on-chain with no recorded broadcast signature",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "release verification still uncertain after",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "release signature journal still unreadable after",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "malformed stored release signature",
+            "indexer/src/operator/recovery.rs",
+        ),
+        (
+            "no escrow instance configured to verify the release against",
+            "indexer/src/operator/recovery.rs",
         ),
         // Deposit — sender side. The processor-side strings (invalid_pubkey,
         // invalid_builder, program_error) are shared with withdrawals via
@@ -323,7 +350,7 @@ fn drill_1_error_message_contracts_present_in_source() {
 //   1. Triage query returns rows in the right order (poison row first).
 //   2. Mark-failed SQL terminates the trigger row.
 //   3. Re-arm SQL flips collateral rows back to `pending`, leaves the
-//      trigger row alone.
+//      trigger row and every held row alone (`id <> ALL(:excluded_ids)`).
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -350,6 +377,12 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
         collateral_ids.push(id);
     }
 
+    // A row an earlier incident left held in `manual_review`: Path C Step 3
+    // could not prove its source burn either way, so it must not re-enter
+    // the queue. The halt sweep does not restamp `manual_review` rows, so
+    // held rows outlive their incident and land in this triage.
+    let held_id = seed_withdrawal(&pool, "manual_review", 6, None).await?;
+
     // ── Triage query (verbatim from runbook) ────────────────────────────
     let rows = sqlx::query(
         r#"
@@ -369,7 +402,7 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
         first_id, poison_id,
         "triage must return poison row first (oldest updated_at)"
     );
-    assert_eq!(rows.len(), 5, "all 5 manual_review rows visible");
+    assert_eq!(rows.len(), 6, "all 6 manual_review rows visible");
 
     // ── Mark trigger as failed (verbatim from runbook step 3) ──────────
     sqlx::query("UPDATE transactions SET status = 'failed', updated_at = NOW() WHERE id = $1")
@@ -383,16 +416,17 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
     // `error_message IS NULL` filter applies cleanly. (The DB schema has no
     // error_message column today; the runbook semantics rely on the alert
     // payload, but the recovery SQL itself is column-free for the dispatch.)
+    let excluded_ids = [poison_id, held_id];
     let updated = sqlx::query(
         r#"
         UPDATE transactions
            SET status = 'pending', updated_at = NOW()
          WHERE transaction_type = 'withdrawal'
            AND status = 'manual_review'
-           AND id <> $1
+           AND id <> ALL($1)
         "#,
     )
-    .bind(poison_id)
+    .bind(&excluded_ids[..])
     .execute(&pool)
     .await?;
     assert_eq!(
@@ -402,14 +436,20 @@ async fn drill_2_path_a_data_error_recovery() -> Result<(), Box<dyn std::error::
     );
 
     // ── Post-state assertions ──────────────────────────────────────────
-    assert_eq!(count_status(&pool, "manual_review").await?, 0);
+    assert_eq!(count_status(&pool, "manual_review").await?, 1);
     assert_eq!(count_status(&pool, "failed").await?, 1);
     assert_eq!(count_status(&pool, "pending").await?, 4);
     for id in collateral_ids {
         assert_eq!(status_of(&pool, id).await?, "pending");
     }
+    assert_eq!(
+        status_of(&pool, held_id).await?,
+        "manual_review",
+        "a held row must survive Path A recovery; re-arming it would release \
+         escrowed funds against an unproven burn"
+    );
 
-    eprintln!("Path A recovery SQL verified end-to-end.");
+    eprintln!("Path A recovery SQL verified end-to-end; held row not re-armed.");
     Ok(())
 }
 
@@ -474,25 +514,35 @@ async fn drill_3_path_b_landed_marks_completed_with_signature(
     Ok(())
 }
 
-// ── Drill 4: Path C — ambiguous, NOT_LANDED → re-arm to pending ─────────────
+// ── Drill 4: Path C, NOT_LANDED - both Step 3 branches ──────────────────────
 //
-// Verifies that re-arming a `manual_review` withdrawal back to `pending`
-// preserves `withdrawal_nonce` - the on-chain bitmap bit is keyed on this,
-// and a re-attempt must hit the same leaf. Also verifies the schema's
-// unique-nonce-per-withdrawal constraint does not block re-arming (the
-// row keeps the same nonce; no new row is inserted).
+// Step 3 branches on whether the source-side burn landed, and the two
+// branches must stay asymmetric:
+//
+//   (1) Burned, no release -> re-arm to `pending`. The re-arm must preserve
+//       `withdrawal_nonce` (the on-chain leaf is keyed on it, so a
+//       re-attempt has to hit the same leaf), and the unique-nonce
+//       constraint must not block re-arming the same row.
+//   (2) Not burned -> terminal, never re-armed. Nothing backs such a row:
+//       `build_release_funds` reads mint/recipient/amount/nonce straight
+//       off it, and the escrow program cannot verify a burn on another
+//       chain, so a re-arm releases escrowed funds against a withdrawal
+//       that was never requested.
+//
+// Both branches sit in one drill so the asymmetry is visible in one place;
+// splitting them is how the runbook drifted into re-arming branch (2).
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn drill_4_path_c_not_landed_recovery_flows() -> Result<(), Box<dyn std::error::Error>> {
     drill_header(
         "withdrawal_manual_review.md",
-        "Path C — ambiguous; NOT_LANDED branch (re-arm)",
+        "Path C - NOT_LANDED (Step 3 branches)",
     );
 
-    let (pool, _storage, _pg) = start_postgres().await?;
+    let (pool, storage, _pg) = start_postgres().await?;
 
+    // ── (1) Burned, no release -> re-arm to pending ────────────────────
     // Seed: row in manual_review with a specific nonce. Webhook
     // error_message would be e.g. "no signatures to verify — remint unsafe".
     let original_nonce: i64 = 42;
@@ -561,7 +611,115 @@ async fn drill_4_path_c_not_landed_re_arms_with_same_nonce(
         "nonce uniqueness must reject a second withdrawal with the same nonce"
     );
 
-    eprintln!("Path C NOT_LANDED re-arm verified; nonce identity preserved.");
+    eprintln!("(1) burned branch: re-arm verified; nonce identity preserved.");
+
+    // ── (2) Not burned -> terminal; never re-armed ─────────────────────
+    // A withdrawal row whose source burn never finalized has nothing
+    // backing it. The runbook marks it `failed`; this pins that the row
+    // leaves the executable queue and that the runbook offers no re-arm.
+    let unburned_nonce: i64 = 43;
+    let unburned_id = seed_withdrawal(
+        &pool,
+        "manual_review",
+        unburned_nonce,
+        Some("could not verify release landed ("),
+    )
+    .await?;
+    let sibling_nonce: i64 = 44;
+    let sibling_id = seed_withdrawal(&pool, "manual_review", sibling_nonce, None).await?;
+
+    eprintln!("simulated verification: release NOT_LANDED, source burn NOT landed");
+
+    sqlx::query("UPDATE transactions SET status = 'failed', updated_at = NOW() WHERE id = $1")
+        .bind(unburned_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        status_of(&pool, unburned_id).await?,
+        "failed",
+        "not-burned branch must terminalize the row, never re-arm it"
+    );
+    assert_eq!(
+        status_of(&pool, sibling_id).await?,
+        "manual_review",
+        "terminal SQL must be row-scoped and leave sibling manual_review rows alone"
+    );
+
+    // The assertion that carries the branch: the fetcher's own query must
+    // not return the row. Driven through the real storage method so a
+    // future change to the pending-selection SQL is caught here. The
+    // branch-(1) row is the positive control - it was re-armed, so the
+    // query must return it, which proves the absence check is not vacuous.
+    let queued = storage
+        .get_pending_db_transactions(TransactionType::Withdrawal, 100)
+        .await?;
+    assert!(
+        queued.iter().any(|txn| txn.id == id),
+        "the re-armed branch-(1) row must be in the fetcher's pending queue"
+    );
+    assert!(
+        !queued.iter().any(|txn| txn.id == unburned_id),
+        "a row with no source burn must never re-enter the executable withdrawal queue"
+    );
+
+    // The runbook text itself must offer no re-arm in this branch. Scoped
+    // to the branch: Paths A, C-burned and G all re-arm legitimately, so a
+    // whole-file scan would be meaningless here.
+    let crate_root = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(&crate_root)
+        .parent()
+        .expect("workspace root");
+    let runbook_path = workspace_root.join("docs/runbooks/withdrawal_manual_review.md");
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
+    // Narrow to the Path C section first. A bare search for the bullet
+    // would silently follow a `Not burned` bullet added to any earlier
+    // path, and pass while Path C itself regressed.
+    let section_start = runbook
+        .find("\n## Path C ")
+        .expect("withdrawal_manual_review.md must contain a Path C section");
+    let section_len = runbook[section_start + 1..]
+        .find("\n## ")
+        .expect("Path C must be followed by another section heading");
+    let path_c = &runbook[section_start..section_start + 1 + section_len];
+    let branch_start = path_c
+        .find("- Not burned")
+        .expect("Path C Step 3 must contain a `Not burned` branch");
+    let branch_end = path_c[branch_start..]
+        .find("\n4. ")
+        .expect("the `Not burned` branch must be followed by Step 4");
+    let branch = &path_c[branch_start..branch_start + branch_end];
+    assert!(
+        branch.contains("do not re-arm"),
+        "the `Not burned` branch must forbid re-arming; got:\n{branch}"
+    );
+    assert!(
+        !branch.contains("'pending'"),
+        "the `Not burned` branch must contain no re-arm SQL; got:\n{branch}"
+    );
+    // Terminalizing is only safe on a *proven* absence. `solana confirm`
+    // returns `not found` both for a burn that never happened and for one
+    // the endpoint no longer covers, so an unproven verdict has to escalate
+    // rather than mark the row failed - the same fence
+    // `sender/remint.rs::coverage_verdict` applies to absent signatures.
+    assert!(
+        branch.contains("Tier 2"),
+        "Step 3 must route an unproven burn verdict to Tier 2 instead of \
+         terminalizing a possibly-burned row; got:\n{branch}"
+    );
+    // Coverage takes both bounds. A ledger floor below the row's slot only
+    // proves nothing was pruned; a node that never advanced to that slot
+    // returns the same `not found`. Dropping either bound silently restores
+    // the misclassification, so pin both.
+    let step_3 = &path_c[..branch_start];
+    assert!(
+        step_3.contains("first-available-block") && step_3.contains("--commitment finalized"),
+        "Step 3 must require both coverage bounds (ledger floor below the \
+         row's slot AND finalized tip above it); got:\n{step_3}"
+    );
+
+    eprintln!("(2) not-burned branch: terminal only on proven absence, unproven escalates.");
     Ok(())
 }
 
@@ -1753,6 +1911,32 @@ async fn drill_16_withdrawal_manual_review_recovery_missing_nonce_flow(
         "manual_review",
         "Path F terminal SQL must NOT touch sibling manual_review rows"
     );
+
+    // ── Path F Step 3 must not DELETE on an unproven burn verdict ──
+    // `solana confirm` returns `not found` both for a burn that never
+    // happened and for one the endpoint no longer covers. This path's
+    // not-landed branch deletes the row, which is the only record of the
+    // burn, so an unproven verdict has to escalate instead.
+    let runbook_path = workspace_root.join("docs/runbooks/withdrawal_manual_review.md");
+    let runbook = std::fs::read_to_string(&runbook_path)
+        .unwrap_or_else(|e| panic!("read {runbook_path:?}: {e}"));
+    let section_start = runbook
+        .find("\n## Path F ")
+        .expect("withdrawal_manual_review.md must contain a Path F section");
+    let section_len = runbook[section_start + 1..]
+        .find("\n## ")
+        .expect("Path F must be followed by another section heading");
+    let path_f = &runbook[section_start..section_start + 1 + section_len];
+    let unproven_start = path_f
+        .find("Burn state unproven")
+        .expect("Path F must carry an unproven-burn branch, not just landed/not-landed");
+    let unproven = &path_f[unproven_start..];
+    assert!(
+        unproven.contains("Tier 2") && !unproven.contains("DELETE"),
+        "Path F's unproven-burn branch must escalate Tier 2 and must not \
+         delete the row; got:\n{unproven}"
+    );
+    eprintln!("OK   Path F § Step 3: unproven burn escalates without deleting");
 
     eprintln!("Path F triage substring + terminal SQL verified.");
     Ok(())

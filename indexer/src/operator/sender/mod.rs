@@ -7,9 +7,12 @@ mod test_support;
 mod transaction;
 pub mod types;
 
-pub use mint::{find_existing_mint_signature_with_memo, JitOutcome};
-pub(crate) use remint::{classify_release_signatures, SigFinality};
-pub(crate) use state::validate_bitmap_consistency;
+pub use mint::{
+    enumerate_consumed_mints, find_existing_mint_signature_with_memo, ConsumedMintKind,
+    ConsumedSet, JitOutcome,
+};
+pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
+pub(crate) use state::{validate_bitmap_consistency, verify_release_landed, ReleaseVerdict};
 pub use types::TransactionStatusUpdate;
 
 #[cfg(any(test, feature = "test-mock-storage"))]
@@ -20,6 +23,8 @@ pub mod test_hooks {
     use super::*;
     use solana_sdk::commitment_config::CommitmentLevel;
     use std::sync::Arc;
+
+    pub use super::remint::DeferredRemintOutcome;
 
     pub fn new_sender_state(
         config: &PrivateChannelIndexerConfig,
@@ -73,9 +78,9 @@ pub mod test_hooks {
     /// transition in isolation.
     pub async fn execute_deferred_remint(
         state: &SenderState,
-        entry: &super::types::PendingRemint,
+        entry: super::types::PendingRemint,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-    ) {
+    ) -> DeferredRemintOutcome {
         super::remint::execute_deferred_remint(state, entry, storage_tx).await
     }
 
@@ -171,6 +176,7 @@ use crate::operator::RpcClientWithRetry;
 use crate::storage::common::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use crate::ProgramType;
+use private_channel_metrics::MetricLabel;
 use solana_sdk::commitment_config::CommitmentLevel;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -197,9 +203,17 @@ const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
 /// parked, and the cost of a fast one is a database read on every tick forever.
 const ROTATION_ORIGINATION_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the sender re-proves it owns its advisory lock.
+///
+/// Well under the 32s finality delay and the 60s recovery tick, so a sender that
+/// loses its lock is gone before anything it still holds matures. Deliberately
+/// not operator-configurable: the value only makes sense alongside the probe and
+/// fenced-write timeouts it is tuned against, and tests inject their own.
+pub const SENDER_LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Advisory-lock key per operator role. Distinct keys so an escrow and a
 /// withdraw sender never contend on the same lock if they share a database.
-fn sender_lock_key(program_type: ProgramType) -> i64 {
+pub fn sender_lock_key(program_type: ProgramType) -> i64 {
     match program_type {
         ProgramType::Escrow => ESCROW_SENDER_LOCK_KEY,
         ProgramType::Withdraw => WITHDRAW_SENDER_LOCK_KEY,
@@ -221,6 +235,7 @@ pub async fn run_sender(
     retry_max_attempts: u32,
     confirmation_poll_interval_ms: u64,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
+    sender_lock_heartbeat_interval: Duration,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
 
@@ -243,9 +258,19 @@ pub async fn run_sender(
     // Held for the rest of run_sender; released on drop or process crash. Stops
     // two overlapping senders (e.g. a rolling restart) from both reminting the
     // same row before either confirms on-chain.
+    //
+    // Declared after `state` on purpose. Locals drop in reverse declaration
+    // order, so the guard drops first and the storage Arc carrying the pool is
+    // still alive for the release query. Moving it above `state` would invert
+    // that and must not be done.
     let _sender_lock = match state
         .storage
-        .try_acquire_sender_lock(sender_lock_key(config.program_type))
+        .try_acquire_sender_lock(
+            sender_lock_key(config.program_type),
+            config.program_type.as_label(),
+            cancellation_token.clone(),
+            sender_lock_heartbeat_interval,
+        )
         .await?
     {
         Some(guard) => guard,
@@ -450,10 +475,14 @@ pub(super) async fn drain_rotation_retry_queue(
         }
 
         match state.storage.try_unpark_to_processing(transaction_id).await {
-            Ok(true) => {}
+            // The park heartbeat and this unpark both bumped the row, so the token
+            // the entry arrived with is dead; carry the one we just won.
+            Ok(Some(lease)) => {
+                state.release_leases.insert(nonce, lease);
+            }
             // Another actor took the row, so this sender no longer owns the
             // work and must stop rather than broadcast it a second time.
-            Ok(false) => {
+            Ok(None) => {
                 warn!(
                     transaction_id,
                     "Queued release is no longer parked; another actor owns it now"
@@ -583,6 +612,7 @@ mod tests {
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: None,
+                deposit_claim_lease: None,
             },
             instruction: InstructionWithSigners {
                 instructions: vec![],
@@ -608,6 +638,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -642,6 +673,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
+            SENDER_LOCK_HEARTBEAT_INTERVAL,
         )
         .await;
 
@@ -675,6 +707,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
+            SENDER_LOCK_HEARTBEAT_INTERVAL,
         )
         .await;
 
@@ -812,6 +845,7 @@ mod tests {
                 transaction_id: Some(QUEUED_ROW),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("trace-70".to_string()),
+                deposit_claim_lease: None,
             },
             InstructionWithSigners {
                 instructions: vec![],

@@ -6,6 +6,7 @@ pub async fn try_complete_processing(
     transaction_id: i64,
     expected_updated_at: chrono::DateTime<chrono::Utc>,
     counterpart_signature: Option<String>,
+    release_signatures: Option<Vec<String>>,
 ) -> Result<bool, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db
@@ -13,12 +14,18 @@ pub async fn try_complete_processing(
                 transaction_id,
                 expected_updated_at,
                 counterpart_signature,
+                release_signatures,
             )
             .await?),
         #[cfg(any(test, feature = "test-mock-storage"))]
         Storage::Mock(mock_db) => {
             mock_db
-                .try_complete_processing(transaction_id, expected_updated_at, counterpart_signature)
+                .try_complete_processing(
+                    transaction_id,
+                    expected_updated_at,
+                    counterpart_signature,
+                    release_signatures,
+                )
                 .await
         }
     }

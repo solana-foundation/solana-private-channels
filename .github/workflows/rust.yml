@@ -8,6 +8,7 @@ on:
       [
         main,
         hardening/pre-release-audit,
+        cantina-audit,
         ottersec-audit,
         feature/smt-to-bitmap-migration,
       ]
@@ -327,9 +328,6 @@ jobs:
       - name: Run indexer integration tests with coverage
         run: make -C integration integration-coverage-indexer
 
-      - name: Run reconciliation e2e tests
-        run: cd indexer && cargo test --test reconciliation_e2e_test -- --nocapture
-
       - name: Generate combined E2E coverage report
         run: make -C integration integration-coverage-report
 
@@ -379,6 +377,13 @@ jobs:
 
       - name: Restore shared artifacts
         run: tar -xzf ci-build-artifacts.tgz
+
+      # Pre-pull once: the container-backed unit tests otherwise race to pull the
+      # same image in parallel, corrupting the stream ("bytes remaining on stream").
+      - name: Warm testcontainers images
+        run: |
+          docker image inspect postgres:11-alpine >/dev/null 2>&1 || docker pull postgres:11-alpine
+          docker image inspect redis:7.0 >/dev/null 2>&1 || docker pull redis:7.0
 
       - name: Run core + indexer unit tests with coverage
         run: make ci-unit-coverage

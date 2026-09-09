@@ -5,6 +5,10 @@
 //!   * oversize transaction (> `PACKET_DATA_SIZE = 1232`)
 //!   * opt-in `sig_verify` branch
 //!   * malformed pubkey string inside `accounts.addresses[]`
+//!   * more `accounts.addresses[]` entries than the transaction has account keys
+//!   * repeated large accounts exceeding the encoded-byte budget
+//!   * the two legacy bs58 `accounts.encoding` values
+//!   * the address-count check running ahead of sigverify and execution
 //!
 //! Pattern: the test spins up a `private_channel_core::rpc::create_rpc_module` against
 //! a fresh Postgres testcontainer and invokes `simulateTransaction` by
@@ -21,6 +25,8 @@ use {
     serde_json::{json, Value},
     solana_sdk::{
         hash::Hash,
+        instruction::CompiledInstruction,
+        message::{Message, MessageHeader},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
         transaction::Transaction,
@@ -83,6 +89,189 @@ fn valid_tx() -> Transaction {
     let recipient = Keypair::new().pubkey();
     let ix = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000);
     Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], Hash::default())
+}
+
+/// A transfer padded with unused read-only keys so it carries exactly `total_keys` keys.
+/// Needed to ask for many addresses without tripping the count cap first.
+fn tx_with_account_keys(total_keys: usize) -> Transaction {
+    assert!(
+        total_keys >= 3,
+        "need at least payer, recipient and program"
+    );
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let mut account_keys = vec![payer.pubkey(), recipient, solana_sdk::system_program::ID];
+    while account_keys.len() < total_keys {
+        account_keys.push(Pubkey::new_unique());
+    }
+
+    // Key 0 signs and key 1 receives; the program and padding keys stay read-only.
+    let header = MessageHeader {
+        num_required_signatures: 1,
+        num_readonly_signed_accounts: 0,
+        num_readonly_unsigned_accounts: (total_keys - 2) as u8,
+    };
+    let transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 100);
+    let message = Message {
+        header,
+        account_keys,
+        recent_blockhash: Hash::default(),
+        instructions: vec![CompiledInstruction {
+            program_id_index: 2,
+            accounts: vec![0, 1],
+            data: transfer.data,
+        }],
+    };
+
+    let tx = Transaction::new(&[&payer], message, Hash::default());
+    let wire_len = bincode::serialize(&tx).unwrap().len();
+    assert!(
+        wire_len <= 1232,
+        "{total_keys} keys serializes to {wire_len} bytes, over PACKET_DATA_SIZE"
+    );
+    tx
+}
+
+// ── (d) more addresses than the transaction has account keys ────────────────
+// Matches Agave, and is what bounds repetition: an address can only be repeated
+// as often as the transaction is wide.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulate_rejects_more_addresses_than_tx_accounts() {
+    let (module, _pg) = build_module(vec![]).await;
+
+    // valid_tx() carries three keys: payer, recipient, system program.
+    let addresses: Vec<String> = (0..4).map(|_| Pubkey::new_unique().to_string()).collect();
+    let encoded = STANDARD.encode(bincode::serialize(&valid_tx()).unwrap());
+
+    let resp = call(
+        &module,
+        "simulateTransaction",
+        json!([
+            encoded,
+            {
+                "encoding": "base64",
+                "accounts": { "encoding": "base64", "addresses": addresses }
+            }
+        ]),
+    )
+    .await;
+
+    let err = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("four addresses against three keys must be rejected: {resp}"));
+    assert_eq!(err["code"], -32602, "must be an invalid-params rejection");
+    let msg = err["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("Too many accounts") && msg.contains('3'),
+        "rejection must name the max, got: {msg}"
+    );
+}
+
+// ── (e) repeated large account over the encoded-byte budget ─────────────────
+// 34 addresses against 34 keys clears the count cap, isolating the byte budget.
+// The SPL Token precompile is always resident, so this needs no setup.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulate_rejects_repeated_precompile_over_budget() {
+    let (module, _pg) = build_module(vec![]).await;
+
+    let tx = tx_with_account_keys(34);
+    let encoded = STANDARD.encode(bincode::serialize(&tx).unwrap());
+    let addresses: Vec<String> = std::iter::repeat_n(spl_token::ID.to_string(), 34).collect();
+
+    let resp = call(
+        &module,
+        "simulateTransaction",
+        json!([
+            encoded,
+            {
+                "encoding": "base64",
+                "accounts": { "encoding": "base64", "addresses": addresses }
+            }
+        ]),
+    )
+    .await;
+
+    let err = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("34 copies of a 134 KB account must exceed the budget: {resp}"));
+    assert_eq!(err["code"], -32602, "must be an invalid-params rejection");
+    let msg = err["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("max"),
+        "rejection must state the budget, got: {msg}"
+    );
+}
+
+// ── (f) legacy bs58 account encodings ───────────────────────────────────────
+// Their encoder replaces anything over 128 bytes with an error string, so a byte
+// estimate could not describe the real reply. Agave rejects them here too.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulate_rejects_base58_accounts_encoding() {
+    let (module, _pg) = build_module(vec![]).await;
+    let encoded = STANDARD.encode(bincode::serialize(&valid_tx()).unwrap());
+
+    for encoding in ["base58", "binary"] {
+        let resp = call(
+            &module,
+            "simulateTransaction",
+            json!([
+                encoded,
+                {
+                    "encoding": "base64",
+                    "accounts": {
+                        "encoding": encoding,
+                        "addresses": [Pubkey::new_unique().to_string()]
+                    }
+                }
+            ]),
+        )
+        .await;
+
+        let err = resp
+            .get("error")
+            .unwrap_or_else(|| panic!("{encoding} account encoding must be rejected: {resp}"));
+        assert_eq!(err["code"], -32602, "{encoding} must be invalid-params");
+    }
+}
+
+// ── (g) the address-count check precedes sigverify and execution ────────────
+// A request that is both signature-invalid and over the address cap reports the
+// address error, which is what proves the cap is checked first. The byte budget
+// is separate: it needs post-execution account sizes, so it runs after the
+// simulation and only prevents the encoding, not the simulation.
+#[tokio::test(flavor = "multi_thread")]
+async fn address_count_is_checked_before_sigverify() {
+    let (module, _pg) = build_module(vec![]).await;
+
+    let mut tx = valid_tx();
+    for sig in tx.signatures.iter_mut() {
+        *sig = solana_sdk::signature::Signature::default();
+    }
+    let encoded = STANDARD.encode(bincode::serialize(&tx).unwrap());
+    let addresses: Vec<String> = (0..4).map(|_| Pubkey::new_unique().to_string()).collect();
+
+    let resp = call(
+        &module,
+        "simulateTransaction",
+        json!([
+            encoded,
+            {
+                "encoding": "base64",
+                "sigVerify": true,
+                "accounts": { "encoding": "base64", "addresses": addresses }
+            }
+        ]),
+    )
+    .await;
+
+    let err = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("expected a rejection, got: {resp}"));
+    let msg = err["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("Too many accounts"),
+        "the account guard must win over sigverify, got: {msg}"
+    );
 }
 
 // ── (a) oversize transaction ────────────────────────────────────────────────

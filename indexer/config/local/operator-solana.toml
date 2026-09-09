@@ -2,8 +2,13 @@
 
 [common]
 program_type = "escrow"
-# Solana Private Channels write node (gateway) — where mint transactions are sent
+# Solana Private Channels write node (gateway) — where mint transactions are sent.
+# Host-side default for running this binary outside compose, so it uses the
+# published port; compose points the container at the gateway's internal
+# listener, which is where this service belongs when RBAC is on.
 rpc_url = "http://localhost:8898"
+# fallback_rpc_url: N/A here. This operator's rpc_url is the single-provider
+# PrivateChannel gateway, which has no independent endpoint to corroborate.
 
 # Solana Solana validator — source of escrow deposit metadata and mint account state
 source_rpc_url = "http://localhost:18899"
@@ -28,3 +33,7 @@ retry_base_delay_secs = 1
 channel_buffer_size = 1000
 # Solana Private Channels block time is 100 ms so poll quickly
 confirmation_poll_interval_ms = 100
+# Required for the escrow operator: a reconciliation mismatch must always alert,
+# so the operator refuses to start without this. Overridden by
+# OPERATOR_RECONCILIATION_WEBHOOK_URL in compose.
+reconciliation_webhook_url = "http://localhost:9/no-op"

@@ -31,7 +31,7 @@ use {
     tokio::sync::mpsc,
 };
 
-// ── fixture helpers ─────────────────────────────────────────────────────────
+// -- fixture helpers ---------------------------------------------------------
 
 async fn start_pg(
     db_name: &str,
@@ -145,10 +145,10 @@ fn dead_client() -> RpcClientWithRetry {
     )
 }
 
-// ── Postgres CAS primitives ───────────────────────────────────────────────
+// -- Postgres CAS primitives -----------------------------------------------
 
-/// `try_park_processing`: `Processing → Parked` succeeds, a re-park
-/// (`Parked → Parked`) is the heartbeat — it succeeds AND advances `updated_at`,
+/// `try_park_processing`: `Processing -> Parked` succeeds, a re-park
+/// (`Parked -> Parked`) is the heartbeat - it succeeds AND advances `updated_at`,
 /// and a row in any other state is a no-op.
 #[tokio::test(flavor = "multi_thread")]
 async fn try_park_processing_cas() {
@@ -163,11 +163,11 @@ async fn try_park_processing_cas() {
         .unwrap();
     set_status(&pool, id, "processing").await;
 
-    // Processing → Parked.
+    // Processing -> Parked.
     assert!(storage.try_park_processing(id).await.unwrap());
     assert_eq!(status_of(&pool, id).await, "parked");
 
-    // Heartbeat: Parked → Parked succeeds and the trigger bumps updated_at.
+    // Heartbeat: Parked -> Parked succeeds and the trigger bumps updated_at.
     let before = updated_at_of(&pool, id).await;
     assert!(storage.try_park_processing(id).await.unwrap());
     assert_eq!(status_of(&pool, id).await, "parked");
@@ -176,14 +176,14 @@ async fn try_park_processing_cas() {
         "re-park must refresh updated_at so recovery treats the row as live"
     );
 
-    // Wrong state → no-op.
+    // Wrong state -> no-op.
     set_status(&pool, id, "completed").await;
     assert!(!storage.try_park_processing(id).await.unwrap());
     assert_eq!(status_of(&pool, id).await, "completed");
 }
 
-/// `try_unpark_to_processing`: strict `Parked → Processing`. A non-`Parked` row
-/// is a no-op — this is what makes the drain drop its builder instead of
+/// `try_unpark_to_processing`: strict `Parked -> Processing`. A non-`Parked` row
+/// is a no-op - this is what makes the drain drop its builder instead of
 /// double-sending after recovery already requeued the nonce.
 #[tokio::test(flavor = "multi_thread")]
 async fn try_unpark_to_processing_cas() {
@@ -197,19 +197,33 @@ async fn try_unpark_to_processing_cas() {
         .await
         .unwrap();
 
-    // Parked → Processing.
+    // Parked -> Processing. The winner gets the row's new token back, which is
+    // the lease its release claim has to present.
     set_status(&pool, id, "parked").await;
-    assert!(storage.try_unpark_to_processing(id).await.unwrap());
+    let lease = storage
+        .try_unpark_to_processing(id)
+        .await
+        .unwrap()
+        .expect("unparking a Parked row returns its post-update token");
     assert_eq!(status_of(&pool, id).await, "processing");
+    assert_eq!(
+        lease,
+        updated_at_of(&pool, id).await,
+        "the returned lease must be the row's committed updated_at"
+    );
 
-    // Not parked (e.g. recovery already requeued it to pending) → no-op.
+    // Not parked (e.g. recovery already requeued it to pending) -> no-op.
     set_status(&pool, id, "pending").await;
-    assert!(!storage.try_unpark_to_processing(id).await.unwrap());
+    assert!(storage
+        .try_unpark_to_processing(id)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(status_of(&pool, id).await, "pending");
 }
 
 /// `try_requeue_parked` is an optimistic CAS keyed on `updated_at`: a matching
-/// timestamp flips `Parked → Pending`, a stale one (a live sender heartbeated
+/// timestamp flips `Parked -> Pending`, a stale one (a live sender heartbeated
 /// the row between recovery's SELECT and this write) no-ops and leaves it parked.
 #[tokio::test(flavor = "multi_thread")]
 async fn try_requeue_parked_cas() {
@@ -224,12 +238,12 @@ async fn try_requeue_parked_cas() {
         .unwrap();
     set_status(&pool, id, "parked").await;
 
-    // Stale timestamp (a heartbeat raced in after recovery read the row) → no-op.
+    // Stale timestamp (a heartbeat raced in after recovery read the row) -> no-op.
     let stale = updated_at_of(&pool, id).await - ChronoDuration::seconds(60);
     assert!(!storage.try_requeue_parked(id, stale).await.unwrap());
     assert_eq!(status_of(&pool, id).await, "parked");
 
-    // Matching timestamp (genuinely orphaned) → requeue to pending.
+    // Matching timestamp (genuinely orphaned) -> requeue to pending.
     let captured = updated_at_of(&pool, id).await;
     assert!(storage.try_requeue_parked(id, captured).await.unwrap());
     assert_eq!(status_of(&pool, id).await, "pending");
@@ -238,7 +252,7 @@ async fn try_requeue_parked_cas() {
 /// `get_stale_parked_transactions` is the read recovery uses to find orphaned
 /// rows: only `Parked` rows older than the threshold, oldest-first, capped at
 /// the limit. A freshly heartbeated parked row and rows in other states are
-/// excluded — that exclusion is what keeps recovery off rows a live sender owns.
+/// excluded - that exclusion is what keeps recovery off rows a live sender owns.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_stale_parked_filters_and_orders() {
     let (db, url, _c) = start_pg("stale_parked_query").await;
@@ -266,7 +280,7 @@ async fn get_stale_parked_filters_and_orders() {
         .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 12))
         .await
         .unwrap();
-    set_status(&pool, fresh, "parked").await; // updated_at ≈ now → within threshold
+    set_status(&pool, fresh, "parked").await; // updated_at ~ now -> within threshold
 
     let processing = db
         .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 13))
@@ -287,7 +301,7 @@ async fn get_stale_parked_filters_and_orders() {
     let ids: Vec<i64> = stale.iter().map(|t| t.id).collect();
     assert_eq!(ids, vec![old, newer]);
 
-    // Limit is honored (FIFO over stale → the oldest).
+    // Limit is honored (FIFO over stale -> the oldest).
     let limited = storage
         .get_stale_parked_transactions(Duration::from_secs(5 * 60), 1, TransactionType::Withdrawal)
         .await
@@ -296,11 +310,11 @@ async fn get_stale_parked_filters_and_orders() {
     assert_eq!(limited[0].id, old);
 }
 
-// ── recovery parked-sweep (E2E through run_recovery_once) ─────────────────
+// -- recovery parked-sweep (E2E through run_recovery_once) -----------------
 
 /// A stale `Parked` row orphaned by a restart is rescued by the recovery worker:
 /// flipped back to `Pending`, counted via the `requeued_parked` metric, and
-/// done silently (no webhook) without burning the recovery retry cap — the row
+/// done silently (no webhook) without burning the recovery retry cap - the row
 /// was never broadcast, so there is nothing to cap.
 #[tokio::test(flavor = "multi_thread")]
 async fn recovery_requeues_stale_parked_to_pending() {
@@ -322,9 +336,15 @@ async fn recovery_requeues_stale_parked_to_pending() {
         .get();
     let (storage_tx, mut storage_rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, id).await,
@@ -386,9 +406,15 @@ async fn recovery_requeues_an_orphaned_rotation_wait_instead_of_quarantining_it(
     backdate(&pool, unrecorded, ChronoDuration::minutes(10)).await;
 
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, parked).await,
@@ -421,9 +447,15 @@ async fn escrow_recovery_never_unparks_withdrawal() {
     backdate(&pool, id, ChronoDuration::minutes(10)).await;
 
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Escrow, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Escrow,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, id).await,
@@ -438,6 +470,7 @@ async fn escrow_recovery_never_unparks_withdrawal() {
 }
 
 /// A fresh `Parked` row — one a live sender just heartbeated — is within the
+/// A fresh `Parked` row - one a live sender just heartbeated - is within the
 /// staleness window, so recovery must leave it alone rather than steal a row
 /// another worker still owns.
 #[tokio::test(flavor = "multi_thread")]
@@ -451,12 +484,18 @@ async fn recovery_leaves_fresh_parked_untouched() {
         .insert_transaction_internal(&make_withdrawal(&Signature::new_unique().to_string(), 21))
         .await
         .unwrap();
-    set_status(&pool, id, "parked").await; // updated_at ≈ now → within threshold
+    set_status(&pool, id, "parked").await; // updated_at ~ now -> within threshold
 
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
-    test_hooks::run_recovery_once(&storage, &dead_client(), ProgramType::Withdraw, &storage_tx)
-        .await
-        .unwrap();
+    test_hooks::run_recovery_once(
+        &storage,
+        &dead_client(),
+        ProgramType::Withdraw,
+        None,
+        &storage_tx,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         status_of(&pool, id).await,

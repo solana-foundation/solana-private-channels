@@ -1,10 +1,10 @@
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{extract::State, Json};
 
 use crate::{
     db,
     error::{AppError, AppResult},
     models::{LoginRequest, LoginResponse},
+    validation::{PASSWORD_MAX_LEN, USERNAME_MAX_LEN},
     AppState,
 };
 
@@ -22,22 +22,34 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<LoginResponse>> {
+    // Cap the inputs before the lookup or any hashing. Maximums only: enforcing
+    // register's minimums would lock out accounts created under an older policy.
+    if req.username.len() > USERNAME_MAX_LEN || req.password.chars().count() > PASSWORD_MAX_LEN {
+        return Err(AppError::Unauthorized);
+    }
+
     let user = db::find_user_by_username(&state.pool, &req.username).await;
     state.pool_status.observe_app(&user);
     let user = user?;
 
     let Some(user) = user else {
-        // User not found — run Argon2 against the dummy hash to match the cost
-        // of the "wrong password" path and prevent username enumeration via timing.
-        let hash = PasswordHash::new(DUMMY_HASH).expect("dummy hash is valid");
-        let _ = Argon2::default().verify_password(req.password.as_bytes(), &hash);
-        return Err(AppError::Unauthorized);
+        // User not found. Run Argon2 against the dummy hash to match the cost of
+        // the "wrong password" path and prevent username enumeration via timing.
+        // Same worker as the real path, so the permit wait can't leak either.
+        state
+            .passwords
+            .verify(req.password, DUMMY_HASH.to_string())
+            .await?;
+        return Err(charge_failed_attempt(&state, &req.username));
     };
 
-    let hash = PasswordHash::new(&user.password_hash).map_err(|_| AppError::Unauthorized)?;
-    Argon2::default()
-        .verify_password(req.password.as_bytes(), &hash)
-        .map_err(|_| AppError::Unauthorized)?;
+    if !state
+        .passwords
+        .verify(req.password, user.password_hash)
+        .await?
+    {
+        return Err(charge_failed_attempt(&state, &req.username));
+    }
 
     let token = state
         .jwt
@@ -47,11 +59,35 @@ pub async fn login(
     Ok(Json(LoginResponse { token }))
 }
 
+/// Spends one attempt against the username and picks the status for a failure.
+///
+/// Charged on the outcome, not before it. Charging up front let an
+/// unauthenticated caller drain a victim's budget just by naming them, holding
+/// that account at 429 without ever knowing its password. A correct password now
+/// succeeds regardless of the bucket, so the limiter cannot deny an account.
+///
+/// Hashing has already run by this point, so this bounds failed attempts rather
+/// than the work an attacker can cause. Per-IP throttling and the Argon2
+/// concurrency cap are what bound the work.
+fn charge_failed_attempt(state: &AppState, username: &str) -> AppError {
+    if state
+        .throttle
+        .per_username
+        .check_key(&username.to_string())
+        .is_err()
+    {
+        return AppError::TooManyRequests;
+    }
+    AppError::Unauthorized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use argon2::PasswordHash;
 
+    /// A malformed dummy hash fails to parse, which makes the unknown-user path
+    /// return without doing Argon2 work and reopens the timing oracle.
     #[test]
     fn dummy_hash_is_valid() {
         assert!(PasswordHash::new(DUMMY_HASH).is_ok());

@@ -1,6 +1,9 @@
 use {
     crate::{
-        accounts::{address_index_repair::repair_address_signatures, AccountsDB},
+        accounts::{
+            address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
+            redis::RedisAccountsDB, writer_lease::WriterLease, AccountsDB,
+        },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps, WriteDeps,
@@ -14,18 +17,27 @@ use {
             sequencer::start_sequence_worker,
             settle::start_settle_worker,
             sigverify::start_sigverify_workerpool,
-            AccountSettlement,
+            AccountSettlements, ExecutedBatch,
         },
     },
     futures::future::FutureExt,
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
-    solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput,
     std::{sync::Arc, time::Duration},
     tokio::{sync::mpsc, task::JoinHandle},
     tokio_util::sync::CancellationToken,
     tracing::{error, info, warn},
 };
+
+/// Total time the whole pipeline gets to drain on shutdown. A saturated drain
+/// measures well under a second, and the settler bounds its own shutdown work
+/// below this, so the remainder covers the cascade.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(6);
+
+/// Shared across every worker that had to be aborted, not spent per worker: a
+/// per-worker reserve would scale with the pipeline. `DRAIN_DEADLINE` plus this
+/// is the whole shutdown, and it has to stay under the container stop grace.
+const ABORT_RESERVE: Duration = Duration::from_secs(2);
 
 /// RPC→dedup ingress queue capacity. Sized so steady state never sheds.
 pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
@@ -33,6 +45,9 @@ pub const DEFAULT_INGRESS_QUEUE_CAPACITY: usize = 10_000;
 pub const DEFAULT_SEQUENCER_QUEUE_CAPACITY: usize = 1000;
 /// executor→settler results queue capacity.
 pub const DEFAULT_EXECUTION_RESULTS_CAPACITY: usize = 1000;
+/// The blockhash window in blocks, matching Solana.
+pub const DEFAULT_MAX_BLOCKHASHES: usize = 150;
+pub const DEFAULT_BLOCKTIME_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum NodeMode {
@@ -65,18 +80,40 @@ pub struct NodeConfig {
     /// batches ≥ `MIN_PARALLEL_BATCH_SIZE`; smaller batches always run sequentially.
     pub max_svm_workers: usize,
     pub accountsdb_connection_url: String,
+    /// Optional Redis cache in front of the read path. Reads consult Redis
+    /// first and fall through to `accountsdb_connection_url` on a miss.
+    pub redis_cache_url: Option<String>,
+    /// Expiry in seconds on cached block entries, bounding the growth an idle
+    /// node's heartbeat blocks cause. Zero disables it.
+    pub redis_block_ttl_secs: u64,
     pub admin_keys: Vec<Pubkey>, // Admin keys that can bypass SPL token program execution
-    pub transaction_expiration_ms: u64,
+    /// How many blocks a blockhash stays valid for. A block count, not a
+    /// duration: blocks come from traffic and from the idle heartbeat, so the
+    /// wall-clock window moves with load exactly as it does on Solana.
+    pub max_blockhashes: usize,
     pub blocktime_ms: u64,
     pub perf_sample_period_secs: u64, // Performance sample collection period (default 60 seconds)
     pub metrics: SharedMetrics,
 }
 
-impl NodeConfig {
-    /// Calculate max_blockhashes from transaction_expiration_ms and blocktime_ms
-    /// This represents how many blockhashes we need to keep in the dedup cache
-    pub fn max_blockhashes(&self) -> usize {
-        (self.transaction_expiration_ms / self.blocktime_ms) as usize
+/// Resolve the blockhash window, honouring the deprecated millisecond field for
+/// one release so an existing deployment keeps its effective window.
+pub fn resolve_max_blockhashes(
+    max_blockhashes: usize,
+    transaction_expiration_ms: Option<u64>,
+    blocktime_ms: u64,
+) -> usize {
+    match transaction_expiration_ms {
+        Some(expiration_ms) => {
+            let blocks = (expiration_ms / blocktime_ms.max(1)) as usize;
+            warn!(
+                "transaction_expiration_ms is deprecated and will be removed; use \
+                 max_blockhashes, a block count. It overrides max_blockhashes, mapping \
+                 {expiration_ms}ms at a {blocktime_ms}ms blocktime to {blocks} blocks."
+            );
+            blocks
+        }
+        None => max_blockhashes,
     }
 }
 
@@ -97,10 +134,12 @@ impl Default for NodeConfig {
             max_svm_workers: 8,
             accountsdb_connection_url: "postgresql://user:password@localhost:5432/private_channel"
                 .to_string(),
-            admin_keys: vec![],               // No admin keys by default
-            transaction_expiration_ms: 15000, // 15 seconds default
-            blocktime_ms: 100,                // 100ms default
-            perf_sample_period_secs: 60,      // 60 seconds default
+            redis_cache_url: None,
+            redis_block_ttl_secs: 3600, // one hour, well past the blockhash window
+            admin_keys: vec![],         // No admin keys by default
+            max_blockhashes: DEFAULT_MAX_BLOCKHASHES,
+            blocktime_ms: DEFAULT_BLOCKTIME_MS,
+            perf_sample_period_secs: 60, // 60 seconds default
             metrics: Arc::new(NoopMetrics),
         }
     }
@@ -124,18 +163,61 @@ impl WorkerHandle {
 pub struct NodeHandles {
     workers: Vec<WorkerHandle>,
     shutdown_token: CancellationToken,
+    /// Held for the node's lifetime by write-capable modes, released on shutdown
+    /// so a replacement node can start straight away.
+    writer_lease: Option<WriterLease>,
+    /// Closed first on shutdown, which is what refuses admission. `None` on a
+    /// read node, which has no write pipeline to close.
+    ingress_tx: Option<async_channel::Sender<SanitizedTransaction>>,
+}
+
+/// How long a read node waits out a cache stamped for another deployment. Worth
+/// waiting for in Aio, where the settler alongside this node purges and re-stamps
+/// it moments later; a genuinely wrong Redis costs only this window and then
+/// fails closed. An unstamped cache is not waited for at all, since the node
+/// serves correctly from Postgres until a write node stamps one.
+///
+/// This covers the cache, not a Postgres the write node has not created the
+/// schema in. That case fails earlier, when the cache handle reads the deployment
+/// id, and is not retried.
+///
+/// Serving is not gated on this: every cached read rechecks the stamp for itself,
+/// so a cache condemned later is dropped without waiting for a restart. Failing
+/// here is about not starting a node whose cache is misconfigured, rather than
+/// letting it come up and quietly serve every read from Postgres.
+const CACHE_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const CACHE_VERIFY_INTERVAL: Duration = Duration::from_secs(1);
+
+async fn wait_for_verified_cache(
+    redis: &crate::accounts::redis::RedisAccountsDB,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + CACHE_VERIFY_TIMEOUT;
+    loop {
+        match crate::accounts::redis_coherence::verify_cache_stamp(redis).await {
+            Ok(()) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                warn!(
+                    "Redis cache not usable yet ({}), waiting for a write node",
+                    e
+                );
+                tokio::time::sleep(CACHE_VERIFY_INTERVAL).await;
+            }
+            Err(e) => return Err(format!("Redis cache never became usable: {e:#}").into()),
+        }
+    }
 }
 
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
-    // max_blockhashes() divides by blocktime_ms and every mode derives it and reject a zero divisor.
     if config.blocktime_ms == 0 {
         return Err("blocktime_ms cannot be 0".into());
     }
     // All modes need a non-zero window: Read advertises it as last_valid_block_height, write modes size the dedup cache with it.
-    if config.max_blockhashes() == 0 {
+    if config.max_blockhashes == 0 {
         return Err(
-            "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)".into(),
+            "max_blockhashes must be greater than 0 (if you set the deprecated \
+                    transaction_expiration_ms, it must be at least blocktime_ms)"
+                .into(),
         );
     }
     // Zero capacity would panic the bounded-channel constructors below; fail closed instead.
@@ -157,21 +239,77 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     // Create a single shutdown token for all services
     let shutdown_token = CancellationToken::new();
 
+    // Taken after config validation so a bad config still fails without touching
+    // Postgres, and before any write-path work so a duplicate node is refused
+    // before it repairs indexes or serves RPC. Losing the lease later cancels the
+    // same token, so the node stops rather than running on without it.
+    let writer_lease = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+        Some(
+            WriterLease::acquire(
+                &config.accountsdb_connection_url,
+                shutdown_token.clone(),
+                Arc::clone(&config.metrics),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // A failure past this point must not return while the lease is still held,
+    // since a caller retrying at once would be refused by a lock nothing wants.
+    let mut workers = Vec::new();
+    let mut ingress_tx = None;
+    let started = start_services(
+        config,
+        shutdown_token.clone(),
+        &mut workers,
+        &mut ingress_tx,
+    )
+    .await;
+    let handles = NodeHandles {
+        workers,
+        shutdown_token,
+        writer_lease,
+        ingress_tx,
+    };
+
+    match started {
+        Ok(()) => Ok(handles),
+        Err(e) => {
+            // Cancels and joins whatever started, so the lease only goes back
+            // once nothing this node spawned is still running.
+            handles.shutdown().await;
+            Err(e)
+        }
+    }
+}
+
+/// Start the workers this node's mode needs, pushing each into `workers` as it is
+/// spawned and setting `ingress` once admission exists. The caller keeps both even
+/// on failure, so a partial startup is shut down in order rather than left to
+/// unwind on its own.
+async fn start_services(
+    config: NodeConfig,
+    shutdown_token: CancellationToken,
+    workers: &mut Vec<WorkerHandle>,
+    ingress: &mut Option<async_channel::Sender<SanitizedTransaction>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat registry — populated for stages that actually run, consumed by /health.
     let mut heartbeats = crate::health::HeartbeatRegistry::new();
 
     // Only create write pipeline for Write and Aio modes
-    let mut write_workers: Vec<WorkerHandle> = Vec::new();
     let (write_deps, live_blockhashes_arc) =
         if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-            // Create the bounded dedup channel (receives from RPC, sends to sigverify);
-            // a full queue sheds load at RPC ingress.
-            let (dedup_tx, dedup_rx) =
-                crate::stages::create_dedup_channel(config.ingress_queue_capacity);
+            // RPC ingress channel (receives from RPC, feeds the sigverify worker
+            // pool). MPMC so many sigverify workers can pull; a full queue sheds
+            // load at RPC ingress.
+            let (ingress_tx, ingress_rx) =
+                crate::stages::create_ingress_channel(config.ingress_queue_capacity);
 
-            // Create the sigverify channel (needed for NodeHandles in all modes)
-            let (sigverify_tx, sigverify_rx) =
-                async_channel::bounded::<SanitizedTransaction>(config.sigverify_queue_size);
+            // sigverify to dedup channel: dedup is a single consumer, so mpsc.
+            let (dedup_tx, dedup_rx) =
+                mpsc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
 
             // Create sequencer channel (bounded so backpressure chains upstream)
             let (sequencer_tx, sequencer_rx) =
@@ -183,14 +321,11 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
             // Create execution results channel between executor and settler (bounded for back-pressure)
             let (execution_results_tx, execution_results_rx) =
-                mpsc::channel::<(
-                    LoadAndExecuteSanitizedTransactionsOutput,
-                    Vec<SanitizedTransaction>,
-                )>(config.execution_results_capacity);
+                mpsc::channel::<ExecutedBatch>(config.execution_results_capacity);
 
             // Create settled accounts channel between settler and executor
             let (settled_accounts_tx, settled_accounts_rx) =
-                mpsc::unbounded_channel::<Vec<(Pubkey, AccountSettlement)>>();
+                mpsc::unbounded_channel::<AccountSettlements>();
 
             // Create settled blockhashes channel between settler and dedup
             let (settled_blockhashes_tx, settled_blockhashes_rx) =
@@ -208,12 +343,8 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             // the repair is skipped.
             let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
             repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
-            let (initial_live_blockhashes, initial_dedup_cache) = load_dedup_state(
-                &db,
-                config.max_blockhashes(),
-                config.transaction_expiration_ms,
-            )
-            .await?;
+            let (initial_live_blockhashes, initial_dedup_cache) =
+                load_dedup_state(&db, config.max_blockhashes).await?;
 
             let dedup_hb = crate::health::StageHeartbeat::new();
             let sigverify_hb = crate::health::StageHeartbeat::new();
@@ -228,33 +359,33 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
             heartbeats.settler = Some(Arc::clone(&settler_hb));
             heartbeats.address_index_writer = Some(Arc::clone(&addr_index_writer_hb));
 
-            // Start dedup stage (filters duplicate transactions before sigverify)
+            // Start sigverify worker pool (first stage). Verification runs before
+            // dedup so only verified transactions ever reach the dedup cache.
+            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
+                num_workers: config.sigverify_workers,
+                admin_keys: config.admin_keys.clone(),
+                rx: ingress_rx,
+                output_tx: dedup_tx,
+                metrics: Arc::clone(&config.metrics),
+                heartbeat: sigverify_hb,
+            })
+            .await;
+            workers.extend(sigverify_workers);
+
+            // Start dedup stage (drops replays after verification, keyed on the
+            // message hash so signature variants of one message collapse to one).
             let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
-                max_blockhashes: config.max_blockhashes(),
+                max_blockhashes: config.max_blockhashes,
                 input_rx: dedup_rx,
                 settled_blockhashes_rx,
-                output_tx: sigverify_tx.clone(),
-                shutdown_token: shutdown_token.clone(),
+                output_tx: sequencer_tx,
                 initial_live_blockhashes,
                 initial_dedup_cache,
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: dedup_hb,
             })
             .await;
-            write_workers.push(dedup);
-
-            // Start sigverify worker pool
-            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
-                num_workers: config.sigverify_workers,
-                admin_keys: config.admin_keys.clone(),
-                rx: sigverify_rx,
-                sequencer_tx,
-                shutdown_token: shutdown_token.clone(),
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: sigverify_hb,
-            })
-            .await;
-            write_workers.extend(sigverify_workers);
+            workers.push(dedup);
 
             // Start sequencer (produces conflict-free batches)
             let sequence = start_sequence_worker(crate::stages::SequencerArgs {
@@ -262,12 +393,11 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 batch_deadline_ms: config.batch_deadline_ms,
                 rx: sequencer_rx,
                 batch_tx,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: sequencer_hb,
             })
             .await;
-            write_workers.push(sequence);
+            workers.push(sequence);
 
             // Start executor (executes and settles batches)
             let execution = start_execution_worker(crate::stages::ExecutionArgs {
@@ -275,14 +405,13 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 settled_accounts_rx,
                 execution_results_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 max_svm_workers: config.max_svm_workers,
                 heartbeat: executor_hb,
                 live_blockhashes: Arc::clone(&live_blockhashes),
             })
             .await;
-            write_workers.push(execution);
+            workers.push(execution);
 
             // Each item is one tick worth of (address, slot, signature) rows.
             const ADDR_SIG_QUEUE_CAPACITY: usize = 1024;
@@ -298,14 +427,17 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 settled_blockhashes_tx,
                 address_signatures_tx: addr_sig_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+                redis_cache_url: config.redis_cache_url.clone(),
+                redis_block_ttl_secs: config.redis_block_ttl_secs,
                 blocktime_ms: config.blocktime_ms,
+                cache_mirror_cooldown: crate::stages::settle::CACHE_MIRROR_COOLDOWN,
                 perf_sample_period_secs: config.perf_sample_period_secs,
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: settler_hb,
             })
             .await;
-            write_workers.push(settle);
+            workers.push(settle);
 
             // Push the writer AFTER the settler so shutdown awaits in the
             // right order: settler drains its buffer, drops its sender, the
@@ -314,16 +446,15 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
                 rows_rx: addr_sig_rx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 flush_chunk_size: ADDR_SIG_FLUSH_CHUNK,
-                shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: addr_index_writer_hb,
             })
             .await;
-            write_workers.push(addr_index_writer);
+            workers.push(addr_index_writer);
 
             (
                 Some(WriteDeps {
-                    dedup_tx: dedup_tx.clone(),
+                    dedup_tx: ingress_tx,
                     metrics: Arc::clone(&config.metrics),
                 }),
                 live_blockhashes,
@@ -337,11 +468,34 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
 
     let read_deps = match config.mode {
         NodeMode::Read | NodeMode::Aio => {
-            let accounts_db = AccountsDB::new(&config.accountsdb_connection_url, true).await?;
+            let accounts_db = match config.redis_cache_url {
+                // Redis in front of Postgres. Postgres stays reachable so a
+                // key missing from the cache resolves against the source of
+                // truth instead of reading as an absence.
+                Some(ref redis_url) => {
+                    let postgres = PostgresAccountsDB::new(&config.accountsdb_connection_url, true)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e)
+                        })?;
+                    let redis = RedisAccountsDB::new(redis_url, postgres)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?;
+                    // Only a write node aligns the cache, so wait for one to
+                    // publish a stamp rather than serving whatever is there. An
+                    // empty cache verifies immediately. Foreign state verifies
+                    // only once a write node purges it, which in Aio is the
+                    // settler alongside this one.
+                    wait_for_verified_cache(&redis).await?;
+                    info!("Read path caching through Redis with Postgres fallback");
+                    AccountsDB::Redis(redis)
+                }
+                None => AccountsDB::new(&config.accountsdb_connection_url, true).await?,
+            };
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).
-            let max_blockhashes = config.max_blockhashes() as u64;
+            let max_blockhashes = config.max_blockhashes as u64;
             Some(ReadDeps {
                 admin_keys: config.admin_keys,
                 accounts_db,
@@ -351,6 +505,9 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
         }
         NodeMode::Write => None,
     };
+
+    // The admission handle, kept so shutdown can close it before anything else.
+    *ingress = write_deps.as_ref().map(|deps| deps.dedup_tx.clone());
 
     let rpc_config = RpcServiceConfig {
         port: config.port,
@@ -372,14 +529,10 @@ pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::er
     }
     info!("  Max connections: {}", config.max_connections);
 
-    // Build vector of all worker handles
-    let mut workers = vec![rpc_handle];
-    workers.extend(write_workers);
+    // RPC first, the order the shutdown loop has always joined them in.
+    workers.insert(0, rpc_handle);
 
-    Ok(NodeHandles {
-        workers,
-        shutdown_token,
-    })
+    Ok(())
 }
 
 impl NodeHandles {
@@ -397,8 +550,13 @@ impl NodeHandles {
             })
             .collect();
 
-        let (completed_idx, _result, _remaining) = futures::future::select_all(futures).await;
-        let worker_name = self.workers[completed_idx].name().to_string();
+        let (completed_idx, _result, remaining) = futures::future::select_all(futures).await;
+        // Released before the list is touched, and the finished worker is taken
+        // out of it: that poll consumed the task's output, and polling a
+        // finished JoinHandle again panics. `remove` rather than `swap_remove`
+        // because shutdown drains in pipeline order.
+        drop(remaining);
+        let worker_name = self.workers.remove(completed_idx).name().to_string();
 
         error!("{} worker quit unexpectedly", worker_name);
         worker_name
@@ -407,25 +565,353 @@ impl NodeHandles {
     pub async fn shutdown(self) {
         info!("Shutting down node...");
 
-        // Cancel the token - this signals all services to shutdown
+        // Closes admission. Every stage after the ingress edge exits when its
+        // own input closes, so cancelling here starts a drain that walks the
+        // pipeline in order rather than stopping all stages at once.
+        // Closed before the token so admission stops first. A closed channel
+        // still hands its buffered transactions to sigverify, so this refuses
+        // new work without discarding anything already accepted. Reversed, the
+        // stages would start unwinding while admission was still open.
+        if let Some(ref ingress_tx) = self.ingress_tx {
+            ingress_tx.close();
+        }
         self.shutdown_token.cancel();
 
-        // Wait for all workers to finish
-        for worker in self.workers {
-            match tokio::time::timeout(Duration::from_secs(5), worker.handle).await {
+        // One deadline for the whole drain, not one per worker: the workers are
+        // awaited in pipeline order, so a per-worker budget would multiply by
+        // the number of stages and overrun the container's stop grace period,
+        // which kills the process mid-drain and loses what the order preserved.
+        let deadline = tokio::time::Instant::now() + DRAIN_DEADLINE;
+        // One reserve for all aborts, so the total stays bounded however many
+        // workers overrun.
+        let abort_deadline = deadline + ABORT_RESERVE;
+        let mut overran = false;
+        let mut still_running = false;
+        for mut worker in self.workers {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, &mut worker.handle).await {
                 Ok(Ok(_)) => info!("{} stopped gracefully", worker.name),
                 Ok(Err(e)) => error!("{} error: {:?}", worker.name, e),
-                Err(_) => warn!("{} shutdown timeout", worker.name),
+                Err(_) => {
+                    // Dropping a JoinHandle detaches the task rather than
+                    // stopping it, so an in-process restart would leave this
+                    // stage holding its pool and channels beside the new one.
+                    worker.handle.abort();
+                    overran = true;
+
+                    // `abort()` only schedules cancellation, so wait for the task
+                    // to actually end. Bounded by the shared reserve, because a
+                    // task that never yields cannot be cancelled at all and must
+                    // not hold shutdown open past the container's stop grace.
+                    let stopped = tokio::time::timeout_at(abort_deadline, &mut worker.handle)
+                        .await
+                        .is_ok();
+                    if stopped {
+                        warn!(
+                            "{} did not drain within the deadline and was aborted",
+                            worker.name
+                        );
+                    } else {
+                        still_running = true;
+                        error!(
+                            "{} ignored the abort and is still running; an in-process restart would overlap it",
+                            worker.name
+                        );
+                    }
+                }
             }
         }
 
-        info!("Node shutdown complete");
+        // A worker that ignored its abort can still commit. Handing the lease
+        // over then would let a replacement start from the old tip and be killed
+        // by the first slot that worker writes.
+        if let Some(lease) = self.writer_lease {
+            if still_running {
+                warn!("Holding the writer lease: a worker did not stop in time");
+                lease.hold();
+            } else {
+                lease.release().await;
+            }
+        }
+
+        if overran {
+            warn!("Node shutdown finished with at least one stage aborted mid-drain");
+        } else {
+            info!("Node shutdown complete");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Docker's default SIGTERM-to-SIGKILL window. The whole shutdown has to
+    /// finish inside it or the process is killed part-way through.
+    const CONTAINER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+    fn handles_from(workers: Vec<WorkerHandle>) -> NodeHandles {
+        NodeHandles {
+            workers,
+            shutdown_token: CancellationToken::new(),
+            writer_lease: None,
+            ingress_tx: None,
+        }
+    }
+
+    /// A handle whose output was already taken must leave the drain list. Tokio
+    /// panics when a finished JoinHandle is polled again, and that panic escapes
+    /// shutdown and main, so the process aborts instead of draining.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quit_worker_is_not_polled_again_by_shutdown() {
+        let quitting = tokio::spawn(async {});
+        let live = tokio::spawn(async {});
+        let mut handles = handles_from(vec![
+            WorkerHandle::new("Quitting".to_string(), quitting),
+            WorkerHandle::new("Live".to_string(), live),
+        ]);
+
+        handles.wait_for_any_worker_quit().await;
+        handles.shutdown().await;
+    }
+
+    /// The name must come from the worker that actually finished, and every other
+    /// worker must still be drained in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wait_for_any_worker_quit_names_the_worker_that_quit() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let blocked = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        let quitting = tokio::spawn(async {});
+        let mut handles = handles_from(vec![
+            WorkerHandle::new("Blocked".to_string(), blocked),
+            WorkerHandle::new("Quitting".to_string(), quitting),
+        ]);
+
+        let name = handles.wait_for_any_worker_quit().await;
+        assert_eq!(name, "Quitting");
+        assert_eq!(handles.workers.len(), 1, "the finished worker must be gone");
+        assert_eq!(handles.workers[0].name(), "Blocked");
+
+        // Let the survivor exit so shutdown drains it rather than aborting it.
+        let _ = tx.send(());
+        handles.shutdown().await;
+    }
+
+    /// The abort reserve is shared, not per worker. Spent per worker it would
+    /// scale with the pipeline and push the whole shutdown past the stop grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_abort_reserve_does_not_scale_with_worker_count() {
+        let workers: Vec<WorkerHandle> = (0..6)
+            .map(|i| {
+                let spinning = tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_secs(30));
+                });
+                WorkerHandle::new(format!("Spinning{i}"), spinning)
+            })
+            .collect();
+        let handles = handles_from(workers);
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < CONTAINER_STOP_GRACE,
+            "shutdown took {:?}, which does not fit the container stop grace",
+            started.elapsed()
+        );
+    }
+
+    /// A worker that outlives the drain must be stopped, not merely stopped
+    /// waiting on. A dropped JoinHandle leaves the task running, so an
+    /// in-process restart would put a second pipeline on the same database.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_overruns_the_drain_is_aborted() {
+        // Set when the task is dropped, which only happens if it was aborted.
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&stopped));
+        let stuck = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await
+        });
+        let handles = NodeHandles {
+            workers: vec![WorkerHandle::new("Stuck".to_string(), stuck)],
+            shutdown_token: CancellationToken::new(),
+            writer_lease: None,
+            ingress_tx: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(2),
+            "shutdown must return once the drain deadline passes"
+        );
+
+        // Checked with no grace period: `abort()` only schedules cancellation, so
+        // returning before the task is gone lets a replacement pipeline overlap
+        // the old one, which is the whole reason for aborting at all.
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the overrunning worker was still running when shutdown returned"
+        );
+    }
+
+    /// A task with no await point cannot be cancelled, so waiting on it must not
+    /// hold the drain open past its budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uncancellable_worker_does_not_extend_the_drain() {
+        let spinning = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let handles = NodeHandles {
+            workers: vec![WorkerHandle::new("Spinning".to_string(), spinning)],
+            shutdown_token: CancellationToken::new(),
+            writer_lease: None,
+            ingress_tx: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        handles.shutdown().await;
+        assert!(
+            started.elapsed() < DRAIN_DEADLINE + Duration::from_secs(3),
+            "shutdown waited on a task that can never be cancelled"
+        );
+    }
+
+    /// Build handles around one worker so shutdown can be driven directly; that
+    /// is the only way to exercise a worker which refuses to stop.
+    fn handles_with(
+        worker: WorkerHandle,
+        token: CancellationToken,
+        lease: WriterLease,
+    ) -> NodeHandles {
+        NodeHandles {
+            workers: vec![worker],
+            shutdown_token: token,
+            writer_lease: Some(lease),
+            ingress_tx: None,
+        }
+    }
+
+    /// Dropping the handles stops no worker: they are separate tasks holding
+    /// their own token clones. Freeing the lock there would let a replacement
+    /// start beside a pipeline that is still committing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_node_handles_without_shutdown_keeps_the_lease() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = Arc::clone(&running);
+        let worker = WorkerHandle::new(
+            "Busy".to_string(),
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        drop(handles_with(worker, token, lease));
+
+        // Long enough for a release to have landed if one were on its way.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            running.load(std::sync::atomic::Ordering::SeqCst),
+            "the worker must still be running, or the test proves nothing"
+        );
+        assert!(
+            WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+                .await
+                .is_err(),
+            "dropped handles must keep the lease while their workers run"
+        );
+    }
+
+    /// The clean path: every worker stops, so the lease is handed over at once and
+    /// a replacement node can start immediately.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_releases_the_lease_when_every_worker_stops() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let watched = token.clone();
+        let worker = WorkerHandle::new(
+            "Tidy".to_string(),
+            tokio::spawn(async move { watched.cancelled().await }),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+            .await
+            .expect("a stopped node must hand the lease over");
+    }
+
+    /// A worker that ignores its abort is still running, so it can still commit.
+    /// Handing the lease over then would let a replacement start from the old tip
+    /// and be killed by the first slot that worker writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_keeps_the_lease_when_a_worker_ignores_its_abort() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        // A blocking thread has no await point to cancel at, which is the only way
+        // a worker is still running once shutdown has returned.
+        let worker = WorkerHandle::new(
+            "Stubborn".to_string(),
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(15))),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        assert!(
+            WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+                .await
+                .is_err(),
+            "the lease must stay held while a worker could still be committing"
+        );
+    }
+
+    /// An overrunning worker that the abort does stop cannot commit again, so the
+    /// lease must still be handed over. Holding it there would cost a deployment
+    /// its writer for one slow drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_releases_the_lease_when_an_overrunning_worker_is_aborted() {
+        let (_db, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let token = CancellationToken::new();
+        let lease = WriterLease::acquire(&url, token.clone(), Arc::new(NoopMetrics))
+            .await
+            .expect("the lease must be granted");
+
+        let worker = WorkerHandle::new(
+            "Slow".to_string(),
+            tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }),
+        );
+
+        handles_with(worker, token, lease).shutdown().await;
+
+        WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+            .await
+            .expect("an aborted worker cannot commit, so the lease must be free");
+    }
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_blocktime() {
@@ -442,21 +928,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_node_rejects_zero_max_blockhashes() {
-        // transaction_expiration_ms < blocktime_ms → max_blockhashes() == 0
         let config = NodeConfig {
-            transaction_expiration_ms: 50,
-            blocktime_ms: 100,
+            max_blockhashes: 0,
             ..Default::default()
         };
 
-        assert_eq!(config.max_blockhashes(), 0);
         let result = run_node(config).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert_eq!(
-            err.to_string(),
-            "transaction_expiration_ms must be >= blocktime_ms (max_blockhashes would be 0)"
-        );
+        assert!(err
+            .to_string()
+            .contains("max_blockhashes must be greater than 0"));
+    }
+
+    /// The deprecated duration maps to the block count it used to imply, so an
+    /// existing deployment keeps its effective window across the upgrade.
+    #[test]
+    fn expiry_config_migrates_from_milliseconds() {
+        assert_eq!(resolve_max_blockhashes(150, Some(15_000), 100), 150);
+        assert_eq!(resolve_max_blockhashes(150, Some(60_000), 100), 600);
+        // Absent, the block count is taken as given.
+        assert_eq!(resolve_max_blockhashes(300, None, 100), 300);
+        // The deprecated field wins while it is set, so a migration is visible.
+        assert_eq!(resolve_max_blockhashes(300, Some(15_000), 100), 150);
     }
 
     #[tokio::test]

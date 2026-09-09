@@ -31,6 +31,7 @@
 mod sender_fixtures;
 
 use {
+    chrono::{DateTime, Utc},
     private_channel_indexer::{
         config::ProgramType,
         operator::{
@@ -43,13 +44,16 @@ use {
                 transaction_util::MAX_POLL_ATTEMPTS_CONFIRMATION,
             },
         },
-        storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
+        storage::{
+            common::{models::DbTransactionBuilder, storage::mock::MockStorage},
+            Storage, TransactionStatus, TransactionType,
+        },
     },
     sender_fixtures::{
         blockhash_reply, ensure_admin_signer_env, make_config, make_instruction, make_remint_info,
         null_status_reply, send_transaction_echo_reply, withdrawal_ctx,
     },
-    solana_sdk::{commitment_config::CommitmentLevel, signature::Signature},
+    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
     std::sync::Arc,
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,
@@ -99,6 +103,41 @@ fn seed_remint_cache(state: &mut SenderState, transaction_id: i64, nonce: u64) {
         .insert(nonce, make_remint_info(transaction_id));
 }
 
+/// Seed the Processing withdrawal row that the PendingRemint transition is
+/// guarded on, so `set_pending_remint` can commit against the mock store the
+/// way it does against Postgres. The row is also what the pre-broadcast
+/// ownership claim CASes against.
+fn seed_processing_withdrawal_row(
+    storage: &MockStorage,
+    transaction_id: i64,
+    nonce: u64,
+) -> DateTime<Utc> {
+    let owner = Pubkey::new_unique().to_string();
+    let mut tx = DbTransactionBuilder::new(
+        format!("sig-{transaction_id}"),
+        1,
+        Pubkey::new_unique().to_string(),
+        1,
+    )
+    .initiator(owner.clone())
+    .recipient(owner)
+    .transaction_type(TransactionType::Withdrawal)
+    .build();
+    tx.id = transaction_id;
+    tx.status = TransactionStatus::Processing;
+    tx.withdrawal_nonce = Some(nonce as i64);
+    let updated_at = tx.updated_at;
+    storage.pending_transactions.lock().unwrap().push(tx);
+    updated_at
+}
+
+/// Arm the ownership lease the way submission does. These tests drive
+/// `send_and_confirm` directly, so nothing else records the incarnation this
+/// sender owns, and a release with no lease aborts before broadcast.
+fn arm_release_lease(state: &mut SenderState, nonce: u64, updated_at: DateTime<Utc>) {
+    state.release_leases.insert(nonce, updated_at);
+}
+
 /// Helper: enqueue one (`getLatestBlockhash`, `sendTransaction`-error)
 /// pair so a single `send_and_confirm` call exhausts the wire layer
 /// quickly. -32601 is classified permanent → no inner retries → exactly
@@ -142,8 +181,10 @@ fn enqueue_unconfirmed_send(mock: &MockRpcServer) {
 // from "the loop ran out of script".
 #[tokio::test]
 async fn idempotent_send_loops_capped_by_retry_max_attempts() {
-    let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(3).await;
+    let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(404, 7);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 404, 7);
+    arm_release_lease(&mut state, 7, lease);
 
     // Three cycles the resend loop may spend, plus one the cap must leave alone.
     for _ in 0..4 {
@@ -227,8 +268,10 @@ async fn idempotent_send_loops_capped_by_retry_max_attempts() {
 // at a budget the first test cannot distinguish from a hard-coded three.
 #[tokio::test]
 async fn idempotent_send_loops_capped_at_higher_budget() {
-    let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(4).await;
+    let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(4).await;
     let ctx = withdrawal_ctx(505, 11);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 505, 11);
+    arm_release_lease(&mut state, 11, lease);
 
     for _ in 0..5 {
         enqueue_unconfirmed_send(&mock);
@@ -280,20 +323,22 @@ async fn idempotent_send_loops_capped_at_higher_budget() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Withdrawal deferral — zero stashed signatures → ManualReview.
+// Withdrawal deferral — ambiguous send, nothing stashed → gated remint.
 // ─────────────────────────────────────────────────────────────────────
 //
-// `remint_cache[nonce]` is seeded so `handle_permanent_failure` enters
-// the deferred-remint branch instead of falling through to
-// `send_fatal_error`. `pending_signatures[nonce]` is left empty: the
-// production code treats this as "the RPC may have broadcast the tx
-// before erroring — blind remint is unsafe" and routes to
-// `ManualReview` with the "no signatures to verify" label.
+// `pending_signatures[nonce]` is left empty because the stash is only
+// written after a successful send, and this send failed. The signature
+// was still journaled write-ahead before the send, and the node answered
+// it with an error, so the release may have reached the network. The
+// deferral is therefore gated on that journaled signature rather than
+// escalated as if nothing had been broadcast.
 #[tokio::test]
-async fn deferral_with_zero_stashed_signatures_routes_to_manual_review() {
-    let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(3).await;
+async fn deferral_with_ambiguous_send_gates_on_journaled_signature() {
+    let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(601, 21);
     seed_remint_cache(&mut state, 601, 21);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 601, 21);
+    arm_release_lease(&mut state, 21, lease);
     // pending_signatures intentionally NOT seeded.
 
     enqueue_failing_send(&mock, "permanent send error");
@@ -309,24 +354,29 @@ async fn deferral_with_zero_stashed_signatures_routes_to_manual_review() {
     )
     .await;
 
-    let update = storage_rx
-        .recv()
+    assert!(
+        storage_rx.try_recv().is_err(),
+        "an ambiguously-sent release must not be terminalized; the row stays Processing until the deferred check runs"
+    );
+    let journaled = mock_storage
+        .get_release_signatures(601)
         .await
-        .expect("zero-sigs deferral arm must emit a ManualReview update");
-    assert_eq!(update.transaction_id, 601);
-    assert_eq!(update.status, TransactionStatus::ManualReview);
-    let msg = update.error_message.unwrap_or_default();
-    assert!(
-        msg.contains("no signatures to verify"),
-        "zero-sigs arm must surface the 'no signatures to verify' label; got {msg:?}"
+        .expect("journal read");
+    assert_eq!(
+        journaled.len(),
+        1,
+        "the send was preceded by a write-ahead persist"
     );
     assert!(
-        !update.remint_attempted,
-        "zero-sigs arm must NOT mark remint_attempted (no remint was scheduled)"
+        !state.pending_signatures.contains_key(&21),
+        "the failed send never stashed its signature"
     );
-    // Entry was NOT pushed to pending_remints — the unsafe-remint guard
-    // returned ManualReview directly.
-    assert!(state.pending_remints.is_empty());
+    assert_eq!(state.pending_remints.len(), 1);
+    assert_eq!(
+        state.pending_remints[0].signatures[0].signature.to_string(),
+        journaled[0].signature,
+        "the gate must carry the journaled signature"
+    );
     mock.shutdown().await;
 }
 
@@ -334,22 +384,31 @@ async fn deferral_with_zero_stashed_signatures_routes_to_manual_review() {
 // Withdrawal deferral — set_pending_remint succeeds → push to queue.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Pre-seed `pending_signatures[nonce]` with one fake signature so the
-// non-zero-sigs branch fires, calls `storage.set_pending_remint`
-// (succeeds under default `MockStorage`), and pushes a `PendingRemint`
-// entry into `state.pending_remints` for the deferred-finality-check
-// loop to pick up later. No status update is emitted on this path —
-// the row stays Processing until the remint resolves.
+// The multi-attempt shape: an earlier attempt broadcast and stashed its
+// signature, then this attempt was journaled write-ahead and its send
+// errored ambiguously. `set_pending_remint` commits and a `PendingRemint`
+// is pushed for the deferred-finality-check loop, carrying BOTH attempts —
+// either one may still land, so classifying only the stashed one could
+// remint on top of a release that lands afterwards. No status update is
+// emitted: the row stays Processing until the remint resolves.
 #[tokio::test]
 async fn deferral_with_stashed_signatures_pushes_pending_remint() {
-    let (mut state, mut storage_rx, storage_tx, mock, _mock_storage) = build_fixture(3).await;
+    let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(602, 22);
     seed_remint_cache(&mut state, 602, 22);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 602, 22);
+    arm_release_lease(&mut state, 22, lease);
+    let prior_attempt = Signature::new_unique();
+    mock_storage
+        .insert_release_signature(602, prior_attempt.to_string(), 0, None)
+        .await
+        .expect("journal the earlier broadcast");
     state.pending_signatures.insert(
         22,
         vec![PendingSig {
-            signature: Signature::new_unique(),
+            signature: prior_attempt,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         }],
     );
 
@@ -379,36 +438,58 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
     let entry = &state.pending_remints[0];
     assert_eq!(entry.ctx.transaction_id, Some(602));
     assert_eq!(entry.ctx.withdrawal_nonce, Some(22));
+    let gated: Vec<String> = entry
+        .signatures
+        .iter()
+        .map(|pending_sig| pending_sig.signature.to_string())
+        .collect();
     assert_eq!(
-        entry.signatures.len(),
-        1,
-        "the seeded stashed signature must be carried over to the PendingRemint entry"
+        gated.len(),
+        2,
+        "both the earlier broadcast and this ambiguously-sent attempt must be gated; got {gated:?}"
+    );
+    assert!(
+        gated.contains(&prior_attempt.to_string()),
+        "the earlier broadcast must still be classified; got {gated:?}"
     );
     mock.shutdown().await;
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Withdrawal deferral — set_pending_remint fails → ManualReview.
+// Withdrawal deferral — set_pending_remint fails → remint state held.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Same setup as the success scenario above, but
-// `MockStorage::set_should_fail("set_pending_remint", true)` makes the
-// storage call fail. The arm catches the error and routes to
-// `ManualReview` with a `"failed to persist pending remint"` label
-// instead of leaving the row in a broken half-state.
+// Same setup as the success scenario above, but neither the write nor the
+// read-back can establish which state was committed: `set_pending_remint`
+// and `get_transaction_status` both fail. With the row's owner unknown the
+// remint info and signature stash go back into the caches and the row keeps
+// its status, so the recovery sweep owns it. Terminalizing it here would
+// strand a still-Processing withdrawal in a status no sweep selects, after
+// the only live copy of them was discarded. (A write failure whose row
+// reads back Processing takes the same path directly; the unit tests in
+// transaction.rs cover that arm.)
 #[tokio::test]
-async fn deferral_set_pending_remint_storage_failure_routes_to_manual_review() {
+async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(603, 23);
     seed_remint_cache(&mut state, 603, 23);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 603, 23);
+    arm_release_lease(&mut state, 23, lease);
+    let prior_attempt = Signature::new_unique();
+    mock_storage
+        .insert_release_signature(603, prior_attempt.to_string(), 0, None)
+        .await
+        .expect("journal the earlier broadcast");
     state.pending_signatures.insert(
         23,
         vec![PendingSig {
-            signature: Signature::new_unique(),
+            signature: prior_attempt,
             last_valid_block_height: 0,
+            blockhash_slot: None,
         }],
     );
     mock_storage.set_should_fail("set_pending_remint", true);
+    mock_storage.set_should_fail("get_transaction_status", true);
 
     enqueue_failing_send(&mock, "permanent send error");
 
@@ -423,20 +504,36 @@ async fn deferral_set_pending_remint_storage_failure_routes_to_manual_review() {
     )
     .await;
 
-    let update = storage_rx
-        .recv()
-        .await
-        .expect("storage-failure arm must emit a ManualReview update");
-    assert_eq!(update.transaction_id, 603);
-    assert_eq!(update.status, TransactionStatus::ManualReview);
-    let msg = update.error_message.unwrap_or_default();
     assert!(
-        msg.contains("failed to persist pending remint"),
-        "storage-failure arm must surface the persistence-error label; got {msg:?}"
+        storage_rx.try_recv().is_err(),
+        "storage-failure arm must not write a terminal status over an unresolved row"
     );
     // The row must NOT have been pushed to pending_remints — the storage
     // write failed, so the in-memory queue cannot be allowed to drift
     // ahead of the durable state.
     assert!(state.pending_remints.is_empty());
+    // The remint info and signature stash are the only thing that can still make
+    // the user whole, so they stay in memory for the recovery sweep or a later
+    // attempt.
+    assert!(
+        state.remint_cache.contains_key(&23),
+        "remint info must be held when the row's owner is unknown"
+    );
+    assert!(
+        state.pending_signatures.contains_key(&23),
+        "release signatures must be held when the row's owner is unknown"
+    );
+    let status = mock_storage
+        .pending_transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|row| row.id == 603)
+        .map(|row| row.status);
+    assert_eq!(
+        status,
+        Some(TransactionStatus::Processing),
+        "the row must stay Processing so the recovery sweep owns it"
+    );
     mock.shutdown().await;
 }

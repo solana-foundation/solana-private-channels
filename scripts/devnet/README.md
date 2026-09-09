@@ -9,6 +9,22 @@ cp .env.example .env
 # Generate strong values with: openssl rand -hex 32
 ```
 
+## Two admin keys
+
+Steps 1-3 below are escrow governance and are signed by `keypairs/escrow-admin.json`,
+the `Instance.admin` key. The services run as a *different* key, the channel admin in
+`ADMIN_PRIVATE_KEY`, which holds receipt-mint authority and is what step 2 registers as
+the operator. Keep them separate: `SetNewAdmin` only rewrites `Instance.admin`, so a key
+that is also the channel admin keeps its receipt-mint authority and its Operator PDA
+after a handover and can still drain escrow custody.
+
+The commands below read their signers from keypair files. Create them first:
+```bash
+mkdir -p keypairs
+solana-keygen new -o ./keypairs/escrow-admin.json -s --no-bip39-passphrase  # signs create_instance / add_operator / allow_mint
+solana-keygen new -o ./keypairs/user.json -s --no-bip39-passphrase          # signs deposit / withdraw
+```
+
 Run all commands from project root:
 
 ## 1. Create Instance
@@ -19,14 +35,14 @@ so fund the admin keypair accordingly before running this.
 ```bash
 cargo run --bin create_instance -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json
+  ./keypairs/escrow-admin.json
 ```
 
 ## 2. Add Operator
 ```bash
 cargo run --bin add_operator -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json \
+  ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <OPERATOR_PUBKEY>
 ```
@@ -35,7 +51,7 @@ cargo run --bin add_operator -- \
 ```bash
 cargo run --bin allow_mint -- \
   https://api.devnet.solana.com \
-  ./keypairs/admin.json \
+  ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <MINT_ADDRESS>
 ```

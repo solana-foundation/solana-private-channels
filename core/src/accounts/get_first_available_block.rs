@@ -1,13 +1,16 @@
 use {
-    super::{postgres::PostgresAccountsDB, redis::RedisAccountsDB, traits::AccountsDB},
-    anyhow::{anyhow, Context, Result},
-    redis::AsyncCommands,
+    super::{postgres::PostgresAccountsDB, traits::AccountsDB},
+    anyhow::{Context, Result},
 };
 
 pub async fn get_first_available_block(db: &AccountsDB) -> Result<u64> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_first_available_block_postgres(postgres_db).await,
-        AccountsDB::Redis(redis_db) => get_first_available_block_redis(redis_db).await,
+        // Served from the source of truth, and no slot index is cached. One
+        // would only cover blocks written since the cache attached, so its
+        // minimum would be a cache artefact rather than the ledger's first
+        // available block.
+        AccountsDB::Redis(redis_db) => get_first_available_block_postgres(&redis_db.fallback).await,
     }
 }
 
@@ -39,22 +42,6 @@ async fn get_first_available_block_postgres(db: &PostgresAccountsDB) -> Result<u
 fn decode_first_available_block(value: &[u8]) -> Option<u64> {
     let bytes: [u8; 8] = value.try_into().ok()?;
     Some(u64::from_le_bytes(bytes))
-}
-
-async fn get_first_available_block_redis(db: &RedisAccountsDB) -> Result<u64> {
-    let mut conn = db.connection.clone();
-    // ZRANGE 0 0 returns the single member with the lowest score (earliest slot).
-    // Pairs with write_batch_redis which uses ZADD on block_slot_index for MIN semantics.
-    let result: redis::RedisResult<Vec<u64>> =
-        conn.zrange("block_slot_index", 0isize, 0isize).await;
-    result
-        .map_err(|e| anyhow!("Failed to get first available block from Redis: {}", e))
-        .and_then(|slots| {
-            slots
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow!("No first available block found in Redis"))
-        })
 }
 
 #[cfg(test)]

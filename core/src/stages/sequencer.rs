@@ -8,7 +8,6 @@ use {
     solana_sdk::transaction::SanitizedTransaction,
     std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
     tracing::{debug, info, warn},
 };
 
@@ -17,7 +16,6 @@ pub struct SequencerArgs {
     pub batch_deadline_ms: u64,
     pub rx: mpsc::Receiver<SanitizedTransaction>,
     pub batch_tx: mpsc::Sender<ConflictFreeBatch>,
-    pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<StageHeartbeat>,
 }
@@ -28,7 +26,6 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
         batch_deadline_ms,
         mut rx,
         batch_tx,
-        shutdown_token,
         metrics,
         heartbeat,
     } = args;
@@ -46,49 +43,38 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
             // Collect transactions up to max_tx_per_batch or until channel is empty
             let mut collected = 0;
 
-            // First, try to get at least one transaction (blocking)
-            tokio::select! {
-                result = rx.recv() => {
-                    match result {
-                        Some(transaction) => {
-                            heartbeat.record_input();
-                            debug!("Sequencer received transaction: {}", transaction.signature());
-                            pending_transactions.push(transaction);
-                            collected += 1;
-                        }
-                        None => {
-                            // Channel closed - flush any remaining with try_send (non-blocking)
-                            // to avoid blocking on a full channel when the executor is also exiting.
-                            if !pending_transactions.is_empty() {
-                                metrics.sequencer_collected(pending_transactions.len());
-                                let sent = flush_batches_nonblocking(
-                                    &mut scheduler,
-                                    &pending_transactions,
-                                    &batch_tx,
-                                    &metrics,
-                                );
-                                total_batches_sent += sent;
-                            }
-                            info!("Sequencer stopped - channel closed, sent {} total batches", total_batches_sent);
-                            return;
-                        }
-                    }
+            // First, get at least one transaction. Closing the input is the only
+            // exit: shutdown reaches this stage as an upstream close, and the
+            // batches held here are already-admitted work that must not be lost.
+            match rx.recv().await {
+                Some(transaction) => {
+                    heartbeat.record_input();
+                    debug!(
+                        "Sequencer received transaction: {}",
+                        transaction.signature()
+                    );
+                    pending_transactions.push(transaction);
+                    collected += 1;
                 }
-
-                _ = shutdown_token.cancelled() => {
-                    // Flush remaining with try_send (non-blocking) so shutdown completes
-                    // promptly even if the output channel is full.
+                None => {
+                    // Defensive: anything collected is dispatched at the bottom
+                    // of the loop, so this is normally empty. The send awaits
+                    // rather than dropping what it cannot fit.
                     if !pending_transactions.is_empty() {
                         metrics.sequencer_collected(pending_transactions.len());
-                        let sent = flush_batches_nonblocking(
+                        let sent = process_and_send_batches(
                             &mut scheduler,
                             &pending_transactions,
                             &batch_tx,
                             &metrics,
-                        );
+                        )
+                        .await;
                         total_batches_sent += sent;
                     }
-                    info!("Sequencer received shutdown signal, sent {} total batches", total_batches_sent);
+                    info!(
+                        "Sequencer stopped - channel closed, sent {} total batches",
+                        total_batches_sent
+                    );
                     return;
                 }
             }
@@ -167,52 +153,6 @@ pub async fn start_sequence_worker(args: SequencerArgs) -> WorkerHandle {
     });
 
     WorkerHandle::new("Sequencer".to_string(), handle)
-}
-
-/// Non-blocking flush used during shutdown / channel-closed paths.
-/// Uses `try_send` so we never block on a full channel when the executor is also exiting.
-/// Batches that can't fit are dropped (transactions will be lost), which is acceptable
-/// because the node is already stopping and clients will time out and retry.
-fn flush_batches_nonblocking(
-    scheduler: &mut Scheduler,
-    transactions: &[SanitizedTransaction],
-    batch_tx: &mpsc::Sender<ConflictFreeBatch>,
-    metrics: &SharedMetrics,
-) -> u64 {
-    let conflict_free_batches = scheduler.schedule(transactions.to_vec());
-    let num_transactions = transactions.len();
-    if num_transactions > 0 {
-        metrics.sequencer_transactions_emitted(num_transactions);
-    }
-    let mut batches_sent = 0u64;
-    let mut dropped_batches = 0u64;
-    let mut dropped_txs = 0usize;
-    for batch in conflict_free_batches {
-        match batch_tx.try_send(batch) {
-            Ok(_) => batches_sent += 1,
-            Err(e) => {
-                let reason = if batch_tx.is_closed() {
-                    "channel closed"
-                } else {
-                    "channel full"
-                };
-                let n = e.into_inner().transactions.len();
-                warn!(
-                    "Sequencer flush dropped batch of {} transactions during shutdown ({})",
-                    n, reason
-                );
-                dropped_batches += 1;
-                dropped_txs += n;
-            }
-        }
-    }
-    if dropped_batches > 0 {
-        warn!(
-            "Sequencer flush dropped {} batches ({} transactions) during shutdown",
-            dropped_batches, dropped_txs
-        );
-    }
-    batches_sent
 }
 
 /// Visible to tests in this crate.
@@ -421,7 +361,6 @@ mod tests {
             batch_deadline_ms: 0,
             rx: input_rx,
             batch_tx,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -448,7 +387,6 @@ mod tests {
             batch_deadline_ms: 0,
             rx: input_rx,
             batch_tx,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -496,7 +434,6 @@ mod tests {
             batch_deadline_ms: 0,
             rx: input_rx,
             batch_tx,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
         })
@@ -513,5 +450,56 @@ mod tests {
             max
         );
         shutdown.cancel();
+    }
+
+    /// The stage must drain its input completely before exiting, and must wait
+    /// for room downstream rather than dropping what does not fit. Both matter
+    /// because a transaction here has already been admitted and acknowledged to
+    /// a client. Exiting on a signal used to abandon whatever was still queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequencer_drains_its_input_before_exiting() {
+        let (tx_in, rx_in) = mpsc::channel(16);
+        // Capacity one, pre-filled, so the flush has to wait for room.
+        let (batch_tx, mut batch_rx) = mpsc::channel::<ConflictFreeBatch>(1);
+
+        let handle = start_sequence_worker(SequencerArgs {
+            max_tx_per_batch: 1,
+            batch_deadline_ms: 0,
+            rx: rx_in,
+            batch_tx,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        let mut expected = Vec::new();
+        for _ in 0..6 {
+            let payer = Keypair::new();
+            let tx = create_test_sanitized_transaction(&payer, &Pubkey::new_unique(), 1);
+            expected.push(*tx.signature());
+            tx_in.send(tx).await.unwrap();
+        }
+        drop(tx_in);
+
+        let mut seen = Vec::new();
+        while seen.len() < expected.len() {
+            match tokio::time::timeout(Duration::from_secs(10), batch_rx.recv()).await {
+                Ok(Some(batch)) => seen.extend(
+                    batch
+                        .transactions
+                        .iter()
+                        .map(|t| *t.transaction.signature()),
+                ),
+                _ => break,
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
+
+        for sig in expected {
+            assert!(
+                seen.contains(&sig),
+                "transaction {sig} was dropped on drain"
+            );
+        }
     }
 }

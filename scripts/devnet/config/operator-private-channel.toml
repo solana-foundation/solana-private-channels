@@ -5,6 +5,9 @@
 program_type = "withdraw"
 # TODO: Add solana devnet rpc url
 rpc_url = "your_solana_devnet_rpc_url"
+# Optional archival Solana fallback for rpc_url. Re-checks a Dead finality verdict
+# before a remint/re-release. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
 # Solana Private Channels gateway URL — operator-private-channel reads withdrawal events from the Solana Private Channels write-node
 # TODO: Add devnet private-channel gateway url
 source_rpc_url = "your_devnet_gateway_url"

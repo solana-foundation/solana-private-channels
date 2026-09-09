@@ -63,6 +63,7 @@ spl-associated-token-account = { workspace = true }
 spl-memo = { workspace = true }
 spl-token = { workspace = true }
 sqlx = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
@@ -70,7 +71,11 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+# hazmat exposes ExpandedSecretKey so a test can vary the ed25519 nonce and
+# forge a second valid signature for one message (issue-279 replay repro).
+ed25519-dalek = { version = "2.2", features = ["hazmat"] }
 serial_test = "3.2.0"
+sha2 = "0.10"
 solana-logger = { workspace = true }
 tempfile = "3"
 testcontainers = { workspace = true }

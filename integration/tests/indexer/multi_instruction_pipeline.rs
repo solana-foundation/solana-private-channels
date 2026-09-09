@@ -21,7 +21,7 @@ use {
     private_channel_indexer::{
         config::ProgramType,
         indexer::{
-            checkpoint::CheckpointUpdate,
+            checkpoint::CheckpointMsg,
             datasource::common::{
                 parser::{
                     DepositAccounts, DepositData, DepositEvent, EscrowInstruction,
@@ -150,7 +150,7 @@ fn withdraw_meta(
 /// Drive the processor over one slot's worth of messages, then close the input
 /// so `start()` returns. Returns once the processor task has fully drained.
 async fn run_slot(storage: Arc<Storage>, instance: Pubkey, messages: Vec<ProcessorMessage>) {
-    let (checkpoint_tx, _checkpoint_rx) = mpsc::channel::<CheckpointUpdate>(16);
+    let (checkpoint_tx, _checkpoint_rx) = mpsc::channel::<CheckpointMsg>(16);
     let (instr_tx, instr_rx) = mpsc::channel::<ProcessorMessage>(16);
 
     let processor =

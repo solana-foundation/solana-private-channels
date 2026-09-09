@@ -7,12 +7,15 @@ use crate::operator::{
     fetch_bitmap_generation, fetch_consumed_nonces, find_withdrawal_bitmap_pda, BitmapState,
     RetryConfig, RpcClientWithRetry,
 };
-use crate::operator::{MintCache, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo};
+use crate::operator::{
+    MintCache, SourceEventId, TransactionKind, TransactionStatusUpdate, WithdrawalRemintInfo,
+};
 use crate::storage::common::storage::Storage;
 use crate::storage::TransactionStatus;
 use crate::{PrivateChannelIndexerConfig, ProgramType};
 use chrono::Utc;
 use private_channel_metrics::MetricLabel;
+use solana_sdk::clock::MAX_PROCESSING_AGE;
 use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -23,8 +26,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, warn};
 
+use super::remint::FinalityRpc;
 use super::types::{InFlightQueue, SenderState, MAX_IN_FLIGHT};
-use super::{classify_release_signatures, SigFinality};
+use super::{classify_signatures, SigFinality};
 
 impl SenderState {
     pub(super) fn new(
@@ -48,10 +52,27 @@ impl SenderState {
         let mint_rpc_client = source_rpc_client.unwrap_or_else(|| rpc_client.clone());
         let mint_cache = MintCache::with_rpc(storage.clone(), mint_rpc_client.clone());
 
+        // Optional destination fallback, same retry/commitment as its primary.
+        // Empty means unset (env renders unconfigured as ""), so it maps to None.
+        let fallback_rpc_client = config
+            .fallback_rpc_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|url| {
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    url.to_string(),
+                    RetryConfig::default(),
+                    CommitmentConfig {
+                        commitment: operator_commitment,
+                    },
+                ))
+            });
+
         Ok(Self {
             rpc_client,
             // Source chain client (also used by MintCache). Remints broadcast here.
             source_rpc_client: mint_rpc_client,
+            fallback_rpc_client,
             storage,
             instance_pda,
             in_flight_withdrawals: HashSet::new(),
@@ -70,10 +91,98 @@ impl SenderState {
             program_type: config.program_type,
             remint_cache: HashMap::new(),
             pending_signatures: HashMap::new(),
+            release_leases: HashMap::new(),
             pending_remints: Vec::new(),
             in_flight: InFlightQueue::new(),
             semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         })
+    }
+}
+
+/// Three-way outcome of asking the chain whether a nonce's release landed.
+///
+/// `Uncertain` fails closed: every read, freshness and coverage ambiguity maps
+/// here and never to `NotLanded`, because only `NotLanded` authorises paying the
+/// user again.
+pub(crate) enum ReleaseVerdict {
+    /// The bit is set: the release landed, in the generation carried here.
+    Landed { generation: u64 },
+    /// The bit is clear inside the window the bitmap currently covers.
+    NotLanded,
+    /// The chain could not answer, which is not the same as answering "no".
+    Uncertain(String),
+}
+
+/// Prove on-chain whether withdrawal `nonce` was released, before anything acts
+/// on a verdict that would pay the user a second time.
+///
+/// The hard part is proving the snapshot is fresh behind a load-balanced RPC
+/// where two calls can hit different backends. The finalized blockhash and its
+/// response context slot come from one call, so the slot and the tip height it
+/// implies agree; the tip must be strictly past every attempt's last valid block
+/// height, since at that height a release can still land. The bitmap is then read
+/// bound to that slot, so a lagging backend errors instead of serving an older
+/// snapshot whose clear bit would read as proof of non-release.
+pub(crate) async fn verify_release_landed(
+    rpc: &RpcClientWithRetry,
+    instance_pda: Option<Pubkey>,
+    nonce: u64,
+    max_lvbh: u64,
+) -> ReleaseVerdict {
+    let Some(instance_pda) = instance_pda else {
+        return ReleaseVerdict::Uncertain("no instance pda configured".to_string());
+    };
+
+    let (ref_slot, lvbh) = match rpc
+        .get_latest_blockhash_with_context(CommitmentConfig::finalized())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return ReleaseVerdict::Uncertain(format!("finalized blockhash read failed: {e}"))
+        }
+    };
+    // A blockhash stays valid for MAX_PROCESSING_AGE blocks past the tip it was
+    // taken at, so its lvbh minus that window is the tip height at `ref_slot`.
+    let Some(tip_height) = lvbh.checked_sub(MAX_PROCESSING_AGE as u64) else {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized last valid block height {lvbh} below MAX_PROCESSING_AGE; \
+             cannot derive a tip height"
+        ));
+    };
+    if tip_height <= max_lvbh {
+        return ReleaseVerdict::Uncertain(format!(
+            "finalized tip height {tip_height} is not past the attempt's last valid block \
+             height {max_lvbh}, so the bits are too stale to prove non-release"
+        ));
+    }
+
+    let bitmap = match fetch_consumed_nonces(
+        rpc,
+        &find_withdrawal_bitmap_pda(&instance_pda),
+        Some(ref_slot),
+    )
+    .await
+    {
+        Ok(bitmap) => bitmap,
+        Err(e) => return ReleaseVerdict::Uncertain(format!("bitmap read failed: {e}")),
+    };
+
+    // Rotation clears every bit, so outside the current window a clear bit is
+    // indistinguishable from a release that happened and was then wiped.
+    if !bitmap.covers(nonce) {
+        return ReleaseVerdict::Uncertain(format!(
+            "the bitmap is on generation {} and its bits say nothing about nonce {nonce}",
+            bitmap.generation
+        ));
+    }
+
+    if bitmap.is_consumed(nonce) {
+        ReleaseVerdict::Landed {
+            generation: bitmap.generation,
+        }
+    } else {
+        ReleaseVerdict::NotLanded
     }
 }
 
@@ -85,6 +194,7 @@ impl SenderState {
 pub(crate) async fn validate_bitmap_consistency(
     storage: &Storage,
     rpc_client: &RpcClientWithRetry,
+    fallback_rpc_client: Option<&RpcClientWithRetry>,
     instance_pda: Option<Pubkey>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) -> Result<(), OperatorError> {
@@ -99,7 +209,7 @@ pub(crate) async fn validate_bitmap_consistency(
         "Validating withdrawal bitmap against completed withdrawals"
     );
 
-    let bitmap = fetch_consumed_nonces(rpc_client, &bitmap_pda).await?;
+    let bitmap = fetch_consumed_nonces(rpc_client, &bitmap_pda, None).await?;
     let (mut db_only, mut chain_only) = diff_bitmap(storage, &bitmap).await?;
 
     // The bitmap and the database are read at different instants, so a release
@@ -159,10 +269,12 @@ pub(crate) async fn validate_bitmap_consistency(
         nonces = ?chain_only,
         "Releases landed on-chain without a Completed row; resolving from broadcast signatures"
     );
+    // The bitmap is the withdraw role's, so its releases were broadcast to Solana.
+    let finality = FinalityRpc::solana(rpc_client, fallback_rpc_client);
     let mut paid_twice = Vec::new();
     for nonce in &chain_only {
         if let ChainAheadOutcome::DoublePayout =
-            resolve_chain_ahead_nonce(storage, rpc_client, storage_tx, *nonce).await
+            resolve_chain_ahead_nonce(storage, &finality, storage_tx, *nonce).await
         {
             paid_twice.push(*nonce);
         }
@@ -196,7 +308,7 @@ async fn confirm_divergence(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
 ) -> Result<(Vec<u64>, Vec<u64>), OperatorError> {
-    let bitmap = fetch_consumed_nonces(rpc_client, bitmap_pda).await?;
+    let bitmap = fetch_consumed_nonces(rpc_client, bitmap_pda, None).await?;
     diff_bitmap(storage, &bitmap).await
 }
 
@@ -239,12 +351,13 @@ pub(super) async fn load_persisted_release_signatures(
     match storage.get_release_signatures(transaction_id).await {
         Ok(stored) => stored
             .iter()
-            .filter_map(|(signature, last_valid_block_height)| {
-                Signature::from_str(signature)
+            .filter_map(|entry| {
+                Signature::from_str(&entry.signature)
                     .ok()
                     .map(|signature| PendingSig {
                         signature,
-                        last_valid_block_height: (*last_valid_block_height).max(0) as u64,
+                        last_valid_block_height: entry.last_valid_block_height.max(0) as u64,
+                        blockhash_slot: entry.blockhash_slot.and_then(|s| u64::try_from(s).ok()),
                     })
             })
             .collect(),
@@ -290,7 +403,7 @@ fn report_unrepaired(nonce: u64) {
 /// dropped is how a real divergence disappears into an info log.
 async fn resolve_chain_ahead_nonce(
     storage: &Storage,
-    rpc_client: &RpcClientWithRetry,
+    finality: &FinalityRpc<'_>,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     nonce: u64,
 ) -> ChainAheadOutcome {
@@ -341,7 +454,7 @@ async fn resolve_chain_ahead_nonce(
     let verdict = if signatures.is_empty() {
         None
     } else {
-        match classify_release_signatures(rpc_client, &signatures).await {
+        match classify_signatures(finality, &signatures).await {
             SigFinality::Landed(sig) => Some(sig),
             SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
                 warn!(nonce, transaction_id = row.id, "Unresolved: {reason}");
@@ -490,6 +603,12 @@ impl SenderState {
         &mut self,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) -> Result<(), OperatorError> {
+        // Deferred remints are Withdraw-only; another role sharing the database
+        // must never claim a row it would classify against the wrong chain.
+        if self.program_type != ProgramType::Withdraw {
+            return Ok(());
+        }
+
         let transactions = self.storage.get_pending_remint_transactions().await?;
 
         if transactions.is_empty() {
@@ -568,6 +687,9 @@ impl SenderState {
                         Ok(PendingSig {
                             signature,
                             last_valid_block_height,
+                            // The transactions-row mirror never carried a slot;
+                            // the journal table is the authority for one.
+                            blockhash_slot: None,
                         })
                     })
                     .collect()
@@ -589,10 +711,18 @@ impl SenderState {
                 // Carried so logs and the bitmap gate can name this withdrawal.
                 withdrawal_nonce: tx.withdrawal_nonce.map(|n| n as u64),
                 trace_id: Some(tx.trace_id.clone()),
+                deposit_claim_lease: None,
             };
 
             let remint_info = WithdrawalRemintInfo {
                 transaction_id: tx.id,
+                // Built from the fields rather than the row: `tx.remint_signatures` was
+                // moved out above, so the whole-row borrow `from_row` needs is gone.
+                source_event_id: SourceEventId::new(
+                    &tx.signature,
+                    tx.instruction_index,
+                    tx.inner_index,
+                ),
                 trace_id: tx.trace_id.clone(),
                 mint,
                 user: initiator,
@@ -654,7 +784,7 @@ mod tests {
     use super::*;
     use crate::operator::sender::test_support::{
         mock_bitmap_account, mock_bitmap_sequence, mock_bitmap_then_read_failure,
-        sender_state_with_storage,
+        sender_state_with_storage, sender_state_with_storage_and_role,
     };
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
@@ -665,7 +795,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn make_sender_state(mock: MockStorage) -> SenderState {
-        sender_state_with_storage("http://localhost:8899", mock)
+        make_sender_state_with_role(mock, ProgramType::Withdraw)
+    }
+
+    fn make_sender_state_with_role(mock: MockStorage, role: ProgramType) -> SenderState {
+        sender_state_with_storage_and_role("http://localhost:8899", mock, role)
     }
 
     /// Build a minimal DbTransaction representing a PendingRemint row.
@@ -1102,6 +1236,42 @@ mod tests {
         assert!(storage_rx.try_recv().is_err());
     }
 
+    /// The deferred remint queue belongs to the Withdraw role. An Escrow sender
+    /// sharing the transactions database must not hydrate a PendingRemint row:
+    /// it would later classify the release signature against the wrong chain.
+    #[tokio::test]
+    async fn recover_pending_remints_noop_for_escrow_role() {
+        let mock = MockStorage::new();
+        let sig = Signature::new_unique();
+        let deadline = Utc::now() - chrono::Duration::seconds(10);
+
+        mock.pending_remint_transactions
+            .lock()
+            .unwrap()
+            .push(make_pending_remint_row(
+                70,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &sig,
+                deadline,
+            ));
+
+        let mut state = make_sender_state_with_role(mock, ProgramType::Escrow);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        state.recover_pending_remints(&storage_tx).await.unwrap();
+
+        assert!(
+            state.pending_remints.is_empty(),
+            "Escrow must not claim a Withdraw remint row"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the row must be left untouched for the Withdraw sender"
+        );
+    }
+
     /// On a clean startup with no PendingRemint rows in the database,
     /// `recover_pending_remints` must be a complete no-op: no entries queued,
     /// no channel messages sent, no errors returned.
@@ -1227,6 +1397,7 @@ mod tests {
             program_type: ProgramType::Escrow,
             storage_type: StorageType::Postgres,
             rpc_url: "http://localhost:8899".to_string(),
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgresql://localhost/test".to_string(),
@@ -1332,10 +1503,14 @@ mod tests {
             });
 
         if let Some(sig) = signature {
-            mock.release_signatures
-                .lock()
-                .unwrap()
-                .insert(id, vec![(sig.to_string(), 1)]);
+            mock.release_signatures.lock().unwrap().insert(
+                id,
+                vec![crate::storage::common::models::StoredSig {
+                    signature: sig.to_string(),
+                    last_valid_block_height: 1,
+                    blockhash_slot: None,
+                }],
+            );
         }
     }
 
@@ -1349,6 +1524,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             None,
             &storage_tx,
         )
@@ -1380,6 +1556,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1431,6 +1608,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1459,6 +1637,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1479,9 +1658,13 @@ mod tests {
         let state = make_sender_state(mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        let outcome =
-            super::resolve_chain_ahead_nonce(&state.storage, &state.rpc_client, &storage_tx, 2)
-                .await;
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            2,
+        )
+        .await;
 
         assert!(
             matches!(outcome, super::ChainAheadOutcome::Unrepaired),
@@ -1527,9 +1710,13 @@ mod tests {
         let state = sender_state_with_storage(&server.url(), mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
-        let outcome =
-            super::resolve_chain_ahead_nonce(&state.storage, &state.rpc_client, &storage_tx, 2)
-                .await;
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            2,
+        )
+        .await;
 
         assert!(
             matches!(outcome, super::ChainAheadOutcome::Repaired),
@@ -1557,6 +1744,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1619,6 +1807,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1655,6 +1844,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1687,6 +1877,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1718,6 +1909,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1753,6 +1945,7 @@ mod tests {
         let result = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )
@@ -1785,6 +1978,7 @@ mod tests {
         let err = super::validate_bitmap_consistency(
             &state.storage,
             &state.rpc_client,
+            None,
             Some(Pubkey::new_unique()),
             &storage_tx,
         )

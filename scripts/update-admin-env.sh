@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Takes the CHANNEL admin keypair, the service identity the containers run as.
+# Never pass the escrow Instance.admin keypair here: sharing one key across both
+# roles means SetNewAdmin revokes nothing, because the rotated-out key keeps its
+# receipt-mint authority and its Operator PDA.
+#
 # Public admin key goes to the tracked template; the private key goes only to a
 # gitignored runtime env file, so `make build-*` never puts a live key in git.
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
-  echo "Usage: $0 <env-file> <admin-keypair-path> [runtime-env-file]" >&2
+  echo "Usage: $0 <env-file> <channel-admin-keypair-path> [runtime-env-file]" >&2
   exit 1
 fi
 

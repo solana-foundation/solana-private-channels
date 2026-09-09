@@ -13,7 +13,7 @@ pub async fn get_supply_impl(
     // Get the current slot for context
     let slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map_err(|e| {
             custom_error(

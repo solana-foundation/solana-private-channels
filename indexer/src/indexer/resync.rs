@@ -1,15 +1,30 @@
 use crate::{
     config::{BackfillConfig, ProgramType},
-    error::{DataSourceError, IndexerError},
+    error::{indexer::ReconciliationError, DataSourceError, IndexerError},
     indexer::{
         backfill::BackfillService, checkpoint::CheckpointWriter,
         datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
     },
+    operator::{
+        enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda, ConsumedSet,
+        RetryConfig, RpcClientWithRetry, CONSUMED_SET_PAGE_SIZE,
+    },
     storage::Storage,
 };
+use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
+#[derive(Clone, Debug)]
+pub struct ChannelReconcileConfig {
+    /// PrivateChannel RPC URL (the chain where mints land).
+    pub channel_rpc_url: String,
+    /// Mint authority (admin) whose confirmed mints carry the idempotency memos.
+    pub authority: Pubkey,
+}
 
 /// Resync service for rebuilding indexer database from chain history
 pub struct ResyncService {
@@ -17,7 +32,13 @@ pub struct ResyncService {
     rpc_poller: Arc<RpcPoller>,
     program_type: ProgramType,
     backfill_config_base: BackfillConfig,
-    escrow_instance_id: Option<solana_sdk::pubkey::Pubkey>,
+    escrow_instance_id: Option<Pubkey>,
+    // When set, the rebuild reconciles each row against the channel's existing mints and
+    // fails closed if that set cannot be built. None preserves the legacy rebuild.
+    channel_reconcile: Option<ChannelReconcileConfig>,
+    // Solana RPC that can read the escrow's withdrawal bitmap. A withdraw rebuild refuses
+    // to run without it, because it cannot prove the chain has not issued nonces yet.
+    withdrawal_bitmap_rpc_url: Option<String>,
 }
 
 impl ResyncService {
@@ -26,7 +47,7 @@ impl ResyncService {
         rpc_poller: Arc<RpcPoller>,
         program_type: ProgramType,
         backfill_config_base: BackfillConfig,
-        escrow_instance_id: Option<solana_sdk::pubkey::Pubkey>,
+        escrow_instance_id: Option<Pubkey>,
     ) -> Self {
         Self {
             storage,
@@ -34,7 +55,117 @@ impl ResyncService {
             program_type,
             backfill_config_base,
             escrow_instance_id,
+            channel_reconcile: None,
+            withdrawal_bitmap_rpc_url: None,
         }
+    }
+
+    /// Enable reconcile-on-rebuild against the PrivateChannel's existing mints.
+    pub fn with_channel_reconcile(mut self, config: ChannelReconcileConfig) -> Self {
+        self.channel_reconcile = Some(config);
+        self
+    }
+
+    /// Point the withdrawal bitmap pre-flight at the Solana RPC holding the escrow.
+    pub fn with_withdrawal_bitmap_rpc(mut self, rpc_url: String) -> Self {
+        self.withdrawal_bitmap_rpc_url = Some(rpc_url);
+        self
+    }
+
+    /// Build the consumed-set from the channel, failing closed on any error.
+    ///
+    /// The production entrypoint (run_resync) guarantees a channel RPC is configured and
+    /// refuses to run otherwise, so the None branch below (warn + Ok(None)) only applies to
+    /// direct/test construction.
+    async fn build_consumed_set(&self) -> Result<Option<Arc<ConsumedSet>>, IndexerError> {
+        let Some(reconcile) = self.channel_reconcile.as_ref() else {
+            warn!(
+                "Resync running WITHOUT channel reconciliation (no channel RPC configured); \
+                 rebuilt deposit/withdrawal rows will be pending. Only safe on an empty channel."
+            );
+            return Ok(None);
+        };
+
+        info!(
+            "Building consumed-set from PrivateChannel authority {} before any destruction...",
+            reconcile.authority
+        );
+        let channel_rpc = RpcClientWithRetry::with_retry_config(
+            reconcile.channel_rpc_url.clone(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        let set =
+            enumerate_consumed_mints(&channel_rpc, &reconcile.authority, CONSUMED_SET_PAGE_SIZE)
+                .await
+                .map_err(|reason| {
+                    error!(
+                        authority = %reconcile.authority,
+                        "Consumed-set enumeration failed; aborting resync before drop: {reason}"
+                    );
+                    IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                        reason,
+                    })
+                })?;
+        info!(
+            "Consumed-set built: {} serviced mint(s) on the channel",
+            set.len()
+        );
+        Ok(Some(Arc::new(set)))
+    }
+
+    /// Refuse a withdraw rebuild unless the on-chain bitmap has issued nothing. The rebuild
+    /// restarts the nonce sequence at 0, so rebuilt rows would reuse nonces the chain has
+    /// spent. Renumbering is not offered because it rewrites which withdrawal a nonce names.
+    async fn refuse_if_bitmap_advanced(&self) -> Result<(), IndexerError> {
+        if self.program_type != ProgramType::Withdraw {
+            return Ok(());
+        }
+        let unverified = |reason: String| {
+            error!("Withdrawal bitmap unverified; aborting resync before drop: {reason}");
+            IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapUnverified { reason })
+        };
+        let (Some(instance), Some(rpc_url)) = (
+            self.escrow_instance_id,
+            self.withdrawal_bitmap_rpc_url.as_ref(),
+        ) else {
+            return Err(unverified(
+                "a withdraw resync needs the escrow instance id and a Solana RPC that can \
+                 read its withdrawal bitmap, and one of them is not configured"
+                    .to_string(),
+            ));
+        };
+
+        let bitmap_pda = find_withdrawal_bitmap_pda(&instance);
+        info!(
+            instance = %instance,
+            bitmap = %bitmap_pda,
+            "Checking the withdrawal bitmap has issued no nonces before any destruction..."
+        );
+        let rpc = RpcClientWithRetry::with_retry_config(
+            rpc_url.clone(),
+            RetryConfig::default(),
+            CommitmentConfig::confirmed(),
+        );
+        let bitmap = fetch_consumed_nonces(&rpc, &bitmap_pda, None)
+            .await
+            .map_err(|e| unverified(e.to_string()))?;
+
+        if bitmap.generation != 0 || !bitmap.consumed.is_empty() {
+            error!(
+                generation = bitmap.generation,
+                set_bits = bitmap.consumed.len(),
+                "Withdrawal bitmap has advanced; aborting resync before drop"
+            );
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::WithdrawalBitmapAdvanced {
+                    generation: bitmap.generation,
+                    set_bits: bitmap.consumed.len(),
+                },
+            ));
+        }
+        info!("Withdrawal bitmap is fresh: generation 0, no set bits");
+        Ok(())
     }
 
     /// Run the resync process
@@ -45,6 +176,54 @@ impl ResyncService {
             self.program_type, genesis_slot
         );
 
+        // ---- Pre-flight: every check runs BEFORE any destruction (fail closed). ----
+        // On any failure below we return Err with the live DB completely untouched, so an
+        // advanced bitmap, a future-slot, an unreachable channel, or a legacy-scheme memo
+        // can never leave a half-wiped database.
+
+        // Pre-flight 1: an escrow rebuild needs its instance scope. The processor filters
+        // escrow instructions by it and an unset scope drops every one of them, so a rebuild
+        // without it would empty the tables, refill them with nothing, and still advance the
+        // checkpoint to the tip. That leaves no gap for a later run to detect, which makes it
+        // the one failure here that is not recoverable by repeating the operation.
+        if self.program_type == ProgramType::Escrow && self.escrow_instance_id.is_none() {
+            error!("Refusing to resync the escrow indexer with no escrow instance id");
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::InvalidPubkey {
+                    pubkey: "<missing>".to_string(),
+                    reason: "escrow_instance_id is required to resync the escrow indexer"
+                        .to_string(),
+                },
+            ));
+        }
+
+        // Pre-flight 2: a withdraw rebuild restarts the nonce sequence, so the chain must
+        // not have issued any nonce yet. Refuses on an unreadable bitmap as well.
+        self.refuse_if_bitmap_advanced().await?;
+
+        // Pre-flight 3: genesis_slot must not be ahead of the chain tip.
+        let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
+            error!("Failed to fetch current slot before resync backfill: {}", e);
+            IndexerError::DataSource(e.into())
+        })?;
+        if genesis_slot > current_slot {
+            error!(
+                "Invalid genesis_slot {}: cannot be ahead of current_slot {}",
+                genesis_slot, current_slot
+            );
+            return Err(IndexerError::from(DataSourceError::InvalidConfig {
+                reason: format!(
+                    "genesis_slot {} is ahead of current_slot {}",
+                    genesis_slot, current_slot
+                ),
+            }));
+        }
+
+        // Pre-flight 4+5: channel reachability + consumed-set completeness + cross-scheme
+        // guard, all inside build_consumed_set, which returns Err on any of them.
+        let consumed = self.build_consumed_set().await?;
+
+        // ---- Destruction: only now, with a complete consumed-set in hand. ----
         // Step 1: Drop existing tables
         info!("Dropping existing database tables...");
         self.storage.drop_tables().await.map_err(|e| {
@@ -92,35 +271,19 @@ impl ResyncService {
         // Start transaction processor as separate tokio task
         let mut transaction_processor =
             TransactionProcessor::new(self.storage.clone(), checkpoint_tx.clone());
-        // Wire the escrow instance scope. Config validation guarantees Some for the
-        // Escrow program; None here means the Withdraw program, where no instance
-        // scoping applies.
+        // Wire the escrow instance scope. Pre-flight 1 guarantees Some for the Escrow
+        // program. For Withdraw it names the bitmap checked above; the processor only
+        // scopes escrow instructions by it, so withdraw rows are unaffected.
         if let Some(instance_id) = self.escrow_instance_id {
             transaction_processor = transaction_processor.with_escrow_instance_id(instance_id);
+        }
+        // Inject the pre-drop consumed-set so the rebuild reconciles each row in place.
+        if let Some(consumed) = consumed {
+            transaction_processor = transaction_processor.with_consumed_set(consumed);
         }
         let processor_handle =
             tokio::spawn(async move { transaction_processor.start(instruction_rx).await });
         info!("TransactionProcessor task spawned");
-
-        // Run backfill service (this will process all transactions from genesis_slot to current)
-        let current_slot = self.rpc_poller.get_latest_slot().await.map_err(|e| {
-            error!("Failed to fetch current slot before resync backfill: {}", e);
-            IndexerError::DataSource(e.into())
-        })?;
-
-        // Validate genesis_slot is not in the future
-        if genesis_slot > current_slot {
-            error!(
-                "Invalid genesis_slot {}: cannot be ahead of current_slot {}",
-                genesis_slot, current_slot
-            );
-            return Err(IndexerError::from(DataSourceError::InvalidConfig {
-                reason: format!(
-                    "genesis_slot {} is ahead of current_slot {}",
-                    genesis_slot, current_slot
-                ),
-            }));
-        }
 
         let total_slots = current_slot.saturating_sub(genesis_slot);
 
@@ -157,16 +320,22 @@ impl ResyncService {
             }
         }
 
-        // Perform cleanup after backfill
+        // Perform cleanup after backfill, with no completeness target to check. A rebuild
+        // resolves its range inside the backfill service and never surfaces the top slot,
+        // so there is nothing to compare against here. Leaving it unchecked is acceptable
+        // because a stale checkpoint after a rebuild heals itself: the next live start
+        // detects the gap below the tip and fills it.
         if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
             checkpoint_handle,
             checkpoint_tx,
             self.storage.clone(),
+            None,
         )
         .await
         {
             error!("Cleanup after resync backfill failed: {}", e);
-            return Err(IndexerError::ShutdownChannelSend);
+            // Returned as-is so the operator sees which stage failed, not a generic one.
+            return Err(e);
         }
 
         info!(
@@ -218,5 +387,248 @@ mod tests {
         assert_eq!(service.program_type, ProgramType::Withdraw);
         assert_eq!(service.escrow_instance_id, Some(instance_id));
         assert_eq!(service.backfill_config_base.start_slot, Some(1000));
+    }
+
+    /// An escrow rebuild with no instance scope would drop every table and refill them with
+    /// nothing, so it must abort before the drop rather than after it.
+    ///
+    /// The RPC points at a dead port, which is what makes the ordering observable: the tip
+    /// fetch sits between this guard and the drop, so an `InvalidPubkey` here can only mean
+    /// the guard ran first. Had it run later, the unreachable node would have produced a
+    /// datasource error instead, and the tables would already be gone.
+    #[tokio::test]
+    async fn run_refuses_escrow_resync_without_instance_id_before_dropping_tables() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://127.0.0.1:1".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+
+        let service = ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Escrow,
+            backfill_config,
+            None,
+        );
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::InvalidPubkey {
+                reason,
+                ..
+            })) => assert!(
+                reason.contains("escrow_instance_id"),
+                "reason must name the missing scope, got: {reason}"
+            ),
+            other => panic!("escrow resync with no instance id must fail closed, got: {other:?}"),
+        }
+    }
+
+    // ── withdrawal bitmap pre-flight ─────────────────────────────────
+
+    /// Mount a withdrawal bitmap account as the server's `getAccountInfo` reply.
+    fn mock_bitmap_account(
+        server: &mut mockito::ServerGuard,
+        generation: u64,
+        consumed: &[u64],
+    ) -> mockito::Mock {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let bytes = crate::operator::bitmap_account_bytes(generation, consumed, 255);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": Pubkey::new_unique().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&bytes), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// A populated mock database, so a refused resync can be shown to have left
+    /// its tables alone rather than merely returned an error.
+    fn populated_storage() -> (MockStorage, Arc<Storage>) {
+        let mock = MockStorage::new();
+        mock.set_checkpoint("withdraw", 1_000);
+        mock.mints.lock().unwrap().insert(
+            "mint".to_string(),
+            crate::storage::common::models::DbMint::new("mint".to_string(), 6, "token".to_string()),
+        );
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        (mock, storage)
+    }
+
+    fn assert_db_intact(mock: &MockStorage) {
+        assert_eq!(mock.calls("drop_tables"), 0, "drop_tables must not run");
+        assert_eq!(mock.calls("init_schema"), 0, "init_schema must not run");
+        assert_eq!(mock.mints.lock().unwrap().len(), 1, "mint row must survive");
+        assert_eq!(
+            mock.committed_checkpoints.lock().unwrap().get("withdraw"),
+            Some(&1_000),
+            "checkpoint must survive"
+        );
+    }
+
+    /// Withdraw service whose tip RPC is a dead port. The tip fetch follows the bitmap
+    /// pre-flight, so a datasource error proves the check passed, and any bitmap error
+    /// proves the check ran before the tip fetch and therefore before the drop.
+    fn withdraw_service(
+        storage: Arc<Storage>,
+        instance: Option<Pubkey>,
+        bitmap_rpc_url: Option<String>,
+    ) -> ResyncService {
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://127.0.0.1:1".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+        let service = ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Withdraw,
+            backfill_config,
+            instance,
+        );
+        match bitmap_rpc_url {
+            Some(url) => service.with_withdrawal_bitmap_rpc(url),
+            None => service,
+        }
+    }
+
+    /// A set bit means the chain has issued a nonce. Rebuilding would restart the
+    /// sequence at 0 underneath it, so the resync must refuse with the tables intact.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_when_bitmap_has_set_bits_db_intact() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[3]);
+        let (mock, storage) = populated_storage();
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapAdvanced {
+                generation,
+                set_bits,
+            })) => {
+                assert_eq!(generation, 0);
+                assert_eq!(set_bits, 1);
+            }
+            other => panic!("a set bit must abort the resync, got: {other:?}"),
+        }
+        assert_db_intact(&mock);
+    }
+
+    /// A rotated bitmap has issued a whole window of nonces even when its bits are
+    /// clear, so a non-zero generation refuses on its own.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_when_bitmap_generation_advanced_db_intact() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 2, &[]);
+        let (mock, storage) = populated_storage();
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapAdvanced {
+                generation,
+                set_bits,
+            })) => {
+                assert_eq!(generation, 2);
+                assert_eq!(set_bits, 0);
+            }
+            other => panic!("an advanced generation must abort the resync, got: {other:?}"),
+        }
+        assert_db_intact(&mock);
+    }
+
+    /// Generation 0 with no bits set is a chain that has issued nothing, so the
+    /// resync continues to the next pre-flight. The dead tip RPC is what it hits.
+    #[tokio::test]
+    async fn run_proceeds_past_bitmap_check_on_fresh_bitmap() {
+        let mut server = mockito::Server::new_async().await;
+        let bitmap = mock_bitmap_account(&mut server, 0, &[]);
+        let (_mock, storage) = populated_storage();
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+
+        match service.run(100).await {
+            Err(IndexerError::DataSource(_)) => {}
+            other => {
+                panic!("a fresh bitmap must pass the check and reach the tip fetch, got: {other:?}")
+            }
+        }
+        bitmap.assert();
+    }
+
+    /// An unreadable bitmap says nothing about whether the chain is fresh, so the
+    /// resync refuses instead of skipping the check.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_when_bitmap_unreadable_db_intact() {
+        let (mock, storage) = populated_storage();
+        let service = withdraw_service(
+            storage,
+            Some(Pubkey::new_unique()),
+            Some("http://127.0.0.1:1".to_string()),
+        );
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::WithdrawalBitmapUnverified { reason },
+            )) => assert!(
+                reason.contains("bitmap"),
+                "reason must name the bitmap read, got: {reason}"
+            ),
+            other => panic!("an unreadable bitmap must abort the resync, got: {other:?}"),
+        }
+        assert_db_intact(&mock);
+    }
+
+    /// Without an escrow instance or a bitmap RPC the check cannot run at all, which
+    /// is the same refusal: absence of evidence is not evidence of a fresh chain.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_without_bitmap_inputs_db_intact() {
+        for (instance, rpc) in [
+            (None, Some("http://127.0.0.1:1".to_string())),
+            (Some(Pubkey::new_unique()), None),
+        ] {
+            let (mock, storage) = populated_storage();
+            let service = withdraw_service(storage, instance, rpc);
+            match service.run(100).await {
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::WithdrawalBitmapUnverified { .. },
+                )) => {}
+                other => panic!("missing bitmap inputs must abort the resync, got: {other:?}"),
+            }
+            assert_db_intact(&mock);
+        }
     }
 }

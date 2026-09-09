@@ -99,6 +99,7 @@ fn build_sender(storage: Arc<Storage>, rpc_url: String) -> SenderState {
             program_type: ProgramType::Withdraw,
             storage_type: StorageType::Postgres,
             rpc_url,
+            fallback_rpc_url: None,
             source_rpc_url: None,
             postgres: PostgresConfig {
                 database_url: "postgres://placeholder/none".to_string(),

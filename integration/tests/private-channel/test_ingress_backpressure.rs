@@ -58,8 +58,10 @@ fn load_config(db_url: String, port: u16, prometheus: bool) -> NodeConfig {
         execution_results_capacity: RESULTS_CAP,
         max_svm_workers: 2,
         accountsdb_connection_url: db_url,
+        redis_cache_url: None,
+        redis_block_ttl_secs: 3_600,
         admin_keys: vec![],
-        transaction_expiration_ms: 15_000,
+        max_blockhashes: 150,
         blocktime_ms: 100,
         perf_sample_period_secs: 3600,
         metrics: if prometheus {

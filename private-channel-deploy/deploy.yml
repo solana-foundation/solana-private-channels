@@ -92,6 +92,19 @@
 
           Fix: solana-keygen new --no-bip39-passphrase --silent --outfile {{ admin_keypair_path }}
 
+    # The withdraw operator re-checks a Dead finality verdict against this fallback
+    # before reminting and refuses to start without one. localnet reuses the local
+    # validator via the compose file, so the var is only required off localnet.
+    - name: Assert archival fallback RPC is set off localnet
+      ansible.builtin.assert:
+        that: network == 'localnet' or (fallback_rpc_url | default('') | length > 0)
+        fail_msg: |
+          fallback_rpc_url is empty for network={{ network }}.
+          The withdraw operator needs an independent, same-cluster archival Solana
+          RPC to corroborate a Dead finality verdict and refuses to start without
+          one. Set fallback_rpc_url in vars/{{ network }}.yml to a provider
+          independent from rpc_url ({{ rpc_url | default('unset') }}).
+
     - name: Derive admin pubkey via solana-keygen
       ansible.builtin.command: "solana-keygen pubkey {{ admin_keypair_path }}"
       changed_when: false
@@ -286,6 +299,62 @@
           `image_tag` empty in vars/<env>.yml. Deploy phase uses it as the docker image tag.
           Fix: set `image_tag: <tag>` in vars/dev.yml, or pass `-e image_tag=<tag>` on the CLI.
 
+    # Opt-in supply-chain gate. When verify_image_signature is set, refuse to
+    # deploy an app image that wasn't built + signed by our publish workflow
+    # (.github/workflows/publish-image.yml). cosign resolves the tag to its
+    # digest and checks the keyless signature (Fulcio cert identity + Rekor), so
+    # a tampered, unsigned, or foreign image fails before any pull.
+    # Off by default; set `verify_image_signature: true` on stacks that pull the
+    # signed org image from GHCR.
+    # Tagged `deploy` as well as `preflight` so the gate still runs when an
+    # operator invokes the deploy phase standalone (`--tags deploy`); otherwise
+    # the phase-4 pull below would fetch the mutable tag unverified.
+    - name: Verify app image signature (cosign)
+      when: verify_image_signature | default(false) | bool
+      delegate_to: localhost
+      run_once: true
+      tags: [ preflight, deploy ]
+      block:
+      - name: Probe cosign on the control node
+        ansible.builtin.command: cosign version
+        changed_when: false
+        failed_when: false
+        register: _cosign_probe
+
+      - name: Assert cosign is installed
+        ansible.builtin.assert:
+          that: _cosign_probe.rc == 0
+          fail_msg: |
+            `verify_image_signature` is set but cosign isn't on the control node.
+            Install: brew install cosign  (or https://docs.sigstore.dev/cosign/system_config/installation)
+
+      - name: cosign verify the app image
+        ansible.builtin.command:
+          argv:
+            - cosign
+            - verify
+            - --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+            - "--certificate-identity-regexp={{ image_signer_identity }}"
+            - --output=json
+            - "{{ image_registry }}/private-channel-app:{{ image_tag }}"
+        changed_when: false
+        register: _cosign_verify
+
+      - name: Report the verified digest
+        ansible.builtin.debug:
+          msg: >-
+            Verified {{ image_registry }}/private-channel-app:{{ image_tag }}
+            @ {{ (_cosign_verify.stdout | from_json)[0].critical.image['docker-manifest-digest'] }}
+
+    # Pin the render + deploy to the exact digest cosign just verified, so the
+    # phase-4 pull can't fetch a tag that moved between verify and pull. Set on
+    # the target host (not delegated) so the render task can read it.
+    - name: Record the verified image digest for digest-pinned deploy
+      when: verify_image_signature | default(false) | bool
+      ansible.builtin.set_fact:
+        pc_app_image_digest: "{{ (_cosign_verify.stdout | from_json)[0].critical.image['docker-manifest-digest'] }}"
+      tags: [ preflight, deploy ]
+
     - name: Assert network is set
       ansible.builtin.assert:
         that: network | default('') | length > 0
@@ -375,6 +444,49 @@
       ansible.builtin.assert:
         that: _compose_stat.stat.exists
         fail_msg: "Expected {{ repo_root }}/{{ compose_file }} not found on control node."
+
+    # Internal services carry no JWT. Point one at the public gateway with RBAC
+    # on and every gated read returns 401, so indexing or minting stalls while
+    # the stack still reports healthy. Nothing does that today; this keeps the
+    # next service from being wired that way.
+    - name: Read compose file for internal RPC routing check
+      ansible.builtin.slurp:
+        src: "{{ repo_root }}/{{ compose_file }}"
+      register: _compose_src
+      delegate_to: localhost
+      run_once: true
+      when: gateway_enforce_jwt | default(true) | bool
+
+    - name: Assert no internal service reads through the public gateway
+      vars:
+        # Any of the three vars pointed at a gateway host, whatever the spelling
+        # (${GATEWAY_URL}, http://gateway:${GATEWAY_PORT}, http://gateway:8898).
+        # The two allowed targets are the internal listener and the read-node.
+        _public_gw: '(?i)(COMMON_RPC_URL|COMMON_SOURCE_RPC_URL|INDEXER_BACKFILL_RPC_URL)=(?!.*(gateway_internal|gateway_read)).*gateway'
+      ansible.builtin.assert:
+        that: (_compose_src.content | b64decode) is not search(_public_gw)
+        fail_msg: |
+          {{ compose_file }} routes an internal service through the gateway's
+          public port while gateway_enforce_jwt is true. That service has no
+          token, so the gateway 401s its gated reads (getBlock, getAccountInfo,
+          getSignaturesForAddress).
+
+          Fix: use GATEWAY_INTERNAL_URL if it also sends transactions, or
+          GATEWAY_READ_URL if it only reads.
+      when: gateway_enforce_jwt | default(true) | bool
+
+    # Same port for both listeners would put the no-RBAC surface on the published
+    # port.
+    - name: Assert the gateway internal port is set and distinct
+      ansible.builtin.assert:
+        that:
+        - gateway_internal_port | default('') | string | length > 0
+        - gateway_internal_port | int != gateway_port | int
+        fail_msg: |
+          gateway_internal_port must be set and different from gateway_port
+          ({{ gateway_port }}). Internal services reach the gateway there with no
+          RBAC and no error redaction.
+      when: gateway_enforce_jwt | default(true) | bool
 
   # =========================================================================
   # PHASE 2: BOOTSTRAP — one-time host prep. Skipped via marker on subsequent runs.
@@ -584,11 +696,15 @@
         dest: "{{ target_versions_env_file }}"
         mode: "0644"
 
+    # Also tagged `deploy` so a standalone `--tags deploy` re-renders the override
+    # with the digest that this invocation's verify step just captured, instead of
+    # reusing a stale override from a prior render.
     - name: Render compose override
       ansible.builtin.template:
         src: templates/compose.yml.j2
         dest: "{{ target_override_file }}"
         mode: "0644"
+      tags: [ render, deploy ]
 
     # If a prior run wrote a real escrow instance ID into the .env file,
     # preserve it across re-renders. Otherwise the next deploy overwrites it
@@ -911,6 +1027,90 @@
       loop: "{{ _enabled }}"
       loop_control:
         label: "{{ item }}:{{ _health_probes[item] }}"
+
+    # /health answers before the auth check, so the probe above passes whether
+    # RBAC is on or off. The two checks below are a pair:
+    #   1. the internal port still serves a gated read, with no JWT
+    #   2. the public port rejects that same read without a token
+    # Check 1 on its own proves nothing: with JWT_SECRET blank it passes because
+    # nothing is enforced anywhere. Check 2 rules that out.
+    #
+    # getBlock is operator-only, the strictest gate the gateway has, so a read
+    # that clears it clears everything else too.
+    #
+    # The internal port has no `ports:` entry, so only a container on the network
+    # can reach it. curl is in the app image; the gateway healthcheck uses it.
+    - name: Gated read succeeds on the gateway internal port
+      when: "'gateway' in compose_services or compose_services | trim == ''"
+      ansible.builtin.command: >-
+        docker exec private-channel-gateway
+        curl -sS -o /dev/null -w '%{http_code}'
+        -X POST http://localhost:{{ gateway_internal_port }}
+        -H 'Content-Type: application/json'
+        -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1]}'
+      changed_when: false
+      register: _gw_internal
+      failed_when: _gw_internal.stdout | trim != '200'
+
+    # The account-gated read operator-solana makes on every JIT mint pre-check.
+    # Same listener and same bypass as getBlock above, so this is belt and braces,
+    # but it is the call that actually 401'd before the internal listener existed.
+    # Any pubkey works; a null result still means the gate let the call through.
+    - name: Account-gated read succeeds on the gateway internal port
+      when: "'gateway' in compose_services or compose_services | trim == ''"
+      ansible.builtin.command: >-
+        docker exec private-channel-gateway
+        curl -sS -o /dev/null -w '%{http_code}'
+        -X POST http://localhost:{{ gateway_internal_port }}
+        -H 'Content-Type: application/json'
+        -d '{"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":["11111111111111111111111111111111"]}'
+      changed_when: false
+      register: _gw_internal_account
+      failed_when: _gw_internal_account.stdout | trim != '200'
+
+    # The URL the read-only services use (GATEWAY_READ_URL). Probed by hostname
+    # from inside the network, the same way they reach it, so a DNS or port
+    # mistake shows up here rather than as stalled indexing.
+    - name: Gated read succeeds on the read-node
+      when: "compose_services | trim == '' or ('gateway' in compose_services and 'read-node' in compose_services)"
+      ansible.builtin.command: >-
+        docker exec private-channel-gateway
+        curl -sS -o /dev/null -w '%{http_code}'
+        -X POST http://read-node:{{ read_port }}
+        -H 'Content-Type: application/json'
+        -d '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[1]}'
+      changed_when: false
+      register: _readnode_block
+      failed_when: _readnode_block.stdout | trim != '200'
+
+    - name: Gated read is rejected on the gateway public port without a token
+      when:
+      - gateway_enforce_jwt | default(true) | bool
+      - "'gateway' in compose_services or compose_services | trim == ''"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gateway_port }}"
+        method: POST
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: getBlock
+          params: [ 1 ]
+        status_code: [ 401 ]
+        timeout: 5
+
+    # The pair above proves the internal port works from inside the network. This
+    # proves it is only reachable there. The one thing keeping it internal is
+    # compose giving it no `ports:` entry; publish it and any caller gets
+    # unauthenticated access with raw transaction errors, undoing the redaction
+    # on the public port. `state: stopped` passes when nothing is listening.
+    - name: Gateway internal port must not be published to the host
+      when: "'gateway' in compose_services or compose_services | trim == ''"
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ gateway_internal_port }}"
+        state: stopped
+        timeout: 5
 
     # Postgres health via pg_isready inside the container — works for any
     # postgres-* service in the stack without needing psql on the host.

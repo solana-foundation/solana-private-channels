@@ -78,6 +78,7 @@ impl SenderState {
                         transaction_id: Some(transaction_id),
                         withdrawal_nonce: Some(nonce),
                         trace_id: Some(trace_id),
+                        deposit_claim_lease: None,
                     },
                     instruction,
                 ));
@@ -442,7 +443,7 @@ mod tests {
     };
     use crate::operator::sender::transaction::handle_nonce_outside_generation;
     use crate::operator::sender::types::{PendingRemint, PendingSig, TransactionContext};
-    use crate::operator::utils::instruction_util::WithdrawalRemintInfo;
+    use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
@@ -454,6 +455,7 @@ mod tests {
     fn make_test_remint_info(transaction_id: i64, trace_id: &str) -> WithdrawalRemintInfo {
         WithdrawalRemintInfo {
             transaction_id,
+            source_event_id: SourceEventId::new(&format!("sig-{transaction_id}"), 0, None),
             trace_id: trace_id.to_string(),
             mint: Pubkey::new_unique(),
             user: Pubkey::new_unique(),
@@ -502,6 +504,7 @@ mod tests {
                 transaction_id: Some(1),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("t".to_string()),
+                deposit_claim_lease: None,
             },
             remint_info: make_test_remint_info(1, "t"),
             signatures: Vec::new(),
@@ -1209,6 +1212,7 @@ mod tests {
             transaction_id: RELEASE_TXID,
             trace_id: "t".to_string(),
             remint_info: Some(make_test_remint_info(1, "t")),
+            fetched_updated_at: chrono::Utc::now(),
         })
     }
 
@@ -1265,7 +1269,16 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let (_bitmap, reads) = mock_bitmap_sequence(&mut server, vec![(1, Vec::new())]);
 
-        let mut state = sender_state(&server.url());
+        // The deferral is a compare-and-set against a Processing row, so the row
+        // has to exist for the rejection path to persist anything.
+        let mock = mock_with_processing_row(1);
+        // The compensating remint classifies the journaled attempt, so the row
+        // needs the write-ahead record an earlier broadcast left behind.
+        let broadcast = Signature::new_unique();
+        mock.insert_release_signature(1, broadcast.to_string(), 1, None)
+            .await
+            .unwrap();
+        let mut state = sender_state_with_storage(&server.url(), mock);
         state.instance_pda = Some(Pubkey::new_unique());
         // The chain rotated to generation 1 without the cache hearing about it.
         state.cached_generation = Some(0);
@@ -1273,8 +1286,9 @@ mod tests {
         state.pending_signatures.insert(
             0,
             vec![PendingSig {
-                signature: Signature::new_unique(),
+                signature: broadcast,
                 last_valid_block_height: 1,
+                blockhash_slot: None,
             }],
         );
 
@@ -1289,6 +1303,7 @@ mod tests {
             transaction_id: Some(1),
             withdrawal_nonce: Some(0),
             trace_id: Some("t".to_string()),
+            deposit_claim_lease: None,
         };
         handle_nonce_outside_generation(
             &mut state,
@@ -1471,6 +1486,7 @@ mod tests {
                 transaction_id: Some(transaction_id),
                 withdrawal_nonce: Some(nonce),
                 trace_id: Some("t".to_string()),
+                deposit_claim_lease: None,
             };
             handle_nonce_outside_generation(
                 &mut state,
@@ -1567,6 +1583,7 @@ mod tests {
             transaction_id: 42,
             trace_id: "trace-42".to_string(),
             remint_info: Some(make_test_remint_info(42, "trace-42")),
+            fetched_updated_at: chrono::Utc::now(),
         });
 
         let ix = state

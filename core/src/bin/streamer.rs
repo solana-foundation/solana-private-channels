@@ -42,7 +42,7 @@ fn now_unix() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Escrow program discriminators (matches admin-ui/src/hooks/useActivityFeed.ts)
+// Escrow program discriminators (must match the escrow program's instruction layout)
 // ---------------------------------------------------------------------------
 const DISC_CREATE_INSTANCE: u8 = 0;
 const DISC_ALLOW_MINT: u8 = 1;
@@ -55,7 +55,7 @@ const DISC_RELEASE_FUNDS: u8 = 7;
 const DISC_ROTATE_BITMAP: u8 = 8;
 
 /// Known program IDs
-const ESCROW_PROGRAM_ID: &str = "GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83";
+const ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 // ---------------------------------------------------------------------------
@@ -560,19 +560,32 @@ async fn poll_loop(
         }
 
         for slot in &blocks {
+            // A stream drop is a missed notification, not a verdict, so every read
+            // failure below is logged and skipped like an absence but named apart.
             let block_info: BlockInfo = match accounts_db.get_block(*slot).await {
-                Some(info) => info,
-                None => {
+                Ok(Some(info)) => info,
+                Ok(None) => {
                     warn!("Block {} listed but not found", slot);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Failed to read block {}: {}", slot, e);
                     continue;
                 }
             };
 
             for sig in &block_info.transaction_signatures {
                 let stored_tx = match accounts_db.get_transaction(sig).await {
-                    Some(tx) => tx,
-                    None => {
+                    Ok(Some(tx)) => tx,
+                    Ok(None) => {
                         warn!("Transaction {} not found in block {}", sig, slot);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to read transaction {} in block {}: {}",
+                            sig, slot, e
+                        );
                         continue;
                     }
                 };

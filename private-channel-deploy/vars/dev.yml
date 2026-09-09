@@ -25,6 +25,11 @@ network: localnet
 #   mainnet  : your dedicated RPC (Helius, Triton, QuickNode, etc.).
 rpc_url: http://127.0.0.1:18899
 
+# fallback_rpc_url - archival Solana RPC that re-checks a Dead finality verdict.
+# REQUIRED off localnet: the withdraw operator refuses to start without an
+# independent, same-cluster endpoint. Leave empty only on localnet.
+fallback_rpc_url: ""
+
 # yellowstone_endpoint — Yellowstone gRPC endpoint for indexer-solana real-time
 # streaming. Env-specific, so it lives here rather than in common.yml.
 #   localnet : ignored — docker-compose.yml hardcodes http://validator:10000, so "" is fine.
@@ -42,11 +47,11 @@ host_data_dir: /tmp/private-channel-test
 
 # === Gateway auth & port ===================================================
 
-# gateway_enforce_jwt — whether the gateway requires a signed JWT on every RPC call.
-#   false : operator services can call getSignaturesForAddress without auth (required for the dev self-test).
-#   true  : production setting. When enabling, also set `jwt_secret` in secrets.yml
-#           (already required there; the gateway will refuse to start without it).
-gateway_enforce_jwt: false
+# gateway_enforce_jwt — whether the gateway's public port requires a signed JWT.
+# On by default: the operator services carry no JWT but reach the gateway on
+# GATEWAY_INTERNAL_PORT, which is exempt from RBAC and from error redaction.
+# This had to be false before that listener existed, or every gated read 401'd.
+gateway_enforce_jwt: true
 
 # gateway_port — host-side port the gateway listens on. Default 8899 in vars/common.yml.
 # Override here if 8899 collides on this host (e.g. local Solana test-validator).
@@ -56,7 +61,7 @@ gateway_enforce_jwt: false
 # Addresses the indexer/operator watch. On localnet these are also where the
 # bundled validator deploys the repo's .so files (pinned to the repo keypairs).
 # On devnet/mainnet the programs must already be deployed; set these to match.
-escrow_program_id: GokvZqD2yP696rzNBNbQvcZ4VsLW7jNvFXU1kW9m7k83
+escrow_program_id: 9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU
 withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 
 # === Escrow instance =======================================================
@@ -65,7 +70,8 @@ withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # Leave commented on localnet: the deploy's pipeline phase creates the instance
 # and writes the real PDA back into .env (env.j2 falls back to the all-1s
 # placeholder until then). On devnet/mainnet the instance already exists —
-# uncomment and set it to the address you created (e.g. via the Admin UI), or
+# uncomment and set it to the address you created (e.g. via the `create_instance`
+# CLI in scripts/devnet), or
 # the indexer will watch a placeholder address that nothing is deployed at.
 # (Must stay commented when unset: Jinja2 `| default()` only fills an *undefined*
 # var, so an active placeholder would render a non-base58 ESCROW_INSTANCE_ID and
@@ -78,10 +84,18 @@ withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # Any withdrawal still unreleased on the old instance is stranded permanently.
 # escrow_instance_id: "<your_instance_address>"
 
-# === Admin keypair ==========================================================
+# === Channel admin keypair ==================================================
 # Path on the control node to a funded Solana keypair (JSON byte array).
-# Used to derive the operator services' ADMIN_PRIVATE_KEY at runtime, and by
-# any post-deploy admin tooling that signs on-chain transactions.
+# Used to derive the operator services' ADMIN_PRIVATE_KEY and
+# PRIVATE_CHANNEL_ADMIN_KEYS at runtime. This is the channel admin: SPL
+# mint+freeze authority on every receipt mint, and the operator fee payer.
+#
+# It is NOT the escrow Instance.admin. That key signs CreateInstance, AllowMint,
+# Add/RemoveOperator and SetNewAdmin, is never rendered into any env file and
+# never reaches the target host. Keep it a separate offline keypair: SetNewAdmin
+# only rewrites Instance.admin, so a rotated-out key that is also the channel
+# admin keeps its receipt-mint authority and its Operator PDA, and can still
+# drain escrow custody after the handover.
 admin_keypair_path: "{{ repo_root }}/keypairs/admin.json"
 
 # === Public surface ========================================================

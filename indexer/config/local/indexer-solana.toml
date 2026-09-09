@@ -3,6 +3,12 @@
 [common]
 program_type = "escrow"
 rpc_url = "http://localhost:18899"
+# Optional archival fallback for rpc_url. Re-checks a Dead finality verdict (operator)
+# and backs the poller's missing-block failover. Empty = unset. Env: COMMON_FALLBACK_RPC_URL
+# fallback_rpc_url = "https://your-archival-endpoint"
+
+# Channel (gateway) RPC. Required for escrow: the startup supply invariant reads from it.
+source_rpc_url = "http://localhost:8898"
 
 # Placeholder — overridden at runtime by COMMON_ESCROW_INSTANCE_ID, which
 # bench-tps/scripts/run.sh derives from the persistent deposit-instance-seed.json
@@ -20,14 +26,12 @@ datasource_type = "yellowstone"
 
 [indexer.yellowstone]
 endpoint = "http://localhost:10000"
-# Must stay "finalized": deposits become irreversible private-channel mints, so
-# ingesting at "confirmed" would let a Solana reorg produce an unbacked mint.
-commitment = "finalized"
 
 [indexer.rpc_polling]
 poll_interval_ms = 1000
 error_retry_interval_ms = 5000
 batch_size = 50
+# The polling loop's missing-metadata failover reads common.fallback_rpc_url.
 
 [indexer.backfill]
 enabled = true

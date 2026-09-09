@@ -8,25 +8,25 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::AccountSettlement,
+        stages::{retained_bytes_of, AccountSettlements, ExecutedBatch},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
             clock::set_clock_now,
-            gasless_callback::{GaslessCallback, SnapshotCallback},
+            gasless_callback::{GaslessCallback, SnapshotCallback, DEFAULT_FEE_PAYER_LAMPORTS},
             gasless_rent_collector::GaslessRentCollector,
         },
     },
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
     solana_sdk::{
-        account::{ReadableAccount, WritableAccount},
+        account::{AccountSharedData, ReadableAccount},
         hash::Hash,
         pubkey::Pubkey,
-        transaction::SanitizedTransaction,
+        transaction::{SanitizedTransaction, TransactionError},
     },
     solana_svm::{
         transaction_error_metrics::TransactionErrorMetrics,
-        transaction_processing_result::ProcessedTransaction,
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
         transaction_processor::{
             LoadAndExecuteSanitizedTransactionsOutput, TransactionBatchProcessor,
             TransactionProcessingConfig, TransactionProcessingEnvironment,
@@ -41,7 +41,6 @@ use {
         time::{Duration, Instant},
     },
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
     tracing::{debug, error, info, warn},
 };
 
@@ -54,13 +53,9 @@ const MIN_PARALLEL_BATCH_FACTOR: usize = 4;
 
 pub struct ExecutionArgs {
     pub batch_rx: mpsc::Receiver<ConflictFreeBatch>,
-    pub settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
-    pub execution_results_tx: mpsc::Sender<(
-        LoadAndExecuteSanitizedTransactionsOutput,
-        Vec<SanitizedTransaction>,
-    )>,
+    pub settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    pub execution_results_tx: mpsc::Sender<ExecutedBatch>,
     pub accountsdb_connection_url: String,
-    pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     /// Max parallel SVM workers per batch (including calling thread).
     /// 1 disables parallelism; >=2 enables it once the batch is large enough
@@ -91,6 +86,13 @@ pub struct ExecutionResult {
     pub regular_transactions: Vec<SanitizedTransaction>,
     pub admin_results: Option<LoadAndExecuteSanitizedTransactionsOutput>,
     pub regular_results: Option<LoadAndExecuteSanitizedTransactionsOutput>,
+    /// BOB generation stamped on the admin path's account writes, 0 when the
+    /// path was skipped. A plain field rather than part of `admin_results` so
+    /// that reading the results does not force callers to unwrap a pair.
+    pub admin_generation: u64,
+    /// BOB generation stamped on the regular path's account writes, 0 when the
+    /// path was skipped.
+    pub regular_generation: u64,
 }
 
 pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
@@ -99,7 +101,6 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         settled_accounts_rx,
         execution_results_tx,
         accountsdb_connection_url,
-        shutdown_token,
         metrics,
         max_svm_workers,
         heartbeat,
@@ -126,108 +127,99 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         let mut total_batches_processed = 0u64;
 
         loop {
-            tokio::select! {
-                // Process batches
-                result = batch_rx.recv() => {
-                    match result {
-                        Some(batch) => {
-                            heartbeat.record_input();
-                            let batch_size = batch.transactions.len();
-                            debug!("Executor received batch with {} transactions", batch_size);
+            // Process batches. Closing the input is the only exit: shutdown
+            // arrives as an upstream close so every admitted batch is run.
+            match batch_rx.recv().await {
+                Some(batch) => {
+                    heartbeat.record_input();
+                    let batch_size = batch.transactions.len();
+                    debug!("Executor received batch with {} transactions", batch_size);
 
-                            // A fatal preload error (transient DB failure that
-                            // survived retries) aborts the loop without settling:
-                            // nothing is recorded, so the txs stay resubmittable.
-                            let execution_result = match execute_batch(
-                                batch,
-                                &mut execution_deps,
+                    let execution_result =
+                        match execute_batch(batch, &mut execution_deps, &metrics).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                // Nothing was executed or settled; a restart is
+                                // preferable to executing against unknown state.
+                                error!("Executor stopping: {}", e);
+                                break;
+                            }
+                        };
+
+                    let num_transactions_executed = execution_result.admin_transactions.len()
+                        + execution_result.regular_transactions.len();
+                    heartbeat.record_progress();
+                    if !execution_result.admin_transactions.is_empty() {
+                        if let Some(admin_results) = execution_result.admin_results {
+                            let len = execution_result.admin_transactions.len();
+                            // Bounded send applies backpressure; race shutdown so a full
+                            // settler queue never wedges executor exit. Owned values only,
+                            // no lock guard is held across this await.
+                            match send_results_chunked(
+                                &execution_results_tx,
+                                admin_results,
+                                execution_result.admin_transactions,
+                                execution_result.admin_generation,
+                                MAX_SEND_CHUNK_BYTES,
                                 &metrics,
-                            ).await {
-                                Ok(result) => result,
-                                Err(e) => {
-                                    // Fatal on purpose. Breaking ends the executor task, which the
-                                    // node supervisor (wait_for_any_worker_quit) turns into a clean
-                                    // full shutdown and a non-zero process exit for the supervisor to
-                                    // restart. Nothing in this batch was settled, and restart rebuilds
-                                    // the dedup cache from settled blocks only, so the dropped txs are
-                                    // not deduped and remain resubmittable.
-                                    error!("Fatal account load error, aborting executor: {:?}", e);
-                                    break;
-                                }
-                            };
-
-                            let num_transactions_executed = execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
-                            heartbeat.record_progress();
-                            if !execution_result.admin_transactions.is_empty() {
-                                if let Some(admin_results) = execution_result.admin_results {
-                                    let len = execution_result.admin_transactions.len();
-                                    // Bounded send applies backpressure; race shutdown so a full
-                                    // settler queue never wedges executor exit. Owned values only,
-                                    // no lock guard is held across this await.
-                                    tokio::select! {
-                                        send_result = execution_results_tx.send((admin_results, execution_result.admin_transactions)) => {
-                                            if let Err(e) = send_result {
-                                                metrics.executor_results_send_failed("admin");
-                                                error!("Failed to send admin results: {:?}", e);
-                                                break;
-                                            }
-                                        }
-                                        _ = shutdown_token.cancelled() => {
-                                            info!("Executor shutdown while sending admin results");
-                                            return;
-                                        }
-                                    }
-                                    metrics.executor_results_sent(len);
-                                } else {
-                                    metrics.executor_missing_results("admin");
-                                    error!("Unexpected error: No result found for admin transactions");
+                            )
+                            .await
+                            {
+                                SendOutcome::Sent => {}
+                                SendOutcome::ChannelClosed => {
+                                    metrics.executor_results_send_failed("admin");
+                                    error!("Failed to send admin results: channel closed");
                                     break;
                                 }
                             }
-                            if !execution_result.regular_transactions.is_empty() {
-                                if let Some(regular_results) = execution_result.regular_results {
-                                    let len = execution_result.regular_transactions.len();
-                                    tokio::select! {
-                                        send_result = execution_results_tx.send((regular_results, execution_result.regular_transactions)) => {
-                                            if let Err(e) = send_result {
-                                                metrics.executor_results_send_failed("regular");
-                                                error!("Failed to send regular results: {:?}", e);
-                                                break;
-                                            }
-                                        }
-                                        _ = shutdown_token.cancelled() => {
-                                            info!("Executor shutdown while sending regular results");
-                                            return;
-                                        }
-                                    }
-                                    metrics.executor_results_sent(len);
-                                } else {
-                                    metrics.executor_missing_results("regular");
-                                    error!("Unexpected error: No result found for regular transactions");
-                                    break;
-                                }
-                            }
-
-                            total_transactions_executed += num_transactions_executed as u64;
-                            total_batches_processed += 1;
-
-                            if total_batches_processed.is_multiple_of(100) {
-                                info!("Executor has processed {} batches, {} total transactions",
-                                      total_batches_processed, total_transactions_executed);
-                            }
-                        }
-                        None => {
-                            info!("Executor stopped - channel closed, executed {} total transactions in {} batches",
-                                  total_transactions_executed, total_batches_processed);
-                            return;
+                            metrics.executor_results_sent(len);
+                        } else {
+                            metrics.executor_missing_results("admin");
+                            error!("Unexpected error: No result found for admin transactions");
+                            break;
                         }
                     }
-                }
+                    if !execution_result.regular_transactions.is_empty() {
+                        if let Some(regular_results) = execution_result.regular_results {
+                            let len = execution_result.regular_transactions.len();
+                            match send_results_chunked(
+                                &execution_results_tx,
+                                regular_results,
+                                execution_result.regular_transactions,
+                                execution_result.regular_generation,
+                                MAX_SEND_CHUNK_BYTES,
+                                &metrics,
+                            )
+                            .await
+                            {
+                                SendOutcome::Sent => {}
+                                SendOutcome::ChannelClosed => {
+                                    metrics.executor_results_send_failed("regular");
+                                    error!("Failed to send regular results: channel closed");
+                                    break;
+                                }
+                            }
+                            metrics.executor_results_sent(len);
+                        } else {
+                            metrics.executor_missing_results("regular");
+                            error!("Unexpected error: No result found for regular transactions");
+                            break;
+                        }
+                    }
 
-                // Handle shutdown signal
-                _ = shutdown_token.cancelled() => {
-                    info!("Executor received shutdown signal, executed {} total transactions in {} batches",
-                          total_transactions_executed, total_batches_processed);
+                    total_transactions_executed += num_transactions_executed as u64;
+                    total_batches_processed += 1;
+
+                    if total_batches_processed.is_multiple_of(100) {
+                        info!(
+                            "Executor has processed {} batches, {} total transactions",
+                            total_batches_processed, total_transactions_executed
+                        );
+                    }
+                }
+                None => {
+                    info!("Executor stopped - channel closed, executed {} total transactions in {} batches",
+                                  total_transactions_executed, total_batches_processed);
                     return;
                 }
             }
@@ -239,7 +231,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
 
 pub async fn get_execution_deps(
     accounts_db: AccountsDB,
-    settled_accounts_rx: mpsc::UnboundedReceiver<Vec<(Pubkey, AccountSettlement)>>,
+    settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
     max_svm_workers: usize,
     live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 ) -> ExecutionDeps {
@@ -329,6 +321,153 @@ fn merge_svm_outputs(
     merged
 }
 
+/// Cap on retained account bytes in one message to the settler.
+/// This bounds a message built from several transactions. One transaction is
+/// never divided, so bounding that case is an admission problem, tracked apart.
+pub(crate) const MAX_SEND_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// A chunk must never exceed the settler budget it is measured against.
+const _: () = assert!(MAX_SEND_CHUNK_BYTES <= crate::stages::MAX_BUFFERED_SETTLE_BYTES);
+
+/// Outcome of a settler send. There is no shutdown variant: abandoning a send
+/// would discard a batch that has already executed and already mutated the
+/// in-memory accounts, and the settler is still draining when this stage exits.
+pub(crate) enum SendOutcome {
+    Sent,
+    ChannelClosed,
+}
+
+/// Where to split a batch, as end-exclusive index ranges over its transactions.
+/// A chunk closes just before the transaction that would exceed the cap, so an
+/// oversized one travels alone and no transaction is ever split across messages.
+fn chunk_ranges_by_bytes(
+    results: &[TransactionProcessingResult],
+    transactions: &[SanitizedTransaction],
+    cap: usize,
+) -> Vec<std::ops::Range<usize>> {
+    // A length mismatch is the settler's error to report, so send the batch whole.
+    if results.len() != transactions.len() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut buffered = 0usize;
+    for (index, (result, transaction)) in results.iter().zip(transactions.iter()).enumerate() {
+        let bytes = retained_bytes_of(result, transaction);
+        if index > start && buffered + bytes > cap {
+            ranges.push(start..index);
+            start = index;
+            buffered = 0;
+        }
+        buffered += bytes;
+    }
+    if start < results.len() {
+        ranges.push(start..results.len());
+    }
+    ranges
+}
+
+/// Send one batch to the settler, waiting for room rather than giving up.
+/// A closed queue hands the batch back so the caller can record it.
+async fn send_one(
+    results_tx: &mpsc::Sender<ExecutedBatch>,
+    batch: ExecutedBatch,
+) -> Result<(), ExecutedBatch> {
+    match results_tx.send(batch).await {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendError(batch)) => Err(batch),
+    }
+}
+
+/// Name what the executor could not hand over. The settler closes its queue
+/// when it gives up, so these are executed and uncommitted just like the buffer
+/// it recorded on its own side, and they end here rather than nowhere.
+fn record_unsent(
+    unsent: &[SanitizedTransaction],
+    never_sent: &[SanitizedTransaction],
+    metrics: &SharedMetrics,
+) {
+    let signatures: Vec<solana_sdk::signature::Signature> = unsent
+        .iter()
+        .chain(never_sent.iter())
+        .map(|transaction| *transaction.signature())
+        .collect();
+    crate::stages::record_discarded("executor", "settler queue closed", &signatures, metrics);
+}
+
+/// Send results to the settler in byte-bounded messages.
+/// A batch under the cap is sent untouched, so ordinary traffic only pays the byte
+/// sum. When split, the real generation rides the last chunk and earlier ones get zero.
+async fn send_results_chunked(
+    results_tx: &mpsc::Sender<ExecutedBatch>,
+    output: LoadAndExecuteSanitizedTransactionsOutput,
+    transactions: Vec<SanitizedTransaction>,
+    generation: u64,
+    cap: usize,
+    metrics: &SharedMetrics,
+) -> SendOutcome {
+    let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
+    if ranges.len() <= 1 {
+        return match send_one(results_tx, (output, transactions, generation)).await {
+            Ok(()) => SendOutcome::Sent,
+            Err((_, transactions, _)) => {
+                record_unsent(&transactions, &[], metrics);
+                SendOutcome::ChannelClosed
+            }
+        };
+    }
+
+    metrics.executor_results_chunked(ranges.len());
+
+    let LoadAndExecuteSanitizedTransactionsOutput {
+        mut processing_results,
+        error_metrics,
+        execute_timings,
+        balance_collector,
+    } = output;
+    let mut transactions = transactions;
+    // Batch-wide telemetry has no per-chunk meaning, so it rides the first message.
+    let mut head = Some((error_metrics, execute_timings, balance_collector));
+
+    let last = ranges.len() - 1;
+    let mut sent = 0usize;
+    for (position, range) in ranges.iter().enumerate() {
+        let take = range.end - range.start;
+        let (error_metrics, execute_timings, balance_collector) =
+            head.take().unwrap_or_else(|| {
+                (
+                    TransactionErrorMetrics::default(),
+                    ExecuteTimings::default(),
+                    None,
+                )
+            });
+        let chunk = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: processing_results.drain(..take).collect(),
+            error_metrics,
+            execute_timings,
+            balance_collector,
+        };
+        let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
+        // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
+        let chunk_generation = if position == last { generation } else { 0 };
+        match send_one(results_tx, (chunk, chunk_transactions, chunk_generation)).await {
+            Ok(()) => sent += take,
+            Err((_, chunk_transactions, _)) => {
+                // Report what actually landed; the caller only counts a whole batch.
+                if sent > 0 {
+                    metrics.executor_results_sent(sent);
+                }
+                // The chunks still undrained never left either, so they belong
+                // in the same record as the one that just failed.
+                record_unsent(&chunk_transactions, &transactions, metrics);
+                return SendOutcome::ChannelClosed;
+            }
+        }
+    }
+
+    SendOutcome::Sent
+}
+
 /// Execute regular transactions across multiple worker threads.
 ///
 /// Correctness:Within a `ConflictFreeBatch`, transactions have disjoint
@@ -400,24 +539,26 @@ fn execute_parallel(
     merge_svm_outputs(chunk_outputs)
 }
 
-/// Cap each writable account's post-execution lamports so fabricated SOL never
-/// persists: a data account keeps at most its 1-lamport existence floor (0
-/// deallocates in the SVM, so the floor is 1, not 0); a dataless account keeps 0.
-/// The cap only ever reduces.
+/// The lamports the gasless callback makes up for an unknown fee payer are the
+/// only money here that nobody deposited. Treat them as a loan the transaction
+/// has to pay back, less one lamport for each account it creates.
 ///
-/// Enumeration-free — any leak (direct `Transfer`, park-then-`CloseAccount`,
-/// `RecoverNested`, swap close, any future program) ends with lamports rising
-/// above a floor, which the cap removes regardless of how. Legit flows are
-/// untouched: transfers don't move lamports; new mints/ATAs are floored at 1 so
-/// they persist; the dataless synthetic fee payer caps to 0 so it's deleted.
+/// The SVM already makes every instruction balance, so once this one source is
+/// blocked, every other balance is made of money that was already here and does
+/// not need checking. A loan that is not paid back fails the transaction rather
+/// than editing accounts, because editing accounts is what corrupts bystanders.
 ///
-/// Assumes no durable native lamports beyond existence floors (deposits mint
-/// tokens; no wrapped SOL) — revisit if native SOL is added. Regular path only
-/// (admin never fabricates fee payers).
-fn cap_lamports(
+/// Regular path only: admin execution never makes up fee payers.
+fn enforce_lamport_conservation(
     output: &mut LoadAndExecuteSanitizedTransactionsOutput,
     transactions: &[SanitizedTransaction],
+    bob: &BOB,
+    fee_payers: &HashSet<Pubkey>,
+    metrics: &SharedMetrics,
 ) {
+    // Reused across transactions so the whole batch allocates at most once.
+    let mut fabricated: Vec<usize> = Vec::new();
+
     for (result, tx) in output
         .processing_results
         .iter_mut()
@@ -426,19 +567,77 @@ fn cap_lamports(
         let Ok(ProcessedTransaction::Executed(executed)) = result else {
             continue;
         };
-        for (index, (_, acct)) in executed.loaded_transaction.accounts.iter_mut().enumerate() {
-            // Only writable accounts are persisted by the settler / BOB update.
+        if !executed.was_successful() {
+            // Failed executed txs commit no account writes downstream.
+            continue;
+        }
+
+        fabricated.clear();
+        // How much of the made-up money is gone, how many new accounts exist to
+        // explain it, and whether any older account ended up richer.
+        let mut shortfall = 0u64;
+        let mut created = 0u64;
+        let mut credited = false;
+        for (index, (pubkey, acct)) in executed.loaded_transaction.accounts.iter().enumerate() {
+            // Read-only accounts are never saved, so never touch or count them.
             if !tx.is_writable(index) {
                 continue;
             }
-            let cap = if acct.data().is_empty() { 0 } else { 1 };
-            if acct.lamports() > cap {
-                acct.set_lamports(cap);
+            if let Some(before) = bob.account_lamports(pubkey) {
+                // This account already existed, so its balance is real money we
+                // must never rewrite. Just note whether it grew.
+                credited |= acct.lamports() > before;
+            } else if fee_payers.contains(pubkey) {
+                // A made-up payer, so anything it no longer holds has escaped.
+                // The set covers the whole batch, so moving money from one
+                // made-up payer to another still counts as escaped.
+                fabricated.push(index);
+                shortfall += DEFAULT_FEE_PAYER_LAMPORTS.saturating_sub(acct.lamports());
+            } else if acct.lamports() > 0 {
+                // BOB never saw it, but it has money, so this tx just made it.
+                created += 1;
             }
+        }
+
+        // Comparing money to a count works because the rate is one each: the SVM
+        // deletes an account holding nothing, and with no rent every way of
+        // making an account gives it exactly one lamport.
+        //
+        // Counting new accounts does not prove the made-up money paid for them,
+        // so a new account paid for with real money could excuse a made-up
+        // lamport that went elsewhere. Hence no older account may grow while any
+        // made-up money is missing.
+        if shortfall > created || (shortfall > 0 && credited) {
+            // Nothing legitimate trips this, so every hit is worth an alert.
+            warn!(
+                sig = %tx.signature(),
+                shortfall,
+                created,
+                credited,
+                "execution: failing tx that does not account for its fabricated fee-payer lamports"
+            );
+            metrics.executor_conservation_rejected();
+            // Fail the tx instead of taking the money back, which would mean
+            // rewriting accounts it owns. Later stages skip failed txs.
+            executed.execution_details.status = Err(TransactionError::UnbalancedTransaction);
+            continue;
+        }
+        // Nothing is missing, so wipe the made-up payers. BOB and the settler
+        // already read an empty account with no money as deleted, so wiping is
+        // how they disappear. Nothing else is touched.
+        //
+        // Always wipe, which burns any real money sent to the payer. Keeping it
+        // would turn an address we made up into a real one, paying the sender
+        // back would rewrite an innocent account, and failing the tx would break
+        // CancelDvp, which sends the closed escrows' leftover money here.
+        for index in &fabricated {
+            executed.loaded_transaction.accounts[*index].1 = AccountSharedData::default();
         }
     }
 }
 
+/// Returns `Err` when the accounts this batch needs could not be loaded. The
+/// abort happens before any SVM run or BOB write, so nothing has changed yet.
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
@@ -532,10 +731,8 @@ pub async fn execute_batch(
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
     let t_op = Instant::now();
-    // Both fatal cases abort the batch without settling, so nothing is recorded
-    // and the txs stay resubmittable. A transient outage would otherwise record
-    // default state over a live account; a corrupt account is an integrity fault
-    // that must not be executed against.
+    // Executing against accounts BOB could not load would settle state derived
+    // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
     let (preload_fetched, preload_cached) = match execution_deps
         .bob
         .preload_accounts(&accounts_to_preload)
@@ -543,16 +740,11 @@ pub async fn execute_batch(
     {
         Ok(counts) => counts,
         Err(e) => {
-            match &e {
-                AccountLoadError::Corrupt(pubkey) => {
-                    metrics.executor_corrupt_account();
-                    error!("aborting batch: account {} is corrupt in the store", pubkey);
-                }
-                AccountLoadError::Backend(msg) => {
-                    metrics.executor_preload_fatal();
-                    error!("aborting batch: account load failed after retries: {}", msg);
-                }
+            if let AccountLoadError::Corrupt(_) = e {
+                metrics.executor_corrupt_account();
             }
+            metrics.executor_preload_fatal();
+            error!("execution: aborting batch, account preload failed: {}", e);
             return Err(e);
         }
     };
@@ -565,6 +757,15 @@ pub async fn execute_batch(
         t_preload
     );
     metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
+
+    // Report BOB cache size and drain the eviction delta right after preload,
+    // when the cache reflects this batch's working set.
+    let cache_stats = execution_deps.bob.cache_stats();
+    metrics.bob_cache_entries(cache_stats.entries);
+    metrics.bob_cache_dirty_entries(cache_stats.dirty_entries);
+    metrics.bob_cache_bytes(cache_stats.bytes);
+    metrics.bob_cache_evicted(cache_stats.evicted);
+    metrics.bob_settlement_divergences(cache_stats.settlement_divergences);
 
     // Refresh the SVM's cached Clock sysvar from wall time. Contra has no
     // real Clock source (see `crate::vm::clock`); without this, programs
@@ -604,6 +805,12 @@ pub async fn execute_batch(
     let mut t_svm_reg = Duration::ZERO;
     let mut t_bob_reg = Duration::ZERO;
 
+    // Generations stamped by each path's BOB update. They stay 0 when that path
+    // is skipped, which the settler's max() fold and BOB's high-water comparison
+    // both treat as "acknowledges nothing".
+    let mut admin_generation = 0u64;
+    let mut regular_generation = 0u64;
+
     // Settle admin transactions immediately so regular transactions see the updates
     let admin_results = if !admin_transactions.is_empty() {
         let t_op = Instant::now();
@@ -625,7 +832,7 @@ pub async fn execute_batch(
 
         // Update BOB's in-memory accounts with the execution results
         let t_op = Instant::now();
-        execution_deps
+        admin_generation = execution_deps
             .bob
             .update_accounts(&admin_results, &admin_transactions);
         t_bob_admin = t_op.elapsed();
@@ -661,8 +868,11 @@ pub async fn execute_batch(
             // `accounts_to_preload` covers admin+regular keys; harmless
             // over-inclusion — admin keys in the snapshot just add a few
             // HashMap entries that regular-tx workers will never look up.
-            let snapshot =
-                SnapshotCallback::from_bob(&execution_deps.bob, &accounts_to_preload, fee_payers);
+            let snapshot = SnapshotCallback::from_bob(
+                &execution_deps.bob,
+                &accounts_to_preload,
+                fee_payers.clone(),
+            );
             // `execute_parallel` uses `std::thread::scope`, which parks this
             // OS thread until the worker threads join. Because we're on a
             // tokio worker, `block_in_place` lets tokio migrate other queued
@@ -677,7 +887,7 @@ pub async fn execute_batch(
             })
         } else {
             // Sequential path: direct BOB access, no snapshot cost.
-            let gasless_callback = GaslessCallback::new(&execution_deps.bob, fee_payers);
+            let gasless_callback = GaslessCallback::new(&execution_deps.bob, fee_payers.clone());
             execution_deps.vm.load_and_execute_sanitized_transactions(
                 &gasless_callback,
                 regular_transactions.as_slice(),
@@ -700,14 +910,20 @@ pub async fn execute_batch(
         );
         metrics.executor_svm_duration_ms("regular", t_svm_reg.as_secs_f64() * 1000.0);
 
-        // Cap writable lamports before either consumer reads the shared output:
-        // the in-memory BOB update below and the durable settler downstream. One
-        // mutation covers both consumers and both exec paths.
-        cap_lamports(&mut regular_results, &regular_transactions);
+        // Run the conservation check before either consumer reads the shared
+        // output: the in-memory BOB update below and the durable settler
+        // downstream. One pass covers both consumers and both exec paths.
+        enforce_lamport_conservation(
+            &mut regular_results,
+            &regular_transactions,
+            &execution_deps.bob,
+            &fee_payers,
+            metrics,
+        );
 
         // Update BOB's in-memory accounts with the execution results
         let t_op = Instant::now();
-        execution_deps
+        regular_generation = execution_deps
             .bob
             .update_accounts(&regular_results, &regular_transactions);
         t_bob_reg = t_op.elapsed();
@@ -741,6 +957,8 @@ pub async fn execute_batch(
         regular_transactions,
         admin_results,
         regular_results,
+        admin_generation,
+        regular_generation,
     })
 }
 
@@ -748,7 +966,8 @@ pub async fn execute_batch(
 mod tests {
     use super::*;
     use crate::{
-        accounts::bob::BOB, stage_metrics::NoopMetrics, test_helpers::start_test_postgres,
+        accounts::bob::BOB, stage_metrics::NoopMetrics, stages::retained_account_bytes,
+        test_helpers::start_test_postgres,
     };
     use solana_sdk::account::AccountSharedData;
     use solana_sdk::{
@@ -758,7 +977,6 @@ mod tests {
         signature::{Keypair, Signer},
         transaction::Transaction,
     };
-    use solana_svm::transaction_processing_result::TransactionProcessingResult;
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
     use solana_svm_callback::TransactionProcessingCallback;
     use std::collections::{HashSet, LinkedList};
@@ -845,7 +1063,7 @@ mod tests {
             .collect();
         execute_batch(ConflictFreeBatch { transactions }, deps, metrics)
             .await
-            .expect("execute_batch should not fail in this test")
+            .expect("test batch must load its accounts")
     }
 
     fn regular_result(
@@ -865,16 +1083,18 @@ mod tests {
         matches!(r, Ok(ProcessedTransaction::Executed(_)))
     }
 
-    // ── cap_lamports unit tests (cap math, tested directly) ──
+    // ── enforce_lamport_conservation unit tests (pure, no SVM) ──
     //
-    // cap_lamports is pure over (output, transactions). We build a 1-tx output
-    // whose loaded accounts we control, pair it with a tx whose writability we
-    // know (`transfer` → idx 0,1 writable, idx 2 system_program read-only),
-    // run the cap, and read the accounts back.
+    // The check is pure over (output, transactions, bob, fee_payers). We seed
+    // BOB with what existed before the transaction, hand the check a loaded
+    // account vector we control paired with a transaction whose writability we
+    // choose, and read the status and the accounts back.
 
-    /// Build a single-tx Executed output carrying `accounts` at the loaded
-    /// transaction's account positions.
-    fn executed_with(accounts: Vec<(Pubkey, AccountSharedData)>) -> TransactionProcessingResult {
+    /// Build a single-tx Executed output carrying `accounts` with the given `status`.
+    fn executed_with_status(
+        status: Result<(), solana_transaction_error::TransactionError>,
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+    ) -> TransactionProcessingResult {
         use solana_svm::account_loader::LoadedTransaction;
         use solana_svm::transaction_execution_result::{
             ExecutedTransaction, TransactionExecutionDetails,
@@ -886,7 +1106,7 @@ mod tests {
                     ..Default::default()
                 },
                 execution_details: TransactionExecutionDetails {
-                    status: Ok(()),
+                    status,
                     log_messages: None,
                     inner_instructions: None,
                     return_data: None,
@@ -896,6 +1116,195 @@ mod tests {
                 programs_modified_by_tx: std::collections::HashMap::new(),
             },
         )))
+    }
+
+    /// A successful single-tx Executed output carrying `accounts`.
+    fn executed_with(accounts: Vec<(Pubkey, AccountSharedData)>) -> TransactionProcessingResult {
+        executed_with_status(Ok(()), accounts)
+    }
+
+    /// One transfer per requested size, carrying those bytes on its writable slot.
+    fn sized_batch(
+        sizes: &[usize],
+    ) -> (Vec<TransactionProcessingResult>, Vec<SanitizedTransaction>) {
+        let mut results = Vec::new();
+        let mut txs = Vec::new();
+        for size in sizes {
+            let from = Keypair::new();
+            let to = Pubkey::new_unique();
+            txs.push(transfer(&from, &to, 100));
+            results.push(executed_with(vec![
+                (
+                    from.pubkey(),
+                    AccountSharedData::new(1, *size, &Pubkey::default()),
+                ),
+                (to, AccountSharedData::new(1, 0, &Pubkey::default())),
+            ]));
+        }
+        (results, txs)
+    }
+
+    /// Wrap processing results in the SVM output shape the send helper consumes.
+    fn output_of(
+        processing_results: Vec<TransactionProcessingResult>,
+    ) -> LoadAndExecuteSanitizedTransactionsOutput {
+        LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results,
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+        }
+    }
+
+    /// A chunk over the cap is no bound at all, and dropping or reordering a
+    /// transaction corrupts the block's signature list. Both are asserted on every
+    /// row, since an unsplit batch can regress just as easily as a split one.
+    #[test]
+    fn chunk_ranges_by_bytes_respects_cap_and_preserves_order() {
+        let cap = 1000usize;
+        let cases: Vec<(&str, Vec<usize>, usize)> = vec![
+            ("all small stays unsplit", vec![10, 10, 10, 10], 1),
+            ("exact fit stays unsplit", vec![500, 500], 1),
+            ("one byte over splits", vec![500, 501], 2),
+            ("single oversized tx sits alone", vec![5000], 1),
+            ("oversized in the middle isolates", vec![10, 5000, 10], 3),
+            ("empty yields no chunks", vec![], 0),
+        ];
+
+        for (name, sizes, expected_chunks) in cases {
+            let (results, txs) = sized_batch(&sizes);
+            let ranges = chunk_ranges_by_bytes(&results, &txs, cap);
+            assert_eq!(ranges.len(), expected_chunks, "chunk count for {}", name);
+
+            let mut next = 0usize;
+            for r in &ranges {
+                assert_eq!(r.start, next, "gap or overlap in {}", name);
+                assert!(r.end > r.start, "empty chunk in {}", name);
+                next = r.end;
+            }
+            assert_eq!(next, sizes.len(), "chunks must cover every tx in {}", name);
+
+            for r in &ranges {
+                if r.end - r.start > 1 {
+                    let bytes = retained_account_bytes(&results[r.clone()], &txs[r.clone()]);
+                    assert!(bytes <= cap, "chunk over cap in {}: {}", name, bytes);
+                }
+            }
+        }
+    }
+
+    /// The one assertion standing between the split and a data-loss bug. If a
+    /// non-final chunk carried the real generation, BOB would treat undrained writes
+    /// as durable and drop them, so only the last chunk may advance the watermark.
+    #[tokio::test]
+    async fn chunked_send_stamps_generation_on_final_chunk_only() {
+        let cap = 1000usize;
+        let _shutdown = CancellationToken::new();
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        // Each transaction alone exceeds the cap, so this splits into three.
+        let (results, txs) = sized_batch(&[5000, 5000, 5000]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 42, cap, &metrics).await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+
+        let mut gens = Vec::new();
+        while let Ok((_, _, g)) = rx.try_recv() {
+            gens.push(g);
+        }
+        assert_eq!(
+            gens,
+            vec![0, 0, 42],
+            "only the final chunk may carry the generation"
+        );
+
+        // Under the cap the batch goes as one message, still stamped.
+        let (results, txs) = sized_batch(&[10, 10]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 7, cap, &metrics).await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+
+        let mut gens = Vec::new();
+        while let Ok((_, _, g)) = rx.try_recv() {
+            gens.push(g);
+        }
+        assert_eq!(gens, vec![7], "an unsplit batch stays one message");
+    }
+
+    use crate::stage_metrics::PrometheusMetrics;
+
+    /// The Prometheus registry is process-global, so counter deltas are read
+    /// one test at a time.
+    static DISCARD_METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn discarded_total() -> f64 {
+        private_channel_metrics::prometheus::gather()
+            .into_iter()
+            .filter(|mf| mf.name() == "private_channel_discarded_executed_transactions_total")
+            .flat_map(|mf| mf.get_metric().to_vec())
+            .map(|m| m.get_counter().value())
+            .sum()
+    }
+
+    /// The settler closes its queue when it gives up, so the batch the executor
+    /// was holding comes back to it. Dropping that silently moves the audit gap
+    /// one stage upstream instead of closing it.
+    #[tokio::test]
+    async fn a_closed_settler_channel_records_the_unsent_batch() {
+        let _guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = discarded_total();
+
+        let (results, txs) = sized_batch(&[10, 10, 10]);
+        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(4);
+        drop(rx);
+
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            1,
+            MAX_SEND_CHUNK_BYTES,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::ChannelClosed));
+        assert_eq!(
+            discarded_total() - before,
+            3.0,
+            "every executed transaction the executor still held must be recorded"
+        );
+    }
+
+    /// A split batch fails partway. The chunks that never went are just as
+    /// executed and just as uncommitted as the one whose send failed.
+    #[tokio::test]
+    async fn a_closed_channel_mid_chunk_records_the_remainder() {
+        let _guard = DISCARD_METRIC_LOCK.lock().await;
+        let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
+        let before = discarded_total();
+
+        // One transaction per chunk, and room for only the first.
+        let (results, txs) = sized_batch(&[5000, 5000, 5000]);
+        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(1);
+        // The receiver never drains, so the second chunk parks. Closing it then
+        // is what the settler does when it gives up mid-handover.
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(rx);
+        });
+        let outcome =
+            send_results_chunked(&chan_tx, output_of(results), txs, 9, 1000, &metrics).await;
+
+        assert!(matches!(outcome, SendOutcome::ChannelClosed));
+        assert_eq!(
+            discarded_total() - before,
+            2.0,
+            "the failed chunk and the undrained remainder must both be recorded"
+        );
+        let _ = closer.await;
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.
@@ -908,108 +1317,521 @@ mod tests {
         AccountSharedData::new(lamports, 0, &solana_sdk_ids::system_program::ID)
     }
 
-    /// Run cap_lamports over one tx whose writable indices are 0 and 1.
-    /// Returns the post-cap accounts.
-    fn run_cap_one_tx(accounts: Vec<(Pubkey, AccountSharedData)>) -> Vec<AccountSharedData> {
-        // `transfer` yields exactly: [from(0,w), to(1,w), system_program(2,ro)].
-        let tx = transfer(&Keypair::new(), &Pubkey::new_unique(), 0);
+    /// A DvP-nonce-tombstone-shaped account: program-owned, no data, sitting on
+    /// the 1-lamport existence floor the SVM requires of a live account.
+    fn tombstone_account() -> AccountSharedData {
+        AccountSharedData::new(1, 0, &Pubkey::new_unique())
+    }
+
+    /// The float the gasless callback fabricates for an unknown fee payer.
+    const FLOAT: u64 = DEFAULT_FEE_PAYER_LAMPORTS;
+
+    /// Build a transaction over exactly `keys`, the first `writable` of them
+    /// writable, plus a trailing read-only program id. Signatures are dummies:
+    /// sanitization counts them, nothing here verifies them.
+    fn tx_over(keys: &[Pubkey], writable: usize) -> SanitizedTransaction {
+        use solana_sdk::{
+            instruction::CompiledInstruction, message::MessageHeader, signature::Signature,
+        };
+        let mut account_keys = keys.to_vec();
+        account_keys.push(solana_sdk_ids::system_program::ID);
+        let message = Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: (keys.len() - writable + 1) as u8,
+            },
+            account_keys,
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: keys.len() as u8,
+                accounts: vec![],
+                data: vec![],
+            }],
+        };
+        let tx = Transaction {
+            signatures: vec![Signature::default()],
+            message,
+        };
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to build controlled-writability tx")
+    }
+
+    struct Outcome {
+        status: Result<(), solana_transaction_error::TransactionError>,
+        accounts: Vec<AccountSharedData>,
+    }
+
+    impl Outcome {
+        fn rejected(&self) -> bool {
+            self.status == Err(solana_transaction_error::TransactionError::UnbalancedTransaction)
+        }
+    }
+
+    /// Seed `pre` into BOB, run the check over one successful transaction whose
+    /// loaded accounts are `accounts` (the first `writable` writable), and
+    /// return the resulting status and accounts.
+    fn run_conservation_with(
+        pre: &[(Pubkey, AccountSharedData)],
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+        writable: usize,
+        fee_payers: &[Pubkey],
+    ) -> Outcome {
+        let (mut bob, _settled_tx) = crate::test_helpers::create_test_bob();
+        for (pubkey, account) in pre {
+            bob.insert_account_for_test(*pubkey, account.clone());
+        }
+        let keys: Vec<Pubkey> = accounts.iter().map(|(pubkey, _)| *pubkey).collect();
+        let tx = tx_over(&keys, writable);
         let mut output = LoadAndExecuteSanitizedTransactionsOutput {
             processing_results: vec![executed_with(accounts)],
             error_metrics: TransactionErrorMetrics::default(),
             execute_timings: ExecuteTimings::default(),
             balance_collector: None,
         };
-        cap_lamports(&mut output, std::slice::from_ref(&tx));
+        enforce_lamport_conservation(
+            &mut output,
+            std::slice::from_ref(&tx),
+            &bob,
+            &fee_payers.iter().copied().collect(),
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        );
         let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
             panic!("expected executed");
         };
-        executed
-            .loaded_transaction
-            .accounts
-            .iter()
-            .map(|(_, a)| a.clone())
-            .collect()
+        Outcome {
+            status: executed.execution_details.status.clone(),
+            accounts: executed
+                .loaded_transaction
+                .accounts
+                .iter()
+                .map(|(_, account)| account.clone())
+                .collect(),
+        }
     }
 
-    /// Data account with excess lamports is floored to its 1-lamport existence
-    /// floor — parking fabricated lamports in a token account is neutralized.
-    #[test]
-    fn cap_data_account_excess_to_one() {
-        let out = run_cap_one_tx(vec![(Pubkey::new_unique(), data_account(11))]);
-        assert_eq!(out[0].lamports(), 1);
+    /// `run_conservation_with` with every loaded account writable.
+    fn run_conservation(
+        pre: &[(Pubkey, AccountSharedData)],
+        accounts: Vec<(Pubkey, AccountSharedData)>,
+        fee_payers: &[Pubkey],
+    ) -> Outcome {
+        let writable = accounts.len();
+        run_conservation_with(pre, accounts, writable, fee_payers)
     }
 
-    /// Data account already at the 1-lamport floor is untouched (ATA/mint floor
-    /// preserved — legit accounts persist).
-    #[test]
-    fn cap_data_account_one_is_noop() {
-        let out = run_cap_one_tx(vec![(Pubkey::new_unique(), data_account(1))]);
-        assert_eq!(out[0].lamports(), 1);
-    }
-
-    /// Data account being closed (0 lamports) stays at 0 — the cap only ever
-    /// reduces, never raises to the floor.
-    #[test]
-    fn cap_data_account_zero_stays_zero() {
-        let out = run_cap_one_tx(vec![(Pubkey::new_unique(), data_account(0))]);
-        assert_eq!(out[0].lamports(), 0);
-    }
-
-    /// Dataless account with excess lamports is zeroed — covers the direct
-    /// exploit recipient, a RecoverNested destination wallet, a swap close
-    /// destination: any dataless gainer.
-    #[test]
-    fn cap_dataless_account_excess_to_zero() {
-        let out = run_cap_one_tx(vec![(Pubkey::new_unique(), dataless_account(10))]);
-        assert_eq!(out[0].lamports(), 0);
-    }
-
-    /// Dataless account already at 0 is untouched.
-    #[test]
-    fn cap_dataless_account_zero_is_noop() {
-        let out = run_cap_one_tx(vec![(Pubkey::new_unique(), dataless_account(0))]);
-        assert_eq!(out[0].lamports(), 0);
-    }
-
-    /// Mixed surgical cap: in one result a data account (11 lamports) floors to
-    /// 1 while a dataless account (10 lamports) zeroes — per-account, not global.
-    #[test]
-    fn cap_mixed_per_account() {
-        let out = run_cap_one_tx(vec![
-            (Pubkey::new_unique(), data_account(11)),
-            (Pubkey::new_unique(), dataless_account(10)),
-        ]);
-        assert_eq!(out[0].lamports(), 1, "data account floored to 1");
-        assert!(!out[0].data().is_empty(), "data preserved");
-        assert_eq!(out[1].lamports(), 0, "dataless account zeroed");
-    }
-
-    /// Read-only accounts are not capped: only writable accounts are persisted,
-    /// so capping a read-only account would be pointless work (and could clobber
-    /// a shared input the settler never writes). idx 2 is the read-only
-    /// system_program slot in a `transfer`.
-    #[test]
-    fn cap_skips_readonly_account() {
-        let out = run_cap_one_tx(vec![
-            (Pubkey::new_unique(), dataless_account(0)), // idx 0, writable
-            (Pubkey::new_unique(), dataless_account(0)), // idx 1, writable
-            (Pubkey::new_unique(), dataless_account(99)), // idx 2, read-only
-        ]);
+    /// A repaid loan erases the fabricated payer and leaves everything else
+    /// exactly as the SVM produced it.
+    #[tokio::test]
+    async fn loan_repaid_erases_payer_and_touches_nothing_else() {
+        let payer = Pubkey::new_unique();
+        let existing = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(existing, data_account(5000))],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (existing, data_account(5000)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
         assert_eq!(
-            out[2].lamports(),
-            99,
-            "read-only account must not be capped"
+            out.accounts[0],
+            AccountSharedData::default(),
+            "fabricated payer must be erased"
+        );
+        assert_eq!(
+            out.accounts[1],
+            data_account(5000),
+            "a pre-existing account must be byte-identical after the check"
         );
     }
 
-    // ── execute_batch behavioral tests (system transfers, through the SVM) ──
+    /// A payer that spent its float with nothing to show for it never repaid
+    /// the loan, so the transaction is rejected and no account is rewritten.
+    #[tokio::test]
+    async fn unrepaid_loan_rejects_transaction() {
+        let payer = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let out = run_conservation(
+            &[],
+            vec![
+                (payer, dataless_account(0)),
+                (recipient, dataless_account(FLOAT)),
+            ],
+            &[payer],
+        );
+        assert!(out.rejected(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[0], dataless_account(0), "payer untouched");
+        assert_eq!(
+            out.accounts[1],
+            dataless_account(FLOAT),
+            "a rejected transaction must not trim the account that gained"
+        );
+    }
 
-    /// Direct exploit, behavioral shift from the old reject model: a fresh `A`
-    /// transfers its fabricated 10 lamports to `R`. Under the cap the tx is NOT
-    /// rejected — it executes — but R (a dataless gainer) is capped to 0 and
-    /// nothing durable is created. A is dataless → capped to 0 → absent.
+    /// Each account the transaction creates consumes one lamport of the float,
+    /// because the SVM requires a live account to hold at least one.
+    #[tokio::test]
+    async fn creation_allowance_permits_one_lamport_per_new_account() {
+        let payer = Pubkey::new_unique();
+        let first = Pubkey::new_unique();
+        let second = Pubkey::new_unique();
+        let out = run_conservation(
+            &[],
+            vec![
+                (payer, dataless_account(FLOAT - 2)),
+                (first, data_account(1)),
+                (second, data_account(1)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[0], AccountSharedData::default());
+        assert_eq!(out.accounts[1], data_account(1), "created account persists");
+        assert_eq!(out.accounts[2], data_account(1), "created account persists");
+    }
+
+    /// The allowance is exact: one created account does not cover a shortfall of two.
+    #[tokio::test]
+    async fn creation_allowance_is_exact() {
+        let payer = Pubkey::new_unique();
+        let created = Pubkey::new_unique();
+        let out = run_conservation(
+            &[],
+            vec![
+                (payer, dataless_account(FLOAT - 2)),
+                (created, data_account(1)),
+            ],
+            &[payer],
+        );
+        assert!(out.rejected(), "status was {:?}", out.status);
+    }
+
+    /// A pre-existing account credited by another pre-existing account keeps
+    /// the credit. This is the property whose absence drains a wSOL escrow.
+    #[tokio::test]
+    async fn pre_existing_account_that_gains_is_untouched() {
+        let payer = Pubkey::new_unique();
+        let source = Pubkey::new_unique();
+        let target = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(source, data_account(5000)), (target, data_account(5000))],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (source, data_account(4000)),
+                (target, data_account(6000)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(
+            out.accounts[1],
+            data_account(4000),
+            "the debited side keeps its balance"
+        );
+        assert_eq!(
+            out.accounts[2],
+            data_account(6000),
+            "the credited side keeps the credit"
+        );
+    }
+
+    /// Counting creations does not prove the float paid for them. Here a new
+    /// account is funded by real money while one float lamport lands in an
+    /// account that already existed, so the count would licence a fabricated
+    /// lamport becoming durable. The credit clause rejects it instead.
+    #[tokio::test]
+    async fn credited_pre_existing_account_rejects_when_float_is_missing() {
+        let payer = Pubkey::new_unique();
+        let funder = Pubkey::new_unique();
+        let escrow = Pubkey::new_unique();
+        let fresh = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(funder, dataless_account(2)), (escrow, data_account(5000))],
+            vec![
+                // One lamport of the float is gone.
+                (payer, dataless_account(FLOAT - 1)),
+                // A real account paid for the new one, not the payer.
+                (funder, dataless_account(1)),
+                (fresh, data_account(1)),
+                // The float lamport ended up here, in durable state.
+                (escrow, data_account(5001)),
+            ],
+            &[payer],
+        );
+        assert!(
+            out.rejected(),
+            "a credited pre-existing account must not be licenced by an unrelated creation, status was {:?}",
+            out.status
+        );
+        assert_eq!(
+            out.accounts[3],
+            data_account(5001),
+            "a rejected transaction must still not rewrite the account that gained"
+        );
+    }
+
+    /// The credit clause is conditional, not blanket: with the float intact,
+    /// pre-existing accounts may move real lamports between themselves. A
+    /// creation funded entirely by real money is still allowed to persist.
+    #[tokio::test]
+    async fn credited_pre_existing_account_is_fine_when_float_is_intact() {
+        let payer = Pubkey::new_unique();
+        let funder = Pubkey::new_unique();
+        let escrow = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(funder, dataless_account(5000)), (escrow, data_account(10))],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (funder, dataless_account(4000)),
+                (escrow, data_account(1010)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[2], data_account(1010), "the credit stands");
+    }
+
+    /// Routing the float through an account that ends where it started, so it
+    /// pays a new account's floor for it, is accepted. This is the allowance
+    /// doing its job, not a way around it: the relay ends no richer, and total
+    /// lamports still rise by exactly one per account created. Rejecting it
+    /// would also reject an ordinary creation, which spends the float the same
+    /// way in one hop instead of two.
+    #[tokio::test]
+    async fn float_relayed_through_a_flat_account_stays_within_the_allowance() {
+        let payer = Pubkey::new_unique();
+        let relay = Pubkey::new_unique();
+        let fresh = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(relay, data_account(5000))],
+            vec![
+                // One lamport of the float is gone.
+                (payer, dataless_account(FLOAT - 1)),
+                // It passed through here and left again, so this ends flat.
+                (relay, data_account(5000)),
+                // And it came to rest as the new account's existence floor.
+                (fresh, data_account(1)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(
+            out.accounts[1],
+            data_account(5000),
+            "the relay must end exactly where it started, so it gained nothing"
+        );
+        assert_eq!(
+            out.accounts[2],
+            data_account(1),
+            "the new account keeps the single lamport the allowance covers"
+        );
+    }
+
+    /// An ordinary wallet (lamports, no data) is neither zeroed nor deleted.
+    /// Force-deleting it was the documented divergence from Agave.
+    #[tokio::test]
+    async fn pre_existing_dataless_account_keeps_lamports() {
+        let payer = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(wallet, dataless_account(7))],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (wallet, dataless_account(7)),
+            ],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[1], dataless_account(7));
+    }
+
+    /// A program-owned dataless account the transaction created (the DvP nonce
+    /// tombstone) survives, and its existence floor is covered by the allowance.
+    #[tokio::test]
+    async fn created_program_owned_dataless_account_survives() {
+        let payer = Pubkey::new_unique();
+        let tombstone = Pubkey::new_unique();
+        let created = tombstone_account();
+        let out = run_conservation(
+            &[],
+            vec![
+                (payer, dataless_account(FLOAT - 1)),
+                (tombstone, created.clone()),
+            ],
+            &[payer],
+        );
+        assert!(
+            out.status.is_ok(),
+            "the tombstone's lamport is covered by the creation allowance, got {:?}",
+            out.status
+        );
+        assert_eq!(
+            out.accounts[1], created,
+            "the nonce tombstone must survive the batch that creates it"
+        );
+    }
+
+    /// Read-only accounts are never inspected: they are not persisted, and
+    /// erasing one would clobber a shared input. The read-only slot here is
+    /// also a batch fee payer, so an inspection would visibly erase it.
+    #[tokio::test]
+    async fn readonly_accounts_are_never_inspected() {
+        let payer = Pubkey::new_unique();
+        let writable = Pubkey::new_unique();
+        let readonly_payer = Pubkey::new_unique();
+        let out = run_conservation_with(
+            &[],
+            vec![
+                (payer, dataless_account(FLOAT)),
+                (writable, dataless_account(0)),
+                (readonly_payer, dataless_account(99)),
+            ],
+            2,
+            &[payer, readonly_payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(
+            out.accounts[2],
+            dataless_account(99),
+            "a read-only account must not be inspected or rewritten"
+        );
+    }
+
+    /// A failed executed tx commits no account writes downstream, so the check
+    /// leaves both its accounts and its status alone.
+    #[tokio::test]
+    async fn failed_executed_transaction_is_skipped() {
+        let payer = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let original = Err(
+            solana_transaction_error::TransactionError::InstructionError(
+                1,
+                solana_sdk::instruction::InstructionError::Custom(0),
+            ),
+        );
+        let tx = tx_over(&[payer, other], 2);
+        let mut output = LoadAndExecuteSanitizedTransactionsOutput {
+            processing_results: vec![executed_with_status(
+                original.clone(),
+                vec![(payer, dataless_account(0)), (other, data_account(11))],
+            )],
+            error_metrics: TransactionErrorMetrics::default(),
+            execute_timings: ExecuteTimings::default(),
+            balance_collector: None,
+        };
+        let (bob, _settled_tx) = crate::test_helpers::create_test_bob();
+        enforce_lamport_conservation(
+            &mut output,
+            std::slice::from_ref(&tx),
+            &bob,
+            &HashSet::from([payer]),
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+        );
+        let Ok(ProcessedTransaction::Executed(executed)) = &output.processing_results[0] else {
+            panic!("expected executed");
+        };
+        assert_eq!(
+            executed.execution_details.status, original,
+            "a failed executed tx must not be re-judged"
+        );
+        let accounts = &executed.loaded_transaction.accounts;
+        assert_eq!(accounts[0].1, dataless_account(0), "payer untouched");
+        assert_eq!(accounts[1].1, data_account(11), "account untouched");
+    }
+
+    /// A fee payer BOB already knows is real money, not a fabrication: no loan
+    /// is charged against it and it is not erased.
+    #[tokio::test]
+    async fn real_fee_payer_is_not_treated_as_fabricated() {
+        let payer = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(payer, dataless_account(5000))],
+            vec![(payer, dataless_account(5000))],
+            &[payer],
+        );
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[0], dataless_account(5000));
+    }
+
+    /// A fabricated payer that allocated data still does not persist: the
+    /// address never existed, so no part of it may become durable state.
+    #[tokio::test]
+    async fn fabricated_payer_with_data_still_does_not_persist() {
+        let payer = Pubkey::new_unique();
+        let out = run_conservation(&[], vec![(payer, data_account(FLOAT))], &[payer]);
+        assert!(out.status.is_ok(), "status was {:?}", out.status);
+        assert_eq!(out.accounts[0], AccountSharedData::default());
+    }
+
+    /// A fabricated payer that gained lamports is still erased. Real lamports
+    /// sent to an address that never existed are burned, not persisted.
+    #[tokio::test]
+    async fn fabricated_payer_that_gains_is_erased() {
+        let payer = Pubkey::new_unique();
+        let source = Pubkey::new_unique();
+        let out = run_conservation(
+            &[(source, dataless_account(5000))],
+            vec![
+                (payer, dataless_account(FLOAT + 5)),
+                (source, dataless_account(4995)),
+            ],
+            &[payer],
+        );
+        assert!(
+            out.status.is_ok(),
+            "an over-repaid loan is not a shortfall, got {:?}",
+            out.status
+        );
+        assert_eq!(out.accounts[0], AccountSharedData::default());
+        assert_eq!(
+            out.accounts[1],
+            dataless_account(4995),
+            "the sender's debit stands"
+        );
+    }
+
+    /// Fabrication follows the batch-wide fee-payer set, not this transaction's
+    /// own payer, so draining one fabricated account into another is still a
+    /// shortfall and cannot smuggle the float out.
+    #[tokio::test]
+    async fn second_fabricated_account_cannot_absorb_the_loan() {
+        let payer = Pubkey::new_unique();
+        let other_payer = Pubkey::new_unique();
+        let out = run_conservation(
+            &[],
+            vec![
+                (payer, dataless_account(0)),
+                (other_payer, dataless_account(FLOAT * 2)),
+            ],
+            &[payer, other_payer],
+        );
+        assert!(out.rejected(), "status was {:?}", out.status);
+    }
+
+    // ── execute_batch behavioral tests (through the real SVM) ──
+
+    /// The status a regular result carries after the conservation check.
+    fn regular_status(
+        result: &ExecutionResult,
+        i: usize,
+    ) -> Result<(), solana_transaction_error::TransactionError> {
+        let Ok(ProcessedTransaction::Executed(executed)) = regular_result(result, i) else {
+            panic!("expected an executed result at index {i}");
+        };
+        executed.execution_details.status.clone()
+    }
+
+    fn unbalanced() -> Result<(), solana_transaction_error::TransactionError> {
+        Err(solana_transaction_error::TransactionError::UnbalancedTransaction)
+    }
+
+    /// Direct exploit: a fabricated payer transfers its whole float to R. The
+    /// loan is unrepaid beyond the single lamport R's creation allows, so the
+    /// transaction is rejected and nothing persists.
     #[tokio::test(flavor = "multi_thread")]
-    async fn direct_exploit_executes_but_persists_nothing() {
+    async fn direct_exploit_is_rejected() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
@@ -1019,21 +1841,19 @@ mod tests {
         let r = Pubkey::new_unique();
         let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 10)]).await;
 
+        assert_eq!(regular_status(&result, 0), unbalanced());
         assert!(
-            is_executed(regular_result(&result, 0)),
-            "under the cap the exploit tx executes, it is not rejected"
-        );
-        assert!(
-            bob_balance(&deps.bob, &r).is_none_or(|l| l == 0),
+            bob_balance(&deps.bob, &r).is_none(),
             "R must gain nothing durable"
         );
         assert!(
-            bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
+            bob_balance(&deps.bob, &a.pubkey()).is_none(),
             "synthetic payer must not persist"
         );
     }
 
-    /// Partial spend (ends at 5 on R): R is a dataless gainer → capped to 0.
+    /// Partial spend (5 of the float lands on R): still short by more than the
+    /// one lamport R's creation allows, so it is rejected too.
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_spend_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -1044,14 +1864,13 @@ mod tests {
         let a = Keypair::new();
         let r = Pubkey::new_unique();
         let result = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 5)]).await;
-        assert!(is_executed(regular_result(&result, 0)));
-        assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
+        assert_eq!(regular_status(&result, 0), unbalanced());
+        assert!(bob_balance(&deps.bob, &r).is_none());
     }
 
     /// 2-step re-use: a value-neutral setup tx (self-transfer of 0) cannot
-    /// graduate the synthetic payer — it is dataless → capped to 0 → not
-    /// persisted, so a later batch still treats `A` as synthetic and its spend
-    /// still persists nothing.
+    /// graduate the synthetic payer: it is erased and never persisted, so a
+    /// later batch still treats `A` as synthetic and its spend is rejected.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_step_setup_does_not_graduate_payer() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -1061,7 +1880,7 @@ mod tests {
 
         let a = Keypair::new();
         let setup = run_batch(&mut deps, &metrics, vec![transfer(&a, &a.pubkey(), 0)]).await;
-        assert!(is_executed(regular_result(&setup, 0)));
+        assert_eq!(regular_status(&setup, 0), Ok(()), "the setup tx conserves");
         assert!(
             bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "synthetic payer must not graduate"
@@ -1069,12 +1888,23 @@ mod tests {
 
         let r = Pubkey::new_unique();
         let spend = run_batch(&mut deps, &metrics, vec![transfer(&a, &r, 10)]).await;
-        assert!(is_executed(regular_result(&spend, 0)));
-        assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
+        assert_eq!(regular_status(&spend, 0), unbalanced());
+        assert!(bob_balance(&deps.bob, &r).is_none());
+
+        // Monotonicity survives the trip through ExecutionResult: a later batch
+        // always reports a strictly higher generation than an earlier one. The
+        // generation is assigned per BOB update, so a rejected transfer still
+        // consumes one.
+        assert!(
+            spend.regular_generation > setup.regular_generation,
+            "generation must strictly increase across batches ({} then {})",
+            setup.regular_generation,
+            spend.regular_generation
+        );
     }
 
-    /// Synthetic fee payer is dropped: any synthetic-payer system transfer →
-    /// the payer (dataless) is capped to 0 → not persisted in BOB.
+    /// Synthetic fee payer is dropped: any synthetic-payer transaction erases
+    /// the payer, so it is never persisted in BOB.
     #[tokio::test(flavor = "multi_thread")]
     async fn synthetic_fee_payer_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -1094,10 +1924,10 @@ mod tests {
     // ── Legitimate flows still work ──
 
     /// Legit gasless sponsorship: a fresh `A` pays for a real `B`'s transfer
-    /// without sending or receiving value. The tx settles, `B→R` lands, and the
-    /// fabricated sponsor account is dropped (dataless → capped to 0).
+    /// without sending or receiving value. The transfer lands on both sides and
+    /// the fabricated sponsor is erased.
     #[tokio::test(flavor = "multi_thread")]
-    async fn legit_gasless_sponsor_succeeds_and_payer_dropped() {
+    async fn gasless_sponsor_succeeds_and_is_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
@@ -1114,30 +1944,20 @@ mod tests {
         )
         .await;
 
-        assert!(
-            is_executed(regular_result(&result, 0)),
-            "legit sponsored transfer must succeed"
-        );
-        // The sponsor pays no fee (gasless) and never touches value. All three
-        // accounts here are dataless system accounts: under the cap none persist
-        // durable native lamports (the channel has no native SOL). What matters
-        // for this test is that the gasless sponsorship EXECUTES (the SVM does
-        // not reject for a missing fee payer) and the synthetic sponsor is not
-        // graduated into BOB.
+        assert_eq!(regular_status(&result, 0), Ok(()));
         assert!(
             bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
             "sponsor must not be persisted"
         );
-        assert!(
-            bob_balance(&deps.bob, &r).is_none_or(|l| l == 0),
-            "dataless recipient is capped to 0"
-        );
+        assert_eq!(bob_balance(&deps.bob, &b.pubkey()), Some(4000));
+        assert_eq!(bob_balance(&deps.bob, &r), Some(1000));
     }
 
-    /// A pre-funded real payer settles normally — the cap is a no-op on accounts
-    /// whose lamports don't exceed their floor.
+    /// A transfer between accounts made of pre-existing lamports persists on
+    /// both sides. This is the clearest semantic change from the old cap, which
+    /// zeroed both.
     #[tokio::test(flavor = "multi_thread")]
-    async fn real_prefunded_payer_unaffected() {
+    async fn real_transfer_persists_both_sides() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
@@ -1148,21 +1968,177 @@ mod tests {
         let r = Pubkey::new_unique();
         let result = run_batch(&mut deps, &metrics, vec![transfer(&b, &r, 1000)]).await;
 
-        assert!(is_executed(regular_result(&result, 0)));
-        // B and R are dataless system accounts. Both are capped to 0 durably —
-        // a system-account-to-system-account transfer of plain lamports has no
-        // durable representation in this channel (there is no native SOL). The
-        // transfer still executes; nothing native persists.
-        assert!(bob_balance(&deps.bob, &r).is_none_or(|l| l == 0));
-        assert!(bob_balance(&deps.bob, &b.pubkey()).is_none_or(|l| l == 0));
+        assert_eq!(regular_status(&result, 0), Ok(()));
+        assert_eq!(bob_balance(&deps.bob, &b.pubkey()), Some(4000));
+        assert_eq!(bob_balance(&deps.bob, &r), Some(1000));
+    }
+
+    /// A gasless user creating an ATA: the payer's float covers the ATA's
+    /// 1-lamport existence floor, so the transaction is accepted and the ATA
+    /// persists. The admin InitializeMint shares the batch, and admin results land
+    /// in BOB before regular execution, so the mint is visible here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ata_creation_under_fabricated_payer_succeeds() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let (admin_tx, mint) = create_admin_initialize_mint_tx();
+        let payer = Keypair::new();
+        let wallet = Pubkey::new_unique();
+        let ata = spl_associated_token_account::get_associated_token_address(&wallet, &mint);
+        let ix = spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(),
+            &wallet,
+            &mint,
+            &spl_token::id(),
+        );
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let raw = Transaction::new(&[&payer], msg, Hash::default());
+        let ata_tx = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
+            .expect("failed to build ATA-create tx");
+
+        let result = run_batch(&mut deps, &metrics, vec![admin_tx, ata_tx]).await;
+
+        assert_eq!(
+            regular_status(&result, 0),
+            Ok(()),
+            "gasless ATA creation must be accepted"
+        );
+        assert_eq!(
+            bob_balance(&deps.bob, &ata),
+            Some(1),
+            "the ATA must persist at its existence floor"
+        );
+        assert!(
+            bob_balance(&deps.bob, &payer.pubkey()).is_none_or(|l| l == 0),
+            "the fabricated payer must not persist"
+        );
+    }
+
+    /// A transaction may list accounts no instruction touches. The unrelated
+    /// writable account must come out byte-identical: rewriting it is what
+    /// would drain a third party's escrow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrelated_writable_account_is_untouched() {
+        use solana_sdk::{
+            account::WritableAccount, instruction::CompiledInstruction, message::MessageHeader,
+        };
+
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        let unrelated = Pubkey::new_unique();
+        // rent_epoch is the SVM loader's rent-exempt marker, stamped on every
+        // account it loads; seed it so byte-identity is testable at all.
+        let mut seeded = data_account(5000);
+        seeded.set_rent_epoch(u64::MAX);
+        deps.bob.insert_account_for_test(unrelated, seeded.clone());
+
+        // A value-neutral self-transfer, with `unrelated` carried along as a
+        // writable key no instruction references.
+        let data =
+            solana_system_interface::instruction::transfer(&payer.pubkey(), &payer.pubkey(), 0)
+                .data;
+        let message = Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![
+                payer.pubkey(),
+                unrelated,
+                solana_sdk_ids::system_program::ID,
+            ],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 2,
+                accounts: vec![0, 0],
+                data,
+            }],
+        };
+        let mut raw = Transaction::new_unsigned(message);
+        raw.sign(&[&payer], Hash::default());
+        let tx = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
+            .expect("failed to build carrier tx");
+
+        let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+
+        assert_eq!(regular_status(&result, 0), Ok(()));
+        assert_eq!(
+            deps.bob.get_account_shared_data(&unrelated),
+            Some(seeded),
+            "an account no instruction touched must be byte-identical"
+        );
+    }
+
+    // Real-SVM premise: a mid-tx failure is Executed{Err} and persists nothing.
+
+    /// A two-instruction system tx where ix0 succeeds and ix1 fails on
+    /// insufficient funds. The SVM returns `Executed` with `status.is_err()`,
+    /// proving the premise that a partial failure is not a top-level `Err`. The
+    /// pre-funded payer must keep its pre-execution balance in BOB: its
+    /// rolled-back intermediate state must not be committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_failure_through_svm_is_executed_err_and_persists_nothing() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        fund(&mut deps.bob, &payer.pubkey(), 100);
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+
+        // ix0: payer pays A (60) and succeeds; ix1: payer pays B (60) and fails (only 40 left).
+        let ix0 = solana_system_interface::instruction::transfer(&payer.pubkey(), &a, 60);
+        let ix1 = solana_system_interface::instruction::transfer(&payer.pubkey(), &b, 60);
+        let msg = Message::new(&[ix0, ix1], Some(&payer.pubkey()));
+        let raw = Transaction::new(&[&payer], msg, Hash::default());
+        let tx = SanitizedTransaction::try_from_legacy_transaction(raw, &HashSet::new())
+            .expect("failed to build two-instruction tx");
+
+        let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+
+        let r = regular_result(&result, 0);
+        assert!(
+            is_executed(r),
+            "the SVM returns Executed for a mid-tx failure"
+        );
+        let Ok(ProcessedTransaction::Executed(executed)) = r else {
+            panic!("expected executed");
+        };
+        assert!(
+            !executed.was_successful(),
+            "the partial failure surfaces as Executed with an Err status"
+        );
+        assert_eq!(
+            bob_balance(&deps.bob, &payer.pubkey()),
+            Some(100),
+            "failed tx must not clobber the pre-funded payer with its rolled-back state"
+        );
+        assert!(
+            bob_balance(&deps.bob, &a).is_none_or(|l| l == 0),
+            "intermediate credit to A must not persist"
+        );
+        assert!(
+            bob_balance(&deps.bob, &b).is_none_or(|l| l == 0),
+            "B was never credited and must be absent"
+        );
     }
 
     // ── Path parity & invariants ──
 
-    /// Parallel path (SnapshotCallback) must reach the same capped outcomes as
-    /// the sequential path for a batch of synthetic-payer transfers.
+    /// Parallel path (SnapshotCallback) must reach the same verdicts as the
+    /// sequential path for a batch of synthetic-payer spends.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cap_parallel_path_parity() {
+    async fn conservation_parallel_path_parity() {
         let (accounts_db, _pg) = start_test_postgres().await;
         let (_tx, rx) = mpsc::unbounded_channel();
         let workers = 4;
@@ -1178,28 +2154,29 @@ mod tests {
         for _ in 0..n {
             let a = Keypair::new();
             let r = Pubkey::new_unique();
-            txs.push(transfer(&a, &r, 10)); // 1-step spend → capped
+            txs.push(transfer(&a, &r, 10)); // 1-step spend, unrepaid loan
             payers.push(a);
             recipients.push(r);
         }
         let result = run_batch(&mut deps, &metrics, txs).await;
 
         for i in 0..n {
-            assert!(
-                is_executed(regular_result(&result, i)),
-                "tx {i} must execute on the parallel path"
+            assert_eq!(
+                regular_status(&result, i),
+                unbalanced(),
+                "tx {i} must be rejected on the parallel path"
             );
         }
         for a in &payers {
             assert!(
-                bob_balance(&deps.bob, &a.pubkey()).is_none_or(|l| l == 0),
+                bob_balance(&deps.bob, &a.pubkey()).is_none(),
                 "synthetic payer must not persist on the parallel path"
             );
         }
         for r in &recipients {
             assert!(
-                bob_balance(&deps.bob, r).is_none_or(|l| l == 0),
-                "dataless recipient must be capped on the parallel path"
+                bob_balance(&deps.bob, r).is_none(),
+                "a rejected tx must persist nothing on the parallel path"
             );
         }
     }
@@ -1263,8 +2240,9 @@ mod tests {
         assert_eq!(results.processing_results.len(), n);
     }
 
-    /// Build a well-formed admin InitializeMint tx (single SPL Token ix, type=0).
-    fn create_admin_initialize_mint_tx() -> SanitizedTransaction {
+    /// Build a well-formed admin InitializeMint tx (single SPL Token ix,
+    /// type=0), returning it alongside the mint address it initializes.
+    fn create_admin_initialize_mint_tx() -> (SanitizedTransaction, Pubkey) {
         use solana_sdk::instruction::{AccountMeta, Instruction};
 
         let payer = Keypair::new();
@@ -1284,8 +2262,9 @@ mod tests {
         };
         let msg = Message::new(&[ix], Some(&payer.pubkey()));
         let tx = Transaction::new(&[&payer], msg, Hash::default());
-        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
-            .expect("failed to create admin init-mint tx")
+        let sanitized = SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("failed to create admin init-mint tx");
+        (sanitized, mint)
     }
 
     /// Build a mixed tx: one admin instruction (InitializeMint) + one
@@ -1503,25 +2482,22 @@ mod tests {
         );
     }
 
+    /// The stage exits when its input closes, which is how shutdown reaches it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_execution_worker_shutdown_exits_cleanly() {
+    async fn test_execution_worker_exits_when_input_closes() {
         let (_accounts_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
-        let (_batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
+        let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, _execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(RESULTS_CAP);
-        let shutdown = CancellationToken::new();
+        let (execution_results_tx, _execution_results_rx) =
+            mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
@@ -1529,10 +2505,10 @@ mod tests {
         })
         .await;
 
-        shutdown.cancel();
+        drop(batch_tx);
 
-        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
-        assert!(result.is_ok(), "worker should exit promptly after shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(5), handle.handle).await;
+        assert!(result.is_ok(), "worker should exit once its input closes");
     }
 
     // --- Corner-case coverage for the parallel SVM execution path.
@@ -1838,18 +2814,15 @@ mod tests {
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, _execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(RESULTS_CAP);
-        let shutdown = CancellationToken::new();
+        let (execution_results_tx, _execution_results_rx) =
+            mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
+        let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 4,
@@ -1876,7 +2849,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
-        let tx = create_admin_initialize_mint_tx();
+        let (tx, _mint) = create_admin_initialize_mint_tx();
         let batch = ConflictFreeBatch {
             transactions: vec![crate::scheduler::TransactionWithIndex {
                 transaction: Arc::new(tx),
@@ -1929,7 +2902,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
 
-        let admin_tx = create_admin_initialize_mint_tx();
+        let (admin_tx, _mint) = create_admin_initialize_mint_tx();
         let regular_tx = create_test_transaction();
         let batch = ConflictFreeBatch {
             transactions: vec![
@@ -1950,6 +2923,17 @@ mod tests {
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(result.admin_results.is_some());
         assert!(result.regular_results.is_some());
+        // Each path gets its own BOB write, so each gets its own generation.
+        // Exact values, because the admin path must be settled before the
+        // regular path so regular transactions observe the admin updates.
+        assert_eq!(
+            result.admin_generation, 1,
+            "the admin BOB update must come first"
+        );
+        assert_eq!(
+            result.regular_generation, 2,
+            "the regular BOB update must follow the admin one"
+        );
     }
 
     // A full results channel blocks the executor's send (backpressure) without
@@ -1962,10 +2946,7 @@ mod tests {
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(1);
+        let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let shutdown = CancellationToken::new();
 
         let _handle = start_execution_worker(ExecutionArgs {
@@ -1973,7 +2954,6 @@ mod tests {
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 1,
@@ -2009,24 +2989,20 @@ mod tests {
     // A full results channel with no receiver must not wedge executor shutdown:
     // the send is raced against the shutdown token.
     #[tokio::test(flavor = "multi_thread")]
-    async fn executor_exits_on_shutdown_with_full_results() {
+    async fn a_full_results_channel_never_costs_an_executed_batch() {
         let (_accounts_db, _pg) = start_test_postgres().await;
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
         let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
-        let (execution_results_tx, execution_results_rx) = mpsc::channel::<(
-            LoadAndExecuteSanitizedTransactionsOutput,
-            Vec<SanitizedTransaction>,
-        )>(1);
-        let shutdown = CancellationToken::new();
+        let (execution_results_tx, execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
+        let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
             settled_accounts_rx: settled_rx,
             execution_results_tx,
             accountsdb_connection_url: url,
-            shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             max_svm_workers: 1,
@@ -2040,25 +3016,63 @@ mod tests {
                 index: 0,
             }],
         };
-        // Fill the cap-1 channel and leave a second batch whose send will block;
-        // never drain the results channel.
+        // Fill the cap-1 channel so the second send parks, then close the input.
         batch_tx.send(one_batch()).await.unwrap();
         batch_tx.send(one_batch()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(batch_tx);
 
-        shutdown.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(2), handle.handle).await;
-        assert!(
-            result.is_ok(),
-            "executor must exit promptly even with a full results channel"
-        );
-        drop(execution_results_rx);
+        // Draining lets the parked send complete. Both batches have already run
+        // against the in-memory accounts, so neither may be abandoned.
+        let mut received = 0;
+        let mut rx = execution_results_rx;
+        while received < 2 {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(_)) => received += 1,
+                _ => break,
+            }
+        }
+        assert_eq!(received, 2, "a full results channel must not drop a batch");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(result.is_ok(), "executor must exit once its input closes");
     }
 
-    // ─── Corrupt-account handling ───
+    /// A batch whose accounts could not be loaded must abort before any SVM run,
+    /// so nothing is executed against phantom-absent state and settled.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn execute_batch_aborts_when_preload_cannot_read_the_store() {
+        use crate::accounts::get_accounts::{reset_test_retry, set_test_retry};
 
-    /// Overwrite the `data` column for `pubkey` with bytes that cannot
-    /// deserialize into an AccountSharedData.
+        set_test_retry(2, 1);
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(
+            crate::test_helpers::dead_postgres_db(),
+            rx,
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(sanitize_transfer(&payer, Hash::default())),
+                index: 0,
+            }],
+        };
+        let result = execute_batch(batch, &mut deps, &noop).await;
+        reset_test_retry();
+
+        assert!(result.is_err(), "an unreadable store must abort the batch");
+        assert!(
+            deps.bob.get_account_shared_data(&payer.pubkey()).is_none(),
+            "nothing may be cached from a read that failed"
+        );
+    }
+
     async fn insert_corrupt_pg(db: &AccountsDB, pubkey: Pubkey) {
         if let AccountsDB::Postgres(pg) = db {
             sqlx::query(
@@ -2081,7 +3095,7 @@ mod tests {
         let corrupt = Pubkey::new_unique();
         insert_corrupt_pg(&accounts_db, corrupt).await;
 
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
@@ -2107,7 +3121,7 @@ mod tests {
         let unref = Pubkey::new_unique();
         insert_corrupt_pg(&accounts_db, unref).await;
 
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
@@ -2120,32 +3134,5 @@ mod tests {
 
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(is_executed(regular_result(&result, 0)));
-    }
-
-    /// A transient preload failure that survives retries is fatal: execute_batch
-    /// returns Err and produces nothing to settle.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial]
-    async fn preload_fatal_aborts_batch() {
-        let accounts_db = crate::test_helpers::dead_postgres_db();
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
-        let noop: SharedMetrics = Arc::new(NoopMetrics);
-
-        // Dead backend; shrink retries so the fatal error returns fast.
-        crate::accounts::get_accounts::set_test_retry(2, 1);
-        let batch = ConflictFreeBatch {
-            transactions: vec![crate::scheduler::TransactionWithIndex {
-                transaction: Arc::new(transfer(&Keypair::new(), &Pubkey::new_unique(), 10)),
-                index: 0,
-            }],
-        };
-        let result = execute_batch(batch, &mut deps, &noop).await;
-        crate::accounts::get_accounts::reset_test_retry();
-
-        assert!(
-            result.is_err(),
-            "a dead backend must abort the batch fatally"
-        );
     }
 }

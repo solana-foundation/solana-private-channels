@@ -80,6 +80,10 @@ The deploy pulls images from GHCR. Build + push them once from the control node,
 
 GHCR docs: [ref](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
 
+### Verifying image signatures
+
+Images published by [`.github/workflows/publish-image.yml`](../.github/workflows/publish-image.yml) are signed keyless with cosign (OIDC, no stored keys). Set `verify_image_signature: true` in a stack's vars to make preflight refuse an app image that wasn't built and signed by that workflow: cosign resolves the tag to its digest and checks the signature's Fulcio identity + Rekor entry, so a tampered, unsigned, or foreign image aborts the deploy before any pull. Requires `cosign` on the control node (`brew install cosign`). Override the expected signer via `image_signer_identity` (a cosign `--certificate-identity-regexp`); the default matches this repo's workflow on main or a release tag.
+
 ## Operating
 
 Cluster-agnostic by design, the commands don't change between localnet, devnet/mainnet. The deploy target is set once in [`vars/dev.yml`](./vars/dev.yml) (`network` + `rpc_url`); the playbook auto-selects the matching compose file ([`docker-compose.yml`](../docker-compose.yml) for localnet, [`docker-compose.devnet.yml`](../docker-compose.devnet.yml) for devnet/mainnet) and renders a per-env `.env` from `vars/dev.yml` + `secrets.yml`.

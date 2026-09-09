@@ -9,7 +9,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::{env, error::Error, str::FromStr};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -65,8 +65,17 @@ fn main() -> Result<()> {
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_id, &mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-    let user_ata = get_associated_token_address(&user_keypair.pubkey(), &mint);
-    let instance_ata = get_associated_token_address(&instance_id, &mint);
+    // Detect the mint's token program (classic SPL Token vs Token-2022) so the
+    // ATAs and the instruction's token_program account match the actual mint.
+    let token_program = client
+        .get_account(&mint)
+        .map_err(|e| format!("Failed to fetch mint {}: {}", mint, e))?
+        .owner;
+    println!("Token program: {}", token_program);
+    let user_ata =
+        get_associated_token_address_with_program_id(&user_keypair.pubkey(), &mint, &token_program);
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance_id, &mint, &token_program);
 
     println!("\nDepositing tokens...");
     println!("User ATA: {}", user_ata);
@@ -87,7 +96,7 @@ fn main() -> Result<()> {
         user_ata,
         instance_ata,
         system_program: SYSTEM_PROGRAM_ID,
-        token_program: spl_token::ID,
+        token_program,
         associated_token_program: spl_associated_token_account::ID,
         event_authority: event_authority_pda,
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,

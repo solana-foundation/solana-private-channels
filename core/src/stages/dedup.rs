@@ -1,16 +1,15 @@
 use {
     crate::{
-        accounts::traits::AccountsDB, accounts::traits::BlockInfo, health::StageHeartbeat,
-        nodes::node::WorkerHandle, stage_metrics::SharedMetrics,
+        accounts::traits::AccountsDB, health::StageHeartbeat, nodes::node::WorkerHandle,
+        stage_metrics::SharedMetrics,
     },
     anyhow::{ensure, Result},
-    solana_sdk::{hash::Hash, signature::Signature, transaction::SanitizedTransaction},
+    solana_sdk::{hash::Hash, transaction::SanitizedTransaction},
     std::{
         collections::{HashMap, HashSet, LinkedList},
         sync::{Arc, RwLock},
     },
     tokio::sync::mpsc,
-    tokio_util::sync::CancellationToken,
     tracing::{info, warn},
 };
 
@@ -18,95 +17,84 @@ pub struct DedupArgs {
     pub max_blockhashes: usize,
     pub input_rx: mpsc::Receiver<SanitizedTransaction>,
     pub settled_blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
-    pub output_tx: async_channel::Sender<SanitizedTransaction>,
-    pub shutdown_token: CancellationToken,
+    pub output_tx: mpsc::Sender<SanitizedTransaction>,
     /// Pre-populated from DB on startup; empty on a fresh node.
     pub initial_live_blockhashes: LinkedList<Hash>,
     /// Pre-populated from DB on startup; empty on a fresh node.
-    pub initial_dedup_cache: HashMap<Hash, HashSet<Signature>>,
+    pub initial_dedup_cache: HashMap<Hash, HashSet<Hash>>,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<StageHeartbeat>,
 }
 
-/// Create the bounded dedup channel pair; a full queue sheds load at RPC ingress.
-pub fn create_dedup_channel(
+/// Bounded ingress queue from RPC into the pipeline; when full it rejects new
+/// transactions instead of blocking. It is MPMC because the first stage is the
+/// sigverify worker pool, so many workers receive from this one channel.
+pub fn create_ingress_channel(
     capacity: usize,
 ) -> (
-    mpsc::Sender<SanitizedTransaction>,
-    mpsc::Receiver<SanitizedTransaction>,
+    async_channel::Sender<SanitizedTransaction>,
+    async_channel::Receiver<SanitizedTransaction>,
 ) {
-    mpsc::channel(capacity)
+    async_channel::bounded(capacity)
 }
 
 /// Load dedup state from the DB to seed the cache on restart.
 ///
 /// Reads the last `max_blockhashes` blocks and reconstructs:
 /// - `live_blockhashes`: the ordered list of recent settled blockhashes
-/// - `dedup_cache`: blockhash → set of signatures that used it as recent_blockhash
+/// - `dedup_cache`: blockhash to the set of message hashes that used it as recent_blockhash
 ///
 /// Returns empty state only on a fresh node (no metadata in DB yet).
 /// Any DB query failure is propagated as an error — the caller must not
 /// start the node with an empty cache when prior state exists, as that
 /// could allow duplicate transactions to execute after a restart.
+///
+/// Age is not consulted: the last `max_blockhashes` blocks are exactly the hashes
+/// still inside their published `lastValidBlockHeight`, however old they are.
 pub async fn load_dedup_state(
     accounts_db: &AccountsDB,
     max_blockhashes: usize,
-    expiry_ms: u64,
 ) -> Result<DedupState> {
     let live_blockhashes: LinkedList<Hash> = LinkedList::new();
-    let dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
+    let dedup_cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
 
-    let latest_slot = match accounts_db.get_latest_slot().await? {
-        Some(slot) => slot,
-        None => {
-            info!("Dedup: no prior blocks found, starting with empty state");
-            return Ok((live_blockhashes, dedup_cache));
-        }
-    };
-
-    let start_slot = latest_slot.saturating_sub((max_blockhashes as u64).saturating_sub(1));
-
-    let blocks = accounts_db
-        .get_blocks_in_range(start_slot, latest_slot)
-        .await?;
+    let blocks = accounts_db.get_last_blocks(max_blockhashes).await?;
+    if blocks.is_empty() {
+        info!("Dedup: no prior blocks found, starting with empty state");
+        return Ok((live_blockhashes, dedup_cache));
+    }
 
     let loaded = blocks.len();
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        // Checked cast; the i64::MAX fallback is unreachable
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
-    let blocks = prune_expired_blocks(blocks, now_secs, expiry_ms);
-    let pruned = loaded.saturating_sub(blocks.len());
-
+    if dedup_window_is_short(&blocks, max_blockhashes) {
+        warn!(
+            "Dedup: only {loaded} blocks survived retention against a window of {max_blockhashes}, \
+             so transactions carrying a blockhash from the missing {} blocks will be rejected as \
+             unknown inside their published lastValidBlockHeight; retention was cut below the window",
+            max_blockhashes - loaded
+        );
+    }
     let (live_blockhashes, dedup_cache) = build_dedup_state(&blocks)?;
 
     info!(
         loaded_blocks = loaded,
-        pruned_blocks = pruned,
-        kept_blocks = blocks.len(),
         live_blockhashes = live_blockhashes.len(),
         cache_entries = dedup_cache.values().map(|s| s.len()).sum::<usize>(),
-        "Dedup: restored dedup state; {pruned} restored blocks were pruned as older than the {expiry_ms}ms expiry window",
+        "Dedup: restored dedup state from the last {max_blockhashes} blocks",
     );
 
     Ok((live_blockhashes, dedup_cache))
 }
 
-type DedupState = (LinkedList<Hash>, HashMap<Hash, HashSet<Signature>>);
+type DedupState = (LinkedList<Hash>, HashMap<Hash, HashSet<Hash>>);
 
-/// Drop restored blocks older than the expiry window.
-fn prune_expired_blocks(blocks: Vec<BlockInfo>, now_secs: i64, expiry_ms: u64) -> Vec<BlockInfo> {
-    // Checked: an oversized expiry clamps to i64::MAX, never wraps negative (drop all).
-    let expiry_secs = i64::try_from(expiry_ms / 1000).unwrap_or(i64::MAX);
-    blocks
-        .into_iter()
-        .filter(|block| match block.block_time {
-            Some(block_time) => now_secs.saturating_sub(block_time) <= expiry_secs,
-            // Age unknown means we cannot prove expiry, so keep the block.
-            None => true,
-        })
-        .collect()
+/// A window short of `max_blockhashes` means retention cut it, unless genesis
+/// is in it: then the chain has simply not produced that many blocks yet.
+/// `blocks` is newest first, so the oldest loaded block is the last.
+fn dedup_window_is_short(
+    blocks: &[crate::accounts::traits::BlockInfo],
+    max_blockhashes: usize,
+) -> bool {
+    blocks.len() < max_blockhashes && blocks.last().is_some_and(|oldest| oldest.slot != 0)
 }
 
 /// Ingest pending blockhash updates into `live_blockhashes`
@@ -126,7 +114,7 @@ fn ingest_blockhashes(
     first: Option<Hash>,
     settled_blockhashes_rx: &mut mpsc::UnboundedReceiver<Hash>,
     live_blockhashes: &RwLock<LinkedList<Hash>>,
-    dedup_cache: &mut HashMap<Hash, HashSet<Signature>>,
+    dedup_cache: &mut HashMap<Hash, HashSet<Hash>>,
     max_blockhashes: usize,
 ) {
     let first = match first.or_else(|| settled_blockhashes_rx.try_recv().ok()) {
@@ -149,7 +137,7 @@ fn ingest_blockhashes(
 /// slice of blocks. Extracted so it can be unit-tested without a live DB.
 fn build_dedup_state(blocks: &[crate::accounts::traits::BlockInfo]) -> Result<DedupState> {
     let mut live_blockhashes: LinkedList<Hash> = LinkedList::new();
-    let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = HashMap::new();
+    let mut dedup_cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
 
     let loaded_hashes: HashSet<Hash> = blocks.iter().map(|b| b.blockhash).collect();
 
@@ -161,11 +149,20 @@ fn build_dedup_state(blocks: &[crate::accounts::traits::BlockInfo]) -> Result<De
             block.transaction_signatures.len(),
             block.transaction_recent_blockhashes.len(),
         );
+        ensure!(
+            block.transaction_message_hashes.len() == block.transaction_signatures.len(),
+            "Block {} has mismatched transaction_message_hashes ({}) and transaction_signatures ({}) lengths",
+            block.slot,
+            block.transaction_message_hashes.len(),
+            block.transaction_signatures.len(),
+        );
 
         live_blockhashes.push_back(block.blockhash);
 
-        for (signature, recent_blockhash) in block
-            .transaction_signatures
+        // The message hash is the replay identity, so the restart cache keys on
+        // it exactly as the runtime stage does.
+        for (message_hash, recent_blockhash) in block
+            .transaction_message_hashes
             .iter()
             .zip(block.transaction_recent_blockhashes.iter())
         {
@@ -173,7 +170,7 @@ fn build_dedup_state(blocks: &[crate::accounts::traits::BlockInfo]) -> Result<De
                 dedup_cache
                     .entry(*recent_blockhash)
                     .or_default()
-                    .insert(*signature);
+                    .insert(*message_hash);
             }
         }
     }
@@ -187,7 +184,6 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
         mut input_rx,
         mut settled_blockhashes_rx,
         output_tx,
-        shutdown_token,
         initial_live_blockhashes,
         initial_dedup_cache,
         metrics,
@@ -200,7 +196,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
     let handle = tokio::spawn(async move {
         info!("Dedup stage started");
 
-        let mut dedup_cache: HashMap<Hash, HashSet<Signature>> = initial_dedup_cache;
+        let mut dedup_cache: HashMap<Hash, HashSet<Hash>> = initial_dedup_cache;
 
         loop {
             // Before blocking on select, drain any already-pending blockhash
@@ -213,14 +209,11 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                 max_blockhashes,
             );
 
+            // Exits when the input closes, never on a shutdown signal: waiting on
+            // the settled-blockhash channel instead would deadlock, because the
+            // settler cannot finish until this stage drains into it.
             tokio::select! {
                 biased;
-
-                // Shutdown signal — checked first so shutdown is prompt.
-                _ = shutdown_token.cancelled() => {
-                    info!("Dedup received shutdown signal");
-                    break;
-                }
 
                 // Blockhash updates have priority over transaction processing.
                 // When both channels are ready, `biased` ensures we ingest new
@@ -249,7 +242,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                 // Process incoming transactions.
                 //
                 // The output channel (`output_tx`) is bounded, so `send().await`
-                // can block when the sigverify stage is saturated.  While this
+                // can block when the sequencer stage is saturated.  While this
                 // task is suspended on that await, new blockhash updates pile up
                 // in `settled_blockhashes_rx` and the live-hash window falls
                 // behind what `getLatestBlockhash` returns to clients.
@@ -264,6 +257,13 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                         Some(transaction) => {
                             metrics.dedup_received();
                             heartbeat.record_input();
+                            // Key replay on the message hash, not the first signature.
+                            // One message can have many valid signatures, so keying on
+                            // the signature would let a sponsor replay the same signed
+                            // message. The message hash is the same across those signature
+                            // variants. Dedup is single-threaded and runs after sigverify,
+                            // so check-and-insert is atomic and only caches verified txs.
+                            let message_hash = *transaction.message_hash();
                             let signature = *transaction.signature();
                             let blockhash = *transaction.message().recent_blockhash();
 
@@ -289,7 +289,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                             // Check if duplicate using two-layer lookup
                             let is_duplicate = dedup_cache
                                 .get(&blockhash)
-                                .map(|sigs| sigs.contains(&signature))
+                                .map(|hashes| hashes.contains(&message_hash))
                                 .unwrap_or(false);
 
                             if is_duplicate {
@@ -302,12 +302,12 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                             dedup_cache
                                 .entry(blockhash)
                                 .or_default()
-                                .insert(signature);
+                                .insert(message_hash);
 
                             metrics.dedup_forwarded();
 
-                            // Forward to sigverify.  While waiting for capacity on
-                            // the bounded output channel, keep draining blockhash
+                            // Forward to the sequencer.  While waiting for capacity
+                            // on the bounded output channel, keep draining blockhash
                             // updates so the live set stays current even when
                             // backpressure stalls the pipeline.
                             loop {
@@ -335,7 +335,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                     }
                                     send_result = output_tx.send(transaction.clone()) => {
                                         if let Err(e) = send_result {
-                                            warn!("Failed to forward transaction to sigverify: {}", e);
+                                            warn!("Failed to forward transaction to sequencer: {}", e);
                                         } else {
                                             heartbeat.record_progress();
                                         }
@@ -388,14 +388,42 @@ mod tests {
         SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap()
     }
 
-    fn make_block(slot: u64, blockhash: Hash, sigs: &[(Signature, Hash)]) -> BlockInfo {
-        make_block_at(slot, blockhash, sigs, None)
+    /// Build two sanitized transactions that share one signed message but carry
+    /// different first signatures. Sanitization derives message_hash from the
+    /// message and never verifies signatures, so both share message_hash and
+    /// differ only in signatures[0]. This is the dedup-stage stand-in for a
+    /// malicious sponsor replaying one victim authorization under varied nonces.
+    fn tx_with_same_message_diff_sig(
+        payer: &Keypair,
+        blockhash: Hash,
+    ) -> (SanitizedTransaction, SanitizedTransaction) {
+        let to = Pubkey::new_unique();
+        let ix = system_instruction::transfer(&payer.pubkey(), &to, 1);
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+
+        let tx_a = Transaction::new(&[payer], msg.clone(), blockhash);
+        let mut tx_b = tx_a.clone();
+        // Swap only the first signature for another distinct value; the signed
+        // message stays byte-identical so message_hash is unchanged.
+        tx_b.signatures[0] = Signature::new_unique();
+
+        let sanitized_a =
+            SanitizedTransaction::try_from_legacy_transaction(tx_a, &HashSet::new()).unwrap();
+        let sanitized_b =
+            SanitizedTransaction::try_from_legacy_transaction(tx_b, &HashSet::new()).unwrap();
+        (sanitized_a, sanitized_b)
+    }
+
+    // Each tuple is (signature, message_hash, recent_blockhash) so the block
+    // carries the parallel arrays the restart rebuild keys on.
+    fn make_block(slot: u64, blockhash: Hash, txs: &[(Signature, Hash, Hash)]) -> BlockInfo {
+        make_block_at(slot, blockhash, txs, None)
     }
 
     fn make_block_at(
         slot: u64,
         blockhash: Hash,
-        sigs: &[(Signature, Hash)],
+        txs: &[(Signature, Hash, Hash)],
         block_time: Option<i64>,
     ) -> BlockInfo {
         BlockInfo {
@@ -405,14 +433,11 @@ mod tests {
             parent_slot: slot.saturating_sub(1),
             block_height: Some(slot),
             block_time,
-            transaction_signatures: sigs.iter().map(|(s, _)| *s).collect(),
-            transaction_recent_blockhashes: sigs.iter().map(|(_, h)| *h).collect(),
+            transaction_signatures: txs.iter().map(|(s, _, _)| *s).collect(),
+            transaction_message_hashes: txs.iter().map(|(_, m, _)| *m).collect(),
+            transaction_recent_blockhashes: txs.iter().map(|(_, _, h)| *h).collect(),
         }
     }
-
-    // 15s window mirrored by the block ages below; bind both to one const so
-    // the prune boundary and the test fixtures can never drift apart.
-    const EXPIRY_MS: u64 = 15_000;
 
     const TEST_INGRESS_CAP: usize = 64;
 
@@ -420,20 +445,17 @@ mod tests {
     fn start_test_dedup() -> (
         mpsc::Sender<SanitizedTransaction>,
         mpsc::UnboundedSender<Hash>,
-        async_channel::Receiver<SanitizedTransaction>,
-        CancellationToken,
+        mpsc::Receiver<SanitizedTransaction>,
     ) {
         let (input_tx, input_rx) = mpsc::channel(TEST_INGRESS_CAP);
         let (bh_tx, bh_rx) = mpsc::unbounded_channel();
-        let (output_tx, output_rx) = async_channel::bounded(64);
-        let shutdown = CancellationToken::new();
+        let (output_tx, output_rx) = mpsc::channel(64);
 
         let args = DedupArgs {
             max_blockhashes: 8,
             input_rx,
             settled_blockhashes_rx: bh_rx,
             output_tx,
-            shutdown_token: shutdown.clone(),
             initial_live_blockhashes: LinkedList::new(),
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
@@ -443,14 +465,14 @@ mod tests {
             start_dedup(args).await;
         });
 
-        (input_tx, bh_tx, output_rx, shutdown)
+        (input_tx, bh_tx, output_rx)
     }
 
     // --- live dedup stage tests ---
 
     #[tokio::test]
     async fn unknown_blockhash_rejected() {
-        let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let live_bh = Hash::new_unique();
         bh_tx.send(live_bh).unwrap();
@@ -467,12 +489,14 @@ mod tests {
             "tx with unknown blockhash should not be forwarded"
         );
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
+    // An identical resubmit (same message, same signature) is still deduped, so
+    // the re-key does not regress the original duplicate-drop behavior.
     #[tokio::test]
-    async fn duplicate_signature_rejected() {
-        let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
+    async fn identical_resubmit_rejected() {
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -489,12 +513,86 @@ mod tests {
         let second = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
         assert!(second.is_err(), "duplicate tx should not be forwarded");
 
-        shutdown.cancel();
+        drop(input_tx);
+    }
+
+    // Two distinct transfers under the same live blockhash have different
+    // messages, so different message hashes; both must be forwarded. Guards
+    // against false-positive dedup of legitimate distinct transactions.
+    #[tokio::test]
+    async fn distinct_messages_both_forwarded() {
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+
+        let bh = Hash::new_unique();
+        bh_tx.send(bh).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let payer = Keypair::new();
+        // make_tx sends to a fresh random destination each call, so the two
+        // messages differ and hash differently.
+        let tx1 = make_tx(&payer, bh);
+        let tx2 = make_tx(&payer, bh);
+        assert_ne!(
+            tx1.message_hash(),
+            tx2.message_hash(),
+            "distinct transfers must differ in message_hash"
+        );
+
+        input_tx.send(tx1).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
+        assert!(first.is_ok(), "first distinct tx should be forwarded");
+
+        input_tx.send(tx2).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
+        assert!(
+            second.is_ok(),
+            "second distinct tx must also be forwarded, not deduped"
+        );
+
+        drop(input_tx);
+    }
+
+    // Regression for the first-signature replay: a second variant that shares
+    // the signed message but carries a different first signature must be
+    // dropped as a duplicate. Fails on signature-keyed dedup, which forwards it.
+    #[tokio::test]
+    async fn varied_signature_same_message_rejected() {
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+
+        let bh = Hash::new_unique();
+        bh_tx.send(bh).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let payer = Keypair::new();
+        let (tx_a, tx_b) = tx_with_same_message_diff_sig(&payer, bh);
+        assert_eq!(
+            tx_a.message_hash(),
+            tx_b.message_hash(),
+            "variants must share message_hash"
+        );
+        assert_ne!(
+            tx_a.signature(),
+            tx_b.signature(),
+            "variants must differ in first signature"
+        );
+
+        input_tx.send(tx_a).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
+        assert!(first.is_ok(), "first variant should be forwarded");
+
+        input_tx.send(tx_b).await.unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(100), output_rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "second variant sharing the message must be deduped"
+        );
+
+        drop(input_tx);
     }
 
     #[tokio::test]
     async fn valid_transaction_forwarded() {
-        let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let bh = Hash::new_unique();
         bh_tx.send(bh).unwrap();
@@ -508,18 +606,18 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_millis(200), output_rx.recv()).await;
         match result {
-            Ok(Ok(forwarded)) => {
+            Ok(Some(forwarded)) => {
                 assert_eq!(*forwarded.signature(), expected_sig);
             }
             other => panic!("expected forwarded tx, got {:?}", other),
         }
 
-        shutdown.cancel();
+        drop(input_tx);
     }
 
     #[tokio::test]
     async fn expired_blockhash_evicted() {
-        let (input_tx, bh_tx, output_rx, shutdown) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
 
         let mut hashes = Vec::new();
         for _ in 0..9 {
@@ -546,7 +644,88 @@ mod tests {
             "tx using latest blockhash should be forwarded"
         );
 
-        shutdown.cancel();
+        drop(input_tx);
+    }
+
+    /// The window is block-denominated: one hash arrives per produced block and
+    /// each one evicts exactly one older entry, taking its replay-protection
+    /// cache entry with it. Validity and replay protection are the same window.
+    #[test]
+    fn dedup_evicts_one_entry_per_block() {
+        use std::sync::RwLock;
+
+        let max_blockhashes = 3usize;
+        let live = RwLock::new(LinkedList::new());
+        let mut cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
+
+        let hashes: Vec<Hash> = (0..5).map(|_| Hash::new_unique()).collect();
+        for hash in &hashes {
+            cache.insert(*hash, HashSet::from([Hash::new_unique()]));
+            let (_tx, mut rx) = mpsc::unbounded_channel();
+            rx.close();
+            ingest_blockhashes(Some(*hash), &mut rx, &live, &mut cache, max_blockhashes);
+        }
+
+        let window: Vec<Hash> = live.read().unwrap().iter().copied().collect();
+        assert_eq!(window, hashes[2..], "the window holds the newest blocks");
+        for evicted in &hashes[..2] {
+            assert!(
+                !cache.contains_key(evicted),
+                "an evicted blockhash takes its message hashes with it"
+            );
+        }
+        for kept in &hashes[2..] {
+            assert!(cache.contains_key(kept), "a live blockhash keeps its entry");
+        }
+    }
+
+    /// The bound is the number of live blocks, and block cadence is not an input
+    /// to it. Under load many hashes arrive per ingest and at idle one does; the
+    /// retained set is identical either way.
+    #[test]
+    fn dedup_footprint_is_bounded_by_the_window_not_by_cadence() {
+        use std::sync::RwLock;
+
+        let max_blockhashes = 4usize;
+        let per_block = 3usize;
+
+        // Same blocks, same message hashes; only how many arrive per ingest
+        // differs, which is the whole of the load-to-idle transition.
+        let hashes: Vec<Hash> = (0..12).map(|_| Hash::new_unique()).collect();
+        let mut retained = Vec::new();
+        for burst in [4usize, 1] {
+            let live = RwLock::new(LinkedList::new());
+            let mut cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
+
+            for chunk in hashes.chunks(burst) {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                for hash in chunk {
+                    cache.insert(*hash, (0..per_block).map(|_| Hash::new_unique()).collect());
+                    tx.send(*hash).expect("queue the settled blockhash");
+                }
+                drop(tx);
+                ingest_blockhashes(None, &mut rx, &live, &mut cache, max_blockhashes);
+            }
+
+            assert_eq!(
+                cache.len(),
+                max_blockhashes,
+                "the cache holds one entry per live block, never more"
+            );
+            assert_eq!(
+                cache.values().map(|set| set.len()).sum::<usize>(),
+                max_blockhashes * per_block,
+                "an evicted block takes its message hashes with it"
+            );
+            let window: Vec<Hash> = live.read().unwrap().iter().copied().collect();
+            assert_eq!(window, hashes[hashes.len() - max_blockhashes..]);
+            retained.push(window);
+        }
+
+        assert_eq!(
+            retained[0], retained[1],
+            "block cadence must not change what the window retains"
+        );
     }
 
     // --- build_dedup_state unit tests ---
@@ -574,17 +753,20 @@ mod tests {
         let hash2 = Hash::new_unique();
         let sig1 = Signature::new_unique();
         let sig2 = Signature::new_unique();
+        let mh1 = Hash::new_unique();
+        let mh2 = Hash::new_unique();
 
         let blocks = vec![
             make_block(1, hash1, &[]),
-            make_block(2, hash2, &[(sig1, hash1), (sig2, hash1)]),
+            make_block(2, hash2, &[(sig1, mh1, hash1), (sig2, mh2, hash1)]),
         ];
         let (live, cache) = build_dedup_state(&blocks).unwrap();
 
         assert_eq!(live.len(), 2);
-        let sigs = cache.get(&hash1).unwrap();
-        assert!(sigs.contains(&sig1));
-        assert!(sigs.contains(&sig2));
+        // The cache is keyed by message hash, not signature.
+        let hashes = cache.get(&hash1).unwrap();
+        assert!(hashes.contains(&mh1));
+        assert!(hashes.contains(&mh2));
         assert!(!cache.contains_key(&hash2));
     }
 
@@ -593,8 +775,9 @@ mod tests {
         let old_hash = Hash::new_unique();
         let hash1 = Hash::new_unique();
         let sig = Signature::new_unique();
+        let mh = Hash::new_unique();
 
-        let blocks = vec![make_block(1, hash1, &[(sig, old_hash)])];
+        let blocks = vec![make_block(1, hash1, &[(sig, mh, old_hash)])];
         let (live, cache) = build_dedup_state(&blocks).unwrap();
 
         assert_eq!(live.len(), 1);
@@ -614,86 +797,26 @@ mod tests {
             .contains("mismatched transaction_signatures"));
     }
 
-    // --- prune_expired_blocks unit tests ---
-
+    // The parallel-array invariant also covers message hashes: a block whose
+    // message-hash count diverges from its signature count must be rejected,
+    // so a corrupt row can never seed a wrong or empty replay cache.
     #[test]
-    fn prune_drops_blocks_older_than_expiry() {
-        let now = 1_000_000i64;
-        let old = make_block_at(1, Hash::new_unique(), &[], Some(now - 20));
-        let fresh = make_block_at(2, Hash::new_unique(), &[], Some(now - 5));
-        let fresh_hash = fresh.blockhash;
+    fn test_mismatched_message_hash_length_returns_error() {
+        let hash = Hash::new_unique();
+        let mut block = make_block(
+            1,
+            hash,
+            &[(Signature::new_unique(), Hash::new_unique(), hash)],
+        );
+        // Drop the message hash so only that array is short.
+        block.transaction_message_hashes.clear();
 
-        let kept = prune_expired_blocks(vec![old, fresh], now, EXPIRY_MS);
-
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].blockhash, fresh_hash);
-    }
-
-    #[test]
-    fn prune_keeps_all_when_within_expiry() {
-        let now = 1_000_000i64;
-        let blocks = vec![
-            make_block_at(1, Hash::new_unique(), &[], Some(now - 1)),
-            make_block_at(2, Hash::new_unique(), &[], Some(now - 1)),
-        ];
-
-        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
-
-        assert_eq!(kept.len(), 2);
-    }
-
-    #[test]
-    fn prune_keeps_none_when_all_stale() {
-        let now = 1_000_000i64;
-        let blocks = vec![
-            make_block_at(1, Hash::new_unique(), &[], Some(now - 3600)),
-            make_block_at(2, Hash::new_unique(), &[], Some(now - 3600)),
-        ];
-
-        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
-
-        assert!(kept.is_empty());
-    }
-
-    #[test]
-    fn prune_keeps_block_time_none() {
-        let now = 1_000_000i64;
-        let blocks = vec![make_block_at(1, Hash::new_unique(), &[], None)];
-
-        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
-
-        assert_eq!(kept.len(), 1);
-    }
-
-    #[test]
-    fn prune_handles_future_block_time() {
-        let now = 1_000_000i64;
-        let blocks = vec![make_block_at(1, Hash::new_unique(), &[], Some(now + 3600))];
-
-        let kept = prune_expired_blocks(blocks, now, EXPIRY_MS);
-
-        assert_eq!(kept.len(), 1);
-    }
-
-    #[test]
-    fn prune_then_build_drops_orphan_signatures() {
-        let now = 1_000_000i64;
-        let stale_hash = Hash::new_unique();
-        let fresh_hash = Hash::new_unique();
-        let stale_sig = Signature::new_unique();
-        let fresh_sig = Signature::new_unique();
-
-        // Stale block carries a self-referencing signature; fresh block too.
-        let stale = make_block_at(1, stale_hash, &[(stale_sig, stale_hash)], Some(now - 3600));
-        let fresh = make_block_at(2, fresh_hash, &[(fresh_sig, fresh_hash)], Some(now - 1));
-
-        let kept = prune_expired_blocks(vec![stale, fresh], now, EXPIRY_MS);
-        let (live, cache) = build_dedup_state(&kept).unwrap();
-
-        assert_eq!(live.len(), 1);
-        assert_eq!(*live.front().unwrap(), fresh_hash);
-        assert!(!cache.contains_key(&stale_hash));
-        assert!(cache.get(&fresh_hash).unwrap().contains(&fresh_sig));
+        let result = build_dedup_state(&[block]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mismatched transaction_message_hashes"));
     }
 
     #[test]
@@ -710,6 +833,284 @@ mod tests {
         assert_eq!(live.len(), 5);
         for (got, expected) in live.iter().zip(hashes.iter()) {
             assert_eq!(got, expected);
+        }
+    }
+
+    // --- reorder wiring + anti-poison integration tests ---
+
+    /// Wire ingress (async_channel) -> sigverify -> (mpsc) dedup -> (mpsc)
+    /// sequencer, exactly as the node builds the write pipeline. Returns the
+    /// ingress sender, the settled-blockhash sender feeding dedup, the sequencer
+    /// receiver, and the shutdown token.
+    async fn start_test_pipeline() -> (
+        async_channel::Sender<SanitizedTransaction>,
+        mpsc::UnboundedSender<Hash>,
+        mpsc::Receiver<SanitizedTransaction>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        use crate::stages::sigverify::{start_sigverify_workerpool, SigverifyArgs};
+
+        let (ingress_tx, ingress_rx) = async_channel::bounded(64);
+        let (dedup_tx, dedup_rx) = mpsc::channel(64);
+        let (sequencer_tx, sequencer_rx) = mpsc::channel(64);
+        let (bh_tx, bh_rx) = mpsc::unbounded_channel();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        start_sigverify_workerpool(SigverifyArgs {
+            num_workers: 2,
+            admin_keys: vec![],
+            rx: ingress_rx,
+            output_tx: dedup_tx,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        tokio::spawn(async move {
+            start_dedup(DedupArgs {
+                max_blockhashes: 8,
+                input_rx: dedup_rx,
+                settled_blockhashes_rx: bh_rx,
+                output_tx: sequencer_tx,
+                initial_live_blockhashes: LinkedList::new(),
+                initial_dedup_cache: HashMap::new(),
+                metrics: Arc::new(NoopMetrics),
+                heartbeat: crate::health::StageHeartbeat::new(),
+            })
+            .await;
+        });
+
+        (ingress_tx, bh_tx, sequencer_rx, shutdown)
+    }
+
+    // An invalid-signature transaction carrying message M is dropped by sigverify
+    // and never reaches dedup, so a later valid transaction with the same message
+    // M is forwarded, not falsely deduped. This fails if the cache is inserted
+    // before verification (the pre-verify poisoning DoS).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_tx_does_not_poison_dedup() {
+        let (ingress_tx, bh_tx, mut sequencer_rx, _shutdown) = start_test_pipeline().await;
+
+        let bh = Hash::new_unique();
+        bh_tx.send(bh).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let payer = Keypair::new();
+        // tx_a is properly signed (valid); tx_b shares the message but has a bogus
+        // first signature, so sigverify rejects it.
+        let (tx_a, tx_b) = tx_with_same_message_diff_sig(&payer, bh);
+        let expected_sig = *tx_a.signature();
+
+        // Send the invalid variant first; sigverify must drop it.
+        ingress_tx.send(tx_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The valid variant with the same message must still be forwarded.
+        ingress_tx.send(tx_a).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), sequencer_rx.recv()).await;
+        match received {
+            Ok(Some(tx)) => assert_eq!(
+                *tx.signature(),
+                expected_sig,
+                "the valid tx must be the one forwarded"
+            ),
+            other => panic!("valid tx must not be deduped by a dropped invalid tx: {other:?}"),
+        }
+
+        drop(ingress_tx);
+    }
+
+    // A single valid transaction traverses the full reorder: ingress -> sigverify
+    // -> dedup -> sequencer. Pins the channel retype and stage wiring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn valid_tx_flows_sigverify_to_sequencer() {
+        let (ingress_tx, bh_tx, mut sequencer_rx, _shutdown) = start_test_pipeline().await;
+
+        let bh = Hash::new_unique();
+        bh_tx.send(bh).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let payer = Keypair::new();
+        let tx = make_tx(&payer, bh);
+        let expected_sig = *tx.signature();
+
+        ingress_tx.send(tx).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), sequencer_rx.recv()).await;
+        match received {
+            Ok(Some(tx)) => assert_eq!(*tx.signature(), expected_sig),
+            other => panic!("valid tx must reach the sequencer: {other:?}"),
+        }
+
+        drop(ingress_tx);
+    }
+
+    /// The window counts blocks, not slots. A slot range that wide holds far fewer
+    /// blocks on a sparse chain, so restoring by slot range would drop hashes the
+    /// node had just published a `lastValidBlockHeight` for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_restores_the_window_by_block_count_not_slot_range() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+
+        // One block every ten slots, which is what an idle node produces.
+        let hashes: Vec<Hash> = (0..5).map(|_| Hash::new_unique()).collect();
+        for (index, hash) in hashes.iter().enumerate() {
+            db.store_block(make_block_at(index as u64 * 10, *hash, &[], Some(0)))
+                .await
+                .unwrap();
+        }
+
+        let (live, _cache) = load_dedup_state(&db, hashes.len()).await.unwrap();
+
+        assert_eq!(
+            live.len(),
+            hashes.len(),
+            "the last {} blocks must all be restored, whatever slots they occupy",
+            hashes.len()
+        );
+    }
+
+    /// Expiry is block-counted, so the restored window is the last
+    /// `max_blockhashes` blocks whatever their age. An idle node's live hashes are
+    /// minutes old, and a clock-based drop would reject hashes clients still hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_restores_the_window_by_block_count_not_age() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+
+        let hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 3_600;
+
+        let hashes: Vec<Hash> = (0..3).map(|_| Hash::new_unique()).collect();
+        for (slot, hash) in hashes.iter().enumerate() {
+            db.store_block(make_block_at(slot as u64, *hash, &[], Some(hour_ago)))
+                .await
+                .unwrap();
+        }
+
+        let (live, _cache) = load_dedup_state(&db, 8).await.unwrap();
+
+        assert_eq!(
+            live.len(),
+            hashes.len(),
+            "every block inside the block-counted window must be restored"
+        );
+    }
+
+    // --- persistence roundtrip (Postgres-gated) ---
+
+    // Store new-format blocks (with message hashes) through store_block, then
+    // load_dedup_state must rebuild a cache keyed by (blockhash, message_hash)
+    // and a live_blockhashes list matching the stored blockhashes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_dedup_state_roundtrip_message_hash() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let bh0 = Hash::new_unique();
+        let bh1 = Hash::new_unique();
+        let sig = Signature::new_unique();
+        let mh = Hash::new_unique();
+
+        // Slot 0: no transactions, just establishes bh0 as a live blockhash.
+        let block0 = BlockInfo {
+            slot: 0,
+            blockhash: bh0,
+            previous_blockhash: Hash::default(),
+            parent_slot: 0,
+            block_height: Some(0),
+            block_time: Some(now_secs),
+            transaction_signatures: vec![],
+            transaction_recent_blockhashes: vec![],
+            transaction_message_hashes: vec![],
+        };
+        // Slot 1: one tx referencing bh0 as its recent blockhash.
+        let block1 = BlockInfo {
+            slot: 1,
+            blockhash: bh1,
+            previous_blockhash: bh0,
+            parent_slot: 0,
+            block_height: Some(1),
+            block_time: Some(now_secs),
+            transaction_signatures: vec![sig],
+            transaction_recent_blockhashes: vec![bh0],
+            transaction_message_hashes: vec![mh],
+        };
+
+        db.store_block(block0).await.unwrap();
+        db.store_block(block1).await.unwrap();
+
+        let (live, cache) = load_dedup_state(&db, 8).await.unwrap();
+
+        assert!(live.contains(&bh0), "bh0 must be a live blockhash");
+        assert!(live.contains(&bh1), "bh1 must be a live blockhash");
+        let hashes = cache
+            .get(&bh0)
+            .expect("bh0 must key a dedup cache entry from the tx that referenced it");
+        assert!(
+            hashes.contains(&mh),
+            "cache must hold the message hash, keyed by the referenced blockhash"
+        );
+    }
+
+    /// Dedup exits when its input closes even while the settler is still alive
+    /// and its blockhash channel is still open. Waiting on that channel instead
+    /// would deadlock the drain: the settler cannot finish until dedup has
+    /// drained into the sequencer, and dedup would be waiting on the settler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dedup_exits_on_input_close_without_waiting_on_blockhashes() {
+        let (input_tx, bh_tx, _output_rx) = start_test_dedup();
+
+        // Held open for the whole test, standing in for a settler still running.
+        let live = Hash::new_unique();
+        bh_tx.send(live).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let (probe_tx, mut probe_rx) = mpsc::channel::<()>(1);
+        let watcher = tokio::spawn(async move {
+            // Closing dedup's input is the only signal it should need.
+            drop(input_tx);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = probe_tx.send(()).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), probe_rx.recv())
+                .await
+                .is_ok(),
+            "dedup must not block the drain on the settled-blockhash channel"
+        );
+        drop(bh_tx);
+        let _ = watcher.await;
+    }
+
+    /// A window short of `max_blockhashes` is only a truncation problem when the
+    /// blocks below it existed. Genesis in the window means the chain is young.
+    #[test]
+    fn dedup_window_is_short_only_when_truncation_cut_it() {
+        // Newest first, as `get_last_blocks` returns them.
+        let chain = |oldest_slot: u64, loaded: u64| -> Vec<BlockInfo> {
+            (0..loaded)
+                .rev()
+                .map(|i| make_block(oldest_slot + i, Hash::new_unique(), &[]))
+                .collect()
+        };
+        for (oldest_slot, loaded, max, short) in [
+            (5, 3, 8, true),
+            (0, 3, 8, false),
+            (5, 8, 8, false),
+            (5, 0, 8, false),
+        ] {
+            assert_eq!(
+                dedup_window_is_short(&chain(oldest_slot, loaded), max),
+                short,
+                "{loaded} blocks from slot {oldest_slot} against a window of {max}"
+            );
         }
     }
 }

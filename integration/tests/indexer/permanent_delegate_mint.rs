@@ -520,19 +520,17 @@ fn set_operator_env_vars() {
     std::env::set_var("OPERATOR_PRIVATE_KEY", &private_key_base58);
 }
 
-/// Defensive coverage for the missing-ATA branch in the withdrawal pre-flight:
-/// when the escrow ATA does not exist on-chain, the operator must treat the
-/// query as on-chain balance = 0 and route the withdrawal to ManualReview.
-/// Mapping the not-found error to a transient RPC failure instead would
-/// restart the operator in a loop on a condition that won't heal.
+/// Coverage for the escrow-balance branch of the withdrawal pre-flight: an
+/// allowlisted permanent-delegate mint whose escrow ATA holds less than the
+/// withdrawal amount must route to ManualReview, not restart the operator.
 ///
-/// We skip `AllowMint` to set up the missing-ATA state — it's the simplest
-/// way to leave the canonical escrow ATA address unfunded. The pre-flight
-/// reads on-chain state at query time and doesn't care how we got there.
+/// `AllowMint` creates the escrow ATA alongside the AllowedMint account, so the
+/// ATA starts empty and every withdrawal reads a zero balance. Skipping AllowMint
+/// would instead park the row at the mint gate before this branch is reached.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
+async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Permanent Delegate: Withdrawal → ManualReview When Escrow ATA Missing ===");
+    println!("=== Permanent Delegate: Withdrawal to ManualReview When Escrow ATA Empty ===");
 
     set_operator_env_vars();
 
@@ -580,15 +578,26 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
     )
     .await?;
 
-    // Skip AllowMint so the escrow ATA is never created on-chain.
+    // AllowMint creates the escrow ATA and the AllowedMint account the gate reads.
+    // Nothing funds the ATA afterwards, so the pre-flight sees a zero balance.
+    allow_mint_for_program(
+        &client,
+        &admin,
+        instance_pda,
+        mint_pubkey,
+        TOKEN_2022_PROGRAM_ID,
+    )
+    .await?;
+
     let escrow_ata = get_associated_token_address_with_program_id(
         &instance_pda,
         &mint_pubkey,
         &TOKEN_2022_PROGRAM_ID,
     );
-    assert!(
-        client.get_account(&escrow_ata).await.is_err(),
-        "pre-condition: escrow ATA must not exist on-chain",
+    let escrow_balance = client.get_token_account_balance(&escrow_ata).await?;
+    assert_eq!(
+        escrow_balance.amount, "0",
+        "pre-condition: escrow ATA must exist and be empty",
     );
 
     // Seed DB: mints row with has_permanent_delegate=None, pending withdrawal.
@@ -650,7 +659,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_does_not_exist(
         .expect("withdrawal row should still exist");
     assert_eq!(
         row.status, "manual_review",
-        "missing escrow ATA should route the withdrawal to manual_review, not loop the operator",
+        "an empty escrow ATA should route the withdrawal to manual_review, not loop the operator",
     );
 
     let stored_mint = storage

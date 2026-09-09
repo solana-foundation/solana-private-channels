@@ -14,7 +14,7 @@
 use {
     private_channel_indexer::{
         config::ProgramType,
-        indexer::checkpoint::{CheckpointUpdate, CheckpointWriter},
+        indexer::checkpoint::{CheckpointMsg, CheckpointUpdate, CheckpointWriter},
         storage::{common::storage::mock::MockStorage, Storage},
     },
     std::{sync::Arc, time::Duration},
@@ -28,7 +28,7 @@ async fn run_with_updates(
     updates: Vec<CheckpointUpdate>,
     hold_for: Duration,
 ) {
-    let (tx, rx) = mpsc::channel::<CheckpointUpdate>(16);
+    let (tx, rx) = mpsc::channel::<CheckpointMsg>(16);
     // batch_interval=1s forces the ticker branch to fire within `hold_for`.
     let handle = CheckpointWriter::new(storage)
         .with_batch_interval(1)
@@ -36,7 +36,7 @@ async fn run_with_updates(
         .start(rx);
 
     for u in updates {
-        tx.send(u).await.expect("channel open");
+        tx.send(CheckpointMsg::Slot(u)).await.expect("channel open");
     }
 
     tokio::time::sleep(hold_for).await;

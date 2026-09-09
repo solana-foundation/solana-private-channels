@@ -129,12 +129,12 @@ fn make_mint_builder(mint: Pubkey) -> MintToBuilder {
 ///
 /// `populate_builder` controls whether `state.mint_builders` is pre-seeded
 /// for `txn_id` (when false, the helper hits its no-cached-builder
-/// PermanentFailure branch on first lookup).
+/// Transient branch on first lookup).
 ///
 /// `populate_mint_cache` controls whether `mock_storage.mints` carries a
 /// `DbMint` for the mint pubkey. The mint-cache-miss test relies on
 /// passing `false` here so `get_mint_metadata` returns the
-/// `PermanentFailure("mint not in mint cache")` branch.
+/// `Transient("mint not in mint cache")` branch.
 struct Fixture {
     state: private_channel_indexer::operator::sender::types::SenderState,
     mock: MockRpcServer,
@@ -428,14 +428,14 @@ async fn jit_returns_manual_review_when_post_init_authority_mismatch() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Mint cache miss — PermanentFailure.
+// Mint cache miss — Transient.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Pre-check sees uninit (would normally fall through to init), but
 // `get_mint_metadata` fails because the mint cache is empty. Routes to
-// PermanentFailure with the cache-miss reason string.
+// Transient with the cache-miss reason string.
 #[tokio::test]
-async fn jit_returns_permanent_failure_when_mint_cache_miss() {
+async fn jit_returns_transient_when_mint_cache_miss() {
     let Fixture {
         mut state,
         mock,
@@ -448,13 +448,13 @@ async fn jit_returns_permanent_failure_when_mint_cache_miss() {
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
 
     match outcome {
-        JitOutcome::PermanentFailure(reason) => {
+        JitOutcome::Transient(reason) => {
             assert!(
                 reason.contains("mint not in mint cache"),
                 "cache-miss must surface the cache-miss reason; got {reason:?}"
             );
         }
-        other => panic!("expected PermanentFailure, got {:?}", debug_outcome(&other)),
+        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
     }
     assert_eq!(
         mock.call_count("sendTransaction"),
@@ -508,10 +508,10 @@ async fn jit_falls_through_when_initial_probe_returns_rpc_error() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// sendTransaction fails — PermanentFailure without polling.
+// sendTransaction fails — Transient without polling.
 // ─────────────────────────────────────────────────────────────────────
 #[tokio::test]
-async fn jit_returns_permanent_failure_when_send_transaction_fails() {
+async fn jit_returns_transient_when_send_transaction_fails() {
     let Fixture {
         mut state,
         mock,
@@ -529,13 +529,13 @@ async fn jit_returns_permanent_failure_when_send_transaction_fails() {
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
 
     match outcome {
-        JitOutcome::PermanentFailure(reason) => {
+        JitOutcome::Transient(reason) => {
             assert!(
                 reason.contains("Failed to send InitializeMint transaction"),
                 "send failure must surface the send-failure reason; got {reason:?}"
             );
         }
-        other => panic!("expected PermanentFailure, got {:?}", debug_outcome(&other)),
+        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
     }
     assert_eq!(mock.call_count("sendTransaction"), 1);
     assert_eq!(
@@ -639,14 +639,14 @@ async fn jit_returns_manual_review_when_backoff_recovers_with_authority_mismatch
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Backoff exhausts with uninit reads — PermanentFailure.
+// Backoff exhausts with uninit reads — Transient.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Wall-clock note: this is the only test that pays the full
 // 4 × BACKOFF_MS = ~750 ms for the backoff loop; do not duplicate this
 // shape elsewhere.
 #[tokio::test]
-async fn jit_returns_permanent_failure_when_backoff_exhausts_with_uninit() {
+async fn jit_returns_transient_when_backoff_exhausts_with_uninit() {
     let Fixture {
         mut state,
         mock,
@@ -667,13 +667,13 @@ async fn jit_returns_permanent_failure_when_backoff_exhausts_with_uninit() {
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
 
     match outcome {
-        JitOutcome::PermanentFailure(reason) => {
+        JitOutcome::Transient(reason) => {
             assert!(
                 reason.contains("InitializeMint transaction could not be confirmed"),
                 "exhausted-backoff must surface the could-not-be-confirmed reason; got {reason:?}"
             );
         }
-        other => panic!("expected PermanentFailure, got {:?}", debug_outcome(&other)),
+        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
     }
     assert_eq!(
         mock.call_count("getAccountInfo"),
@@ -685,10 +685,10 @@ async fn jit_returns_permanent_failure_when_backoff_exhausts_with_uninit() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// No cached builder — PermanentFailure, zero RPC calls.
+// No cached builder — Transient, zero RPC calls.
 // ─────────────────────────────────────────────────────────────────────
 #[tokio::test]
-async fn jit_returns_permanent_failure_when_no_cached_builder() {
+async fn jit_returns_transient_when_no_cached_builder() {
     let Fixture {
         mut state,
         mock,
@@ -699,13 +699,13 @@ async fn jit_returns_permanent_failure_when_no_cached_builder() {
     let outcome = test_hooks::jit_mint_init(&mut state, txn_id, instruction).await;
 
     match outcome {
-        JitOutcome::PermanentFailure(reason) => {
+        JitOutcome::Transient(reason) => {
             assert!(
                 reason.contains("no cached MintToBuilder"),
                 "missing-builder branch must surface its specific reason; got {reason:?}"
             );
         }
-        other => panic!("expected PermanentFailure, got {:?}", debug_outcome(&other)),
+        other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
     }
     assert_eq!(
         mock.call_count("getAccountInfo"),
@@ -722,6 +722,6 @@ fn debug_outcome(outcome: &JitOutcome) -> String {
     match outcome {
         JitOutcome::Retry(_) => "Retry(_)".to_string(),
         JitOutcome::ManualReview(reason) => format!("ManualReview({reason:?})"),
-        JitOutcome::PermanentFailure(reason) => format!("PermanentFailure({reason:?})"),
+        JitOutcome::Transient(reason) => format!("Transient({reason:?})"),
     }
 }
