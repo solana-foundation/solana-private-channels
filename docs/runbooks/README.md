@@ -119,6 +119,10 @@ The runbooks call this out at every relevant site.
   refusing to checkpoint past a slot whose block the RPC endpoint will not serve.
   Paged by the `indexer-block-unavailable` Grafana alert, not by the webhook
   dispatch table above (no transaction row changes status).
+- [`mint_memo_cutover.md`](mint_memo_cutover.md) - a resync aborting because a
+  channel mint carries a legacy-scheme idempotency memo. Log-discovered, not
+  paged; the resync fails closed before dropping anything, so the database is
+  intact.
 
 ## Drills
 

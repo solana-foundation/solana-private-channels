@@ -469,7 +469,7 @@ pub async fn enumerate_consumed_mints(
                 return Err(format!(
                     "channel mint {} carries an idempotency memo that does not parse to a \
                      current-scheme source-event-id (legacy memo scheme); resync cannot reconcile \
-                     across the memo cutover - drain the operator and follow the cutover runbook",
+                     across the memo cutover - see docs/runbooks/mint_memo_cutover.md",
                     status.signature
                 ));
             };
