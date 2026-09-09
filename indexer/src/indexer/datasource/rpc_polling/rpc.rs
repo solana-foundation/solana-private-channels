@@ -17,6 +17,11 @@ pub(crate) const MAX_IDLE_GAP_SLOTS: u64 = 1_000;
 /// same poller also reads chains whose skipped runs no heartbeat bounds.
 pub(crate) const MAX_LOOKAHEAD_SLOTS: u64 = MAX_IDLE_GAP_SLOTS * 10;
 
+/// Highest transaction version this poller can decode. A ceiling, not a request:
+/// below it one v1 tx fails the whole block with -32015, which wedges the slot
+/// instead of skipping it. https://solana.com/upgrades/larger-transaction-sizes
+const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
+
 pub struct RpcPoller {
     client: reqwest::Client,
     rpc_url: String,
@@ -58,10 +63,7 @@ impl RpcPoller {
                     {
                         "encoding": self.encoding.to_string(),
                         "transactionDetails": "full",
-                        // Ceiling, not a request: below it one v1 tx fails the whole
-                        // block with -32015, which wedges the slot instead of skipping it.
-                        // https://solana.com/upgrades/larger-transaction-sizes
-                        "maxSupportedTransactionVersion": 1,
+                        "maxSupportedTransactionVersion": MAX_SUPPORTED_TRANSACTION_VERSION,
                         "rewards": false,
                         "commitment": self.commitment.to_string(),
                     }

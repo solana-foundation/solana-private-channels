@@ -1217,8 +1217,9 @@ mod tests {
     fn v1_transaction_captured_from_devnet_parses_into_a_deposit_row() {
         let amount = 4_242;
         // Escrow program at key index 0; the rest pad the deposit's 12 accounts.
-        let mut account_keys: Vec<String> =
-            (0u8..12).map(|index| test_pubkey(index).to_string()).collect();
+        let mut account_keys: Vec<String> = (0u8..12)
+            .map(|index| test_pubkey(index).to_string())
+            .collect();
         account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
 
         let response = json!({
