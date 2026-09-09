@@ -290,7 +290,9 @@ async fn it2b_deposit_dead_signature_demoted() {
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
     // Persisted write-ahead before broadcast; the mint never landed and the blockhash expired.
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
+    // Journal the blockhash slot the attempt was built against: absence is only
+    // proof of non-inclusion when the ledger is known to cover that window.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, Some(50))
         .await
         .unwrap();
 
@@ -301,6 +303,8 @@ async fn it2b_deposit_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor below the journaled slot, so the window is covered.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(1)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
@@ -317,11 +321,14 @@ async fn it2b_deposit_dead_signature_demoted() {
     mock.shutdown().await;
 }
 
-// IT-3: withdrawal whose recorded release signature is dead (null status, blockhash expired) → demote.
+// IT-3: withdrawal whose recorded release signature is dead (null status, blockhash
+// expired) and no escrow instance is configured → quarantine, not demote. With no
+// bitmap to check the nonce against, the release may have landed under a signature
+// that was never journaled, so re-arming could pay twice.
 
 #[tokio::test(flavor = "multi_thread")]
-async fn it3_withdrawal_dead_signature_demoted() {
-    let (db, url, _container) = start_pg("it3_wd_demote").await;
+async fn it3_withdrawal_dead_signature_quarantines_without_instance() {
+    let (db, url, _container) = start_pg("it3_wd_quarantine").await;
     let storage = Arc::new(Storage::Postgres(db.clone()));
     storage.init_schema().await.unwrap();
     let pool = sqlx::PgPool::connect(&url).await.unwrap();
@@ -329,7 +336,9 @@ async fn it3_withdrawal_dead_signature_demoted() {
     let tx = make_withdrawal(&Signature::new_unique().to_string(), 7);
     let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
     seed_backdated_processing(&pool, tx_id, ChronoDuration::minutes(10)).await;
-    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, None)
+    // Journal the blockhash slot the attempt was built against: absence is only
+    // proof of non-inclusion when the ledger is known to cover that window.
+    db.insert_release_signature_internal(tx_id, Signature::new_unique().to_string(), 100, Some(50))
         .await
         .unwrap();
 
@@ -340,23 +349,31 @@ async fn it3_withdrawal_dead_signature_demoted() {
         Reply::result(json!({"context": {"slot": 200}, "value": [null]})),
     );
     mock.enqueue("getBlockHeight", Reply::result(json!(1000)));
+    // Ledger floor below the journaled slot, so the window is covered.
+    mock.enqueue("getFirstAvailableBlock", Reply::result(json!(1)));
     let client = test_client(mock.url());
     let (storage_tx, _rx) = mpsc::channel::<TransactionStatusUpdate>(8);
 
-    let metric_before = snapshot_recovered("withdraw", "requeued", "withdrawal");
+    let metric_before = snapshot_recovered("withdraw", "quarantined", "withdrawal");
 
     test_hooks::run_recovery_once(&storage, &client, ProgramType::Withdraw, None, &storage_tx)
         .await
         .unwrap();
 
-    assert_eq!(status_of(&pool, tx_id).await, "pending");
+    assert_eq!(status_of(&pool, tx_id).await, "manual_review");
     let fresh = updated_at_of(&pool, tx_id).await;
     assert!(
         fresh > Utc::now() - ChronoDuration::seconds(5),
         "updated_at should be fresh"
     );
     assert_eq!(mock.call_count("sendTransaction"), 0);
-    assert_recovered_increment("withdraw", "requeued", "withdrawal", metric_before, "IT-3");
+    assert_recovered_increment(
+        "withdraw",
+        "quarantined",
+        "withdrawal",
+        metric_before,
+        "IT-3",
+    );
     mock.shutdown().await;
 }
 
