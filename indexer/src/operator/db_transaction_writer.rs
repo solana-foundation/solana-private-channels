@@ -73,8 +73,9 @@ impl DbTransactionWriter {
                 update.status,
                 update.counterpart_signature.clone(),
                 update.processed_at.unwrap_or_else(Utc::now),
-                // Theirs' release_signatures provenance column is out of scope
-                // for this merge, so nothing is written to it yet.
+                // The release_signatures column exists and is migrated, but nothing
+                // reads it yet. It is provenance only, and adopting it means a new
+                // field on every TransactionStatusUpdate, so it is deferred, not dropped.
                 None,
             )
             .await
@@ -88,10 +89,9 @@ impl DbTransactionWriter {
                     .with_label_values(&[pt, &format!("{:?}", update.status)])
                     .inc();
             }
-            // A skipped Completed is not recoverable: the release landed on
-            // chain, no other path re-derives that outcome, and the next boot
-            // rebuilds the local tree without the nonce and refuses to start.
-            // Every other status is routine recovery churn.
+            // A skipped Completed is unrecoverable: the release landed on chain and
+            // validate_bitmap_consistency refuses the next boot once Completed rows
+            // and bitmap bits diverge. Every other status is routine recovery churn.
             Ok(false) if update.status == TransactionStatus::Completed => {
                 error!(
                     trace_id = trace_id,
