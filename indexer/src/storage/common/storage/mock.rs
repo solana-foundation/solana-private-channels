@@ -149,10 +149,16 @@ impl MockStorage {
     }
 
     pub async fn init_schema(&self) -> Result<(), StorageError> {
-        Ok(())
+        self.check_should_fail("init_schema")
     }
 
+    /// Empties the row tables so a test can tell a drop that ran from one that
+    /// was refused, instead of only counting calls.
     pub async fn drop_tables(&self) -> Result<(), StorageError> {
+        self.check_should_fail("drop_tables")?;
+        self.pending_transactions.lock().unwrap().clear();
+        self.mints.lock().unwrap().clear();
+        self.committed_checkpoints.lock().unwrap().clear();
         Ok(())
     }
 

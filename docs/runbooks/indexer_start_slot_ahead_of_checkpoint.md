@@ -94,6 +94,10 @@ chosen genesis slot under fail-closed channel reconciliation:
 private-channel-indexer resync --genesis-slot <slot> --channel-rpc-url <url>
 ```
 
+A withdraw resync additionally needs `common.escrow_instance_id` and `--escrow-rpc-url`
+(a Solana RPC), and refuses unless the escrow's withdrawal bitmap is at generation 0 with
+no set bits.
+
 Do **not** hand-edit `indexer_state` to make the refusal go away. That is the silent data
 loss the refusal exists to prevent, and it is the same move
 [`indexer_block_unavailable.md`](indexer_block_unavailable.md) forbids.
