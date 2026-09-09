@@ -79,9 +79,8 @@ COPY private-channel-escrow-program/clients/rust/Cargo.toml ./private-channel-es
 COPY private-channel-withdraw-program/program/Cargo.toml ./private-channel-withdraw-program/program/
 COPY private-channel-withdraw-program/tests/integration-tests/Cargo.toml ./private-channel-withdraw-program/tests/integration-tests/
 COPY private-channel-withdraw-program/clients/rust/Cargo.toml ./private-channel-withdraw-program/clients/rust/
-COPY dvp-swap-program/program/Cargo.toml ./dvp-swap-program/program/
-COPY dvp-swap-program/tests/integration-tests/Cargo.toml ./dvp-swap-program/tests/integration-tests/
-COPY dvp-swap-program/tests/transfer-hook-fixture/Cargo.toml ./dvp-swap-program/tests/transfer-hook-fixture/
+# dvp-swap-program is vendored (generated client + prebuilt .so from
+# solana-foundation/dvp); only the client crate is a workspace member.
 COPY dvp-swap-program/clients/rust/Cargo.toml ./dvp-swap-program/clients/rust/
 COPY integration/Cargo.toml ./integration/
 COPY test_utils/Cargo.toml ./test_utils/
@@ -95,8 +94,7 @@ RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-p
     private-channel-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/clients/rust/src \
-    dvp-swap-program/program/src dvp-swap-program/tests/integration-tests/src \
-    dvp-swap-program/tests/transfer-hook-fixture/src dvp-swap-program/clients/rust/src \
+    dvp-swap-program/clients/rust/src \
     core/src metrics/src auth/src auth/src/bin bench-tps/src
 RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escrow-program/tests/integration-tests/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/program/src/lib.rs \
@@ -104,8 +102,7 @@ RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escr
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \
     test_utils/src/lib.rs scripts/devnet/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/clients/rust/src/lib.rs \
-    dvp-swap-program/program/src/lib.rs dvp-swap-program/tests/integration-tests/src/lib.rs \
-    dvp-swap-program/tests/transfer-hook-fixture/src/lib.rs dvp-swap-program/clients/rust/src/lib.rs \
+    dvp-swap-program/clients/rust/src/lib.rs \
     core/src/lib.rs metrics/src/lib.rs auth/src/lib.rs && \
     printf 'fn main() {}\n' > bench-tps/src/main.rs && \
     printf 'fn main() {}\n' > auth/src/main.rs && \
@@ -130,12 +127,9 @@ RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     make -C private-channel-escrow-program install build \
     && make -C private-channel-withdraw-program install build \
-    && make -C dvp-swap-program install generate-clients \
-    && (cd dvp-swap-program/program && cargo-build-sbf) \
     && mkdir -p /out/deploy \
     && cp target/deploy/private_channel_escrow_program.so /out/deploy/ \
-    && cp target/deploy/private_channel_withdraw_program.so /out/deploy/ \
-    && cp target/deploy/dvp_swap_program.so /out/deploy/
+    && cp target/deploy/private_channel_withdraw_program.so /out/deploy/
 
 # Next, do the real build for the other components
 COPY core ./core
@@ -147,11 +141,10 @@ COPY auth ./auth
 # core/precompiles/private_channel_withdraw_program.so is a symlink into target/deploy/ (used by
 # include_bytes! in core). The cache-mounted target/ isn't reliably available to the next
 # build, so swap the symlink for the real .so. rm first — otherwise cp follows the symlink
-# and writes to the wrong place.
+# and writes to the wrong place. (dvp_swap_program.so is a committed vendored binary, not built
+# here, so it needs no swap.)
 RUN rm -f core/precompiles/private_channel_withdraw_program.so \
-    && cp /out/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so \
-    && rm -f core/precompiles/dvp_swap_program.so \
-    && cp /out/deploy/dvp_swap_program.so core/precompiles/dvp_swap_program.so
+    && cp /out/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so
 
 # Final build — binaries are copied to /out/ per the convention noted above.
 RUN --mount=type=cache,target=/usr/src/private_channel/target,sharing=locked \
