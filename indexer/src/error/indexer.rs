@@ -133,6 +133,16 @@ pub enum ReconciliationError {
     )]
     WithdrawalBitmapAdvanced { generation: u64, set_bits: usize },
 
+    /// The local database already holds completed withdrawals, so their nonces are set on
+    /// the chain's bitmap whatever an RPC reports. This is refused before any RPC is read.
+    #[error(
+        "the database records {completed} completed withdrawal(s), so the chain's bitmap has \
+         issued their nonces; a resync would restart the nonce sequence at 0 under them. \
+         Aborted before drop, the database is intact. See \
+         docs/runbooks/resync_bitmap_advanced.md"
+    )]
+    WithdrawalNoncesReleased { completed: usize },
+
     /// The bitmap could not be read, so the advance check never ran. An unreadable
     /// bitmap is not evidence that the chain is fresh, so resync refuses rather than skips.
     #[error(

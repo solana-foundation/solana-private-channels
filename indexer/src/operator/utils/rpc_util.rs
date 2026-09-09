@@ -241,6 +241,16 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get the estimated production time of `slot` with retry. The resync
+    /// pre-flight compares it against wall clock to prove the node it is about
+    /// to read the bitmap from is at the live tip and not replaying a snapshot.
+    pub async fn get_block_time(&self, slot: u64) -> Result<i64, Box<client_error::Error>> {
+        self.with_retry("get_block_time", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_block_time(slot).await
+        })
+        .await
+    }
+
     /// Get the node's lowest retained slot with retry. An absence-based `Dead`
     /// finality verdict consults this to prove the endpoint still retains the
     /// attempt's slot range.

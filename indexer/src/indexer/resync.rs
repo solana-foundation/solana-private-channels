@@ -17,6 +17,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+/// How far behind wall clock the bitmap RPC's finalized tip may sit and still count as
+/// evidence about the live chain. Generous next to Solana's finalization, because the
+/// failure it exists to catch is a node hours behind, not one a few slots behind.
+const MAX_BITMAP_RPC_TIP_LAG_SECS: i64 = 120;
+
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
 #[derive(Clone, Debug)]
 pub struct ChannelReconcileConfig {
@@ -114,9 +119,14 @@ impl ResyncService {
         Ok(Some(Arc::new(set)))
     }
 
-    /// Refuse a withdraw rebuild unless the on-chain bitmap has issued nothing. The rebuild
+    /// Refuse a withdraw rebuild unless the chain has issued no nonce at all. The rebuild
     /// restarts the nonce sequence at 0, so rebuilt rows would reuse nonces the chain has
     /// spent. Renumbering is not offered because it rewrites which withdrawal a nonce names.
+    ///
+    /// Two independent proofs, in order. The database's own completed rows settle it without
+    /// any RPC. Only then is the bitmap read, and it is read bound to a finalized tip proven
+    /// fresh against wall clock, so a lagging or snapshot-replaying node errors instead of
+    /// serving an old empty bitmap whose clear bits would read as a fresh chain.
     async fn refuse_if_bitmap_advanced(&self) -> Result<(), IndexerError> {
         if self.program_type != ProgramType::Withdraw {
             return Ok(());
@@ -125,6 +135,26 @@ impl ResyncService {
             error!("Withdrawal bitmap unverified; aborting resync before drop: {reason}");
             IndexerError::Reconciliation(ReconciliationError::WithdrawalBitmapUnverified { reason })
         };
+
+        // Local proof first. A completed withdrawal is this database's own record that its
+        // nonce was released, which no RPC answer can contradict. Bounded by i64::MAX
+        // because the column is signed.
+        let completed = self
+            .storage
+            .get_completed_withdrawal_nonces(0, i64::MAX as u64)
+            .await?;
+        if !completed.is_empty() {
+            error!(
+                completed = completed.len(),
+                "Database holds completed withdrawals; aborting resync before drop"
+            );
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::WithdrawalNoncesReleased {
+                    completed: completed.len(),
+                },
+            ));
+        }
+
         let (Some(instance), Some(rpc_url)) = (
             self.escrow_instance_id,
             self.withdrawal_bitmap_rpc_url.as_ref(),
@@ -145,9 +175,34 @@ impl ResyncService {
         let rpc = RpcClientWithRetry::with_retry_config(
             rpc_url.clone(),
             RetryConfig::default(),
-            CommitmentConfig::confirmed(),
+            CommitmentConfig::finalized(),
         );
-        let bitmap = fetch_consumed_nonces(&rpc, &bitmap_pda, None)
+
+        // Anchor on the node's own finalized tip, then prove that tip is recent. A node
+        // replaying a snapshot answers consistently about a chain that is hours old, and
+        // its empty bitmap would otherwise pass this check.
+        let (ref_slot, _) = rpc
+            .get_latest_blockhash_with_context(CommitmentConfig::finalized())
+            .await
+            .map_err(|e| unverified(format!("finalized tip read failed: {e}")))?;
+        let tip_time = rpc.get_block_time(ref_slot).await.map_err(|e| {
+            unverified(format!(
+                "finalized tip slot {ref_slot} has no block time, so its freshness cannot \
+                 be shown: {e}"
+            ))
+        })?;
+        let lag = chrono::Utc::now().timestamp().saturating_sub(tip_time);
+        if lag > MAX_BITMAP_RPC_TIP_LAG_SECS {
+            return Err(unverified(format!(
+                "the bitmap RPC's finalized tip (slot {ref_slot}) is {lag}s behind wall clock, \
+                 past the {MAX_BITMAP_RPC_TIP_LAG_SECS}s limit; a lagging node cannot show the \
+                 chain has issued no nonce"
+            )));
+        }
+
+        // Bound to that slot, so a load balancer routing this read to an older backend
+        // returns an error rather than a staler bitmap.
+        let bitmap = fetch_consumed_nonces(&rpc, &bitmap_pda, Some(ref_slot))
             .await
             .map_err(|e| unverified(e.to_string()))?;
 
@@ -164,7 +219,10 @@ impl ResyncService {
                 },
             ));
         }
-        info!("Withdrawal bitmap is fresh: generation 0, no set bits");
+        info!(
+            ref_slot,
+            "Withdrawal bitmap is fresh: generation 0, no set bits, read at the finalized tip"
+        );
         Ok(())
     }
 
@@ -435,7 +493,51 @@ mod tests {
 
     // ── withdrawal bitmap pre-flight ─────────────────────────────────
 
-    /// Mount a withdrawal bitmap account as the server's `getAccountInfo` reply.
+    use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+
+    /// Context slot every mocked finalized tip reports. The bitmap mock only answers a
+    /// read bound to it, so an unbound read fails every test that expects the check to pass.
+    const REF_SLOT: u64 = 7;
+
+    /// Mount the node's finalized tip: `getLatestBlockhash` at `REF_SLOT` and a
+    /// `getBlockTime` for it. `None` answers the block time with null.
+    fn mock_fresh_tip(server: &mut mockito::ServerGuard, block_time: Option<i64>) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": REF_SLOT},
+                        "value": {
+                            "blockhash": solana_sdk::hash::Hash::new_unique().to_string(),
+                            "lastValidBlockHeight": 1_000u64
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockTime""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": block_time}).to_string(),
+            )
+            .create();
+    }
+
+    /// Mount a withdrawal bitmap account as the server's `getAccountInfo` reply, answering
+    /// only a read bound to `REF_SLOT`.
     fn mock_bitmap_account(
         server: &mut mockito::ServerGuard,
         generation: u64,
@@ -445,16 +547,17 @@ mod tests {
         let bytes = crate::operator::bitmap_account_bytes(generation, consumed, 255);
         server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(
-                r#""method"\s*:\s*"getAccountInfo""#.into(),
-            ))
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                mockito::Matcher::Regex(format!(r#""minContextSlot"\s*:\s*{REF_SLOT}\b"#)),
+            ]))
             .with_status(200)
             .with_body(
                 serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "context": {"slot": 1},
+                        "context": {"slot": REF_SLOT},
                         "value": {
                             "owner": Pubkey::new_unique().to_string(),
                             "lamports": 1_000_000u64,
@@ -480,6 +583,40 @@ mod tests {
         );
         let storage = Arc::new(Storage::Mock(mock.clone()));
         (mock, storage)
+    }
+
+    fn seed_completed_withdrawal(mock: &MockStorage, nonce: u64) {
+        let now = chrono::Utc::now();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(DbTransaction {
+                id: nonce as i64 + 1,
+                signature: solana_sdk::signature::Signature::new_unique().to_string(),
+                trace_id: format!("trace-{nonce}"),
+                slot: 1,
+                initiator: Pubkey::new_unique().to_string(),
+                recipient: Pubkey::new_unique().to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                amount: TokenAmount(1_000),
+                memo: None,
+                transaction_type: TransactionType::Withdrawal,
+                withdrawal_nonce: Some(nonce as i64),
+                status: TransactionStatus::Completed,
+                created_at: now,
+                updated_at: now,
+                processed_at: None,
+                counterpart_signature: None,
+                remint_signatures: None,
+                remint_last_valid_block_heights: None,
+                pending_remint_deadline_at: None,
+                finality_check_attempts: 0,
+                recovery_requeue_attempts: 0,
+                instruction_index: 0,
+                inner_index: None,
+                landed_remint_signature: None,
+                release_refused_on_chain: false,
+            });
     }
 
     fn assert_db_intact(mock: &MockStorage) {
@@ -527,11 +664,81 @@ mod tests {
         }
     }
 
+    /// A completed row is the database's own record that a nonce was released, so the
+    /// resync refuses on it without consulting any RPC. The bitmap RPC is a dead port
+    /// here, which is what proves no read was attempted.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_when_db_holds_completed_withdrawals_before_any_rpc() {
+        let (mock, storage) = populated_storage();
+        seed_completed_withdrawal(&mock, 4);
+        seed_completed_withdrawal(&mock, 9);
+        let service = withdraw_service(
+            storage,
+            Some(Pubkey::new_unique()),
+            Some("http://127.0.0.1:1".to_string()),
+        );
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::WithdrawalNoncesReleased {
+                completed,
+            })) => assert_eq!(completed, 2),
+            other => panic!("completed withdrawals must abort the resync locally, got: {other:?}"),
+        }
+        assert_db_intact(&mock);
+    }
+
+    /// A node whose finalized tip is far behind wall clock is replaying old state, and an
+    /// empty bitmap from it says nothing about the live chain. The bitmap must not be read.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_when_bitmap_rpc_tip_is_stale_db_intact() {
+        let mut server = mockito::Server::new_async().await;
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp() - 3_600));
+        let bitmap = mock_bitmap_account(&mut server, 0, &[]).expect(0);
+        let (mock, storage) = populated_storage();
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::WithdrawalBitmapUnverified { reason },
+            )) => assert!(
+                reason.contains("behind wall clock"),
+                "reason must name the lag, got: {reason}"
+            ),
+            other => panic!("a stale tip must abort the resync, got: {other:?}"),
+        }
+        bitmap.assert();
+        assert_db_intact(&mock);
+    }
+
+    /// Without a block time for the finalized tip its freshness cannot be shown, which is
+    /// the same refusal as an unreadable bitmap.
+    #[tokio::test]
+    async fn run_refuses_withdraw_resync_when_tip_block_time_unavailable_db_intact() {
+        let mut server = mockito::Server::new_async().await;
+        mock_fresh_tip(&mut server, None);
+        let bitmap = mock_bitmap_account(&mut server, 0, &[]).expect(0);
+        let (mock, storage) = populated_storage();
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::WithdrawalBitmapUnverified { reason },
+            )) => assert!(
+                reason.contains("block time"),
+                "reason must name the missing block time, got: {reason}"
+            ),
+            other => panic!("a tip with no block time must abort the resync, got: {other:?}"),
+        }
+        bitmap.assert();
+        assert_db_intact(&mock);
+    }
+
     /// A set bit means the chain has issued a nonce. Rebuilding would restart the
     /// sequence at 0 underneath it, so the resync must refuse with the tables intact.
     #[tokio::test]
     async fn run_refuses_withdraw_resync_when_bitmap_has_set_bits_db_intact() {
         let mut server = mockito::Server::new_async().await;
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
         let _bitmap = mock_bitmap_account(&mut server, 0, &[3]);
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
@@ -554,6 +761,7 @@ mod tests {
     #[tokio::test]
     async fn run_refuses_withdraw_resync_when_bitmap_generation_advanced_db_intact() {
         let mut server = mockito::Server::new_async().await;
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
         let _bitmap = mock_bitmap_account(&mut server, 2, &[]);
         let (mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
@@ -571,11 +779,13 @@ mod tests {
         assert_db_intact(&mock);
     }
 
-    /// Generation 0 with no bits set is a chain that has issued nothing, so the
-    /// resync continues to the next pre-flight. The dead tip RPC is what it hits.
+    /// Generation 0 with no bits set, read bound to a fresh finalized tip, is a chain that
+    /// has issued nothing, so the resync continues to the next pre-flight. The dead tip
+    /// RPC is what it hits. The bitmap mock only answers a read bound to `REF_SLOT`.
     #[tokio::test]
-    async fn run_proceeds_past_bitmap_check_on_fresh_bitmap() {
+    async fn run_proceeds_past_bitmap_check_on_fresh_bitmap_bound_to_finalized_tip() {
         let mut server = mockito::Server::new_async().await;
+        mock_fresh_tip(&mut server, Some(chrono::Utc::now().timestamp()));
         let bitmap = mock_bitmap_account(&mut server, 0, &[]);
         let (_mock, storage) = populated_storage();
         let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
@@ -604,8 +814,8 @@ mod tests {
             Err(IndexerError::Reconciliation(
                 ReconciliationError::WithdrawalBitmapUnverified { reason },
             )) => assert!(
-                reason.contains("bitmap"),
-                "reason must name the bitmap read, got: {reason}"
+                reason.contains("bitmap") || reason.contains("finalized"),
+                "reason must name the failed read, got: {reason}"
             ),
             other => panic!("an unreadable bitmap must abort the resync, got: {other:?}"),
         }

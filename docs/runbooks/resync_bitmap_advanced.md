@@ -18,7 +18,20 @@ intact. See docs/runbooks/resync_bitmap_advanced.md
 
 The error surfaces as `ReconciliationError::WithdrawalBitmapAdvanced`.
 
-A sibling refusal fires when the bitmap could not be read at all:
+A sibling refusal fires when the database itself records released nonces, before
+any RPC is consulted:
+
+```
+the database records <N> completed withdrawal(s), so the chain's bitmap has issued
+their nonces; a resync would restart the nonce sequence at 0 under them. Aborted
+before drop, the database is intact. See docs/runbooks/resync_bitmap_advanced.md
+```
+
+That one is `ReconciliationError::WithdrawalNoncesReleased`. It is the same
+refusal as an advanced bitmap, reached from local evidence rather than from the
+chain, and no RPC answer can clear it.
+
+A third refusal fires when the bitmap could not be read at all:
 
 ```
 withdrawal bitmap could not be verified, resync aborted before drop: <reason>. An
@@ -30,6 +43,14 @@ That one is `ReconciliationError::WithdrawalBitmapUnverified`. It usually means
 `common.escrow_instance_id` or `--escrow-rpc-url` is missing, or the Solana RPC
 did not answer. Fix the input and rerun; the check itself has not made a
 judgement about the chain yet.
+
+Two of its reasons are about the RPC endpoint rather than the bitmap account:
+
+- `finalized tip ... is <N>s behind wall clock` means the node is lagging or
+  replaying a snapshot. Its answers describe an older chain, so an empty bitmap
+  from it proves nothing. Point `--escrow-rpc-url` at a node at the live tip.
+- `finalized tip slot ... has no block time` means the node could not date its
+  own tip, so its freshness could not be shown either way.
 
 **Nothing has been destroyed.** The bitmap is read in the same fail-closed
 pre-flight block as the genesis-slot, channel-reachability and memo-scheme
@@ -61,6 +82,19 @@ The refusal is the only pre-flight that reads chain-side withdrawal state, and i
 fires on any non-zero generation or any set bit, because either one proves the
 chain has issued a nonce.
 
+It takes two independent proofs, in that order, so a wrong answer from one cannot
+open the gate on its own:
+
+1. **The database's own completed withdrawals.** A `completed` withdrawal row is
+   this indexer's record that the chain released that nonce. No RPC answer can
+   contradict it, so this runs first and needs no network at all.
+2. **The bitmap, read at a tip proven fresh.** The check reads the node's
+   finalized tip, refuses if that tip's block time is more than 120 seconds
+   behind wall clock, and then reads the bitmap bound to that exact slot with
+   `minContextSlot`. A load balancer routing the account read to an older backend
+   returns an error rather than a staler bitmap, and a node replaying a snapshot
+   is rejected at the tip check before the bitmap is read at all.
+
 ## Why renumbering is not offered
 
 Aligning the rebuilt rows with the chain would mean assigning each rebuilt
@@ -85,8 +119,11 @@ solana account <BITMAP_PDA> --url <ESCROW_RPC> --output json
 ```
 
 If the account is at generation 0 with no set bits and the resync still refused,
-the RPC is serving stale or wrong state. Point `--escrow-rpc-url` at a different
-endpoint and rerun before doing anything else.
+either the RPC is serving stale or wrong state, or the database holds completed
+withdrawals whose bits a rotation has since cleared. Check which refusal fired:
+`WithdrawalNoncesReleased` is the local one and names a row count, and no change
+of endpoint will clear it. For the others, point `--escrow-rpc-url` at a node at
+the live tip and rerun before doing anything else.
 
 ### 2. Do not resync; stand up a fresh instance
 
@@ -125,3 +162,7 @@ that plan exists.
   database and discovers the problem at the first release.
 - **Do not resync without `--escrow-rpc-url` configured** hoping the check is
   skipped. It is not; an unreadable bitmap refuses the same way.
+- **Do not point `--escrow-rpc-url` at a lagging node** to get an empty bitmap
+  past the check. The tip freshness check exists for exactly that, and deleting
+  the completed rows to clear the local check destroys the only record of which
+  nonces were paid.
