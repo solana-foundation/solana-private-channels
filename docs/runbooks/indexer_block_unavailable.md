@@ -93,7 +93,7 @@ Confirm the endpoint really cannot serve it (substitute the slot from the log):
 
 ```sh
 curl -s "$COMMON_RPC_URL" -H 'content-type: application/json' -d \
-  '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[<N>,{"encoding":"json","transactionDetails":"none","maxSupportedTransactionVersion":0,"rewards":false,"commitment":"finalized"}]}'
+  '{"jsonrpc":"2.0","id":1,"method":"getBlock","params":[<N>,{"encoding":"json","transactionDetails":"none","maxSupportedTransactionVersion":1,"rewards":false,"commitment":"finalized"}]}'
 ```
 
 An error with code `-32004`, `-32007` or `-32009`, or a `null` result, confirms
