@@ -58,7 +58,10 @@ impl RpcPoller {
                     {
                         "encoding": self.encoding.to_string(),
                         "transactionDetails": "full",
-                        "maxSupportedTransactionVersion": 0,
+                        // Ceiling, not a request: below it one v1 tx fails the whole
+                        // block with -32015, which wedges the slot instead of skipping it.
+                        // https://solana.com/upgrades/larger-transaction-sizes
+                        "maxSupportedTransactionVersion": 1,
                         "rewards": false,
                         "commitment": self.commitment.to_string(),
                     }

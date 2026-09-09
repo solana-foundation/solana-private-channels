@@ -262,7 +262,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{error::ParserError, test_utils::rpc_blocks::*};
+    use crate::{
+        error::ParserError,
+        test_utils::{
+            escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes},
+            pubkey::test_pubkey,
+            rpc_blocks::*,
+        },
+    };
+    use serde_json::json;
 
     const TEST_PROGRAM_ID: &str = "TestProgram11111111111111111111111111111111";
 
@@ -1187,5 +1195,89 @@ mod tests {
             total,
             "(instruction_index, inner_index) must be unique regardless of CPI depth"
         );
+    }
+
+    /// A v1 transaction survives `RpcBlock` and reaches the parser intact.
+    ///
+    /// The envelope is copied from what a node actually served: devnet slot
+    /// 495752744, `getBlock` with `maxSupportedTransactionVersion: 1`. Its v1
+    /// markers are `version: 1` beside `transaction`, `transactionConfig` nested
+    /// inside `message`, and no `addressTableLookups` at all, because v1 dropped
+    /// lookup tables (SIMD-0385). None of the three are declared on our structs,
+    /// so serde has to drop them; this pins that. Tightening `RpcBlock` with
+    /// `deny_unknown_fields` breaks v1 here rather than in production.
+    ///
+    /// The captured transaction belonged to an unrelated devnet program, so the
+    /// instruction payload and its event CPI are swapped for escrow fixtures to
+    /// give the parser a row to find. The envelope is the real one; the payload
+    /// is version-independent and covered by the deposit tests above.
+    ///
+    /// v1 format: https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0385-transaction-v1.md
+    #[test]
+    fn v1_transaction_captured_from_devnet_parses_into_a_deposit_row() {
+        let amount = 4_242;
+        // Escrow program at key index 0; the rest pad the deposit's 12 accounts.
+        let mut account_keys: Vec<String> =
+            (0u8..12).map(|index| test_pubkey(index).to_string()).collect();
+        account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+
+        let response = json!({
+            "blockhash": "xbRm5shPwQECtyLGoxKKERD7vRqPeNHYqB6vt6hzjMb",
+            "parentSlot": 495_752_743u64,
+            "transactions": [{
+                "version": 1,
+                "transaction": {
+                    "signatures": ["42dtdM7KqUDEuPZPH8ic7KXoe6e14TrLCAKLVefGPKWhQgWBZkmDomRze9zv9KHyDjHMWSHTGWqwLfKevq6wzQDq"],
+                    "message": {
+                        "header": {
+                            "numRequiredSignatures": 1,
+                            "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": 1
+                        },
+                        "accountKeys": account_keys,
+                        "recentBlockhash": "Fu11pcSvhJBX3sNaE1FzsXC6jPx5wJPTaWrdsfmMPnos",
+                        "instructions": [{
+                            "programIdIndex": 0,
+                            "accounts": (0u8..12).collect::<Vec<u8>>(),
+                            "data": bs58::encode(deposit_ix_bytes(amount, None)).into_string(),
+                            "stackHeight": 1
+                        }],
+                        "transactionConfig": {
+                            "computeUnitLimit": 1_400_000,
+                            "heapSize": null,
+                            "loadedAccountsDataSizeLimit": 1_048_576,
+                            "priorityFee": null
+                        }
+                    }
+                },
+                "meta": {
+                    "err": null,
+                    "status": { "Ok": null },
+                    "fee": 5000,
+                    "computeUnitsConsumed": 37_638,
+                    "logMessages": [],
+                    "loadedAddresses": { "writable": [], "readonly": [] },
+                    "innerInstructions": [{
+                        "index": 0,
+                        "instructions": [{
+                            "programIdIndex": 0,
+                            "accounts": [],
+                            "data": bs58::encode(deposit_event_bytes(amount)).into_string(),
+                            "stackHeight": 2
+                        }]
+                    }]
+                }
+            }]
+        });
+
+        let block: RpcBlock = serde_json::from_value(response)
+            .expect("a v1 getBlock response must deserialize into RpcBlock");
+
+        let result = parse_block(&block, 495_752_744, ProgramType::Escrow, None);
+
+        assert_eq!(result.len(), 1, "the v1 deposit is indexed");
+        assert_eq!(deposit_amount(&result[0]), amount);
+        assert_eq!(result[0].instruction_index, 0);
+        assert_eq!(result[0].inner_index, None);
     }
 }
