@@ -31,6 +31,7 @@
 mod sender_fixtures;
 
 use {
+    chrono::{DateTime, Utc},
     private_channel_indexer::{
         config::ProgramType,
         operator::{
@@ -106,7 +107,11 @@ fn seed_remint_cache(state: &mut SenderState, transaction_id: i64, nonce: u64) {
 /// guarded on, so `set_pending_remint` can commit against the mock store the
 /// way it does against Postgres. The row is also what the pre-broadcast
 /// ownership claim CASes against.
-fn seed_processing_withdrawal_row(storage: &MockStorage, transaction_id: i64, nonce: u64) {
+fn seed_processing_withdrawal_row(
+    storage: &MockStorage,
+    transaction_id: i64,
+    nonce: u64,
+) -> DateTime<Utc> {
     let owner = Pubkey::new_unique().to_string();
     let mut tx = DbTransactionBuilder::new(
         format!("sig-{transaction_id}"),
@@ -121,7 +126,16 @@ fn seed_processing_withdrawal_row(storage: &MockStorage, transaction_id: i64, no
     tx.id = transaction_id;
     tx.status = TransactionStatus::Processing;
     tx.withdrawal_nonce = Some(nonce as i64);
+    let updated_at = tx.updated_at;
     storage.pending_transactions.lock().unwrap().push(tx);
+    updated_at
+}
+
+/// Arm the ownership lease the way submission does. These tests drive
+/// `send_and_confirm` directly, so nothing else records the incarnation this
+/// sender owns, and a release with no lease aborts before broadcast.
+fn arm_release_lease(state: &mut SenderState, nonce: u64, updated_at: DateTime<Utc>) {
+    state.release_leases.insert(nonce, updated_at);
 }
 
 /// Helper: enqueue one (`getLatestBlockhash`, `sendTransaction`-error)
@@ -169,7 +183,8 @@ fn enqueue_unconfirmed_send(mock: &MockRpcServer) {
 async fn idempotent_send_loops_capped_by_retry_max_attempts() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(404, 7);
-    seed_processing_withdrawal_row(&mock_storage, 404, 7);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 404, 7);
+    arm_release_lease(&mut state, 7, lease);
 
     // Three cycles the resend loop may spend, plus one the cap must leave alone.
     for _ in 0..4 {
@@ -255,7 +270,8 @@ async fn idempotent_send_loops_capped_by_retry_max_attempts() {
 async fn idempotent_send_loops_capped_at_higher_budget() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(4).await;
     let ctx = withdrawal_ctx(505, 11);
-    seed_processing_withdrawal_row(&mock_storage, 505, 11);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 505, 11);
+    arm_release_lease(&mut state, 11, lease);
 
     for _ in 0..5 {
         enqueue_unconfirmed_send(&mock);
@@ -321,7 +337,8 @@ async fn deferral_with_ambiguous_send_gates_on_journaled_signature() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(601, 21);
     seed_remint_cache(&mut state, 601, 21);
-    seed_processing_withdrawal_row(&mock_storage, 601, 21);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 601, 21);
+    arm_release_lease(&mut state, 21, lease);
     // pending_signatures intentionally NOT seeded.
 
     enqueue_failing_send(&mock, "permanent send error");
@@ -379,7 +396,8 @@ async fn deferral_with_stashed_signatures_pushes_pending_remint() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(602, 22);
     seed_remint_cache(&mut state, 602, 22);
-    seed_processing_withdrawal_row(&mock_storage, 602, 22);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 602, 22);
+    arm_release_lease(&mut state, 22, lease);
     let prior_attempt = Signature::new_unique();
     mock_storage
         .insert_release_signature(602, prior_attempt.to_string(), 0, None)
@@ -455,7 +473,8 @@ async fn deferral_undeterminable_state_holds_remint_info_and_stash() {
     let (mut state, mut storage_rx, storage_tx, mock, mock_storage) = build_fixture(3).await;
     let ctx = withdrawal_ctx(603, 23);
     seed_remint_cache(&mut state, 603, 23);
-    seed_processing_withdrawal_row(&mock_storage, 603, 23);
+    let lease = seed_processing_withdrawal_row(&mock_storage, 603, 23);
+    arm_release_lease(&mut state, 23, lease);
     let prior_attempt = Signature::new_unique();
     mock_storage
         .insert_release_signature(603, prior_attempt.to_string(), 0, None)
