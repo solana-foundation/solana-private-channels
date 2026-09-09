@@ -189,7 +189,7 @@ impl PrivateChannelIndexerConfig {
 /// an independence check.
 ///
 /// Which URLs serve blocks depends on the datasource. Live polling fetches from
-/// `common.rpc_url` and its startup backfill from `backfill.rpc_url`, so both count.
+/// `common.rpc_url`, plus `backfill.rpc_url` when startup backfill is enabled.
 /// Yellowstone streams its blocks and reaches RPC only through `backfill.rpc_url`, which
 /// serves both its reconnect gap-fill and its startup backfill.
 pub fn validate_fallback_endpoint(
@@ -201,10 +201,20 @@ pub fn validate_fallback_endpoint(
     };
     let fallback = fallback.trim_end_matches('/');
 
-    let sources: &[&str] = match indexer.datasource_type {
-        DatasourceType::RpcPolling => &[common.rpc_url.trim(), indexer.backfill.rpc_url.trim()],
-        DatasourceType::Yellowstone => &[indexer.backfill.rpc_url.trim()],
-    };
+    let mut sources = Vec::new();
+    match indexer.datasource_type {
+        DatasourceType::RpcPolling => {
+            sources.push(common.rpc_url.trim());
+            // Startup backfill is the only other block source here, and it is built
+            // only under `backfill.enabled`, so a disabled one fetches nothing.
+            if indexer.backfill.enabled {
+                sources.push(indexer.backfill.rpc_url.trim());
+            }
+        }
+        // The reconnect gap-fill is armed whatever `backfill.enabled` says, so this URL
+        // always serves blocks on this datasource.
+        DatasourceType::Yellowstone => sources.push(indexer.backfill.rpc_url.trim()),
+    }
 
     if let Some(primary) = sources
         .iter()
@@ -488,14 +498,23 @@ mod tests {
             err.contains(&indexer.backfill.rpc_url),
             "the error must name the gap-fill block source: {err}"
         );
+
+        // The gap-fill is armed regardless of `backfill.enabled`, so unlike the polling
+        // path this URL still serves blocks with backfill switched off.
+        indexer.backfill.enabled = false;
+        assert!(
+            validate_fallback_endpoint(&common, &indexer).is_err(),
+            "the gap-fill fetches blocks whether or not startup backfill is enabled"
+        );
     }
 
-    /// Startup backfill fetches from `backfill.rpc_url` whatever the datasource, so under
-    /// polling that is a second block source. A fallback pointed at it re-fetches from the
-    /// endpoint that just served the slot unusably, which is the boot loop this check exists
-    /// to prevent, with a failover in the config making it look handled.
+    /// An enabled startup backfill is a second block source under polling, so a fallback
+    /// pointed at it re-fetches from the endpoint that just served the slot unusably, which
+    /// is the boot loop this check exists to prevent, with a failover in the config making it
+    /// look handled. Disabled, that URL fetches nothing (the service is only built under
+    /// `backfill.enabled`), so the same config is a working failover and must be accepted.
     #[test]
-    fn fallback_equal_to_the_startup_fill_source_is_refused() {
+    fn fallback_equal_to_the_startup_fill_source_is_refused_only_when_backfill_runs() {
         let startup_fill_url = "http://backfill-node:8899";
         let mut common = create_common_config();
         common.fallback_rpc_url = Some(startup_fill_url.to_string());
@@ -507,6 +526,12 @@ mod tests {
         assert!(
             err.contains(startup_fill_url),
             "the error must name the startup fill's block source: {err}"
+        );
+
+        indexer.backfill.enabled = false;
+        assert!(
+            validate_fallback_endpoint(&common, &indexer).is_ok(),
+            "a disabled backfill's rpc_url serves no blocks, so it must not block startup"
         );
     }
 

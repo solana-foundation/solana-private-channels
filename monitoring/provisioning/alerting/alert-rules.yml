@@ -61,7 +61,9 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: up{job=~"(indexer|operator)-.*|gateway"}
+              # Prod (Ansible) job names plus the dev/devnet compose job names.
+              # Keep in sync with monitored-series-vanished below.
+              expr: up{job=~"private-channel-(indexer|operator)-.*|gateway|(indexer|operator)-(solana|private-channel)"}
               instant: true
               refId: A
           - refId: C

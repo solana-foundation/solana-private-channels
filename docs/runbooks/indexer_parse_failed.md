@@ -112,11 +112,13 @@ one; there is no operator command that marks a slot skipped, and there should no
 
 Screen every endpoint the deploy uses, not just the primary: failing closed makes a thin
 one a halt rather than a dropped row, and a fallback that strips stack heights recovers
-nothing. Each is asked for its own finalized tip, so a lagging node still answers.
+nothing. Each is asked for its own finalized tip, so a lagging node still answers. An unset
+`COMMON_FALLBACK_RPC_URL` is skipped rather than probed, since only that one is optional.
 
 ```sh
-for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do echo "== $url"; slot=$(curl -s "$url" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]}' | jq -r .result); curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$slot,{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}" | jq '[.result.transactions[].meta.innerInstructions[]?.instructions[]?.stackHeight] | {heights: length, nulls: map(select(. == null)) | length}'; done
+for url in "$COMMON_RPC_URL" "$COMMON_FALLBACK_RPC_URL" "$INDEXER_BACKFILL_RPC_URL"; do [ -n "$url" ] || { echo "== unset, skipped"; continue; }; echo "== $url"; slot=$(curl -s "$url" -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"finalized"}]}' | jq -r .result); [ -n "$slot" ] && [ "$slot" != null ] || { echo "no finalized tip, endpoint unreachable or not serving"; continue; }; curl -s "$url" -H 'content-type: application/json' -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[$slot,{\"encoding\":\"json\",\"maxSupportedTransactionVersion\":0,\"commitment\":\"finalized\"}]}" | jq '[.result.transactions[].meta.innerInstructions[]?.instructions[]?.stackHeight] | {heights: length, nulls: map(select(. == null)) | length}'; done
 ```
 
 Any `nulls` is cause 1 on that endpoint. `heights: 0` is inconclusive on a quiet chain, so
-re-run it against a slot known to carry a deposit. Screens cause 1 only.
+re-run it against a slot known to carry a deposit. Screens cause 1 only. A skipped fallback
+means the deploy has no failover, so a thin primary halts ingestion instead of recovering.
