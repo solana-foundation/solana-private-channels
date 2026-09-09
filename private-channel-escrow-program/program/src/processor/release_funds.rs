@@ -105,6 +105,10 @@ pub fn process_release_funds(
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
 
+    if allowed_mint.withdrawals_blocked {
+        return Err(PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint.into());
+    }
+
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
     validate_ata(
         instance_ata_info,

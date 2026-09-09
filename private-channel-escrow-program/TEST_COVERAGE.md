@@ -42,17 +42,19 @@
 - `test_allow_mint_token_2022_pausable_accepted` — pausable Token-2022 mint allowed; pause state is enforced by the operator at withdrawal time
 - `test_allow_mint_token_2022_transfer_hook_blocked` — TransferHookNotAllowed; the program's `TransferChecked` CPI does not resolve extra-account metas, so hook mints are rejected at validation
 
-### BlockMint (9 integration tests)
+### BlockMint (11 integration tests)
 
-- `test_block_mint_success` — happy path with rent reclamation
+- `test_block_mint_success` — happy path; the PDA survives with both gates set
 - `test_block_mint_allowed_mint_not_found` — nonexistent mint fails
 - `test_block_mint_invalid_pda` — wrong PDA rejected
 - `test_block_mint_invalid_admin_not_signer` — unsigned admin rejected
 - `test_block_mint_invalid_admin` — wrong admin rejected
 - `test_block_mint_invalid_instance_account_owner` — wrong owner rejected
 - `test_block_mint_mismatched_mint` — PDA/mint mismatch rejected
-- `test_block_mint_prevents_deposit` — a blocked mint causes a subsequent deposit to fail with InvalidAccountData
+- `test_block_mint_prevents_deposit` — a deposit-blocked mint fails a subsequent deposit with DepositsBlockedForMint
 - `test_allow_block_allow_cycle` — a mint can be re-allowed after being blocked; deposit succeeds once re-allowed
+- `test_block_mint_deposits_only_still_allows_release` — blocking deposits leaves already-escrowed funds withdrawable
+- `test_block_mint_withdrawals_prevents_release` — the withdrawal gate alone rejects a release with WithdrawalsBlockedForMint
 
 ### AddOperator (6 integration tests)
 

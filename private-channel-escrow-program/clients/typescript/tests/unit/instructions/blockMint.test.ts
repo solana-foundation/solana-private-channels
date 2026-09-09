@@ -1,6 +1,5 @@
 import { expect } from '@jest/globals';
 import { AccountRole } from '@solana/kit';
-import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import {
     getBlockMintInstructionAsync,
     getBlockMintInstructionDataCodec,
@@ -23,6 +22,8 @@ describe('blockMint', () => {
                 admin,
                 instance,
                 mint,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             const decodedData = getBlockMintInstructionDataCodec().decode(instruction.data);
@@ -32,32 +33,35 @@ describe('blockMint', () => {
             expect(decodedData.discriminator).toBe(2);
         });
 
-        it('should have no additional parameters beyond discriminator', async () => {
+        it('should encode both gates independently', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const admin = mockTransactionSigner(TEST_ADDRESSES.ADMIN);
             const instance = TEST_ADDRESSES.INSTANCE;
             const mint = TEST_ADDRESSES.WRAPPED_SOL;
 
+            // Opposite values so a swapped or shared byte would fail here
             const instruction = await getBlockMintInstructionAsync({
                 payer,
                 admin,
                 instance,
                 mint,
+                blockDeposits: true,
+                blockWithdrawals: false,
             });
 
             const decodedData = getBlockMintInstructionDataCodec().decode(instruction.data);
 
-            // BlockMint instruction should only have discriminator field, no additional params
-            expect(Object.keys(decodedData)).toEqual(['discriminator']);
-            expect(decodedData.discriminator).toBe(2);
+            expect(Object.keys(decodedData)).toEqual(['discriminator', 'blockDeposits', 'blockWithdrawals']);
+            expect(decodedData.blockDeposits).toBe(true);
+            expect(decodedData.blockWithdrawals).toBe(false);
 
-            // Verify data is minimal (just 1 byte for discriminator)
-            expect(instruction.data.length).toBe(1);
+            // discriminator + one byte per gate
+            expect(instruction.data.length).toBe(3);
         });
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, admin, instance, mint, allowedMint, systemProgram, eventAuthority, privateChannelEscrowProgram', async () => {
+        it('should include all required accounts: payer, admin, instance, mint, allowedMint, eventAuthority, privateChannelEscrowProgram', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const admin = mockTransactionSigner(TEST_ADDRESSES.ADMIN);
             const instance = TEST_ADDRESSES.INSTANCE;
@@ -68,10 +72,12 @@ describe('blockMint', () => {
                 admin,
                 instance,
                 mint,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
-            // Based on program instruction definition, BlockMint should have 8 accounts
-            expect(instruction.accounts).toHaveLength(8);
+            // Based on program instruction definition, BlockMint should have 7 accounts
+            expect(instruction.accounts).toHaveLength(7);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -93,16 +99,12 @@ describe('blockMint', () => {
             const allowedMintAccount = instruction.accounts[4];
             expect(allowedMintAccount.address).toBeDefined();
 
-            // Account 5: systemProgram (Readonly)
-            const systemProgramAccount = instruction.accounts[5];
-            expect(systemProgramAccount.address).toBe(SYSTEM_PROGRAM_ADDRESS);
-
-            // Account 6: eventAuthority (Readonly PDA)
-            const eventAuthorityAccount = instruction.accounts[6];
+            // Account 5: eventAuthority (Readonly PDA)
+            const eventAuthorityAccount = instruction.accounts[5];
             expect(eventAuthorityAccount.address).toBeDefined();
 
-            // Account 7: privateChannelEscrowProgram (Readonly)
-            const privateChannelEscrowProgramAccount = instruction.accounts[7];
+            // Account 6: privateChannelEscrowProgram (Readonly)
+            const privateChannelEscrowProgramAccount = instruction.accounts[6];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
 
@@ -117,6 +119,8 @@ describe('blockMint', () => {
                 admin,
                 instance,
                 mint,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             // Account 0: payer - should be WritableSigner
@@ -139,16 +143,12 @@ describe('blockMint', () => {
             const allowedMintAccount = instruction.accounts[4];
             expect(allowedMintAccount.role).toBe(AccountRole.WRITABLE);
 
-            // Account 5: systemProgram - should be Readonly
-            const systemProgramAccount = instruction.accounts[5];
-            expect(systemProgramAccount.role).toBe(AccountRole.READONLY);
-
-            // Account 6: eventAuthority - should be Readonly (PDA, not a signer)
-            const eventAuthorityAccount = instruction.accounts[6];
+            // Account 5: eventAuthority - should be Readonly (PDA, not a signer)
+            const eventAuthorityAccount = instruction.accounts[5];
             expect(eventAuthorityAccount.role).toBe(AccountRole.READONLY);
 
-            // Account 7: privateChannelEscrowProgram - should be Readonly
-            const privateChannelEscrowProgramAccount = instruction.accounts[7];
+            // Account 6: privateChannelEscrowProgram - should be Readonly
+            const privateChannelEscrowProgramAccount = instruction.accounts[6];
             expect(privateChannelEscrowProgramAccount.role).toBe(AccountRole.READONLY);
         });
 
@@ -163,12 +163,14 @@ describe('blockMint', () => {
                 admin,
                 instance,
                 mint,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             // Verify the instruction uses the correct program address
             expect(instruction.programAddress).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
             expect(instruction.programAddress).toBe(EXPECTED_PROGRAM_ADDRESS);
-            expect(instruction.accounts[7].address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
+            expect(instruction.accounts[6].address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
     });
 
@@ -191,6 +193,8 @@ describe('blockMint', () => {
                 admin,
                 instance,
                 mint,
+                blockDeposits: true,
+                blockWithdrawals: true,
                 // Not providing allowedMint - should be auto-derived from instance + mint
             });
 
@@ -217,6 +221,8 @@ describe('blockMint', () => {
                 instance,
                 mint,
                 allowedMint: customAllowedMintPda,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             // Verify the provided address is used instead of auto-derived one
@@ -247,6 +253,8 @@ describe('blockMint', () => {
                 admin,
                 instance: instance1,
                 mint: mint1,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             const instruction2 = await getBlockMintInstructionAsync({
@@ -254,6 +262,8 @@ describe('blockMint', () => {
                 admin,
                 instance: instance1,
                 mint: mint2,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             // Different instance, same mint
@@ -262,6 +272,8 @@ describe('blockMint', () => {
                 admin,
                 instance: instance2,
                 mint: mint1,
+                blockDeposits: true,
+                blockWithdrawals: true,
             });
 
             // Get the allowedMint accounts from each instruction

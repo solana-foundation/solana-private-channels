@@ -82,6 +82,10 @@ pub fn process_deposit(
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
 
+    if allowed_mint.deposits_blocked {
+        return Err(PrivateChannelEscrowProgramError::DepositsBlockedForMint.into());
+    }
+
     validate_ata(
         user_ata_info,
         user_info.address(),

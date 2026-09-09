@@ -14,6 +14,30 @@
                 "format": "u8",
                 "kind": "numberTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -206,6 +230,30 @@
               "name": "mint",
               "type": {
                 "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
               }
             }
           ],
@@ -558,6 +606,18 @@
         "kind": "errorNode",
         "message": "Unexpected current tree index for SMT root reset",
         "name": "unexpectedTreeIndex"
+      },
+      {
+        "code": 14,
+        "kind": "errorNode",
+        "message": "Deposits are blocked for this mint",
+        "name": "depositsBlockedForMint"
+      },
+      {
+        "code": 15,
+        "kind": "errorNode",
+        "message": "Withdrawals are blocked for this mint",
+        "name": "withdrawalsBlockedForMint"
       }
     ],
     "instructions": [
@@ -830,7 +890,7 @@
           },
           {
             "docs": [
-              "Token mint to be blocked"
+              "Token mint whose gates are being set"
             ],
             "isSigner": false,
             "isWritable": false,
@@ -845,15 +905,6 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "allowedMint"
-          },
-          {
-            "docs": [
-              "System program for account creation"
-            ],
-            "isSigner": false,
-            "isWritable": false,
-            "kind": "instructionAccountNode",
-            "name": "systemProgram"
           },
           {
             "docs": [
@@ -887,6 +938,30 @@
               "endian": "le",
               "format": "u8",
               "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "blockDeposits",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "blockWithdrawals",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
             }
           }
         ],

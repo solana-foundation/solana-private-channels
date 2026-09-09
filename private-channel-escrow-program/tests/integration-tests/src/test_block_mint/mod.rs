@@ -1,13 +1,15 @@
 use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
+    smt_utils::ProcessorSMT,
     state_utils::{
-        assert_get_or_allow_mint, assert_get_or_block_mint, assert_get_or_create_instance,
-        assert_get_or_deposit,
+        assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_block_mint,
+        assert_get_or_create_instance, assert_get_or_deposit, assert_get_or_release_funds,
     },
     utils::{
         assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
-        MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        DEPOSITS_BLOCKED_FOR_MINT_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR,
+        INVALID_ALLOWED_MINT_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::{BlockMintBuilder, DepositBuilder};
@@ -19,6 +21,10 @@ use solana_sdk::{
 };
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
+
+const DEPOSIT_AMOUNT: u64 = 1_000_000;
+const RELEASE_AMOUNT: u64 = 500_000;
+const TRANSACTION_NONCE: u64 = 42;
 
 #[test]
 fn test_block_mint_success() {
@@ -50,7 +56,9 @@ fn test_block_mint_success() {
         &instance_pda,
         &allowed_mint_pda,
         &mint.pubkey(),
-        true,
+        true, // block_deposits
+        true, // block_withdrawals
+        true, // with_profiling
     )
     .expect("BlockMint should succeed");
 }
@@ -85,6 +93,8 @@ fn test_block_mint_allowed_mint_not_found() {
         .mint(mint.pubkey())
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(true)
+        .block_withdrawals(true)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
@@ -132,6 +142,8 @@ fn test_block_mint_invalid_pda() {
         .mint(mint.pubkey())
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(true)
+        .block_withdrawals(true)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
@@ -176,12 +188,12 @@ fn test_block_mint_invalid_admin_not_signer() {
         AccountMeta::new_readonly(instance_pda, false), // instance
         AccountMeta::new_readonly(mint.pubkey(), false), // mint
         AccountMeta::new(allowed_mint_pda, false),      // allowed_mint (writable)
-        AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // system_program (not used but kept)
-        AccountMeta::new_readonly(event_authority_pda, false),               // event_authority
+        AccountMeta::new_readonly(event_authority_pda, false), // event_authority
         AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // private_channel_escrow_program
     ];
 
-    let data = vec![2]; // discriminator for BlockMint
+    // BlockMint discriminator, then both gates set
+    let data = vec![2, 1, 1];
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -233,6 +245,8 @@ fn test_block_mint_invalid_admin() {
         .mint(mint.pubkey())
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(true)
+        .block_withdrawals(true)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&wrong_admin]);
@@ -268,6 +282,8 @@ fn test_block_mint_invalid_instance_account_owner() {
         .mint(mint.pubkey())
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(true)
+        .block_withdrawals(true)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
@@ -318,6 +334,8 @@ fn test_block_mint_mismatched_mint() {
         .mint(other_mint.pubkey())
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(true)
+        .block_withdrawals(true)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin]);
@@ -365,7 +383,9 @@ fn test_block_mint_prevents_deposit() {
         &instance_pda,
         &allowed_mint_pda,
         &mint.pubkey(),
-        false,
+        true,  // block_deposits
+        false, // block_withdrawals
+        false, // with_profiling
     )
     .expect("BlockMint should succeed");
 
@@ -403,7 +423,8 @@ fn test_block_mint_prevents_deposit() {
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
-    assert_program_error(result, INVALID_ACCOUNT_DATA_ERROR);
+    // The PDA still exists and deserializes; the deposit gate is what rejects.
+    assert_program_error(result, DEPOSITS_BLOCKED_FOR_MINT_ERROR);
 }
 
 #[test]
@@ -436,7 +457,9 @@ fn test_allow_block_allow_cycle() {
         &instance_pda,
         &allowed_mint_pda,
         &mint.pubkey(),
-        false,
+        true,  // block_deposits
+        true,  // block_withdrawals
+        false, // with_profiling
     )
     .expect("BlockMint should succeed");
 
@@ -473,4 +496,190 @@ fn test_allow_block_allow_cycle() {
         false,
     )
     .expect("Deposit after re-allow should succeed");
+}
+
+// Blocking deposits must leave already-escrowed funds withdrawable, so
+// release_funds cannot depend on anything the deposit gate takes away.
+#[test]
+fn test_block_mint_deposits_only_still_allows_release() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        RELEASE_AMOUNT,
+    );
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit should succeed");
+
+    assert_get_or_block_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        true,  // block_deposits
+        false, // block_withdrawals
+        false, // with_profiling
+    )
+    .expect("BlockMint should succeed");
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
+    smt.insert(TRANSACTION_NONCE);
+    let new_withdrawal_root = smt.current_root();
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        new_withdrawal_root,
+        TRANSACTION_NONCE,
+        sibling_proofs,
+        false,
+    )
+    .expect("ReleaseFunds must still work when only deposits are blocked");
+}
+
+#[test]
+fn test_block_mint_withdrawals_prevents_release() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        RELEASE_AMOUNT,
+    );
+
+    assert_get_or_deposit(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        None,
+        false,
+    )
+    .expect("Deposit should succeed");
+
+    // Deposits left open so this pins the withdrawal gate alone.
+    assert_get_or_block_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        false, // block_deposits
+        true,  // block_withdrawals
+        false, // with_profiling
+    )
+    .expect("BlockMint should succeed");
+
+    let mut smt = ProcessorSMT::new();
+    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
+    smt.insert(TRANSACTION_NONCE);
+    let new_withdrawal_root = smt.current_root();
+
+    let result = assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        new_withdrawal_root,
+        TRANSACTION_NONCE,
+        sibling_proofs,
+        false,
+    );
+
+    assert_program_error(result, WITHDRAWALS_BLOCKED_FOR_MINT_ERROR);
 }

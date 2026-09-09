@@ -152,24 +152,23 @@ pub fn assert_get_or_allow_mint(
     Ok((allowed_mint_pda, bump))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn assert_get_or_block_mint(
     context: &mut TestContext,
     admin: &Keypair,
     instance_pda: &Pubkey,
     allowed_mint_pda: &Pubkey,
     mint: &Pubkey,
+    block_deposits: bool,
+    block_withdrawals: bool,
     with_profiling: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     context.airdrop_if_required(&admin.pubkey(), 1_000_000_000)?;
 
     assert_account_exists(context, allowed_mint_pda);
 
+    let (_, bump) = find_allowed_mint_pda(instance_pda, mint);
     let (event_authority_pda, _) = find_event_authority_pda();
-
-    let previous_lamports_balance = context
-        .get_account(&context.payer.pubkey())
-        .unwrap()
-        .lamports;
 
     let instruction = BlockMintBuilder::new()
         .payer(context.payer.pubkey())
@@ -177,9 +176,10 @@ pub fn assert_get_or_block_mint(
         .instance(*instance_pda)
         .mint(*mint)
         .allowed_mint(*allowed_mint_pda)
-        .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(block_deposits)
+        .block_withdrawals(block_withdrawals)
         .instruction();
 
     let transaction_metadata = context
@@ -194,8 +194,9 @@ pub fn assert_get_or_block_mint(
     assert_block_mint_account(
         context,
         allowed_mint_pda,
-        &context.payer.pubkey(),
-        previous_lamports_balance,
+        bump,
+        block_deposits,
+        block_withdrawals,
     );
 
     // Assert BlockMint event was emitted

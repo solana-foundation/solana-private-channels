@@ -89,26 +89,39 @@ pub struct BlockMintEvent {
     pub event_discriminator: u8,
     /// Instance seed pubkey
     pub instance_seed: Pubkey,
-    /// Mint pubkey that was blocked
+    /// Mint pubkey whose gates were set
     pub mint: Pubkey,
+    /// Deposit gate after this instruction
+    pub deposits_blocked: bool,
+    /// Withdrawal gate after this instruction
+    pub withdrawals_blocked: bool,
 }
 
 impl BlockMintEvent {
-    pub fn new(instance_seed: Pubkey, mint: Pubkey) -> Self {
+    pub fn new(
+        instance_seed: Pubkey,
+        mint: Pubkey,
+        deposits_blocked: bool,
+        withdrawals_blocked: bool,
+    ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::BlockMint as u8,
             instance_seed,
             mint,
+            deposits_blocked,
+            withdrawals_blocked,
         }
     }
 
-    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint)
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint) + 1 + 1 (gates)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(73);
+        let mut data = Vec::with_capacity(75);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.mint.as_ref());
+        data.push(self.deposits_blocked as u8);
+        data.push(self.withdrawals_blocked as u8);
         data
     }
 }
@@ -387,7 +400,7 @@ mod tests {
     fn test_block_mint_event() {
         let instance_seed = Pubkey::new_from_array([1u8; 32]);
         let mint = Pubkey::new_from_array([2u8; 32]);
-        let event = BlockMintEvent::new(instance_seed, mint);
+        let event = BlockMintEvent::new(instance_seed, mint, true, false);
 
         assert_eq!(
             event.event_discriminator,
@@ -396,11 +409,14 @@ mod tests {
         assert_eq!(event.instance_seed, instance_seed);
         assert_eq!(event.mint, mint);
 
-        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint)
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 1 + 1 (gates)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 73);
+        assert_eq!(bytes.len(), 75);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::BlockMint as u8);
+        // Opposite values pin the gate byte order the indexer reads.
+        assert_eq!(bytes[73], 1);
+        assert_eq!(bytes[74], 0);
     }
 
     #[test]

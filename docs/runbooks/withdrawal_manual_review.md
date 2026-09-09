@@ -153,16 +153,22 @@ to say explicitly what the user is owed.
        and record whether to restore them by an admin mint on the channel.
        [Escalate](_escalation.md) (Tier 3): a burn of an unsupported mint means one
        was created or distributed on the channel without a matching `AllowMint`.
-     - **Allowlisted, then blocked.** `BlockMint` closes the account, and escrowed
-       funds are still held. The withdrawal cannot proceed while the mint is blocked,
-       because the escrow program rejects the release. Either re-allow the mint and
-       re-arm the row, or refund out-of-band from the escrow.
-       [Escalate](_escalation.md) (Tier 2).
+     - **Present but undecodable** (message says `allowlist account failed to decode`).
+       The account exists and is escrow-owned but its layout is not one this operator
+       build knows, so the deployed program and the operator are out of step. Do not
+       re-arm until they match. [Escalate](_escalation.md) (Tier 2).
 
      Either way, if the parked row's `withdrawal_nonce` is a multiple of the tree
      size, marking it `failed` releases later withdrawals onto a tree generation
      that was never rotated, so rotate before you terminalize it. This applies to
      any terminalized boundary row, not just this one.
+   - `withdrawals blocked for mint:` - an admin set the mint's withdrawal gate, which
+     `release_funds` rejects on-chain. The escrow still holds the funds and the row is
+     intact, so nothing is lost. Re-open the gate (`BlockMint` with
+     `block_withdrawals: false`, or `AllowMint`, which re-opens both), then re-arm the
+     row. No operator restart is needed: a blocked mint is never cached as clear.
+     Blocking withdrawals is deliberate, so confirm with whoever set it before
+     re-opening. [Escalate](_escalation.md) (Tier 2).
    - `withdrawal mint absent on target chain:` - the mint was allowlisted, so its
      account existed then, and the node answered from a slot at or past that allow
      before reporting nothing. A lagging node cannot produce this message; it

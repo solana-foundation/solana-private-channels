@@ -44,16 +44,35 @@ pub fn assert_allow_mint_account(
         AllowedMint::from_bytes(&account.data).expect("Should deserialize allowed mint account");
 
     assert_eq!(allowed_mint.bump, expected_bump);
+    // Also covers the re-allow path: AllowMint must re-open both gates.
+    assert!(!allowed_mint.deposits_blocked);
+    assert!(!allowed_mint.withdrawals_blocked);
 }
 
+/// BlockMint leaves the PDA in place, so this asserts the gates it wrote
+/// rather than the account being gone.
 pub fn assert_block_mint_account(
     context: &mut TestContext,
     allowed_mint_pda: &Pubkey,
-    payer: &Pubkey,
-    previous_lamports_balance: u64,
+    expected_bump: u8,
+    expected_deposits_blocked: bool,
+    expected_withdrawals_blocked: bool,
 ) {
-    assert_account_not_exists(context, allowed_mint_pda);
-    assert_account_lamports_gt(context, payer, previous_lamports_balance);
+    let account = context
+        .get_account(allowed_mint_pda)
+        .expect("Allowed mint account should survive BlockMint");
+
+    assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
+
+    let allowed_mint =
+        AllowedMint::from_bytes(&account.data).expect("Should deserialize allowed mint account");
+
+    assert_eq!(allowed_mint.bump, expected_bump);
+    assert_eq!(allowed_mint.deposits_blocked, expected_deposits_blocked);
+    assert_eq!(
+        allowed_mint.withdrawals_blocked,
+        expected_withdrawals_blocked
+    );
 }
 
 pub fn assert_account_exists(context: &mut TestContext, pubkey: &Pubkey) {

@@ -28,7 +28,7 @@ pnpm add private-channel-escrow-program @solana/kit
 1. [CreateInstance](#createinstance) - Create a new escrow instance
 2. [AllowMint](#allowmint) - Whitelist a token mint for deposits
 3. [Mint Risk Considerations](#mint-risk-considerations) - Authorities/extensions to vet before whitelisting
-4. [BlockMint](#blockmint) - Revoke deposit permissions for a mint
+4. [BlockMint](#blockmint) - Set the deposit and withdrawal gates on a mint
 5. [AddOperator](#addoperator) - Authorize a withdrawal operator
 6. [RemoveOperator](#removeoperator) - Remove an operator
 7. [SetNewAdmin](#setnewadmin) - Transfer admin control
@@ -127,7 +127,7 @@ In every case the safe posture is the same: only whitelist mints whose close/fre
 
 ## BlockMint
 
-Revokes deposit permissions for a previously whitelisted mint. Closes the AllowedMint PDA and reclaims rent to the payer.
+Sets the deposit and withdrawal gates on a previously whitelisted mint. The AllowedMint PDA stays open, so blocking deposits does not strand existing balances.
 
 ### TypeScript Example
 
@@ -136,21 +136,25 @@ import {
   getBlockMintInstructionAsync,
 } from 'private-channel-escrow-program';
 
+// Stop new deposits, leave existing balances withdrawable
 const blockMintIx = await getBlockMintInstructionAsync({
   payer,
   admin, // Must be instance admin
   instance: process.env.INSTANCE_ADDRESS,
   mint: USDC_MINT,
+  blockDeposits: true,
+  blockWithdrawals: false,
 });
 
 // Sign and send transaction with payer and admin as signers
 ```
 
 **Notes:**
-- New deposits for this mint fail immediately with `InvalidAllowedMint` error
+- The gates are independent, and both flags are absolute: passing `false` for one re-opens that gate
+- With `blockDeposits`, new deposits fail with `DepositsBlockedForMint`; withdrawals are unaffected
+- With `blockWithdrawals`, `ReleaseFunds` fails with `WithdrawalsBlockedForMint`, and the operator parks the withdrawal for manual review rather than failing it
 - Existing Solana Private Channels balances are NOT affected
-- Withdraws still work for existing balances
-- Reversible: Admin can call AllowMint again to re-enable
+- Reversible: block again with `false`, or call AllowMint, which re-opens both gates
 
 ## AddOperator
 

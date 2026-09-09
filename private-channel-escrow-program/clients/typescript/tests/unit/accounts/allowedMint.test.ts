@@ -9,7 +9,9 @@ import {
 // Expected size calculation based on program structure
 const EXPECTED_SIZE =
     1 + // discriminator
-    1; // bump
+    1 + // bump
+    1 + // depositsBlocked
+    1; // withdrawalsBlocked
 
 describe('AllowedMint Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -17,6 +19,8 @@ describe('AllowedMint Account', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 1,
                 bump: 250,
+                depositsBlocked: true,
+                withdrawalsBlocked: false,
             };
 
             // Test encoding
@@ -36,6 +40,8 @@ describe('AllowedMint Account', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 255,
                 bump: 127,
+                depositsBlocked: false,
+                withdrawalsBlocked: true,
             };
 
             // Test combined codec
@@ -54,6 +60,8 @@ describe('AllowedMint Account', () => {
                 const testAllowedMint: AllowedMint = {
                     discriminator: 1,
                     bump,
+                    depositsBlocked: false,
+                    withdrawalsBlocked: false,
                 };
 
                 const codec = getAllowedMintCodec();
@@ -71,27 +79,35 @@ describe('AllowedMint Account', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 1,
                 bump: 250,
+                depositsBlocked: true,
+                withdrawalsBlocked: false,
             };
 
             // Verify all required fields are present
             expect(testAllowedMint).toHaveProperty('discriminator');
             expect(testAllowedMint).toHaveProperty('bump');
+            expect(testAllowedMint).toHaveProperty('depositsBlocked');
+            expect(testAllowedMint).toHaveProperty('withdrawalsBlocked');
         });
 
         it('should validate allowedMint structure field types', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 1,
                 bump: 250,
+                depositsBlocked: true,
+                withdrawalsBlocked: false,
             };
 
             // Verify field types
             expect(typeof testAllowedMint.discriminator).toBe('number');
             expect(typeof testAllowedMint.bump).toBe('number');
+            expect(typeof testAllowedMint.depositsBlocked).toBe('boolean');
+            expect(typeof testAllowedMint.withdrawalsBlocked).toBe('boolean');
         });
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (2 bytes)', () => {
+        it('should report correct account size (4 bytes)', () => {
             const accountSize = getAllowedMintEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -100,6 +116,8 @@ describe('AllowedMint Account', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 1,
                 bump: 250,
+                depositsBlocked: true,
+                withdrawalsBlocked: false,
             };
 
             const encoder = getAllowedMintEncoder();
@@ -117,14 +135,20 @@ describe('AllowedMint Account', () => {
                 {
                     discriminator: 0,
                     bump: 100,
+                    depositsBlocked: false,
+                    withdrawalsBlocked: false,
                 },
                 {
                     discriminator: 255,
                     bump: 255,
+                    depositsBlocked: true,
+                    withdrawalsBlocked: true,
                 },
                 {
                     discriminator: 127,
                     bump: 50,
+                    depositsBlocked: true,
+                    withdrawalsBlocked: false,
                 },
             ];
 
@@ -142,6 +166,8 @@ describe('AllowedMint Account', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 0,
                 bump: 0,
+                depositsBlocked: false,
+                withdrawalsBlocked: false,
             };
 
             const codec = getAllowedMintCodec();
@@ -155,6 +181,8 @@ describe('AllowedMint Account', () => {
             const testAllowedMint: AllowedMint = {
                 discriminator: 255,
                 bump: 255,
+                depositsBlocked: true,
+                withdrawalsBlocked: true,
             };
 
             const codec = getAllowedMintCodec();

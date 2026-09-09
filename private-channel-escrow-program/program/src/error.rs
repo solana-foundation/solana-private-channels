@@ -60,6 +60,14 @@ pub enum PrivateChannelEscrowProgramError {
     /// (13) ResetSmtRoot pre-state mismatch. Blocks replaying a landed reset.
     #[error("Unexpected current tree index for SMT root reset")]
     UnexpectedTreeIndex,
+
+    /// (14) Admin has blocked deposits for this mint
+    #[error("Deposits are blocked for this mint")]
+    DepositsBlockedForMint,
+
+    /// (15) Admin has blocked withdrawals for this mint
+    #[error("Withdrawals are blocked for this mint")]
+    WithdrawalsBlockedForMint,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -95,6 +103,8 @@ mod tests {
             (InvalidSmtProof, 11),
             (InvalidTransactionNonceForCurrentTreeIndex, 12),
             (UnexpectedTreeIndex, 13),
+            (DepositsBlockedForMint, 14),
+            (WithdrawalsBlockedForMint, 15),
         ];
 
         for (error, expected_code) in cases {

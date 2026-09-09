@@ -71,6 +71,19 @@ cargo run --bin withdraw -- \
   <AMOUNT>
 ```
 
+## Block Mint (set the deposit / withdrawal gates)
+Both flags are absolute, so passing `false` for one re-opens that gate. Blocking
+deposits leaves already-escrowed balances withdrawable.
+```bash
+cargo run --bin block_mint -- \
+  https://api.devnet.solana.com \
+  ./keypairs/escrow-admin.json \
+  <INSTANCE_ID> \
+  <MINT_ADDRESS> \
+  <BLOCK_DEPOSITS> \
+  <BLOCK_WITHDRAWALS>
+```
+
 ## Monitor
 ```bash
 # Watch deposit processing

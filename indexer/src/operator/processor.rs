@@ -22,6 +22,7 @@ use crate::ProgramType;
 use chrono::Utc;
 use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
 use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_escrow_program_client::AllowedMint;
 use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
@@ -511,13 +512,36 @@ async fn check_withdrawal_mint_supported(
 
     // Owned by anything else means the address collides with an unrelated account
     // rather than carrying the escrow's permission, which release would reject.
-    let allowed = response
+    let Some(account) = response
         .value
-        .is_some_and(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
-    if !allowed {
+        .filter(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+    else {
         return Ok(Some(BailReason::new(
             metrics::BAIL_REASON_UNSUPPORTED_MINT,
             format!("unsupported withdrawal mint: {mint} (no escrow allowlist account)"),
+        )));
+    };
+
+    // Escrow-owned at the canonical PDA but undecodable means a layout this
+    // operator does not know. A release against it would fail anyway, so park
+    // instead of raising a transient the task would restart on forever.
+    let Ok(allowed_mint) = AllowedMint::from_bytes(&account.data) else {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_UNSUPPORTED_MINT,
+            format!("unsupported withdrawal mint: {mint} (allowlist account failed to decode)"),
+        )));
+    };
+
+    // release_funds rejects a withdrawal-blocked mint on-chain, and that failure is
+    // permanent, so letting it broadcast would terminalize the row through the
+    // remint path. Parking keeps it re-armable once the admin re-opens the gate.
+    //
+    // Checked before the existence floor below so a blocked mint is never cached as
+    // clear, which is what lets a re-armed row proceed without an operator restart.
+    if allowed_mint.withdrawals_blocked {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_WITHDRAWALS_BLOCKED,
+            format!("withdrawals blocked for mint: {mint}"),
         )));
     }
 
@@ -4415,13 +4439,24 @@ mod tests {
     }
 
     /// Mocked `getAccountInfo` reply for an escrow-owned AllowedMint account.
-    fn allowed_mint_account_response(slot: u64) -> serde_json::Value {
+    fn allowed_mint_account_response(
+        slot: u64,
+        deposits_blocked: bool,
+        withdrawals_blocked: bool,
+    ) -> serde_json::Value {
+        // discriminator, bump, then one byte per gate.
+        let data = [
+            2u8,
+            255u8,
+            deposits_blocked as u8,
+            withdrawals_blocked as u8,
+        ];
         serde_json::json!({
             "context": {"slot": slot},
             "value": {
                 "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
                 "lamports": 1_000_000u64,
-                "data": [STANDARD.encode([2u8, 255u8]), "base64"],
+                "data": [STANDARD.encode(data), "base64"],
                 "executable": false,
                 "rentEpoch": 0
             }
@@ -4484,7 +4519,8 @@ mod tests {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         insert_mint_row(&storage, &mint);
-        let mut ps = processor_state_answering(&storage, allowed_mint_account_response(500));
+        let mut ps =
+            processor_state_answering(&storage, allowed_mint_account_response(500, false, false));
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -4504,7 +4540,8 @@ mod tests {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         insert_mint_row(&storage, &mint);
-        let mut ps = processor_state_answering(&storage, allowed_mint_account_response(500));
+        let mut ps =
+            processor_state_answering(&storage, allowed_mint_account_response(500, false, false));
 
         let (outcome, _, _) = run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
 
@@ -4515,29 +4552,87 @@ mod tests {
         );
     }
 
-    /// `BlockMint` closes the allowlist account and `release_funds` requires it, so a
-    /// blocked mint's release can never land. Parking makes that visible instead of
-    /// dispatching a transaction the escrow program is certain to reject.
+    /// A withdrawal-blocked mint's release is rejected on-chain, and that failure is
+    /// permanent, so it would terminalize the row through remint. Parking keeps it
+    /// re-armable once the admin re-opens the gate.
     #[tokio::test]
-    async fn process_release_funds_blocked_mint_parks_rather_than_dispatching() {
+    async fn process_release_funds_withdrawals_blocked_mint_parks_rather_than_dispatching() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         insert_mint_row(&storage, &mint);
-        seed_mint_status(&storage, &mint, "blocked", 50);
-        let mut ps = processor_state_answering(&storage, absent_account_response());
+        let mut ps =
+            processor_state_answering(&storage, allowed_mint_account_response(500, false, true));
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
 
         assert!(outcome.is_ok());
-        assert_eq!(
-            update.expect("row must be parked").status,
-            TransactionStatus::ManualReview
-        );
+        let update = update.expect("row must be parked");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .expect("error_message must be set")
+            .contains("withdrawals blocked for mint:"));
         assert!(
             builder.is_none(),
             "a release that cannot land is not dispatched"
         );
+        assert!(
+            !ps.mint_cache.has_existence_floor(&mint),
+            "a blocked mint must not be cached as clear, or unblocking would need a restart"
+        );
+    }
+
+    /// Blocking deposits must not stop a release, which is the whole point of the
+    /// gates being independent.
+    #[tokio::test]
+    async fn process_release_funds_deposits_blocked_mint_still_dispatches() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        let mut ps =
+            processor_state_answering(&storage, allowed_mint_account_response(500, true, false));
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok());
+        assert!(update.is_none(), "a deposit-blocked mint is still payable");
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// An allowlist account whose layout this operator cannot decode parks the row
+    /// instead of raising a transient the task would restart on forever.
+    #[tokio::test]
+    async fn process_release_funds_undecodable_allowlist_account_parks() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+        // Escrow-owned at the right address, but too short to be an AllowedMint.
+        let truncated = serde_json::json!({
+            "context": {"slot": 500},
+            "value": {
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode([2u8, 255u8]), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut ps = processor_state_answering(&storage, truncated);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "a bad account must not end the loop");
+        assert_eq!(
+            update.expect("row must be parked").status,
+            TransactionStatus::ManualReview
+        );
+        assert!(builder.is_none(), "nothing may be dispatched");
     }
 
     /// An account squatting the allowlist address carries no escrow permission, so

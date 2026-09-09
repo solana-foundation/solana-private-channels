@@ -60,13 +60,13 @@ pub enum PrivateChannelEscrowProgramInstruction {
         bump: u8,
     } = 1,
 
-    /// Block previously allowed mints for the instance (admin-only).
+    /// Set the deposit and withdrawal gates on an allowed mint (admin-only).
+    /// Both flags are absolute, so passing false for one re-opens that gate.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to validate admin authority"))]
-    #[codama(account(name = "mint", docs = "Token mint to be blocked"))]
+    #[codama(account(name = "mint", docs = "Token mint whose gates are being set"))]
     #[codama(account(name = "allowed_mint", docs = "Existing Allowed Mint PDA", writable))]
-    #[codama(account(name = "system_program", docs = "System program for account creation"))]
     #[codama(account(
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
@@ -75,7 +75,12 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
-    BlockMint {} = 2,
+    BlockMint {
+        /// Reject new deposits for this mint
+        block_deposits: bool,
+        /// Reject fund releases for this mint
+        block_withdrawals: bool,
+    } = 2,
 
     /// Add an operator to the instance (admin-only).
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]

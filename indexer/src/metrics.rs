@@ -157,12 +157,14 @@ counter_vec!(
 /// pipeline running. Kept here so the emitting code and the pre-registration
 /// below read one list and a label cannot exist in only one of them.
 pub const BAIL_REASON_UNSUPPORTED_MINT: &str = "unsupported_mint";
+pub const BAIL_REASON_WITHDRAWALS_BLOCKED: &str = "withdrawals_blocked";
 pub const BAIL_REASON_TARGET_MINT_MISSING: &str = "target_mint_missing";
 pub const BAIL_REASON_MINT_PAUSED: &str = "mint_paused";
 pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
 
-pub const BAIL_REASONS: [&str; 4] = [
+pub const BAIL_REASONS: [&str; 5] = [
     BAIL_REASON_UNSUPPORTED_MINT,
+    BAIL_REASON_WITHDRAWALS_BLOCKED,
     BAIL_REASON_TARGET_MINT_MISSING,
     BAIL_REASON_MINT_PAUSED,
     BAIL_REASON_ESCROW_DRAINED,

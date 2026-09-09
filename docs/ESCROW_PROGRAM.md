@@ -17,7 +17,7 @@
 |-------------|-------------|---------------|
 | [`CreateInstance`](#createinstance) | Create a new escrow instance with the specified admin | 0 |
 | [`AllowMint`](#allowmint) | Allow new token mints for the instance (admin-only) | 1 |
-| [`BlockMint`](#blockmint) | Block previously allowed mints for the instance (admin-only) | 2 |
+| [`BlockMint`](#blockmint) | Set the deposit and withdrawal gates on an allowed mint (admin-only) | 2 |
 | [`AddOperator`](#addoperator) | Add an operator to the instance (admin-only) | 3 |
 | [`RemoveOperator`](#removeoperator) | Remove an operator from the instance (admin-only) | 4 |
 | [`SetNewAdmin`](#setnewadmin) | Set a new admin for the instance (current admin only) | 5 |
@@ -75,11 +75,19 @@ Discriminator: `1`
 | 10 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### BlockMint
-Blocks previously allowed mints for the instance (admin-only).
+Sets the deposit and withdrawal gates on an allowed mint (admin-only).
+
+The two gates are independent, and both flags are absolute: passing `false` for one
+re-opens that gate. The AllowedMint PDA is not closed, so blocking deposits leaves
+already-escrowed balances withdrawable. `AllowMint` also re-opens both gates.
 
 Discriminator: `2`
 
-**Parameters:** None
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `block_deposits` | bool | Reject new deposits for this mint |
+| `block_withdrawals` | bool | Reject fund releases for this mint |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -87,11 +95,10 @@ Discriminator: `2`
 | 0 | `payer` | ✓ | ✓ | Transaction fee payer |
 | 1 | `admin` | ✓ | | Admin of Instance |
 | 2 | `instance` | | | Instance PDA to validate admin authority |
-| 3 | `mint` | | | Token mint to be blocked |
+| 3 | `mint` | | | Token mint whose gates are being set |
 | 4 | `allowed_mint` | | ✓ | Existing Allowed Mint PDA |
-| 5 | `system_program` | | | System program for account creation |
-| 6 | `event_authority` | | | Event authority PDA for emitting events |
-| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+| 5 | `event_authority` | | | Event authority PDA for emitting events |
+| 6 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### AddOperator
 Adds an operator to the instance (admin-only).
@@ -243,7 +250,7 @@ Discriminator: `228`
 |-------------|-------------|---------------|
 | Instance | Escrow instance that holds token funds and manages operators | 0 |
 | Operator | Authorized operator for an instance that can release funds | 1 |
-| AllowedMint | Token mint that is allowed for deposits in an instance | 2 |
+| AllowedMint | Token mint allowed in an instance, holding its deposit and withdrawal gates | 2 |
 
 ### Instance
 Represents an escrow instance that holds token funds and manages operators.
@@ -269,13 +276,15 @@ Represents an authorized operator for an instance that can release funds.
 | `bump` | u8 | PDA bump seed |
 
 ### AllowedMint
-Represents a token mint that is allowed for deposits in an instance.
+Represents a token mint that is allowed in an instance, and its two gates.
 
 **PDA Derivation**: `["allowed_mint", instance_pda, mint_pubkey]`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `bump` | u8 | PDA bump seed |
+| `deposits_blocked` | bool | `Deposit` rejects this mint |
+| `withdrawals_blocked` | bool | `ReleaseFunds` rejects this mint |
 
 ## Errors
 
@@ -296,6 +305,9 @@ The program defines the following custom errors:
 | 10 | `InvalidAllowedMint` | Invalid allowed mint |
 | 11 | `InvalidSmtProof` | Invalid SMT proof provided |
 | 12 | `InvalidTransactionNonceForCurrentTreeIndex` | Invalid transaction nonce for current tree index |
+| 13 | `UnexpectedTreeIndex` | Unexpected current tree index for SMT root reset |
+| 14 | `DepositsBlockedForMint` | Deposits are blocked for this mint |
+| 15 | `WithdrawalsBlockedForMint` | Withdrawals are blocked for this mint |
 
 ## Other Constants
 
