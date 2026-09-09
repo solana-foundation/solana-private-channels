@@ -55,7 +55,7 @@ up later as a custody reconciliation mismatch, which points an operator at the w
 ### 1. Confirm the state
 
 ```sql
-SELECT program_type, last_committed_slot, owed_rotation_target FROM indexer_state;
+SELECT program_type, last_committed_slot FROM indexer_state;
 ```
 
 Compare `last_committed_slot` against the configured start slot. Remember that the
@@ -94,6 +94,10 @@ chosen genesis slot under fail-closed channel reconciliation:
 private-channel-indexer resync --genesis-slot <slot> --channel-rpc-url <url>
 ```
 
+A withdraw resync additionally needs `common.escrow_instance_id` and `--escrow-rpc-url`
+(a Solana RPC), and refuses unless the escrow's withdrawal bitmap is at generation 0 with
+no set bits.
+
 Do **not** hand-edit `indexer_state` to make the refusal go away. That is the silent data
 loss the refusal exists to prevent, and it is the same move
 [`indexer_block_unavailable.md`](indexer_block_unavailable.md) forbids.
@@ -102,18 +106,17 @@ loss the refusal exists to prevent, and it is the same move
 
 ## The special case: a checkpoint of exactly 0
 
-A row whose `last_committed_slot` is `0` **and** whose `owed_rotation_target` is not null
-**and** which has no `transactions` rows is almost certainly a phantom. Older builds
-created the `indexer_state` row with a `NOT NULL DEFAULT 0` slot when the operator armed a
-tree rotation before the indexer ever flushed a checkpoint, so a never-indexed program read
-back as "indexed through genesis".
+A row whose `last_committed_slot` is `0` **and** which has no `transactions` rows is almost
+certainly a phantom. Older builds created the `indexer_state` row with a
+`NOT NULL DEFAULT 0` slot before the indexer ever flushed a checkpoint, so a never-indexed
+program read back as "indexed through genesis".
 
 Newer builds leave the slot unset in that case, but they cannot repair rows that already
 hold a defaulted zero: nothing distinguishes one from a real genesis checkpoint. Confirm
 with:
 
 ```sql
-SELECT s.program_type, s.last_committed_slot, s.owed_rotation_target,
+SELECT s.program_type, s.last_committed_slot,
        (SELECT COUNT(*) FROM transactions t
          WHERE t.transaction_type = CASE s.program_type
                                       WHEN 'withdraw' THEN 'withdrawal'
@@ -125,9 +128,8 @@ FROM indexer_state s;
 The count is scoped to the program's own rows on purpose: both programs can share one
 database, and the other program's rows say nothing about whether this one was ever indexed.
 
-If `last_committed_slot = 0`, `owed_rotation_target` is set and `tx_rows` is 0, the row
-never carried a real checkpoint. Clear the slot so the configured start slot can
-initialize the ledger, keeping the rotation target intact:
+If `last_committed_slot = 0` and `tx_rows` is 0, the row never carried a real checkpoint.
+Clear the slot so the configured start slot can initialize the ledger:
 
 ```sql
 UPDATE indexer_state SET last_committed_slot = NULL WHERE program_type = '<program>';

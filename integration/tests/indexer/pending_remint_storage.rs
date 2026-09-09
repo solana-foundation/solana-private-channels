@@ -102,7 +102,7 @@ async fn test_pending_remint_round_trip_preserves_signatures_and_deadline() {
     let deadline = Utc::now() + ChronoDuration::minutes(30);
 
     let remint_lvbhs = vec![0; remint_sigs.len()];
-    db.set_pending_remint_internal(tx_id, remint_sigs.clone(), remint_lvbhs, deadline)
+    db.set_pending_remint_internal(tx_id, remint_sigs.clone(), remint_lvbhs, deadline, false)
         .await
         .expect("set_pending_remint must succeed");
 
@@ -129,6 +129,55 @@ async fn test_pending_remint_round_trip_preserves_signatures_and_deadline() {
     assert!(
         row.pending_remint_deadline_at.is_some(),
         "deadline must round-trip"
+    );
+}
+
+// ── Case A2 ─────────────────────────────────────────────────────────────────
+/// A release the program refused is proof the payout never happened, and it is
+/// the only such proof that outlives a bitmap rotation. It is written in the
+/// same UPDATE that queues the refund, so it must read straight back off the
+/// row, and a refund queued without one must read back false rather than NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_release_refusal_round_trips_with_the_pending_remint_row() {
+    let (db, url, _container) = start_pg("t12_refusal").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let mut ids = Vec::new();
+    for nonce in 0..2i64 {
+        let sig = Signature::new_unique().to_string();
+        let tx = make_withdrawal(&sig, nonce);
+        let id = db.insert_transaction_internal(&tx).await.unwrap();
+        sqlx::query(
+            "UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+
+    let deadline = Utc::now() + ChronoDuration::seconds(32);
+    db.set_pending_remint_internal(ids[0], vec!["sig-a".to_string()], vec![0], deadline, true)
+        .await
+        .unwrap();
+    db.set_pending_remint_internal(ids[1], vec!["sig-b".to_string()], vec![0], deadline, false)
+        .await
+        .unwrap();
+
+    let rows = db.get_pending_remint_transactions_internal().await.unwrap();
+    assert_eq!(rows.len(), 2);
+    let refused = rows.iter().find(|r| r.id == ids[0]).unwrap();
+    let ordinary = rows.iter().find(|r| r.id == ids[1]).unwrap();
+    assert!(
+        refused.release_refused_on_chain,
+        "the refusal must survive the write"
+    );
+    assert!(
+        !ordinary.release_refused_on_chain,
+        "an ordinary deferral must stay held to the bitmap gate"
     );
 }
 
@@ -164,6 +213,7 @@ async fn test_pending_remint_query_filters_by_status() {
         vec!["fake".to_string()],
         vec![0],
         Utc::now() + ChronoDuration::minutes(10),
+        false,
     )
     .await
     .unwrap();
@@ -216,6 +266,7 @@ async fn test_finality_check_attempts_persisted_across_restart() {
         vec![Signature::new_unique().to_string()],
         vec![0],
         initial_deadline,
+        false,
     )
     .await
     .unwrap();
@@ -282,6 +333,7 @@ async fn test_remint_signatures_round_trip_and_gc() {
         vec![sig.clone()],
         vec![0],
         Utc::now() + ChronoDuration::minutes(10),
+        false,
     )
     .await
     .unwrap();

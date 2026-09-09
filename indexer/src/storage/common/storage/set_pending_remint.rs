@@ -6,6 +6,7 @@ pub async fn set_pending_remint(
     remint_signatures: Vec<String>,
     remint_last_valid_block_heights: Vec<i64>,
     deadline_at: chrono::DateTime<chrono::Utc>,
+    release_refused_on_chain: bool,
 ) -> Result<(), StorageError> {
     match storage {
         Storage::Postgres(db) => {
@@ -14,6 +15,7 @@ pub async fn set_pending_remint(
                 remint_signatures,
                 remint_last_valid_block_heights,
                 deadline_at,
+                release_refused_on_chain,
             )
             .await?;
 
@@ -27,6 +29,7 @@ pub async fn set_pending_remint(
                     remint_signatures,
                     remint_last_valid_block_heights,
                     deadline_at,
+                    release_refused_on_chain,
                 )
                 .await
         }

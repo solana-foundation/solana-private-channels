@@ -228,6 +228,7 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     };
     storage.insert_db_transaction(&withdrawal).await?;
 

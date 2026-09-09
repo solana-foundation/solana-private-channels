@@ -48,6 +48,10 @@ async fn send_create_instance(
 ) -> Result<(Pubkey, Signature), Box<dyn std::error::Error>> {
     let instance_seed = Keypair::new();
     let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
+    let (withdrawal_bitmap_pda, bitmap_bump) = Pubkey::find_program_address(
+        &[b"withdrawal_bitmap", instance_pda.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    );
 
     let (event_authority_pda, _) = find_event_authority_pda();
 
@@ -56,10 +60,12 @@ async fn send_create_instance(
         .admin(my_wallet.pubkey())
         .instance_seed(instance_seed.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .bitmap_bump(bitmap_bump)
         .instruction();
 
     let signature = send_and_confirm_instructions(

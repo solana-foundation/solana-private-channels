@@ -48,11 +48,11 @@ The core payment channel processes transactions through a five-stage pipeline op
 - `AllowMint`/`BlockMint`: Manage whitelisted SPL token mints for deposits
 - `AddOperator`/`RemoveOperator`: Manage authorized operators
 - `Deposit`: Lock user tokens in escrow (permissionless)
-- `ReleaseFunds`: Withdraw funds with SMT proof verification
+- `ReleaseFunds`: Withdraw funds, consuming the nonce's bit in the withdrawal bitmap
 
 **Security**:
 - Isolation for each Solana Private Channels instance (with unique admin, operators, mints, and Merkle tree roots)
-- Sparse Merkle Tree (SMT) proof verification to prevent double spending of withdrawals
+- An on-chain withdrawal bitmap, one bit per nonce, to prevent double spending of withdrawals
 - Admin-only mint whitelisting
 - Operator-based withdrawal processing
 

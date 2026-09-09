@@ -76,6 +76,12 @@ withdraw_program_id: J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 # (Must stay commented when unset: Jinja2 `| default()` only fills an *undefined*
 # var, so an active placeholder would render a non-base58 ESCROW_INSTANCE_ID and
 # crash the indexer's Pubkey::from_str at boot.)
+#
+# Instances created before the withdrawal bitmap have no bitmap account and can
+# never gain one, so every release against them now fails. Before repointing
+# this at a new instance, DRAIN the old one: stop accepting withdrawals on it,
+# let the in-flight ones settle, and confirm zero non-terminal withdrawal rows.
+# Any withdrawal still unreleased on the old instance is stranded permanently.
 # escrow_instance_id: "<your_instance_address>"
 
 # === Channel admin keypair ==================================================

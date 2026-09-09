@@ -4,7 +4,14 @@ on:
   push:
     branches: [main, hardening/pre-release-audit]
   pull_request:
-    branches: [main, hardening/pre-release-audit, cantina-audit]
+    branches:
+      [
+        main,
+        hardening/pre-release-audit,
+        cantina-audit,
+        ottersec-audit,
+        feature/smt-to-bitmap-migration,
+      ]
 
 permissions:
   contents: read

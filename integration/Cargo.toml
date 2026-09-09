@@ -80,6 +80,10 @@ name = "parked_withdrawal_recovery"
 path = "tests/indexer/parked_withdrawal_recovery.rs"
 
 [[test]]
+name = "rotation_driver_e2e"
+path = "tests/indexer/rotation_driver_e2e.rs"
+
+[[test]]
 name = "test_rpc_http_malformed"
 path = "tests/private-channel/rpc/test_rpc_http_malformed.rs"
 
@@ -167,10 +171,6 @@ path = "tests/indexer/sender_max_retries.rs"
 [[test]]
 name = "sender_onchain_error_arms"
 path = "tests/indexer/sender_onchain_error_arms.rs"
-
-[[test]]
-name = "sender_rotation_retry"
-path = "tests/indexer/sender_rotation_retry.rs"
 
 [[test]]
 name = "jit_mint_helper"

@@ -4,8 +4,10 @@ pub mod metrics;
 
 use crate::auth::{
     auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, redacts_transaction_errors, AuthDecision,
+    forbidden_body, is_gated, redacts_transaction_errors_for, role_check_error_body, verify_bearer,
+    AuthDecision, Role,
 };
+use crate::db::get_user_role;
 use clap::Parser;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
@@ -32,6 +34,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
@@ -261,6 +264,9 @@ pub struct Gateway {
     auth_db: Option<PgPool>,
     /// Cached result of the last upstream readiness probe, refreshed on demand.
     ready_cache: Arc<AsyncMutex<Option<ReadyCache>>>,
+    /// Cached auth-DB role confirmations, keyed by user id. Lets a token's
+    /// Operator claim be re-checked without a DB lookup on every request.
+    role_cache: Arc<Mutex<HashMap<Uuid, CachedRole>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -269,8 +275,18 @@ struct ReadyCache {
     healthy: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CachedRole {
+    is_operator: bool,
+    checked_at: Instant,
+}
+
 const READY_CACHE_TTL: Duration = Duration::from_secs(2);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a DB role confirmation is trusted before re-checking. Bounds the
+/// window a demoted operator keeps access to at most this duration.
+const ROLE_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Outcome of the ownership account fetch. `NotFound` means the read node
 /// answered and the account does not exist, which is a real 403. `Unavailable`
@@ -450,6 +466,7 @@ impl Gateway {
             jwt_secret,
             auth_db,
             ready_cache: Arc::new(AsyncMutex::new(None)),
+            role_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -658,7 +675,65 @@ impl Gateway {
         }
     }
 
+    /// Confirms whether `user_id` currently holds the Operator role in the auth
+    /// DB, caching the result for `ROLE_CACHE_TTL`. A JWT can outlive a demotion
+    /// by up to 24h, so an Operator claim is only honored when this returns
+    /// `true`.
+    ///
+    /// Returns `Err` if the DB is unreachable; the caller fails closed (denies
+    /// the operator elevation) rather than trusting a stale claim.
+    async fn confirm_operator(&self, auth_db: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+        // Fast path: a fresh cached confirmation avoids the DB round-trip.
+        // The lock is never held across the await below.
+        if let Some(entry) = self.role_cache.lock().unwrap().get(&user_id) {
+            if entry.checked_at.elapsed() < ROLE_CACHE_TTL {
+                return Ok(entry.is_operator);
+            }
+        }
+
+        // Stamp the check time before the query so a slow lookup can't cache a
+        // stale role under a fresh timestamp; staleness stays bounded by the TTL
+        // even when concurrent requests race on the same user.
+        let checked_at = Instant::now();
+        let is_operator = matches!(get_user_role(auth_db, user_id).await?, Some(Role::Operator));
+
+        let mut cache = self.role_cache.lock().unwrap();
+        // Evict expired entries so the map stays bounded to recently-active operators.
+        cache.retain(|_, entry| entry.checked_at.elapsed() < ROLE_CACHE_TTL);
+        cache.insert(
+            user_id,
+            CachedRole {
+                is_operator,
+                checked_at,
+            },
+        );
+        Ok(is_operator)
+    }
+
+    /// Records an auth-rejection metric and builds the error response.
+    fn reject_with_metrics(
+        &self,
+        method_label: &str,
+        status: StatusCode,
+        body: Bytes,
+        start: Instant,
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+        Self::record_metrics(
+            Some("auth_rejected"),
+            method_label,
+            "none",
+            &status.as_u16().to_string(),
+            start.elapsed().as_secs_f64(),
+        );
+        self.error_response(status, Some(body))
+    }
+
     /// Enforces RBAC on gated methods.
+    ///
+    /// Returns `Some(response)` if the request must be rejected, `None` if it may
+    /// proceed. No-ops immediately when auth is not configured. Operator claims
+    /// are re-checked against the auth DB (cached), so a demoted operator loses
+    /// access within `ROLE_CACHE_TTL` rather than when their 24h token expires.
     ///
     /// Returns `Err(response)` if the request must be rejected. `Ok(redact)` if
     /// it may proceed, where `redact` marks a response whose transaction errors
@@ -681,10 +756,52 @@ impl Gateway {
             _ => return Ok(false),
         };
 
-        let decision = check_request_auth(auth_header, decoding_key, method, params);
+        let mut claims = verify_bearer(auth_header, decoding_key);
+
+        // Re-check an Operator claim against the DB and downgrade to User when the
+        // role was revoked. This runs before the ungated branch below so redaction
+        // is decided from the confirmed role on every method, not the JWT's claim.
+        let mut role_check_failed = false;
+        if let Some(caller) = claims.as_mut() {
+            if caller.role == Role::Operator {
+                let confirmed = match Uuid::parse_str(&caller.sub) {
+                    Ok(user_id) => self.confirm_operator(auth_db, user_id).await,
+                    // A malformed sub can't map to an operator row.
+                    Err(_) => Ok(false),
+                };
+                match confirmed {
+                    Ok(true) => {}                         // still an operator
+                    Ok(false) => caller.role = Role::User, // demoted -> effective User
+                    Err(_) => {
+                        // Unreachable DB: treat as non-operator so redaction fails
+                        // closed, and let the gated branch reject the request.
+                        caller.role = Role::User;
+                        role_check_failed = true;
+                    }
+                }
+            }
+        }
+
+        // Public methods need neither a token nor a role check, but redaction is a
+        // separate axis: getSignatureStatuses is ungated and still error-bearing.
+        // A public method stays available when the auth DB is down; it just redacts.
+        if !is_gated(method) {
+            return Ok(redacts_transaction_errors_for(claims.as_ref(), method));
+        }
+
+        if role_check_failed {
+            return Err(self.reject_with_metrics(
+                method_label,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                role_check_error_body(),
+                start,
+            ));
+        }
+
+        let decision = check_request_auth(claims.as_ref(), method, params);
         // Independent of the decision: authorizing the request says nothing
         // about whether the caller may see why execution failed.
-        let redact = redacts_transaction_errors(auth_header, decoding_key, method);
+        let redact = redacts_transaction_errors_for(claims.as_ref(), method);
 
         let (status, body) = match decision {
             AuthDecision::Proceed => return Ok(redact),

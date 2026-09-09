@@ -1,12 +1,11 @@
 use crate::{
-    smt_utils::ProcessorSMT,
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
-        assert_get_or_release_funds, assert_get_or_reset_smt_root,
+        assert_get_or_release_funds, assert_get_or_rotate_bitmap,
     },
     utils::{
-        assert_program_error, set_mint, setup_test_balances, TestContext, INVALID_SMT_PROOF_ERROR,
-        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
+        assert_program_error, set_mint, setup_test_balances, TestContext, NONCE_ALREADY_USED_ERROR,
+        NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
     },
 };
 
@@ -17,7 +16,7 @@ const LARGE_DEPOSIT: u64 = 10_000_000;
 const RELEASE_AMOUNT: u64 = 100_000;
 
 #[test]
-fn test_double_spend_same_nonce_after_tree_reset() {
+fn test_double_spend_same_nonce_after_bitmap_rotation() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let operator = Keypair::new();
@@ -63,11 +62,6 @@ fn test_double_spend_same_nonce_after_tree_reset() {
 
     let nonce: u64 = 42;
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
-    smt.insert(nonce);
-    let new_root = smt.current_root();
-
     assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -77,24 +71,18 @@ fn test_double_spend_same_nonce_after_tree_reset() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_root,
         nonce,
-        sibling_proofs,
         false,
     )
     .expect("First release with nonce 42 should succeed");
 
-    assert_get_or_reset_smt_root(&mut context, &operator, &instance_pda, &operator_pda, false)
-        .expect("Reset SMT root should succeed");
+    assert_get_or_rotate_bitmap(&mut context, &operator, &instance_pda, &operator_pda, false)
+        .expect("RotateBitmap should succeed");
 
-    // After reset, tree_index=1 expects nonces 65536..131071.
-    // Nonce 42 belongs to tree_index=0 and should be rejected.
+    // After rotation, generation 1 expects nonces 65536..131071.
+    // Nonce 42 belongs to generation 0 and should be rejected even though
+    // the rotation cleared its bit.
     context.warp_to_slot(2);
-
-    let mut replay_smt = ProcessorSMT::new();
-    let (_, replay_proofs) = replay_smt.generate_exclusion_proof_for_verification(nonce);
-    replay_smt.insert(nonce);
-    let replay_root = replay_smt.current_root();
 
     let result = assert_get_or_release_funds(
         &mut context,
@@ -105,20 +93,15 @@ fn test_double_spend_same_nonce_after_tree_reset() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        replay_root,
         nonce,
-        replay_proofs,
         false,
     );
 
-    assert_program_error(
-        result,
-        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
-    );
+    assert_program_error(result, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR);
 }
 
 #[test]
-fn test_double_spend_smt_exclusion_rejects_used_nonce() {
+fn test_double_spend_bitmap_rejects_used_nonce() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let operator = Keypair::new();
@@ -164,11 +147,6 @@ fn test_double_spend_smt_exclusion_rejects_used_nonce() {
 
     let nonce: u64 = 42;
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
-    smt.insert(nonce);
-    let new_root = smt.current_root();
-
     assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -178,16 +156,13 @@ fn test_double_spend_smt_exclusion_rejects_used_nonce() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_root,
         nonce,
-        sibling_proofs,
         false,
     )
     .expect("First release with nonce 42 should succeed");
 
-    // Replay the same nonce without tree reset. The on-chain root now has nonce 42
-    // as a non-empty leaf, so the exclusion proof fails — the SMT math itself
-    // prevents double-spend, not just tree_index validation.
+    // Replay the same nonce without rotating. Its bit is set, so the bitmap
+    // itself prevents the double-spend, independent of generation validation.
     context.warp_to_slot(2);
 
     let result = assert_get_or_release_funds(
@@ -199,13 +174,11 @@ fn test_double_spend_smt_exclusion_rejects_used_nonce() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_root,
         nonce,
-        sibling_proofs,
         false,
     );
 
-    assert_program_error(result, INVALID_SMT_PROOF_ERROR);
+    assert_program_error(result, NONCE_ALREADY_USED_ERROR);
 }
 
 #[test]
@@ -253,13 +226,7 @@ fn test_double_spend_sequential_releases_then_replay() {
         LARGE_DEPOSIT,
     );
 
-    let mut smt = ProcessorSMT::new();
-
     for nonce in [42u64, 43, 44] {
-        let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
-        smt.insert(nonce);
-        let new_root = smt.current_root();
-
         assert_get_or_release_funds(
             &mut context,
             &operator,
@@ -269,25 +236,18 @@ fn test_double_spend_sequential_releases_then_replay() {
             &TOKEN_PROGRAM_ID,
             RELEASE_AMOUNT,
             &user.pubkey(),
-            new_root,
             nonce,
-            sibling_proofs,
             false,
         )
         .unwrap_or_else(|_| panic!("Release with nonce {} should succeed", nonce));
     }
 
-    // Replay nonce 42 after three sequential releases.
-    // On-chain root has nonces 42, 43, 44 — exclusion proof for 42 fails.
-    // Fresh SMT proofs won't match the on-chain root that already contains 42.
+    // Replay nonce 42 after three sequential releases. Nonces 42, 43 and 44 all
+    // live in the same bitmap byte, so this also pins that setting a neighbour
+    // does not clear an earlier bit.
     context.warp_to_slot(2);
 
     let replay_nonce: u64 = 42;
-
-    let mut replay_smt = ProcessorSMT::new();
-    let (_, replay_proofs) = replay_smt.generate_exclusion_proof_for_verification(replay_nonce);
-    replay_smt.insert(replay_nonce);
-    let replay_root = replay_smt.current_root();
 
     let result = assert_get_or_release_funds(
         &mut context,
@@ -298,11 +258,9 @@ fn test_double_spend_sequential_releases_then_replay() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        replay_root,
         replay_nonce,
-        replay_proofs,
         false,
     );
 
-    assert_program_error(result, INVALID_SMT_PROOF_ERROR);
+    assert_program_error(result, NONCE_ALREADY_USED_ERROR);
 }

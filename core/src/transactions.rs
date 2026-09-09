@@ -4,10 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 const SPL_INITIALIZE_MINT: u8 = 0;
+const SPL_INITIALIZE_MINT2: u8 = 20;
 
 /// A lazy-initialized static mapping from program_id (Pubkey) to a HashSet of admin instruction types (u8)
-pub static ADMIN_INSTRUCTIONS_MAP: LazyLock<HashMap<Pubkey, HashSet<u8>>> =
-    LazyLock::new(|| HashMap::from([(spl_token::id(), HashSet::from([SPL_INITIALIZE_MINT]))]));
+pub static ADMIN_INSTRUCTIONS_MAP: LazyLock<HashMap<Pubkey, HashSet<u8>>> = LazyLock::new(|| {
+    HashMap::from([(
+        spl_token::id(),
+        HashSet::from([SPL_INITIALIZE_MINT, SPL_INITIALIZE_MINT2]),
+    )])
+});
 
 /// Checks if an instruction is an admin-only instruction
 pub fn is_admin_instruction(program_id: &Pubkey, instruction_type: u8) -> bool {
@@ -117,6 +122,11 @@ mod tests {
     #[test]
     fn spl_initialize_mint_is_admin() {
         assert!(is_admin_instruction(&spl_token::id(), 0));
+    }
+
+    #[test]
+    fn spl_initialize_mint2_is_admin() {
+        assert!(is_admin_instruction(&spl_token::id(), 20));
     }
 
     #[test]

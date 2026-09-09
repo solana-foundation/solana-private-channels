@@ -19,6 +19,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
         signer
     ))]
     #[codama(account(name = "instance", docs = "Instance PDA to be created", writable))]
+    #[codama(account(
+        name = "withdrawal_bitmap",
+        docs = "Withdrawal bitmap PDA to be created",
+        writable
+    ))]
     #[codama(account(name = "system_program", docs = "System program"))]
     #[codama(account(
         name = "event_authority",
@@ -31,6 +36,8 @@ pub enum PrivateChannelEscrowProgramInstruction {
     CreateInstance {
         /// Bump for the instance PDA
         bump: u8,
+        /// Bump for the withdrawal bitmap PDA
+        bitmap_bump: u8,
     } = 0,
 
     /// Allow new token mints for the instance (admin-only).
@@ -171,7 +178,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
     #[codama(account(name = "operator", docs = "Operator releasing the funds", signer))]
     #[codama(account(
         name = "instance",
-        docs = "Instance PDA to validate and update",
+        docs = "Instance PDA to validate and sign the transfer"
+    ))]
+    #[codama(account(
+        name = "withdrawal_bitmap",
+        docs = "Withdrawal bitmap PDA to consume the nonce",
         writable
     ))]
     #[codama(account(
@@ -208,18 +219,19 @@ pub enum PrivateChannelEscrowProgramInstruction {
         amount: u64,
         /// User receiving the funds (wallet address, not the ATA)
         user: Pubkey,
-        /// New withdrawal transactions root
-        new_withdrawal_root: [u8; 32],
-        /// Transaction nonce
+        /// Transaction nonce to consume from the withdrawal bitmap
         transaction_nonce: u64,
-        /// Sibling proofs (flattened as 512 bytes: 16 proofs × 32 bytes each)
-        sibling_proofs: [u8; 512],
     } = 7,
 
-    /// Reset the SMT root for the instance (operator-only).
+    /// Rotate the withdrawal bitmap to the next generation (operator-only).
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
-    #[codama(account(name = "operator", docs = "Operator resetting the SMT root", signer))]
-    #[codama(account(name = "instance", docs = "Instance PDA to reset", writable))]
+    #[codama(account(name = "operator", docs = "Operator rotating the bitmap", signer))]
+    #[codama(account(name = "instance", docs = "Instance PDA the bitmap belongs to"))]
+    #[codama(account(
+        name = "withdrawal_bitmap",
+        docs = "Withdrawal bitmap PDA to rotate",
+        writable
+    ))]
     #[codama(account(
         name = "operator_pda",
         docs = "Operator PDA to validate operator permissions"
@@ -232,10 +244,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
-    ResetSmtRoot {
-        /// Tree index the caller expects the instance to be at. Rejected if it
-        /// no longer matches, so a replayed reset cannot advance the tree twice.
-        expected_current_tree_index: u64,
+    RotateBitmap {
+        /// Generation the caller expects the bitmap to be at. Rejected if it no
+        /// longer matches, so a replayed rotation cannot skip a generation.
+        expected_generation: u64,
     } = 8,
 
     /// Invoked via CPI from another program to log event via instruction data.

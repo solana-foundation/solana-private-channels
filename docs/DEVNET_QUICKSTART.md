@@ -291,7 +291,7 @@ cargo run --bin withdraw -- \
   <AMOUNT>
 ```
 
-The indexer detects the burn on Solana Private Channels, builds a Merkle proof, and the operator releases funds from the Solana escrow. You should be able to check your balance in your wallet or on Solana explorer to see the withdrawal.
+The indexer detects the burn on Solana Private Channels, and the operator releases funds from the Solana escrow, consuming that withdrawal's nonce in the escrow instance's withdrawal bitmap. You should be able to check your balance in your wallet or on Solana explorer to see the withdrawal.
 
 ## Stopping Services
 

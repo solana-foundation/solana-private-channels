@@ -50,13 +50,18 @@ pub const INVALID_ADMIN_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidAd
 pub const INVALID_ALLOWED_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::InvalidAllowedMint as u32;
 pub const INVALID_OPERATOR_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidOperatorPda as u32;
-pub const INVALID_SMT_PROOF_ERROR: u32 = PrivateChannelEscrowProgramError::InvalidSmtProof as u32;
+pub const INVALID_WITHDRAWAL_BITMAP_ERROR: u32 =
+    PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap as u32;
+pub const NONCE_ALREADY_USED_ERROR: u32 = PrivateChannelEscrowProgramError::NonceAlreadyUsed as u32;
 pub const TRANSFER_HOOK_NOT_ALLOWED_ERROR: u32 =
     PrivateChannelEscrowProgramError::TransferHookNotAllowed as u32;
-pub const INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR: u32 =
-    PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex as u32;
-pub const UNEXPECTED_TREE_INDEX_ERROR: u32 =
-    PrivateChannelEscrowProgramError::UnexpectedTreeIndex as u32;
+pub const NONCE_OUTSIDE_CURRENT_GENERATION_ERROR: u32 =
+    PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration as u32;
+pub const UNEXPECTED_GENERATION_ERROR: u32 =
+    PrivateChannelEscrowProgramError::UnexpectedGeneration as u32;
+
+/// Nonces covered by one bitmap generation. Must match the on-chain constant.
+pub const NONCES_PER_GENERATION: u64 = 65_536;
 
 // Standard Solana Program Error Codes
 pub const INVALID_ARGUMENT_ERROR: u32 = 5; // ProgramError::InvalidArgument
@@ -764,7 +769,7 @@ fn get_operation_name(instruction: &Instruction) -> &'static str {
         5 => "SetNewAdmin",
         6 => "Deposit",
         7 => "ReleaseFunds",
-        8 => "ResetSmtRoot",
+        8 => "RotateBitmap",
         _ => "Unknown",
     }
 }
