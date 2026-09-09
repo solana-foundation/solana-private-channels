@@ -276,7 +276,8 @@ Represents an authorized operator for an instance that can release funds.
 | `bump` | u8 | PDA bump seed |
 
 ### AllowedMint
-Represents a token mint that is allowed in an instance, and its two gates.
+Represents a token mint that is allowed in an instance, its two gates, and the mint
+profile recorded when it was allowed.
 
 **PDA Derivation**: `["allowed_mint", instance_pda, mint_pubkey]`
 
@@ -285,6 +286,16 @@ Represents a token mint that is allowed in an instance, and its two gates.
 | `bump` | u8 | PDA bump seed |
 | `deposits_blocked` | bool | `Deposit` rejects this mint |
 | `withdrawals_blocked` | bool | `ReleaseFunds` rejects this mint |
+| `decimals` | u8 | Mint decimals at `AllowMint`; `Deposit` rejects a mismatch |
+| `token_program` | Pubkey | Token program at `AllowMint`; `Deposit` rejects a mismatch |
+
+A mint carrying `MintCloseAuthority` can be closed and recreated at the same address
+with either value changed. Closing requires zero supply, so that window is while the
+escrow holds none of the mint — in practice between `AllowMint` and the first deposit,
+which is also when the channel-side mint is initialized from the allow-time decimals.
+`Deposit` compares both and fails with `MintProfileChanged`; an admin blocks and
+re-allows to re-pin. `ReleaseFunds` does not compare them, since the escrow can only
+hold a balance while the profile is unchangeable.
 
 ## Errors
 
@@ -308,6 +319,7 @@ The program defines the following custom errors:
 | 13 | `UnexpectedTreeIndex` | Unexpected current tree index for SMT root reset |
 | 14 | `DepositsBlockedForMint` | Deposits are blocked for this mint |
 | 15 | `WithdrawalsBlockedForMint` | Withdrawals are blocked for this mint |
+| 16 | `MintProfileChanged` | Mint no longer matches the profile recorded at AllowMint |
 
 ## Other Constants
 

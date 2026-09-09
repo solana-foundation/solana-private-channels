@@ -703,16 +703,44 @@ async fn check_withdrawal_preflights_inner(
         reason: e.to_string(),
     })?;
 
-    // PausableConfig and PermanentDelegate only exist on Token-2022 mints.
-    // For legacy SPL Token, skip the pre-flight entirely — saves an RPC
-    // round-trip on every withdrawal and avoids forcing extension-flag
-    // resolution for mints that can't carry the extensions in the first
-    // place. Falls back to RPC only if the mint isn't in the DB yet.
     let token_program = processor_state
         .mint_cache
         .get_mint_metadata(&mint)
         .await?
         .token_program;
+
+    // A freeze_authority holder can freeze the pooled escrow ATA, which strands
+    // every depositor for that mint. This runs before the Token-2022 gate below
+    // because freeze_authority is a base-layout field on both token programs.
+    // Gated on the mint having one at all, so a mint nobody can freeze costs no
+    // per-withdrawal read.
+    if processor_state
+        .mint_cache
+        .has_freeze_authority(&mint)
+        .await?
+    {
+        let release_funds_state = processor_state
+            .release_funds_state
+            .as_mut()
+            .ok_or(OperatorError::MissingBuilder)?;
+        let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
+
+        if processor_state
+            .mint_cache
+            .is_ata_frozen(&instance_ata)
+            .await?
+        {
+            return Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_ESCROW_FROZEN,
+                format!("escrow ATA frozen for mint: {mint}"),
+            )));
+        }
+    }
+
+    // PausableConfig and PermanentDelegate only exist on Token-2022 mints.
+    // For legacy SPL Token, stop here — saves an RPC round-trip on every
+    // withdrawal and avoids forcing extension-flag resolution for mints that
+    // can't carry the extensions in the first place.
     if token_program != spl_token_2022::ID {
         return Ok(None);
     }
@@ -1471,6 +1499,7 @@ mod tests {
         let mint_pubkey = Pubkey::new_unique();
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
         let recipient = Pubkey::new_unique();
         {
             let mock_storage = match storage.as_ref() {
@@ -1547,6 +1576,7 @@ mod tests {
         let mint_pubkey = Pubkey::new_unique();
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
         let recipient = Pubkey::new_unique();
         {
             let mock_storage = match storage.as_ref() {
@@ -1651,6 +1681,7 @@ mod tests {
         let mint_pubkey = Pubkey::new_unique();
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
         let recipient = Pubkey::new_unique();
         {
             let Storage::Mock(mock_storage) = storage.as_ref() else {
@@ -1830,6 +1861,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -1902,6 +1934,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2196,6 +2229,7 @@ mod tests {
         let mint_pubkey = Pubkey::new_unique();
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
         {
             let mock_storage = match storage.as_ref() {
                 Storage::Mock(m) => m,
@@ -2266,6 +2300,7 @@ mod tests {
         // The gate is not this test's subject; treat the mint as already proved.
         let mint_pubkey = Pubkey::new_unique();
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, _sender_rx) = mpsc::channel(10);
@@ -2648,6 +2683,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2714,6 +2750,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         // Pass 1: the pre-flight cannot reach an RPC, so the row is requeued to Pending.
         let (ftx1, frx1) = mpsc::channel::<DbTransaction>(4);
@@ -2802,6 +2839,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -3120,6 +3158,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(4);
         let (sender_tx, mut sender_rx) = mpsc::channel(16);
@@ -3631,6 +3670,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -3741,6 +3781,7 @@ mod tests {
         };
         // The gate is not this test's subject; treat the mint as already proved.
         ps.mint_cache.record_existence_floor(&mint_pubkey, 1);
+        ps.mint_cache.record_freeze_authority(&mint_pubkey, false);
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -4444,13 +4485,15 @@ mod tests {
         deposits_blocked: bool,
         withdrawals_blocked: bool,
     ) -> serde_json::Value {
-        // discriminator, bump, then one byte per gate.
-        let data = [
+        // discriminator, bump, one byte per gate, decimals, then token_program.
+        let mut data = vec![
             2u8,
             255u8,
             deposits_blocked as u8,
             withdrawals_blocked as u8,
+            6u8,
         ];
+        data.extend_from_slice(spl_token::id().as_ref());
         serde_json::json!({
             "context": {"slot": slot},
             "value": {
@@ -4521,6 +4564,9 @@ mod tests {
         insert_mint_row(&storage, &mint);
         let mut ps =
             processor_state_answering(&storage, allowed_mint_account_response(500, false, false));
+        // Freezing is not this test's subject, and the single mocked response
+        // cannot serve both the allowlist read and a mint read.
+        ps.mint_cache.record_freeze_authority(&mint, false);
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -4592,6 +4638,7 @@ mod tests {
         insert_mint_row(&storage, &mint);
         let mut ps =
             processor_state_answering(&storage, allowed_mint_account_response(500, true, false));
+        ps.mint_cache.record_freeze_authority(&mint, false);
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -4602,6 +4649,48 @@ mod tests {
             matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
             "the withdrawal must be dispatched"
         );
+    }
+
+    /// A `freeze_authority` holder can freeze the pooled escrow ATA, stranding every
+    /// depositor for that mint. Parking makes that visible instead of dispatching a
+    /// release the token program is certain to reject.
+    #[tokio::test]
+    async fn process_release_funds_frozen_escrow_ata_parks() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        // Token account, 165-byte base layout: state at 108, 2 means Frozen.
+        let mut ata_data = vec![0u8; 165];
+        ata_data[108] = 2;
+        let frozen_ata = serde_json::json!({
+            "context": {"slot": 500},
+            "value": {
+                "owner": spl_token::id().to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(&ata_data), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+
+        let mut ps = processor_state_answering(&storage, frozen_ata);
+        // Lets the allowlist read short-circuit, so the one mocked response is
+        // free to serve the escrow ATA read.
+        ps.mint_cache.record_existence_floor(&mint, 1);
+        ps.mint_cache.record_freeze_authority(&mint, true);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "one frozen mint must not end the loop");
+        let update = update.expect("row must be parked");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .expect("error_message must be set")
+            .contains("escrow ATA frozen for mint:"));
+        assert!(builder.is_none(), "nothing may be dispatched");
     }
 
     /// An allowlist account whose layout this operator cannot decode parks the row

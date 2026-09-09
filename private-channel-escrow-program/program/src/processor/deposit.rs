@@ -86,6 +86,19 @@ pub fn process_deposit(
         return Err(PrivateChannelEscrowProgramError::DepositsBlockedForMint.into());
     }
 
+    // A recreate at the same address can change either value. Closing needs zero
+    // supply, so the window is while the escrow holds none of this mint, and the
+    // channel mint is initialized from the allow-time decimals on the first deposit.
+    // TransferChecked cannot catch it: the decimals it validates are read from the
+    // mint below. Runs before validate_ata, which only rejects a changed token
+    // program until someone creates the new escrow ATA.
+    let mint_decimals = get_mint_decimals(mint_info)?;
+    if allowed_mint.decimals != mint_decimals
+        || allowed_mint.token_program != *token_program_info.address()
+    {
+        return Err(PrivateChannelEscrowProgramError::MintProfileChanged.into());
+    }
+
     validate_ata(
         user_ata_info,
         user_info.address(),
@@ -113,7 +126,7 @@ pub fn process_deposit(
         amount: args.amount,
         token_program: token_program_info.address(),
         mint: mint_info,
-        decimals: get_mint_decimals(mint_info)?,
+        decimals: mint_decimals,
     }
     .invoke_signed(&[])?;
 

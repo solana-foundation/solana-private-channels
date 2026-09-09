@@ -38,6 +38,22 @@
                   "kind": "numberTypeNode"
                 }
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "decimals",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "tokenProgram",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -618,6 +634,12 @@
         "kind": "errorNode",
         "message": "Withdrawals are blocked for this mint",
         "name": "withdrawalsBlockedForMint"
+      },
+      {
+        "code": 16,
+        "kind": "errorNode",
+        "message": "Mint no longer matches the profile recorded at AllowMint",
+        "name": "mintProfileChanged"
       }
     ],
     "instructions": [

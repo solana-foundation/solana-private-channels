@@ -84,7 +84,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (12 integration tests)
+### Deposit (15 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -94,12 +94,15 @@
 - `test_deposit_not_enough_accounts` — missing accounts
 - `test_deposit_token_2022_basic_success` — Token2022 deposit
 - `test_deposit_token_2022_transfer_hook_rejected` — TransferHookNotAllowed on deposit path (live swap of mint data post-AllowMint proves the check runs at deposit, not only at AllowMint)
+- `test_deposit_token_2022_transfer_fee_success` — the escrow credits the measured balance delta, so the depositor is credited net of the fee
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
 - `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData
 - `test_deposit_wrong_instance_ata` — passing an instance ATA for a different mint is rejected with InvalidInstructionData
+- `test_deposit_rejected_after_mint_decimals_change` — MintProfileChanged; TransferChecked cannot catch this since it validates the decimals it is handed against the mint itself
+- `test_deposit_rejected_after_mint_token_program_change` — MintProfileChanged; the ATAs for the new program are left uncreated, so this also pins the check running before `validate_ata`
 
-### ReleaseFunds (23 integration tests)
+### ReleaseFunds (24 integration tests)
 
 - `test_release_funds_success` — happy path with SMT proof
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -123,6 +126,7 @@
 - `test_zero_amount_release` — zero amount edge case
 - `test_release_funds_wrong_user_ata` — passing another user's ATA as user_ata while keeping the correct user pubkey in instruction data is rejected with InvalidInstructionData
 - `test_release_funds_full_balance` — releasing the entire deposited balance succeeds and leaves the instance ATA at zero
+- `test_release_funds_token_2022_transfer_fee_success` — escrow is debited the full release amount and the user receives it minus the fee, so the fee falls on the user, not the escrow
 
 ### ResetSmtRoot (4 integration tests)
 

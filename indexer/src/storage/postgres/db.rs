@@ -2343,7 +2343,13 @@ impl PostgresDb {
                 VALUES ($1, $2, $3, $4)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
-                    token_program = EXCLUDED.token_program
+                    token_program = EXCLUDED.token_program,
+                    -- Reset so the operator re-resolves them. A re-allow can follow
+                    -- a close and recreate, and preserving the flags would keep the
+                    -- pause and drain pre-flights on the pre-recreate profile for
+                    -- the life of the row.
+                    is_pausable = NULL,
+                    has_permanent_delegate = NULL
                 "#,
             )
             .bind(&mint.mint_address)

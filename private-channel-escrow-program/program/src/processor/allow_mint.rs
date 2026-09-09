@@ -92,7 +92,7 @@ pub fn process_allow_mint(
         token_program_info,
     )?;
 
-    let allowed_mint = AllowedMint::new(args.bump);
+    let allowed_mint = AllowedMint::new(args.bump, mint_decimals, *token_program_info.address());
     allowed_mint
         .validate_pda(
             instance_info.address(),

@@ -1282,6 +1282,29 @@ mod tests {
         );
     }
 
+    /// A re-allow can follow a close and recreate, so the extension flags must not
+    /// survive it. Keeping them would leave the pause and drain pre-flights running
+    /// on the pre-recreate profile for the life of the row.
+    #[tokio::test]
+    async fn upsert_mints_batch_resets_extension_flags_on_re_allow() {
+        let (storage, _mock) = make_mock_storage();
+        let mint = DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string());
+        storage
+            .upsert_mints_batch(std::slice::from_ref(&mint))
+            .await
+            .unwrap();
+        storage
+            .set_mint_extension_flags("m1", true, true)
+            .await
+            .unwrap();
+
+        storage.upsert_mints_batch(&[mint]).await.unwrap();
+
+        let row = storage.get_mint("m1").await.unwrap().unwrap();
+        assert_eq!(row.is_pausable, None);
+        assert_eq!(row.has_permanent_delegate, None);
+    }
+
     #[tokio::test]
     async fn sync_mint_status_missing_row_is_noop() {
         let (storage, _mock) = make_mock_storage();

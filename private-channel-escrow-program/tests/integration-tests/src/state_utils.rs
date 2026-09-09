@@ -141,7 +141,7 @@ pub fn assert_get_or_allow_mint(
         )
         .expect("AllowMint should succeed");
 
-    assert_allow_mint_account(context, &allowed_mint_pda, bump);
+    assert_allow_mint_account(context, &allowed_mint_pda, mint, bump, &token_program_id);
 
     // Assert AllowMint event was emitted
     assert_event_discriminator_present(

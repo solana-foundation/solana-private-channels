@@ -16,12 +16,18 @@ use pinocchio::{error::ProgramError, Address};
 /// Seeds: [b"allowed_mint", instance_pda, mint_pubkey]
 ///
 /// Gates are independent so blocking deposits cannot strand existing balances.
+///
+/// `decimals` and `token_program` pin what the admin reviewed. A mint closed and
+/// recreated at the same address can change either, so Deposit compares both and
+/// stops until an admin blocks and re-allows the mint.
 #[derive(Clone, Debug, PartialEq, CodamaAccount)]
 #[repr(C)]
 pub struct AllowedMint {
     pub bump: u8,
     pub deposits_blocked: bool,
     pub withdrawals_blocked: bool,
+    pub decimals: u8,
+    pub token_program: Address,
 }
 
 impl Discriminator for AllowedMint {
@@ -31,11 +37,14 @@ impl Discriminator for AllowedMint {
 
 impl AccountSerialize for AllowedMint {
     fn to_bytes_inner(&self) -> Vec<u8> {
-        vec![
+        let mut data = vec![
             self.bump,
             self.deposits_blocked as u8,
             self.withdrawals_blocked as u8,
-        ]
+            self.decimals,
+        ];
+        data.extend_from_slice(self.token_program.as_ref());
+        data
     }
 }
 
@@ -43,13 +52,17 @@ impl AllowedMint {
     pub const LEN: usize = 1 + // discriminator
         1 + // bump
         1 + // deposits_blocked
-        1; // withdrawals_blocked
+        1 + // withdrawals_blocked
+        1 + // decimals
+        32; // token_program
 
-    pub fn new(bump: u8) -> Self {
+    pub fn new(bump: u8, decimals: u8, token_program: Address) -> Self {
         Self {
             bump,
             deposits_blocked: false,
             withdrawals_blocked: false,
+            decimals,
+            token_program,
         }
     }
 
@@ -76,11 +89,23 @@ impl AllowedMint {
             1 => true,
             _ => return Err(ProgramError::InvalidAccountData),
         };
+        offset += 1;
+
+        let decimals = data[offset];
+        offset += 1;
+
+        let token_program = Address::new_from_array(
+            data[offset..offset + 32]
+                .try_into()
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        );
 
         Ok(Self {
             bump,
             deposits_blocked,
             withdrawals_blocked,
+            decimals,
+            token_program,
         })
     }
 
@@ -108,17 +133,21 @@ mod tests {
     // create an account that blocks the deposit it was created for.
     #[test]
     fn test_allowed_mint_new() {
-        let allowed_mint = AllowedMint::new(99);
+        let token_program = Address::new_from_array([7u8; 32]);
+        let allowed_mint = AllowedMint::new(99, 6, token_program);
+
         assert_eq!(allowed_mint.bump, 99);
         assert!(!allowed_mint.deposits_blocked);
         assert!(!allowed_mint.withdrawals_blocked);
+        assert_eq!(allowed_mint.decimals, 6);
+        assert_eq!(allowed_mint.token_program, token_program);
     }
 
-    // The two gates are adjacent bytes of the same type, so this sets them to
-    // opposite values to pin the field order across the wire format.
+    // The gates are adjacent bytes of the same type and decimals follows them, so
+    // this gives every field a distinct value to pin the order on the wire.
     #[test]
     fn test_allowed_mint_serialization_roundtrip() {
-        let mut allowed_mint = AllowedMint::new(200);
+        let mut allowed_mint = AllowedMint::new(200, 9, Address::new_from_array([7u8; 32]));
         allowed_mint.deposits_blocked = true;
 
         let bytes = allowed_mint.to_bytes();
@@ -134,8 +163,13 @@ mod tests {
     // Borsh-based client cannot decode, so it is rejected on read.
     #[test]
     fn test_allowed_mint_try_from_bytes_non_canonical_gate() {
-        let data = [AllowedMint::DISCRIMINATOR, 200, 2, 0];
+        let mut data = [0u8; AllowedMint::LEN];
+        data[0] = AllowedMint::DISCRIMINATOR;
+        data[1] = 200; // bump
+        data[2] = 2; // deposits_blocked, neither 0 nor 1
+
         let result = AllowedMint::try_from_bytes(&data);
+
         assert_eq!(result.err(), Some(ProgramError::InvalidAccountData));
     }
 
@@ -162,7 +196,7 @@ mod tests {
     // what a pre-gates 2-byte account hits after the layout change.
     #[test]
     fn test_allowed_mint_try_from_bytes_too_short() {
-        let data = [AllowedMint::DISCRIMINATOR, 200]; // bump only, LEN=4
+        let data = [AllowedMint::DISCRIMINATOR, 200]; // bump only, LEN=37
         let result = AllowedMint::try_from_bytes(&data);
         assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
     }

@@ -29,11 +29,23 @@ pub fn assert_instance_account(
     assert_eq!(instance.current_tree_index, expected_current_tree_index);
 }
 
+/// Decimals sit at offset 44 for both SPL Token and Token-2022 mints.
+const MINT_DECIMALS_OFFSET: usize = 44;
+
 pub fn assert_allow_mint_account(
     context: &mut TestContext,
     allowed_mint_pda: &Pubkey,
+    mint: &Pubkey,
     expected_bump: u8,
+    expected_token_program: &Pubkey,
 ) {
+    // Compared against what the mint itself reports, so this holds whatever
+    // decimals a test mint is created with.
+    let mint_decimals = context
+        .get_account(mint)
+        .expect("Mint account should exist")
+        .data[MINT_DECIMALS_OFFSET];
+
     let account = context
         .get_account(allowed_mint_pda)
         .expect("Allowed mint account should exist");
@@ -44,9 +56,11 @@ pub fn assert_allow_mint_account(
         AllowedMint::from_bytes(&account.data).expect("Should deserialize allowed mint account");
 
     assert_eq!(allowed_mint.bump, expected_bump);
-    // Also covers the re-allow path: AllowMint must re-open both gates.
+    // Also covers the re-allow path: AllowMint must re-open both gates and re-pin.
     assert!(!allowed_mint.deposits_blocked);
     assert!(!allowed_mint.withdrawals_blocked);
+    assert_eq!(allowed_mint.decimals, mint_decimals);
+    assert_eq!(allowed_mint.token_program, *expected_token_program);
 }
 
 /// BlockMint leaves the PDA in place, so this asserts the gates it wrote

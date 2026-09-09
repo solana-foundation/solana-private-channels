@@ -452,20 +452,22 @@ impl MockStorage {
         self.check_should_fail("upsert_mints_batch")?;
         let mut store = self.mints.lock().unwrap();
         for mint in mints {
-            // Must mirror the Postgres `ON CONFLICT DO UPDATE SET decimals,
-            // token_program` semantics: the indexer upserts a `DbMint::new`
-            // (flags = None) every time it sees AllowMint, but the operator
-            // lazily fills `is_pausable` / `has_permanent_delegate` via
-            // `set_mint_extension_flags`. A re-upsert (reorg, indexer
-            // restart, retry) must preserve those flags, otherwise the next
-            // withdrawal wastes an RPC round-trip re-resolving them. A
-            // blanket `insert` here would silently disagree with prod and
-            // let tests lock in the wrong behavior. `status` is NOT touched on
-            // conflict — `sync_mint_status` is the sole writer of the mirror.
+            // Must mirror the Postgres `ON CONFLICT DO UPDATE`: refresh decimals
+            // and token_program, and reset both extension flags so the operator
+            // re-resolves them via `set_mint_extension_flags`. A re-allow can
+            // follow a close and recreate, so preserving the flags would keep the
+            // pause and drain pre-flights on the pre-recreate profile for the life
+            // of the row; the cost of resetting is one RPC round-trip on the next
+            // withdrawal, replays (reorg, restart, retry) included. A blanket
+            // `insert` here would silently disagree with prod and let tests lock in
+            // the wrong behavior. `status` is NOT touched on conflict —
+            // `sync_mint_status` is the sole writer of the mirror.
             match store.get_mut(&mint.mint_address) {
                 Some(existing) => {
                     existing.decimals = mint.decimals;
                     existing.token_program = mint.token_program.clone();
+                    existing.is_pausable = None;
+                    existing.has_permanent_delegate = None;
                 }
                 None => {
                     store.insert(mint.mint_address.clone(), mint.clone());

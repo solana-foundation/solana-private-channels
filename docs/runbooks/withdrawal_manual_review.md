@@ -162,6 +162,14 @@ to say explicitly what the user is owed.
      size, marking it `failed` releases later withdrawals onto a tree generation
      that was never rotated, so rotate before you terminalize it. This applies to
      any terminalized boundary row, not just this one.
+   - `escrow ATA frozen for mint:` - the mint's `freeze_authority` holder froze the
+     pooled escrow ATA, so no release for that mint can settle. The escrow still
+     holds the funds and the row is intact. Nothing on our side can thaw it: contact
+     the authority holder, and re-arm the row once
+     `solana account $(escrow-ata <instance> <mint>) --url <target-rpc>` shows the
+     account no longer frozen. Because the ATA is pooled per mint, expect every
+     withdrawal for that mint to park here, not just this one.
+     [Escalate](_escalation.md) (Tier 2).
    - `withdrawals blocked for mint:` - an admin set the mint's withdrawal gate, which
      `release_funds` rejects on-chain. The escrow still holds the funds and the row is
      intact, so nothing is lost. Re-open the gate (`BlockMint` with

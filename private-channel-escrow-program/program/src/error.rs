@@ -68,6 +68,10 @@ pub enum PrivateChannelEscrowProgramError {
     /// (15) Admin has blocked withdrawals for this mint
     #[error("Withdrawals are blocked for this mint")]
     WithdrawalsBlockedForMint,
+
+    /// (16) Mint no longer matches the profile recorded when it was allowed
+    #[error("Mint no longer matches the profile recorded at AllowMint")]
+    MintProfileChanged,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -105,6 +109,7 @@ mod tests {
             (UnexpectedTreeIndex, 13),
             (DepositsBlockedForMint, 14),
             (WithdrawalsBlockedForMint, 15),
+            (MintProfileChanged, 16),
         ];
 
         for (error, expected_code) in cases {

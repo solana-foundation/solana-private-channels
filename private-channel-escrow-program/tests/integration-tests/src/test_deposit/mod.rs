@@ -5,10 +5,11 @@ use crate::{
         assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account, get_or_create_associated_token_account_2022,
         get_token_balance, set_mint, set_mint_2022_basic, set_mint_2022_with_transfer_hook,
-        set_token_balance, setup_test_balances, TestContext, ATA_PROGRAM_ID,
-        INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
-        NOT_ENOUGH_ACCOUNT_KEYS_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
-        TOKEN_INSUFFICIENT_FUNDS_ERROR, TRANSFER_HOOK_NOT_ALLOWED_ERROR,
+        set_mint_with_decimals, set_token_balance, setup_test_balances, TestContext,
+        ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
+        INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        TRANSFER_HOOK_NOT_ALLOWED_ERROR,
     },
 };
 
@@ -895,4 +896,149 @@ fn test_deposit_wrong_instance_ata() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, INVALID_INSTRUCTION_DATA_ERROR);
+}
+
+// A mint closed and recreated at the same address can come back with different
+// decimals. TransferChecked cannot catch it, since it validates against the
+// mint itself, so the pinned value is the only thing that does.
+#[test]
+fn test_deposit_rejected_after_mint_decimals_change() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Same address, 9 decimals instead of the 6 that were pinned.
+    set_mint_with_decimals(&mut context, &mint.pubkey(), 9);
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, MINT_PROFILE_CHANGED_ERROR);
+}
+
+// A recreate under a different token program moves the escrow ATA. The ATAs for
+// the new program are deliberately left uncreated here: the profile check has to
+// fire before validate_ata, which is what stops a deposit landing in an ATA the
+// operator never reads once someone creates it.
+#[test]
+fn test_deposit_rejected_after_mint_token_program_change() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Same address, now owned by Token-2022 instead of the pinned legacy program.
+    set_mint_2022_basic(&mut context, &mint.pubkey());
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, MINT_PROFILE_CHANGED_ERROR);
 }

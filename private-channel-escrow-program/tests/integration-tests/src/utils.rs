@@ -61,6 +61,8 @@ pub const DEPOSITS_BLOCKED_FOR_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::DepositsBlockedForMint as u32;
 pub const WITHDRAWALS_BLOCKED_FOR_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint as u32;
+pub const MINT_PROFILE_CHANGED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::MintProfileChanged as u32;
 
 // Standard Solana Program Error Codes
 pub const INVALID_ARGUMENT_ERROR: u32 = 5; // ProgramError::InvalidArgument
@@ -387,8 +389,12 @@ pub fn set_token_balance_2022(
 }
 
 pub fn set_mint(context: &mut TestContext, mint: &Pubkey) {
+    set_mint_with_decimals(context, mint, 6);
+}
+
+pub fn set_mint_with_decimals(context: &mut TestContext, mint: &Pubkey, decimals: u8) {
     let mint_account = Mint {
-        decimals: 6,
+        decimals,
         is_initialized: true,
         freeze_authority: COption::None,
         mint_authority: COption::None,

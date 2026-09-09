@@ -13,6 +13,8 @@ use spl_token_2022::extension::{
     pausable::PausableConfig, permanent_delegate::PermanentDelegate, BaseStateWithExtensions,
     StateWithExtensions,
 };
+use spl_token_2022::state::Account as Token2022AccountState;
+use spl_token_2022::state::AccountState;
 use spl_token_2022::state::Mint as Token2022MintState;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::collections::HashMap;
@@ -21,6 +23,25 @@ use std::sync::Arc;
 use tracing::warn;
 
 const DECIMALS_OFFSET: usize = 44;
+
+/// `getTokenAccountBalance` returns `RpcResponseError { code: -32602, ... }`
+/// when the ATA does not exist. The lowercased substring match is a fallback
+/// for non-standard RPC providers that may surface the same condition with a
+/// different code.
+fn is_account_not_found(e: &client_error::Error) -> bool {
+    let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) = &e.kind else {
+        return false;
+    };
+    if *code == -32602 {
+        return true;
+    }
+    let msg = message.to_lowercase();
+    msg.contains("could not find account") || msg.contains("account not found")
+}
+
+/// `freeze_authority` is a `COption<Pubkey>` following `is_initialized`: a 4-byte
+/// little-endian tag, then the key. Same base layout for SPL Token and Token-2022.
+const FREEZE_AUTHORITY_TAG_OFFSET: usize = 46;
 
 /// Reads a mint, telling "absent" apart from "could not read"; `get_account` merges both.
 ///
@@ -47,21 +68,6 @@ async fn read_target_mint_account(
     }
 }
 
-/// `getTokenAccountBalance` returns `RpcResponseError { code: -32602, ... }`
-/// when the ATA does not exist. The lowercased substring match is a fallback
-/// for non-standard RPC providers that may surface the same condition with a
-/// different code.
-fn is_account_not_found(e: &client_error::Error) -> bool {
-    let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) = &e.kind else {
-        return false;
-    };
-    if *code == -32602 {
-        return true;
-    }
-    let msg = message.to_lowercase();
-    msg.contains("could not find account") || msg.contains("account not found")
-}
-
 /// In-memory cache for basic mint metadata (`token_program`, `decimals`).
 /// Token-2022 extension flags (`is_pausable`, `has_permanent_delegate`) are
 /// resolved separately via [`MintCache::get_extension_flags`], because the
@@ -74,6 +80,11 @@ pub struct MintCache {
     rpc_client: Option<Arc<RpcClientWithRetry>>,
     cache: HashMap<String, MintMetadata>,
     extension_flags_cache: HashMap<String, (bool, bool)>,
+    /// Whether the mint has a `freeze_authority`, which gates the escrow-ATA
+    /// freeze check. In-memory only: a freeze authority can be revoked but never
+    /// added, so a stale `true` only costs one avoidable read and a stale value
+    /// cannot miss a freeze. Not worth a `mints` column.
+    freeze_authority_cache: HashMap<String, bool>,
     /// Per-mint slot the mint provably existed at, recorded by the caller that
     /// proved it. Absent means unproven, which keeps a missing account retryable.
     existence_floor: HashMap<String, u64>,
@@ -92,6 +103,7 @@ impl MintCache {
             rpc_client: None,
             cache: HashMap::new(),
             extension_flags_cache: HashMap::new(),
+            freeze_authority_cache: HashMap::new(),
             existence_floor: HashMap::new(),
         }
     }
@@ -102,6 +114,7 @@ impl MintCache {
             rpc_client: Some(rpc_client),
             cache: HashMap::new(),
             extension_flags_cache: HashMap::new(),
+            freeze_authority_cache: HashMap::new(),
             existence_floor: HashMap::new(),
         }
     }
@@ -115,6 +128,13 @@ impl MintCache {
     /// proof; only then may a missing account be treated as permanent rather than lag.
     pub fn record_existence_floor(&mut self, mint: &Pubkey, slot: u64) {
         self.existence_floor.insert(mint.to_string(), slot);
+    }
+
+    /// Record whether this mint has a `freeze_authority`, for a caller that has
+    /// already read the mint. Saves `has_freeze_authority` its own read.
+    pub fn record_freeze_authority(&mut self, mint: &Pubkey, present: bool) {
+        self.freeze_authority_cache
+            .insert(mint.to_string(), present);
     }
 
     /// Whether a caller has already proved this mint exists on the target chain.
@@ -269,6 +289,52 @@ impl MintCache {
         Ok(bool::from(cfg.paused))
     }
 
+    /// Whether the mint has a `freeze_authority`. Only such a mint can have its
+    /// pooled escrow ATA frozen, so this gates the per-withdrawal ATA read.
+    ///
+    /// Cached for the process lifetime. A cached value can only be wrong if the
+    /// mint is closed at zero supply and recreated with a freeze authority while
+    /// preserving the decimals and token program that `Deposit` pins; the cost of
+    /// that is a release failing on-chain instead of parking, which is the
+    /// behaviour before this check existed. A restart re-resolves it.
+    pub async fn has_freeze_authority(&mut self, mint: &Pubkey) -> Result<bool, OperatorError> {
+        let mint_str = mint.to_string();
+
+        if let Some(present) = self.freeze_authority_cache.get(&mint_str) {
+            return Ok(*present);
+        }
+
+        let floor = self.existence_floor(mint);
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError(format!(
+                "MintCache needs RPC to resolve the freeze authority for mint {mint_str}",
+            ))
+        })?;
+
+        let account = read_target_mint_account(rpc, mint, floor).await?;
+
+        if account.data.len() < FREEZE_AUTHORITY_TAG_OFFSET + 4 {
+            return Err(AccountError::InvalidMint {
+                pubkey: *mint,
+                reason: format!("Invalid mint account data length: {}", account.data.len()),
+            }
+            .into());
+        }
+
+        // A COption tag of 1 means Some.
+        let present = u32::from_le_bytes(
+            account.data[FREEZE_AUTHORITY_TAG_OFFSET..FREEZE_AUTHORITY_TAG_OFFSET + 4]
+                .try_into()
+                .map_err(|_| AccountError::InvalidMint {
+                    pubkey: *mint,
+                    reason: "could not read freeze_authority tag".to_string(),
+                })?,
+        ) == 1;
+
+        self.freeze_authority_cache.insert(mint_str, present);
+        Ok(present)
+    }
+
     /// Live fetch of a token account's raw balance (base units).
     ///
     /// Intended for the permanent-delegate pre-flight: we can't trust our
@@ -296,6 +362,43 @@ impl MintCache {
                 "get_token_account_balance({ata}): {e}"
             ))),
         }
+    }
+
+    /// Whether the token account is frozen.
+    ///
+    /// Reads the account rather than its balance because `state` is not part of
+    /// the `getTokenAccountBalance` response. Kept separate from
+    /// `get_ata_balance` so a delegated mint's balance check keeps its own
+    /// round-trip; only a mint that is both freezable and delegated pays twice.
+    /// Only call this after `has_freeze_authority` came back true.
+    pub async fn is_ata_frozen(&self, ata: &Pubkey) -> Result<bool, OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError("is_ata_frozen requires an RPC client".to_string())
+        })?;
+
+        let response = rpc
+            .get_account_with_context(ata, rpc.rpc_client.commitment())
+            .await
+            .map_err(|e| OperatorError::RpcError(format!("get_account({ata}): {e}")))?;
+
+        // An account that does not exist cannot be frozen. `getAccountInfo` reports
+        // absence in its success shape, so unlike the balance read this needs no
+        // error-shape sniffing.
+        let Some(account) = response.value else {
+            return Ok(false);
+        };
+
+        // Covers both token programs: the base layout is identical and an account
+        // carrying no extensions unpacks as base-only.
+        let state =
+            StateWithExtensions::<Token2022AccountState>::unpack(&account.data).map_err(|_| {
+                AccountError::AccountDeserializationFailed {
+                    pubkey: *ata,
+                    reason: "not a token account".to_string(),
+                }
+            })?;
+
+        Ok(state.base.state == AccountState::Frozen)
     }
 
     async fn fetch_mint_from_rpc(
@@ -782,6 +885,27 @@ mod tests {
         );
     }
 
+    /// A token account: 165-byte base layout, `amount` at 64, `state` at 108.
+    fn create_mock_token_account_data(amount: u64, frozen: bool) -> Vec<u8> {
+        let mut data = vec![0u8; 165];
+        data[64..72].copy_from_slice(&amount.to_le_bytes());
+        data[108] = if frozen { 2 } else { 1 };
+        data
+    }
+
+    fn token_account_response(amount: u64, frozen: bool) -> serde_json::Value {
+        serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": TOKEN_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(create_mock_token_account_data(amount, frozen)), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
+    }
+
     #[tokio::test]
     async fn get_ata_balance_errors_without_rpc() {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
@@ -854,6 +978,94 @@ mod tests {
             .await
             .expect("a missing ATA is a zero balance, not a transient failure");
         assert_eq!(balance, 0);
+    }
+
+    #[tokio::test]
+    async fn is_ata_frozen_errors_without_rpc() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::new(storage);
+
+        let err = cache
+            .is_ata_frozen(&create_test_mint())
+            .await
+            .expect_err("is_ata_frozen should require RPC");
+        assert!(
+            matches!(err, crate::error::OperatorError::RpcError(_)),
+            "expected RpcError, got {err:?}",
+        );
+    }
+
+    /// The whole point of reading the account instead of the balance: `state` is
+    /// absent from the `getTokenAccountBalance` response.
+    #[tokio::test]
+    async fn is_ata_frozen_reads_the_account_state_byte() {
+        for frozen in [false, true] {
+            let mut mocks = std::collections::HashMap::new();
+            mocks.insert(
+                RpcRequest::GetAccountInfo,
+                token_account_response(500, frozen),
+            );
+            let rpc_client = RpcClientWithRetry::new_mocked(mocks);
+
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            let cache = MintCache::with_rpc(storage, Arc::new(rpc_client));
+
+            assert_eq!(
+                cache.is_ata_frozen(&Pubkey::new_unique()).await.unwrap(),
+                frozen
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn is_ata_frozen_treats_a_missing_account_as_unfrozen() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
+
+        let frozen = cache
+            .is_ata_frozen(&Pubkey::new_unique())
+            .await
+            .expect("a missing ATA is not a transient failure");
+        assert!(!frozen, "an account that does not exist cannot be frozen");
+    }
+
+    /// The gate that decides whether a withdrawal pays for the ATA read at all.
+    #[tokio::test]
+    async fn has_freeze_authority_reads_the_coption_tag() {
+        for (tag, expected) in [(1u32, true), (0u32, false)] {
+            let mut mint_data = create_mock_mint_account_data(6);
+            mint_data[FREEZE_AUTHORITY_TAG_OFFSET..FREEZE_AUTHORITY_TAG_OFFSET + 4]
+                .copy_from_slice(&tag.to_le_bytes());
+
+            let response = serde_json::json!({
+                "context": {"slot": 1},
+                "value": {
+                    "owner": TOKEN_PROGRAM_ID.to_string(),
+                    "lamports": 1_000_000u64,
+                    "data": [STANDARD.encode(&mint_data), "base64"],
+                    "executable": false,
+                    "rentEpoch": 0
+                }
+            });
+            let mut mocks = std::collections::HashMap::new();
+            mocks.insert(RpcRequest::GetAccountInfo, response);
+
+            let storage = Arc::new(Storage::Mock(MockStorage::new()));
+            let mut cache =
+                MintCache::with_rpc(storage, Arc::new(RpcClientWithRetry::new_mocked(mocks)));
+
+            let mint = create_test_mint();
+            assert_eq!(
+                cache.has_freeze_authority(&mint).await.unwrap(),
+                expected,
+                "COption tag {tag} should resolve to {expected}"
+            );
+
+            // Second call must not need the RPC, which is what keeps a
+            // non-freezable mint from paying per withdrawal.
+            cache.rpc_client = None;
+            assert_eq!(cache.has_freeze_authority(&mint).await.unwrap(), expected);
+        }
     }
 
     #[tokio::test]

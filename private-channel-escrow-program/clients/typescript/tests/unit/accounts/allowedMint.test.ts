@@ -1,4 +1,5 @@
 import { expect } from '@jest/globals';
+import { address } from '@solana/kit';
 import {
     getAllowedMintEncoder,
     getAllowedMintDecoder,
@@ -6,12 +7,16 @@ import {
     type AllowedMint,
 } from '../../../src/generated';
 
+const TOKEN_PROGRAM = address('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+
 // Expected size calculation based on program structure
 const EXPECTED_SIZE =
     1 + // discriminator
     1 + // bump
     1 + // depositsBlocked
-    1; // withdrawalsBlocked
+    1 + // withdrawalsBlocked
+    1 + // decimals
+    32; // tokenProgram
 
 describe('AllowedMint Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -21,6 +26,8 @@ describe('AllowedMint Account', () => {
                 bump: 250,
                 depositsBlocked: true,
                 withdrawalsBlocked: false,
+                decimals: 6,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             // Test encoding
@@ -42,6 +49,8 @@ describe('AllowedMint Account', () => {
                 bump: 127,
                 depositsBlocked: false,
                 withdrawalsBlocked: true,
+                decimals: 9,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             // Test combined codec
@@ -62,6 +71,8 @@ describe('AllowedMint Account', () => {
                     bump,
                     depositsBlocked: false,
                     withdrawalsBlocked: false,
+                    decimals: 6,
+                    tokenProgram: TOKEN_PROGRAM,
                 };
 
                 const codec = getAllowedMintCodec();
@@ -81,6 +92,8 @@ describe('AllowedMint Account', () => {
                 bump: 250,
                 depositsBlocked: true,
                 withdrawalsBlocked: false,
+                decimals: 6,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             // Verify all required fields are present
@@ -88,6 +101,8 @@ describe('AllowedMint Account', () => {
             expect(testAllowedMint).toHaveProperty('bump');
             expect(testAllowedMint).toHaveProperty('depositsBlocked');
             expect(testAllowedMint).toHaveProperty('withdrawalsBlocked');
+            expect(testAllowedMint).toHaveProperty('decimals');
+            expect(testAllowedMint).toHaveProperty('tokenProgram');
         });
 
         it('should validate allowedMint structure field types', () => {
@@ -96,6 +111,8 @@ describe('AllowedMint Account', () => {
                 bump: 250,
                 depositsBlocked: true,
                 withdrawalsBlocked: false,
+                decimals: 6,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             // Verify field types
@@ -103,11 +120,13 @@ describe('AllowedMint Account', () => {
             expect(typeof testAllowedMint.bump).toBe('number');
             expect(typeof testAllowedMint.depositsBlocked).toBe('boolean');
             expect(typeof testAllowedMint.withdrawalsBlocked).toBe('boolean');
+            expect(typeof testAllowedMint.decimals).toBe('number');
+            expect(typeof testAllowedMint.tokenProgram).toBe('string');
         });
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (4 bytes)', () => {
+        it('should report correct account size (37 bytes)', () => {
             const accountSize = getAllowedMintEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -118,6 +137,8 @@ describe('AllowedMint Account', () => {
                 bump: 250,
                 depositsBlocked: true,
                 withdrawalsBlocked: false,
+                decimals: 6,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             const encoder = getAllowedMintEncoder();
@@ -137,18 +158,24 @@ describe('AllowedMint Account', () => {
                     bump: 100,
                     depositsBlocked: false,
                     withdrawalsBlocked: false,
+                    decimals: 0,
+                    tokenProgram: TOKEN_PROGRAM,
                 },
                 {
                     discriminator: 255,
                     bump: 255,
                     depositsBlocked: true,
                     withdrawalsBlocked: true,
+                    decimals: 255,
+                    tokenProgram: TOKEN_PROGRAM,
                 },
                 {
                     discriminator: 127,
                     bump: 50,
                     depositsBlocked: true,
                     withdrawalsBlocked: false,
+                    decimals: 9,
+                    tokenProgram: TOKEN_PROGRAM,
                 },
             ];
 
@@ -168,6 +195,8 @@ describe('AllowedMint Account', () => {
                 bump: 0,
                 depositsBlocked: false,
                 withdrawalsBlocked: false,
+                decimals: 0,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             const codec = getAllowedMintCodec();
@@ -183,6 +212,8 @@ describe('AllowedMint Account', () => {
                 bump: 255,
                 depositsBlocked: true,
                 withdrawalsBlocked: true,
+                decimals: 255,
+                tokenProgram: TOKEN_PROGRAM,
             };
 
             const codec = getAllowedMintCodec();
