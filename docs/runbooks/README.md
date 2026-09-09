@@ -123,6 +123,10 @@ The runbooks call this out at every relevant site.
   channel mint carries a legacy-scheme idempotency memo. Log-discovered, not
   paged; the resync fails closed before dropping anything, so the database is
   intact.
+- [`resync_bitmap_advanced.md`](resync_bitmap_advanced.md) - a withdraw resync
+  refusing because the escrow's withdrawal bitmap has already issued nonces.
+  Log-discovered, not paged; fails closed before dropping anything, so the
+  database is intact. The supported path is a fresh instance, not a resync.
 
 ## Drills
 
