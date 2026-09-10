@@ -90,8 +90,12 @@ impl AccountsDB {
         super::get_latest_slot::get_latest_slot(self).await
     }
 
-    pub async fn set_latest_slot(&mut self, slot: u64) -> Result<(), String> {
-        super::set_latest_slot::set_latest_slot(self, slot).await
+    pub async fn get_block_height(&self) -> Result<Option<u64>> {
+        super::get_block_height::get_block_height(self).await
+    }
+
+    pub async fn get_current_slot(&self) -> Result<Option<u64>> {
+        super::current_slot::get_current_slot(self).await
     }
 
     pub async fn store_block(&mut self, block_info: BlockInfo) -> Result<(), String> {
@@ -128,6 +132,10 @@ impl AccountsDB {
         end_slot: u64,
     ) -> Result<Vec<BlockInfo>> {
         super::get_blocks_in_range::get_blocks_in_range(self, start_slot, end_slot).await
+    }
+
+    pub async fn get_last_blocks(&self, limit: usize) -> Result<Vec<BlockInfo>> {
+        super::get_last_blocks::get_last_blocks(self, limit).await
     }
 
     pub async fn get_epoch_info(&self) -> Result<crate::rpc::api::EpochInfo> {
@@ -342,6 +350,47 @@ mod tests {
         assert!(db.get_block(999).await.unwrap().is_none());
     }
 
+    /// The chain counters are read back from `metadata`, which is what lets the
+    /// slot keep advancing while blocks are sparse and the height count blocks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_batch_persists_the_chain_counters() {
+        let (mut db, _pg) = start_test_postgres().await;
+
+        let mut block = create_test_block_info(40, Hash::new_unique());
+        block.block_height = Some(7);
+        db.write_batch(&[], vec![], Some(block)).await.unwrap();
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(40));
+        assert_eq!(db.get_block_height().await.unwrap(), Some(7));
+    }
+
+    /// A node upgrading in place has no counters yet. Both fall back to the last
+    /// stored block, whose height was its slot before this change, so the live
+    /// counters continue the old sequence rather than restarting it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_counters_fall_back_to_the_last_stored_block() {
+        let (mut db, _pg) = start_test_postgres().await;
+        db.store_block(create_test_block_info(12, Hash::new_unique()))
+            .await
+            .unwrap();
+
+        // Delete the counters to reproduce a ledger written by the old build,
+        // which stored blocks but no counters at all.
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        sqlx::query(
+            "DELETE FROM metadata WHERE key IN ('latest_slot', 'current_slot', 'block_height')",
+        )
+        .execute(postgres_db.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(db.get_latest_slot().await.unwrap(), Some(12));
+        assert_eq!(db.get_current_slot().await.unwrap(), Some(12));
+        assert_eq!(db.get_block_height().await.unwrap(), Some(12));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn get_latest_slot_empty_then_populated() {
         let (mut db, _pg) = start_test_postgres().await;
@@ -393,6 +442,46 @@ mod tests {
 
         let slots = db.get_blocks(0, Some(20)).await.unwrap();
         assert_eq!(slots, vec![1, 3, 7, 10]);
+    }
+
+    /// A read replica has no live blockhash window and answers both the hash and
+    /// the height from the same mirrored tip, so the deadline it publishes matches
+    /// the hash it just served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_replica_reports_a_consistent_height() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("expected Postgres variant")
+        };
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
+        crate::accounts::redis_coherence::stamp_deployment_id(&redis_raw, &deployment_id)
+            .await
+            .unwrap();
+
+        let blockhash = Hash::new_unique();
+        let mut block = create_test_block_info(40, blockhash);
+        block.block_height = Some(7);
+        pg_db
+            .write_batch(&[], vec![], Some(block.clone()))
+            .await
+            .unwrap();
+        crate::accounts::write_batch::write_batch_redis(
+            &mut redis_raw,
+            &[],
+            vec![],
+            Some(block.clone()),
+        )
+        .await
+        .unwrap();
+
+        let replica = AccountsDB::Redis(redis_raw);
+        assert_eq!(replica.get_latest_blockhash().await.unwrap(), blockhash);
+        assert_eq!(replica.get_block_height().await.unwrap(), Some(7));
+        assert_eq!(replica.get_latest_slot().await.unwrap(), Some(40));
+        assert_eq!(replica.get_current_slot().await.unwrap(), Some(40));
     }
 
     /// Point lookups resolve a cache miss against Postgres instead of reporting

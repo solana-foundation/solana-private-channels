@@ -6,6 +6,9 @@ use {
     tracing::warn,
 };
 
+/// Metadata key holding the tip blockhash.
+pub const LATEST_BLOCKHASH_KEY: &str = "latest_blockhash";
+
 pub async fn get_latest_blockhash(db: &AccountsDB) -> Result<Hash> {
     match db {
         AccountsDB::Postgres(postgres_db) => get_latest_blockhash_postgres(postgres_db).await,
@@ -35,7 +38,7 @@ async fn get_latest_blockhash_postgres(db: &PostgresAccountsDB) -> Result<Hash> 
 }
 
 async fn get_latest_blockhash_redis(db: &RedisAccountsDB) -> Result<Hash> {
-    let cached = match db.get_trusted::<String>("latest_blockhash").await {
+    let cached = match db.get_trusted::<String>(LATEST_BLOCKHASH_KEY).await {
         Ok(hash_str) => hash_str,
         Err(e) => {
             warn!("Failed to get latest blockhash from Redis: {}", e);

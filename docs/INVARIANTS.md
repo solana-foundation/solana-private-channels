@@ -23,6 +23,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | C13 | Solana Private Channels DB SHOULD use database backup and recovery | SHOULD | Done | #60 |
 | C14 | A regular transaction MUST NOT increase the durable lamport supply beyond one lamport per account it creates, and MUST NOT alter any account it did not touch | MUST | Done | #115, #131 |
 | C15 | Every account key an admitted transaction can reference MUST be resolvable at admission | MUST | Done | #182 |
+| C16 | A slot MUST commit only if it extends the stored ledger, and a write-capable node MUST hold the writer lease | MUST | Done | #134 |
 
 ## On-chain Programs
 
@@ -30,7 +31,7 @@ This document defines the safety and correctness invariants that Solana Private 
 |----|-----------|-------|--------|-----|
 | P1 | Escrow program MUST require SPL transfers on escrow | MUST | Done | #18 |
 | P2 | Escrow program MUST reject SPL transfers for unauthorized mints | MUST | Done | #10 |
-| P3 | Withdrawal program MUST require admin transaction to release funds AND a valid withdrawal proof | MUST | Done | #9, #10, #29 |
+| P3 | Withdrawal program MUST require admin transaction to release funds AND that the withdrawal's nonce is unconsumed in the current bitmap generation | MUST | Done | #9, #10, #29 |
 
 ## Indexer
 

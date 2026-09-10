@@ -31,7 +31,7 @@ use {
                     TransactionStatusUpdate,
                 },
             },
-            utils::instruction_util::{SourceEventId, WithdrawalRemintInfo},
+            utils::instruction_util::{SourceEventId, TransactionKind, WithdrawalRemintInfo},
             SignerUtil,
         },
         storage::{common::storage::mock::MockStorage, Storage},
@@ -163,22 +163,11 @@ pub fn null_status_reply() -> Reply {
 /// remint-deferral branch is not taken.
 pub fn deposit_ctx(transaction_id: i64) -> TransactionContext {
     TransactionContext {
+        kind: TransactionKind::Mint,
         transaction_id: Some(transaction_id),
         withdrawal_nonce: None,
         trace_id: Some(format!("trace-{transaction_id}")),
         deposit_claim_lease: None,
-    }
-}
-
-/// `deposit_ctx` carrying the ownership lease a prior claim returned, so
-/// JIT re-fire tests can present a valid or stale lease token.
-pub fn deposit_ctx_with_lease(
-    transaction_id: i64,
-    lease: chrono::DateTime<chrono::Utc>,
-) -> TransactionContext {
-    TransactionContext {
-        deposit_claim_lease: Some(lease),
-        ..deposit_ctx(transaction_id)
     }
 }
 
@@ -216,6 +205,7 @@ pub fn account_info_reply_bytes(data: &[u8]) -> Reply {
 /// retry-counter logic in `send_and_confirm`.
 pub fn withdrawal_ctx(transaction_id: i64, nonce: u64) -> TransactionContext {
     TransactionContext {
+        kind: TransactionKind::ReleaseFunds,
         transaction_id: Some(transaction_id),
         withdrawal_nonce: Some(nonce),
         trace_id: Some(format!("trace-{transaction_id}")),
@@ -234,8 +224,7 @@ pub fn make_remint_info(transaction_id: i64) -> WithdrawalRemintInfo {
     let user_ata = get_associated_token_address_with_program_id(&user, &mint, &token_program);
     WithdrawalRemintInfo {
         transaction_id,
-        // Deterministic per transaction_id; these tests exercise deferral, not memo matching.
-        source_event_id: SourceEventId::new(&format!("withdraw-sig-{transaction_id}"), 0, None),
+        source_event_id: SourceEventId::new(&format!("sig-{transaction_id}"), 0, None),
         trace_id: format!("trace-{transaction_id}"),
         mint,
         user,

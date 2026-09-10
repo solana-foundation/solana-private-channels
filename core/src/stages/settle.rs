@@ -52,6 +52,69 @@ pub const CACHE_MIRROR_COOLDOWN: Duration = Duration::from_secs(60);
 /// a cache that has been away needs rather than failing a healthy one for being
 /// slow to answer the first time.
 const CACHE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Idle block cadence, so block height and therefore expiry keep advancing.
+/// One second cuts idle rows tenfold against a block every tick, while a longer
+/// gap would save little more and stretch idle expiry well past the loaded case.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the idle-slot write may hold the tick, one default blocktime like
+/// the mirror budget. The write is one row on a quiet pool, and a tick that
+/// outlives this is one tick late: the next tick republishes a higher slot.
+const IDLE_SLOT_PUBLISH_BUDGET: Duration = Duration::from_millis(100);
+
+/// A tick produces a block when it settled work, or when the heartbeat is due.
+/// Genesis is always produced so the chain has an anchor.
+fn should_produce_block(has_work: bool, is_genesis: bool, since_last_block: Duration) -> bool {
+    has_work || is_genesis || since_last_block >= HEARTBEAT_INTERVAL
+}
+
+/// Record a tick that produced no block, so `getSlot` keeps moving while the
+/// node is idle. The in-memory counter is what production uses, so a failed
+/// write costs a stale published slot until the next tick, never a wrong block.
+async fn publish_idle_slot(
+    postgres_db: &PostgresAccountsDB,
+    redis_db: Option<&RedisAccountsDB>,
+    slot: u64,
+) -> Result<()> {
+    // Awaited on the tick with no retry budget behind it, so a Postgres that sits
+    // on the statement would stop the chain here. Bounded, the stall reaches the
+    // heartbeat block instead, and that path has retries and a failure budget.
+    match tokio::time::timeout(
+        IDLE_SLOT_PUBLISH_BUDGET,
+        crate::accounts::current_slot::set_current_slot(postgres_db, slot),
+    )
+    .await
+    {
+        Ok(written) => written?,
+        Err(_) => {
+            return Err(anyhow!(
+                "publishing the idle slot exceeded its {:?} budget",
+                IDLE_SLOT_PUBLISH_BUDGET
+            ))
+        }
+    }
+    // A cache given up on is left alone here too: ten writes a second into one
+    // the batch path is deliberately not touching is most of the cost the
+    // give-up exists to avoid.
+    let Some(redis) = redis_db.filter(|redis| !redis.is_mirroring_paused()) else {
+        return Ok(());
+    };
+    // Same reason as above: the cache is never allowed to hold the chain, on
+    // this path or the batch one.
+    if tokio::time::timeout(
+        CACHE_MIRROR_BUDGET,
+        crate::accounts::current_slot::mirror_current_slot(redis, slot),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            "Mirroring the idle slot exceeded its {:?} budget, abandoning it",
+            CACHE_MIRROR_BUDGET
+        );
+    }
+    Ok(())
+}
 
 /// Bounds one settle attempt, matching the stage health margin so an overrun is
 /// already unhealthy. Unbounded, the pool's 30s acquire would outlast the budget.
@@ -145,6 +208,9 @@ struct SettleResult {
     /// An announcement found no consumer. Not an error: the block is
     /// committed, and the caller still owes it the bookkeeping.
     publisher_gone: bool,
+    /// Height of the block just produced, so the caller can advance its counter
+    /// without re-reading the database.
+    block_height: u64,
 }
 
 /// The channels a committed block is announced on, ahead of any cache work.
@@ -185,6 +251,7 @@ impl From<String> for SettleError {
 struct LastBlock {
     slot: u64,
     blockhash: Hash,
+    block_height: u64,
 }
 
 /// Align the Redis cache with the Postgres source of truth at startup.
@@ -210,6 +277,7 @@ pub async fn warm_redis_cache(
     postgres_db: &PostgresAccountsDB,
     redis_db: &RedisAccountsDB,
     postgres_slot: Option<u64>,
+    postgres_block_height: Option<u64>,
     postgres_blockhash: Option<Hash>,
 ) -> Result<bool> {
     info!("Aligning Redis cache with Postgres...");
@@ -236,6 +304,14 @@ pub async fn warm_redis_cache(
         conn.set::<_, _, ()>("latest_slot", slot)
             .await
             .map_err(|e| anyhow!("Failed to write latest_slot to Redis: {}", e))?;
+    }
+    // Published with the tip, not left to the next mirrored block: a purge clears
+    // it, and a replica reading a stale or foreign height would answer
+    // getBlockHeight from another ledger's counter.
+    if let Some(height) = postgres_block_height {
+        conn.set::<_, _, ()>("block_height", height)
+            .await
+            .map_err(|e| anyhow!("Failed to write block_height to Redis: {}", e))?;
     }
     if let Some(blockhash) = postgres_blockhash {
         conn.set::<_, _, ()>("latest_blockhash", blockhash.to_string())
@@ -264,6 +340,8 @@ pub struct SettleArgs {
     /// The cache the read path also attaches to. One knob for both, so a writer
     /// cannot stop mirroring a cache that readers still trust.
     pub redis_cache_url: Option<String>,
+    /// Expiry in seconds on cached block entries. Zero disables it.
+    pub redis_block_ttl_secs: u64,
     pub blocktime_ms: u64,
     /// How long a cache given up on is left alone before it is probed again. A
     /// field so a test can drive a give-up and its recovery without waiting out
@@ -283,6 +361,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         address_signatures_tx,
         accountsdb_connection_url,
         redis_cache_url,
+        redis_block_ttl_secs,
         blocktime_ms,
         cache_mirror_cooldown,
         perf_sample_period_secs,
@@ -299,6 +378,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
             accountsdb_connection_url: String,
             redis_cache_url: Option<String>,
+            redis_block_ttl_secs: u64,
             blocktime_ms: u64,
             cache_mirror_cooldown: Duration,
             perf_sample_period_secs: u64,
@@ -328,8 +408,9 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     )
                     .await
                     {
-                        Ok(Ok(r)) => {
+                        Ok(Ok(mut r)) => {
                             info!("Redis cache enabled");
+                            r.set_block_ttl_secs(redis_block_ttl_secs);
                             Some(r)
                         }
                         // Connecting is what builds the handle, so there is
@@ -368,16 +449,49 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 .map(|tip| LastBlock {
                     slot: tip.slot,
                     blockhash: tip.blockhash,
+                    // The tip row carries the height it was written with, which is
+                    // the counter's own seed, so one row still describes one block.
+                    block_height: tip.block_height.unwrap_or(tip.slot),
                 });
             let last_slot = last_block.as_ref().map(|b| b.slot);
             let last_blockhash = last_block.as_ref().map(|b| b.blockhash);
+
+            // The durable counter wins when present: it continues the last stored
+            // block's height across an upgrade. Zero would send the height
+            // backwards and invalidate every lastValidBlockHeight clients hold.
+            if let Some(height) = accounts_db
+                .get_block_height()
+                .await
+                .context("Failed to read the block height at startup")?
+            {
+                if let Some(block) = last_block.as_mut() {
+                    block.block_height = height;
+                }
+            }
+
+            // The last tick the node reached, which idle ticks advance past the
+            // last block. Resuming below it would replay slots clients have
+            // already been told about.
+            let last_current_slot = accounts_db
+                .get_current_slot()
+                .await
+                .context("Failed to read the current slot at startup")?;
+            let last_block_height = last_block.as_ref().map(|b| b.block_height);
 
             // Align the cache with Postgres before the first dual-write. Failing
             // to verify it means the cache cannot be trusted, so run Postgres-only
             // rather than write a second ledger into it.
             redis_db = match redis_db {
                 Some(redis) => {
-                    match warm_redis_cache(&postgres_db, &redis, last_slot, last_blockhash).await {
+                    match warm_redis_cache(
+                        &postgres_db,
+                        &redis,
+                        last_slot,
+                        last_block_height,
+                        last_blockhash,
+                    )
+                    .await
+                    {
                         Ok(purged) => {
                             if purged {
                                 metrics.redis_cache_purged();
@@ -442,6 +556,17 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             let mut perf_start_slot = last_block.as_ref().map(|b| b.slot).unwrap_or(0);
             let mut perf_num_transactions = 0u64;
 
+            // Advances every tick, so it is worker state rather than derived from
+            // the last block. A restart resumes from the durable tick counter,
+            // which idle ticks keep moving, so the slot never goes backwards.
+            let mut next_slot = match last_block.as_ref() {
+                Some(block) => last_current_slot.unwrap_or(block.slot).max(block.slot) + 1,
+                None => 0,
+            };
+            // Tick deadlines, not wall-clock reads: the heartbeat check runs once
+            // per tick and must not cost a clock syscall.
+            let mut last_block_at = Instant::now();
+
             loop {
                 // `biased` keeps block cadence crisp under sustained load:
                 // shutdown is handled promptly, the blocktime tick is polled
@@ -455,9 +580,9 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 tokio::select! {
                     biased;
 
-                    // Blocktime tick: unconditionally produce a block with
-                    // whatever has accumulated since the last tick.
-                    _ = blocktime_interval.tick() => {
+                    // Blocktime tick: produce a block when this tick carried work
+                    // or the heartbeat is due, and advance the slot either way.
+                    tick = blocktime_interval.tick() => {
                         // A cooldown that has run out earns a probe, off the block
                         // path. Claimed first, so a cooldown lapsing under a slow
                         // probe cannot start a second one, and re-armed so the
@@ -475,10 +600,28 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         }
 
                         let num_results = processing_results.len();
+                        if !should_produce_block(
+                            num_results > 0,
+                            last_block.is_none(),
+                            tick.saturating_duration_since(last_block_at),
+                        ) {
+                            // The chain is on this slot even though no block
+                            // backs it. Only reached when the tick carried no
+                            // work, so the loaded path never pays for it.
+                            if let Err(e) =
+                                publish_idle_slot(&postgres_db, redis_db.as_ref(), next_slot).await
+                            {
+                                warn!("Failed to publish idle slot {next_slot}, the next tick republishes: {e:#}");
+                                metrics.settler_idle_slot_publish_failed();
+                            }
+                            next_slot += 1;
+                            continue;
+                        }
                         if buffered_account_bytes >= MAX_BUFFERED_SETTLE_BYTES {
                             metrics.settler_backpressure_engaged();
                         }
                         match settle_with_retry(
+                            next_slot,
                             last_block.clone(),
                             &mut accounts_db,
                             redis_db.as_mut(),
@@ -505,7 +648,10 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 last_block = Some(LastBlock {
                                     slot: settle_result.slot,
                                     blockhash: settle_result.blockhash,
+                                    block_height: settle_result.block_height,
                                 });
+                                last_block_at = tick;
+                                next_slot += 1;
                                 processing_results.clear();
                                 buffered_account_bytes = 0;
                                 metrics.settler_buffered_account_bytes(0);
@@ -637,6 +783,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             if !processing_results.is_empty() {
                 let num_results = processing_results.len();
                 match settle_with_retry(
+                    next_slot,
                     last_block.clone(),
                     &mut accounts_db,
                     redis_db.as_mut(),
@@ -696,6 +843,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             address_signatures_tx,
             accountsdb_connection_url,
             redis_cache_url,
+            redis_block_ttl_secs,
             blocktime_ms,
             cache_mirror_cooldown,
             perf_sample_period_secs,
@@ -774,6 +922,7 @@ fn discard_buffer(
 /// a second blockhash for a slot a replica may already be serving.
 #[allow(clippy::too_many_arguments)]
 async fn settle_with_retry(
+    next_slot: u64,
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
     mut redis_db: Option<&mut RedisAccountsDB>,
@@ -816,6 +965,7 @@ async fn settle_with_retry(
 
         let commit_timeout = attempt_timeout(draining, deadline);
         let attempt = settle_transactions(
+            next_slot,
             last_block.clone(),
             accounts_db,
             redis_db.as_deref_mut(),
@@ -895,6 +1045,9 @@ fn attempt_timeout(draining: bool, deadline: Instant) -> Duration {
 /// Settle transactions: Update accounts database with changes
 #[allow(clippy::too_many_arguments)]
 async fn settle_transactions(
+    // The tick slot this block occupies. It is not `last_block.slot + 1`: idle
+    // ticks advance the slot without producing a block.
+    next_slot: u64,
     last_block: Option<LastBlock>,
     accounts_db: &mut AccountsDB,
     redis_db: Option<&mut RedisAccountsDB>,
@@ -922,9 +1075,12 @@ async fn settle_transactions(
     // in a block can never disagree about when it was produced.
     let block_time = (block_time_nanos / 1_000_000_000) as i64;
 
-    let (next_slot, last_blockhash, last_slot, is_genesis) = match last_block {
-        Some(ref lb) => (lb.slot + 1, lb.blockhash, lb.slot, false),
-        None => (0, Hash::default(), 0, true),
+    // The parent is the last block actually produced, which on a sparse chain is
+    // not the previous slot. The indexer's continuity walk requires that exact
+    // linkage or it stops advancing.
+    let (last_blockhash, parent_slot, next_height, is_genesis) = match last_block {
+        Some(ref lb) => (lb.blockhash, lb.slot, lb.block_height + 1, false),
+        None => (Hash::default(), next_slot, 0, true),
     };
 
     // Phase 1: build account maps and transaction lists
@@ -1026,11 +1182,8 @@ async fn settle_transactions(
         slot: next_slot,
         blockhash: next_blockhash,
         previous_blockhash: last_blockhash,
-        parent_slot: last_slot,
-        // Block height equals the slot: slots are strictly contiguous from genesis,
-        // and both lastValidBlockHeight and the getSignatureStatuses context slot
-        // are read as block heights on that basis. Do not diverge them.
-        block_height: Some(next_slot),
+        parent_slot,
+        block_height: Some(next_height),
         block_time: Some(block_time),
         transaction_signatures: block_transaction_signatures,
         transaction_recent_blockhashes: block_transaction_recent_blockhashes,
@@ -1101,6 +1254,7 @@ async fn settle_transactions(
             mirror_batch_to_cache(
                 redis,
                 next_slot,
+                block_info.parent_slot,
                 &accounts_vec,
                 transactions_for_db,
                 block_info,
@@ -1150,6 +1304,7 @@ async fn settle_transactions(
         slot: next_slot,
         blockhash: next_blockhash,
         publisher_gone,
+        block_height: next_height,
     })
 }
 
@@ -1266,6 +1421,7 @@ enum MirrorOutcome {
 async fn mirror_batch_to_cache(
     redis: &mut RedisAccountsDB,
     slot: u64,
+    parent_slot: u64,
     accounts_vec: &[(Pubkey, AccountSettlement)],
     transactions_for_db: Vec<(
         Signature,
@@ -1286,7 +1442,7 @@ async fn mirror_batch_to_cache(
 
     // Checked before the write, because the write advances the cached tip
     // and the tip is what shows a batch was missed.
-    match redis_coherence::ensure_cache_continuity(redis, slot).await {
+    match redis_coherence::ensure_cache_continuity(redis, parent_slot, slot).await {
         Ok(redis_coherence::CacheStatus::InService) => {}
         // A purge is already walking this cache. Writing to it would renew
         // the lease and put back into service the stale keys that purge has
@@ -1398,7 +1554,10 @@ mod tests {
         // and a dropped receiver would fail the send and flip `publisher_gone`.
         let (blockhashes_tx, _blockhashes_rx) = mpsc::unbounded_channel();
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(RESULTS_CAP);
+        // The next slot after the parent: a busy node produces a block per tick.
+        let next_slot = last_block.as_ref().map(|b| b.slot + 1).unwrap_or(0);
         let result = settle_transactions(
+            next_slot,
             last_block,
             db,
             None,
@@ -1585,6 +1744,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown,
@@ -1913,6 +2073,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 100,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -2052,6 +2213,7 @@ mod tests {
         let nanos = 1_700_000_000_123_456_789u128;
 
         let r1 = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -2065,6 +2227,7 @@ mod tests {
         .await
         .unwrap();
         let r2 = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -2422,6 +2585,7 @@ mod tests {
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            redis_block_ttl_secs: 0,
             heartbeat: crate::health::StageHeartbeat::new(),
         })
         .await;
@@ -2655,6 +2819,34 @@ mod tests {
         assert_ne!(&bytes[0..8], &slot.to_le_bytes());
     }
 
+    #[test]
+    fn idle_tick_before_the_heartbeat_produces_nothing() {
+        assert!(!should_produce_block(
+            false,
+            false,
+            HEARTBEAT_INTERVAL - Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn heartbeat_due_produces_a_block() {
+        assert!(should_produce_block(false, false, HEARTBEAT_INTERVAL));
+    }
+
+    /// A tick that carried work produces a block immediately, which also resets
+    /// the heartbeat, so a busy node never emits a redundant empty block.
+    #[test]
+    fn busy_tick_produces_a_block_and_resets_the_heartbeat() {
+        assert!(should_produce_block(true, false, Duration::ZERO));
+    }
+
+    /// Genesis is produced whatever the clock says, so the chain has an anchor
+    /// and getLatestBlockhash answers from the first tick.
+    #[test]
+    fn genesis_is_always_produced() {
+        assert!(should_produce_block(false, true, Duration::ZERO));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_settle_empty_results() {
         let (mut db, _pg) = start_test_postgres().await;
@@ -2670,6 +2862,7 @@ mod tests {
         let (mut db, _pg) = start_test_postgres().await;
 
         let r1 = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -2687,8 +2880,10 @@ mod tests {
         let last = LastBlock {
             slot: r1.slot,
             blockhash: r1.blockhash,
+            block_height: r1.slot,
         };
         let r2 = settle_transactions(
+            last.slot + 1,
             Some(last),
             &mut db,
             None,
@@ -2730,9 +2925,11 @@ mod tests {
         let with_tx: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
         let r = settle_transactions(
+            5 + 1,
             Some(LastBlock {
                 slot: 5,
                 blockhash: parent_hash,
+                block_height: 5,
             }),
             &mut db,
             None,
@@ -2768,6 +2965,7 @@ mod tests {
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed), tx)];
 
         let result = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -3134,6 +3332,7 @@ mod tests {
         let results1: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed1), tx1)];
 
         let r1 = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -3152,6 +3351,7 @@ mod tests {
         let last = LastBlock {
             slot: r1.slot,
             blockhash: r1.blockhash,
+            block_height: r1.slot,
         };
         let from2 = Keypair::new();
         let to2 = Pubkey::new_unique();
@@ -3164,6 +3364,7 @@ mod tests {
         let results2: Vec<(TransactionProcessingResult, _)> = vec![(Ok(processed2), tx2)];
 
         let r2 = settle_transactions(
+            last.slot + 1,
             Some(last),
             &mut db,
             None,
@@ -3309,6 +3510,7 @@ mod tests {
             &postgres_db,
             &redis_db,
             Some(test_slot),
+            Some(0),
             Some(test_blockhash),
         )
         .await;
@@ -3375,6 +3577,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 100,
             perf_sample_period_secs: 60,
             shutdown_token: shutdown.clone(),
@@ -3423,6 +3626,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 50, // fast for testing
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -3482,6 +3686,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 100,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -3575,6 +3780,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -3616,6 +3822,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -3669,6 +3876,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -3778,6 +3986,7 @@ mod tests {
         let results1 = vec![(Ok(executed1), tx1)];
 
         let r1 = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -3801,6 +4010,7 @@ mod tests {
         let last = LastBlock {
             slot: r1.slot,
             blockhash: r1.blockhash,
+            block_height: r1.slot,
         };
         let from2 = Keypair::new();
         let to2 = Pubkey::new_unique();
@@ -3813,6 +4023,7 @@ mod tests {
         let results2 = vec![(Ok(executed2), tx2)];
 
         let r2 = settle_transactions(
+            last.slot + 1,
             Some(last),
             &mut db,
             None,
@@ -3885,6 +4096,7 @@ mod tests {
         ];
 
         let result = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -3991,6 +4203,7 @@ mod tests {
             AccountSharedData::new(500, 0, &Pubkey::new_unique()),
         )]);
         settle_transactions(
+            0,
             None,
             &mut pg_db,
             None,
@@ -4006,7 +4219,7 @@ mod tests {
 
         let slot = pg_db.get_latest_slot().await.unwrap();
         let blockhash = pg_db.get_latest_blockhash().await.ok();
-        warm_redis_cache(&postgres_db, &redis_db, slot, blockhash)
+        warm_redis_cache(&postgres_db, &redis_db, slot, Some(0), blockhash)
             .await
             .unwrap();
 
@@ -4039,7 +4252,7 @@ mod tests {
             .unwrap();
         let _: () = conn.set("latest_slot", stale_slot).await.unwrap();
 
-        warm_redis_cache(&postgres_db, &redis_db, None, None)
+        warm_redis_cache(&postgres_db, &redis_db, None, None, None)
             .await
             .unwrap();
 
@@ -4077,7 +4290,7 @@ mod tests {
             .unwrap();
         let _: () = conn.set("latest_slot", stale_slot).await.unwrap();
 
-        warm_redis_cache(&postgres_db, &redis_db, None, None)
+        warm_redis_cache(&postgres_db, &redis_db, None, None, None)
             .await
             .unwrap();
 
@@ -4132,6 +4345,7 @@ mod tests {
             &postgres_db,
             &redis_db,
             Some(postgres_slot),
+            Some(0),
             Some(Hash::new_unique()),
         )
         .await
@@ -4172,6 +4386,7 @@ mod tests {
             "transaction_count",
             "performance_samples",
             "latest_slot",
+            "block_height",
             "latest_blockhash",
         ];
 
@@ -4194,12 +4409,15 @@ mod tests {
         let _: () = conn.set("transaction_count", 77u64).await.unwrap();
         let _: () = conn.lpush("performance_samples", "{}").await.unwrap();
         let _: () = conn.set("latest_slot", stale_slot).await.unwrap();
+        // A foreign height left behind would be served as this ledger's
+        // getBlockHeight until the next mirrored block overwrote it.
+        let _: () = conn.set("block_height", 77u64).await.unwrap();
         let _: () = conn
             .set("latest_blockhash", Hash::new_unique().to_string())
             .await
             .unwrap();
 
-        warm_redis_cache(&postgres_db, &redis_db, None, None)
+        warm_redis_cache(&postgres_db, &redis_db, None, None, None)
             .await
             .unwrap();
 
@@ -4235,7 +4453,7 @@ mod tests {
         }
         let _: () = seed.query_async(&mut conn).await.unwrap();
 
-        warm_redis_cache(&postgres_db, &redis_db, None, None)
+        warm_redis_cache(&postgres_db, &redis_db, None, None, None)
             .await
             .unwrap();
 
@@ -4302,9 +4520,11 @@ mod tests {
             AccountSharedData::new(500, 0, &Pubkey::new_unique()),
         )]);
         settle_transactions(
+            last_slot + 1,
             Some(LastBlock {
                 slot: last_slot,
                 blockhash: Hash::new_unique(),
+                block_height: last_slot,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -4359,9 +4579,11 @@ mod tests {
             AccountSharedData::new(500, 0, &Pubkey::new_unique()),
         )]);
         settle_transactions(
+            200 + 1,
             Some(LastBlock {
                 slot: 200,
                 blockhash: Hash::new_unique(),
+                block_height: 200,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -4385,6 +4607,121 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("a cache whose continuity cannot be checked must stop being served");
+    }
+
+    /// Heartbeat blocks grow the cache without bound unless entries expire.
+    /// Postgres is the source of truth, so an expired entry is a miss that
+    /// re-reads, and the untouched tip keys keep the cache in service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_cached_block_is_served_from_postgres() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+        redis_raw.set_block_ttl_secs(1);
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+
+        settle_transactions(
+            0,
+            None,
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        let ttl: i64 = conn.ttl("block:0").await.unwrap();
+        assert!(
+            ttl > 0 && ttl <= 1,
+            "the cached block must carry the configured expiry, got {ttl}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !conn.exists::<_, bool>("block:0").await.unwrap(),
+            "the entry must have expired"
+        );
+
+        // The tip keys are untouched by the expiry, so the cache is still served.
+        let cache_db = AccountsDB::Redis(redis_raw.clone());
+        assert!(
+            cache_db.get_block(0).await.unwrap().is_some(),
+            "an expired entry must fall through to Postgres"
+        );
+        assert_eq!(
+            conn.get::<_, Option<Vec<u8>>>("deployment_id")
+                .await
+                .unwrap(),
+            Some(deployment_id),
+            "expiring block entries must not condemn the cache"
+        );
+        assert_eq!(
+            conn.get::<_, Option<u64>>("latest_slot").await.unwrap(),
+            Some(0),
+            "the cached tip must survive the expiry"
+        );
+    }
+
+    /// A heartbeat block sits many slots after the block it extends, so judging
+    /// continuity against `slot - 1` would condemn the cache once per heartbeat
+    /// forever. The cache must stay in service and keep mirroring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sparse_block_does_not_condemn_the_cache() {
+        let (mut pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (mut redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let deployment_id = redis_coherence::read_deployment_id(&postgres_db)
+            .await
+            .unwrap();
+        let mut conn = redis_raw.connection.clone();
+        let _: () = conn.set("deployment_id", &deployment_id[..]).await.unwrap();
+        let _: () = conn.set("latest_slot", 200u64).await.unwrap();
+
+        // Ten idle ticks later: the heartbeat block extends slot 200 at slot 210.
+        settle_transactions(
+            210,
+            Some(LastBlock {
+                slot: 200,
+                blockhash: Hash::new_unique(),
+                block_height: 20,
+            }),
+            &mut pg_db,
+            Some(&mut redis_raw),
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        let stamped: Option<Vec<u8>> = conn.get("deployment_id").await.unwrap();
+        assert_eq!(
+            stamped,
+            Some(deployment_id),
+            "a block that extends the cached tip must leave the cache in service"
+        );
+        let mirrored: Option<u64> = conn.get("latest_slot").await.unwrap();
+        assert_eq!(mirrored, Some(210), "the block must still be mirrored");
     }
 
     /// Settling a batch far ahead of the cached tip is what an outage looks like
@@ -4416,9 +4753,11 @@ mod tests {
             AccountSharedData::new(500, 0, &Pubkey::new_unique()),
         )]);
         settle_transactions(
+            200 + 1,
             Some(LastBlock {
                 slot: 200,
                 blockhash: Hash::new_unique(),
+                block_height: 200,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -4487,9 +4826,11 @@ mod tests {
         )]);
         let settling = tokio::spawn(async move {
             settle_transactions(
+                last_slot + 1,
                 Some(LastBlock {
                     slot: last_slot,
                     blockhash: Hash::new_unique(),
+                    block_height: last_slot,
                 }),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -4576,9 +4917,11 @@ mod tests {
         )]);
         let settling = tokio::spawn(async move {
             settle_transactions(
+                last_slot + 1,
                 Some(LastBlock {
                     slot: last_slot,
                     blockhash: Hash::new_unique(),
+                    block_height: last_slot,
                 }),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -4647,9 +4990,11 @@ mod tests {
         // the cache and not the Postgres commit under it.
         let healthy_started = tokio::time::Instant::now();
         let healthy = settle_transactions(
+            last_slot + 1,
             Some(LastBlock {
                 slot: last_slot,
                 blockhash: Hash::new_unique(),
+                block_height: last_slot,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -4680,9 +5025,11 @@ mod tests {
         )]);
         let started = tokio::time::Instant::now();
         let settled = settle_transactions(
+            healthy.slot + 1,
             Some(LastBlock {
                 slot: healthy.slot,
                 blockhash: healthy.blockhash,
+                block_height: healthy.block_height,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -4746,9 +5093,11 @@ mod tests {
             AccountSharedData::new(500, 0, &Pubkey::new_unique()),
         )]);
         settle_transactions(
+            last_slot + 1,
             Some(LastBlock {
                 slot: last_slot,
                 blockhash: Hash::new_unique(),
+                block_height: last_slot,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -4807,9 +5156,11 @@ mod tests {
         let mut last = LastBlock {
             slot: 200,
             blockhash: Hash::new_unique(),
+            block_height: 200,
         };
         for attempt in 1..=CACHE_FAILURE_LIMIT {
             let settled = settle_transactions(
+                last.slot + 1,
                 Some(last.clone()),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -4825,6 +5176,7 @@ mod tests {
             last = LastBlock {
                 slot: settled.slot,
                 blockhash: settled.blockhash,
+                block_height: settled.block_height,
             };
 
             assert_eq!(
@@ -4862,9 +5214,11 @@ mod tests {
         let mut last = LastBlock {
             slot: 200,
             blockhash: Hash::new_unique(),
+            block_height: 200,
         };
         for _ in 0..CACHE_FAILURE_LIMIT - 1 {
             let settled = settle_transactions(
+                last.slot + 1,
                 Some(last.clone()),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -4880,6 +5234,7 @@ mod tests {
             last = LastBlock {
                 slot: settled.slot,
                 blockhash: settled.blockhash,
+                block_height: settled.block_height,
             };
         }
 
@@ -4912,6 +5267,7 @@ mod tests {
         let mut last = LastBlock {
             slot: 200,
             blockhash: Hash::new_unique(),
+            block_height: 200,
         };
         // Never two failures in a row after the first pair, and never enough
         // successes to be a healthy cache either.
@@ -4926,6 +5282,7 @@ mod tests {
             let _: () = conn.set("latest_slot", tip).await.unwrap();
 
             let settled = settle_transactions(
+                last.slot + 1,
                 Some(last.clone()),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -4941,6 +5298,7 @@ mod tests {
             last = LastBlock {
                 slot: settled.slot,
                 blockhash: settled.blockhash,
+                block_height: settled.block_height,
             };
         }
 
@@ -4983,9 +5341,11 @@ mod tests {
         let mut last = LastBlock {
             slot: 200,
             blockhash: Hash::new_unique(),
+            block_height: 200,
         };
         for _ in 0..CACHE_FAILURE_LIMIT {
             let settled = settle_transactions(
+                last.slot + 1,
                 Some(last.clone()),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -5001,6 +5361,7 @@ mod tests {
             last = LastBlock {
                 slot: settled.slot,
                 blockhash: settled.blockhash,
+                block_height: settled.block_height,
             };
         }
 
@@ -5039,9 +5400,11 @@ mod tests {
         let _: () = conn.set("latest_slot", "not-a-slot").await.unwrap();
 
         let failed = settle_transactions(
+            200 + 1,
             Some(LastBlock {
                 slot: 200,
                 blockhash: Hash::new_unique(),
+                block_height: 200,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -5058,9 +5421,11 @@ mod tests {
         // A readable tip one slot back, so the next batch mirrors.
         let _: () = conn.set("latest_slot", failed.slot).await.unwrap();
         settle_transactions(
+            failed.slot + 1,
             Some(LastBlock {
                 slot: failed.slot,
                 blockhash: failed.blockhash,
+                block_height: failed.block_height,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -5114,9 +5479,11 @@ mod tests {
         let mut last = LastBlock {
             slot: 200,
             blockhash: Hash::new_unique(),
+            block_height: 200,
         };
         for _ in 0..CACHE_FAILURE_LIMIT {
             let settled = settle_transactions(
+                last.slot + 1,
                 Some(last.clone()),
                 &mut pg_db,
                 Some(&mut redis_raw),
@@ -5132,6 +5499,7 @@ mod tests {
             last = LastBlock {
                 slot: settled.slot,
                 blockhash: settled.blockhash,
+                block_height: settled.block_height,
             };
         }
 
@@ -5220,9 +5588,11 @@ mod tests {
         // The purge took the tip with it, so this batch mirrors into an empty
         // cache rather than one it has to be contiguous with.
         let mirrored = settle_transactions(
+            500 + 1,
             Some(LastBlock {
                 slot: 500,
                 blockhash: Hash::new_unique(),
+                block_height: 500,
             }),
             &mut pg_db,
             Some(&mut redis_raw),
@@ -5276,6 +5646,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: Some(redis_url),
+            redis_block_ttl_secs: 0,
             blocktime_ms: 100,
             // Short enough to watch a give-up and its recovery inside one test.
             cache_mirror_cooldown: Duration::from_millis(300),
@@ -5319,7 +5690,8 @@ mod tests {
             recovered.expect("a cache given up on must be mirrored to again without a restart");
 
         // Still mirroring, not just the one batch that followed the rebuild.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Past a heartbeat, because an idle node only produces a block then.
+        tokio::time::sleep(HEARTBEAT_INTERVAL + Duration::from_millis(500)).await;
         let tip: Option<u64> = conn.get("latest_slot").await.unwrap();
         assert!(
             tip.is_some_and(|slot| slot > recovered),
@@ -5373,6 +5745,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: Some(redis_url),
+            redis_block_ttl_secs: 0,
             blocktime_ms: 100,
             cache_mirror_cooldown: Duration::from_millis(300),
             perf_sample_period_secs: 3600,
@@ -5501,7 +5874,7 @@ mod tests {
             .await
             .unwrap();
 
-        warm_redis_cache(&postgres_db, &redis_db, None, None)
+        warm_redis_cache(&postgres_db, &redis_db, None, None, None)
             .await
             .unwrap();
 
@@ -5549,6 +5922,7 @@ mod tests {
             &postgres_db,
             &redis_db,
             Some(postgres_slot),
+            Some(0),
             Some(Hash::new_unique()),
         )
         .await
@@ -5583,6 +5957,7 @@ mod tests {
             &postgres_db,
             &redis_db,
             Some(slot),
+            Some(0),
             Some(Hash::new_unique()),
         )
         .await
@@ -5631,6 +6006,7 @@ mod tests {
             &postgres_db,
             &redis_db,
             Some(slot),
+            Some(0),
             Some(Hash::new_unique()),
         )
         .await
@@ -5663,6 +6039,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url.clone(),
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 50,
             perf_sample_period_secs: 1, // fires after 1s
             shutdown_token: shutdown.clone(),
@@ -5726,6 +6103,7 @@ mod tests {
             address_signatures_tx,
             accountsdb_connection_url: url,
             redis_cache_url: None,
+            redis_block_ttl_secs: 0,
             blocktime_ms: 50,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -5799,12 +6177,14 @@ mod tests {
         let last = LastBlock {
             slot: 5,
             blockhash: Hash::new_unique(),
+            block_height: 5,
         };
 
         // Spawn the settle on its own task; move the DB in and back out.
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
         let task = tokio::spawn(async move {
             let r = settle_transactions(
+                last.slot + 1,
                 Some(last),
                 &mut db,
                 None,
@@ -5867,9 +6247,11 @@ mod tests {
 
         // Empty processing results: no addr-index rows produced.
         let result = settle_transactions(
+            9 + 1,
             Some(LastBlock {
                 slot: 9,
                 blockhash: Hash::new_unique(),
+                block_height: 9,
             }),
             &mut db,
             None,
@@ -5909,6 +6291,7 @@ mod tests {
 
         let results = single_successful_transfer();
         let result = settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -5950,6 +6333,7 @@ mod tests {
         let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
 
         settle_transactions(
+            0,
             None,
             &mut db,
             None,
@@ -6015,6 +6399,7 @@ mod tests {
             accountsdb_connection_url: url,
             redis_cache_url: None,
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            redis_block_ttl_secs: 0,
             blocktime_ms,
             perf_sample_period_secs: 3600,
             shutdown_token: shutdown.clone(),
@@ -6076,6 +6461,167 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// Everything an idle settler produced over `run_for`: the blocks it stored in
+    /// slot order, and the blockhashes it published to dedup.
+    struct IdleRun {
+        blocks: Vec<BlockInfo>,
+        published: Vec<Hash>,
+    }
+
+    /// Run a settler against a throwaway Postgres with no traffic at all, so
+    /// every block it produces is a heartbeat block.
+    async fn run_idle_settler(blocktime_ms: u64, run_for: Duration) -> IdleRun {
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
+        let (address_signatures_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(64);
+
+        let shutdown = CancellationToken::new();
+        let _settle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx,
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            redis_block_ttl_secs: 0,
+            blocktime_ms,
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: crate::health::StageHeartbeat::new(),
+        })
+        .await;
+
+        // The settler waits SETTLE_START_DELAY_MS before its first tick.
+        tokio::time::sleep(Duration::from_millis(SETTLE_START_DELAY_MS) + run_for).await;
+        shutdown.cancel();
+
+        let mut published = Vec::new();
+        while let Ok(hash) = settled_blockhashes_rx.try_recv() {
+            published.push(hash);
+        }
+        let tip = db.get_latest_slot().await.unwrap().expect("a tip block");
+        let blocks = db.get_blocks_in_range(0, tip).await.unwrap();
+        IdleRun { blocks, published }
+    }
+
+    /// The tick keeps advancing the slot while an idle node produces roughly one
+    /// block a second, so the tip block's slot runs well ahead of its height.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_tick_advances_slot_without_producing_a_block() {
+        let run = run_idle_settler(100, Duration::from_millis(2_600)).await;
+
+        let tip = run.blocks.last().expect("at least one block");
+        let height = tip.block_height.expect("a block height");
+        assert!(
+            tip.slot > height,
+            "idle ticks must advance the slot past the height, saw slot {} height {}",
+            tip.slot,
+            height
+        );
+        // Ten ticks per heartbeat, so two heartbeats already open a gap of ~18.
+        assert!(
+            tip.slot - height >= 9,
+            "the gap must track the tick-to-block ratio, saw slot {} height {}",
+            tip.slot,
+            height
+        );
+    }
+
+    /// An idle node produces one block per heartbeat interval, not one per tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_produces_a_block_after_the_interval() {
+        let run = run_idle_settler(100, Duration::from_millis(2_600)).await;
+
+        // Genesis plus one block per elapsed heartbeat, with a tick of slack.
+        assert!(
+            (3..=5).contains(&run.blocks.len()),
+            "expected genesis plus ~2 heartbeat blocks, got {}: {:?}",
+            run.blocks.len(),
+            run.blocks.iter().map(|b| b.slot).collect::<Vec<_>>()
+        );
+    }
+
+    /// Block height counts blocks, so it is contiguous across a sparse chain
+    /// whose slots are not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_height_counts_blocks_not_slots() {
+        let run = run_idle_settler(100, Duration::from_millis(2_600)).await;
+
+        let slots: Vec<u64> = run.blocks.iter().map(|b| b.slot).collect();
+        assert!(
+            slots.windows(2).any(|w| w[1] - w[0] > 1),
+            "the chain must actually be sparse before height is worth checking: {slots:?}"
+        );
+        let heights: Vec<u64> = run
+            .blocks
+            .iter()
+            .map(|b| b.block_height.expect("a block height"))
+            .collect();
+        let expected: Vec<u64> = (0..heights.len() as u64).collect();
+        assert_eq!(
+            heights, expected,
+            "height must count blocks, slots {slots:?}"
+        );
+    }
+
+    /// A block extends the last block actually produced, which the indexer's
+    /// continuity walk requires: `slot - 1` names a slot with no block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parent_names_the_previous_produced_block() {
+        let run = run_idle_settler(100, Duration::from_millis(2_600)).await;
+
+        let slots: Vec<u64> = run.blocks.iter().map(|b| b.slot).collect();
+        assert!(
+            slots.windows(2).any(|w| w[1] - w[0] > 1),
+            "the chain must actually be sparse before linkage is worth checking: {slots:?}"
+        );
+        for pair in run.blocks.windows(2) {
+            assert_eq!(
+                pair[1].parent_slot, pair[0].slot,
+                "a block must name the previous stored block, slots {slots:?}"
+            );
+            assert_eq!(
+                pair[1].previous_blockhash, pair[0].blockhash,
+                "a block must carry the previous stored block's hash"
+            );
+        }
+    }
+
+    /// One blockhash per block, never one per tick: an idle tick that produces
+    /// nothing must not mint or publish a hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blockhash_is_minted_once_per_block() {
+        let run = run_idle_settler(100, Duration::from_millis(2_600)).await;
+
+        assert_eq!(
+            run.published.len(),
+            run.blocks.len(),
+            "one published hash per stored block, slots {:?}",
+            run.blocks.iter().map(|b| b.slot).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two heartbeat blocks carry no transactions at all, so only the slot and
+    /// the block time separate their hashes. They must still be distinct.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consecutive_heartbeat_blocks_have_distinct_hashes() {
+        use std::collections::HashSet;
+
+        let run = run_idle_settler(100, Duration::from_millis(2_600)).await;
+
+        // Genesis keeps the default hash by design, so judge the rest.
+        let hashes: Vec<Hash> = run.blocks.iter().skip(1).map(|b| b.blockhash).collect();
+        assert!(hashes.len() >= 2, "need two heartbeat blocks to compare");
+        let distinct: HashSet<Hash> = hashes.iter().copied().collect();
+        assert_eq!(distinct.len(), hashes.len(), "heartbeat hashes must differ");
     }
 
     /// Wiring + no-double-send: with no txs fed, empty blocks never touch
@@ -6247,11 +6793,14 @@ mod tests {
             second_tip.slot
         );
 
-        let successor: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = $1")
-            .bind(first_tip.slot as i64 + 1)
-            .fetch_one(pool.as_ref())
-            .await
-            .expect("the block after the old tip exists");
+        // Idle ticks advance the slot without a block, so the successor is the
+        // next block that exists rather than the next slot.
+        let successor: Vec<u8> =
+            sqlx::query_scalar("SELECT data FROM blocks WHERE slot > $1 ORDER BY slot LIMIT 1")
+                .bind(first_tip.slot as i64)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("the block after the old tip exists");
         let successor: BlockInfo = bincode::deserialize(&successor).unwrap();
         assert_eq!(
             successor.previous_blockhash, first_tip.blockhash,
@@ -6342,5 +6891,135 @@ mod tests {
             genesis_before, genesis_after,
             "the canonical slot zero must not be overwritten by a genesis restart"
         );
+    }
+
+    /// A cache the settler gave up on is left alone by idle ticks too. Ten writes
+    /// a second into a paused cache is most of what the pause exists to stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_leaves_a_paused_cache_alone() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        publish_idle_slot(&postgres_db, Some(&redis_raw), 10)
+            .await
+            .unwrap();
+        redis_raw.pause_mirroring(Duration::from_secs(60));
+        publish_idle_slot(&postgres_db, Some(&redis_raw), 11)
+            .await
+            .unwrap();
+
+        let mut conn = redis_raw.connection.clone();
+        let mirrored: Option<u64> = conn
+            .get(crate::accounts::current_slot::CURRENT_SLOT_KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            mirrored,
+            Some(10),
+            "a paused cache must not be written by an idle tick"
+        );
+        assert_eq!(
+            pg_db.get_current_slot().await.unwrap(),
+            Some(11),
+            "the durable counter must advance whatever the cache is doing"
+        );
+    }
+
+    /// The idle publish is awaited on the blocktime tick, so a cache that accepts
+    /// the connection and stops answering would stop the chain: no slot advance,
+    /// no heartbeat block, no expiry. The budget is what keeps that impossible.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_does_not_wait_on_the_cache_past_its_budget() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        let (redis_raw, _redis) = start_test_redis(postgres_db.clone()).await;
+
+        let mut conn = redis_raw.connection.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(30_000u64)
+            .arg("ALL")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        // Its own ceiling, because the failure this pins is a hang.
+        tokio::time::timeout(
+            CACHE_MIRROR_BUDGET * 10,
+            publish_idle_slot(&postgres_db, Some(&redis_raw), 42),
+        )
+        .await
+        .expect("a stalled cache must not hold the settler tick")
+        .expect("the durable half publishes whatever the cache does");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < CACHE_MIRROR_BUDGET * 3,
+            "the idle publish must abandon the cache at its budget, waited {waited:?}"
+        );
+        assert_eq!(
+            pg_db.get_current_slot().await.unwrap(),
+            Some(42),
+            "the slot must keep advancing while the cache is stalled"
+        );
+    }
+
+    /// Same contract for the durable half: a Postgres that accepts the statement
+    /// and sits on it would stop the tick just as a stalled cache would, and this
+    /// is the one path in the loop with no retry budget to surface that through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_does_not_wait_on_postgres_past_its_budget() {
+        let (pg_db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = pg_db else {
+            panic!("Expected Postgres variant")
+        };
+        let postgres_db = postgres_db.clone();
+        publish_idle_slot(&postgres_db, None, 10)
+            .await
+            .expect("a quiet pool publishes");
+
+        // A row lock held open is the smallest server-side stall there is: the
+        // next upsert queues behind it for as long as this transaction lives.
+        let mut lock = postgres_db.pool.begin().await.unwrap();
+        sqlx::query("SELECT value FROM metadata WHERE key = $1 FOR UPDATE")
+            .bind(crate::accounts::current_slot::CURRENT_SLOT_KEY)
+            .fetch_one(&mut *lock)
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            IDLE_SLOT_PUBLISH_BUDGET * 10,
+            publish_idle_slot(&postgres_db, None, 11),
+        )
+        .await
+        .expect("a stalled Postgres must not hold the settler tick");
+        let waited = started.elapsed();
+
+        let error = outcome.expect_err("a write past its budget is a failure the tick reports");
+        assert!(
+            format!("{error:#}").contains("budget"),
+            "the failure must name the budget, got: {error:#}"
+        );
+        assert!(
+            waited < IDLE_SLOT_PUBLISH_BUDGET * 3,
+            "the idle publish must abandon Postgres at its budget, waited {waited:?}"
+        );
+
+        // Releasing the lock is all it takes for the next tick to land, so the
+        // stall was the lock and not a pool the timeout left unusable.
+        lock.rollback().await.unwrap();
+        publish_idle_slot(&postgres_db, None, 12)
+            .await
+            .expect("the tick after the stall publishes");
+        assert_eq!(pg_db.get_current_slot().await.unwrap(), Some(12));
     }
 }

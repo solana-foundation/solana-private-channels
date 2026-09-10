@@ -31,6 +31,7 @@ integration-test:
 	@cargo test --test test_sequencer_zero_deadline -- --nocapture
 	@cargo test --test test_signatures_corruption_guard -- --nocapture
 	@cargo test --test test_node_config_validation -- --nocapture
+	@cargo test --test test_duplicate_writer -- --nocapture
 	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
 	@cargo test --test ingress_backpressure -- --nocapture
 	@cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
@@ -69,7 +70,6 @@ integration-test:
 	@cargo test --test sender_sign_and_send_error -- --nocapture
 	@cargo test --test sender_max_retries -- --nocapture
 	@cargo test --test sender_onchain_error_arms -- --nocapture
-	@cargo test --test sender_rotation_retry -- --nocapture
 	@cargo test --test jit_mint_helper -- --nocapture
 	@cargo test --test storage_update_failure -- --nocapture
 	@cargo test --test processor_quarantine -- --nocapture
@@ -78,6 +78,7 @@ integration-test:
 	@cargo test --test mint_builder_validation -- --nocapture
 	@cargo test --test sender_channel_close -- --nocapture
 	@cargo test --test sender_cancellation_drain -- --nocapture
+	@cargo test --test rotation_driver_e2e -- --nocapture
 
 # Format and lint code
 fmt:
@@ -187,6 +188,8 @@ integration-coverage-private-channel:
 	@cargo llvm-cov test --no-report --workspace --test test_signatures_corruption_guard -- --nocapture
 	@echo "Running run_node config-validation tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test test_node_config_validation -- --nocapture
+	@echo "Running single-writer lease tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test test_duplicate_writer -- --nocapture
 	@# Kept in sync with the integration-test group; runs the backpressure CI guards (RSS test stays #[ignore]).
 	@cargo llvm-cov test --no-report --workspace --test ingress_backpressure -- --nocapture
 
@@ -287,8 +290,6 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test sender_max_retries -- --nocapture
 	@echo "Running sender on-chain error-arm tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_onchain_error_arms -- --nocapture
-	@echo "Running sender rotation-retry drain tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test sender_rotation_retry -- --nocapture
 	@echo "Running JIT-mint helper coverage tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test jit_mint_helper -- --nocapture
 	@echo "Running storage-update-failure tests with coverage instrumentation..."
@@ -305,6 +306,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test sender_channel_close -- --nocapture
 	@echo "Running sender cancellation-drain tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test sender_cancellation_drain -- --nocapture
+	@echo "Running rotation-driver E2E tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test rotation_driver_e2e -- --nocapture
 
 integration-coverage-report:
 	@echo "Generating combined integration E2E coverage report..."

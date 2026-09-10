@@ -14,8 +14,8 @@ pub async fn register(
     Json(req): Json<RegisterRequest>,
 ) -> AppResult<Json<User>> {
     // Validate username length and characters.
-    // Only alphanumeric, underscores, and hyphens are allowed — keeps usernames
-    // URL-safe and unambiguous in display contexts.
+    // ASCII only: Unicode alphanumerics include homoglyphs that render identically to
+    // ASCII, and the signed wallet message names the account.
     if req.username.len() < USERNAME_MIN_LEN {
         return Err(AppError::BadRequest(format!(
             "username must be at least {USERNAME_MIN_LEN} characters"
@@ -29,7 +29,7 @@ pub async fn register(
     if !req
         .username
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err(AppError::BadRequest(
             "username may only contain letters, numbers, underscores, and hyphens".into(),

@@ -33,6 +33,10 @@ pub trait StageMetrics: Send + Sync {
     /// restart until the row is repaired.
     fn executor_corrupt_account(&self);
 
+    // Writer lease
+    fn writer_lease_probe(&self, outcome: &'static str);
+    fn writer_lease_lost(&self, reason: &'static str);
+
     // Executor — latency histograms (durations in milliseconds)
     fn executor_batch_duration_ms(&self, ms: f64);
     fn executor_preload_duration_ms(&self, ms: f64);
@@ -54,6 +58,9 @@ pub trait StageMetrics: Send + Sync {
     fn settler_backpressure_engaged(&self);
     fn settler_txs_settled(&self, count: usize);
     fn settler_settle_retried(&self);
+    /// Idle-slot publishes that failed or outlived their budget. The next tick
+    /// republishes, so a steady rate here is a Postgres that is stalling.
+    fn settler_idle_slot_publish_failed(&self);
     /// Executed transactions dropped without a settled block, by the stage
     /// that was holding them.
     fn discarded_executed_transactions(&self, stage: &'static str, count: usize);
@@ -134,6 +141,12 @@ impl StageMetrics for NoopMetrics {
     fn executor_corrupt_account(&self) {
         debug!("executor: corrupt stored account");
     }
+    fn writer_lease_probe(&self, outcome: &'static str) {
+        debug!("writer lease: probe {}", outcome);
+    }
+    fn writer_lease_lost(&self, reason: &'static str) {
+        debug!("writer lease: lost, {}", reason);
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         debug!("executor: batch_duration={:.3}ms", ms);
     }
@@ -175,6 +188,9 @@ impl StageMetrics for NoopMetrics {
     }
     fn settler_settle_retried(&self) {
         debug!("settler: settle retried");
+    }
+    fn settler_idle_slot_publish_failed(&self) {
+        debug!("settler: idle slot publish failed");
     }
     fn discarded_executed_transactions(&self, stage: &'static str, n: usize) {
         debug!("{}: discarded {}", stage, n);
@@ -351,6 +367,18 @@ counter_vec!(
     &[]
 );
 counter_vec!(
+    WRITER_LEASE_PROBE,
+    "private_channel_writer_lease_probe_total",
+    "Writer lease ownership probes by outcome",
+    &["outcome"]
+);
+counter_vec!(
+    WRITER_LEASE_LOST,
+    "private_channel_writer_lease_lost_total",
+    "Times the writer lease stopped being provable, by reason",
+    &["reason"]
+);
+counter_vec!(
     SETTLER_TXS_SETTLED,
     "private_channel_settler_txs_settled_total",
     "Transactions settled to DB",
@@ -366,6 +394,12 @@ counter_vec!(
     SETTLER_SETTLE_RETRIED,
     "private_channel_settler_settle_retried_total",
     "Settle attempts that failed and were retried",
+    &[]
+);
+counter_vec!(
+    SETTLER_IDLE_SLOT_PUBLISH_FAILED,
+    "private_channel_settler_idle_slot_publish_failed_total",
+    "Idle-slot publishes that failed or outlived their budget; the next tick republishes",
     &[]
 );
 counter_vec!(
@@ -558,6 +592,12 @@ impl StageMetrics for PrometheusMetrics {
             .with_label_values(&[] as &[&str])
             .inc();
     }
+    fn writer_lease_probe(&self, outcome: &'static str) {
+        WRITER_LEASE_PROBE.with_label_values(&[outcome]).inc();
+    }
+    fn writer_lease_lost(&self, reason: &'static str) {
+        WRITER_LEASE_LOST.with_label_values(&[reason]).inc();
+    }
     fn executor_batch_duration_ms(&self, ms: f64) {
         EXECUTOR_BATCH_DURATION
             .with_label_values(&[] as &[&str])
@@ -623,6 +663,11 @@ impl StageMetrics for PrometheusMetrics {
     }
     fn settler_settle_retried(&self) {
         SETTLER_SETTLE_RETRIED
+            .with_label_values(&[] as &[&str])
+            .inc();
+    }
+    fn settler_idle_slot_publish_failed(&self) {
+        SETTLER_IDLE_SLOT_PUBLISH_FAILED
             .with_label_values(&[] as &[&str])
             .inc();
     }
@@ -708,6 +753,8 @@ pub fn init_prometheus_metrics() {
         EXECUTOR_CONSERVATION_REJECTED,
         EXECUTOR_PRELOAD_FATAL,
         EXECUTOR_CORRUPT_ACCOUNT,
+        WRITER_LEASE_PROBE,
+        WRITER_LEASE_LOST,
         SETTLER_TXS_SETTLED,
         SETTLER_BACKPRESSURE_ENGAGED,
         EXECUTOR_RESULTS_CHUNKED,

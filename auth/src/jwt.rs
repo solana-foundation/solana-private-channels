@@ -107,6 +107,28 @@ mod tests {
         assert_eq!(claims.role, Role::Operator);
     }
 
+    /// Decodes the raw JWT payload and asserts the role claim is exactly
+    /// "user" or "operator", the spelling the gateway accepts. Reading it as
+    /// plain JSON instead of into `Role` is the point: a round trip through
+    /// our own enum passes even if it writes "User".
+    #[test]
+    fn role_claim_is_lowercase_in_the_payload() {
+        for (role, expected_claim) in [(Role::User, "user"), (Role::Operator, "operator")] {
+            let token = config().sign(Uuid::new_v4(), role).unwrap();
+            let mut validation = Validation::default();
+            validation.set_issuer(&[JWT_ISSUER]);
+            validation.set_audience(&[JWT_AUDIENCE]);
+            let payload = decode::<serde_json::Value>(
+                &token,
+                &DecodingKey::from_secret(SECRET.as_bytes()),
+                &validation,
+            )
+            .unwrap()
+            .claims;
+            assert_eq!(payload["role"], expected_claim);
+        }
+    }
+
     #[test]
     fn wrong_secret_is_rejected() {
         let token = config().sign(Uuid::new_v4(), Role::User).unwrap();

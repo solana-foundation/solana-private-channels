@@ -381,7 +381,12 @@ pub mod rpc_mocks {
     /// `[start, end]` plus one `getBlock` per `(slot, parent_slot)` producer.
     pub fn chain(server: &mut Server, start: u64, end: u64, producers: &[(u64, u64)]) -> Vec<Mock> {
         let slots: Vec<u64> = producers.iter().map(|(slot, _)| *slot).collect();
-        let mut mocks = vec![mock_get_blocks(server, start, end, &slots)];
+        // The backfill floor is exclusive, so the anchor lookup asks from one slot
+        // below the range. Same producers answer it.
+        let mut mocks = vec![
+            mock_get_blocks(server, start, end, &slots),
+            mock_get_blocks(server, start.saturating_sub(1), end, &slots),
+        ];
         for (slot, parent) in producers {
             mocks.push(mock_get_block_at(server, *slot, *parent));
         }

@@ -55,31 +55,6 @@
               "type": {
                 "kind": "publicKeyTypeNode"
               }
-            },
-            {
-              "kind": "structFieldTypeNode",
-              "name": "withdrawalTransactionsRoot",
-              "type": {
-                "count": {
-                  "kind": "fixedCountNode",
-                  "value": 32
-                },
-                "item": {
-                  "endian": "le",
-                  "format": "u8",
-                  "kind": "numberTypeNode"
-                },
-                "kind": "arrayTypeNode"
-              }
-            },
-            {
-              "kind": "structFieldTypeNode",
-              "name": "currentTreeIndex",
-              "type": {
-                "endian": "le",
-                "format": "u64",
-                "kind": "numberTypeNode"
-              }
             }
           ],
           "kind": "structTypeNode"
@@ -104,6 +79,33 @@
         },
         "kind": "accountNode",
         "name": "operator"
+      },
+      {
+        "data": {
+          "fields": [
+            {
+              "kind": "structFieldTypeNode",
+              "name": "bump",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "generation",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            }
+          ],
+          "kind": "structTypeNode"
+        },
+        "kind": "accountNode",
+        "name": "withdrawalBitmap"
       }
     ],
     "definedTypes": [
@@ -420,22 +422,6 @@
               "type": {
                 "kind": "publicKeyTypeNode"
               }
-            },
-            {
-              "kind": "structFieldTypeNode",
-              "name": "newWithdrawalRoot",
-              "type": {
-                "count": {
-                  "kind": "fixedCountNode",
-                  "value": 32
-                },
-                "item": {
-                  "endian": "le",
-                  "format": "u8",
-                  "kind": "numberTypeNode"
-                },
-                "kind": "arrayTypeNode"
-              }
             }
           ],
           "kind": "structTypeNode"
@@ -443,7 +429,7 @@
       },
       {
         "kind": "definedTypeNode",
-        "name": "resetSmtRootEvent",
+        "name": "rotateBitmapEvent",
         "type": {
           "fields": [
             {
@@ -467,6 +453,15 @@
               "name": "operator",
               "type": {
                 "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "newGeneration",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
               }
             }
           ],
@@ -544,20 +539,26 @@
       {
         "code": 11,
         "kind": "errorNode",
-        "message": "Invalid SMT proof provided",
-        "name": "invalidSmtProof"
+        "message": "Invalid withdrawal bitmap account",
+        "name": "invalidWithdrawalBitmap"
       },
       {
         "code": 12,
         "kind": "errorNode",
-        "message": "Invalid transaction nonce for current tree index",
-        "name": "invalidTransactionNonceForCurrentTreeIndex"
+        "message": "Withdrawal nonce already released",
+        "name": "nonceAlreadyUsed"
       },
       {
         "code": 13,
         "kind": "errorNode",
-        "message": "Unexpected current tree index for SMT root reset",
-        "name": "unexpectedTreeIndex"
+        "message": "Withdrawal nonce outside the current bitmap generation",
+        "name": "nonceOutsideCurrentGeneration"
+      },
+      {
+        "code": 14,
+        "kind": "errorNode",
+        "message": "Unexpected generation for bitmap rotation",
+        "name": "unexpectedGeneration"
       }
     ],
     "instructions": [
@@ -598,6 +599,15 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "instance"
+          },
+          {
+            "docs": [
+              "Withdrawal bitmap PDA to be created"
+            ],
+            "isSigner": false,
+            "isWritable": true,
+            "kind": "instructionAccountNode",
+            "name": "withdrawalBitmap"
           },
           {
             "docs": [
@@ -645,6 +655,15 @@
           {
             "kind": "instructionArgumentNode",
             "name": "bump",
+            "type": {
+              "endian": "le",
+              "format": "u8",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "bitmapBump",
             "type": {
               "endian": "le",
               "format": "u8",
@@ -1377,12 +1396,21 @@
           },
           {
             "docs": [
-              "Instance PDA to validate and update"
+              "Instance PDA to validate and sign the transfer"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "instance"
+          },
+          {
+            "docs": [
+              "Withdrawal bitmap PDA to consume the nonce"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "instance"
+            "name": "withdrawalBitmap"
           },
           {
             "docs": [
@@ -1499,43 +1527,11 @@
           },
           {
             "kind": "instructionArgumentNode",
-            "name": "newWithdrawalRoot",
-            "type": {
-              "count": {
-                "kind": "fixedCountNode",
-                "value": 32
-              },
-              "item": {
-                "endian": "le",
-                "format": "u8",
-                "kind": "numberTypeNode"
-              },
-              "kind": "arrayTypeNode"
-            }
-          },
-          {
-            "kind": "instructionArgumentNode",
             "name": "transactionNonce",
             "type": {
               "endian": "le",
               "format": "u64",
               "kind": "numberTypeNode"
-            }
-          },
-          {
-            "kind": "instructionArgumentNode",
-            "name": "siblingProofs",
-            "type": {
-              "count": {
-                "kind": "fixedCountNode",
-                "value": 512
-              },
-              "item": {
-                "endian": "le",
-                "format": "u8",
-                "kind": "numberTypeNode"
-              },
-              "kind": "arrayTypeNode"
             }
           }
         ],
@@ -1562,7 +1558,7 @@
           },
           {
             "docs": [
-              "Operator resetting the SMT root"
+              "Operator rotating the bitmap"
             ],
             "isSigner": true,
             "isWritable": false,
@@ -1571,12 +1567,21 @@
           },
           {
             "docs": [
-              "Instance PDA to reset"
+              "Instance PDA the bitmap belongs to"
+            ],
+            "isSigner": false,
+            "isWritable": false,
+            "kind": "instructionAccountNode",
+            "name": "instance"
+          },
+          {
+            "docs": [
+              "Withdrawal bitmap PDA to rotate"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "instance"
+            "name": "withdrawalBitmap"
           },
           {
             "docs": [
@@ -1623,7 +1628,7 @@
           },
           {
             "kind": "instructionArgumentNode",
-            "name": "expectedCurrentTreeIndex",
+            "name": "expectedGeneration",
             "type": {
               "endian": "le",
               "format": "u64",
@@ -1639,7 +1644,7 @@
           }
         ],
         "kind": "instructionNode",
-        "name": "resetSmtRoot"
+        "name": "rotateBitmap"
       },
       {
         "accounts": [

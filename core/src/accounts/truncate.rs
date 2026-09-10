@@ -12,6 +12,15 @@ use {
 };
 
 const FIRST_AVAILABLE_BLOCK_KEY: &str = "first_available_block";
+
+/// The fewest slots a retention may keep and still hold the whole blockhash
+/// window after a restart: the window in blocks, times the slots an idle node
+/// ticks per block it produces. One slot per block is the loaded floor.
+pub fn retention_floor_slots(max_blockhashes: usize, blocktime_ms: u64) -> u64 {
+    let heartbeat_ms = crate::stages::settle::HEARTBEAT_INTERVAL.as_millis() as u64;
+    let idle_slots_per_block = (heartbeat_ms / blocktime_ms.max(1)).max(1);
+    (max_blockhashes as u64).saturating_mul(idle_slots_per_block)
+}
 const ACCOUNT_HISTORY_TABLE: &str = "account_history";
 const TRUNCATE_ADVISORY_LOCK_ID: i64 = 0x434F4E_54525543; // "CONTRUC" as hex
 const MAX_BIND_PARAMS: usize = 60_000;
@@ -687,6 +696,25 @@ mod tests {
         assert_eq!(report.transactions_deleted, 0);
         assert_eq!(report.account_history_rows_deleted, 0);
         assert_eq!(report.first_available_block, None);
+    }
+
+    /// The floor is the dedup window at the widest block spacing the node has,
+    /// which moves with the blocktime and never drops below one slot per block.
+    #[test]
+    fn retention_floor_tracks_the_idle_gap() {
+        for (max_blockhashes, blocktime_ms, floor) in [
+            (150, 100, 1_500),
+            (150, 10, 15_000),
+            (150, 1_000, 150),
+            (150, 5_000, 150),
+            (1, 100, 10),
+        ] {
+            assert_eq!(
+                retention_floor_slots(max_blockhashes, blocktime_ms),
+                floor,
+                "{max_blockhashes} blockhashes at {blocktime_ms}ms"
+            );
+        }
     }
 
     #[test]

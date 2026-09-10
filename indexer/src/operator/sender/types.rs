@@ -1,19 +1,18 @@
-use super::remint::FinalityRpc;
 use crate::config::ProgramType;
+use crate::operator::sender::remint::FinalityRpc;
 use crate::operator::utils::instruction_util::{
-    ExtraErrorCheckPolicy, MintToBuilder, ReleaseFundsBuilderWithNonce,
-    ResetSmtRootBuilderWithTarget, RetryPolicy, WithdrawalRemintInfo,
+    ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, TransactionKind, WithdrawalRemintInfo,
 };
+use crate::operator::MintCache;
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
-use crate::{operator::utils::smt_util::SmtState, operator::MintCache};
 use chrono::{DateTime, Utc};
-use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
 use solana_keychain::Signer;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -79,23 +78,19 @@ pub struct TransactionContext {
     pub transaction_id: Option<i64>,
     pub withdrawal_nonce: Option<u64>,
     pub trace_id: Option<String>,
+    /// What this transaction is; an InitializeMint and a rotation carry identical empty ids.
+    pub kind: TransactionKind,
     /// Ownership lease from this deposit's most recent successful claim (the
-    /// row's post-claim `updated_at`). A JIT re-fire must present it to the
-    /// next claim before broadcasting again.
+    /// row's `updated_at`). A re-fire of the same deposit presents it again.
     pub deposit_claim_lease: Option<DateTime<Utc>>,
 }
 
 /// How a fire-and-store send is handled, decided by whether it carries user value.
 ///
-/// `Recoverable` (a user `Mint`, which moves value): before broadcasting, the
-/// signature is recorded by an atomic claim that also proves the sender still
-/// owns the row. If build or sign fails before broadcast, the row is left
-/// Processing so recovery re-mints it. If another writer changed the row first,
-/// the claim fails and the send is skipped; that only delays the mint until
-/// recovery retries, it never double-mints.
-///
-/// `Terminal` (`InitializeMint`): mints no balance and is on-chain idempotent, so no
-/// journal, and a build/sign failure fails fast.
+/// `Recoverable` (a user `Mint`) claims the row and persists the signature before
+/// broadcasting, and every pre-broadcast failure leaves the row Processing so
+/// recovery re-mints it. `Terminal` (`InitializeMint`) mints no balance and is
+/// on-chain idempotent, so it journals nothing and fails fast.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendDurability {
     Recoverable {
@@ -118,9 +113,6 @@ pub struct TransactionStatusUpdate {
     /// True when a remint was attempted but failed (ManualReview). Lets consumers
     /// distinguish "remint tried and failed" from "remint never attempted".
     pub remint_attempted: bool,
-    /// Full broadcast release-attempt list, set on an SMT-confirmed Completed so
-    /// the writer can durably record provenance. COALESCE-guarded downstream.
-    pub release_signatures: Option<Vec<String>>,
 }
 
 /// A Mint or InitializeMint transaction that has been sent but not yet confirmed.
@@ -129,9 +121,9 @@ pub struct TransactionStatusUpdate {
 /// tick via a single `getSignatureStatuses` RPC call.  Decoupling send from confirm
 /// allows the sender to process new transactions while waiting for on-chain confirmation.
 ///
-/// Only Mint and InitializeMint are eligible — ReleaseFunds and ResetSmtRoot still use
-/// the blocking `send_and_confirm` path because SMT proof ordering makes concurrent
-/// in-flight withdrawals unsafe.
+/// Only Mint and InitializeMint are eligible. ReleaseFunds and RotateBitmap still use
+/// the blocking `send_and_confirm` path so that at most one withdrawal is in flight
+/// when a rotation is waiting to clear the bits.
 pub struct InFlightTx {
     /// Signature returned by `sendTransaction`. Used as the polling key.
     pub signature: Signature,
@@ -168,50 +160,64 @@ pub struct InFlightTx {
     pub permit: OwnedSemaphorePermit,
 }
 
-/// Sender state tracking SMT and pending transactions
+/// Sender state tracking in-flight work and deferred remints
 pub struct SenderState {
     pub rpc_client: Arc<RpcClientWithRetry>,
     /// Source chain RPC: PrivateChannel for the withdraw operator, where the
     /// burn happened. Remints broadcast here to restore the burned balance.
     /// rpc_client is the destination chain (Solana) for ReleaseFunds.
     pub source_rpc_client: Arc<RpcClientWithRetry>,
-    /// Optional second endpoint that re-checks a `Dead` verdict on the destination
-    /// `rpc_client`. `None` keeps it single-endpoint. Never used for the source.
+    /// Independent destination-chain endpoint that re-checks a Dead verdict.
+    /// One node's missing status can be a prune rather than proof of absence.
     pub fallback_rpc_client: Option<Arc<RpcClientWithRetry>>,
-    /// Startup floor for the channel node's `max_blockhashes`, which the retention
-    /// proof re-reads and maxes against when bounding a source-side absence.
     pub storage: Arc<Storage>,
     pub instance_pda: Option<Pubkey>,
-    pub smt_state: Option<SenderSMTState>,
+    /// Withdrawal nonces broadcast but not yet settled. The rotation barrier reads
+    /// this: clearing the bits while a release is in flight would let its nonce be
+    /// replayed in the next generation.
+    pub in_flight_withdrawals: HashSet<u64>,
+    /// The generation the bitmap was last known to be on, or `None` for unknown.
+    ///
+    /// Only ever written from a value the chain itself reported, so it can lag
+    /// the chain but never lead it. It is trusted only when it permits a send;
+    /// every refusal is taken against a fresh read instead, which is what keeps
+    /// a stale entry from stranding a releasable withdrawal.
+    pub cached_generation: Option<u64>,
     pub retry_counts: HashMap<u64, u32>,
+    /// Attempts spent on the rotation in hand; one counter suffices because at most one is ever in flight.
+    pub rotation_retry_attempts: u32,
+    /// The rotation last dispatched, kept because nothing else can re-dispatch one that failed.
+    pub rotation_in_flight: Option<Box<RotateBitmapBuilder>>,
+    /// The generation that rotation was bound to. It survives a re-arm on
+    /// purpose: rebinding a rotation that already landed would make the replay
+    /// look legitimate and close a generation nobody ever opened.
+    pub rotation_bound_generation: Option<u64>,
+    /// Times that rotation has been put back on the tick, so a hopeless one stops being retried.
+    pub rotation_rearm_attempts: u32,
+    /// Consecutive gate passes that withheld a rotation. Crossing a boundary
+    /// looks blocked for a moment even when nothing is wrong, so the report
+    /// waits for the count rather than firing on the first pass.
+    pub rotation_blocked_passes: u32,
     pub mint_builders: HashMap<i64, MintToBuilder>,
     pub mint_cache: MintCache,
     pub retry_max_attempts: u32,
     /// Milliseconds between `getSignatureStatuses` polls. Populated from `OperatorConfig`.
     pub confirmation_poll_interval_ms: u64,
-    pub rotation_retry_queue: Vec<(TransactionContext, ReleaseFundsBuilder)>,
-    /// Withdrawals parked because an unresolved PendingRemint nonce in the same
-    /// tree could leave the local SMT out of sync with chain. Drained each tick
-    /// after process_pending_remints. Stores the full builder so remint_info
-    /// travels with the parked withdrawal.
-    pub ambiguous_retry_queue: Vec<Box<ReleaseFundsBuilderWithNonce>>,
-    /// The tree rotation the sender owes the chain, with the generation it owes.
-    /// A reset has no DB row and no nonce, so its durable record is
-    /// `indexer_state.owed_rotation_target`, re-armed here at boot. Both are cleared
-    /// only where a fresh on-chain read shows the chain reached the target.
-    pub pending_rotation: Option<Box<ResetSmtRootBuilderWithTarget>>,
+    /// Withdrawals the program refused because their generation had not opened
+    /// yet. The instruction is kept whole rather than the builder: nothing in it
+    /// depends on the generation, so a rotation makes the same bytes valid.
+    pub rotation_retry_queue: Vec<(TransactionContext, InstructionWithSigners)>,
+    /// Pending RotateBitmap transaction waiting for in-flight txs to settle
+    pub pending_rotation: Option<Box<RotateBitmapBuilder>>,
     pub program_type: ProgramType,
     /// Cached remint info for withdrawal transactions, keyed by nonce.
-    /// Extracted before cleanup_failed_transaction removes builder from SMT cache.
+    /// Extracted before cleanup_failed_transaction drops the nonce's caches.
     pub remint_cache: HashMap<u64, WithdrawalRemintInfo>,
     /// Signatures sent per withdrawal nonce (with lvbh), used for finality checks before reminting.
     pub pending_signatures: HashMap<u64, Vec<PendingSig>>,
     /// Ownership lease per withdrawal nonce: the row's `updated_at` as of this
     /// sender's most recent successful claim. Every release attempt presents the
-    /// current value and stores the one the claim returns, so a retry, a rebuild,
-    /// or an unpark still speaks for the incarnation it owns. Lives on the state
-    /// rather than the context because the retry recursion re-enters
-    /// `send_and_confirm` with an immutable context.
+    /// lease and adopts the one the claim returns.
     pub release_leases: HashMap<u64, DateTime<Utc>>,
     /// Deferred remint queue — entries are processed after their deadline matures.
     pub pending_remints: Vec<PendingRemint>,
@@ -230,10 +236,9 @@ impl SenderState {
     /// Finality oracle for the destination `rpc_client`, carrying the optional
     /// fallback used to re-check a `Dead` verdict (the prunable Solana path).
     ///
-    /// Which chain `rpc_client` points at is decided by the role, not the field
-    /// name: a withdraw operator sends ReleaseFunds to Solana, an escrow operator
-    /// mints deposits on the channel. The tag must follow the role or a still-valid
-    /// signature could be read against the wrong height scale.
+    /// Which chain `rpc_client` points at follows the role, not the field name:
+    /// a withdraw operator releases on Solana, an escrow operator mints on the
+    /// channel. A wrong tag reads an lvbh against the wrong height scale.
     pub(crate) fn dest_finality(&self) -> FinalityRpc<'_> {
         let fallback = self.fallback_rpc_client.as_deref();
         match self.program_type {
@@ -242,20 +247,9 @@ impl SenderState {
         }
     }
 
-    /// Finality oracle for `source_rpc_client`, single-endpoint: neither chain has
-    /// a second node configured for this role's source.
-    ///
-    /// `source_rpc_client` is the mirror of `rpc_client`: the channel for a withdraw
-    /// operator (where the remint MintTo lands) and Solana custody for an escrow one.
-    ///
-    /// The source (remint MintTo) path deliberately stays absence-authoritative
-    /// and is NOT downgraded by an on-chain SMT check the way the destination
-    /// (release) path is. What makes absence trustworthy here is the snapshot,
-    /// not the node's canonicity: the status and the block height it is compared
-    /// against come from one response over one totally ordered commit log, and
-    /// the node reports its own failures as errors rather than as a missing
-    /// status. The ledger-floor check still bounds it to the retained range.
-    /// Do not "fix" this into a symmetric SMT gate.
+    /// Finality oracle for `source_rpc_client`, single-endpoint: neither chain
+    /// has a second node configured for this role's source. The ledger-floor
+    /// check is therefore the whole protection on this path.
     pub(crate) fn source_finality(&self) -> FinalityRpc<'_> {
         match self.program_type {
             ProgramType::Withdraw => FinalityRpc::channel(&self.source_rpc_client, None),
@@ -264,17 +258,14 @@ impl SenderState {
     }
 }
 
-/// Withdrawal signature + its blockhash's `last_valid_block_height`, so the
-/// remint gate can prove the signature can no longer land.
+/// Withdrawal signature, its blockhash's `last_valid_block_height`, and the slot
+/// that blockhash was read at, so the remint gate can prove both that the
+/// signature can no longer land and that the endpoint still retains its window.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingSig {
     pub signature: Signature,
     pub last_valid_block_height: u64,
-    /// Slot the signing blockhash was read at. A transaction cannot land in a
-    /// block older than its blockhash, so this is the exact earliest slot the
-    /// signature could occupy, fixed at broadcast and immune to later changes
-    /// in the node's window. `None` on attempts journaled before it was
-    /// recorded; those fall back to deriving the bound from the window.
+    /// `None` for an attempt journaled before the column existed.
     pub blockhash_slot: Option<u64>,
 }
 
@@ -292,6 +283,21 @@ pub struct PendingRemint {
     pub deadline: DateTime<Utc>,
     /// Number of times the finality check has been retried (e.g. due to RPC errors).
     pub finality_check_attempts: u32,
+    /// Set when the program itself refused this nonce's release.
+    ///
+    /// That refusal is direct proof no payout occurred, and the only evidence
+    /// that outlives a rotation. It is persisted with the entry and restored
+    /// with it, so a restart inside the finality window still lets the refund
+    /// go through instead of falling back to manual review.
+    pub release_refused_on_chain: bool,
+    /// The last slot a release for this nonce could have landed in, read once.
+    ///
+    /// The indexer's checkpoint has to reach this before an absent release
+    /// record proves anything. Re-reading it each tick would move the target
+    /// the checkpoint is chasing, so it is captured on the first check and
+    /// kept. A restart re-captures a later slot, which only asks for more
+    /// coverage than before, never less.
+    pub coverage_slot: Option<u64>,
 }
 
 /// Result item sent from the dedicated poll task back to the sender loop.
@@ -312,11 +318,6 @@ pub enum PollTaskResult {
         Box<InFlightTx>,
         Option<solana_transaction_status::TransactionStatus>,
     ),
-}
-
-pub struct SenderSMTState {
-    pub smt_state: SmtState,
-    pub nonce_to_builder: HashMap<u64, (TransactionContext, ReleaseFundsBuilder)>,
 }
 
 #[derive(Clone)]

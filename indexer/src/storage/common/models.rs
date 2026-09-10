@@ -29,9 +29,10 @@ pub enum TransactionStatus {
     Pending,
     // Currently processing by an Operator
     Processing,
-    // Withdrawal whose proof generation is blocked by an unresolved ambiguous
-    // nonce in the same tree. Never broadcast on-chain. Lives only while the
-    // sender owns it in memory; recovery requeues it if a restart orphans it.
+    // Withdrawal waiting on the bitmap rotation that opens its nonce's window.
+    // Never broadcast on-chain, so nothing moved funds. A live sender holds it
+    // in its retry queue and unparks it to send; recovery requeues it if a
+    // restart orphans it.
     Parked,
     Completed,
     Failed,
@@ -102,6 +103,12 @@ pub struct DbTransaction {
     /// to FailedReminted. A crash before the async writer runs can no longer
     /// leave a landed remint recorded only as PendingRemint (which would replay).
     pub landed_remint_signature: Option<String>,
+    /// Set when the program itself refused this row's release, which is direct
+    /// proof no payout occurred and the only such proof that outlives a bitmap
+    /// rotation. Written with the PendingRemint transition so a restart inside
+    /// the finality window still lets the refund skip the bitmap gate. Rows that
+    /// were never refused carry false (column DEFAULT).
+    pub release_refused_on_chain: bool,
 }
 
 /// Per-mint balance aggregate used during startup reconciliation.
@@ -191,6 +198,17 @@ pub struct DbMintStatus {
     pub effective_slot: i64,
     pub signature: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// A `ReleaseFunds` the indexer saw succeed on chain, keyed by the withdrawal
+/// nonce it consumed. The bitmap clears a nonce's bit once its generation
+/// rotates and an RPC signature lookup keeps only a bounded history, so this row
+/// is the only record of a payout that never expires.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DbObservedRelease {
+    pub withdrawal_nonce: i64,
+    pub signature: String,
+    pub slot: i64,
 }
 
 /// Resolved mint status at a particular slot, derived from `mint_status_history`.
@@ -295,6 +313,7 @@ impl DbTransactionBuilder {
             instruction_index: self.instruction_index,
             inner_index: self.inner_index,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         }
     }
 }

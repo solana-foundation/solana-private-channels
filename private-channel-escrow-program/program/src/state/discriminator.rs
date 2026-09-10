@@ -11,6 +11,7 @@ pub enum PrivateChannelEscrowAccountDiscriminators {
     InstanceDiscriminator = 0,
     OperatorDiscriminator = 1,
     AllowedMintDiscriminator = 2,
+    WithdrawalBitmapDiscriminator = 3,
 }
 
 #[repr(u8)]
@@ -23,7 +24,7 @@ pub enum PrivateChannelEscrowInstructionDiscriminators {
     SetNewAdmin = 5,
     Deposit = 6,
     ReleaseFunds = 7,
-    ResetSmtRoot = 8,
+    RotateBitmap = 8,
     EmitEvent = 228,
 }
 
@@ -40,7 +41,7 @@ impl TryFrom<u8> for PrivateChannelEscrowInstructionDiscriminators {
             5 => Ok(Self::SetNewAdmin),
             6 => Ok(Self::Deposit),
             7 => Ok(Self::ReleaseFunds),
-            8 => Ok(Self::ResetSmtRoot),
+            8 => Ok(Self::RotateBitmap),
             228 => Ok(Self::EmitEvent),
             _ => Err(()),
         }

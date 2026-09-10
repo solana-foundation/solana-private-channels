@@ -16,9 +16,9 @@ pub async fn get_blocks_in_range(
         AccountsDB::Postgres(postgres_db) => {
             get_blocks_in_range_postgres(postgres_db, start_slot, end_slot).await
         }
-        // Served from the source of truth. The cached form skipped slots it had
-        // no entry for, which silently shortened the range; this path feeds the
-        // dedup rebuild, where a dropped block means a replay slips through.
+        // Served from the source of truth: the cache cannot express which slots
+        // in the range it has no entry for, so reading through it would silently
+        // shorten the range instead of missing.
         AccountsDB::Redis(redis_db) => {
             get_blocks_in_range_postgres(&redis_db.fallback, start_slot, end_slot).await
         }

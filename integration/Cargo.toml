@@ -80,6 +80,10 @@ name = "parked_withdrawal_recovery"
 path = "tests/indexer/parked_withdrawal_recovery.rs"
 
 [[test]]
+name = "rotation_driver_e2e"
+path = "tests/indexer/rotation_driver_e2e.rs"
+
+[[test]]
 name = "test_rpc_http_malformed"
 path = "tests/private-channel/rpc/test_rpc_http_malformed.rs"
 
@@ -169,10 +173,6 @@ name = "sender_onchain_error_arms"
 path = "tests/indexer/sender_onchain_error_arms.rs"
 
 [[test]]
-name = "sender_rotation_retry"
-path = "tests/indexer/sender_rotation_retry.rs"
-
-[[test]]
 name = "jit_mint_helper"
 path = "tests/indexer/jit_mint_helper.rs"
 
@@ -220,6 +220,15 @@ path = "tests/private-channel/test_signatures_corruption_guard.rs"
 [[test]]
 name = "test_node_config_validation"
 path = "tests/private-channel/test_node_config_validation.rs"
+
+[[test]]
+name = "test_duplicate_writer"
+path = "tests/private-channel/test_duplicate_writer.rs"
+
+# Slot/height divergence, sparse-chain indexer walk and block-counted expiry.
+[[test]]
+name = "test_sparse_chain"
+path = "tests/private-channel/test_sparse_chain.rs"
 
 # Redis-backend warm-cache + read-path coverage test. Runs independently of
 # private_channel_integration so it still contributes coverage even when the broader

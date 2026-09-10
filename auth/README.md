@@ -15,15 +15,52 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `AUTH_RATE_LIMIT_PER_SECOND` | `5` | Sustained per-IP request rate for `/auth/register` and `/auth/login`. |
 | `AUTH_RATE_LIMIT_BURST` | `10` | Burst allowance above the sustained per-IP rate. |
 | `AUTH_USERNAME_ATTEMPTS_PER_MINUTE` | `5` | Credential attempts per minute against a single username, across all IPs. |
+| `AUTH_MAX_CONNECTIONS` | `1024` | Maximum concurrent client connections. Past this, a new connection is dropped rather than queued. |
+| `AUTH_MAX_CONNECTIONS_PER_IP` | `64` | Maximum concurrent connections from one client IP, so one host cannot take the whole budget. |
+| `AUTH_HEADER_READ_TIMEOUT_SECS` | `10` | Seconds a client may take to send a full request header block (slowloris protection). Doubles as the idle timeout: see below. |
+| `AUTH_REQUEST_TIMEOUT_SECS` | `15` | Seconds a request may take once its headers are in, covering the body read and the handler. Shed as `503`. Must stay above the 5s pool acquire timeout, or pool exhaustion is cancelled before `/health` can observe it. |
+| `AUTH_TCP_KEEPALIVE_IDLE_SECS` | `60` | Idle seconds before the OS starts sending TCP keepalive probes. A backstop: the header timeout closes an idle connection first, so this only bites once that value is raised. |
+| `AUTH_TCP_KEEPALIVE_INTERVAL_SECS` | `15` | Seconds between TCP keepalive probes. |
 
 The credential routes run Argon2, which is deliberately CPU and memory heavy. They are
 rate limited per IP and per username, capped at `AUTH_ARGON2_MAX_CONCURRENCY` concurrent
 hashes, and limited to a 4 KB request body. Over-budget requests get `429`; requests that
-wait too long for a hashing slot get `503`.
+wait too long for a hashing slot, outrun `AUTH_REQUEST_TIMEOUT_SECS`, or find the database
+unreachable, get `503`. A `500` means the database answered and we asked it wrong.
+
+Those budgets are per request, so they are only charged once a request arrives. Connections
+are bounded separately by `AUTH_MAX_CONNECTIONS` and `AUTH_MAX_CONNECTIONS_PER_IP`, and the
+header and request timeouts close clients that connect and then stall. These hold whether or
+not an ingress proxy adds limits of its own, so a proxy bypass still meets a bounded listener.
+
+`AUTH_MAX_CONNECTIONS` only binds if the process may open that many descriptors. Keep
+`RLIMIT_NOFILE` (`ulimit -n`) above it plus `AUTH_DATABASE_MAX_CONNECTIONS`, or `accept` hits
+`EMFILE` first and the listener backs off for 100 ms at a time — refusing everyone — instead
+of shedding the one connection over the cap. The Compose files set `nofile` to 65536; a
+common 1024 default is below the cap.
+
+`AUTH_HEADER_READ_TIMEOUT_SECS` is also the idle timeout. The header deadline is re-armed for
+each request on a kept-alive connection, so an idle connection is closed that many seconds
+after the previous response. Keep a pooled client's idle timeout below it: a client that
+reuses a connection the server has just closed sees `connection closed before message
+completed`, and a `POST` in that race is not safely retryable. Raise this value if a client
+you don't control pools for longer.
 
 Because the per-IP limit keys on the peer address, the service must be reached directly.
 Putting it behind a proxy without forwarding the client address would bucket every user
 into the proxy's IP.
+
+Both per-IP budgets key on that address masked to a /64 for IPv6, so a client handed a whole
+/64 gets one budget rather than one per address in it. Where addresses are aggregated — an
+ingress proxy, IPv4 CGNAT, an office /64 — the connection cap is the harsher of the two and
+needs raising. An over-budget *request* gets a `429` the client can retry, but an over-cap
+*connection* is dropped with no response at all, which a browser reports as a network error.
+`AUTH_MAX_CONNECTIONS_PER_IP=64` is roughly ten browsers.
+
+The in-container health probe reaches `/health` over loopback, so it competes for
+`AUTH_MAX_CONNECTIONS` with everyone else. Under Compose that is harmless, but a Kubernetes
+liveness probe would turn a connection flood into a restart loop: give the probe its own
+listener or budget before relying on one.
 
 ## API
 
@@ -37,7 +74,7 @@ Create a new account. All users are registered with the `user` role.
 { "username": "alice", "password": "hunter2" }
 ```
 
-Username requirements: 5–32 characters, alphanumeric plus underscores and hyphens only.
+Username requirements: 5–32 characters, ASCII alphanumeric plus underscores and hyphens only.
 
 Password requirements: 6–128 characters. The cap is measured in characters, not bytes.
 
@@ -59,13 +96,15 @@ Returns `{ "token": "<jwt>" }`. Both wrong username and wrong password return `4
 
 ### `POST /auth/challenge-wallet` 🔒
 
-Request a sign challenge to prove ownership of a Solana wallet. Requires a valid JWT.
+Request a sign challenge to prove ownership of a Solana wallet. Requires a valid JWT. Send the wallet you want to link, so it can be named in the message the user signs.
 
-Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes.
+Request: `{ "pubkey": "<base58 pubkey>" }`
+
+Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes. The message names both the account and the wallet so a signer only ever consents to linking their own wallet to their own account.
 
 ```json
 {
-  "message": "Solana Private Channels wallet verification\nuser: <uuid>\nnonce: <uuid>\nexpires: <unix>",
+  "message": "PrivateChannel wallet verification\n\nAccount: <username> (id: <uuid>)\nWallet: <base58 pubkey>\n\nOnly sign this if \"<username>\" is YOUR PrivateChannel account.\n\nnonce: <uuid>\nexpires: <unix>",
   "nonce": "<uuid>",
   "expires_at": "<iso8601>"
 }
@@ -164,7 +203,7 @@ SELECT * FROM private_channel_auth.admin_audit ORDER BY created_at DESC;
 Wallets are not trusted on assertion — the user must cryptographically prove they control the private key.
 
 ```
-1. POST /auth/challenge-wallet
+1. POST /auth/challenge-wallet  { pubkey }
    ← { message, nonce, expires_at }
 
 2. Sign `message` with the wallet's private key (Ed25519)

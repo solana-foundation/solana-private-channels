@@ -14,7 +14,7 @@ pub async fn get_recent_blockhash_impl(
         .unwrap_or_else(|_| Hash::default());
     let slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .ok()
         .flatten()

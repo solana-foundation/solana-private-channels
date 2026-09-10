@@ -70,7 +70,7 @@ pub async fn get_token_account_balance_impl(
 
     let slot = read_deps
         .accounts_db
-        .get_latest_slot()
+        .get_current_slot()
         .await
         .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
         .unwrap_or(0);

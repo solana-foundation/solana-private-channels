@@ -1,5 +1,10 @@
 use {
     super::{
+        counter,
+        current_slot::CURRENT_SLOT_KEY,
+        get_block_height::BLOCK_HEIGHT_KEY,
+        get_latest_blockhash::LATEST_BLOCKHASH_KEY,
+        get_latest_slot::LATEST_SLOT_KEY,
         postgres::PostgresAccountsDB,
         redis::RedisAccountsDB,
         traits::{AccountsDB, BlockInfo},
@@ -25,6 +30,18 @@ pub struct AddressSignatureRow {
     pub address: Vec<u8>,
     pub slot: i64,
     pub signature: Vec<u8>,
+}
+
+/// Refusal message for a batch whose block does not extend the stored ledger.
+/// Names both causes: a second write-capable node, or this node retrying a slot
+/// whose commit it never saw land. The log line is what an operator sees first.
+fn stale_tip_error(slot: u64) -> String {
+    format!(
+        "Refusing to commit slot {}: a block at or above it is already stored. \
+         Either a second write-capable node is running against this database, or \
+         this batch retries a slot that already committed.",
+        slot
+    )
 }
 
 /// Bulk-insert into address_signatures inside an active PG tx.
@@ -216,32 +233,61 @@ async fn write_batch_postgres(
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
 
-    // ── Block info: at most 2 queries (block row + latest_blockhash) ──
+    // ── Block info: at most 2 queries (block row + chain tip metadata) ──
     // Runs before the counter because whether this slot is new is what decides
     // whether the counter may advance.
     let slot_is_new = if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        // `xmax = 0` distinguishes a real insert from an ON CONFLICT update. It
-        // reads correctly only because the settler is the sole writer of this
-        // table, which is the same assumption the counter below already makes.
-        let inserted: bool = sqlx::query_scalar(
-            "INSERT INTO blocks (slot, data) VALUES ($1, $2)
+        // A block may only extend the stored ledger, and a slot already stored may
+        // only be rewritten with the same bytes: that admits the settler's own
+        // retry after a lost acknowledgement and rejects every other writer.
+        //
+        // `xmax = 0` then separates a real insert from such a replay, so the
+        // counter below advances once per slot however often the commit retries.
+        let inserted: Option<bool> = sqlx::query_scalar(
+            "INSERT INTO blocks (slot, data)
+                 SELECT $1, $2
+                 WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot > $1)
                  ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data
+                   WHERE blocks.data = EXCLUDED.data
                  RETURNING (xmax = 0)",
         )
         .bind(block_info.slot as i64)
         .bind(block_data)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("Failed to store block: {}", e))?;
 
+        // No row means a newer block is already stored, or this slot holds a
+        // different one. Either way another writer has passed this batch.
+        let Some(inserted) = inserted else {
+            return Err(stale_tip_error(block_info.slot));
+        };
+
+        // The tip blockhash and the chain counters go in one UNNEST upsert, so
+        // making slot and height durable costs no extra round trip. They commit
+        // with the block row, so a rolled-back batch leaves all three untouched.
+        let keys: Vec<&str> = vec![
+            LATEST_BLOCKHASH_KEY,
+            LATEST_SLOT_KEY,
+            CURRENT_SLOT_KEY,
+            BLOCK_HEIGHT_KEY,
+        ];
+        let values: Vec<Vec<u8>> = vec![
+            block_info.blockhash.as_ref().to_vec(),
+            counter::encode(block_info.slot).to_vec(),
+            counter::encode(block_info.slot).to_vec(),
+            counter::encode(block_info.block_height.unwrap_or(block_info.slot)).to_vec(),
+        ];
         sqlx::query(
-            "INSERT INTO metadata (key, value) VALUES ('latest_blockhash', $1)
+            "INSERT INTO metadata (key, value)
+                 SELECT * FROM UNNEST($1::varchar[], $2::bytea[])
                  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
-        .bind(block_info.blockhash.as_ref())
+        .bind(&keys)
+        .bind(&values)
         .execute(&mut *tx)
         .await
-        .map_err(|e| format!("Failed to update latest blockhash: {}", e))?;
+        .map_err(|e| format!("Failed to update the chain tip metadata: {}", e))?;
 
         inserted
     } else {
@@ -249,12 +295,12 @@ async fn write_batch_postgres(
         true
     };
 
-    // Read-modify-write inside BEGIN…COMMIT: safe because all writers serialize
-    // via this path and MVCC returns the caller's own last commit.
+    // Read-modify-write inside BEGIN…COMMIT. The block insert above already let
+    // only one writer past for this slot, and a rejected writer's increment rolls
+    // back with the rest of its batch.
     //
-    // Skipped when this slot already had a block. Every other write here is an
-    // idempotent upsert, so a commit replayed after a lost acknowledgement would
-    // otherwise be the one statement that counted the same batch twice.
+    // Skipped on a replayed slot: every other write here is an idempotent upsert,
+    // so this is the one statement that would count the same batch twice.
     if tx_count > 0 && slot_is_new {
         let current_count_bytes = sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT value FROM metadata WHERE key = 'transaction_count'",
@@ -359,11 +405,23 @@ pub(crate) async fn write_batch_redis(
 
     // Store block info and update latest slot
     if let Some(block) = block_info {
-        pipe.set("latest_blockhash", block.blockhash.to_string());
-        pipe.set("latest_slot", block.slot);
+        pipe.set(LATEST_BLOCKHASH_KEY, block.blockhash.to_string());
+        pipe.set(LATEST_SLOT_KEY, block.slot);
+        // The live slot moves on idle ticks too, but a block still republishes
+        // it so a replica never reports a slot behind the block it can fetch.
+        pipe.set(CURRENT_SLOT_KEY, block.slot);
+        // Mirrored so a read replica reports a height consistent with the hash
+        // it serves from the same cache.
+        pipe.set(BLOCK_HEIGHT_KEY, block.block_height.unwrap_or(block.slot));
         let key = format!("block:{}", block.slot);
         let serialized = bincode::serialize(&block).unwrap();
-        pipe.set(key, serialized);
+        // Only block entries expire. The tip keys the coherence check reads are
+        // never given a TTL, so an expiry can neither condemn the cache nor
+        // trigger a rebuild.
+        match db.block_ttl_secs() {
+            0 => pipe.set(key, serialized),
+            ttl => pipe.set_ex(key, serialized, ttl),
+        };
     }
 
     // Execute pipeline - explicitly specify the return type to fix type inference

@@ -48,6 +48,10 @@ pub(super) fn create_message(message: proto::Message) -> CreateResult<VersionedM
         return Err("failed to parse hash");
     }
 
+    // `versioned` is true for v0 and v1 alike, so v1 lands in the V0 arm. That
+    // only loses `Message.config`, which we never read. v1 has no lookups, so the
+    // vec stays empty. Upstream fixed the same thing in geyser 15.1.1:
+    // https://github.com/rpcpool/yellowstone-grpc/blob/master/CHANGELOG.md
     Ok(if message.versioned {
         let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
         for table in message.address_table_lookups {

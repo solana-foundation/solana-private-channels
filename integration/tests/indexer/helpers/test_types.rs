@@ -17,6 +17,10 @@ pub const BASE_AMOUNT: u64 = 10_000;
 // Coverage-instrumented builds are ~2-3x slower than release/debug. CI sets
 // PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600 for the coverage target to give those runs
 // enough headroom; all other invocations fall back to 240 s.
+//
+// Every wait helper takes its budget from here rather than from an argument. A number
+// written at the call site is tuned against whatever build its author ran, so it silently
+// ignores the env var above and fails the slowest run in CI while passing locally.
 pub static WAIT_TIMEOUT_SECS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
     std::env::var("PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS")
         .ok()

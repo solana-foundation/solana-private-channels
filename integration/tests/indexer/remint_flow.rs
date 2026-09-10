@@ -42,7 +42,6 @@
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
 
-use private_channel_indexer::storage::common::models::StoredSig;
 use {
     private_channel_indexer::{
         config::ProgramType,
@@ -53,7 +52,10 @@ use {
             },
             utils::instruction_util::WithdrawalRemintInfo,
         },
-        storage::{common::storage::mock::MockStorage, Storage, TransactionStatus},
+        storage::{
+            common::{models::StoredSig, storage::mock::MockStorage},
+            Storage, TransactionStatus,
+        },
     },
     sender_fixtures::{
         blockhash_reply, confirmed_status_reply, ensure_admin_signer_env, make_config,
@@ -131,6 +133,7 @@ fn seed_pending_remint_row(mock: &MockStorage, id: i64, attempts: i32) {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         });
 }
 
@@ -158,6 +161,8 @@ fn make_pending_remint(
         // as matured and processes it on the first tick.
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
+        release_refused_on_chain: false,
+        coverage_slot: None,
     }
 }
 
@@ -182,46 +187,20 @@ fn make_pending_remint_with_lvbh(
         original_error: "release_funds failed".to_string(),
         deadline: chrono::Utc::now() - chrono::Duration::seconds(1),
         finality_check_attempts,
+        release_refused_on_chain: false,
+        coverage_slot: None,
     }
-}
-
-/// A `getSignatureStatuses` reply for one finalized-failed signature. The
-/// release classifies as dead on this, so the gate proceeds to the remint.
-fn finalized_failed_status_reply() -> Reply {
-    Reply::result(json!({
-        "context": {"slot": 200},
-        "value": [{
-            "slot": 100,
-            "confirmations": null,
-            "err": {"InstructionError": [0, {"Custom": 1}]},
-            "status": {"Err": {"InstructionError": [0, {"Custom": 1}]}},
-            "confirmationStatus": "finalized"
-        }]
-    }))
-}
-
-/// `getLatestBlockhash` errors, enough to exhaust the RPC retry wrapper so
-/// build_and_sign fails pre-broadcast (nothing signed, nothing sent).
-fn blockhash_rpc_errors() -> Vec<Reply> {
-    vec![
-        Reply::error(-32000, "blockhash rpc down 1"),
-        Reply::error(-32000, "blockhash rpc down 2"),
-        Reply::error(-32000, "blockhash rpc down 3"),
-        Reply::error(-32000, "blockhash rpc down 4"),
-        Reply::error(-32000, "blockhash rpc down 5"),
-    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // (a) Idempotency short-circuit — attempt_remint finds a landed prior remint.
 // ─────────────────────────────────────────────────────────────────────
 //
-// Drives `execute_deferred_remint` directly. A write-ahead remint
-// signature is on record; `attempt_remint` classifies it on the source
-// chain, the scripted `getSignatureStatuses` reports it finalized, so the
-// helper short-circuits before sending and routes the confirmed arm to the
-// `FailedReminted` status emission. This is the crash-after-send recovery
-// path that prevents a duplicate mint.
+// Drives `execute_deferred_remint` directly. A write-ahead remint signature is
+// on record; `attempt_remint` classifies it on the source chain, the scripted
+// `getSignatureStatuses` reports it finalized, so the helper short-circuits
+// before sending and routes the confirmed arm to the `FailedReminted` status
+// emission. This is the crash-after-send path that prevents a duplicate mint.
 #[tokio::test]
 async fn execute_deferred_remint_short_circuits_on_prior_confirmed_remint() {
     let mock = MockRpcServer::start().await;
@@ -605,7 +584,7 @@ async fn execute_deferred_remint_emits_failed_reminted_after_successful_send() {
     let txn_id: i64 = 7_001;
     let info = make_remint_info(txn_id);
 
-    // No stored attempt, so classification is skipped: send + confirm happy path.
+    // No journaled attempt, so classification is skipped: send + confirm happy path.
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     mock.enqueue("getSignatureStatuses", confirmed_status_reply());
@@ -651,7 +630,7 @@ async fn execute_deferred_remint_durably_records_landed_signature() {
     // The PendingRemint row this remint resolves.
     seed_pending_remint_row(&storage_mock, txn_id, 0);
 
-    // No stored attempt, then a clean send and confirm.
+    // No journaled attempt, then a clean send and confirm.
     mock.enqueue("getLatestBlockhash", blockhash_reply());
     mock.enqueue("sendTransaction", send_transaction_echo_reply());
     mock.enqueue("getSignatureStatuses", confirmed_status_reply());
@@ -696,15 +675,14 @@ async fn execute_deferred_remint_durably_records_landed_signature() {
 // (f) attempt_remint send fails: defer, not ManualReview.
 // ─────────────────────────────────────────────────────────────────────
 //
-// No stored attempt, then `sendTransaction` errors. The signature was
-// persisted write-ahead before the send, so the outcome is ambiguous
-// (the node may have broadcast it): `attempt_remint` returns `DeferInFlight`
-// to reclassify next tick rather than escalating. The caller gets
-// `DeferredRemintOutcome::DeferInFlight` and no status is emitted.
+// No journaled attempt, then `sendTransaction` errors. The signature was
+// persisted write-ahead before the send, so the outcome is ambiguous (the node
+// may have broadcast it): `attempt_remint` defers to reclassify on a later tick
+// rather than escalating. No status is emitted.
 #[tokio::test]
 async fn execute_deferred_remint_defers_when_send_fails() {
     let mock = MockRpcServer::start().await;
-    let (state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
+    let (state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
 
     let txn_id: i64 = 7_002;
     let info = make_remint_info(txn_id);
@@ -727,128 +705,20 @@ async fn execute_deferred_remint_defers_when_send_fails() {
             panic!("a send failure must defer, not resolve terminally")
         }
     }
+    assert_eq!(
+        storage_mock
+            .remint_signatures
+            .lock()
+            .unwrap()
+            .get(&txn_id)
+            .map(|sigs| sigs.len())
+            .unwrap_or(0),
+        1,
+        "the attempt must be journaled before the send, so the next tick can classify it"
+    );
     assert!(
         storage_rx.try_recv().is_err(),
         "a deferred remint must not emit a status update"
-    );
-    mock.shutdown().await;
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// (g) Pre-broadcast remint failure gets a bounded retry, not immediate
-//     ManualReview.
-// ─────────────────────────────────────────────────────────────────────
-//
-// The release is finalized-failed, so the gate classifies it dead and
-// proceeds to remint. Source-chain blockhash retrieval then fails before
-// the transaction is signed or sent, so no remint could have landed and
-// retrying is safe. The first failure must not terminalize: the entry is
-// re-queued with a bumped attempt counter and its row stays PendingRemint,
-// the status startup recovery reloads, so it survives a restart. Escalation
-// to ManualReview only happens once the attempt cap is reached, see (h).
-#[tokio::test]
-async fn pre_broadcast_remint_failure_below_cap_defers() {
-    let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx, storage_mock) = build_state(mock.url()).await;
-
-    let txn_id: i64 = 94;
-    seed_pending_remint_row(&storage_mock, txn_id, 0);
-    state.pending_remints.push(make_pending_remint(
-        txn_id,
-        6,
-        vec![Signature::new_unique()],
-        0,
-        make_remint_info(txn_id),
-    ));
-
-    // Release sig finalized-failed, so classification is dead and the gate
-    // proceeds to the remint.
-    mock.enqueue("getSignatureStatuses", finalized_failed_status_reply());
-    // Blockhash retrieval fails: build_and_sign errors before any broadcast.
-    mock.enqueue_sequence("getLatestBlockhash", blockhash_rpc_errors());
-
-    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
-
-    // Nothing was broadcast, so no terminal status is emitted.
-    assert!(
-        storage_rx.try_recv().is_err(),
-        "a pre-broadcast failure below the cap must defer, not write a status"
-    );
-    // Re-queued in memory with the attempt counter bumped.
-    assert_eq!(state.pending_remints.len(), 1, "entry must be re-queued");
-    assert_eq!(
-        state.pending_remints[0].finality_check_attempts, 1,
-        "the deferral must bump the attempt counter"
-    );
-    // The row is still PendingRemint, so the restart sweep re-hydrates it.
-    let recoverable = storage_mock
-        .get_pending_remint_transactions()
-        .await
-        .unwrap();
-    assert!(
-        recoverable
-            .iter()
-            .any(|t| t.id == txn_id && t.status == TransactionStatus::PendingRemint),
-        "a pre-broadcast failure must leave the row recoverable across restarts"
-    );
-    assert_eq!(
-        mock.call_count("sendTransaction"),
-        0,
-        "no broadcast expected"
-    );
-    mock.shutdown().await;
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// (h) Pre-broadcast remint failure at the cap escalates to ManualReview.
-// ─────────────────────────────────────────────────────────────────────
-//
-// The bounded retry from (g) is not infinite. An entry already at
-// MAX_FINALITY_CHECK_ATTEMPTS - 1 that fails pre-broadcast again trips the
-// cap: it is dropped from the queue and a ManualReview status is emitted
-// carrying both the original withdrawal error and the escalation reason.
-#[tokio::test]
-async fn pre_broadcast_remint_failure_at_cap_escalates_to_manual_review() {
-    let mock = MockRpcServer::start().await;
-    let (mut state, mut storage_rx, storage_tx, _mock) = build_state(mock.url()).await;
-
-    let txn_id: i64 = 95;
-    state.pending_remints.push(make_pending_remint(
-        txn_id,
-        7,
-        vec![Signature::new_unique()],
-        2, // MAX_FINALITY_CHECK_ATTEMPTS - 1
-        make_remint_info(txn_id),
-    ));
-
-    mock.enqueue("getSignatureStatuses", finalized_failed_status_reply());
-    mock.enqueue_sequence("getLatestBlockhash", blockhash_rpc_errors());
-
-    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
-
-    let update = storage_rx
-        .recv()
-        .await
-        .expect("the cap must emit a ManualReview update");
-    assert_eq!(update.transaction_id, txn_id);
-    assert_eq!(update.status, TransactionStatus::ManualReview);
-    let msg = update.error_message.unwrap_or_default();
-    assert!(
-        msg.contains("escalated to ManualReview"),
-        "ManualReview at the cap must surface the escalation label; got {msg:?}"
-    );
-    assert!(
-        msg.contains("release_funds failed"),
-        "ManualReview must preserve the original withdrawal error; got {msg:?}"
-    );
-    assert!(
-        state.pending_remints.is_empty(),
-        "entry must not be re-queued past the cap"
-    );
-    assert_eq!(
-        mock.call_count("sendTransaction"),
-        0,
-        "no broadcast expected"
     );
     mock.shutdown().await;
 }

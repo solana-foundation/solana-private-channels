@@ -158,6 +158,7 @@ async fn test_pending_remint_persisted_and_recovered() -> Result<(), Box<dyn std
             vec![sig1.to_string(), sig2.to_string()],
             vec![lvbh_sig1, lvbh_sig2],
             deadline,
+            false,
         )
         .await?;
 
@@ -259,7 +260,7 @@ async fn test_resolved_remint_not_returned_by_recovery_query(
     // Insert and transition to PendingRemint.
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, 5_000).await?;
     storage
-        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline)
+        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline, false)
         .await?;
 
     // Confirm it shows up in recovery before resolution.
@@ -306,7 +307,7 @@ async fn test_failed_reminted_row_not_returned_by_recovery_query(
     // 1. Insert withdrawal and transition to PendingRemint.
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, 5_000).await?;
     storage
-        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline)
+        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline, false)
         .await?;
 
     // Confirm it appears in recovery before resolution.
@@ -376,7 +377,13 @@ async fn test_withdrawal_failure_remint_restores_balance() -> Result<(), Box<dyn
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, withdrawal_amount).await?;
     storage
-        .set_pending_remint(tx_id, vec![withdrawal_sig.to_string()], vec![0], deadline)
+        .set_pending_remint(
+            tx_id,
+            vec![withdrawal_sig.to_string()],
+            vec![0],
+            deadline,
+            false,
+        )
         .await?;
 
     // Step 3: while the row is in PendingRemint the balance must reflect the
@@ -473,6 +480,7 @@ async fn test_multiple_pending_remints_excluded_from_balance(
                 vec![Signature::new_unique().to_string()],
                 vec![0],
                 deadline,
+                false,
             )
             .await?;
     }
@@ -523,7 +531,7 @@ async fn test_manual_review_not_returned_by_recovery_query(
 
     let tx_id = insert_withdrawal(&pool, &mint, &recipient, 5_000).await?;
     storage
-        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline)
+        .set_pending_remint(tx_id, vec![sig.to_string()], vec![0], deadline, false)
         .await?;
 
     // Confirm it appears before resolution.

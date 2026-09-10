@@ -73,6 +73,7 @@ fn pending_deposit_row(id: i64, mint: Pubkey, recipient: Pubkey) -> DbTransactio
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     }
 }
 

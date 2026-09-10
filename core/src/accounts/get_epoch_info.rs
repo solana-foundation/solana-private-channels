@@ -21,12 +21,20 @@ pub async fn get_epoch_info(db: &AccountsDB) -> Result<EpochInfo> {
 async fn get_epoch_info_postgres(db: &PostgresAccountsDB) -> Result<EpochInfo> {
     let pool = db.pool.clone();
 
-    // Get the latest slot
-    let latest_slot = sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(slot) FROM blocks")
-        .fetch_one(pool.as_ref())
+    // Both read the same counters getSlot and getBlockHeight answer from, so the
+    // three RPCs can never disagree about the tip.
+    let handle = AccountsDB::Postgres(db.clone());
+    let latest_slot = super::current_slot::get_current_slot(&handle)
         .await
         .context("Failed to query latest slot")?
-        .context("No blocks found in database")? as u64;
+        .context("No blocks found in database")?;
+
+    // Blocks are sparse relative to slots, so the height is its own counter.
+    // No stored block means no blocks produced, which is a height of zero.
+    let block_height = super::get_block_height::get_block_height(&handle)
+        .await
+        .context("Failed to query block height")?
+        .unwrap_or(0);
 
     // Get transaction count (optional)
     let transaction_count = sqlx::query_scalar::<_, Vec<u8>>(
@@ -42,7 +50,7 @@ async fn get_epoch_info_postgres(db: &PostgresAccountsDB) -> Result<EpochInfo> {
 
     Ok(EpochInfo {
         absolute_slot: latest_slot,
-        block_height: latest_slot,
+        block_height,
         epoch: EPOCH,
         slot_index: latest_slot,
         slots_in_epoch: SLOTS_IN_EPOCH,

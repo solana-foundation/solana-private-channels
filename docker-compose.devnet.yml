@@ -255,6 +255,13 @@ services:
     container_name: private-channel-auth
     restart: unless-stopped
     logging: *default-logging
+    # Must stay above AUTH_MAX_CONNECTIONS plus the DB pool, or accept() hits
+    # EMFILE before the connection cap engages and the listener stalls instead
+    # of shedding.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -269,6 +276,12 @@ services:
       - AUTH_RATE_LIMIT_PER_SECOND=${AUTH_RATE_LIMIT_PER_SECOND:-5}
       - AUTH_RATE_LIMIT_BURST=${AUTH_RATE_LIMIT_BURST:-10}
       - AUTH_USERNAME_ATTEMPTS_PER_MINUTE=${AUTH_USERNAME_ATTEMPTS_PER_MINUTE:-5}
+      - AUTH_MAX_CONNECTIONS=${AUTH_MAX_CONNECTIONS:-1024}
+      - AUTH_MAX_CONNECTIONS_PER_IP=${AUTH_MAX_CONNECTIONS_PER_IP:-64}
+      - AUTH_HEADER_READ_TIMEOUT_SECS=${AUTH_HEADER_READ_TIMEOUT_SECS:-10}
+      - AUTH_REQUEST_TIMEOUT_SECS=${AUTH_REQUEST_TIMEOUT_SECS:-15}
+      - AUTH_TCP_KEEPALIVE_IDLE_SECS=${AUTH_TCP_KEEPALIVE_IDLE_SECS:-60}
+      - AUTH_TCP_KEEPALIVE_INTERVAL_SECS=${AUTH_TCP_KEEPALIVE_INTERVAL_SECS:-15}
     ports:
       - "${AUTH_PORT}:${AUTH_PORT}"
     command: ["/usr/local/bin/auth"]
@@ -606,6 +619,8 @@ services:
       - HOST_SUFFIX=
       - BENCH_METRICS_TARGET=${BENCH_METRICS_TARGET:-host.docker.internal:9101}
       - PRIVATE_CHANNEL_METRICS_PORT=${PRIVATE_CHANNEL_METRICS_PORT:-9090}
+      # devnet runs no streamer; without this the baked config probes it forever
+      - PROBE_STREAMER=false
     networks:
       - private-channel-network
     healthcheck:
@@ -644,6 +659,10 @@ services:
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
       - ALERT_CONTACT_TYPE=${ALERT_CONTACT_TYPE:-webhook}
+      # External URL for Grafana-generated links (alert notifications, shares).
+      # Without it Grafana emits localhost links. Set GRAFANA_ROOT_URL to the
+      # reachable Grafana address for the deployment.
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
     networks:
       - private-channel-network
     healthcheck:

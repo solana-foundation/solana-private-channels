@@ -70,6 +70,11 @@ services:
       # alert_contact_type (e.g. slack) + alert_webhook_url to enable alerting.
       - ALERT_WEBHOOK_URL={{ alert_webhook_url | default('http://localhost:9/no-op') }}
       - ALERT_CONTACT_TYPE={{ alert_contact_type | default('webhook') }}
+      # External URL Grafana uses when generating links (alert notifications,
+      # share links). Without it Grafana emits localhost links that are useless
+      # from Slack. Set grafana_root_url to the box's reachable Grafana address,
+      # e.g. http://<external-ip>:{{ monitoring_grafana_port }}.
+      - GF_SERVER_ROOT_URL={{ grafana_root_url | default('http://localhost:3000') }}
       # Postgres datasource (for the Postgres dashboard's direct-DB queries).
       - POSTGRES_INDEXER_HOST=postgres-indexer
       - POSTGRES_INDEXER_DB={{ postgres_indexer_db }}

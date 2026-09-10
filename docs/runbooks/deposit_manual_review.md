@@ -10,7 +10,7 @@ Deposits never halt the pipeline. The processor's classifier
 side, but the deposit loop continues after each quarantine
 (`process_deposit_funds`, `processor.rs:704-722` - note the absence of
 `halt_withdrawal_pipeline` and the loop `continue` semantics). There is
-no SMT, no nonce, no remint.
+no nonce, no remint.
 
 Practically: a single deposit `manual_review` is a single row in trouble.
 Other deposits keep flowing. There is no collateral, no sweep, no halt to

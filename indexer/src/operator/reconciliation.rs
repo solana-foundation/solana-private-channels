@@ -425,7 +425,8 @@ async fn trip_halt(
     if let Err(e) = storage.set_reconciliation_halt(reason).await {
         error!("Failed to set durable reconciliation halt flag: {}", e);
     }
-    match storage.quarantine_all_active_withdrawals(None).await {
+    // Unbounded on purpose: an insolvency halt is not nonce-scoped.
+    match storage.quarantine_active_withdrawals(None, None).await {
         Ok(n) => info!(rows = n, "Quarantined active withdrawals on halt"),
         Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
     }
@@ -887,6 +888,7 @@ mod tests {
                 instruction_index: 0,
                 inner_index: None,
                 landed_remint_signature: None,
+                release_refused_on_chain: false,
             });
     }
 
@@ -1936,6 +1938,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         });
         id
     }

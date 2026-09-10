@@ -5,6 +5,7 @@ use {
         rpc::{
             error::{read_not_enabled, write_not_enabled},
             get_account_info_impl::get_account_info_impl,
+            get_block_height_impl::get_block_height_impl,
             get_block_impl::get_block_impl,
             get_block_time_impl::get_block_time_impl,
             get_blocks_impl::get_blocks_impl,
@@ -113,10 +114,9 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
         get_slot_impl(read_deps, _config).await
     }
 
-    // Block height equals slot here, so this reads the slot and cannot drift from getSlot.
     async fn get_block_height(&self, _config: Option<RpcContextConfig>) -> RpcResult<u64> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
-        get_slot_impl(read_deps, _config).await
+        get_block_height_impl(read_deps, _config).await
     }
 
     async fn get_block(

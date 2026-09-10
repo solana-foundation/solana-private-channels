@@ -11,6 +11,10 @@
 **/generated/
 **/escrow-generated/
 **/withdraw-generated/
+# The DvP swap client is vendored from solana-foundation/dvp (generated snapshot,
+# not regenerated in-tree), so its generated code is committed here.
+!/dvp-swap-program/clients/rust/src/generated/
+!/dvp-swap-program/clients/rust/src/generated/**
 
 # Javascript / Typescript
 **/node_modules/
