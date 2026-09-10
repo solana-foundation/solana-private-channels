@@ -6,11 +6,11 @@ use {
             redis::{RedisAccountsDB, CACHE_FAILURE_LIMIT},
             redis_coherence,
             traits::BlockInfo,
-            write_batch::AddressSignatureRow,
             AccountsDB,
         },
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
+        stages::{AddressSignatureBatch, WeightBudget, MAX_QUEUED_ADDRESS_ROWS},
     },
     anyhow::{anyhow, Context, Result},
     redis::AsyncCommands,
@@ -32,7 +32,10 @@ use {
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
-    tokio::{sync::mpsc, time::Instant},
+    tokio::{
+        sync::{mpsc, OwnedSemaphorePermit},
+        time::Instant,
+    },
     tokio_util::sync::CancellationToken,
     tracing::{debug, error, info, warn},
 };
@@ -146,13 +149,16 @@ pub struct AccountSettlement {
     pub deleted: bool,
 }
 
-/// One executed batch on its way from the executor to the settler. The third
-/// element is the executor's generation for the account writes in this batch.
-pub type ExecutedBatch = (
-    LoadAndExecuteSanitizedTransactionsOutput,
-    Vec<SanitizedTransaction>,
-    u64,
-);
+/// One executed batch on its way from the executor to the settler.
+pub struct ExecutedBatch {
+    pub output: LoadAndExecuteSanitizedTransactionsOutput,
+    pub transactions: Vec<SanitizedTransaction>,
+    /// The executor's generation for the account writes in this batch.
+    pub generation: u64,
+    /// The executor's in-flight byte budget for this batch. Nothing reads it:
+    /// dropping it wherever this message ends is what returns the bytes.
+    pub permit: OwnedSemaphorePermit,
+}
 
 /// Settlement acknowledgement sent back to BOB after a commit.
 ///
@@ -219,9 +225,13 @@ struct BlockPublishers<'a> {
     /// Advances the dedup window. Until dedup holds the hash, transactions
     /// built on it are dropped.
     blockhashes: &'a mpsc::UnboundedSender<Hash>,
-    /// Acks the commit to BOB, which unpins the settled accounts.
+    /// Acks the commit to BOB, which unpins the settled accounts. Unbounded on
+    /// purpose: BOB drains only while the executor runs and the executor runs
+    /// only while the settler drains, so a blocking send here would deadlock.
     accounts: &'a mpsc::UnboundedSender<AccountSettlements>,
-    address_signatures: &'a mpsc::Sender<Vec<AddressSignatureRow>>,
+    address_signatures: &'a mpsc::Sender<AddressSignatureBatch>,
+    /// Rows queued to the writer but not yet folded into a flush.
+    rows_budget: &'a WeightBudget,
 }
 
 #[derive(Debug)]
@@ -335,7 +345,7 @@ pub struct SettleArgs {
     pub settled_accounts_tx: mpsc::UnboundedSender<AccountSettlements>,
     pub settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
     /// Bounded channel to the background `address_index_writer`.
-    pub address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
+    pub address_signatures_tx: mpsc::Sender<AddressSignatureBatch>,
     pub accountsdb_connection_url: String,
     /// The cache the read path also attaches to. One knob for both, so a writer
     /// cannot stop mirroring a cache that readers still trust.
@@ -375,7 +385,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             mut execution_results_rx: mpsc::Receiver<ExecutedBatch>,
             settled_accounts_tx: mpsc::UnboundedSender<AccountSettlements>,
             settled_blockhashes_tx: mpsc::UnboundedSender<Hash>,
-            address_signatures_tx: mpsc::Sender<Vec<AddressSignatureRow>>,
+            address_signatures_tx: mpsc::Sender<AddressSignatureBatch>,
             accountsdb_connection_url: String,
             redis_cache_url: Option<String>,
             redis_block_ttl_secs: u64,
@@ -387,6 +397,9 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             heartbeat: Arc<crate::health::StageHeartbeat>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
+
+            // Stage-private: nothing outside the settler takes from this budget.
+            let rows_budget = WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS);
 
             let mut accounts_db = AccountsDB::new(&accountsdb_connection_url, false)
                 .await
@@ -631,6 +644,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                 blockhashes: &settled_blockhashes_tx,
                                 accounts: &settled_accounts_tx,
                                 address_signatures: &address_signatures_tx,
+                                rows_budget: &rows_budget,
                             }),
                             highest_generation,
                             &heartbeat,
@@ -747,7 +761,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     result = execution_results_rx.recv(),
                         if buffered_account_bytes < MAX_BUFFERED_SETTLE_BYTES => {
                         match result {
-                            Some((svm_output, transactions, generation)) => {
+                            Some(ExecutedBatch { output: svm_output, transactions, generation, .. }) => {
                                 heartbeat.record_input();
                                 debug!("Settle worker received output with {} transactions", transactions.len());
                                 if svm_output.processing_results.len() != transactions.len() {
@@ -793,6 +807,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         blockhashes: &settled_blockhashes_tx,
                         accounts: &settled_accounts_tx,
                         address_signatures: &address_signatures_tx,
+                        rows_budget: &rows_budget,
                     }),
                     highest_generation,
                     &heartbeat,
@@ -895,12 +910,13 @@ fn discard_buffer(
     // so a snapshot lets a batch land behind the record and die with the
     // receiver. Closing refuses it instead, and the executor records its own.
     execution_results_rx.close();
-    while let Ok((svm_output, transactions, _generation)) = execution_results_rx.try_recv() {
+    while let Ok(batch) = execution_results_rx.try_recv() {
         processing_results.extend(
-            svm_output
+            batch
+                .output
                 .processing_results
                 .into_iter()
-                .zip(transactions.into_iter()),
+                .zip(batch.transactions),
         );
     }
 
@@ -1230,10 +1246,22 @@ async fn settle_transactions(
             publisher_gone = true;
         }
 
-        // Closed channel = writer gone; escalate to exit.
+        // Closed channel = writer gone; escalate to exit. The budget wait is
+        // inside the timing window so a park on rows reads like a park on depth.
         if !addr_sig_rows.is_empty() {
             let send_t0 = tokio::time::Instant::now();
-            match publishers.address_signatures.send(addr_sig_rows).await {
+            let Some(permit) = publishers
+                .rows_budget
+                .acquire(addr_sig_rows.len(), publishers.address_signatures)
+                .await
+            else {
+                return Err(SettleError::AddressIndexWriterGone);
+            };
+            let batch = AddressSignatureBatch {
+                rows: addr_sig_rows,
+                permit,
+            };
+            match publishers.address_signatures.send(batch).await {
                 Ok(()) => {
                     metrics.address_signatures_send_blocked_ms(
                         send_t0.elapsed().as_secs_f64() * 1000.0,
@@ -1517,6 +1545,7 @@ mod tests {
     use super::*;
 
     use crate::{
+        accounts::write_batch::AddressSignatureRow,
         stage_metrics::{NoopMetrics, SharedMetrics},
         test_helpers::{
             create_test_sanitized_transaction, postgres_container_url, start_test_postgres,
@@ -1567,6 +1596,7 @@ mod tests {
                 blockhashes: &blockhashes_tx,
                 accounts: &accounts_tx,
                 address_signatures: &address_signatures_tx,
+                rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
             }),
             0,
             settle_now(),
@@ -1629,6 +1659,29 @@ mod tests {
 
     fn sig(byte: u8) -> Signature {
         Signature::from([byte; 64])
+    }
+
+    /// Wrap an executor output in the queued message shape, with a permit from
+    /// a throwaway budget so tests not about the budget need not build one.
+    fn batch_of(
+        output: LoadAndExecuteSanitizedTransactionsOutput,
+        transactions: Vec<SanitizedTransaction>,
+        generation: u64,
+    ) -> ExecutedBatch {
+        ExecutedBatch {
+            output,
+            transactions,
+            generation,
+            permit: crate::stages::test_permit(),
+        }
+    }
+
+    /// The same for a block's address-index rows.
+    fn rows_msg(rows: Vec<AddressSignatureRow>) -> AddressSignatureBatch {
+        AddressSignatureBatch {
+            rows,
+            permit: crate::stages::test_permit(),
+        }
     }
 
     /// One batch whose single writable account carries `bytes` of data.
@@ -1714,7 +1767,7 @@ mod tests {
     /// Unread receivers held alive; dropping the address-index one is fatal.
     struct SettlerSinks {
         _blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
-        _address_signatures_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
+        _address_signatures_rx: mpsc::Receiver<AddressSignatureBatch>,
     }
 
     /// Settler on a throwaway Postgres, with the channels the assertions read.
@@ -1835,6 +1888,55 @@ mod tests {
         false
     }
 
+    /// The premise the in-flight budget rests on: the settler never holds a
+    /// permit outside the queue, so receiving a batch is what returns its bytes
+    /// to the executor, whatever the settler goes on to do with the batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_settler_returns_the_in_flight_budget_on_receive() {
+        let (_db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, mut settled_rx, _h, _sinks, _hb) =
+            settler_under_test(url, 50, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
+
+        let budget = WeightBudget::new(1);
+        let permit = budget
+            .acquire(1, &exec_tx)
+            .await
+            .expect("a fresh budget hands out its only permit");
+        let (output, transactions) = sized_settle_batch(1024);
+        exec_tx
+            .send(ExecutedBatch {
+                output,
+                transactions,
+                generation: 1,
+                permit,
+            })
+            .await
+            .unwrap();
+
+        // Idle ticks also broadcast, so wait for the one carrying our accounts:
+        // that settlement is proof the batch was received and not merely queued.
+        let settled = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let settlement = settled_rx.recv().await.expect("settler still running");
+                if !settlement.accounts.is_empty() {
+                    return settlement;
+                }
+            }
+        })
+        .await
+        .expect("the sent batch must settle");
+        assert_eq!(settled.accounts.len(), 2, "both writable accounts settled");
+        assert_eq!(
+            budget.available(),
+            1,
+            "the received batch returned its weight"
+        );
+        shutdown.cancel();
+    }
+
     /// The finding itself: unguarded, the settler drains forever and one tick can
     /// bind an unbounded array. Guarded, the channel backs up and parks the
     /// executor instead, so a full channel here means the fix is working.
@@ -1853,7 +1955,7 @@ mod tests {
         let mut blocked = false;
         for _ in 0..64 {
             let (output, txs) = sized_settle_batch(batch_bytes);
-            match exec_tx.try_send((output, txs, 1)) {
+            match exec_tx.try_send(batch_of(output, txs, 1)) {
                 Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     blocked = true;
@@ -1883,9 +1985,12 @@ mod tests {
         let mut delivered = 0;
         for _ in 0..12 {
             let (output, txs) = sized_settle_batch(batch_bytes);
-            if tokio::time::timeout(Duration::from_secs(10), exec_tx.send((output, txs, 1)))
-                .await
-                .is_ok()
+            if tokio::time::timeout(
+                Duration::from_secs(10),
+                exec_tx.send(batch_of(output, txs, 1)),
+            )
+            .await
+            .is_ok()
             {
                 delivered += 1;
             }
@@ -1927,7 +2032,7 @@ mod tests {
         let feeder = tokio::spawn(async move {
             for _ in 0..16 {
                 let (output, txs) = sized_settle_batch(batch_bytes);
-                if exec_tx.send((output, txs, 1)).await.is_err() {
+                if exec_tx.send(batch_of(output, txs, 1)).await.is_err() {
                     break;
                 }
             }
@@ -1973,7 +2078,7 @@ mod tests {
         let mut blocked = false;
         for _ in 0..64 {
             let (output, txs) = failed_sized_settle_batch(batch_bytes);
-            match exec_tx.try_send((output, txs, 1)) {
+            match exec_tx.try_send(batch_of(output, txs, 1)) {
                 Ok(()) => tokio::time::sleep(Duration::from_millis(20)).await,
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     blocked = true;
@@ -2008,7 +2113,7 @@ mod tests {
 
         for _ in 0..20 {
             let (output, txs) = sized_settle_batch(128);
-            exec_tx.send((output, txs, 1)).await.unwrap();
+            exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         }
         let settled = tokio::time::timeout(Duration::from_secs(10), settled_rx.recv()).await;
         assert!(settled.is_ok(), "ordinary traffic must settle");
@@ -2035,11 +2140,11 @@ mod tests {
 
         // Generation 1 saturates the buffer on its own.
         let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES + 4096);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         // Generation 2 cannot be drained while the guard is shut.
         let (output2, txs2) = sized_settle_batch(4096);
-        let _ = exec_tx.try_send((output2, txs2, 2));
+        let _ = exec_tx.try_send(batch_of(output2, txs2, 2));
 
         let settlements = tokio::time::timeout(Duration::from_secs(10), settled_rx.recv())
             .await
@@ -2087,7 +2192,7 @@ mod tests {
         let feeder = tokio::spawn(async move {
             loop {
                 let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES / 2);
-                if exec_tx.send((output, txs, 1)).await.is_err() {
+                if exec_tx.send(batch_of(output, txs, 1)).await.is_err() {
                     break;
                 }
             }
@@ -2120,7 +2225,7 @@ mod tests {
             settler_under_test(url, 60_000, 1, Arc::new(NoopMetrics), shutdown.clone()).await;
 
         let (output, txs) = sized_settle_batch(MAX_BUFFERED_SETTLE_BYTES + 4096);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         drop(exec_tx);
@@ -2147,7 +2252,7 @@ mod tests {
         let tip = block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(600)).await;
         unblock_slots(&pool).await;
@@ -2178,7 +2283,7 @@ mod tests {
         let tip = block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         // Held long enough that a timestamp sampled at the winning attempt
         // would be several seconds later than one pinned at the first.
@@ -2263,7 +2368,7 @@ mod tests {
         block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         // Past the stage progress margin, so a frozen verdict would still read healthy.
         tokio::time::sleep(Duration::from_secs(8)).await;
@@ -2292,7 +2397,7 @@ mod tests {
         block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         let t0 = tokio::time::Instant::now();
@@ -2332,7 +2437,7 @@ mod tests {
             .expect("lock blocks");
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         let t0 = tokio::time::Instant::now();
         let exited = tokio::time::timeout(Duration::from_secs(60), handle.handle).await;
@@ -2368,7 +2473,7 @@ mod tests {
         let tip = block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Cancel while it is retrying, then let the failure clear well inside
@@ -2412,7 +2517,7 @@ mod tests {
         block_slots_above_tip(&pool).await;
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         let t0 = tokio::time::Instant::now();
@@ -2449,7 +2554,7 @@ mod tests {
             .expect("lock blocks");
 
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         // Long enough that an attempt is in flight, short enough that its own
         // timeout has not fired.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2478,12 +2583,12 @@ mod tests {
         // Capacity one, so the second sender parks exactly as the executor does.
         let (tx, mut rx) = mpsc::channel::<ExecutedBatch>(1);
         let (output, txs) = sized_settle_batch(1024);
-        tx.send((output, txs, 1)).await.unwrap();
+        tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         let parked_tx = tx.clone();
         let parked = tokio::spawn(async move {
             let (output, txs) = sized_settle_batch(1024);
-            parked_tx.send((output, txs, 2)).await.is_ok()
+            parked_tx.send(batch_of(output, txs, 2)).await.is_ok()
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2501,7 +2606,7 @@ mod tests {
 
         let (output, txs) = sized_settle_batch(1024);
         assert!(
-            tx.send((output, txs, 3)).await.is_err(),
+            tx.send(batch_of(output, txs, 3)).await.is_err(),
             "the queue must be closed once the buffer is discarded, not merely emptied"
         );
     }
@@ -2528,12 +2633,12 @@ mod tests {
 
         // Buffered before the tick that fails.
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
 
         // Queued while the settler is retrying and therefore not draining.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let (output, txs) = sized_settle_batch(1024);
-        exec_tx.send((output, txs, 2)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 2)).await.unwrap();
 
         let exited = tokio::time::timeout(Duration::from_secs(40), handle.handle).await;
         assert!(
@@ -2593,7 +2698,7 @@ mod tests {
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
         for _ in 0..4 {
             let (output, txs) = sized_settle_batch(1024);
-            exec_tx.send((output, txs, 1)).await.unwrap();
+            exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3591,7 +3696,7 @@ mod tests {
         // commit it rather than the stage exiting on the signal and dropping it.
         let (output, txs) = sized_settle_batch(1024);
         let landed = *txs[0].signature();
-        exec_tx.send((output, txs, 1)).await.unwrap();
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
         drop(exec_tx);
 
         let result = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
@@ -3649,7 +3754,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx], 1)).await.unwrap();
+        exec_tx.send(batch_of(output, vec![tx], 1)).await.unwrap();
 
         // Wait for the blocktime tick to process and emit settlements
         let settlements =
@@ -3703,7 +3808,10 @@ mod tests {
         // Buffered well before the first tick, which waits out the start delay,
         // so the tick that finds dedup gone has a batch to commit.
         let (output, transactions) = one_account_batch();
-        exec_tx.send((output, transactions, 1)).await.unwrap();
+        exec_tx
+            .send(batch_of(output, transactions, 1))
+            .await
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(10), worker.handle)
             .await
@@ -3791,7 +3899,10 @@ mod tests {
         .await;
 
         let (output, transactions) = one_account_batch();
-        exec_tx.send((output, transactions, 7)).await.unwrap();
+        exec_tx
+            .send(batch_of(output, transactions, 7))
+            .await
+            .unwrap();
 
         let settlements = recv_nonempty_settlements(&mut settled_accounts_rx).await;
         assert_eq!(
@@ -3833,9 +3944,15 @@ mod tests {
         .await;
 
         let (output_a, transactions_a) = one_account_batch();
-        exec_tx.send((output_a, transactions_a, 9)).await.unwrap();
+        exec_tx
+            .send(batch_of(output_a, transactions_a, 9))
+            .await
+            .unwrap();
         let (output_b, transactions_b) = one_account_batch();
-        exec_tx.send((output_b, transactions_b, 7)).await.unwrap();
+        exec_tx
+            .send(batch_of(output_b, transactions_b, 7))
+            .await
+            .unwrap();
 
         let settlements = recv_nonempty_settlements(&mut settled_accounts_rx).await;
         assert_eq!(
@@ -4840,6 +4957,7 @@ mod tests {
                     blockhashes: &blockhashes_tx,
                     accounts: &accounts_tx,
                     address_signatures: &address_signatures_tx,
+                    rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
                 }),
                 0,
                 settle_now(),
@@ -4931,6 +5049,7 @@ mod tests {
                     blockhashes: &blockhashes_tx,
                     accounts: &accounts_tx,
                     address_signatures: &address_signatures_tx,
+                    rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
                 }),
                 generation,
                 settle_now(),
@@ -6064,7 +6183,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx], 1)).await.unwrap();
+        exec_tx.send(batch_of(output, vec![tx], 1)).await.unwrap();
 
         // Poll for perf sample with deadline instead of fixed sleep.
         // Perf tick fires after ~1s; poll every 100ms for up to 5s.
@@ -6131,7 +6250,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        exec_tx.send((output, vec![tx], 1)).await.unwrap();
+        exec_tx.send(batch_of(output, vec![tx], 1)).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
         assert!(
@@ -6156,6 +6275,128 @@ mod tests {
         vec![(Ok(processed), tx)]
     }
 
+    /// Rows, not messages, are what the settler waits on. A block whose rows
+    /// exceed the whole budget still passes, taking all of it, and the writer
+    /// hands the rows back by taking the message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_takes_its_rows_from_the_row_budget() {
+        let (db, _pg) = start_test_postgres().await;
+        let mut db = db;
+
+        // One row per account key, so three against a budget of two.
+        let budget = WeightBudget::new(2);
+        let (addr_sig_tx, mut addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(4);
+        let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+
+        let results = single_successful_transfer();
+        let last = LastBlock {
+            slot: 5,
+            blockhash: Hash::new_unique(),
+            block_height: 5,
+        };
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let result = settle_transactions(
+            last.slot + 1,
+            Some(last),
+            &mut db,
+            None,
+            &results,
+            &metrics,
+            Some(BlockPublishers {
+                blockhashes: &settled_blockhashes_tx,
+                accounts: &settled_accounts_tx,
+                address_signatures: &addr_sig_tx,
+                rows_budget: &budget,
+            }),
+            0,
+            settle_now(),
+            SETTLE_ATTEMPT_TIMEOUT,
+        )
+        .await;
+
+        assert!(result.is_ok(), "a block over the budget must still pass");
+        assert_eq!(budget.available(), 0, "an oversized block takes all of it");
+
+        let queued = addr_sig_rx.recv().await.expect("rows queued");
+        assert_eq!(queued.rows.len(), 3, "every account key is indexed");
+        drop(queued);
+        assert_eq!(budget.available(), 2, "taking the message returns the rows");
+    }
+
+    /// The row budget parks the settler even with queue slots to spare, and
+    /// only the writer taking a batch lets it go on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spent_row_budget_parks_the_settler_until_a_batch_is_taken() {
+        let (db, _pg) = start_test_postgres().await;
+        let mut db = db;
+
+        // Slots to spare: the budget, held by the queued batch, is the limit.
+        let (addr_sig_tx, mut addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(4);
+        let results = single_successful_transfer();
+        let last = LastBlock {
+            slot: 5,
+            blockhash: Hash::new_unique(),
+            block_height: 5,
+        };
+
+        let task = tokio::spawn(async move {
+            let budget = WeightBudget::new(1);
+            let permit = budget.acquire(1, &addr_sig_tx).await.expect("permit");
+            addr_sig_tx
+                .send(AddressSignatureBatch {
+                    rows: Vec::new(),
+                    permit,
+                })
+                .await
+                .unwrap();
+
+            let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
+            let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::unbounded_channel();
+            let metrics: SharedMetrics = Arc::new(NoopMetrics);
+            let r = settle_transactions(
+                last.slot + 1,
+                Some(last),
+                &mut db,
+                None,
+                &results,
+                &metrics,
+                Some(BlockPublishers {
+                    blockhashes: &settled_blockhashes_tx,
+                    accounts: &settled_accounts_tx,
+                    address_signatures: &addr_sig_tx,
+                    rows_budget: &budget,
+                }),
+                0,
+                settle_now(),
+                SETTLE_ATTEMPT_TIMEOUT,
+            )
+            .await;
+            (r, db)
+        });
+
+        // The prefill holds the only permit, so the block cannot hand over.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !task.is_finished(),
+            "the settler must wait on the row budget"
+        );
+        assert_eq!(addr_sig_rx.len(), 1, "queue depth was never the limit");
+
+        drop(addr_sig_rx.recv().await.expect("prefill"));
+        let rows = tokio::time::timeout(Duration::from_secs(5), addr_sig_rx.recv())
+            .await
+            .expect("the freed rows must unpark the settler")
+            .expect("addr-index channel open");
+        assert_eq!(rows.rows.len(), 3);
+
+        let (result, _db) = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("settle task completes")
+            .expect("settle task joins");
+        assert!(result.is_ok(), "settle returns Ok once the rows are taken");
+    }
+
     /// The regression test. A blocked-yet-open address-index send must NOT
     /// gate the admission broadcasts: both the settled accounts and the new
     /// blockhash have to reach their consumers while the settler is still parked
@@ -6167,8 +6408,8 @@ mod tests {
         let mut db = db;
 
         // capacity-1 channel pre-filled so the in-function send blocks.
-        let (addr_sig_tx, mut addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
-        addr_sig_tx.send(Vec::new()).await.unwrap();
+        let (addr_sig_tx, mut addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(1);
+        addr_sig_tx.send(rows_msg(Vec::new())).await.unwrap();
 
         let (settled_accounts_tx, mut settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
@@ -6194,6 +6435,7 @@ mod tests {
                     blockhashes: &settled_blockhashes_tx,
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
+                    rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
                 }),
                 0,
                 settle_now(),
@@ -6241,7 +6483,7 @@ mod tests {
     async fn broadcasts_with_empty_address_signatures() {
         let (mut db, _pg) = start_test_postgres().await;
 
-        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
+        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(1);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
 
@@ -6261,6 +6503,7 @@ mod tests {
                 blockhashes: &settled_blockhashes_tx,
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
+                rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
             }),
             0,
             settle_now(),
@@ -6284,7 +6527,7 @@ mod tests {
 
         let (settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel();
-        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
+        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(1);
         // Drop both consumers before calling.
         drop(settled_accounts_rx);
         drop(settled_blockhashes_rx);
@@ -6301,6 +6544,7 @@ mod tests {
                 blockhashes: &settled_blockhashes_tx,
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
+                rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
             }),
             0,
             settle_now(),
@@ -6330,7 +6574,7 @@ mod tests {
 
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
-        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
+        let (addr_sig_tx, _addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(1);
 
         settle_transactions(
             0,
@@ -6343,6 +6587,7 @@ mod tests {
                 blockhashes: &settled_blockhashes_tx,
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
+                rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
             }),
             0,
             settle_now(),
@@ -6366,7 +6611,7 @@ mod tests {
     /// empty blocks (no rows) pass through untouched.
     struct WiredPipeline {
         exec_tx: mpsc::Sender<ExecutedBatch>,
-        addr_sig_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
+        addr_sig_rx: mpsc::Receiver<AddressSignatureBatch>,
         live_blockhashes: Arc<std::sync::RwLock<std::collections::LinkedList<Hash>>>,
         shutdown: CancellationToken,
         _settle: WorkerHandle,
@@ -6387,8 +6632,11 @@ mod tests {
         let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, settled_blockhashes_rx) = mpsc::unbounded_channel();
-        let (address_signatures_tx, addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(1);
-        address_signatures_tx.send(Vec::new()).await.unwrap();
+        let (address_signatures_tx, addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(1);
+        address_signatures_tx
+            .send(rows_msg(Vec::new()))
+            .await
+            .unwrap();
 
         let shutdown = CancellationToken::new();
         let _settle = start_settle_worker(SettleArgs {
@@ -6479,7 +6727,7 @@ mod tests {
         let (_exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_accounts_tx, _settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, mut settled_blockhashes_rx) = mpsc::unbounded_channel();
-        let (address_signatures_tx, _addr_sig_rx) = mpsc::channel::<Vec<AddressSignatureRow>>(64);
+        let (address_signatures_tx, _addr_sig_rx) = mpsc::channel::<AddressSignatureBatch>(64);
 
         let shutdown = CancellationToken::new();
         let _settle = start_settle_worker(SettleArgs {
@@ -6678,7 +6926,7 @@ mod tests {
             execute_timings: Default::default(),
             balance_collector: None,
         };
-        p.exec_tx.send((output, vec![tx], 1)).await.unwrap();
+        p.exec_tx.send(batch_of(output, vec![tx], 1)).await.unwrap();
 
         wait_for_window(
             &p.live_blockhashes,
