@@ -485,9 +485,13 @@ impl ResyncService {
                 // Both writers are stopped outright rather than drained. Closing the
                 // checkpoint channel is the writer's cue to flush what it has, which
                 // would commit a durable frontier over a database this run only half
-                // rebuilt and leave no gap for a later run to detect.
-                processor_abort.abort();
-                checkpoint_abort.abort();
+                // rebuilt and leave no gap for a later run to detect. Waited on, because
+                // returning frees the lock and an aborted write can still be in flight.
+                crate::shutdown_utils::abort_and_await_writers(&[
+                    processor_abort,
+                    checkpoint_abort,
+                ])
+                .await;
                 return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
             }
             result = rebuild => result?,

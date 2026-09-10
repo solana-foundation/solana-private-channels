@@ -452,9 +452,10 @@ async fn run_backfill_only(
             error!("Live-state lock lost during the backfill; stopping it");
             // Stopped outright rather than drained. Closing the checkpoint channel is the
             // writer's cue to flush what it has, which is exactly the write that must not
-            // land on a database being rebuilt underneath us.
-            processor_abort.abort();
-            checkpoint_abort.abort();
+            // land on a database being rebuilt underneath us. Waited on, because returning
+            // frees the lock and an aborted write can still be in flight.
+            crate::shutdown_utils::abort_and_await_writers(&[processor_abort, checkpoint_abort])
+                .await;
             Err(IndexerError::Storage(StorageError::LiveStateLockLost))
         }
         result = run_fill => result,
@@ -829,8 +830,11 @@ pub async fn run(
                 biased;
                 _ = live_lock_lost.cancelled() => {
                     error!("Live-state lock lost during the startup fill; stopping without draining");
-                    processor_handle.abort();
-                    checkpoint_handle.abort();
+                    crate::shutdown_utils::abort_and_await_writers(&[
+                        processor_handle.abort_handle(),
+                        checkpoint_handle.abort_handle(),
+                    ])
+                    .await;
                     return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
                 }
                 result = startup_fill => result?,
@@ -1053,8 +1057,11 @@ pub async fn run(
             if reason == StopReason::LiveLockLost {
                 error!("Live-state lock lost; stopping without draining");
                 cancellation_token.cancel();
-                processor_handle.abort();
-                checkpoint_handle.abort();
+                crate::shutdown_utils::abort_and_await_writers(&[
+                    processor_handle.abort_handle(),
+                    checkpoint_handle.abort_handle(),
+                ])
+                .await;
                 return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
             }
 

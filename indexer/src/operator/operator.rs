@@ -408,7 +408,8 @@ pub async fn run(
                             reconciliation_handle.abort_handle(),
                             feepayer_monitor_handle.abort_handle(),
                         ],
-                    );
+                    )
+                    .await;
                     return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
                 }
                 StopReason::Interrupted => {
@@ -448,7 +449,8 @@ pub async fn run(
                 reconciliation_handle.abort_handle(),
                 feepayer_monitor_handle.abort_handle(),
             ],
-        );
+        )
+        .await;
         return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
     }
 
@@ -627,12 +629,13 @@ async fn validate_withdraw_fallback(
 /// Nothing may drain: Postgres frees the lock the instant our session dies, so a resync may
 /// already be dropping the tables these tasks broadcast and write into. Costs no more than
 /// an abrupt kill, which the recovery worker already handles.
-fn stop_without_draining(cancellation_token: &CancellationToken, workers: &[AbortHandle]) {
+///
+/// Waits for the workers to stop rather than only asking, since returning is what lets the
+/// lock go and an aborted task can still have a write in flight.
+async fn stop_without_draining(cancellation_token: &CancellationToken, workers: &[AbortHandle]) {
     error!("Live-state lock lost; stopping without draining");
     cancellation_token.cancel();
-    for worker in workers {
-        worker.abort();
-    }
+    crate::shutdown_utils::abort_and_await_writers(workers).await;
 }
 
 fn critical_exit(program_type_label: &str, task_name: &str) {
@@ -649,8 +652,9 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 mod tests {
     use super::*;
 
-    /// Every worker must be stopped outright, not asked to finish. A drain here would
-    /// broadcast and write into tables a resync may already be dropping.
+    /// Every worker must be stopped outright, not asked to finish, and be stopped by the
+    /// time this returns: returning is what releases the lock, and a drain or a straggler
+    /// would write into tables a resync may already be dropping.
     #[tokio::test]
     async fn stop_without_draining_aborts_every_worker() {
         let workers: Vec<_> = (0..3)
@@ -659,8 +663,14 @@ mod tests {
         let aborts: Vec<_> = workers.iter().map(|w| w.abort_handle()).collect();
         let cancellation_token = CancellationToken::new();
 
-        stop_without_draining(&cancellation_token, &aborts);
+        stop_without_draining(&cancellation_token, &aborts).await;
 
+        for abort in &aborts {
+            assert!(
+                abort.is_finished(),
+                "a worker still running when this returned could write after the lock is freed"
+            );
+        }
         assert!(
             cancellation_token.is_cancelled(),
             "the shared token must be cancelled so cooperative tasks stop too"
