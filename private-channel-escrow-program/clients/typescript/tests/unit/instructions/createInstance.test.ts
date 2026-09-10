@@ -5,6 +5,7 @@ import {
     getCreateInstanceInstructionDataCodec,
     CREATE_INSTANCE_DISCRIMINATOR,
     findEventAuthorityPda,
+    findWithdrawalBitmapPda,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
 import { mockTransactionSigner, TEST_ADDRESSES, EXPECTED_PROGRAM_ADDRESS } from '../../setup/mocks';
@@ -111,20 +112,28 @@ describe('createInstance', () => {
             expect(decodedData.bump).toBe(testBump);
             expect(instruction.accounts[2].address).toBe(testInstanceSeed.address);
 
+            // The bitmap bump is auto-derived alongside its account.
+            const [, expectedBitmapBump] = await findWithdrawalBitmapPda({
+                instance: instruction.accounts[3].address,
+            });
+            expect(decodedData.bitmapBump).toBe(expectedBitmapBump);
+
             // Verify data types
             expect(typeof decodedData.discriminator).toBe('number');
             expect(typeof decodedData.bump).toBe('number');
+            expect(typeof decodedData.bitmapBump).toBe('number');
 
             // Re-encode and verify it matches
             const reEncodedData = getCreateInstanceInstructionDataCodec().encode({
                 bump: testBump,
+                bitmapBump: expectedBitmapBump,
             });
             expect(reEncodedData).toEqual(instruction.data);
         });
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, admin, instance, systemProgram, eventAuthority, privateChannelEscrowProgram', async () => {
+        it('should include all required accounts: payer, admin, instanceSeed, instance, withdrawalBitmap, systemProgram, eventAuthority, privateChannelEscrowProgram', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const admin = mockTransactionSigner(TEST_ADDRESSES.ADMIN);
             const instanceSeed = mockTransactionSigner(TEST_ADDRESSES.INSTANCE_SEED);
@@ -136,7 +145,7 @@ describe('createInstance', () => {
             });
 
             // Based on program instruction definition, CreateInstance should have 6 accounts
-            expect(instruction.accounts).toHaveLength(7);
+            expect(instruction.accounts).toHaveLength(8);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -154,16 +163,22 @@ describe('createInstance', () => {
             const instanceAccount = instruction.accounts[3];
             expect(instanceAccount.address).toBeDefined();
 
-            // Account 4: systemProgram (Readonly)
-            const systemProgramAccount = instruction.accounts[4];
+            // Account 4: withdrawalBitmap (Writable PDA, derived from the instance)
+            const [expectedBitmapPda] = await findWithdrawalBitmapPda({
+                instance: instanceAccount.address,
+            });
+            expect(instruction.accounts[4].address).toBe(expectedBitmapPda);
+
+            // Account 5: systemProgram (Readonly)
+            const systemProgramAccount = instruction.accounts[5];
             expect(systemProgramAccount.address).toBe(SYSTEM_PROGRAM_ADDRESS);
 
             // Account 5: eventAuthority (Readonly PDA)
-            const eventAuthorityAccount = instruction.accounts[5];
+            const eventAuthorityAccount = instruction.accounts[6];
             expect(eventAuthorityAccount.address).toBeDefined();
 
             // Account 6: privateChannelEscrowProgram (Readonly)
-            const privateChannelEscrowProgramAccount = instruction.accounts[6];
+            const privateChannelEscrowProgramAccount = instruction.accounts[7];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
 
@@ -194,16 +209,19 @@ describe('createInstance', () => {
             const instanceAccount = instruction.accounts[3];
             expect(instanceAccount.role).toBe(AccountRole.WRITABLE);
 
-            // Account 4: systemProgram - should be Readonly
-            const systemProgramAccount = instruction.accounts[4];
+            // Account 4: withdrawalBitmap - should be Writable (created here)
+            expect(instruction.accounts[4].role).toBe(AccountRole.WRITABLE);
+
+            // Account 5: systemProgram - should be Readonly
+            const systemProgramAccount = instruction.accounts[5];
             expect(systemProgramAccount.role).toBe(AccountRole.READONLY);
 
             // Account 5: eventAuthority - should be Readonly (PDA, not a signer)
-            const eventAuthorityAccount = instruction.accounts[5];
+            const eventAuthorityAccount = instruction.accounts[6];
             expect(eventAuthorityAccount.role).toBe(AccountRole.READONLY);
 
             // Account 6: privateChannelEscrowProgram - should be Readonly
-            const privateChannelEscrowProgramAccount = instruction.accounts[6];
+            const privateChannelEscrowProgramAccount = instruction.accounts[7];
             expect(privateChannelEscrowProgramAccount.role).toBe(AccountRole.READONLY);
         });
 
@@ -223,11 +241,11 @@ describe('createInstance', () => {
             expect(instruction.programAddress).toBe(EXPECTED_PROGRAM_ADDRESS);
 
             // Verify systemProgram uses the correct address
-            const systemProgramAccount = instruction.accounts[4];
+            const systemProgramAccount = instruction.accounts[5];
             expect(systemProgramAccount.address).toBe(SYSTEM_PROGRAM_ADDRESS);
 
             // Verify privateChannelEscrowProgram uses the correct address
-            const privateChannelEscrowProgramAccount = instruction.accounts[6];
+            const privateChannelEscrowProgramAccount = instruction.accounts[7];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
 
@@ -243,7 +261,7 @@ describe('createInstance', () => {
                 instanceSeed,
             });
 
-            const systemProgramAccount1 = instruction1.accounts[4];
+            const systemProgramAccount1 = instruction1.accounts[5];
             expect(systemProgramAccount1.address).toBe(SYSTEM_PROGRAM_ADDRESS);
 
             // Test with explicitly provided systemProgram
@@ -254,7 +272,7 @@ describe('createInstance', () => {
                 systemProgram: SYSTEM_PROGRAM_ADDRESS,
             });
 
-            const systemProgramAccount2 = instruction2.accounts[4];
+            const systemProgramAccount2 = instruction2.accounts[5];
             expect(systemProgramAccount2.address).toBe(SYSTEM_PROGRAM_ADDRESS);
         });
 
@@ -273,7 +291,7 @@ describe('createInstance', () => {
             // Get expected eventAuthority PDA
             const [expectedEventAuthorityPda] = await findEventAuthorityPda();
 
-            const eventAuthorityAccount1 = instruction1.accounts[5];
+            const eventAuthorityAccount1 = instruction1.accounts[6];
             expect(eventAuthorityAccount1.address).toBe(expectedEventAuthorityPda);
 
             // Test with explicitly provided eventAuthority
@@ -285,7 +303,7 @@ describe('createInstance', () => {
                 eventAuthority: customEventAuthority[0],
             });
 
-            const eventAuthorityAccount2 = instruction2.accounts[5];
+            const eventAuthorityAccount2 = instruction2.accounts[6];
             expect(eventAuthorityAccount2.address).toBe(customEventAuthority[0]);
         });
     });

@@ -15,9 +15,11 @@
 //! 7. Runtime reconciliation halt: channel supply over-issued beyond escrow custody
 //!    trips the durable halt, forced-unhealthy latch, quarantine, and webhook alert.
 //! 8. Sequential withdrawals: two consecutive withdrawal nonces both complete correctly.
-//! 9. SMT root mismatch on startup: a poisoned local SMT state (nonce 0 completed but
-//!    on-chain disagrees) must drive the next pending withdrawal out of `pending` via
-//!    the fatal-error path instead of silently completing.
+//! 9. Boot bitmap diff: a database that claims a release the chain never made must
+//!    refuse to start, while a release the chain made but the database never
+//!    recorded must be reconciled in place and let the operator start.
+//! 10. Double release: the same nonce submitted under two different rows must move
+//!     tokens exactly once, and the loser must not be reminted.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -226,6 +228,10 @@ async fn wait_for_any_transaction_status(
 /// Poll until the deposit's write-ahead mint signature is journaled in
 /// `pending_release_signatures`. The journal is written right before broadcast,
 /// so a non-empty journal proves the mint reached the send step.
+///
+/// Unused until the ownership-checked write-ahead persist lands; the assertion
+/// it serves currently expects the send error to terminalize the mint instead.
+#[allow(dead_code)]
 async fn wait_for_release_signature_journaled(
     pool: &sqlx::PgPool,
     signature: &str,
@@ -251,6 +257,71 @@ async fn wait_for_release_signature_journaled(
         signature, timeout_secs
     )
     .into())
+}
+
+/// Consume a withdrawal nonce on-chain directly, without going through the
+/// operator.
+///
+/// Staging a boot-time divergence needs a bit that is genuinely set while the
+/// database knows nothing about it. Letting an operator do it and then deleting
+/// the row does not work: `OperatorHandle::shutdown` only detaches the task, so
+/// the first operator keeps running and keeps the sender's advisory lock, and a
+/// second one started against the same database exits immediately. Sending the
+/// release from the test sidesteps operator lifecycle entirely.
+async fn release_nonce_on_chain(
+    client: &RpcClient,
+    admin: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    user: Pubkey,
+    amount: u64,
+    nonce: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
+    use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+    use private_channel_indexer::operator::{
+        find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
+        find_withdrawal_bitmap_pda,
+    };
+    use spl_associated_token_account::get_associated_token_address_with_program_id;
+
+    let token_program = spl_token::id();
+    let release_ix = ReleaseFundsBuilder::new()
+        .payer(admin.pubkey())
+        .operator(admin.pubkey())
+        .instance(instance)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&instance))
+        .operator_pda(find_operator_pda(&instance, &admin.pubkey()))
+        .mint(mint)
+        .allowed_mint(find_allowed_mint_pda(&instance, &mint))
+        .user_ata(get_associated_token_address_with_program_id(
+            &user,
+            &mint,
+            &token_program,
+        ))
+        .instance_ata(get_associated_token_address_with_program_id(
+            &instance,
+            &mint,
+            &token_program,
+        ))
+        .token_program(token_program)
+        .associated_token_program(spl_associated_token_account::id())
+        .event_authority(find_event_authority_pda())
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(amount)
+        .user(user)
+        .transaction_nonce(nonce)
+        .instruction();
+
+    helpers::send_and_confirm_instructions(
+        client,
+        &[release_ix],
+        admin,
+        &[admin],
+        "Release Funds (direct)",
+    )
+    .await?;
+    Ok(())
 }
 
 fn make_withdrawal_transaction(
@@ -286,6 +357,7 @@ fn make_withdrawal_transaction(
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     }
 }
 
@@ -373,7 +445,7 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
     .await?;
 
     // 4. wait_for_transaction_completion(pool, sig, 180s)
-    operator_util::wait_for_transaction_completion(&pool, &signature, 180).await?;
+    operator_util::wait_for_transaction_completion(&pool, &signature).await?;
 
     // 5. Assert status = "completed", counterpart_signature.is_some()
     let db_tx = db::get_transaction(&pool, &signature)
@@ -472,7 +544,7 @@ async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dy
     )
     .await?;
 
-    operator_util::wait_for_transaction_completion(&pool, &signature, 180).await?;
+    operator_util::wait_for_transaction_completion(&pool, &signature).await?;
 
     let balance_after = get_token_balance(&pc_client, &user_pubkey, &env.mint).await?;
     assert_eq!(
@@ -563,8 +635,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     // Use the env-aware timeout so coverage-instrumented runs (which set
     // PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=600) don't hit the 180 s ceiling that was
     // tuned for uninstrumented nextest.
-    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig, *WAIT_TIMEOUT_SECS)
-        .await?;
+    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig).await?;
 
     let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
     assert_eq!(
@@ -686,9 +757,9 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     storage.insert_db_transaction(&bad_deposit).await?;
 
     // A write-ahead-persisted mint is never terminalized in the sender: the send
-    // error leaves the row Processing for recovery to reconcile against the persisted
-    // signature. So the mint journals its signature and stays Processing, never Failed.
-    wait_for_release_signature_journaled(&pool, &mint_fail_sig, 180).await?;
+    // error leaves the row Processing for recovery to reconcile against the
+    // persisted signature, so it journals its signature and never reaches Failed.
+    wait_for_release_signature_journaled(&pool, &mint_fail_sig, *WAIT_TIMEOUT_SECS).await?;
     let mint_row = db::get_transaction(&pool, &mint_fail_sig)
         .await?
         .expect("the deposit row must exist");
@@ -739,17 +810,17 @@ async fn test_failed_withdrawal_alerts_and_preflight_mint_defers_to_recovery(
     )
     .await?;
 
-    // The mint has no on-chain AllowedMint account, so the withdrawal gate parks it
-    // before a release is ever built. No signature is journaled and the deferred-remint
-    // gate never sees it; the row goes straight to ManualReview.
-    let disposition = wait_for_any_transaction_status(
+    // The mint has no on-chain AllowedMint account, so the withdrawal gate parks
+    // the row before a release is ever built. Nothing is broadcast and no
+    // signature is journaled, so it goes straight to `ManualReview` rather than
+    // through the sender's cannot-safely-remint branch.
+    wait_for_any_transaction_status(
         &pool,
         &withdrawal_sig,
         &["manual_review"],
         *WAIT_TIMEOUT_SECS,
     )
     .await?;
-    println!("bad withdrawal settled as {disposition}");
 
     alert_mock.assert();
 
@@ -1109,165 +1180,31 @@ async fn test_runtime_reconciliation_halts_on_supply_over_issuance(
     Ok(())
 }
 
-/// (sequential SMT proofs): the withdrawal operator correctly builds and
-/// submits SMT exclusion proofs for two consecutive withdrawal nonces.
+/// Sequential withdrawals: the operator releases two consecutive nonces, each
+/// consuming its own bit.
 ///
-/// The sender processes transactions sequentially; nonce 0 is inserted into the
-/// local Sparse Merkle Tree first, so the exclusion proof for nonce 1 is built
-/// against a tree that already contains nonce 0. Both withdrawals must complete
-/// and the recipient must receive 2 × withdrawal amount.
+/// The sender processes transactions one at a time, so nonce 0's bit is set
+/// before nonce 1 is even built. Neighbouring nonces share a byte in the
+/// bitmap, which is exactly where a wrong mask would make one release clear or
+/// block the other. Both withdrawals must complete
+/// The database records a `completed` withdrawal at nonce 0, but the freshly
+/// created instance's bitmap has every bit clear. That is the database claiming
+/// a release the chain never made, which invalidates the operator's whole view
+/// of its own history, so it must refuse to start rather than consume more
+/// nonces against a history it cannot trust.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_sequential_withdrawals_multiple_nonces() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Operator Lifecycle: Sequential Withdrawals (Multi-Nonce) ===");
-
-    const ESCROW_FUND: u64 = 200_000;
-    const WITHDRAWAL_AMOUNT: u64 = 50_000;
-
-    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
-    let client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
-
-    let pg_container = Postgres::default()
-        .with_db_name("operator_multi_nonce")
-        .with_user("postgres")
-        .with_password("password")
-        .start()
-        .await?;
-    let pg_host = pg_container.get_host().await?;
-    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
-    let db_url = format!(
-        "postgres://postgres:password@{}:{}/operator_multi_nonce",
-        pg_host, pg_port
-    );
-
-    let pool = db::connect(&db_url).await?;
-    let storage = Storage::Postgres(
-        PostgresDb::new(&PostgresConfig {
-            database_url: db_url.clone(),
-            max_connections: 10,
-        })
-        .await?,
-    );
-    storage.init_schema().await?;
-
-    // One user will receive both withdrawals.
-    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 0, None).await?;
-    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
-
-    // Register the mint so the withdrawal processor can build the instruction.
-    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
-    storage.upsert_mints_batch(&[mint_meta]).await?;
-    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
-
-    // Fund the escrow ATA with enough tokens to cover both withdrawals.
-    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    mint_to_owner(&client, &admin, env.mint, env.instance, &admin, ESCROW_FUND).await?;
-
-    let user_pubkey = env.users[0].pubkey();
-    let initial_balance = get_token_balance(&client, &user_pubkey, &env.mint).await?;
-
-    // Insert two withdrawals with sequential nonces.  The sender processes them
-    // in arrival order: nonce 0 is committed to the local SMT first, then the
-    // exclusion proof for nonce 1 is generated against the updated tree root.
-    let sig0 = Signature::new_unique().to_string();
-    let sig1 = Signature::new_unique().to_string();
-
-    storage
-        .insert_db_transaction(&make_withdrawal_transaction(
-            sig0.clone(),
-            env.mint.to_string(),
-            user_pubkey.to_string(),
-            WITHDRAWAL_AMOUNT,
-            0, // nonce 0 — committed to SMT first
-        ))
-        .await?;
-    storage
-        .insert_db_transaction(&make_withdrawal_transaction(
-            sig1.clone(),
-            env.mint.to_string(),
-            user_pubkey.to_string(),
-            WITHDRAWAL_AMOUNT,
-            1, // nonce 1 — proof built after nonce 0 is in the tree
-        ))
-        .await?;
-
-    let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
-    let operator_handle = start_operator_with_alert(
-        ProgramType::Withdraw,
-        test_validator.rpc_url(),
-        db_url.clone(),
-        operator_keypair,
-        env.instance,
-        None,
-    )
-    .await?;
-
-    // Wait until both withdrawals are completed.
-    operator_util::wait_for_operator_completion(&pool, 2, "sequential withdrawals").await?;
-
-    // Both transactions must be completed with a counterpart signature.
-    for (idx, sig) in [&sig0, &sig1].iter().enumerate() {
-        let db_tx = db::get_transaction(&pool, sig)
-            .await?
-            .expect("Transaction not found in DB");
-        assert_eq!(db_tx.status, "completed", "Withdrawal {idx} not completed");
-        assert!(
-            db_tx.counterpart_signature.is_some(),
-            "Withdrawal {idx} missing counterpart signature"
-        );
-    }
-
-    // The recipient must have received tokens from both withdrawals.
-    let final_balance = get_token_balance(&client, &user_pubkey, &env.mint).await?;
-    assert_eq!(
-        final_balance,
-        initial_balance + WITHDRAWAL_AMOUNT * 2,
-        "User should have received both withdrawal amounts"
-    );
-
-    operator_handle.shutdown().await;
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SMT root mismatch detected when processing a withdrawal
-//
-// The withdrawal-side operator's `initialize_smt_state` fetches the on-chain
-// SMT root from the escrow instance PDA, rebuilds the same root locally from
-// completed withdrawal nonces in the DB, and refuses to proceed if the two
-// don't match (see `initialize_smt_state` in `sender/state.rs`). The check
-// runs *lazily* — only when the first `ReleaseFunds` transaction is about
-// to be built (see `handle_transaction_builder` in `sender/transaction.rs`).
-//
-// Production behaviour on mismatch: the error propagates up to the
-// `handle_transaction_builder` caller, which logs it, increments an error
-// counter, and calls `send_fatal_error` to mark the specific withdrawal as
-// failed. The operator process itself keeps running so that other
-// (non-withdrawal) pipelines aren't taken down.
-//
-// We trigger the mismatch by pre-seeding:
-//   (a) a COMPLETED withdrawal at nonce 0 — poisons the SMT state
-//   (b) a PENDING withdrawal at nonce 1 — forces the SMT-init path to run
-// and assert the pending withdrawal transitions to a non-pending terminal
-// status (the fatal-error path inside `handle_transaction_builder`) within
-// a bounded wait.
-//
-// Target: the `SmtRootMismatch` branch in `sender/state.rs`.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
+async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use test_utils::operator_helper::start_private_channel_to_solana_operator;
 
-    println!("=== Operator Lifecycle: SMT Root Mismatch Aborts Startup ===");
+    println!("=== Operator Lifecycle: Boot Halts When DB Is Ahead Of The Bitmap ===");
 
     let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
     let client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
 
     let pg_container = Postgres::default()
-        .with_db_name("operator_smt_mismatch")
+        .with_db_name("operator_bitmap_db_ahead")
         .with_user("postgres")
         .with_password("password")
         .start()
@@ -1275,7 +1212,7 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     let pg_host = pg_container.get_host().await?;
     let pg_port = pg_container.get_host_port_ipv4(5432).await?;
     let db_url = format!(
-        "postgres://postgres:password@{}:{}/operator_smt_mismatch",
+        "postgres://postgres:password@{}:{}/operator_bitmap_db_ahead",
         pg_host, pg_port
     );
 
@@ -1289,17 +1226,14 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     );
     storage.init_schema().await?;
 
-    // Fresh instance: on-chain SMT root is [0u8; 32] (empty tree).
+    // Fresh instance: every bit in its bitmap is clear.
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 0, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
 
-    // Step 1: seed the DB with a COMPLETED withdrawal at nonce 0 — this
-    // poisons the SMT state: when the operator rebuilds the SMT locally
-    // it will insert nonce 0 and compute a non-zero root, while the fresh
-    // on-chain instance still has the default empty root.
+    // Step 1: claim nonce 0 as completed. Nothing on-chain backs that claim.
     let poison_sig = Signature::new_unique().to_string();
     let fake_completed = make_withdrawal_transaction(
         poison_sig.clone(),
@@ -1316,9 +1250,7 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     .execute(&pool)
     .await?;
 
-    // Step 2: add a PENDING withdrawal at nonce 1. The boot pre-flight validates the
-    // SMT root BEFORE any row is fetched, so on a mismatch the operator refuses to
-    // start and this row is never processed; it must stay `pending`.
+    // Step 2: a PENDING withdrawal the halt must leave untouched at nonce 1.
     let trigger_sig = Signature::new_unique().to_string();
     let trigger_withdrawal = make_withdrawal_transaction(
         trigger_sig.clone(),
@@ -1329,9 +1261,6 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     );
     storage.insert_db_transaction(&trigger_withdrawal).await?;
 
-    // Start the withdrawal-side operator. Its boot pre-flight rebuilds the SMT from
-    // the poisoned `completed` nonce, finds it diverges from the empty on-chain root,
-    // and refuses to start (returns Err); the operator task then exits.
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_private_channel_to_solana_operator(
         test_validator.rpc_url(),
@@ -1354,12 +1283,10 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     }
     assert!(
         exited,
-        "operator must refuse to start (the task exits) on a startup SMT root mismatch"
+        "operator must refuse to start (the task exits) when the DB is ahead of the bitmap"
     );
 
-    // SOLA2-21: the innocent trigger withdrawal is never moved out of `pending`
-    // (never `failed`, never `completed`) because the pre-flight gates before the
-    // pipeline runs.
+    // The innocent trigger withdrawal never leaves `pending`: the diff gates first.
     let trigger = db::get_transaction(&pool, &trigger_sig)
         .await?
         .expect("trigger withdrawal row must exist");
@@ -1370,5 +1297,576 @@ async fn test_operator_aborts_on_smt_root_mismatch_at_startup(
     );
 
     operator_handle.shutdown().await;
+    Ok(())
+}
+
+/// The mirror image, and the direction that must NOT halt. A release lands
+/// on-chain and its `completed` write is lost, so a bit is set with no matching
+/// row. The money already moved correctly; halting the whole pipeline over a
+/// bookkeeping gap would be the wrong trade. The operator starts, reports the
+/// orphan nonce, and keeps processing new withdrawals.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn std::error::Error>>
+{
+    println!("=== Operator Lifecycle: Boot Continues When The Chain Is Ahead ===");
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("operator_bitmap_chain_ahead")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/operator_bitmap_chain_ahead",
+        pg_host, pg_port
+    );
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(&client, &admin, env.mint, env.instance, &admin, 200_000).await?;
+
+    let user_pubkey = env.users[0].pubkey();
+
+    // Consume nonce 0 on-chain with no row to match: a release whose write was lost.
+    release_nonce_on_chain(
+        &client,
+        &admin,
+        env.instance,
+        env.mint,
+        user_pubkey,
+        50_000,
+        0,
+    )
+    .await?;
+    let balance_after_orphan = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+
+    // Advance the sequence past the nonce the chain already consumed.
+    sqlx::query("SELECT setval('withdrawal_nonce_seq', 0, true)")
+        .execute(&pool)
+        .await?;
+
+    let next_sig = Signature::new_unique().to_string();
+    storage
+        .insert_db_transaction(&make_withdrawal_transaction(
+            next_sig.clone(),
+            env.mint.to_string(),
+            user_pubkey.to_string(),
+            25_000,
+            1,
+        ))
+        .await?;
+
+    let operator_handle = start_operator_with_alert(
+        ProgramType::Withdraw,
+        test_validator.rpc_url(),
+        db_url.clone(),
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
+        env.instance,
+        None,
+    )
+    .await?;
+
+    operator_util::wait_for_transaction_completion(&pool, &next_sig).await?;
+
+    assert!(
+        !operator_handle._handle.is_finished(),
+        "a chain-ahead divergence must not halt the operator"
+    );
+    let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    assert_eq!(
+        balance_after,
+        balance_after_orphan + 25_000,
+        "the post-boot withdrawal must release exactly once"
+    );
+
+    operator_handle.shutdown().await;
+    Ok(())
+}
+
+/// The invariant the bitmap exists to enforce: a nonce that already released
+/// must never release again.
+///
+/// The database cannot produce two rows on one nonce (a trigger assigns them
+/// from a sequence behind a unique index), so the second attempt is staged the
+/// way it actually happens in production: a row whose release landed is re-armed
+/// to `pending`, and the operator sends that same nonce a second time. The
+/// program refuses it with `NonceAlreadyUsed` and no tokens move.
+///
+/// Without any surviving signature to attribute the release to, the re-armed row
+/// ends in `manual_review` rather than `completed`. Both are correct terminal
+/// states for that arm; what must never happen is a second payout or a remint.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_second_release_of_same_nonce_moves_no_tokens(
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== Operator Lifecycle: Double Release Of One Nonce ===");
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("operator_double_release")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/operator_double_release",
+        pg_host, pg_port
+    );
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(&client, &admin, env.mint, env.instance, &admin, 200_000).await?;
+
+    let user_pubkey = env.users[0].pubkey();
+    let initial_balance = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+
+    let withdrawal_sig = Signature::new_unique().to_string();
+    storage
+        .insert_db_transaction(&make_withdrawal_transaction(
+            withdrawal_sig.clone(),
+            env.mint.to_string(),
+            user_pubkey.to_string(),
+            50_000,
+            0,
+        ))
+        .await?;
+
+    let operator_handle = start_operator_with_alert(
+        ProgramType::Withdraw,
+        test_validator.rpc_url(),
+        db_url.clone(),
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
+        env.instance,
+        None,
+    )
+    .await?;
+
+    operator_util::wait_for_transaction_completion(&pool, &withdrawal_sig).await?;
+
+    let balance_after_first = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    assert_eq!(
+        balance_after_first,
+        initial_balance + 50_000,
+        "the first release must pay out once"
+    );
+
+    // Re-arm the settled row and drop the evidence of its broadcast, so the
+    // operator has no local way to know this nonce already released.
+    //
+    // That is the point of the setup: with the signatures gone, nothing in the
+    // operator's own state can stop a second payout, and only the on-chain bit
+    // is left to refuse it.
+    sqlx::query(
+        "DELETE FROM pending_release_signatures WHERE transaction_id IN
+           (SELECT id FROM transactions WHERE signature = $1)",
+    )
+    .bind(&withdrawal_sig)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE transactions
+            SET status = 'pending'::transaction_status,
+                counterpart_signature = NULL,
+                processed_at = NULL
+          WHERE signature = $1",
+    )
+    .bind(&withdrawal_sig)
+    .execute(&pool)
+    .await?;
+
+    // Wait for the re-armed row to settle again, whichever terminal state it takes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(*WAIT_TIMEOUT_SECS);
+    let mut status = String::new();
+    while std::time::Instant::now() < deadline {
+        status = db::get_transaction(&pool, &withdrawal_sig)
+            .await?
+            .map(|row| row.status)
+            .unwrap_or_default();
+        if matches!(
+            status.as_str(),
+            "completed" | "failed" | "failed_reminted" | "manual_review"
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let balance_after_second = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    assert_eq!(
+        balance_after_second, balance_after_first,
+        "a second release of a consumed nonce must move no tokens (status {status})"
+    );
+    assert_ne!(
+        status, "failed_reminted",
+        "a consumed nonce must never be reminted"
+    );
+
+    // The bit is set exactly once, whatever the row's bookkeeping says.
+    let bitmap_pda = private_channel_indexer::operator::find_withdrawal_bitmap_pda(&env.instance);
+    let bitmap = private_channel_indexer::operator::parse_withdrawal_bitmap(
+        &client.get_account_data(&bitmap_pda).await?,
+    )?;
+    assert_eq!(
+        bitmap.consumed,
+        vec![0],
+        "exactly one nonce may be consumed on-chain"
+    );
+
+    operator_handle.shutdown().await;
+    Ok(())
+}
+
+/// A withdrawal whose nonce belongs to the next generation is held back, either
+/// by the pre-send generation check or by the program's own
+/// `NonceOutsideCurrentGeneration` refusal, depending on which of the two sees
+/// it first. Whichever catches it, the row must be requeued rather than failed,
+/// and must succeed once the rotation lands.
+///
+/// Requires the eight-nonce test window, since the production one would need
+/// 65,536 withdrawals to reach a boundary.
+#[cfg(feature = "test-tree")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_withdrawal_one_generation_early_succeeds_after_rotation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::operator::bitmap_constants::NONCES_PER_GENERATION;
+
+    println!("=== Operator Lifecycle: Withdrawal One Generation Early ===");
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("operator_early_generation")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/operator_early_generation",
+        pg_host, pg_port
+    );
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(&client, &admin, env.mint, env.instance, &admin, 500_000).await?;
+
+    let user_pubkey = env.users[0].pubkey();
+    let initial_balance = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+
+    // The first nonce of generation 1: refused, requeued, valid after rotation.
+    let early_sig = Signature::new_unique().to_string();
+    storage
+        .insert_db_transaction(&make_withdrawal_transaction(
+            early_sig.clone(),
+            env.mint.to_string(),
+            user_pubkey.to_string(),
+            10_000,
+            NONCES_PER_GENERATION as i64,
+        ))
+        .await?;
+
+    let operator_handle = start_operator_with_alert(
+        ProgramType::Withdraw,
+        test_validator.rpc_url(),
+        db_url.clone(),
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
+        env.instance,
+        None,
+    )
+    .await?;
+
+    operator_util::wait_for_transaction_completion(&pool, &early_sig).await?;
+
+    let balance_after = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    assert_eq!(
+        balance_after,
+        initial_balance + 10_000,
+        "the early withdrawal must release once the rotation lands"
+    );
+
+    operator_handle.shutdown().await;
+    Ok(())
+}
+
+/// The money-safety case the bitmap gate exists for. A release genuinely landed
+/// (its bit is set), but the signature the row carries classifies as dead, so
+/// signature evidence alone would say "never landed, remint it". The bitmap
+/// overrules that: the entry escalates instead of paying the user twice.
+///
+/// Driven through `test_hooks::process_pending_remints` rather than a running
+/// operator. The gate only fires for an entry that matured while the process was
+/// up, which cannot be staged by restarting an operator: `OperatorHandle` cannot
+/// actually stop one. Storage and the bitmap are both real here, so the only
+/// thing simulated is the scheduling.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_landed_release_with_dead_signatures_is_not_reminted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::operator::sender::test_hooks;
+    use private_channel_indexer::operator::sender::types::{PendingRemint, PendingSig};
+    use private_channel_indexer::operator::sender::types::{
+        TransactionContext, TransactionStatusUpdate,
+    };
+    use private_channel_indexer::operator::{SourceEventId, TransactionKind, WithdrawalRemintInfo};
+    use solana_sdk::commitment_config::CommitmentLevel;
+
+    println!("=== Operator Lifecycle: Landed Release With Dead Signatures ===");
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name("operator_dead_sig_remint")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/operator_dead_sig_remint",
+        pg_host, pg_port
+    );
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Arc::new(Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    ));
+    storage.init_schema().await?;
+
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
+    let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
+    storage.upsert_mints_batch(&[mint_meta]).await?;
+    seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;
+
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    mint_to_owner(&client, &admin, env.mint, env.instance, &admin, 200_000).await?;
+
+    let user_pubkey = env.users[0].pubkey();
+
+    // The release really happens, so nonce 0's bit is genuinely set on-chain.
+    release_nonce_on_chain(
+        &client,
+        &admin,
+        env.instance,
+        env.mint,
+        user_pubkey,
+        50_000,
+        0,
+    )
+    .await?;
+    let balance_after_release = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+
+    // The withdrawal row this release belongs to, about to be queued for a remint
+    // with a signature that was never broadcast and whose blockhash is long
+    // expired.
+    //
+    // That is the exact shape signature-only classification calls dead, so from
+    // here the bitmap is the only thing standing between the user and a second
+    // credit.
+    let withdrawal_sig = Signature::new_unique().to_string();
+    storage
+        .insert_db_transaction(&make_withdrawal_transaction(
+            withdrawal_sig.clone(),
+            env.mint.to_string(),
+            user_pubkey.to_string(),
+            50_000,
+            0,
+        ))
+        .await?;
+    let row = db::get_transaction(&pool, &withdrawal_sig)
+        .await?
+        .expect("withdrawal row must exist");
+    let (transaction_id, trace_id): (i64, String) =
+        sqlx::query_as("SELECT id, trace_id FROM transactions WHERE signature = $1")
+            .bind(&withdrawal_sig)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        row.withdrawal_nonce,
+        Some(0),
+        "row must own the consumed nonce"
+    );
+
+    let config = PrivateChannelIndexerConfig {
+        program_type: ProgramType::Withdraw,
+        storage_type: StorageType::Postgres,
+        rpc_url: test_validator.rpc_url(),
+        fallback_rpc_url: None,
+        source_rpc_url: None,
+        postgres: PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        },
+        escrow_instance_id: Some(env.instance),
+    };
+    let mut state = test_hooks::new_sender_state(
+        &config,
+        CommitmentLevel::Confirmed,
+        Some(env.instance),
+        storage.clone(),
+        3,
+        400,
+        None,
+    )?;
+
+    state.pending_remints.push(PendingRemint {
+        ctx: TransactionContext {
+            kind: TransactionKind::ReleaseFunds,
+            transaction_id: Some(transaction_id),
+            withdrawal_nonce: Some(0),
+            trace_id: Some(trace_id.clone()),
+            deposit_claim_lease: None,
+        },
+        remint_info: WithdrawalRemintInfo {
+            transaction_id,
+            source_event_id: SourceEventId::new(&format!("sig-{transaction_id}"), 0, None),
+            trace_id: trace_id.clone(),
+            mint: env.mint,
+            user: user_pubkey,
+            user_ata: spl_associated_token_account::get_associated_token_address(
+                &user_pubkey,
+                &env.mint,
+            ),
+            token_program: spl_token::id(),
+            amount: 50_000,
+        },
+        signatures: vec![PendingSig {
+            signature: Signature::new_unique(),
+            last_valid_block_height: 1,
+            blockhash_slot: None,
+        }],
+        original_error: "release_funds failed".to_string(),
+        deadline: Utc::now() - chrono::Duration::seconds(1),
+        finality_check_attempts: 0,
+        release_refused_on_chain: false,
+        coverage_slot: None,
+    });
+
+    let (storage_tx, mut storage_rx) = tokio::sync::mpsc::channel::<TransactionStatusUpdate>(10);
+    test_hooks::process_pending_remints(&mut state, &storage_tx).await;
+
+    let update = storage_rx
+        .try_recv()
+        .expect("a blocked remint must still report the row");
+    assert_eq!(
+        update.status,
+        private_channel_indexer::storage::common::models::TransactionStatus::ManualReview,
+        "a consumed nonce must escalate rather than remint"
+    );
+    assert!(
+        !update.remint_attempted,
+        "no mint may be attempted once the bit proves the release landed"
+    );
+    assert!(
+        state.pending_remints.is_empty(),
+        "the entry must be consumed"
+    );
+
+    let balance_after_gate = get_token_balance(&client, &user_pubkey, &env.mint).await?;
+    assert_eq!(
+        balance_after_gate, balance_after_release,
+        "the gate must prevent any second credit"
+    );
+
+    Ok(())
+}
+
+/// Instance creation must allocate the withdrawal bitmap in the same
+/// instruction, on generation 0 with nothing consumed. Anything else and the
+/// first withdrawal against a new instance fails.
+///
+/// This exercises the same `CreateInstance` shape the devnet
+/// `create_instance` binary builds; that binary needs a live cluster, so its
+/// PDA derivation is covered by the operator's unit tests instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_create_instance_allocates_a_fresh_bitmap() -> Result<(), Box<dyn std::error::Error>> {
+    use private_channel_indexer::operator::{find_withdrawal_bitmap_pda, parse_withdrawal_bitmap};
+
+    println!("=== Operator Lifecycle: CreateInstance Allocates The Bitmap ===");
+
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 0, None).await?;
+
+    // The instance itself must exist.
+    client.get_account(&env.instance).await?;
+
+    let bitmap_pda = find_withdrawal_bitmap_pda(&env.instance);
+    let data = client.get_account_data(&bitmap_pda).await?;
+    let bitmap = parse_withdrawal_bitmap(&data)?;
+
+    assert_eq!(bitmap.generation, 0, "a new bitmap starts on generation 0");
+    assert!(
+        bitmap.consumed.is_empty(),
+        "a new bitmap has no consumed nonces, found {:?}",
+        bitmap.consumed
+    );
+
     Ok(())
 }

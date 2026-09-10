@@ -6,7 +6,7 @@ pub mod deposit;
 pub mod process_emit_event;
 pub mod release_funds;
 pub mod remove_operator;
-pub mod reset_smt_root;
+pub mod rotate_bitmap;
 pub mod set_new_admin;
 pub mod shared;
 
@@ -18,6 +18,6 @@ pub use deposit::*;
 pub use process_emit_event::*;
 pub use release_funds::*;
 pub use remove_operator::*;
-pub use reset_smt_root::*;
+pub use rotate_bitmap::*;
 pub use set_new_admin::*;
 pub use shared::*;

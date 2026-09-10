@@ -1,7 +1,8 @@
 use crate::accounts::traits::BlockInfo;
 use solana_sdk::{
     hash::Hash,
-    message::Message,
+    instruction::CompiledInstruction,
+    message::{Message, MessageHeader},
     signature::{Keypair, Signer},
     transaction::{SanitizedTransaction, Transaction},
 };
@@ -21,6 +22,58 @@ pub fn create_test_sanitized_transaction(
         .expect("failed to create SanitizedTransaction from test legacy transaction")
 }
 
+/// Legacy transaction with a repeated account key, built field by field because the SDK dedupes.
+pub fn duplicate_account_keys_transaction(payer: &Keypair, recent_blockhash: Hash) -> Transaction {
+    // Both copies land in the readonly tail, which is the cheapest shape to submit.
+    duplicate_keys_transaction(
+        payer,
+        recent_blockhash,
+        vec![payer.pubkey(), spl_memo::id(), spl_memo::id()],
+        2,
+        1,
+    )
+}
+
+/// Same idea, but the repeated key is writable, which is the shape that stresses the write locks.
+pub fn duplicate_writable_account_keys_transaction(
+    payer: &Keypair,
+    recent_blockhash: Hash,
+) -> Transaction {
+    // Only the trailing program stays readonly, so the payer is locked writable twice.
+    duplicate_keys_transaction(
+        payer,
+        recent_blockhash,
+        vec![payer.pubkey(), payer.pubkey(), spl_memo::id()],
+        1,
+        2,
+    )
+}
+
+fn duplicate_keys_transaction(
+    payer: &Keypair,
+    recent_blockhash: Hash,
+    account_keys: Vec<solana_sdk::pubkey::Pubkey>,
+    num_readonly_unsigned_accounts: u8,
+    program_id_index: u8,
+) -> Transaction {
+    let message = Message {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts,
+        },
+        account_keys,
+        recent_blockhash,
+        instructions: vec![CompiledInstruction {
+            program_id_index,
+            accounts: vec![],
+            data: b"dup".to_vec(),
+        }],
+    };
+    let mut transaction = Transaction::new_unsigned(message);
+    transaction.sign(&[payer], recent_blockhash);
+    transaction
+}
 /// Create a BlockInfo with sensible defaults for a given slot.
 pub fn create_test_block_info(slot: u64, blockhash: Hash) -> BlockInfo {
     BlockInfo {

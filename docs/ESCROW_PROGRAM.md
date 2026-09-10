@@ -23,7 +23,7 @@
 | [`SetNewAdmin`](#setnewadmin) | Set a new admin for the instance (current admin only) | 5 |
 | [`Deposit`](#deposit) | Deposit tokens from user ATA to instance escrow ATA (permissionless) | 6 |
 | [`ReleaseFunds`](#releasefunds) | Release funds from escrow to user (operator-only) | 7 |
-| [`ResetSmtRoot`](#resetsmtroot) | Reset the SMT root for the instance (operator-only) | 8 |
+| [`RotateBitmap`](#rotatebitmap) | Rotate the withdrawal bitmap to the next generation (operator-only) | 8 |
 | [`EmitEvent`](#emitevent) | Emit event via CPI | 228 |
 
 ### Instruction Details
@@ -37,6 +37,7 @@ Discriminator: `0`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `bump` | u8 | PDA bump seed for instance account |
+| `bitmap_bump` | u8 | PDA bump seed for withdrawal bitmap account |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -45,9 +46,13 @@ Discriminator: `0`
 | 1 | `admin` | ✓ | | Admin of Instance |
 | 2 | `instance_seed` | ✓ | | Instance seed signer for PDA derivation |
 | 3 | `instance` | | ✓ | Instance PDA to be created |
-| 4 | `system_program` | | | System program |
-| 5 | `event_authority` | | | Event authority PDA for emitting events |
-| 6 | `private_channel_escrow_program` | | | Current program for CPI |
+| 4 | `withdrawal_bitmap` | | ✓ | Withdrawal bitmap PDA to be created |
+| 5 | `system_program` | | | System program |
+| 6 | `event_authority` | | | Event authority PDA for emitting events |
+| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+
+The bitmap is created here, so every instance has one by construction. It is
+8202 bytes, costing the payer roughly 0.058 SOL in rent.
 
 #### AllowMint
 Allows new token mints for the instance (admin-only).
@@ -188,42 +193,54 @@ Discriminator: `7`
 |-----------|------|-------------|
 | `amount` | u64 | Amount of tokens to release |
 | `user` | Pubkey | User receiving the funds (wallet address, not the ATA) |
-| `new_withdrawal_root` | [u8; 32] | New withdrawal transactions root |
-| `transaction_nonce` | u64 | Transaction nonce |
-| `sibling_proofs` | [u8; 512] | Sibling proofs (flattened as 512 bytes: 16 proofs × 32 bytes each) |
+| `transaction_nonce` | u64 | Transaction nonce to consume from the withdrawal bitmap |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
 |---------|------|--------|----------|-------------|
 | 0 | `payer` | ✓ | ✓ | Transaction fee payer |
 | 1 | `operator` | ✓ | | Operator releasing the funds |
-| 2 | `instance` | | ✓ | Instance PDA to validate and update |
-| 3 | `operator_pda` | | | Operator PDA to validate operator permissions |
-| 4 | `mint` | | | Token mint being released |
-| 5 | `allowed_mint` | | | AllowedMint PDA to validate mint is allowed |
-| 6 | `user_ata` | | ✓ | User's Associated Token Account for this mint |
-| 7 | `instance_ata` | | ✓ | Instance's Associated Token Account (escrow) for this mint |
-| 8 | `token_program` | | | Token program for the mint |
-| 9 | `associated_token_program` | | | Associated Token program |
-| 10 | `event_authority` | | | Event authority PDA for emitting events |
-| 11 | `private_channel_escrow_program` | | | Current program for CPI |
+| 2 | `instance` | | | Instance PDA to validate and sign the transfer |
+| 3 | `withdrawal_bitmap` | | ✓ | Withdrawal bitmap PDA to consume the nonce |
+| 4 | `operator_pda` | | | Operator PDA to validate operator permissions |
+| 5 | `mint` | | | Token mint being released |
+| 6 | `allowed_mint` | | | AllowedMint PDA to validate mint is allowed |
+| 7 | `user_ata` | | ✓ | User's Associated Token Account for this mint |
+| 8 | `instance_ata` | | ✓ | Instance's Associated Token Account (escrow) for this mint |
+| 9 | `token_program` | | | Token program for the mint |
+| 10 | `associated_token_program` | | | Associated Token program |
+| 11 | `event_authority` | | | Event authority PDA for emitting events |
+| 12 | `private_channel_escrow_program` | | | Current program for CPI |
 
-#### ResetSmtRoot
-Resets the SMT root for the instance (operator-only).
+Replay protection is the bitmap alone: the nonce's bit must be clear, and the
+nonce must fall in the generation the bitmap currently covers. The instance is
+read-only here, it only signs the transfer.
+
+#### RotateBitmap
+Rotates the withdrawal bitmap to the next generation (operator-only).
+
+Clears every bit and increments the generation, so the next 65,536 nonces can be
+released. `expected_generation` must match the bitmap's current generation, which
+makes the instruction non-idempotent: a replayed rotation cannot skip a whole
+generation of nonces.
 
 Discriminator: `8`
 
-**Parameters:** None
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `expected_generation` | u64 | Generation the caller expects the bitmap to be at |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
 |---------|------|--------|----------|-------------|
 | 0 | `payer` | ✓ | ✓ | Transaction fee payer |
-| 1 | `operator` | ✓ | | Operator resetting the SMT root |
-| 2 | `instance` | | ✓ | Instance PDA to reset |
-| 3 | `operator_pda` | | | Operator PDA to validate operator permissions |
-| 4 | `event_authority` | | | Event authority PDA for emitting events |
-| 5 | `private_channel_escrow_program` | | | Current program for CPI |
+| 1 | `operator` | ✓ | | Operator rotating the bitmap |
+| 2 | `instance` | | | Instance PDA the bitmap belongs to |
+| 3 | `withdrawal_bitmap` | | ✓ | Withdrawal bitmap PDA to rotate |
+| 4 | `operator_pda` | | | Operator PDA to validate operator permissions |
+| 5 | `event_authority` | | | Event authority PDA for emitting events |
+| 6 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### EmitEvent
 Invoked via CPI from another program to log event via instruction data.
@@ -244,6 +261,7 @@ Discriminator: `228`
 | Instance | Escrow instance that holds token funds and manages operators | 0 |
 | Operator | Authorized operator for an instance that can release funds | 1 |
 | AllowedMint | Token mint that is allowed for deposits in an instance | 2 |
+| WithdrawalBitmap | Withdrawal nonce replay protection for an instance | 3 |
 
 ### Instance
 Represents an escrow instance that holds token funds and manages operators.
@@ -256,8 +274,26 @@ Represents an escrow instance that holds token funds and manages operators.
 | `version` | u8 | Instance version |
 | `instance_seed` | Pubkey | Unique seed for this instance |
 | `admin` | Pubkey | Authority that controls the instance |
-| `withdrawal_transactions_root` | [u8; 32] | Sparse Merkle Tree root for withdrawal transactions |
-| `current_tree_index` | u64 | Current tree index to prevent double spending |
+
+### WithdrawalBitmap
+Withdrawal nonce replay protection: one bit per nonce in the current generation.
+Created alongside the instance and reused forever, so rent is a fixed one-time
+cost regardless of withdrawal volume.
+
+**PDA Derivation**: `["withdrawal_bitmap", instance_pda]`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bump` | u8 | PDA bump seed |
+| `generation` | u64 | Nonce window this bitmap covers: `nonce / 65536` |
+| `bits` | [u8; 8192] | One bit per nonce; bit `nonce % 65536` is set on release |
+
+`ReleaseFunds` rejects a nonce whose bit is already set, and rejects any nonce
+outside the current generation. `RotateBitmap` clears the bits and advances the
+generation, which is what keeps the account a fixed size as volume grows. Only
+`bump` and `generation` appear in the IDL: the bits are read by slicing at
+offset 10, since a fixed 8192-byte field does not fit on the BPF stack and its
+length varies with the `test-tree` feature.
 
 ### Operator
 Represents an authorized operator for an instance that can release funds.
@@ -294,14 +330,18 @@ The program defines the following custom errors:
 | 8 | `InvalidTokenAccount` | Invalid token account provided |
 | 9 | `InvalidEscrowBalance` | Invalid escrow balance |
 | 10 | `InvalidAllowedMint` | Invalid allowed mint |
-| 11 | `InvalidSmtProof` | Invalid SMT proof provided |
-| 12 | `InvalidTransactionNonceForCurrentTreeIndex` | Invalid transaction nonce for current tree index |
+| 11 | `InvalidWithdrawalBitmap` | Withdrawal bitmap account is malformed or not the expected PDA |
+| 12 | `NonceAlreadyUsed` | Withdrawal nonce has already been released |
+| 13 | `NonceOutsideCurrentGeneration` | Withdrawal nonce belongs to a different bitmap generation |
+| 14 | `UnexpectedGeneration` | Bitmap rotation pre-state mismatch; blocks replaying a landed rotation |
 
 ## Other Constants
 
 - **Instance Version**: 1
-- **Tree Height**: 16
-- **Max Tree Leaves**: 65536
-- **Empty Tree Root** (Pre-computed root hash for empty Sparse Merkle Tree): `[143, 230, 177, 104, 146, 86, 192, 211, 133, 244, 47, 91, 190, 32, 39, 162, 44, 25, 150, 225, 16, 186, 151, 193, 113, 211, 229, 148, 141, 233, 43, 235]`
-- **Empty Leaf**: `[0u8; 32]`
+- **Nonces Per Generation**: 65536
+- **Bitmap Bytes**: 8192 (one bit per nonce)
+- **Withdrawal Bitmap Account Size**: 8202 bytes (1 discriminator + 1 bump + 8 generation + 8192 bits)
+
+Under the `test-tree` feature these shrink to 8 nonces in 1 byte, so integration
+tests can cross a generation boundary without 65,536 withdrawals.
 - **Non-Empty Leaf Hash**: SHA256 hash of `[1u8; 32]`

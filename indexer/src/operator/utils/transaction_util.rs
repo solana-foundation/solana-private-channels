@@ -229,11 +229,10 @@ pub fn parse_program_error(
             InstructionError::Custom(code),
         ) => {
             match *code {
-                11 => Some(PrivateChannelEscrowProgramError::InvalidSmtProof),
-                12 => Some(
-                    PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex,
-                ),
-                13 => Some(PrivateChannelEscrowProgramError::UnexpectedTreeIndex),
+                11 => Some(PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap),
+                12 => Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+                13 => Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+                14 => Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
                 _ => None, // Ignore other program errors
             }
         }
@@ -322,40 +321,33 @@ mod tests {
     // parse_program_error
     // ====================================================================
 
+    /// This map is the single point where an on-chain error code becomes a
+    /// named variant. The codes were renumbered with the bitmap change, and a
+    /// stale entry here would silently route one rejection down another's arm,
+    /// which is how a spent nonce could end up reminted. Pin every code.
     #[test]
-    fn parse_custom_11_invalid_smt_proof() {
-        let err = TransactionError::InstructionError(0, InstructionError::Custom(11));
-        let result = parse_program_error(&err);
-        assert!(matches!(
-            result,
-            Some(PrivateChannelEscrowProgramError::InvalidSmtProof)
-        ));
-    }
+    fn parse_program_error_code_table() {
+        let cases = [
+            (
+                11u32,
+                Some(PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap),
+            ),
+            (12, Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed)),
+            (
+                13,
+                Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+            ),
+            (
+                14,
+                Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
+            ),
+            (99, None),
+        ];
 
-    #[test]
-    fn parse_custom_12_invalid_nonce() {
-        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
-        let result = parse_program_error(&err);
-        assert!(matches!(
-            result,
-            Some(PrivateChannelEscrowProgramError::InvalidTransactionNonceForCurrentTreeIndex)
-        ));
-    }
-
-    #[test]
-    fn parse_custom_13_unexpected_tree_index() {
-        let err = TransactionError::InstructionError(0, InstructionError::Custom(13));
-        let result = parse_program_error(&err);
-        assert!(matches!(
-            result,
-            Some(PrivateChannelEscrowProgramError::UnexpectedTreeIndex)
-        ));
-    }
-
-    #[test]
-    fn parse_custom_99_returns_none() {
-        let err = TransactionError::InstructionError(0, InstructionError::Custom(99));
-        assert!(parse_program_error(&err).is_none());
+        for (code, expected) in cases {
+            let err = TransactionError::InstructionError(0, InstructionError::Custom(code));
+            assert_eq!(parse_program_error(&err), expected, "custom code {code}");
+        }
     }
 
     #[test]
@@ -433,8 +425,9 @@ mod tests {
         assert!(matches!(result, Ok(ConfirmationResult::Confirmed)));
     }
 
-    /// A confirmed status carrying Custom(11) must decode to Failed(InvalidSmtProof) so
-    /// the sender receives the exact escrow-program error rather than a generic failure.
+    /// A confirmed status carrying Custom(11) must decode to
+    /// Failed(InvalidWithdrawalBitmap) so the sender receives the exact
+    /// escrow-program error rather than a generic failure.
     #[tokio::test]
     async fn check_transaction_status_returns_failed_on_program_error() {
         let mut server = mockito::Server::new_async().await;
@@ -478,7 +471,7 @@ mod tests {
         assert!(matches!(
             result,
             Ok(ConfirmationResult::Failed(Some(
-                PrivateChannelEscrowProgramError::InvalidSmtProof
+                PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap
             )))
         ));
     }

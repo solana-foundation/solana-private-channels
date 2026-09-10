@@ -44,6 +44,7 @@ use {
 fn make_row(
     id: i64,
     mint: &Pubkey,
+    initiator: &Pubkey,
     recipient: &Pubkey,
     sig: &Signature,
     amount: u64,
@@ -55,7 +56,7 @@ fn make_row(
         signature: Signature::new_unique().to_string(),
         trace_id: format!("trace-{id}"),
         slot: 100,
-        initiator: Pubkey::new_unique().to_string(),
+        initiator: initiator.to_string(),
         recipient: recipient.to_string(),
         mint: mint.to_string(),
         amount: TokenAmount(amount),
@@ -75,6 +76,7 @@ fn make_row(
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     }
 }
 
@@ -102,6 +104,9 @@ async fn recover_rehydrates_valid_pending_remint_row() {
     let mock = MockStorage::new();
 
     let mint = Pubkey::new_unique();
+    // Distinct from `recipient`: the burn debited the initiator, so the remint
+    // must target them, not the withdrawal's Solana destination.
+    let initiator = Pubkey::new_unique();
     let recipient = Pubkey::new_unique();
     let sig = Signature::new_unique();
     let deadline = Utc::now() + chrono::Duration::seconds(20);
@@ -109,7 +114,9 @@ async fn recover_rehydrates_valid_pending_remint_row() {
     mock.pending_remint_transactions
         .lock()
         .unwrap()
-        .push(make_row(42, &mint, &recipient, &sig, 5_000, deadline));
+        .push(make_row(
+            42, &mint, &initiator, &recipient, &sig, 5_000, deadline,
+        ));
 
     let storage = Arc::new(Storage::Mock(mock));
     let mut state = test_hooks::new_sender_state(
@@ -135,7 +142,8 @@ async fn recover_rehydrates_valid_pending_remint_row() {
     assert_eq!(entry.ctx.transaction_id, Some(42));
     assert_eq!(entry.ctx.trace_id.as_deref(), Some("trace-42"));
     assert_eq!(entry.remint_info.mint, mint);
-    assert_eq!(entry.remint_info.user, recipient);
+    assert_eq!(entry.remint_info.user, initiator);
+    assert_ne!(entry.remint_info.user, recipient);
     assert_eq!(entry.remint_info.amount, 5_000u64);
     assert_eq!(entry.signatures.len(), 1);
     assert_eq!(entry.signatures[0].signature, sig);
@@ -197,12 +205,28 @@ async fn recover_escalates_malformed_row_but_continues_with_others() {
     let deadline = Utc::now() + chrono::Duration::seconds(20);
 
     // Row 1 — invalid mint string, cannot be parsed back to a Pubkey.
-    let mut bad = make_row(10, &Pubkey::new_unique(), &recipient, &sig, 1_000, deadline);
+    let mut bad = make_row(
+        10,
+        &Pubkey::new_unique(),
+        &Pubkey::new_unique(),
+        &recipient,
+        &sig,
+        1_000,
+        deadline,
+    );
     bad.mint = "definitely-not-base58".to_string();
 
     // Row 2 — valid, must still be queued despite the bad sibling.
     let good_mint = Pubkey::new_unique();
-    let good = make_row(11, &good_mint, &recipient, &sig, 2_500, deadline);
+    let good = make_row(
+        11,
+        &good_mint,
+        &Pubkey::new_unique(),
+        &recipient,
+        &sig,
+        2_500,
+        deadline,
+    );
 
     mock.pending_remint_transactions
         .lock()

@@ -24,6 +24,7 @@ const INSTANCE_SEED: &[u8] = b"instance";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 const OPERATOR_SEED: &[u8] = b"operator";
+const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
 
 pub const TEST_ADMIN_KEYPAIR: [u8; 64] = [
     153, 171, 234, 182, 220, 215, 41, 189, 53, 34, 53, 20, 142, 90, 108, 73, 104, 168, 58, 67, 78,
@@ -184,6 +185,10 @@ impl TestEnvironment {
 
         let instance_seed = escrow_instance_id.unwrap_or(Keypair::new());
         let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
+        let (withdrawal_bitmap_pda, bitmap_bump) = Pubkey::find_program_address(
+            &[WITHDRAWAL_BITMAP_SEED, instance_pda.as_ref()],
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        );
         let (event_authority_pda, _) = find_event_authority_pda();
 
         // If instance already exists, return it
@@ -196,10 +201,12 @@ impl TestEnvironment {
             .admin(admin.pubkey())
             .instance_seed(instance_seed.pubkey())
             .instance(instance_pda)
+            .withdrawal_bitmap(withdrawal_bitmap_pda)
             .system_program(SYSTEM_PROGRAM_ID)
             .event_authority(event_authority_pda)
             .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
             .bump(bump)
+            .bitmap_bump(bitmap_bump)
             .instruction();
 
         send_and_confirm_instructions(

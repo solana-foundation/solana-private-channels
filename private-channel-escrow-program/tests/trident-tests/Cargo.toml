@@ -10,7 +10,6 @@ edition = "2021"
 solana-sdk = "2.3.1"
 spl-associated-token-account = { version = "4.0.0", features = ["no-entrypoint"] }
 private-channel-escrow-program-client = { path = "../../clients/rust" }
-tests-private-channel-escrow-program = { path = "../integration-tests" }
 
 [dependencies.trident-fuzz]
 version = "0.12.0"
@@ -26,5 +25,5 @@ name = "fuzz_escrow"
 path = "fuzz_escrow.rs"
 
 [[bin]]
-name = "fuzz_reset_smt"
-path = "fuzz_reset_smt.rs"
+name = "fuzz_rotate_bitmap"
+path = "fuzz_rotate_bitmap.rs"

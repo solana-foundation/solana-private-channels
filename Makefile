@@ -5,14 +5,14 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 .DEFAULT_GOAL := build
 
-PROGRAM_DIRS := private-channel-escrow-program private-channel-withdraw-program dvp-swap-program
+PROGRAM_DIRS := private-channel-escrow-program private-channel-withdraw-program
 RUST_DIRS := core indexer gateway auth
 FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
 .PHONY: install install-toolchain check-toolchain check-docker build fmt generate-idl generate-clients
-.PHONY: unit-test integration-test all-test drills drill
+.PHONY: unit-test integration-test all-test drills drill dvp-client-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
 .PHONY: unit-coverage coverage-html all-coverage ci-unit-coverage ci-e2e-coverage
@@ -120,12 +120,18 @@ unit-test:
 	@for dir in $(PROGRAM_DIRS) $(RUST_DIRS); do \
 		$(MAKE) -C $$dir unit-test; \
 	done
+	@$(MAKE) dvp-client-test
+
+# Vendored DvP client (dvp-swap-program/clients/rust) has no per-dir Makefile,
+# so run its tests (verify helpers + CPI-flag regression) directly by crate.
+dvp-client-test:
+	@echo "Running vendored DvP swap client tests..."
+	@cargo test -p dvp-swap-program-client
 
 integration-test:
 	@echo "Running integration tests for all projects..."
 	@$(MAKE) -C private-channel-escrow-program integration-test
 	@$(MAKE) -C private-channel-withdraw-program integration-test
-	@$(MAKE) -C dvp-swap-program integration-test
 	@# Delegate to integration/Makefile so escrow-feature grouping + the full
 	@# `[[test]]` set stay in one place. See integration/Makefile:integration-test
 	@# for the private-channel/test-tree/prod group ordering.
@@ -152,7 +158,7 @@ ci-integration-test-build-test-tree:
 	@$(MAKE) -C private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 
 ci-integration-test-prebuilt:
@@ -215,7 +221,7 @@ ci-integration-test-indexer:
 	@$(MAKE) -C private-channel-escrow-program build-test
 	@echo "=== test-tree feature group ==="
 	@cd integration && cargo test --features test-tree --test indexer_integration -- --nocapture
-	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture
+	@cd integration && cargo test --features test-tree --test operator_lifecycle_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --features test-tree --test withdrawal_null_nonce -- --nocapture
 	@echo "=== Rebuilding escrow in prod for prod-feature indexer group ==="
 	@$(MAKE) -C private-channel-escrow-program build-no-clients
@@ -252,6 +258,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test mint_builder_validation -- --nocapture
 	@cd integration && cargo test --test sender_channel_close -- --nocapture
 	@cd integration && cargo test --test sender_cancellation_drain -- --nocapture
+	@cd integration && cargo test --test rotation_driver_e2e -- --nocapture
 
 # Backward-compatible aliases.
 unit-test-ci: ci-unit-test
@@ -307,6 +314,7 @@ ci-unit-coverage:
 	@$(MAKE) -C indexer unit-coverage
 	@$(MAKE) -C gateway unit-coverage
 	@$(MAKE) -C auth unit-coverage
+	@$(MAKE) dvp-client-test
 
 ci-e2e-coverage:
 	@echo "Running E2E integration tests with coverage..."

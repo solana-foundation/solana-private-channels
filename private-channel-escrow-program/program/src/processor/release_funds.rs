@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use crate::{
-    constants::tree_constants::TREE_HEIGHT,
     error::PrivateChannelEscrowProgramError,
     events::ReleaseFundsEvent,
     processor::{
@@ -12,10 +11,10 @@ use crate::{
             token_utils::{validate_ata, validate_token2022_extensions},
         },
         verify_account_owner, verify_ata_program, verify_current_program, verify_mutability,
-        verify_token_programs, SparseMerkleTreeUtils,
+        verify_token_programs,
     },
     require_len,
-    state::{discriminator::AccountSerialize, AllowedMint, Instance, Operator},
+    state::{AllowedMint, Instance, Operator, WithdrawalBitmap},
     validate_event_authority,
 };
 use pinocchio::{
@@ -28,38 +27,37 @@ use pinocchio_token_2022::{
     instructions::TransferChecked as TransferChecked2022, ID as TOKEN_2022_PROGRAM_ID,
 };
 
-// amount (8) + user (32) + new_root (32) + transaction_nonce (8) + sibling_proofs (TREE_HEIGHT * 32)
-const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 32 + 8 + (TREE_HEIGHT * 32);
+// amount (8) + user (32) + transaction_nonce (8)
+const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 8;
 
 /// Processes the ReleaseFunds instruction.
 ///
 /// # Account Layout
 /// 0. `[signer, writable]` payer - Pays for transaction fees
 /// 1. `[signer]` operator - Operator releasing the funds
-/// 2. `[writable]` instance - Instance PDA to validate and update
-/// 3. `[]` operator_pda - Operator PDA to validate operator permissions
-/// 4. `[]` mint - Token mint being released
-/// 5. `[]` allowed_mint - AllowedMint PDA to validate mint is allowed
-/// 6. `[writable]` user_ata - User's Associated Token Account for this mint
-/// 7. `[writable]` instance_ata - Instance's Associated Token Account for this mint
-/// 8. `[]` token_program - Token program for the mint
-/// 9. `[]` associated_token_program - Associated Token program
-/// 10. `[]` event_authority - Event authority PDA for emitting events
-/// 11. `[]` private_channel_escrow_program - Current program for CPI
+/// 2. `[]` instance - Instance PDA to validate and sign the transfer
+/// 3. `[writable]` withdrawal_bitmap - Withdrawal bitmap PDA to consume the nonce
+/// 4. `[]` operator_pda - Operator PDA to validate operator permissions
+/// 5. `[]` mint - Token mint being released
+/// 6. `[]` allowed_mint - AllowedMint PDA to validate mint is allowed
+/// 7. `[writable]` user_ata - User's Associated Token Account for this mint
+/// 8. `[writable]` instance_ata - Instance's Associated Token Account for this mint
+/// 9. `[]` token_program - Token program for the mint
+/// 10. `[]` associated_token_program - Associated Token program
+/// 11. `[]` event_authority - Event authority PDA for emitting events
+/// 12. `[]` private_channel_escrow_program - Current program for CPI
 ///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to release
 /// * `user` (Pubkey) - User receiving the funds
-/// * `new_withdrawal_root` ([u8; 32]) - New SMT root after adding this transaction nonce
-/// * `transaction_nonce` (u64) - Transaction nonce to verify exclusion from current SMT
-/// * `sibling_proofs` ([[u8; 32]; 16]) - SMT sibling proofs for exclusion verification
+/// * `transaction_nonce` (u64) - Transaction nonce to consume from the bitmap
 pub fn process_release_funds(
     program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
-    let [payer_info, operator_info, instance_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
+    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -67,7 +65,7 @@ pub fn process_release_funds(
 
     verify_signer(payer_info, true)?;
     verify_signer(operator_info, false)?;
-    verify_mutability(instance_info, true)?;
+    verify_mutability(withdrawal_bitmap_info, true)?;
     verify_ata_program(associated_token_program_info)?;
     verify_token_programs(token_program_info)?;
     verify_current_program(program_info)?;
@@ -77,7 +75,7 @@ pub fn process_release_funds(
     verify_account_owner(mint_info, token_program_info.address())?;
 
     let instance_data = instance_info.try_borrow()?;
-    let mut instance = Instance::try_from_bytes(&instance_data)?;
+    let instance = Instance::try_from_bytes(&instance_data)?;
 
     instance
         .validate_pda(instance_info)
@@ -117,19 +115,15 @@ pub fn process_release_funds(
         validate_token2022_extensions(mint_info)?;
     }
 
-    instance.validate_current_tree_index(args.transaction_nonce)?;
-
-    SparseMerkleTreeUtils::verify_smt_exclusion_proof(
-        &instance.withdrawal_transactions_root,
-        args.transaction_nonce,
-        &args.sibling_proofs,
+    let mut bitmap_data = withdrawal_bitmap_info.try_borrow_mut()?;
+    WithdrawalBitmap::validate(
+        &bitmap_data,
+        instance_info.address(),
+        withdrawal_bitmap_info,
     )?;
-
-    SparseMerkleTreeUtils::verify_smt_inclusion_proof(
-        &args.new_withdrawal_root,
-        args.transaction_nonce,
-        &args.sibling_proofs,
-    )?;
+    WithdrawalBitmap::validate_generation(&bitmap_data, args.transaction_nonce)?;
+    WithdrawalBitmap::consume_nonce(&mut bitmap_data, args.transaction_nonce)?;
+    drop(bitmap_data);
 
     let escrow_token_balance_before = get_token_account_balance(instance_ata_info)?;
 
@@ -159,19 +153,12 @@ pub fn process_release_funds(
         .checked_sub(escrow_token_balance_after)
         .ok_or(PrivateChannelEscrowProgramError::InvalidEscrowBalance)?;
 
-    instance.withdrawal_transactions_root = args.new_withdrawal_root;
-    let updated_instance_data = instance.to_bytes();
-    instance_info
-        .try_borrow_mut()?
-        .copy_from_slice(&updated_instance_data);
-
     let event = ReleaseFundsEvent::new(
         instance.instance_seed,
         *operator_info.address(),
         released,
         args.user,
         *mint_info.address(),
-        args.new_withdrawal_root,
     );
     emit_event(
         program_id,
@@ -186,9 +173,7 @@ pub fn process_release_funds(
 struct ReleaseFundsArgs {
     amount: u64,
     user: Address,
-    new_withdrawal_root: [u8; 32],
     transaction_nonce: u64,
-    sibling_proofs: [[u8; 32]; TREE_HEIGHT],
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramError> {
@@ -207,29 +192,16 @@ fn process_instruction_data(data: &[u8]) -> Result<ReleaseFundsArgs, ProgramErro
     let user = Address::new_from_array(user_bytes);
     offset += 32;
 
-    let mut new_withdrawal_root = [0u8; 32];
-    new_withdrawal_root.copy_from_slice(&data[offset..offset + 32]);
-    offset += 32;
-
     let transaction_nonce = u64::from_le_bytes(
         data[offset..offset + 8]
             .try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
-    offset += 8;
-
-    let mut sibling_proofs = [[0u8; 32]; TREE_HEIGHT];
-    for sibling_proof in sibling_proofs.iter_mut() {
-        sibling_proof.copy_from_slice(&data[offset..offset + 32]);
-        offset += 32;
-    }
 
     Ok(ReleaseFundsArgs {
-        new_withdrawal_root,
         transaction_nonce,
         amount,
         user,
-        sibling_proofs,
     })
 }
 
@@ -241,33 +213,22 @@ mod tests {
 
     #[test]
     fn test_process_release_funds_instruction_data_valid() {
-        let user_key = Address::new_from_array([0u8; 32]);
-        let new_root = [1u8; 32];
+        let user_key = Address::new_from_array([7u8; 32]);
         let transaction_nonce = 42u64;
         let amount = 1000u64;
-        let sibling_proofs = [2u8; 512];
 
         let mut instruction_data = vec![];
-
-        // Pack data according to new format
         instruction_data.extend_from_slice(&amount.to_le_bytes());
         instruction_data.extend_from_slice(user_key.as_ref());
-        instruction_data.extend_from_slice(&new_root);
         instruction_data.extend_from_slice(&transaction_nonce.to_le_bytes());
-
-        // Add flattened sibling proofs
-        instruction_data.extend_from_slice(&sibling_proofs);
 
         let result = process_instruction_data(&instruction_data);
 
         assert!(result.is_ok());
         let args = result.unwrap();
-        assert_eq!(args.new_withdrawal_root, new_root);
         assert_eq!(args.transaction_nonce, transaction_nonce);
         assert_eq!(args.amount, amount);
         assert_eq!(args.user, user_key);
-        let expected_sibling_proofs = [[2u8; 32]; 16];
-        assert_eq!(args.sibling_proofs, expected_sibling_proofs);
     }
 
     #[test]

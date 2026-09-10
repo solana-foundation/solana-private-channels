@@ -78,6 +78,12 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
                     pdaSeedValueNode('wallet', accountValueNode('operator')),
                 ]),
             },
+            {
+                account: 'withdrawalBitmap',
+                defaultValue: pdaValueNode(pdaLinkNode('withdrawalBitmap'), [
+                    pdaSeedValueNode('instance', accountValueNode('instance')),
+                ]),
+            },
 
             // CreateInstance instruction
             {

@@ -5,13 +5,14 @@ use crate::operator::{
 };
 use crate::storage::common::models::DbTransaction;
 use private_channel_escrow_program_client::instructions::{
-    ReleaseFundsBuilder, ResetSmtRootBuilder,
+    ReleaseFundsBuilder, RotateBitmapBuilder,
 };
 use solana_keychain::Signer;
 use solana_sdk::hash::hashv;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::instruction::mint_to;
+use std::fmt::Display;
 
 pub const REMINT_IDEMPOTENCY_MEMO_PREFIX: &str = "private_channel:remint:";
 
@@ -66,15 +67,22 @@ impl SourceEventId {
     }
 }
 
+impl Display for SourceEventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /*
 Mint initialization is going to be done outside of the operator. There's a command that will add to the allowed mints on Solana mainnet
 and will also initialize that mint on PrivateChannel. This simplifies our operator's code and reduces the checks it needs to do if we'd want to
 validate mint existence on PrivateChannel.
 */
 
-/// Single encoding for all idempotency memos so the mint and remint variants cannot drift.
+/// Single encoding for both idempotency memos so the mint and remint variants
+/// cannot drift apart from what the consumed-set parser expects.
 fn idempotency_memo(prefix: &str, id: &SourceEventId) -> String {
-    format!("{prefix}{}", id.as_str())
+    format!("{prefix}{id}")
 }
 
 pub fn mint_idempotency_memo(source_event_id: &SourceEventId) -> String {
@@ -127,21 +135,40 @@ pub enum ExtraErrorCheckPolicy {
     Extra(Vec<ExtraErrorCheckFn>),
 }
 
+/// Which builder a transaction came from, so consumers dispatch on the kind rather than on absent ids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionKind {
+    ReleaseFunds,
+    InitializeMint,
+    Mint,
+    RotateBitmap,
+}
+
 /// Wrapper enum for different transaction builder types
 /// Allows processor to send multiple builder types through a single channel to sender
 #[derive(Clone, Debug)]
 pub enum TransactionBuilder {
-    /// Release funds transaction (PrivateChannel → Solana) - requires SMT proof
+    /// Release funds transaction (PrivateChannel to Solana) - consumes a nonce bit
     ReleaseFunds(Box<ReleaseFundsBuilderWithNonce>),
     /// Initialize mint transaction (Solana → PrivateChannel) - simple initialize_mint instruction
     InitializeMint(Box<InitializeMintBuilder>),
     /// Mint transaction (Solana → PrivateChannel) - simple SPL mint, no proof needed
     Mint(Box<MintToBuilderWithTxnId>),
-    /// Reset SMT root transaction - rotates to new tree
-    ResetSmtRoot(Box<ResetSmtRootBuilderWithTarget>),
+    /// Rotate the withdrawal bitmap - clears the bits and opens the next generation
+    RotateBitmap(Box<RotateBitmapBuilder>),
 }
 
 impl TransactionBuilder {
+    /// The one place a builder variant is turned into the kind carried downstream.
+    pub fn kind(&self) -> TransactionKind {
+        match self {
+            Self::ReleaseFunds(_) => TransactionKind::ReleaseFunds,
+            Self::InitializeMint(_) => TransactionKind::InitializeMint,
+            Self::Mint(_) => TransactionKind::Mint,
+            Self::RotateBitmap(_) => TransactionKind::RotateBitmap,
+        }
+    }
+
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         match self {
             Self::ReleaseFunds(builder_with_nonce) => {
@@ -149,13 +176,13 @@ impl TransactionBuilder {
             }
             Self::InitializeMint(builder) => Ok(vec![builder.instruction()?]),
             Self::Mint(builder_with_txn_id) => builder_with_txn_id.builder.instructions(),
-            Self::ResetSmtRoot(rotation) => Ok(vec![rotation.builder.instruction()]),
+            Self::RotateBitmap(builder) => Ok(vec![builder.instruction()]),
         }
     }
 
     pub fn compute_unit_price(&self) -> Option<u64> {
         match self {
-            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => Some(1),
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => Some(1),
             Self::InitializeMint(_) | Self::Mint(_) => None,
         }
     }
@@ -165,13 +192,13 @@ impl TransactionBuilder {
     pub fn compute_budget(&self) -> Option<u32> {
         match self {
             Self::ReleaseFunds(_) => DEFAULT_CU_RELEASE_FUNDS,
-            Self::InitializeMint(_) | Self::Mint(_) | Self::ResetSmtRoot(_) => DEFAULT_CU_MINT,
+            Self::InitializeMint(_) | Self::Mint(_) | Self::RotateBitmap(_) => DEFAULT_CU_MINT,
         }
     }
 
     pub fn signers(&self) -> Vec<&'static Signer> {
         match self {
-            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => {
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => {
                 vec![SignerUtil::admin_signer(), SignerUtil::operator_signer()]
             }
             Self::InitializeMint(_) | Self::Mint(_) => vec![SignerUtil::admin_signer()],
@@ -184,7 +211,7 @@ impl TransactionBuilder {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.transaction_id),
             Self::Mint(builder) => Some(builder.txn_id),
-            Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
+            Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
         }
     }
 
@@ -192,14 +219,24 @@ impl TransactionBuilder {
         match self {
             Self::ReleaseFunds(b) => Some(b.trace_id.clone()),
             Self::Mint(b) => Some(b.trace_id.clone()),
-            Self::InitializeMint(_) | Self::ResetSmtRoot(_) => None,
+            Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
+        }
+    }
+
+    /// The fetch-time ownership token, present only for a deposit `Mint`. A
+    /// release carries its own token on the builder and arms it as a lease at
+    /// submission, so it is not reported here.
+    pub fn fetched_updated_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Mint(b) => Some(b.fetched_updated_at),
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::RotateBitmap(_) => None,
         }
     }
 
     pub fn withdrawal_nonce(&self) -> Option<u64> {
         match self {
             Self::ReleaseFunds(builder) => Some(builder.nonce),
-            Self::InitializeMint(_) | Self::Mint(_) | Self::ResetSmtRoot(_) => None,
+            Self::InitializeMint(_) | Self::Mint(_) | Self::RotateBitmap(_) => None,
         }
     }
 
@@ -211,13 +248,13 @@ impl TransactionBuilder {
     ///   verification to prevent duplicate issuance.
     /// - **ReleaseFunds**: Idempotent retry - Uses transaction nonce to prevent duplicates.
     ///   Safe to retry on transient network failures.
-    /// - **ResetSmtRoot**: Idempotent retry - binds expected_current_tree_index from its
-    ///   target, a value not read from chain, so a replay after the first reset lands is
-    ///   rejected on-chain (UnexpectedTreeIndex) rather than advancing the tree twice.
+    /// - **RotateBitmap**: Idempotent retry - carries expected_generation, so a replay
+    ///   after the first rotation lands is rejected on-chain (UnexpectedGeneration)
+    ///   rather than skipping a whole generation of nonces.
     pub fn retry_policy(&self) -> RetryPolicy {
         match self {
             Self::Mint(_) => RetryPolicy::None,
-            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::ResetSmtRoot(_) => {
+            Self::ReleaseFunds(_) | Self::InitializeMint(_) | Self::RotateBitmap(_) => {
                 RetryPolicy::Idempotent
             }
         }
@@ -229,7 +266,7 @@ impl TransactionBuilder {
             Self::InitializeMint(_) => {
                 ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_already_initialized_error)])
             }
-            Self::ReleaseFunds(_) | Self::ResetSmtRoot(_) => ExtraErrorCheckPolicy::None,
+            Self::ReleaseFunds(_) | Self::RotateBitmap(_) => ExtraErrorCheckPolicy::None,
         }
     }
 }
@@ -240,44 +277,6 @@ pub(crate) fn mint_extra_error_checks_policy() -> ExtraErrorCheckPolicy {
     ExtraErrorCheckPolicy::Extra(vec![Box::new(is_mint_not_initialized_error)])
 }
 
-/// A tree rotation paired with the generation it must produce.
-///
-/// The target is derived from the boundary withdrawal's nonce, never from chain, so it
-/// is the only value the sender can check a fresh on-chain read against and the only
-/// value that gives the program's replay guard content.
-#[derive(Clone, Debug)]
-pub struct ResetSmtRootBuilderWithTarget {
-    pub builder: ResetSmtRootBuilder,
-    /// Tree index this rotation must leave on-chain: `nonce / MAX_TREE_LEAVES`.
-    pub target_tree_index: u64,
-}
-
-impl ResetSmtRootBuilderWithTarget {
-    /// Wire the reset's accounts. One constructor for both arming paths, the
-    /// processor's boundary dispatch and the sender's re-arm from the stored target,
-    /// so an account added here can never be missed by one of them.
-    pub fn new(
-        admin_pubkey: Pubkey,
-        operator_pubkey: Pubkey,
-        instance_pda: Pubkey,
-        operator_pda: Pubkey,
-        event_authority_pda: Pubkey,
-        target_tree_index: u64,
-    ) -> Self {
-        let mut builder = ResetSmtRootBuilder::new();
-        builder
-            .payer(admin_pubkey)
-            .operator(operator_pubkey)
-            .instance(instance_pda)
-            .operator_pda(operator_pda)
-            .event_authority(event_authority_pda);
-        Self {
-            builder,
-            target_tree_index,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ReleaseFundsBuilderWithNonce {
     pub builder: ReleaseFundsBuilder,
@@ -285,10 +284,9 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub transaction_id: i64,
     pub trace_id: String,
     pub remint_info: Option<WithdrawalRemintInfo>,
-    /// The row's `updated_at` at the moment this builder took ownership of it,
-    /// used as the token the sender CASes on when it claims the row before
-    /// broadcasting. Proves the release is still the same `Processing`
-    /// incarnation, so a row recovery has since demoted is never released.
+    /// The row's `updated_at` at fetch time. The sender CASes on it when it
+    /// persists the write-ahead signature, proving the release still owns the
+    /// same `Processing` incarnation it was handed.
     pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -375,6 +373,16 @@ impl MintToBuilder {
         self.recipient_ata
     }
 
+    pub fn try_as_expected_mint(&self) -> Option<(Pubkey, Pubkey, Pubkey, Pubkey, u64)> {
+        Some((
+            self.mint?,
+            self.recipient_ata?,
+            self.mint_authority?,
+            self.token_program?,
+            self.amount?,
+        ))
+    }
+
     /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to]
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         let mint = self.mint.ok_or_else(|| ProgramError::InvalidBuilder {
@@ -450,9 +458,8 @@ pub struct MintToBuilderWithTxnId {
     pub builder: MintToBuilder,
     pub txn_id: i64,
     pub trace_id: String,
-    /// The row's `updated_at` at fetch time, used as the ownership token the
-    /// sender CASes on when it persists the write-ahead signature. Proves the
-    /// deposit is still the same `Processing` incarnation before broadcast.
+    /// The row's `updated_at` at fetch time, the ownership token the sender
+    /// CASes on when it persists the write-ahead signature.
     pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -500,7 +507,7 @@ impl InitializeMintBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use private_channel_escrow_program_client::instructions::ResetSmtRootBuilder;
+    use private_channel_escrow_program_client::instructions::RotateBitmapBuilder;
     use solana_sdk::pubkey::Pubkey;
 
     fn pk(i: u8) -> Pubkey {
@@ -512,6 +519,32 @@ mod tests {
     // ========================================================================
     // MintToBuilder
     // ========================================================================
+
+    #[test]
+    fn try_as_expected_mint_all_set() {
+        let mut b = MintToBuilder::new();
+        b.mint(pk(1))
+            .recipient_ata(pk(3))
+            .mint_authority(pk(5))
+            .token_program(pk(6))
+            .amount(100);
+        let result = b.try_as_expected_mint();
+        assert!(result.is_some());
+        let (mint, ata, auth, tp, amt) = result.unwrap();
+        assert_eq!(mint, pk(1));
+        assert_eq!(ata, pk(3));
+        assert_eq!(auth, pk(5));
+        assert_eq!(tp, pk(6));
+        assert_eq!(amt, 100);
+    }
+
+    #[test]
+    fn try_as_expected_mint_missing_field() {
+        let mut b = MintToBuilder::new();
+        b.mint(pk(1)).recipient_ata(pk(3));
+        // missing mint_authority, token_program, amount
+        assert!(b.try_as_expected_mint().is_none());
+    }
 
     fn fully_configured_builder() -> MintToBuilder {
         let mut b = MintToBuilder::new();
@@ -599,9 +632,8 @@ mod tests {
             .private_channel_escrow_program(pk(11))
             .amount(100)
             .user(pk(12))
-            .new_withdrawal_root([0u8; 32])
-            .transaction_nonce(42)
-            .sibling_proofs([0u8; 512]);
+            .withdrawal_bitmap(pk(13))
+            .transaction_nonce(42);
         TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
             builder: inner.clone(),
             nonce: 42,
@@ -631,19 +663,18 @@ mod tests {
         )))
     }
 
-    fn make_reset_smt_builder() -> TransactionBuilder {
-        let mut inner = ResetSmtRootBuilder::new();
+    fn make_rotate_bitmap_builder() -> TransactionBuilder {
+        let mut inner = RotateBitmapBuilder::new();
         inner
             .payer(pk(1))
             .operator(pk(2))
             .instance(pk(3))
-            .operator_pda(pk(4))
-            .event_authority(pk(5))
-            .private_channel_escrow_program(pk(6));
-        TransactionBuilder::ResetSmtRoot(Box::new(ResetSmtRootBuilderWithTarget {
-            builder: inner,
-            target_tree_index: 1,
-        }))
+            .withdrawal_bitmap(pk(4))
+            .operator_pda(pk(5))
+            .event_authority(pk(6))
+            .private_channel_escrow_program(pk(7))
+            .expected_generation(0);
+        TransactionBuilder::RotateBitmap(Box::new(inner.clone()))
     }
 
     #[test]
@@ -651,7 +682,7 @@ mod tests {
         assert_eq!(make_release_funds_builder().compute_unit_price(), Some(1));
         assert_eq!(make_init_mint_builder().compute_unit_price(), None);
         assert_eq!(make_mint_builder().compute_unit_price(), None);
-        assert_eq!(make_reset_smt_builder().compute_unit_price(), Some(1));
+        assert_eq!(make_rotate_bitmap_builder().compute_unit_price(), Some(1));
     }
 
     #[test]
@@ -662,7 +693,10 @@ mod tests {
         );
         assert_eq!(make_init_mint_builder().compute_budget(), DEFAULT_CU_MINT);
         assert_eq!(make_mint_builder().compute_budget(), DEFAULT_CU_MINT);
-        assert_eq!(make_reset_smt_builder().compute_budget(), DEFAULT_CU_MINT);
+        assert_eq!(
+            make_rotate_bitmap_builder().compute_budget(),
+            DEFAULT_CU_MINT
+        );
     }
 
     #[test]
@@ -670,7 +704,7 @@ mod tests {
         assert_eq!(make_release_funds_builder().transaction_id(), Some(7));
         assert_eq!(make_init_mint_builder().transaction_id(), None);
         assert_eq!(make_mint_builder().transaction_id(), Some(10));
-        assert_eq!(make_reset_smt_builder().transaction_id(), None);
+        assert_eq!(make_rotate_bitmap_builder().transaction_id(), None);
     }
 
     #[test]
@@ -684,7 +718,7 @@ mod tests {
             make_mint_builder().trace_id(),
             Some("trace-mint".to_string())
         );
-        assert_eq!(make_reset_smt_builder().trace_id(), None);
+        assert_eq!(make_rotate_bitmap_builder().trace_id(), None);
     }
 
     #[test]
@@ -692,7 +726,7 @@ mod tests {
         assert_eq!(make_release_funds_builder().withdrawal_nonce(), Some(42));
         assert_eq!(make_init_mint_builder().withdrawal_nonce(), None);
         assert_eq!(make_mint_builder().withdrawal_nonce(), None);
-        assert_eq!(make_reset_smt_builder().withdrawal_nonce(), None);
+        assert_eq!(make_rotate_bitmap_builder().withdrawal_nonce(), None);
     }
 
     #[test]
@@ -710,7 +744,7 @@ mod tests {
             RetryPolicy::None
         ));
         assert!(matches!(
-            make_reset_smt_builder().retry_policy(),
+            make_rotate_bitmap_builder().retry_policy(),
             RetryPolicy::Idempotent
         ));
     }
@@ -730,7 +764,7 @@ mod tests {
             ExtraErrorCheckPolicy::Extra(_)
         ));
         assert!(matches!(
-            make_reset_smt_builder().extra_error_checks_policy(),
+            make_rotate_bitmap_builder().extra_error_checks_policy(),
             ExtraErrorCheckPolicy::None
         ));
     }

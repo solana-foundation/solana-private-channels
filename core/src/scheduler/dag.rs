@@ -53,8 +53,13 @@ impl DAGScheduler {
                     dependencies.insert(dependent_tx);
                 }
 
+                // Skip our own lock, as the read loop below already does. A key
+                // repeated in the writable set would otherwise make the
+                // transaction depend on itself, and it would never become ready.
                 if let Some(write_tx) = locks.write_lock {
-                    dependencies.insert(write_tx);
+                    if write_tx != tx_index {
+                        dependencies.insert(write_tx);
+                    }
                 }
 
                 locks.write_lock = Some(tx_index);

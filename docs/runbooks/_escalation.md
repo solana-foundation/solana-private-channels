@@ -27,7 +27,7 @@ Send:
 
 Verification could not produce `LANDED` or `NOT_LANDED`. Cause is
 usually RPC unreachable, signature lookback rotated past `processed_at`,
-or evidence is contradictory (e.g. sig finalized but SMT leaf empty).
+or evidence is contradictory (e.g. sig finalized but the nonce's bit is clear).
 Funds may or may not be stranded; no recovery action is safe yet.
 
 Page: the on-call operator.

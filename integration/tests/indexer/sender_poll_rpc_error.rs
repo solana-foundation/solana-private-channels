@@ -34,7 +34,7 @@ use {
                 types::{InFlightTx, TransactionContext, MAX_IN_FLIGHT},
             },
             utils::{
-                instruction_util::{ExtraErrorCheckPolicy, RetryPolicy},
+                instruction_util::{ExtraErrorCheckPolicy, RetryPolicy, TransactionKind},
                 transaction_util::MAX_POLL_ATTEMPTS_CONFIRMATION,
             },
         },
@@ -67,6 +67,7 @@ fn make_in_flight_tx(
     InFlightTx {
         signature: sig,
         ctx: TransactionContext {
+            kind: TransactionKind::Mint,
             transaction_id: Some(txn_id),
             withdrawal_nonce: None,
             trace_id: Some(format!("trace-{txn_id}")),

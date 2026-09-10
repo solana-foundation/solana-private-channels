@@ -16,7 +16,7 @@ pub enum EventDiscriminators {
     SetNewAdmin = 5,
     Deposit = 6,
     ReleaseFunds = 7,
-    ResetSmtRoot = 8,
+    RotateBitmap = 8,
 }
 
 #[derive(CodamaType)]
@@ -269,8 +269,6 @@ pub struct ReleaseFundsEvent {
     pub user: Pubkey,
     /// Mint of the released tokens
     pub mint: Pubkey,
-    /// New withdrawal transactions root after release
-    pub new_withdrawal_root: [u8; 32],
 }
 
 impl ReleaseFundsEvent {
@@ -280,7 +278,6 @@ impl ReleaseFundsEvent {
         amount: u64,
         user: Pubkey,
         mint: Pubkey,
-        new_withdrawal_root: [u8; 32],
     ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::ReleaseFunds as u8,
@@ -289,13 +286,12 @@ impl ReleaseFundsEvent {
             amount,
             user,
             mint,
-            new_withdrawal_root,
         }
     }
 
-    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 8 (amount) + 32 (user) + 32 (mint) + 32 (new_withdrawal_root)
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 8 (amount) + 32 (user) + 32 (mint)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(177);
+        let mut data = Vec::with_capacity(145);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
@@ -303,37 +299,40 @@ impl ReleaseFundsEvent {
         data.extend_from_slice(&self.amount.to_le_bytes());
         data.extend_from_slice(self.user.as_ref());
         data.extend_from_slice(self.mint.as_ref());
-        data.extend_from_slice(&self.new_withdrawal_root);
         data
     }
 }
 
 #[derive(CodamaType)]
-pub struct ResetSmtRootEvent {
+pub struct RotateBitmapEvent {
     /// Unique u8 byte for event type.
     pub event_discriminator: u8,
     /// Instance seed pubkey
     pub instance_seed: Pubkey,
-    /// Operator who reset the SMT root
+    /// Operator who rotated the bitmap
     pub operator: Pubkey,
+    /// Generation the bitmap now covers
+    pub new_generation: u64,
 }
 
-impl ResetSmtRootEvent {
-    pub fn new(instance_seed: Pubkey, operator: Pubkey) -> Self {
+impl RotateBitmapEvent {
+    pub fn new(instance_seed: Pubkey, operator: Pubkey, new_generation: u64) -> Self {
         Self {
-            event_discriminator: EventDiscriminators::ResetSmtRoot as u8,
+            event_discriminator: EventDiscriminators::RotateBitmap as u8,
             instance_seed,
             operator,
+            new_generation,
         }
     }
 
-    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator)
+    // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (operator) + 8 (new_generation)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(73);
+        let mut data = Vec::with_capacity(81);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.operator.as_ref());
+        data.extend_from_slice(&self.new_generation.to_le_bytes());
         data
     }
 }
@@ -497,16 +496,8 @@ mod tests {
         let operator = Pubkey::new_from_array([2u8; 32]);
         let user = Pubkey::new_from_array([3u8; 32]);
         let mint = Pubkey::new_from_array([4u8; 32]);
-        let new_withdrawal_root = [5u8; 32];
         let amount = 500_000u64;
-        let event = ReleaseFundsEvent::new(
-            instance_seed,
-            operator,
-            amount,
-            user,
-            mint,
-            new_withdrawal_root,
-        );
+        let event = ReleaseFundsEvent::new(instance_seed, operator, amount, user, mint);
 
         assert_eq!(
             event.event_discriminator,
@@ -517,32 +508,33 @@ mod tests {
         assert_eq!(event.amount, amount);
         assert_eq!(event.user, user);
         assert_eq!(event.mint, mint);
-        assert_eq!(event.new_withdrawal_root, new_withdrawal_root);
 
-        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 8 (amount) + 32 (user) + 32 (mint) + 32 (new_withdrawal_root)
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 8 (amount) + 32 (user) + 32 (mint)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 177);
+        assert_eq!(bytes.len(), 145);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::ReleaseFunds as u8);
     }
 
     #[test]
-    fn test_reset_smt_root_event() {
+    fn test_rotate_bitmap_event() {
         let instance_seed = Pubkey::new_from_array([1u8; 32]);
         let operator = Pubkey::new_from_array([2u8; 32]);
-        let event = ResetSmtRootEvent::new(instance_seed, operator);
+        let new_generation = 3u64;
+        let event = RotateBitmapEvent::new(instance_seed, operator, new_generation);
 
         assert_eq!(
             event.event_discriminator,
-            EventDiscriminators::ResetSmtRoot as u8
+            EventDiscriminators::RotateBitmap as u8
         );
         assert_eq!(event.instance_seed, instance_seed);
         assert_eq!(event.operator, operator);
+        assert_eq!(event.new_generation, new_generation);
 
-        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator)
+        // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (operator) + 8 (new_generation)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 73);
+        assert_eq!(bytes.len(), 81);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
-        assert_eq!(bytes[8], EventDiscriminators::ResetSmtRoot as u8);
+        assert_eq!(bytes[8], EventDiscriminators::RotateBitmap as u8);
     }
 }

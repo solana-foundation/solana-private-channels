@@ -15,7 +15,8 @@ use helpers::{
     calculate_user_total_deposited, db, execute_user_deposits, execute_user_withdrawal,
     get_token_balance, operator_util, test_types::*, verify_database,
 };
-use private_channel_indexer::operator::tree_constants::MAX_TREE_LEAVES;
+use private_channel_indexer::operator::bitmap_constants::NONCES_PER_GENERATION;
+use private_channel_indexer::operator::find_withdrawal_bitmap_pda;
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
@@ -423,7 +424,8 @@ async fn verify_deposit_indexing(
 
     // Wait for checkpoint
     println!("Waiting for checkpoints to reach slot {}...", current_slot);
-    let checkpoint_ready = db::wait_for_checkpoint(pool, "escrow", current_slot, 30).await?;
+    let checkpoint_ready =
+        db::wait_for_checkpoint(pool, "escrow", current_slot, *WAIT_TIMEOUT_SECS).await?;
 
     assert!(checkpoint_ready, "Checkpoint did not catch up");
     println!("✓ Indexer caught up to slot {}\n", current_slot);
@@ -597,147 +599,127 @@ async fn execute_tree_rotation_boundary_phase(
     pool: &sqlx::PgPool,
     env: &TestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Phase 10 drives MAX_TREE_LEAVES withdrawals through the operator to trigger tree rotation.
-    // With the production value (65,536) this would require tens of thousands of on-chain
-    // transactions and would never finish on a test validator. Always compile with
-    // --features test-tree (MAX_TREE_LEAVES = 8) when running this test.
+    // Phase 10 drives a full generation of withdrawals through the operator to
+    // trigger a rotation. With the production window (65,536) this would need tens
+    // of thousands of on-chain transactions and would never finish on a test
+    // validator. Always compile with --features test-tree (window of 8).
     #[cfg(not(feature = "test-tree"))]
     panic!(
         "test_master_chaos_stress_test requires --features test-tree. \
-         Without it MAX_TREE_LEAVES={} and Phase 10 would need ~65k on-chain transactions.",
-        MAX_TREE_LEAVES
+         Without it NONCES_PER_GENERATION={} and Phase 10 would need ~65k on-chain transactions.",
+        NONCES_PER_GENERATION
     );
 
-    println!("\n## Tree Rotation Boundary Phase");
+    println!("\n## Bitmap Rotation Boundary Phase");
     println!(
-        "Testing tree rotation at boundary (MAX_TREE_LEAVES = {})...",
-        MAX_TREE_LEAVES
+        "Testing bitmap rotation at boundary (NONCES_PER_GENERATION = {})...",
+        NONCES_PER_GENERATION
     );
 
-    // Get current withdrawal count (only withdrawals have nonces that trigger rotation)
-    let current_withdrawal_count = db::count_transactions_by_type(pool, "withdrawal").await? as u64;
-    println!("Current withdrawal count: {}", current_withdrawal_count);
+    let opening = read_withdrawal_bitmap(client, &env.instance).await?;
+    assert_eq!(
+        opening.generation, 0,
+        "the rotation phase must start on the first generation"
+    );
 
-    // We need to reach just before MAX_TREE_LEAVES boundary
-    // Only withdrawals consume nonce space, so we need to count withdrawals only
-    // Create 5 withdrawals: the 5th at nonce=MAX_TREE_LEAVES will trigger rotation
-    let target_nonce = (MAX_TREE_LEAVES as u64) - 5; // Leave room for 5 boundary transactions
-    let withdrawals_needed = target_nonce.saturating_sub(current_withdrawal_count);
-
+    // Only withdrawals consume nonce space, one nonce per row.
+    let next_nonce = db::next_withdrawal_nonce(pool).await?;
     println!(
-        "Need {} more withdrawals to reach nonce {} (boundary at {})",
-        withdrawals_needed, target_nonce, MAX_TREE_LEAVES
+        "Next withdrawal nonce: {} (boundary at {})",
+        next_nonce, NONCES_PER_GENERATION
+    );
+    assert!(
+        next_nonce < NONCES_PER_GENERATION,
+        "earlier phases already crossed the boundary at nonce {}, so this phase cannot observe the rotation",
+        NONCES_PER_GENERATION
     );
 
-    if withdrawals_needed > 0 {
-        println!(
-            "Creating {} additional withdrawals to approach boundary...",
-            withdrawals_needed
-        );
-
-        for i in 0..withdrawals_needed {
-            let user_idx = (i % env.users.len() as u64) as usize;
-            // Withdraw small amount (1/20th of total balance)
-            let small_amount = calculate_user_total_deposited(user_idx) / 20;
-            let withdrawal_tx = execute_user_withdrawal(
-                client.as_ref(),
-                &env.users[user_idx],
-                env.mint,
-                small_amount,
-            )
-            .await?;
-
-            // Wait for each withdrawal to complete before proceeding
-            operator_util::wait_for_transaction_completion(pool, &withdrawal_tx.signature, 60)
-                .await?;
-            if i % 1000 == 0 {
-                println!(
-                    "{}/{} withdrawals ({:.1}%) processed by operator",
-                    i + 1,
-                    withdrawals_needed,
-                    (i + 1) as f64 / withdrawals_needed as f64 * 100.0
-                );
-            }
-        }
-
-        println!(
-            "✓ Created {} withdrawals, all processed by operator",
-            withdrawals_needed
-        );
+    // Fill the rest of the window one withdrawal at a time. Serialising them
+    // keeps the nonce each release consumes predictable, which is what makes the
+    // bitmap assertions below exact rather than a count.
+    let fill_count = NONCES_PER_GENERATION - next_nonce;
+    println!(
+        "Releasing {} withdrawals to consume the rest of generation 0...",
+        fill_count
+    );
+    for i in 0..fill_count {
+        let user_idx = (i % env.users.len() as u64) as usize;
+        // Small next to the user's balance, so no single withdrawal can drain it.
+        let small_amount = calculate_user_total_deposited(user_idx) / 20;
+        let withdrawal_tx = execute_user_withdrawal(
+            client.as_ref(),
+            &env.users[user_idx],
+            env.mint,
+            small_amount,
+        )
+        .await?;
+        operator_util::wait_for_transaction_completion(pool, &withdrawal_tx.signature).await?;
+        println!("  ✓ nonce {} released", next_nonce + i);
     }
 
-    // Now create 5 boundary withdrawal transactions
-    // The 5th one will be at nonce=MAX_TREE_LEAVES, triggering tree rotation
-    println!("\nCreating withdrawal transactions at tree boundary...");
-    let current_withdrawal_nonce = db::count_transactions_by_type(pool, "withdrawal").await? as u64;
-
-    // Small withdrawal amounts for boundary testing
-    let small_amount = calculate_user_total_deposited(0) / 20;
-
-    println!(
-        "  Withdrawal nonce {} (5 before boundary)...",
-        current_withdrawal_nonce
+    let filled = read_withdrawal_bitmap(client, &env.instance).await?;
+    assert_eq!(
+        filled.generation, 0,
+        "the window must not rotate before a boundary nonce is released"
     );
-    let tx_1 =
-        execute_user_withdrawal(client.as_ref(), &env.users[0], env.mint, small_amount).await?;
-
-    println!(
-        "  Withdrawal nonce {} (4 before boundary)...",
-        current_withdrawal_nonce + 1
+    assert_eq!(
+        filled.consumed,
+        (0..NONCES_PER_GENERATION).collect::<Vec<u64>>(),
+        "every nonce of generation 0 must be consumed before the boundary"
     );
-    let tx_2 =
-        execute_user_withdrawal(client.as_ref(), &env.users[1], env.mint, small_amount).await?;
+    println!("✓ Generation 0 fully consumed, still on generation 0");
 
+    // This nonce opens the next window, so the operator has to rotate before it
+    // can release it.
     println!(
-        "  Withdrawal nonce {} (3 before boundary)...",
-        current_withdrawal_nonce + 2
+        "\nReleasing the boundary nonce {} (should trigger rotation)...",
+        NONCES_PER_GENERATION
     );
-    let tx_3 =
-        execute_user_withdrawal(client.as_ref(), &env.users[2], env.mint, small_amount).await?;
+    let boundary_tx = execute_user_withdrawal(
+        client.as_ref(),
+        &env.users[0],
+        env.mint,
+        calculate_user_total_deposited(0) / 20,
+    )
+    .await?;
+    operator_util::wait_for_transaction_completion(pool, &boundary_tx.signature).await?;
 
-    println!(
-        "  Withdrawal nonce {} (2 before boundary)...",
-        current_withdrawal_nonce + 3
-    );
-    let tx_4 =
-        execute_user_withdrawal(client.as_ref(), &env.users[3], env.mint, small_amount).await?;
-
-    println!(
-        "  Withdrawal nonce {} (AT boundary - should trigger rotation)...",
-        current_withdrawal_nonce + 4
-    );
-    let tx_5 =
-        execute_user_withdrawal(client.as_ref(), &env.users[4], env.mint, small_amount).await?;
-
-    println!("\n✓ Created 5 boundary withdrawal transactions");
-    println!("  Waiting for operator to process and handle tree rotation...");
-
-    // Wait for operator to process all transactions
-    operator_util::wait_for_transaction_completion(pool, &tx_1.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &tx_2.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &tx_3.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &tx_4.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &tx_5.signature, 60).await?;
-
-    println!("✓ All boundary transactions processed");
-
-    // Verify on-chain tree_index incremented
-    println!("\nVerifying tree rotation occurred...");
-    let instance_data = client.get_account_data(&env.instance).await?;
-    let instance = private_channel_escrow_program_client::Instance::from_bytes(&instance_data)?;
+    // Verify the on-chain generation advanced and the bits were cleared.
+    println!("\nVerifying bitmap rotation occurred...");
+    let bitmap = read_withdrawal_bitmap(client, &env.instance).await?;
 
     assert_eq!(
-        instance.current_tree_index, 1,
-        "Tree should have rotated to index 1"
+        bitmap.generation, 1,
+        "the boundary release must rotate the bitmap to generation 1"
+    );
+    // The new window reuses the same bit positions, so a bit the rotation failed
+    // to clear would resurface here as an already-consumed nonce. Only the
+    // boundary nonce itself may be set.
+    assert_eq!(
+        bitmap.consumed,
+        vec![NONCES_PER_GENERATION],
+        "rotation must clear every bit of the previous generation"
     );
 
-    println!("✓ Tree rotation successful! current_tree_index = 1");
+    println!("✓ Bitmap rotation successful! generation = 1");
     println!(
-        "✓ Operator correctly handled tree boundary at {}",
-        MAX_TREE_LEAVES
+        "✓ Operator correctly handled the generation boundary at {}",
+        NONCES_PER_GENERATION
     );
 
     Ok(())
+}
+
+/// Read and decode this instance's withdrawal bitmap.
+async fn read_withdrawal_bitmap(
+    client: &Arc<RpcClient>,
+    instance: &solana_sdk::pubkey::Pubkey,
+) -> Result<private_channel_indexer::operator::BitmapState, Box<dyn std::error::Error>> {
+    let bitmap_pda = find_withdrawal_bitmap_pda(instance);
+    let data = client.get_account_data(&bitmap_pda).await?;
+    Ok(private_channel_indexer::operator::parse_withdrawal_bitmap(
+        &data,
+    )?)
 }
 
 #[allow(dead_code)]
@@ -747,7 +729,14 @@ async fn execute_post_rotation_verification_phase(
     env: &TestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n## Post-Rotation Verification Phase");
-    println!("Creating 3 additional withdrawals to verify tree_index=1 works correctly...");
+    println!("Creating 3 additional withdrawals to verify generation 1 works correctly...");
+
+    let before = read_withdrawal_bitmap(client, &env.instance).await?;
+    assert_eq!(
+        before.generation, 1,
+        "the post-rotation phase must start in generation 1"
+    );
+    let first_new_nonce = db::next_withdrawal_nonce(pool).await?;
 
     let small_amount = calculate_user_total_deposited(0) / 20;
 
@@ -776,20 +765,25 @@ async fn execute_post_rotation_verification_phase(
 
     // Wait for all post-rotation withdrawals to complete
     println!("Waiting for post-rotation withdrawals to complete...");
-    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_1.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_2.signature, 60).await?;
-    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_3.signature, 60).await?;
+    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_1.signature).await?;
+    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_2.signature).await?;
+    operator_util::wait_for_transaction_completion(pool, &post_rotation_tx_3.signature).await?;
 
     println!("✓ All 3 post-rotation withdrawals completed successfully");
 
-    // Final verification that tree_index is still 1
-    let instance_data = client.get_account_data(&env.instance).await?;
-    let instance = private_channel_escrow_program_client::Instance::from_bytes(&instance_data)?;
+    // These must consume bits in the new window without rotating again.
+    let bitmap = read_withdrawal_bitmap(client, &env.instance).await?;
     assert_eq!(
-        instance.current_tree_index, 1,
-        "Tree index should remain at 1 after post-rotation withdrawals"
+        bitmap.generation, 1,
+        "three withdrawals inside one window must not rotate again"
     );
-    println!("✓ Verified tree_index = 1 (stable after rotation)");
+    let mut expected = before.consumed.clone();
+    expected.extend([first_new_nonce, first_new_nonce + 1, first_new_nonce + 2]);
+    assert_eq!(
+        bitmap.consumed, expected,
+        "each post-rotation withdrawal must consume its own nonce in the new generation"
+    );
+    println!("✓ Verified generation = 1 (stable after rotation)");
 
     Ok(())
 }
