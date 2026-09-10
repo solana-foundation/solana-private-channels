@@ -334,9 +334,11 @@ impl ResyncService {
         let consumed = self.build_consumed_set().await?;
 
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
-        // Not a safety check: the drop below runs on the lock's own session and so cannot
-        // outlive the lock whatever this says. Asking first turns a lock already lost into
-        // a clean refusal rather than an error from halfway through the drop.
+        // Two different failures are covered here. A session that died takes the drop with
+        // it, because the drop runs on that session. A loss verdict that was wrong leaves
+        // the session alive and still holding the lock, so only this check can stop it,
+        // and stop it is what we want: the rebuild below watches the same token and would
+        // abort immediately after, leaving the tables dropped and nothing put back.
         live_lock.ensure_held().await.inspect_err(|e| {
             error!("Refusing to drop tables: {}", e);
         })?;

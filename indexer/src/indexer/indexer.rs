@@ -87,6 +87,26 @@ where
     }
 }
 
+/// Wind the checkpoint writer down once the processor has ended.
+///
+/// Closing its channel is the writer's cue to flush, which is what a restart needs. A lost
+/// lock turns that into a hazard: a resync may already be dropping these tables, and the
+/// flush would commit a durable frontier over the rebuild. So the writer is aborted
+/// instead, which costs no more than an abrupt kill since the durable checkpoint stands.
+async fn finish_checkpoint_writer(
+    lock_lost: &CancellationToken,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
+    checkpoint_handle: tokio::task::JoinHandle<()>,
+) {
+    if lock_lost.is_cancelled() {
+        error!("Live-state lock lost; abandoning the checkpoint flush");
+        checkpoint_handle.abort();
+        return;
+    }
+    drop(checkpoint_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), checkpoint_handle).await;
+}
+
 /// Race the running processor task against the shutdown signal. Biased to the
 /// processor so a fatal error that becomes ready at the same moment as the
 /// signal still wins, and the caller exits non-zero instead of reporting a
@@ -949,6 +969,9 @@ pub async fn run(
     // and by the datasource), so the processor side only fires on a fatal write
     // failure or a panic - both must crash the process so the supervisor
     // restarts it and the failed slot replays from the durable checkpoint.
+    // Kept back from the move below: the processor arm has to ask the same question the
+    // signal arm does, and a task dying is exactly when the lock tends to have gone too.
+    let processor_end_lock_lost = live_lock_lost.clone();
     match supervise(
         &mut processor_handle,
         stop_signal(signal::ctrl_c(), live_lock_lost),
@@ -957,15 +980,21 @@ pub async fn run(
     {
         Supervision::ProcessorEnded(res) => {
             // Flush batched checkpoints for already-committed slots so a restart resumes
-            // from the latest durable point; timeout-bounded since a dead DB would stall it.
+            // from the latest durable point, unless the lock is gone and the flush would
+            // land on a rebuild.
             cancellation_token.cancel();
             drop(instruction_tx);
-            drop(checkpoint_tx);
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), checkpoint_handle).await;
+            finish_checkpoint_writer(&processor_end_lock_lost, checkpoint_tx, checkpoint_handle)
+                .await;
 
             match res {
                 Ok(Ok(())) => {
+                    // Only clean if the lock held throughout. Exiting zero otherwise would
+                    // report success for a database that may be being rebuilt underneath.
+                    if processor_end_lock_lost.is_cancelled() {
+                        error!("Live-state lock lost; the processor stopped without draining");
+                        return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
+                    }
                     info!("TransactionProcessor stopped cleanly");
                 }
                 Ok(Err(e)) => {
@@ -1173,6 +1202,54 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, Supervision::ProcessorEnded(Err(_))));
+    }
+
+    /// A writer stand-in that records whether it saw its channel close, which is the cue
+    /// it flushes on. Returns the flag and the pieces `finish_checkpoint_writer` takes.
+    fn checkpoint_writer_stub() -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        mpsc::Sender<CheckpointMsg>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel::<CheckpointMsg>(1);
+        let observed = Arc::clone(&flushed);
+        let handle = tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        (flushed, tx, handle)
+    }
+
+    /// The ordinary processor-death path still has to flush, or a restart would replay
+    /// slots that were already committed.
+    #[tokio::test]
+    async fn checkpoint_writer_flushes_when_the_lock_is_held() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+
+        finish_checkpoint_writer(&CancellationToken::new(), tx, handle).await;
+
+        assert!(
+            flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a processor that ended under a held lock must let the writer flush"
+        );
+    }
+
+    /// The same path under a lost lock must not flush: a resync may already be dropping
+    /// these tables, and the frontier would land on the rebuild.
+    #[tokio::test]
+    async fn checkpoint_writer_is_abandoned_when_the_lock_is_lost() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+        let lost = CancellationToken::new();
+        lost.cancel();
+
+        finish_checkpoint_writer(&lost, tx, handle).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a lost lock must abort the writer rather than cue its flush"
+        );
     }
 
     /// One-shot backfill: every slot recorded, and the checkpoint only reaching the target

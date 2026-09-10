@@ -13,6 +13,7 @@ use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -396,15 +397,18 @@ pub async fn run(
                 // Stopping outright costs no more than an abrupt kill, which the recovery
                 // worker already handles.
                 StopReason::LiveLockLost => {
-                    error!("Live-state lock lost; stopping without draining");
-                    cancellation_token.cancel();
-                    fetcher_handle.abort();
-                    processor_handle.abort();
-                    sender_handle.abort();
-                    storage_writer_handle.abort();
-                    recovery_handle.abort();
-                    reconciliation_handle.abort();
-                    feepayer_monitor_handle.abort();
+                    stop_without_draining(
+                        &cancellation_token,
+                        &[
+                            fetcher_handle.abort_handle(),
+                            processor_handle.abort_handle(),
+                            sender_handle.abort_handle(),
+                            storage_writer_handle.abort_handle(),
+                            recovery_handle.abort_handle(),
+                            reconciliation_handle.abort_handle(),
+                            feepayer_monitor_handle.abort_handle(),
+                        ],
+                    );
                     return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
                 }
                 StopReason::Interrupted => {
@@ -427,6 +431,25 @@ pub async fn run(
         _ = &mut recovery_handle => {
             critical_exit(pt_label, "recovery");
         }
+    }
+
+    // A critical task dying and the lock going are one failure when the database is what
+    // went away, so the exit path has to ask the same question the signal path did.
+    // Draining here would broadcast and flush into tables a resync may already be dropping.
+    if live_lock_lost.is_cancelled() {
+        stop_without_draining(
+            &cancellation_token,
+            &[
+                fetcher_handle.abort_handle(),
+                processor_handle.abort_handle(),
+                sender_handle.abort_handle(),
+                storage_writer_handle.abort_handle(),
+                recovery_handle.abort_handle(),
+                reconciliation_handle.abort_handle(),
+                feepayer_monitor_handle.abort_handle(),
+            ],
+        );
+        return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
     }
 
     // Graceful shutdown — runs on both the ctrl-c path and the critical-task-
@@ -599,6 +622,19 @@ async fn validate_withdraw_fallback(
 /// `shutdown_operator` so the remaining tasks get the usual graceful-shutdown
 /// treatment.  The process will exit naturally once `shutdown_operator`
 /// returns, and the supervisor will restart the operator.
+/// Stop every worker outright, for a lost live-state lock.
+///
+/// Nothing may drain: Postgres frees the lock the instant our session dies, so a resync may
+/// already be dropping the tables these tasks broadcast and write into. Costs no more than
+/// an abrupt kill, which the recovery worker already handles.
+fn stop_without_draining(cancellation_token: &CancellationToken, workers: &[AbortHandle]) {
+    error!("Live-state lock lost; stopping without draining");
+    cancellation_token.cancel();
+    for worker in workers {
+        worker.abort();
+    }
+}
+
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,
@@ -612,6 +648,31 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every worker must be stopped outright, not asked to finish. A drain here would
+    /// broadcast and write into tables a resync may already be dropping.
+    #[tokio::test]
+    async fn stop_without_draining_aborts_every_worker() {
+        let workers: Vec<_> = (0..3)
+            .map(|_| tokio::spawn(async { std::future::pending::<()>().await }))
+            .collect();
+        let aborts: Vec<_> = workers.iter().map(|w| w.abort_handle()).collect();
+        let cancellation_token = CancellationToken::new();
+
+        stop_without_draining(&cancellation_token, &aborts);
+
+        assert!(
+            cancellation_token.is_cancelled(),
+            "the shared token must be cancelled so cooperative tasks stop too"
+        );
+        for worker in workers {
+            assert!(
+                worker.await.unwrap_err().is_cancelled(),
+                "a worker that was only signalled, not aborted, could still write"
+            );
+        }
+    }
+
     use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;

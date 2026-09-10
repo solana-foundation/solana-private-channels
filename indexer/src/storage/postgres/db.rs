@@ -68,6 +68,11 @@ const LOCK_KEEPALIVE_IDLE_SECS: u32 = 60;
 const LOCK_KEEPALIVE_INTERVAL_SECS: u32 = 15;
 const LOCK_KEEPALIVE_COUNT: u32 = 3;
 
+/// How long a statement on a lock session may wait for a lock another session holds.
+/// A resync runs with the workers scaled to zero, so nothing should be queueing it; this
+/// is long enough to outlast a passing query and short enough to fail fast otherwise.
+const LOCK_WAIT_TIMEOUT_MS: &str = "10000";
+
 /// Ask Postgres to reap this session quickly if the holder's host disappears.
 ///
 /// A vanished host sends no FIN, so the backend sits in `recv()` holding the
@@ -89,6 +94,24 @@ pub async fn apply_lock_session_keepalives(conn: &mut PgConnection) {
 
     if let Err(e) = applied {
         warn!("Could not set TCP keepalives on the lock session: {e}");
+    }
+}
+
+/// Bound how long fenced work waits for somebody else's table lock.
+///
+/// The drop needs ACCESS EXCLUSIVE on every table, so one unexpected session holding a
+/// read is enough to queue it. Without this that wait is unbounded, and the heartbeat
+/// reads the busy connection as alive, so a queued drop wedges the resync while it holds
+/// the exclusive lock and every worker stays refused. Best effort; the client-side cap
+/// still applies.
+pub async fn apply_lock_session_lock_timeout(conn: &mut PgConnection) {
+    // `SET` takes no bind parameters, which would force the value into the statement text.
+    if let Err(e) = sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+        .bind(LOCK_WAIT_TIMEOUT_MS)
+        .execute(conn)
+        .await
+    {
+        warn!("Could not set lock_timeout on the lock session: {e}");
     }
 }
 
@@ -1324,6 +1347,7 @@ impl PostgresDb {
         // which is the failure these settings exist to prevent. A refused acquire
         // returns the connection to the pool still carrying them, which is harmless.
         apply_lock_session_keepalives(&mut conn).await;
+        apply_lock_session_lock_timeout(&mut conn).await;
         let acquired: bool = sqlx::query_scalar(mode.acquire_sql())
             .bind(LIVE_STATE_LOCK_KEY)
             .fetch_one(&mut *conn)

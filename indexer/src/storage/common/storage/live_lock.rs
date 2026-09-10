@@ -75,6 +75,12 @@ impl LiveLockMode {
     }
 }
 
+/// Cap on one piece of fenced work. Sized for the table drop, which is the only fenced
+/// caller: a catalog update and an unlink rather than a scan, so minutes are already far
+/// beyond any healthy run. Waiting on somebody else's table lock is bounded separately and
+/// much sooner by the session's `lock_timeout`.
+const FENCED_WORK_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Every reason a live-state lock can be declared lost. Shared so the emitting code
 /// and the pre-registration below read one list and neither can drift.
 const LOSS_REASONS: [&str; 3] = ["not_held", "probe_error", "probe_timeout"];
@@ -144,6 +150,11 @@ impl LiveLockSession {
 #[derive(Debug)]
 pub struct LiveLockHandle {
     stop: CancellationToken,
+    /// Cancelled once the heartbeat stops being able to prove ownership. Held here so
+    /// the guard can refuse destructive work on our own verdict, not only on the
+    /// server's answer: a verdict leaves the session parked and still holding the lock,
+    /// so Postgres would still report it held.
+    lost: CancellationToken,
     session: Arc<LiveLockSession>,
     /// Never aborted: aborting would drop the connection at an await point and
     /// skip the close, so the lock would linger until the pool noticed. Cancel
@@ -217,7 +228,20 @@ impl LiveLockGuard {
 }
 
 impl LiveLockHandle {
+    /// True once our own heartbeat has given up on the lock.
+    ///
+    /// A verdict can be a false positive, and the session is parked open afterwards
+    /// rather than closed, so it goes on holding the lock and the server goes on
+    /// reporting it held. Destruction needs both answers to agree.
+    fn vouched_for(&self) -> Result<(), StorageError> {
+        if self.lost.is_cancelled() {
+            return Err(StorageError::LiveStateLockLost);
+        }
+        Ok(())
+    }
+
     async fn ensure_held(&self) -> Result<(), StorageError> {
+        self.vouched_for()?;
         let mut guard = self.session.conn.lock().await;
         let Some(conn) = guard.as_mut() else {
             return Err(StorageError::LiveStateLockLost);
@@ -237,13 +261,23 @@ impl LiveLockHandle {
     where
         F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
     {
+        self.vouched_for()?;
         let mut guard = self.session.conn.lock().await;
         let Some(conn) = guard.as_mut() else {
             return Err(StorageError::LiveStateLockLost);
         };
+        // Bounded so the mutex cannot be held forever. The heartbeat probes through the
+        // same mutex and reads a busy one as "in use, still alive", so unbounded work
+        // here would leave it tolerating a wedged session for as long as that lasted.
+        let outcome = match tokio::time::timeout(FENCED_WORK_TIMEOUT, f(conn)).await {
+            Ok(result) => result,
+            Err(_) => Err(sqlx::Error::Protocol(
+                "fenced work timed out on the live-state lock session".into(),
+            )),
+        };
         // Any failure here is a lost lock as far as the caller is concerned. The session
         // is the lock, so a statement it could not run is one we could not fence.
-        f(conn).await.map_err(|e| {
+        outcome.map_err(|e| {
             error!("Fenced work on the live-state lock session failed: {e}");
             StorageError::LiveStateLockLost
         })
@@ -296,6 +330,9 @@ fn spawn_heartbeat(
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
     let task_session = session.clone();
+    // Kept for the guard as well as the reporter: the guard refuses destructive work on
+    // it, which the server's own answer cannot stand in for once the session is parked.
+    let lost = on_lost.clone();
     let task = tokio::spawn(async move {
         let probe_session = task_session.clone();
         super::sender_lock::run_lock_heartbeat(
@@ -323,6 +360,7 @@ fn spawn_heartbeat(
     });
     LiveLockHandle {
         stop,
+        lost,
         session,
         task: Some(task),
     }

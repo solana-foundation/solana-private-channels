@@ -17,7 +17,8 @@ use private_channel_indexer::{
         common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
         common::storage::sender_lock::SenderLockGuard,
         postgres::db::{
-            apply_lock_session_keepalives, probe_advisory_lock_held, release_advisory_lock,
+            apply_lock_session_keepalives, apply_lock_session_lock_timeout,
+            probe_advisory_lock_held, release_advisory_lock,
         },
         DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
     },
@@ -3009,6 +3010,120 @@ async fn fenced_drop_refuses_once_the_lock_session_is_gone(
     assert!(
         transactions_table_exists(&pool).await,
         "the refused drop must leave the schema standing"
+    );
+    Ok(())
+}
+
+/// I14. The finding this test exists for: a loss verdict can be a false positive, and the
+/// heartbeat deliberately parks the session open afterwards. So the server still reports
+/// the lock as held and a probe alone says "go ahead". Acting on that drops every table
+/// and then refuses to rebuild, because the rebuild watches the same token. The guard has
+/// to refuse on our own verdict, not just on the server's answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_false_loss_verdict_refuses_the_drop() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let lost = CancellationToken::new();
+    let guard = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Exclusive,
+            "i14_resync",
+            lost.clone(),
+            Duration::ZERO,
+        )
+        .await?;
+
+    // The session is untouched, so this stands in for a verdict that was wrong.
+    lost.cancel();
+
+    assert_eq!(
+        live_lock_holders(&url).await.len(),
+        1,
+        "the session must still hold the lock, or this is not the false-positive case"
+    );
+    assert!(
+        guard.ensure_held().await.is_err(),
+        "a lock we can no longer vouch for must fail the check that guards the drop"
+    );
+    assert!(
+        storage.drop_tables_fenced(&guard).await.is_err(),
+        "the drop must be refused even though the server still reports the lock held"
+    );
+    assert!(
+        transactions_table_exists(&pool).await,
+        "a refused drop must leave the database intact"
+    );
+    Ok(())
+}
+
+/// I15. The drop needs ACCESS EXCLUSIVE on every table, so one stray reader is enough to
+/// queue it. Unbounded, that wait wedges the resync while it holds the exclusive lock and
+/// every worker stays refused, and the heartbeat cannot see it because a busy connection
+/// reads as alive. The session's own lock_timeout is what bounds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lock_session_bounds_its_lock_waits() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let mut conn = pg_connect(&url).await;
+    apply_lock_session_lock_timeout(&mut conn).await;
+
+    let lock_timeout: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(
+        lock_timeout, "10s",
+        "the lock session must bound how long it waits for another session's lock"
+    );
+    Ok(())
+}
+
+/// I16. The same bound, observed through the fenced drop itself: a competing table lock
+/// must make it fail rather than hang. The elapsed time is what says which bound fired,
+/// since the client-side cap is minutes away.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_drop_blocked_on_a_table_lock_fails_rather_than_hanging(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "i16_resync",
+        Duration::ZERO,
+    )
+    .await?;
+
+    // A plain read is enough: it takes ACCESS SHARE, which the drop's ACCESS EXCLUSIVE
+    // has to wait out.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT 1 FROM transactions LIMIT 1")
+        .execute(&mut blocker)
+        .await?;
+
+    let started = std::time::Instant::now();
+    let blocked = storage.drop_tables_fenced(&guard).await;
+    let elapsed = started.elapsed();
+
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+
+    assert!(
+        blocked.is_err(),
+        "a drop queued behind another session's lock must fail, got {blocked:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "it must be the session's lock_timeout that fired, not the client cap; took {elapsed:?}"
+    );
+    assert!(
+        transactions_table_exists(&pool).await,
+        "a drop that never ran must leave the schema standing"
     );
     Ok(())
 }
