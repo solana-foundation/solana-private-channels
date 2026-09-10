@@ -25,6 +25,12 @@ pub trait StageMetrics: Send + Sync {
     fn executor_results_send_failed(&self, kind: &'static str);
     fn executor_missing_results(&self, kind: &'static str);
     fn executor_dropped_expired_blockhash(&self, count: usize);
+    /// Transactions failed for referencing more account data than the SVM would
+    /// load. Sustained non-zero means someone is probing the preload path.
+    fn executor_oversized_transactions(&self, count: usize);
+    /// Transactions held back because their batch hit its preload byte budget.
+    /// They run in the next sub-batch, so this is throughput, not loss.
+    fn executor_batch_deferred(&self, count: usize);
     fn executor_conservation_rejected(&self);
     /// A batch aborted because its accounts could not be loaded. Non-zero means
     /// the executor stopped rather than execute against unknown state.
@@ -131,6 +137,12 @@ impl StageMetrics for NoopMetrics {
     }
     fn executor_dropped_expired_blockhash(&self, count: usize) {
         debug!("executor: dropped {} expired blockhash txs", count);
+    }
+    fn executor_oversized_transactions(&self, count: usize) {
+        debug!("executor: failed {} oversized txs", count);
+    }
+    fn executor_batch_deferred(&self, count: usize) {
+        debug!("executor: deferred {} txs past the preload budget", count);
     }
     fn executor_conservation_rejected(&self) {
         debug!("executor: rejected tx failing lamport conservation");
@@ -355,6 +367,18 @@ counter_vec!(
     &[]
 );
 counter_vec!(
+    EXECUTOR_OVERSIZED_TXS,
+    "private_channel_executor_oversized_transactions_total",
+    "Transactions failed for referencing more account data than the SVM would load",
+    &[]
+);
+counter_vec!(
+    EXECUTOR_BATCH_DEFERRED,
+    "private_channel_executor_batch_deferred_total",
+    "Transactions held back because their batch reached its preload byte budget",
+    &[]
+);
+counter_vec!(
     EXECUTOR_PRELOAD_FATAL,
     "private_channel_executor_preload_fatal_total",
     "Batches aborted because the accounts they reference could not be loaded",
@@ -574,6 +598,16 @@ impl StageMetrics for PrometheusMetrics {
     }
     fn executor_dropped_expired_blockhash(&self, count: usize) {
         EXECUTOR_DROPPED_EXPIRED_BH
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
+    }
+    fn executor_oversized_transactions(&self, count: usize) {
+        EXECUTOR_OVERSIZED_TXS
+            .with_label_values(&[] as &[&str])
+            .inc_by(count as f64);
+    }
+    fn executor_batch_deferred(&self, count: usize) {
+        EXECUTOR_BATCH_DEFERRED
             .with_label_values(&[] as &[&str])
             .inc_by(count as f64);
     }
