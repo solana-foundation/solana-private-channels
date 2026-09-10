@@ -36,7 +36,7 @@
 ### AllowMint (10 integration tests)
 
 - `test_allow_mint_success` — SPL Token mint
-- `test_allow_mint_duplicate` — duplicate mint fails
+- `test_allow_mint_twice_repins_instead_of_failing` — since BlockMint stopped closing the PDA, a second AllowMint re-pins the profile and re-opens both gates; expires the blockhash so the second transaction is not dropped as a replay
 - `test_allow_mint_invalid_pda` — wrong PDA rejected
 - `test_allow_mint_invalid_admin_not_signer` — unsigned admin rejected
 - `test_allow_mint_invalid_admin` — wrong admin rejected

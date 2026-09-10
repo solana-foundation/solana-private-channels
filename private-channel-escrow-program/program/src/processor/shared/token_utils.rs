@@ -165,10 +165,12 @@ const TRANSFER_CHECKED_DISCRIMINATOR: u8 = 12;
 /// `ExtraAccountMetaList` itself and rejects the CPI if they do not satisfy
 /// it, so resolving them is the client's job.
 ///
-/// Each extra is forwarded with its writable flag but never its signer bit:
-/// a hostile `ExtraAccountMetaList` can name an account that signed this
-/// transaction, and stripping the bit keeps the hook from receiving that
-/// signature.
+/// Each extra keeps its writable flag but never its signer bit, so a hostile
+/// `ExtraAccountMetaList` naming the payer or user cannot borrow their
+/// signature. The authority is passed as a signer and so not covered by the
+/// strip; `spl-tlv-account-resolution` clamps resolved extras to the
+/// privileges the address holds in the hook's `Execute`, where it is readonly.
+/// A mint that genuinely needs a signer extra is untransferable here.
 ///
 /// Ported from <https://github.com/solana-foundation/dvp>.
 #[inline(always)]

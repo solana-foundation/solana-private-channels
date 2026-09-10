@@ -1,4 +1,5 @@
 use crate::{
+    assertions::assert_allow_mint_account,
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance},
     utils::{
@@ -45,7 +46,7 @@ fn test_allow_mint_success() {
 }
 
 #[test]
-fn test_allow_mint_duplicate() {
+fn test_allow_mint_twice_repins_instead_of_failing() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let mint = Keypair::new();
@@ -68,7 +69,11 @@ fn test_allow_mint_duplicate() {
     )
     .expect("First AllowMint should succeed");
 
-    // Second allow mint with same mint should fail
+    // Without this the second transaction is byte-identical to the first and
+    // gets dropped as an already-processed signature, so the program would
+    // never run and this would pass whatever the handler does.
+    context.svm.expire_blockhash();
+
     let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
     let instance_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
@@ -92,10 +97,20 @@ fn test_allow_mint_duplicate() {
         .bump(bump)
         .instruction();
 
-    let result = context.send_transaction_with_signers(instruction, &[&admin]);
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("A second AllowMint re-pins the profile rather than failing");
 
-    // Should fail because account already exists
-    assert!(result.is_err(), "Duplicate allow mint should fail");
+    // BlockMint no longer closes the PDA, so AllowMint has to tolerate an
+    // existing account. Re-pins decimals and token program, and re-opens both
+    // gates. `test_allow_block_allow_cycle` covers the same path after a block.
+    assert_allow_mint_account(
+        &mut context,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        bump,
+        &TOKEN_PROGRAM_ID,
+    );
 }
 
 #[test]

@@ -42,6 +42,10 @@ const FIXED_ACCOUNTS_LEN: usize = 12;
 /// resolves to), forwarded to the token program. Empty for mints without
 /// a hook. The client resolves them; the IDL cannot express them.
 ///
+/// Unlike before, extra accounts no longer fail the instruction. On a
+/// hook-less mint they are inert: the token program reads trailing accounts
+/// only as multisig signers, which the signing user cannot be.
+///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to deposit
 /// * `recipient` (Option<Pubkey>) - Optional recipient for private_channel tracking

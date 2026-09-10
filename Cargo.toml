@@ -4,6 +4,7 @@ members = [
     "auth",
     "private-channel-escrow-program/program",
     "private-channel-escrow-program/tests/integration-tests",
+    # Test-only hook program; a member so `cargo clippy` covers it.
     "private-channel-escrow-program/tests/transfer-hook-fixture",
     "private-channel-escrow-program/clients/rust",
     "private-channel-withdraw-program/program",

@@ -43,6 +43,9 @@ have prefixes.
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
+| `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
+| `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
+| `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
@@ -203,15 +206,20 @@ to say explicitly what the user is owed.
      the authority holder, and re-arm the row once
      `solana account $(escrow-ata <instance> <mint>) --url <target-rpc>` shows the
      account no longer frozen. Because the ATA is pooled per mint, expect every
-     withdrawal for that mint to park here, not just this one.
+     withdrawal for that mint to park here, not just this one. Only the pooled
+     ATA is checked: a freeze on one user's own ATA fails on-chain instead and
+     reminds their channel balance, so it lands in
+     [withdrawal_failed_reminted.md](withdrawal_failed_reminted.md), not here.
      [Escalate](_escalation.md) (Tier 2).
    - `withdrawals blocked for mint:` - an admin set the mint's withdrawal gate, which
      `release_funds` rejects on-chain. The escrow still holds the funds and the row is
      intact, so nothing is lost. Re-open the gate (`BlockMint` with
      `block_withdrawals: false`, or `AllowMint`, which re-opens both), then re-arm the
-     row. No operator restart is needed: a blocked mint is never cached as clear.
-     Blocking withdrawals is deliberate, so confirm with whoever set it before
-     re-opening. [Escalate](_escalation.md) (Tier 2).
+     row. Blocking withdrawals is deliberate, so confirm with whoever set it before
+     re-opening. Note the gate is only read on a mint's first withdrawal per
+     operator process, so rows for a mint it had already served terminalize through
+     remint instead of parking here; restart the operator after a block to close
+     that window. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook validation account missing for mint:` - the mint's
      `TransferHook` points at a hook program whose `ExtraAccountMetaList` does not
      exist, so Token-2022 can resolve no transfer of it and no release can settle.

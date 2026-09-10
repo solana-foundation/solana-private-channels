@@ -2520,10 +2520,12 @@ impl PostgresDb {
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program,
-                    -- Reset so the operator re-resolves them. A re-allow can follow
-                    -- a close and recreate, and preserving the flags would keep the
-                    -- pause and drain pre-flights on the pre-recreate profile for
-                    -- the life of the row.
+                    -- Reset so the operator re-resolves them on its next start. A
+                    -- re-allow can follow a close and recreate, and preserving the
+                    -- flags would keep the pause and drain pre-flights on the
+                    -- pre-recreate profile for the life of the row. A running
+                    -- operator reads its in-memory cache first, so this does not
+                    -- reach one until it restarts.
                     is_pausable = NULL,
                     has_permanent_delegate = NULL
                 "#,

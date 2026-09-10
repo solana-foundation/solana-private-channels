@@ -51,6 +51,10 @@ const FIXED_ACCOUNTS_LEN: usize = 13;
 /// resolves to), forwarded to the token program. Empty for mints without
 /// a hook. The operator resolves them; the IDL cannot express them.
 ///
+/// Unlike before, extra accounts no longer fail the instruction. On a
+/// hook-less mint they are inert: the token program reads trailing accounts
+/// only as multisig signers, which the escrow PDA is not.
+///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to release
 /// * `user` (Pubkey) - User receiving the funds

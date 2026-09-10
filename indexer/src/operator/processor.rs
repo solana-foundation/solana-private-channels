@@ -774,6 +774,10 @@ async fn check_withdrawal_preflights_inner(
     Ok(None)
 }
 
+/// Mirrors `MAX_HOOK_REMAINING_ACCOUNTS` in the escrow's `token_utils`, which
+/// codama does not export. Past it the program rejects the transfer.
+const MAX_HOOK_REMAINING_ACCOUNTS: usize = 32;
+
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
 ///
@@ -836,6 +840,16 @@ async fn attach_hook_extras(
             format!("transfer-hook validation account missing for mint: {mint}"),
         )));
     };
+
+    if hook_extras.len() > MAX_HOOK_REMAINING_ACCOUNTS {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
+            format!(
+                "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {}",
+                hook_extras.len()
+            ),
+        )));
+    }
 
     if !hook_extras.is_empty() {
         release.builder.add_remaining_accounts(&hook_extras);

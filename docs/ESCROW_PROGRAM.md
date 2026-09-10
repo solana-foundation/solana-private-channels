@@ -330,7 +330,8 @@ with either value changed. Closing requires zero supply, so that window is while
 escrow holds none of the mint — in practice between `AllowMint` and the first deposit,
 which is also when the channel-side mint is initialized from the allow-time decimals.
 `Deposit` compares both and fails with `MintProfileChanged`; an admin blocks and
-re-allows to re-pin. `ReleaseFunds` does not compare them, since the escrow can only
+re-allows to re-pin. A decimals change also needs the channel mint re-created,
+since re-allow leaves it on the old decimals. `ReleaseFunds` does not compare them, since the escrow can only
 hold a balance while the profile is unchangeable.
 
 ## Errors
