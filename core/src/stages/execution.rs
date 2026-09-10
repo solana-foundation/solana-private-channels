@@ -62,8 +62,8 @@ pub struct ExecutionArgs {
     /// to give each worker ≥ MIN_PARALLEL_BATCH_FACTOR transactions.
     pub max_svm_workers: usize,
     pub heartbeat: Arc<crate::health::StageHeartbeat>,
-    /// Shared live-blockhash window (same Arc advanced by dedup). Used at
-    /// execute_batch entry to drop txs whose recent_blockhash expired.
+    /// Shared live-blockhash window (same Arc advanced by dedup). Read twice
+    /// per batch, the second time after the account load decides what executes.
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 }
 
@@ -636,6 +636,48 @@ fn enforce_lamport_conservation(
     }
 }
 
+/// Keep only the transactions whose recent blockhash is still in the live
+/// window, in input order. Order matters because each partition's transactions
+/// are later zipped positionally against the SVM results the settler reads.
+///
+/// `when` names the point in the batch this ran at, so a dropped transaction's
+/// log line says whether it aged out before the account load or during it.
+fn retain_live(
+    mut transactions: Vec<SanitizedTransaction>,
+    live_blockhashes: &RwLock<LinkedList<Hash>>,
+    metrics: &SharedMetrics,
+    when: &'static str,
+) -> Vec<SanitizedTransaction> {
+    // Snapshot under the lock once, so the per-tx check is a hash lookup.
+    let live: HashSet<Hash> = live_blockhashes
+        .read()
+        .expect("blockhash lock poisoned")
+        .iter()
+        .copied()
+        .collect();
+
+    // Retained in place, so the usual no-drop batch reallocates nothing.
+    let mut dropped = 0usize;
+    transactions.retain(|tx| {
+        if live.contains(tx.message().recent_blockhash()) {
+            return true;
+        }
+        dropped += 1;
+        warn!(
+            sig = %tx.signature(),
+            bh = %tx.message().recent_blockhash(),
+            when,
+            "execution: dropping tx whose recent blockhash expired"
+        );
+        false
+    });
+
+    if dropped > 0 {
+        metrics.executor_dropped_expired_blockhash(dropped);
+    }
+    transactions
+}
+
 /// Returns `Err` when the accounts this batch needs could not be loaded. The
 /// abort happens before any SVM run or BOB write, so nothing has changed yet.
 pub async fn execute_batch(
@@ -654,28 +696,68 @@ pub async fn execute_batch(
         .map(|tx| tx.transaction.as_ref().clone())
         .collect();
 
-    // Drop txs whose recent_blockhash expired while parked in an upstream
-    // bounded queue. Snapshot the window once per batch to keep contains() O(1).
-    let live: HashSet<Hash> = execution_deps
-        .live_blockhashes
-        .read()
-        .expect("blockhash lock poisoned")
-        .iter()
-        .copied()
-        .collect();
-    let (all_transactions, expired): (Vec<_>, Vec<_>) = all_transactions
-        .into_iter()
-        .partition(|tx| live.contains(tx.message().recent_blockhash()));
-    if !expired.is_empty() {
-        for tx in &expired {
-            warn!(
-                sig = %tx.signature(),
-                bh = %tx.message().recent_blockhash(),
-                "execution: dropping tx whose recent blockhash expired during pipeline wait"
-            );
+    // Cheap first pass, so the account load never pays for an already-dead tx.
+    let all_transactions = retain_live(
+        all_transactions,
+        &execution_deps.live_blockhashes,
+        metrics,
+        "pipeline wait",
+    );
+
+    // Keys a later drop leaves unused only add clean, evictable BOB entries.
+    let mut accounts_to_preload = HashSet::new();
+    for tx in &all_transactions {
+        for account in tx.message().account_keys().iter() {
+            accounts_to_preload.insert(*account);
         }
-        metrics.executor_dropped_expired_blockhash(expired.len());
     }
+
+    // Preload accounts
+    let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
+    let t_op = Instant::now();
+    // Executing against accounts BOB could not load would settle state derived
+    // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
+    let (preload_fetched, preload_cached) = match execution_deps
+        .bob
+        .preload_accounts(&accounts_to_preload)
+        .await
+    {
+        Ok(counts) => counts,
+        Err(e) => {
+            if let AccountLoadError::Corrupt(_) = e {
+                metrics.executor_corrupt_account();
+            }
+            metrics.executor_preload_fatal();
+            error!("execution: aborting batch, account preload failed: {}", e);
+            return Err(e);
+        }
+    };
+    let t_preload = t_op.elapsed();
+    debug!(
+        "preload: {} accounts ({} fetched, {} cached) in {:?}",
+        accounts_to_preload.len(),
+        preload_fetched,
+        preload_cached,
+        t_preload
+    );
+    metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
+
+    // The window keeps advancing while the load above is pending, so a tx that
+    // was live when the batch arrived can be expired by now. Nothing downstream
+    // catches it: both VMs get all-Ok prechecks and a default processing
+    // blockhash. Without this a client told the hash is dead can re-sign, and
+    // the stale tx and its replacement both execute.
+    //
+    // Dedup can still evict on its own task just after this reads, so the
+    // verdict is not atomic with the dispatch. What keeps that harmless is the
+    // synchronous run from here to both VMs: the gap is microseconds rather
+    // than a whole account load. An await added in between restores the bug.
+    let all_transactions = retain_live(
+        all_transactions,
+        &execution_deps.live_blockhashes,
+        metrics,
+        "account preload",
+    );
 
     // TODO: ConflictFree scheduling should do the admin/non-admin/ATA partitioning
     // This would allow better parallelization and cleaner separation of concerns
@@ -685,17 +767,11 @@ pub async fn execute_batch(
     let mut admin_transactions = Vec::new();
     let mut regular_transactions = Vec::new();
     let mut fee_payers = HashSet::new();
-    let mut accounts_to_preload = HashSet::new();
 
     let t_op = Instant::now();
     for tx in all_transactions {
         // Collect fee payer BEFORE moving tx
         fee_payers.insert(*tx.fee_payer());
-        // Collect all accounts referenced in the transaction
-        // This includes program accounts, instruction accounts, and fee payer
-        for account in tx.message().account_keys().iter() {
-            accounts_to_preload.insert(*account);
-        }
 
         // Router contract: a tx is admin-routed only when EVERY instruction is
         // listed in ADMIN_INSTRUCTIONS_MAP. A mixed tx is routed to
@@ -727,36 +803,6 @@ pub async fn execute_batch(
         "partition: {} admin, {} regular in {:?}",
         num_admin_transactions, num_regular_transactions, t_partition
     );
-
-    // Preload accounts
-    let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
-    let t_op = Instant::now();
-    // Executing against accounts BOB could not load would settle state derived
-    // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
-    let (preload_fetched, preload_cached) = match execution_deps
-        .bob
-        .preload_accounts(&accounts_to_preload)
-        .await
-    {
-        Ok(counts) => counts,
-        Err(e) => {
-            if let AccountLoadError::Corrupt(_) = e {
-                metrics.executor_corrupt_account();
-            }
-            metrics.executor_preload_fatal();
-            error!("execution: aborting batch, account preload failed: {}", e);
-            return Err(e);
-        }
-    };
-    let t_preload = t_op.elapsed();
-    debug!(
-        "preload: {} accounts ({} fetched, {} cached) in {:?}",
-        accounts_to_preload.len(),
-        preload_fetched,
-        preload_cached,
-        t_preload
-    );
-    metrics.executor_preload_duration_ms(t_preload.as_secs_f64() * 1000.0);
 
     // Report BOB cache size and drain the eviction delta right after preload,
     // when the cache reflects this batch's working set.
@@ -3134,5 +3180,143 @@ mod tests {
 
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(is_executed(regular_result(&result, 0)));
+    }
+
+    /// The filter keeps input order, which is what keeps each partition's
+    /// transactions aligned with the SVM results the settler later zips
+    /// against them, and drops every transaction whose blockhash is not in
+    /// the window.
+    #[test]
+    fn retain_live_keeps_live_transactions_in_order() {
+        let (a, b, c) = (Hash::new_unique(), Hash::new_unique(), Hash::new_unique());
+        let live = RwLock::new(LinkedList::from([a, b]));
+        let payer = Keypair::new();
+
+        let txs = vec![
+            sanitize_transfer(&payer, a),
+            sanitize_transfer(&payer, c),
+            sanitize_transfer(&payer, b),
+            sanitize_transfer(&payer, c),
+        ];
+        let expected = vec![*txs[0].signature(), *txs[2].signature()];
+
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+        let kept = retain_live(txs, &live, &noop, "test");
+
+        assert_eq!(
+            kept.iter().map(|tx| *tx.signature()).collect::<Vec<_>>(),
+            expected,
+            "only live-blockhash txs survive, in input order"
+        );
+    }
+
+    /// Block the executor's preload SELECT until the returned txn is committed.
+    async fn hold_accounts_lock(url: &str) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(url)
+            .await
+            .expect("lock pool must connect");
+        let mut tx = pool.begin().await.expect("lock txn must begin");
+        sqlx::query("LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("must take the accounts lock");
+        tx
+    }
+
+    /// Wait until the preload is parked, so the window moves mid-await.
+    async fn wait_for_preload_waiter(url: &str) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(url)
+            .await
+            .expect("probe pool must connect");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' \
+                   AND query LIKE 'SELECT pubkey, data FROM accounts%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_stat_activity must be readable");
+            if waiting > 0 {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the preload query never parked on the accounts lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The finding: a blockhash can expire while the batch is parked in the
+    /// preload await, and nothing re-checked it before the VM dispatch, so a
+    /// stale transfer executed alongside the client's replacement. Both VM
+    /// groups are covered by putting an admin and a regular tx in one batch.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn expiry_during_preload_is_caught_before_dispatch() {
+        for (evict_during_preload, expect_admin, expect_regular) in
+            [(true, 0usize, 0usize), (false, 1usize, 1usize)]
+        {
+            let (accounts_db, pg) = start_test_postgres().await;
+            let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
+            let (_settled_tx, rx) = mpsc::unbounded_channel();
+
+            let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
+            let mut deps = get_execution_deps(accounts_db, rx, 1, Arc::clone(&live)).await;
+            let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+            let (admin_tx, _mint) = create_admin_initialize_mint_tx();
+            let batch = ConflictFreeBatch {
+                transactions: vec![
+                    crate::scheduler::TransactionWithIndex {
+                        transaction: Arc::new(admin_tx),
+                        index: 0,
+                    },
+                    crate::scheduler::TransactionWithIndex {
+                        transaction: Arc::new(sanitize_transfer(&Keypair::new(), Hash::default())),
+                        index: 1,
+                    },
+                ],
+            };
+
+            let lock_txn = hold_accounts_lock(&url).await;
+            let controller = async {
+                wait_for_preload_waiter(&url).await;
+                if evict_during_preload {
+                    live.write().unwrap().clear();
+                }
+                lock_txn.commit().await.expect("lock txn must commit");
+            };
+
+            let (result, ()) = tokio::join!(execute_batch(batch, &mut deps, &noop), controller);
+            let result = result.expect("the batch must load its accounts");
+
+            assert_eq!(
+                result.admin_transactions.len(),
+                expect_admin,
+                "admin partition (evict={evict_during_preload})"
+            );
+            assert_eq!(
+                result.regular_transactions.len(),
+                expect_regular,
+                "regular partition (evict={evict_during_preload})"
+            );
+            assert_eq!(
+                result.admin_results.is_none(),
+                expect_admin == 0,
+                "admin VM must run only for surviving txs (evict={evict_during_preload})"
+            );
+            assert_eq!(
+                result.regular_results.is_none(),
+                expect_regular == 0,
+                "SVM must run only for surviving txs (evict={evict_during_preload})"
+            );
+        }
     }
 }

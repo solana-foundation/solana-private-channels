@@ -659,3 +659,114 @@ async fn get_slot_does_not_regress_across_a_restart() -> Result<()> {
     );
     Ok(())
 }
+
+/// Hold an ACCESS EXCLUSIVE lock on `accounts` so the executor's preload SELECT
+/// parks until the returned transaction is committed. A heartbeat block writes
+/// no accounts, so the chain keeps producing blocks and the blockhash window
+/// keeps advancing while the executor is stuck.
+async fn hold_accounts_lock(pg_url: &str) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(pg_url)
+        .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE accounts IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// Wait until the preload is parked, so the window moves mid-await.
+async fn wait_for_preload_waiter(probe: &sqlx::PgPool, within: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' \
+               AND query LIKE 'SELECT pubkey, data FROM accounts%'",
+        )
+        .fetch_one(probe)
+        .await?;
+        if waiting > 0 {
+            return Ok(());
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the executor's preload never parked on the accounts lock"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A transfer whose blockhash expires while its batch is stuck loading accounts
+/// must not execute. The client is told the hash is dead, re-signs the same
+/// action against a fresh one, and only that replacement may land. Letting both
+/// through would debit the sender twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_original_that_expires_in_a_stalled_preload_does_not_land() -> Result<()> {
+    let window = 2usize;
+    let (node, pg_url, _pg) = start_node(window).await?;
+
+    // Taken before the first submission so the very first preload parks on it.
+    let lock_txn = hold_accounts_lock(&pg_url).await?;
+
+    // Opened and warmed before the stall starts, so polling for it spends none
+    // of the budget below on a connect.
+    let probe = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&pg_url)
+        .await?;
+    sqlx::query("SELECT 1").execute(&probe).await?;
+
+    let blockhash = node.client.get_latest_blockhash().await?;
+    let original = client_transaction(blockhash);
+    let original_sig = submit(&node.client, &original).await?;
+
+    // The parked preload is under a five second load budget, past which the
+    // executor aborts the batch and stops. The two waits before the lock is
+    // released are bounded to four seconds between them so it never gets
+    // there, since blowing the budget would fail this test for the wrong
+    // reason. Both are generous: parking takes milliseconds and a two-block
+    // window clears in about two heartbeats.
+    wait_for_preload_waiter(&probe, Duration::from_secs(1)).await?;
+
+    // The heartbeat keeps minting blocks past the parked transaction's hash.
+    let deadline = tokio::time::Instant::now() + HEARTBEAT * 3;
+    loop {
+        if !node
+            .client
+            .is_blockhash_valid(&blockhash, node.client.commitment())
+            .await?
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the blockhash never left a {window}-block window"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    // What a wallet does next: sign the same action against a live blockhash.
+    let replacement = client_transaction(node.client.get_latest_blockhash().await?);
+    let replacement_sig = submit(&node.client, &replacement).await?;
+
+    lock_txn.commit().await?;
+
+    assert!(
+        landed(&node.client, &replacement_sig, HEARTBEAT * 5).await?,
+        "the replacement carries a live blockhash and must land"
+    );
+
+    // The stale batch ran first, so an execution would already be settled.
+    let status = node
+        .client
+        .get_signature_statuses(&[original_sig])
+        .await?
+        .value;
+    assert!(
+        status.first().is_some_and(|slot| slot.is_none()),
+        "the expired original must not execute alongside its replacement"
+    );
+    Ok(())
+}
