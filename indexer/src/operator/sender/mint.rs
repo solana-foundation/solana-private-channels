@@ -1,14 +1,23 @@
-use crate::operator::utils::instruction_util::{InitializeMintBuilder, TransactionBuilder};
+use crate::operator::utils::instruction_util::{
+    InitializeMintBuilder, MintToBuilderWithTxnId, TransactionBuilder,
+};
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{
     sign_and_send_transaction, RpcClientWithRetry, SignerUtil, SourceEventId,
-    MINT_IDEMPOTENCY_MEMO_PREFIX, REMINT_IDEMPOTENCY_MEMO_PREFIX,
+    MINT_IDEMPOTENCY_MEMO_PREFIX, MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+    REMINT_IDEMPOTENCY_MEMO_PREFIX,
 };
+use serde_json::Value;
 use solana_keychain::SolanaSigner;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::program_option::COption;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use solana_transaction_status::parse_instruction::ParsedInstruction;
+use solana_transaction_status::{
+    EncodedTransaction, UiCompiledInstruction, UiInstruction, UiMessage, UiParsedInstruction,
+    UiParsedMessage, UiPartiallyDecodedInstruction, UiRawMessage,
+};
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
 use std::collections::HashMap;
@@ -16,6 +25,15 @@ use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use super::types::{InstructionWithSigners, SenderState};
+
+#[derive(Clone, Copy, Debug)]
+struct ExpectedMintInstruction {
+    mint: Pubkey,
+    recipient_ata: Pubkey,
+    mint_authority: Pubkey,
+    token_program: Pubkey,
+    amount: u64,
+}
 
 /// Verdict from `try_jit_mint_initialization`. The caller in
 /// `transaction.rs` matches on this to decide whether to re-issue the mint,
@@ -451,7 +469,7 @@ pub async fn enumerate_consumed_mints(
                 return Err(format!(
                     "channel mint {} carries an idempotency memo that does not parse to a \
                      current-scheme source-event-id (legacy memo scheme); resync cannot reconcile \
-                     across the memo cutover - drain the operator and follow the cutover runbook",
+                     across the memo cutover - see docs/runbooks/mint_memo_cutover.md",
                     status.signature
                 ));
             };
@@ -482,6 +500,413 @@ fn strip_memo_length_prefix(memo: &str) -> &str {
 }
 
 /// Cleanup mint builder cache when transaction completes or fails
+/// Check recent ATA signatures for an already-confirmed mint carrying the given memo.
+/// Any RPC failure (including `-32601`) is returned as `Err` — callers decide.
+pub async fn find_existing_mint_signature_with_memo(
+    rpc_client: &RpcClientWithRetry,
+    builder_with_txn_id: &MintToBuilderWithTxnId,
+    expected_memo: &str,
+) -> Result<Option<Signature>, String> {
+    let transaction_id = builder_with_txn_id.txn_id;
+    let Some(expected_mint) = expected_mint_instruction(transaction_id, builder_with_txn_id) else {
+        return Ok(None);
+    };
+
+    let signatures = match rpc_client
+        .get_signatures_for_address(
+            &expected_mint.recipient_ata,
+            MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
+        )
+        .await
+    {
+        Ok(signatures) => signatures,
+        Err(e) => {
+            return Err(format!(
+                "Failed idempotency lookup for transaction_id {} on {}: {}",
+                transaction_id, expected_mint.recipient_ata, e
+            ));
+        }
+    };
+
+    for signature_status in signatures {
+        if signature_status.err.is_some() {
+            continue;
+        }
+
+        let memo = match signature_status.memo.as_deref() {
+            Some(memo) if memo_matches(memo, expected_memo) => memo,
+            _ => continue,
+        };
+
+        let signature = match Signature::from_str(&signature_status.signature) {
+            Ok(signature) => signature,
+            Err(e) => {
+                warn!(
+                    "Skipping invalid signature returned by RPC during idempotency check: {} ({})",
+                    signature_status.signature, e
+                );
+                continue;
+            }
+        };
+
+        let transaction = match rpc_client.get_transaction(&signature).await {
+            Ok(transaction) => transaction,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to fetch transaction {} for idempotency confirmation: {}",
+                    signature, e
+                ));
+            }
+        };
+
+        if transaction_matches_expected_mint(&transaction, expected_memo, &expected_mint) {
+            info!(
+                "Skipping resend for transaction_id {}: found existing confirmed mint {} with memo {}",
+                transaction_id, signature, memo
+            );
+            return Ok(Some(signature));
+        }
+    }
+
+    Ok(None)
+}
+
+fn expected_mint_instruction(
+    transaction_id: i64,
+    builder_with_txn_id: &MintToBuilderWithTxnId,
+) -> Option<ExpectedMintInstruction> {
+    let (mint, recipient_ata, mint_authority, token_program, amount) =
+        builder_with_txn_id.builder.try_as_expected_mint().or_else(|| {
+            warn!(
+                "Cannot run mint idempotency check for transaction_id {}: builder fields incomplete",
+                transaction_id
+            );
+            None
+        })?;
+    Some(ExpectedMintInstruction {
+        mint,
+        recipient_ata,
+        mint_authority,
+        token_program,
+        amount,
+    })
+}
+
+fn transaction_succeeded(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+) -> bool {
+    transaction
+        .transaction
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.err.is_none())
+}
+
+fn transaction_matches_expected_mint(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+    expected_memo: &str,
+    expected_mint: &ExpectedMintInstruction,
+) -> bool {
+    if !transaction_succeeded(transaction) {
+        return false;
+    }
+
+    let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
+        return false;
+    };
+
+    match &ui_transaction.message {
+        UiMessage::Parsed(parsed_message) => {
+            parsed_message_has_signer(parsed_message, &expected_mint.mint_authority)
+                && parsed_message
+                    .instructions
+                    .iter()
+                    .any(|instruction| instruction_has_memo(instruction, expected_memo))
+                && parsed_message
+                    .instructions
+                    .iter()
+                    .any(|instruction| instruction_has_expected_mint(instruction, expected_mint))
+        }
+        UiMessage::Raw(raw_message) => {
+            raw_message_has_signer(raw_message, &expected_mint.mint_authority)
+                && raw_message.instructions.iter().any(|instruction| {
+                    raw_instruction_has_memo(raw_message, instruction, expected_memo)
+                })
+                && raw_message.instructions.iter().any(|instruction| {
+                    raw_instruction_has_expected_mint(raw_message, instruction, expected_mint)
+                })
+        }
+    }
+}
+
+fn parsed_message_has_signer(parsed_message: &UiParsedMessage, signer: &Pubkey) -> bool {
+    parsed_message
+        .account_keys
+        .iter()
+        .any(|account| account.signer && parse_pubkey(&account.pubkey) == Some(*signer))
+}
+
+fn raw_message_has_signer(raw_message: &UiRawMessage, signer: &Pubkey) -> bool {
+    raw_message
+        .account_keys
+        .iter()
+        .position(|account| parse_pubkey(account) == Some(*signer))
+        .is_some_and(|index| index < raw_message.header.num_required_signatures as usize)
+}
+
+fn raw_instruction_has_memo(
+    raw_message: &UiRawMessage,
+    instruction: &UiCompiledInstruction,
+    expected_memo: &str,
+) -> bool {
+    let Some(program_id) = raw_message
+        .account_keys
+        .get(instruction.program_id_index as usize)
+    else {
+        return false;
+    };
+
+    is_memo_program_id(program_id)
+        && bs58::decode(&instruction.data)
+            .into_vec()
+            .map(|memo_data| memo_data == expected_memo.as_bytes())
+            .unwrap_or(false)
+}
+
+fn instruction_has_memo(instruction: &UiInstruction, expected_memo: &str) -> bool {
+    match instruction {
+        UiInstruction::Compiled(_) => false,
+        UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed_instruction)) => {
+            is_memo_program_id(&parsed_instruction.program_id)
+                && parsed_instruction.parsed.as_str() == Some(expected_memo)
+        }
+        UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(partially_decoded)) => {
+            is_memo_program_id(&partially_decoded.program_id)
+                && bs58::decode(&partially_decoded.data)
+                    .into_vec()
+                    .map(|memo_data| memo_data == expected_memo.as_bytes())
+                    .unwrap_or(false)
+        }
+    }
+}
+
+fn instruction_has_expected_mint(
+    instruction: &UiInstruction,
+    expected_mint: &ExpectedMintInstruction,
+) -> bool {
+    match instruction {
+        UiInstruction::Compiled(_) => false,
+        UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed_instruction)) => {
+            parsed_instruction_has_expected_mint(parsed_instruction, expected_mint)
+        }
+        UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(partially_decoded)) => {
+            partially_decoded_instruction_has_expected_mint(partially_decoded, expected_mint)
+        }
+    }
+}
+
+fn parsed_instruction_has_expected_mint(
+    parsed_instruction: &ParsedInstruction,
+    expected_mint: &ExpectedMintInstruction,
+) -> bool {
+    if parse_pubkey(&parsed_instruction.program_id) != Some(expected_mint.token_program) {
+        return false;
+    }
+
+    let Some(instruction_type) = parsed_instruction
+        .parsed
+        .get("type")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+
+    if instruction_type != "mintTo" && instruction_type != "mintToChecked" {
+        return false;
+    }
+
+    let Some(info) = parsed_instruction.parsed.get("info") else {
+        return false;
+    };
+
+    if parse_pubkey_field(info, "mint") != Some(expected_mint.mint)
+        || parse_pubkey_field(info, "account") != Some(expected_mint.recipient_ata)
+        || parse_pubkey_field(info, "mintAuthority") != Some(expected_mint.mint_authority)
+    {
+        return false;
+    }
+
+    let amount = match instruction_type {
+        "mintTo" => parse_u64_field(info, "amount"),
+        "mintToChecked" => info
+            .get("tokenAmount")
+            .and_then(|token_amount| parse_u64_field(token_amount, "amount")),
+        _ => None,
+    };
+
+    amount == Some(expected_mint.amount)
+}
+
+fn accounts_and_amount_match(
+    program_id: &Pubkey,
+    mint: &Pubkey,
+    recipient_ata: &Pubkey,
+    mint_authority: &Pubkey,
+    instruction_data: &[u8],
+    expected: &ExpectedMintInstruction,
+) -> bool {
+    *program_id == expected.token_program
+        && *mint == expected.mint
+        && *recipient_ata == expected.recipient_ata
+        && *mint_authority == expected.mint_authority
+        && parse_token_instruction_mint_amount(program_id, instruction_data)
+            == Some(expected.amount)
+}
+
+fn partially_decoded_instruction_has_expected_mint(
+    partially_decoded: &UiPartiallyDecodedInstruction,
+    expected_mint: &ExpectedMintInstruction,
+) -> bool {
+    let Some(program_id) = parse_pubkey(&partially_decoded.program_id) else {
+        return false;
+    };
+    let Some(mint) = partially_decoded
+        .accounts
+        .first()
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Some(recipient_ata) = partially_decoded
+        .accounts
+        .get(1)
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Some(mint_authority) = partially_decoded
+        .accounts
+        .get(2)
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Ok(data) = bs58::decode(&partially_decoded.data).into_vec() else {
+        return false;
+    };
+    accounts_and_amount_match(
+        &program_id,
+        &mint,
+        &recipient_ata,
+        &mint_authority,
+        &data,
+        expected_mint,
+    )
+}
+
+fn raw_instruction_has_expected_mint(
+    raw_message: &UiRawMessage,
+    instruction: &UiCompiledInstruction,
+    expected_mint: &ExpectedMintInstruction,
+) -> bool {
+    let Some(program_id) = raw_message
+        .account_keys
+        .get(instruction.program_id_index as usize)
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Some(mint) = instruction
+        .accounts
+        .first()
+        .and_then(|i| raw_message.account_keys.get(*i as usize))
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Some(recipient_ata) = instruction
+        .accounts
+        .get(1)
+        .and_then(|i| raw_message.account_keys.get(*i as usize))
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Some(mint_authority) = instruction
+        .accounts
+        .get(2)
+        .and_then(|i| raw_message.account_keys.get(*i as usize))
+        .and_then(|a| parse_pubkey(a))
+    else {
+        return false;
+    };
+    let Ok(data) = bs58::decode(&instruction.data).into_vec() else {
+        return false;
+    };
+    accounts_and_amount_match(
+        &program_id,
+        &mint,
+        &recipient_ata,
+        &mint_authority,
+        &data,
+        expected_mint,
+    )
+}
+
+fn parse_pubkey(value: &str) -> Option<Pubkey> {
+    Pubkey::from_str(value).ok()
+}
+
+fn parse_pubkey_field(value: &Value, field: &str) -> Option<Pubkey> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(parse_pubkey)
+}
+
+fn parse_u64_field(value: &Value, field: &str) -> Option<u64> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .and_then(|amount| amount.parse::<u64>().ok())
+}
+
+fn parse_token_instruction_mint_amount(program_id: &Pubkey, data: &[u8]) -> Option<u64> {
+    if *program_id == spl_token::id() {
+        return match spl_token::instruction::TokenInstruction::unpack(data).ok()? {
+            spl_token::instruction::TokenInstruction::MintTo { amount }
+            | spl_token::instruction::TokenInstruction::MintToChecked { amount, .. } => {
+                Some(amount)
+            }
+            _ => None,
+        };
+    }
+
+    if *program_id == spl_token_2022::id() {
+        return match spl_token_2022::instruction::TokenInstruction::unpack(data).ok()? {
+            spl_token_2022::instruction::TokenInstruction::MintTo { amount }
+            | spl_token_2022::instruction::TokenInstruction::MintToChecked { amount, .. } => {
+                Some(amount)
+            }
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn is_memo_program_id(program_id: &str) -> bool {
+    Pubkey::from_str(program_id)
+        .map(|pubkey| pubkey == spl_memo::id())
+        .unwrap_or(false)
+}
+
+fn memo_matches(returned_memo: &str, expected_memo: &str) -> bool {
+    returned_memo
+        .split("; ")
+        .any(|memo| strip_memo_length_prefix(memo) == expected_memo)
+}
+
 pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Option<i64>) {
     if let Some(txn_id) = transaction_id {
         state.mint_builders.remove(&txn_id);

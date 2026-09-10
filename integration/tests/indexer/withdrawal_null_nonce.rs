@@ -27,7 +27,7 @@ mod setup;
 
 use {
     chrono::Utc,
-    helpers::{db, mint_to_owner},
+    helpers::{db, mint_to_owner, test_types::WAIT_TIMEOUT_SECS},
     private_channel_indexer::{
         config::{OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator,
@@ -119,8 +119,8 @@ async fn wait_for_status(
     pool: &sqlx::PgPool,
     signature: &str,
     expected_status: &str,
-    timeout_secs: u64,
 ) -> Result<(), String> {
+    let timeout_secs = *WAIT_TIMEOUT_SECS;
     let start = std::time::Instant::now();
     let mut last_seen = String::new();
     while start.elapsed().as_secs() < timeout_secs {
@@ -223,6 +223,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     };
     storage.insert_db_transaction(&withdrawal).await?;
 
@@ -262,7 +263,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
     .await?;
 
     // 6. Assert ManualReview within 30s.
-    wait_for_status(&pool, &signature, "manual_review", 30)
+    wait_for_status(&pool, &signature, "manual_review")
         .await
         .expect("NULL-nonce row must be quarantined to manual_review");
 

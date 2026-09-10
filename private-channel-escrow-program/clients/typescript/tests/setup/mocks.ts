@@ -50,11 +50,9 @@ export const TEST_ADDRESSES = {
 } as const;
 
 /**
- * Test root for withdrawal transactions
+ * Test nonce for withdrawal transactions
  */
-export const TEST_ROOT: Array<number> = Array.from(new Uint8Array(32).fill(42));
 export const TEST_TRANSACTION_NONCE = 1;
-export const TEST_SIBLING_PROOFS: Array<number> = Array.from(new Uint8Array(512).fill(0));
 
 /**
  * Expected program address for all instructions

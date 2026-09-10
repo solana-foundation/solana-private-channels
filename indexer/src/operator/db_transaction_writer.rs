@@ -73,7 +73,10 @@ impl DbTransactionWriter {
                 update.status,
                 update.counterpart_signature.clone(),
                 update.processed_at.unwrap_or_else(Utc::now),
-                update.release_signatures.clone(),
+                // The release_signatures column exists and is migrated, but nothing
+                // reads it yet. It is provenance only, and adopting it means a new
+                // field on every TransactionStatusUpdate, so it is deferred, not dropped.
+                None,
             )
             .await
         {
@@ -83,6 +86,19 @@ impl DbTransactionWriter {
                     "Updated transaction {} to status {:?}", update.transaction_id, update.status
                 );
                 metrics::OPERATOR_DB_UPDATES
+                    .with_label_values(&[pt, &format!("{:?}", update.status)])
+                    .inc();
+            }
+            // A skipped Completed is unrecoverable: the release landed on chain and
+            // validate_bitmap_consistency refuses the next boot once Completed rows
+            // and bitmap bits diverge. Every other status is routine recovery churn.
+            Ok(false) if update.status == TransactionStatus::Completed => {
+                error!(
+                    trace_id = trace_id,
+                    "Transaction {} already past Processing; Completed status write LOST",
+                    update.transaction_id
+                );
+                metrics::OPERATOR_DB_UPDATE_SKIPPED
                     .with_label_values(&[pt, &format!("{:?}", update.status)])
                     .inc();
             }
@@ -197,7 +213,6 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: false,
-            release_signatures: None,
         }
     }
 
@@ -377,7 +392,6 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: Some("remint_sig_abc".to_string()),
             remint_attempted: true,
-            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -411,7 +425,6 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: true,
-            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -446,7 +459,6 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: false,
-            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
@@ -481,10 +493,94 @@ mod tests {
             processed_at: Some(Utc::now()),
             remint_signature: None,
             remint_attempted: true,
-            release_signatures: None,
         };
 
         writer.send_webhook_alert(&server.url(), &update).await;
         mock.assert();
+    }
+
+    // ── skipped status writes ─────────────────────────────────────────
+
+    /// Seed a withdrawal already terminalized to `ManualReview`. Both the
+    /// mock and the SQL refuse a later status write against such a row, so
+    /// this is the fixture that produces `Ok(false)`.
+    fn seed_manual_review_withdrawal(mock: &MockStorage, id: i64) {
+        use crate::storage::common::amount::TokenAmount;
+        use crate::storage::common::models::{DbTransaction, TransactionType};
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(DbTransaction {
+                id,
+                signature: format!("sig_{id}"),
+                trace_id: format!("trace-{id}"),
+                slot: 100,
+                initiator: "initiator".to_string(),
+                recipient: "recipient".to_string(),
+                mint: "mint_addr".to_string(),
+                amount: TokenAmount(1000),
+                memo: None,
+                transaction_type: TransactionType::Withdrawal,
+                withdrawal_nonce: Some(1),
+                status: TransactionStatus::ManualReview,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                processed_at: None,
+                counterpart_signature: None,
+                remint_signatures: None,
+                remint_last_valid_block_heights: None,
+                pending_remint_deadline_at: None,
+                finality_check_attempts: 0,
+                recovery_requeue_attempts: 0,
+                instruction_index: 0,
+                inner_index: None,
+                landed_remint_signature: None,
+                release_refused_on_chain: false,
+            });
+    }
+
+    fn skipped_count(program_type: &str, status: &str) -> f64 {
+        metrics::OPERATOR_DB_UPDATE_SKIPPED
+            .with_label_values(&[program_type, status])
+            .get()
+    }
+
+    /// A dropped `Completed` write is the one outcome the row can never
+    /// reach again on its own: the release landed on chain but the DB will
+    /// never say so, and the next boot rebuilds a local tree that disagrees
+    /// with chain. It has to be countable, not an INFO line.
+    #[tokio::test]
+    async fn skipped_completed_write_escalates_and_counts() {
+        let mock = MockStorage::new();
+        seed_manual_review_withdrawal(&mock, 12345);
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(mock));
+        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Withdraw);
+
+        let before = skipped_count("withdraw", "Completed");
+        writer
+            .handle_update(create_test_update(TransactionStatus::Completed))
+            .await;
+
+        assert_eq!(skipped_count("withdraw", "Completed") - before, 1.0);
+    }
+
+    /// Recovery legitimately moves rows off `Processing` and re-derives a
+    /// non-`Completed` outcome, so those skips stay quiet. Without this the
+    /// routine race would page.
+    #[tokio::test]
+    async fn skipped_non_completed_write_is_not_escalated() {
+        let mock = MockStorage::new();
+        seed_manual_review_withdrawal(&mock, 12345);
+        let (_tx, rx) = mpsc::channel(1);
+        let storage = Arc::new(Storage::Mock(mock));
+        let writer = DbTransactionWriter::new(storage, rx, None, ProgramType::Withdraw);
+
+        let before = skipped_count("withdraw", "Failed");
+        writer
+            .handle_update(create_test_update(TransactionStatus::Failed))
+            .await;
+
+        assert_eq!(skipped_count("withdraw", "Failed") - before, 0.0);
     }
 }

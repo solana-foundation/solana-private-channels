@@ -2,7 +2,8 @@
 //!
 //! Invariants tested:
 //! - **Balance conservation**: `escrow_balance == total_deposited - total_released`
-//! - **Invalid-proof rejection**: garbage proofs must fail without touching balances.
+//! - **Foreign-bitmap rejection**: a bitmap that is not this instance's PDA must
+//!   fail without touching balances.
 //! - **Double-spend prevention**: replaying a successful release must be rejected.
 
 mod shared;
@@ -11,14 +12,18 @@ use std::collections::HashMap;
 
 use private_channel_escrow_program_client::instructions::{DepositBuilder, ReleaseFundsBuilder};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
-use tests_private_channel_escrow_program::smt_utils::ProcessorSMT;
+use solana_sdk::pubkey::Pubkey;
 use trident_fuzz::fuzzing::*;
 
 use shared::{clamp_amount, setup_escrow, token_amount, AccountAddresses};
 
-/// Clamp nonces to [0, 999] — flat range, no tree-generation partitioning.
+/// Nonces covered by one bitmap generation. Must match the on-chain constant.
+const NONCES_PER_GENERATION: u64 = 65_536;
+
+/// Clamp nonces to generation 0, spanning the whole bitmap so the byte index
+/// arithmetic is exercised beyond the first few bytes.
 fn clamp_nonce(raw: u64) -> u64 {
-    raw % 1_000
+    raw % NONCES_PER_GENERATION
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -27,8 +32,6 @@ fn clamp_nonce(raw: u64) -> u64 {
 #[derive(Clone)]
 struct SuccessfulRelease {
     amount: u64,
-    new_withdrawal_root: [u8; 32],
-    sibling_proofs: [u8; 512],
 }
 
 // ── Fuzz test ─────────────────────────────────────────────────────────────────
@@ -37,9 +40,8 @@ struct SuccessfulRelease {
 pub struct FuzzTest {
     pub trident: Trident,
     pub fuzz_accounts: AccountAddresses,
-    /// Local mirror of the on-chain SMT.
-    smt: ProcessorSMT,
-    /// Successful releases keyed by nonce, for double-spend replay.
+    /// Successful releases keyed by nonce. Doubles as the mirror of the
+    /// on-chain bitmap bits: a key here means that nonce is consumed.
     successful_releases: HashMap<u64, SuccessfulRelease>,
     /// User's token balance at the start of the iteration (after minting).
     initial_user_balance: u64,
@@ -56,7 +58,6 @@ impl FuzzTest {
     #[init]
     fn start(&mut self) {
         self.initial_user_balance = setup_escrow(&mut self.trident, &mut self.fuzz_accounts);
-        self.smt = ProcessorSMT::new();
         self.successful_releases.clear();
         self.total_deposited = 0;
         self.total_released = 0;
@@ -112,10 +113,11 @@ impl FuzzTest {
         }
     }
 
-    /// 50% valid release / 50% garbage-proof release.
+    /// 50% valid release / 50% release against a foreign bitmap.
     ///
-    /// Valid path: real exclusion proof — must succeed, balances must shift.
-    /// Invalid path: garbage proofs — must fail, balances must be unchanged.
+    /// Valid path: this instance's bitmap — must succeed, balances must shift.
+    /// Invalid path: a random address in the bitmap slot — must fail, balances
+    /// must be unchanged and the nonce must stay unconsumed.
     #[flow]
     fn fuzz_release(&mut self) {
         let amount = clamp_amount(self.trident.random_from_range(1..u64::MAX));
@@ -124,6 +126,11 @@ impl FuzzTest {
 
         let operator = self.fuzz_accounts.operator.get(&mut self.trident).unwrap();
         let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let withdrawal_bitmap = self
+            .fuzz_accounts
+            .withdrawal_bitmap
+            .get(&mut self.trident)
+            .unwrap();
         let operator_pda = self
             .fuzz_accounts
             .operator_pda
@@ -146,22 +153,21 @@ impl FuzzTest {
         let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
-        let (sibling_proofs, new_root, should_succeed) =
-            if use_valid && !self.smt.contains(nonce) && amount <= instance_bal_before {
-                let (_, proofs) = self.smt.generate_exclusion_proof(nonce);
-                let mut next = self.smt.clone();
-                next.insert(nonce);
-                (proofs, next.current_root(), true)
-            } else {
-                ([0xddu8; 512], [0xffu8; 32], false)
-            };
+        let should_succeed = use_valid
+            && !self.successful_releases.contains_key(&nonce)
+            && amount <= instance_bal_before;
+        let bitmap_account = if should_succeed {
+            withdrawal_bitmap
+        } else {
+            Pubkey::new_unique()
+        };
 
-        // ReleaseFunds requires 1.2M CUs for SMT proof verification.
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
             .payer(self.trident.payer().pubkey())
             .operator(operator)
             .instance(instance)
+            .withdrawal_bitmap(bitmap_account)
             .operator_pda(operator_pda)
             .mint(mint)
             .allowed_mint(allowed_mint)
@@ -169,9 +175,7 @@ impl FuzzTest {
             .instance_ata(instance_ata)
             .amount(amount)
             .user(user)
-            .new_withdrawal_root(new_root)
             .transaction_nonce(nonce)
-            .sibling_proofs(sibling_proofs)
             .instruction();
 
         let res = self
@@ -184,15 +188,8 @@ impl FuzzTest {
                 "valid release failed nonce={nonce} amount={amount}: {}",
                 res.logs()
             );
-            self.smt.insert(nonce);
-            self.successful_releases.insert(
-                nonce,
-                SuccessfulRelease {
-                    amount,
-                    new_withdrawal_root: new_root,
-                    sibling_proofs,
-                },
-            );
+            self.successful_releases
+                .insert(nonce, SuccessfulRelease { amount });
             assert_eq!(
                 token_amount(&mut self.trident, &instance_ata),
                 instance_bal_before - amount
@@ -220,16 +217,25 @@ impl FuzzTest {
         }
     }
 
-    /// Replay an already-processed release with the exact same proof — must be rejected.
+    /// Replay an already-processed release verbatim — must be rejected.
+    ///
+    /// Picks a nonce known to be consumed rather than guessing one: a random
+    /// nonce almost never lands on the handful actually released, which would
+    /// make this flow a no-op.
     #[flow]
     fn fuzz_double_spend(&mut self) {
-        let nonce = clamp_nonce(self.trident.random_from_range(0..u64::MAX));
-        let Some(prev) = self.successful_releases.get(&nonce).cloned() else {
+        let Some((&nonce, prev)) = self.successful_releases.iter().next() else {
             return;
         };
+        let prev = prev.clone();
 
         let operator = self.fuzz_accounts.operator.get(&mut self.trident).unwrap();
         let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let withdrawal_bitmap = self
+            .fuzz_accounts
+            .withdrawal_bitmap
+            .get(&mut self.trident)
+            .unwrap();
         let operator_pda = self
             .fuzz_accounts
             .operator_pda
@@ -256,6 +262,7 @@ impl FuzzTest {
             .payer(self.trident.payer().pubkey())
             .operator(operator)
             .instance(instance)
+            .withdrawal_bitmap(withdrawal_bitmap)
             .operator_pda(operator_pda)
             .mint(mint)
             .allowed_mint(allowed_mint)
@@ -263,9 +270,7 @@ impl FuzzTest {
             .instance_ata(instance_ata)
             .amount(prev.amount)
             .user(user)
-            .new_withdrawal_root(prev.new_withdrawal_root)
             .transaction_nonce(nonce)
-            .sibling_proofs(prev.sibling_proofs)
             .instruction();
 
         let res = self

@@ -10,7 +10,7 @@ scrape_configs:
     metric_relabel_configs:
       # Keep only metrics for specific containers
       - source_labels: [container_label_com_docker_compose_service]
-        regex: '(write-node|read-node|gateway|streamer|postgres-primary|postgres-replica|postgres-indexer|validator|indexer-solana|indexer-private_channel|operator-solana|operator-private_channel)'
+        regex: '(write-node|read-node|gateway|streamer|postgres-primary|postgres-replica|postgres-indexer|validator|indexer-solana|indexer-private-channel|operator-solana|operator-private-channel)'
         action: keep
 
   # Indexer & Operator app-level metrics
@@ -19,20 +19,20 @@ scrape_configs:
     static_configs:
       - targets: ['indexer-solana${HOST_SUFFIX}:9100']
 
-  - job_name: 'indexer-private_channel'
+  - job_name: 'indexer-private-channel'
     scrape_interval: 2s
     static_configs:
-      - targets: ['indexer-private_channel${HOST_SUFFIX}:9100']
+      - targets: ['indexer-private-channel${HOST_SUFFIX}:9100']
 
   - job_name: 'operator-solana'
     scrape_interval: 2s
     static_configs:
       - targets: ['operator-solana${HOST_SUFFIX}:9102']
 
-  - job_name: 'operator-private_channel'
+  - job_name: 'operator-private-channel'
     scrape_interval: 2s
     static_configs:
-      - targets: ['operator-private_channel${HOST_SUFFIX}:9103']
+      - targets: ['operator-private-channel${HOST_SUFFIX}:9103']
 
   - job_name: 'gateway'
     static_configs:
@@ -56,7 +56,7 @@ scrape_configs:
       - targets:
           - http://write-node${HOST_SUFFIX}:8900/health
           - http://read-node${HOST_SUFFIX}:8901/health
-          - http://streamer${HOST_SUFFIX}:8902/health
+          - http://streamer${HOST_SUFFIX}:8902/health # line deleted at container start when PROBE_STREAMER=false (devnet runs no streamer; a permanent probe_success=0 would page forever)
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

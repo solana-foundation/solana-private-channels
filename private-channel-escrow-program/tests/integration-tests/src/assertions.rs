@@ -1,7 +1,8 @@
-use crate::smt_utils::EMPTY_TREE_ROOT;
 use crate::utils::get_token_balance;
-use crate::utils::{TestContext, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
-use private_channel_escrow_program_client::{accounts::Instance, AllowedMint, Operator};
+use crate::utils::{TestContext, NONCES_PER_GENERATION, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID};
+use private_channel_escrow_program_client::{
+    accounts::Instance, AllowedMint, Operator, WithdrawalBitmap,
+};
 use solana_program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::state::Account as TokenAccount;
@@ -12,7 +13,6 @@ pub fn assert_instance_account(
     expected_admin: &Pubkey,
     expected_bump: u8,
     expected_instance_seed: &Pubkey,
-    expected_current_tree_index: u64,
 ) {
     let account = context
         .get_account(instance_pda)
@@ -26,7 +26,6 @@ pub fn assert_instance_account(
     assert_eq!(instance.admin, *expected_admin);
     assert_eq!(instance.bump, expected_bump);
     assert_eq!(instance.instance_seed, *expected_instance_seed);
-    assert_eq!(instance.current_tree_index, expected_current_tree_index);
 }
 
 pub fn assert_allow_mint_account(
@@ -189,28 +188,78 @@ pub fn assert_release_funds_balances(
     );
 }
 
-pub fn assert_instance_smt_reset(
+/// Bits start after the discriminator (1), bump (1) and generation (8).
+const BITMAP_BITS_OFFSET: usize = 10;
+
+pub fn assert_withdrawal_bitmap_account(
     context: &mut TestContext,
-    instance_pda: &Pubkey,
-    previous_tree_index: u64,
+    withdrawal_bitmap_pda: &Pubkey,
+    expected_bump: u8,
+    expected_generation: u64,
 ) {
     let account = context
-        .get_account(instance_pda)
-        .expect("Instance account should exist");
+        .get_account(withdrawal_bitmap_pda)
+        .expect("Withdrawal bitmap account should exist");
 
     assert_eq!(account.owner, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
 
-    let instance =
-        Instance::from_bytes(&account.data).expect("Should deserialize instance account");
+    let bitmap = WithdrawalBitmap::from_bytes(&account.data)
+        .expect("Should deserialize withdrawal bitmap account");
+
+    assert_eq!(bitmap.bump, expected_bump);
+    assert_eq!(bitmap.generation, expected_generation);
+}
+
+pub fn assert_bitmap_bits_cleared(context: &mut TestContext, withdrawal_bitmap_pda: &Pubkey) {
+    let account = context
+        .get_account(withdrawal_bitmap_pda)
+        .expect("Withdrawal bitmap account should exist");
+
+    assert!(
+        account.data[BITMAP_BITS_OFFSET..]
+            .iter()
+            .all(|byte| *byte == 0),
+        "every bit should be clear"
+    );
+}
+
+pub fn assert_nonce_consumed(
+    context: &mut TestContext,
+    withdrawal_bitmap_pda: &Pubkey,
+    nonce: u64,
+    expected_consumed: bool,
+) {
+    let account = context
+        .get_account(withdrawal_bitmap_pda)
+        .expect("Withdrawal bitmap account should exist");
+
+    let bit = (nonce % NONCES_PER_GENERATION) as usize;
+    let byte = account.data[BITMAP_BITS_OFFSET + bit / 8];
+    let consumed = byte & (1u8 << (bit % 8)) != 0;
 
     assert_eq!(
-        instance.withdrawal_transactions_root, EMPTY_TREE_ROOT,
-        "SMT root should be reset to EMPTY_TREE_ROOT"
+        consumed, expected_consumed,
+        "nonce {nonce} consumed state should be {expected_consumed}"
     );
+}
+
+pub fn assert_bitmap_rotated(
+    context: &mut TestContext,
+    withdrawal_bitmap_pda: &Pubkey,
+    previous_generation: u64,
+) {
+    let account = context
+        .get_account(withdrawal_bitmap_pda)
+        .expect("Withdrawal bitmap account should exist");
+
+    let bitmap = WithdrawalBitmap::from_bytes(&account.data)
+        .expect("Should deserialize withdrawal bitmap account");
 
     assert_eq!(
-        instance.current_tree_index,
-        previous_tree_index + 1,
-        "Tree index should be incremented after reset"
+        bitmap.generation,
+        previous_generation + 1,
+        "Generation should be incremented after rotation"
     );
+
+    assert_bitmap_bits_cleared(context, withdrawal_bitmap_pda);
 }

@@ -153,8 +153,9 @@ fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService 
 }
 
 /// Resync service that reconciles each rebuilt row against the PrivateChannel
-/// at `channel_rpc_url` (D4). `escrow_instance_id` filters deposits to this
-/// instance; pass `Some(instance)` for Escrow, `None` for Withdraw.
+/// at `channel_rpc_url` (D4). `escrow_instance_id` filters deposits for Escrow
+/// and names the bitmap a Withdraw rebuild checks. Both chains are the one
+/// validator here, so the bitmap is read from `source_rpc_url`.
 fn make_channel_resync_service(
     source_rpc_url: String,
     storage: Arc<Storage>,
@@ -171,7 +172,7 @@ fn make_channel_resync_service(
     let backfill_config = BackfillConfig {
         enabled: true,
         exit_after_backfill: true,
-        rpc_url: source_rpc_url,
+        rpc_url: source_rpc_url.clone(),
         batch_size: 50,
         max_gap_slots: u64::MAX,
         start_slot: None,
@@ -187,6 +188,7 @@ fn make_channel_resync_service(
         channel_rpc_url,
         authority,
     })
+    .with_withdrawal_bitmap_rpc(source_rpc_url)
 }
 
 /// Wait until the confirmed tip reaches `target`. Backfill fetches blocks at
@@ -1276,12 +1278,13 @@ async fn resync_reclassifies_failed_reminted_withdrawal() -> Result<(), Box<dyn 
     wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
 
     let mock = MockRpcServer::start().await;
-    // Withdraw program: no escrow instance; the source-event-id is instance-independent.
+    // Withdraw program: the instance only names the bitmap the pre-flight reads, which
+    // is fresh here because no release ran. The source-event-id is instance-independent.
     let h = Harness {
         db_url: db_url.clone(),
         source_rpc_url: validator.rpc_url(),
         program_type: ProgramType::Withdraw,
-        instance: None,
+        instance: Some(env.instance),
         channel_url: mock.url(),
         genesis,
     };
@@ -1341,7 +1344,7 @@ async fn resync_leaves_released_withdrawal_for_smt_guard() -> Result<(), Box<dyn
         db_url: db_url.clone(),
         source_rpc_url: validator.rpc_url(),
         program_type: ProgramType::Withdraw,
-        instance: None,
+        instance: Some(env.instance),
         channel_url: mock.url(),
         genesis,
     };

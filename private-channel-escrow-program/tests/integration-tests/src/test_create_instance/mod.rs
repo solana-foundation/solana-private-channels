@@ -1,5 +1,5 @@
 use crate::{
-    pda_utils::{find_event_authority_pda, find_instance_pda},
+    pda_utils::{find_event_authority_pda, find_instance_pda, find_withdrawal_bitmap_pda},
     state_utils::assert_get_or_create_instance,
     utils::{
         assert_program_error, TestContext, INCORRECT_PROGRAM_ID_ERROR,
@@ -43,16 +43,19 @@ fn test_create_instance_duplicate() {
 
     let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
 
     let instruction = CreateInstanceBuilder::new()
         .payer(context.payer.pubkey())
         .admin(admin2.pubkey())
         .instance_seed(instance_seed.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .bitmap_bump(bitmap_bump)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin2, &instance_seed]);
@@ -73,16 +76,19 @@ fn test_create_instance_invalid_pda() {
 
     let wrong_pda = Pubkey::new_unique();
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&wrong_pda);
 
     let instruction = CreateInstanceBuilder::new()
         .payer(context.payer.pubkey())
         .admin(admin.pubkey())
         .instance_seed(instance_seed.pubkey())
         .instance(wrong_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(1) // Wrong bump
+        .bitmap_bump(bitmap_bump)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&admin, &instance_seed]);
@@ -102,6 +108,7 @@ fn test_create_instance_invalid_admin_not_signer() {
 
     let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
 
     // Create instruction where admin is NOT marked as signer to test program validation
     let accounts = vec![
@@ -109,14 +116,16 @@ fn test_create_instance_invalid_admin_not_signer() {
         AccountMeta::new_readonly(admin.pubkey(), false), // admin (NOT signer)
         AccountMeta::new_readonly(instance_seed.pubkey(), true), // instance_seed (signer)
         AccountMeta::new(instance_pda, false),          // instance (writable)
+        AccountMeta::new(withdrawal_bitmap_pda, false), // withdrawal_bitmap (writable)
         AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
         AccountMeta::new_readonly(event_authority_pda, false), // event_authority
         AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // private_channel_escrow_program
     ];
 
-    // Create instruction data in Borsh format: discriminator(1) + bump(1)
+    // Create instruction data in Borsh format: discriminator(1) + bump(1) + bitmap_bump(1)
     let mut data = vec![0]; // discriminator for CreateInstance
     data.push(bump); // bump
+    data.push(bitmap_bump); // bitmap_bump
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -140,6 +149,7 @@ fn test_create_instance_invalid_event_authority() {
         .unwrap();
 
     let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
     let wrong_event_authority = Pubkey::new_unique(); // Not the real event authority PDA
 
     let accounts = vec![
@@ -147,6 +157,7 @@ fn test_create_instance_invalid_event_authority() {
         AccountMeta::new_readonly(admin.pubkey(), true), // admin (signer)
         AccountMeta::new_readonly(instance_seed.pubkey(), true), // instance_seed (signer)
         AccountMeta::new(instance_pda, false),          // instance (writable)
+        AccountMeta::new(withdrawal_bitmap_pda, false), // withdrawal_bitmap (writable)
         AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false), // system_program
         AccountMeta::new_readonly(wrong_event_authority, false), // event_authority (WRONG)
         AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // private_channel_escrow_program
@@ -154,6 +165,7 @@ fn test_create_instance_invalid_event_authority() {
 
     let mut data = vec![0]; // discriminator for CreateInstance
     data.push(bump); // bump
+    data.push(bitmap_bump); // bitmap_bump
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -178,6 +190,7 @@ fn test_create_instance_invalid_system_program() {
 
     let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
     let wrong_system_program = Pubkey::new_unique();
 
     let accounts = vec![
@@ -185,6 +198,7 @@ fn test_create_instance_invalid_system_program() {
         AccountMeta::new_readonly(admin.pubkey(), true), // admin (signer)
         AccountMeta::new_readonly(instance_seed.pubkey(), true), // instance_seed (signer)
         AccountMeta::new(instance_pda, false),          // instance (writable)
+        AccountMeta::new(withdrawal_bitmap_pda, false), // withdrawal_bitmap (writable)
         AccountMeta::new_readonly(wrong_system_program, false), // system_program (WRONG)
         AccountMeta::new_readonly(event_authority_pda, false), // event_authority
         AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // private_channel_escrow_program
@@ -192,6 +206,7 @@ fn test_create_instance_invalid_system_program() {
 
     let mut data = vec![0]; // discriminator for CreateInstance
     data.push(bump); // bump
+    data.push(bitmap_bump); // bitmap_bump
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,

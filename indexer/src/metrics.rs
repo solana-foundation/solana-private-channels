@@ -106,6 +106,18 @@ counter_vec!(
     &["program_type"]
 );
 
+// A status write matched no row because the transaction had already moved
+// off Processing. That is routine for most statuses and is not counted here;
+// only a skipped `Completed` increments, because it means an on-chain release
+// the DB will never record, which wedges the next boot's bitmap diff.
+// Any nonzero sample needs a human.
+counter_vec!(
+    OPERATOR_DB_UPDATE_SKIPPED,
+    "private_channel_operator_db_updates_skipped_total",
+    "Completed status DB updates that matched no row",
+    &["program_type", "status"]
+);
+
 histogram_vec!(
     OPERATOR_RPC_SEND_DURATION,
     "private_channel_operator_rpc_send_duration_seconds",
@@ -182,6 +194,11 @@ counter_vec!(
 // stuck-row recovery worker.  `outcome` ∈ {completed, requeued, quarantined};
 // `type` ∈ {deposit, withdrawal}.  All values 0 in steady state — any
 // sustained nonzero is concrete evidence of operator crash-window activity.
+//
+// The same counter also reports withdrawals cleared out of a stalled status by
+// the reconcile sweep: `manual_review_cleared` and `pending_remint_cleared`.
+// Those two are withdrawal-only, and each one means a row that had stopped
+// moving was proven landed on-chain and promoted to Completed.
 counter_vec!(
     OPERATOR_STALE_PROCESSING_RECOVERED,
     "private_channel_operator_stale_processing_recovered_total",
@@ -202,7 +219,7 @@ counter_vec!(
     &["program_type", "outcome"]
 );
 
-// Release-side SMT confirmation gate: the on-chain root verdict wherever a
+// Release-side confirmation gate: the on-chain bitmap verdict wherever a
 // release consumer needs to know whether a nonce actually released. `site` is one
 // of {recovery, remint, presend}; `verdict` is one of {landed, not_landed,
 // uncertain}, plus `journal_unavailable` on `presend` only. `recovery` and
@@ -215,7 +232,7 @@ counter_vec!(
 counter_vec!(
     OPERATOR_RELEASE_VERIFY,
     "private_channel_operator_release_verify_total",
-    "Release-side SMT confirmation verdicts",
+    "Release-side on-chain confirmation verdicts",
     &["site", "verdict"]
 );
 
@@ -293,6 +310,11 @@ pub fn init_labels(program_type: &str) {
         OPERATOR_DB_UPDATES.with_label_values(&[program_type, status]);
     }
 
+    // Only Completed is ever counted here. Seeding the other statuses would
+    // publish series that are pinned at zero by construction, which reads on
+    // a dashboard as "no skips happened" rather than "never measured".
+    OPERATOR_DB_UPDATE_SKIPPED.with_label_values(&[program_type, "Completed"]);
+
     for result in &["success", "failure", "error"] {
         OPERATOR_RPC_SEND_DURATION.with_label_values(&[program_type, result]);
     }
@@ -301,8 +323,15 @@ pub fn init_labels(program_type: &str) {
         "build_error",
         "max_retries_exceeded",
         "rpc_send_error",
-        "invalid_smt_proof",
-        "invalid_nonce_for_tree_index",
+        "nonce_already_used",
+        "nonce_outside_generation",
+        "bitmap_unavailable",
+        "rotation_already_landed",
+        "rotation_rearmed",
+        "rotation_lost",
+        "rotation_blocked_by_lower_nonce",
+        "rotation_origination_read_failed",
+        "bitmap_divergence",
         "mint_not_initialized",
         "confirmation_timeout_non_idempotent",
         "confirmation_timeout",
@@ -314,10 +343,6 @@ pub fn init_labels(program_type: &str) {
         "jit_missing_claim_lease",
         "malformed_status_response",
         "status_poll_rpc_error",
-        "rotation_not_landed",
-        "rotation_gate_unavailable",
-        "rotation_blocked_by_lower_nonce",
-        "reset_tree_already_advanced",
     ] {
         OPERATOR_TRANSACTION_ERRORS.with_label_values(&[program_type, error_reason]);
     }
@@ -375,6 +400,16 @@ pub fn init_labels(program_type: &str) {
         }
     }
 
+    // Stalled-row clears exist only on the withdraw side; pairing them with
+    // `deposit` would register a series that can never increment.
+    for outcome in &["manual_review_cleared", "pending_remint_cleared"] {
+        OPERATOR_STALE_PROCESSING_RECOVERED.with_label_values(&[
+            program_type,
+            outcome,
+            "withdrawal",
+        ]);
+    }
+
     // Release-verify gate labels are program-independent (site, verdict); the
     // idempotent pre-registration is harmless across repeated init_labels calls.
     for site in &["recovery", "remint", "presend"] {
@@ -414,6 +449,7 @@ pub fn init() {
         INDEXER_SLOT_PROCESSING_DURATION,
         OPERATOR_TRANSACTIONS_FETCHED,
         OPERATOR_DB_UPDATES,
+        OPERATOR_DB_UPDATE_SKIPPED,
         OPERATOR_DB_UPDATE_ERRORS,
         OPERATOR_RPC_SEND_DURATION,
         OPERATOR_TRANSACTION_ERRORS,

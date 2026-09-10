@@ -8,6 +8,9 @@ export function updateInstructionBumps(privateChannelEscrowCodama: Codama): Coda
                     bump: {
                         defaultValue: accountBumpValueNode('instance'),
                     },
+                    bitmapBump: {
+                        defaultValue: accountBumpValueNode('withdrawalBitmap'),
+                    },
                 },
             },
             allowMint: {

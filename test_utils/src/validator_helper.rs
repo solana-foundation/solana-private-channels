@@ -104,12 +104,11 @@ const GEYSER_PLUGIN_PATH: &str = concat!(
 /// Why this exists:
 ///   `target/deploy/private_channel_escrow_program.so` is a single artifact path
 ///   that both prod (`make build`) and test-tree (`make build-test`) builds
-///   overwrite. Meanwhile the indexer's SMT empty-tree root is a compile-
-///   time constant derived from the `test-tree` feature on the
-///   `private-channel-indexer` crate. If the two disagree, the operator computes
-///   one empty root locally and sees a different one on-chain, refuses to
-///   build withdrawals, and the test times out 2+ minutes later with a
-///   cryptic balance assertion failure.
+///   overwrite. Meanwhile the size of a generation window is a compile-time
+///   constant on the `private-channel-indexer` crate, derived from the same
+///   feature. If the two disagree, the operator computes one generation for a
+///   nonce and the program enforces another, so every release is rejected and
+///   the test times out minutes later on a cryptic balance assertion.
 ///
 ///   This preflight reads cargo's build fingerprint for the escrow
 ///   program, matches it to the deployed `.so` by mtime, and panics with
@@ -117,10 +116,9 @@ const GEYSER_PLUGIN_PATH: &str = concat!(
 fn verify_escrow_program_features_match_indexer(program_path: &Path) {
     static CHECKED: Once = Once::new();
     CHECKED.call_once(|| {
-        // Detect the test-tree feature via the indexer's TREE_HEIGHT constant.
-        // Prod build: TREE_HEIGHT=16. test-tree build: TREE_HEIGHT=3.
+        // Detect test-tree via the window size: 65,536 in prod, 8 under the feature.
         let expected_test_tree =
-            private_channel_indexer::operator::tree_constants::TREE_HEIGHT != 16;
+            private_channel_indexer::operator::bitmap_constants::NONCES_PER_GENERATION != 65_536;
         let so_mtime = match fs::metadata(program_path).and_then(|m| m.modified()) {
             Ok(t) => t,
             Err(e) => {
@@ -213,15 +211,15 @@ fn verify_escrow_program_features_match_indexer(program_path: &Path) {
             panic!(
                 "\n\n\
                 ========================================================================\n\
-                SMT TREE FEATURE MISMATCH — test would fail with 'SMT root mismatch'\n\
+                BITMAP GENERATION FEATURE MISMATCH\n\
                 ========================================================================\n\
                 Deployed escrow `.so` features: {deployed_name}\n\
                 Current test binary expects:    {expected_name}\n\
                 \n\
-                The indexer's `EMPTY_TREE_ROOT` is a compile-time constant that\n\
-                depends on the `test-tree` feature. It must match the escrow program\n\
-                loaded into solana-test-validator, or the operator will refuse to\n\
-                build withdrawal transactions (see indexer/src/operator/sender/state.rs).\n\
+                NONCES_PER_GENERATION is a compile-time constant that depends on the\n\
+                `test-tree` feature. It must match the escrow program loaded into\n\
+                solana-test-validator, or every release is rejected on-chain with\n\
+                NonceOutsideCurrentGeneration.\n\
                 \n\
                 Rebuild the escrow program to match:\n\
                     {rebuild_cmd}\n\

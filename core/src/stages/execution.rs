@@ -3072,4 +3072,67 @@ mod tests {
             "nothing may be cached from a read that failed"
         );
     }
+
+    async fn insert_corrupt_pg(db: &AccountsDB, pubkey: Pubkey) {
+        if let AccountsDB::Postgres(pg) = db {
+            sqlx::query(
+                "INSERT INTO accounts (pubkey, data) VALUES ($1, $2)
+                 ON CONFLICT (pubkey) DO UPDATE SET data = EXCLUDED.data",
+            )
+            .bind(pubkey.to_bytes().to_vec())
+            .bind(vec![0xAAu8; 5])
+            .execute(pg.pool.as_ref())
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A corrupt account is a fatal integrity fault: execute_batch aborts the
+    /// whole batch so nothing is settled, rather than failing single txs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn corrupt_account_aborts_batch() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let corrupt = Pubkey::new_unique();
+        insert_corrupt_pg(&accounts_db, corrupt).await;
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let batch = ConflictFreeBatch {
+            transactions: vec![crate::scheduler::TransactionWithIndex {
+                transaction: Arc::new(transfer(&Keypair::new(), &corrupt, 10)),
+                index: 0,
+            }],
+        };
+        let result = execute_batch(batch, &mut deps, &noop).await;
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Corrupt(k)) if k == corrupt),
+            "a referenced corrupt account must abort the batch fatally"
+        );
+    }
+
+    /// A corrupt account referenced by no transaction has no effect: it is never
+    /// loaded, so the batch executes normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreferenced_corrupt_account_has_no_effect() {
+        let (accounts_db, _pg) = start_test_postgres().await;
+        let unref = Pubkey::new_unique();
+        insert_corrupt_pg(&accounts_db, unref).await;
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let result = run_batch(
+            &mut deps,
+            &metrics,
+            vec![transfer(&Keypair::new(), &Pubkey::new_unique(), 10)],
+        )
+        .await;
+
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(is_executed(regular_result(&result, 0)));
+    }
 }
