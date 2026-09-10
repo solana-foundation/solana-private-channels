@@ -21,7 +21,7 @@ dispatch table below routes by webhook + `transaction_type`.
 > dispatch table; see
 > [`sender_lock_lost_runbook.md`](sender_lock_lost_runbook.md).
 >
-> **A third condition pages through Grafana, not the webhook.** The
+> **A fourth condition pages through Grafana, not the webhook.** The
 > **`live-state-lock-lost`** alert fires when an indexer, operator or resync
 > cannot prove it still owns the live-state lock, which is what keeps live
 > workers and a destructive resync off the same database. The same runbook
