@@ -45,3 +45,8 @@ indexer/config/devnet/
 # Test coverage
 coverage/
 coverage-*.lcov
+
+# Local audit findings exports (Cantina / OtterSec), not part of the repo.
+cantina_findings*.json
+cantina_severity_downgrade_requests*.csv
+*findings-export-*.json
