@@ -1,7 +1,7 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
-    DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
-    MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
+    DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
+    MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
 };
 use crate::storage::common::storage::RequeueOutcome;
 use bigdecimal::BigDecimal;
@@ -12,8 +12,11 @@ use std::sync::{Arc, Mutex};
 /// Recorded status update from `update_transaction_status`.
 pub type StatusUpdateRecord = (i64, TransactionStatus, Option<String>, DateTime<Utc>);
 
-/// (transaction_id, signatures, last_valid_block_heights, deadline) persisted on PendingRemint transition.
-pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>);
+/// What a PendingRemint transition persists, in tuple order: the transaction id,
+/// the withdrawal signatures, their last_valid_block_heights, the deadline the
+/// finality check waits out, and whether the program itself refused the release.
+/// Tests read this to check what the sender actually wrote.
+pub type PendingRemintRecord = (i64, Vec<String>, Vec<i64>, DateTime<Utc>, bool);
 
 /// In-memory mirror of `pending_release_signatures`, keyed by transaction id.
 pub type ReleaseSignatureMap = HashMap<i64, Vec<StoredSig>>;
@@ -44,6 +47,11 @@ pub struct MockStorage {
     pub mint_status_history: Arc<Mutex<Vec<DbMintStatus>>>,
     /// Mirrors the `pending_release_signatures` table for verify-before-demote.
     pub release_signatures: Arc<Mutex<ReleaseSignatureMap>>,
+    /// Mirrors the `observed_releases` table, keyed by withdrawal nonce.
+    pub observed_releases: Arc<Mutex<HashMap<i64, DbObservedRelease>>>,
+    /// Nonce floors the rotation gate has asked for, oldest first. Tests read
+    /// this to pin how much of the table each pass has to aggregate over.
+    pub unreleased_bounds_floors: Arc<Mutex<Vec<i64>>>,
     /// Mirrors the `pending_remint_signatures` write-ahead table.
     pub remint_signatures: Arc<Mutex<ReleaseSignatureMap>>,
     /// Mirrors the `superseded` column: attempts retired after being proven dead.
@@ -58,9 +66,6 @@ pub struct MockStorage {
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Mirrors the single-row `reconciliation_halt` table; `None` = not halted.
     pub reconciliation_halt: Arc<Mutex<Option<HaltInfo>>>,
-    /// Mirrors `indexer_state.owed_rotation_target`: the tree generation the sender
-    /// owes, per program type. An absent key is a NULL column.
-    pub owed_rotation_targets: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl MockStorage {
@@ -144,13 +149,16 @@ impl MockStorage {
     }
 
     pub async fn init_schema(&self) -> Result<(), StorageError> {
-        self.check_should_fail("init_schema")?;
-        Ok(())
+        self.check_should_fail("init_schema")
     }
 
-    // Counted, so a test can assert the rebuild never reached the destruction.
+    /// Empties the row tables so a test can tell a drop that ran from one that
+    /// was refused, instead of only counting calls.
     pub async fn drop_tables(&self) -> Result<(), StorageError> {
         self.check_should_fail("drop_tables")?;
+        self.pending_transactions.lock().unwrap().clear();
+        self.mints.lock().unwrap().clear();
+        self.committed_checkpoints.lock().unwrap().clear();
         Ok(())
     }
 
@@ -214,122 +222,26 @@ impl MockStorage {
     ) -> Result<Vec<DbTransaction>, StorageError> {
         let mut pending = self.pending_transactions.lock().unwrap();
 
-        // Withdrawals: mirror the Postgres frontier dequeue. Return Pending
-        // withdrawals in nonce order, only those below the lowest active
-        // (non-Pending) nonce, and mark them Processing in place (kept in the
-        // store so they act as the barrier on the next call).
-        if matches!(transaction_type, TransactionType::Withdrawal) {
-            let barrier = pending
-                .iter()
-                .filter(|t| {
-                    t.transaction_type == TransactionType::Withdrawal
-                        && matches!(
-                            t.status,
-                            TransactionStatus::Processing
-                                | TransactionStatus::Parked
-                                | TransactionStatus::PendingRemint
-                                | TransactionStatus::ManualReview
-                        )
-                })
-                .filter_map(|t| t.withdrawal_nonce)
-                .min();
+        // Mirror the Postgres dequeue: Pending rows of this type in created_at
+        // order, with no nonce frontier. Locked rows stay in the store as
+        // Processing so a later claim's CAS can find them, and are handed back
+        // carrying the post-lock token the RETURNING clause supplies.
+        let mut order: Vec<usize> = (0..pending.len())
+            .filter(|&i| {
+                pending[i].transaction_type == transaction_type
+                    && pending[i].status == TransactionStatus::Pending
+            })
+            .collect();
+        order.sort_by_key(|&i| pending[i].created_at);
+        order.truncate(limit.max(0) as usize);
 
-            // Numbered nonces below the frontier, in nonce order.
-            let mut numbered: Vec<(i64, i64)> = pending
-                .iter()
-                .filter(|t| {
-                    t.transaction_type == TransactionType::Withdrawal
-                        && t.status == TransactionStatus::Pending
-                })
-                .filter_map(|t| t.withdrawal_nonce.map(|nonce| (nonce, t.id)))
-                .filter(|(nonce, _)| barrier.is_none_or(|b| *nonce < b))
-                .collect();
-            numbered.sort_by_key(|(nonce, _)| *nonce);
-
-            // NULL-nonce rows are poison; the frontier doesn't apply. Dequeue them
-            // (sorted last, mirroring SQL ORDER BY ... ASC) so the processor can
-            // quarantine them.
-            let null_nonce_ids = pending
-                .iter()
-                .filter(|t| {
-                    t.transaction_type == TransactionType::Withdrawal
-                        && t.status == TransactionStatus::Pending
-                        && t.withdrawal_nonce.is_none()
-                })
-                .map(|t| t.id);
-
-            let mut ids: Vec<i64> = numbered.into_iter().map(|(_, id)| id).collect();
-            ids.extend(null_nonce_ids);
-            ids.truncate(limit.max(0) as usize);
-
-            let mut matched = Vec::new();
-            for id in ids {
-                if let Some(txn) = pending.iter_mut().find(|t| t.id == id) {
-                    txn.status = TransactionStatus::Processing;
-                    matched.push(txn.clone());
-                }
-            }
-            return Ok(matched);
-        }
-
-        // Deposits: FIFO by insertion order. Mirror Postgres: lock only Pending
-        // rows, flip them to Processing in place (keep them in the store so a
-        // later claim's CAS can find the row), and hand back the post-lock token.
         let mut matched = Vec::new();
-        for txn in pending.iter_mut() {
-            if txn.transaction_type == transaction_type
-                && txn.status == TransactionStatus::Pending
-                && (matched.len() as i64) < limit
-            {
-                txn.status = TransactionStatus::Processing;
-                txn.updated_at = Utc::now();
-                matched.push(txn.clone());
-            }
+        for i in order {
+            pending[i].status = TransactionStatus::Processing;
+            pending[i].updated_at = Utc::now();
+            matched.push(pending[i].clone());
         }
         Ok(matched)
-    }
-
-    pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
-        let pending = self.pending_transactions.lock().unwrap();
-        // Processing excluded on purpose: those are already dispatched ahead of
-        // the rotation, so the sender's in-flight guard covers them.
-        Ok(pending.iter().any(|t| {
-            t.transaction_type == TransactionType::Withdrawal
-                && t.withdrawal_nonce.is_some_and(|n| n < nonce)
-                && matches!(
-                    t.status,
-                    TransactionStatus::Pending
-                        | TransactionStatus::Parked
-                        | TransactionStatus::PendingRemint
-                        | TransactionStatus::ManualReview
-                )
-        }))
-    }
-
-    pub async fn lowest_unreleased_withdrawal_below(
-        &self,
-        nonce: i64,
-    ) -> Result<Option<i64>, StorageError> {
-        self.check_should_fail("lowest_unreleased_withdrawal_below")?;
-        let pending = self.pending_transactions.lock().unwrap();
-        // Processing included, unlike has_active_withdrawal_below: this gates the
-        // sender's submit, which must hold after a restart dropped its in-flight map.
-        Ok(pending
-            .iter()
-            .filter(|t| {
-                t.transaction_type == TransactionType::Withdrawal
-                    && matches!(
-                        t.status,
-                        TransactionStatus::Pending
-                            | TransactionStatus::Processing
-                            | TransactionStatus::Parked
-                            | TransactionStatus::PendingRemint
-                            | TransactionStatus::ManualReview
-                    )
-            })
-            .filter_map(|t| t.withdrawal_nonce)
-            .filter(|lower| *lower < nonce)
-            .min())
     }
 
     pub async fn get_committed_checkpoint(
@@ -361,46 +273,6 @@ impl MockStorage {
                 }
             })
             .or_insert(slot);
-        Ok(())
-    }
-
-    pub async fn get_owed_rotation_target(
-        &self,
-        program_type: &str,
-    ) -> Result<Option<u64>, StorageError> {
-        self.check_should_fail("get_owed_rotation_target")?;
-        Ok(self
-            .owed_rotation_targets
-            .lock()
-            .unwrap()
-            .get(program_type)
-            .copied())
-    }
-
-    pub async fn set_owed_rotation_target(
-        &self,
-        program_type: &str,
-        target_tree_index: u64,
-    ) -> Result<(), StorageError> {
-        self.check_should_fail("set_owed_rotation_target")?;
-        self.owed_rotation_targets
-            .lock()
-            .unwrap()
-            .insert(program_type.to_string(), target_tree_index);
-        Ok(())
-    }
-
-    pub async fn clear_owed_rotation_target(
-        &self,
-        program_type: &str,
-        target_tree_index: u64,
-    ) -> Result<(), StorageError> {
-        self.check_should_fail("clear_owed_rotation_target")?;
-        // Mirrors the postgres WHERE guard: only the proven target is retired.
-        let mut map = self.owed_rotation_targets.lock().unwrap();
-        if map.get(program_type) == Some(&target_tree_index) {
-            map.remove(program_type);
-        }
         Ok(())
     }
 
@@ -719,6 +591,24 @@ impl MockStorage {
         Ok(nonces)
     }
 
+    pub async fn get_withdrawal_by_nonce(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<DbTransaction>, StorageError> {
+        self.check_should_fail("get_withdrawal_by_nonce")?;
+        Ok(self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|t| {
+                t.transaction_type == TransactionType::Withdrawal
+                    && t.withdrawal_nonce == Some(nonce as i64)
+            })
+            .cloned())
+    }
+
     /// Mirror `set_pending_remint_internal`: transition a Processing row to
     /// PendingRemint and store the finality-check payload. Replaying an
     /// identical payload on an already-PendingRemint row succeeds; any other
@@ -730,6 +620,7 @@ impl MockStorage {
         remint_signatures: Vec<String>,
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: DateTime<Utc>,
+        release_refused_on_chain: bool,
     ) -> Result<(), StorageError> {
         self.check_should_fail("set_pending_remint")?;
 
@@ -755,6 +646,7 @@ impl MockStorage {
             row.remint_signatures = Some(remint_signatures.clone());
             row.remint_last_valid_block_heights = Some(remint_last_valid_block_heights.clone());
             row.pending_remint_deadline_at = Some(deadline_at);
+            row.release_refused_on_chain = release_refused_on_chain;
             row.updated_at = Utc::now();
 
             // Keep the rehydration list in step, so `get_pending_remint_transactions`
@@ -772,6 +664,7 @@ impl MockStorage {
             remint_signatures,
             remint_last_valid_block_heights,
             deadline_at,
+            release_refused_on_chain,
         ));
         Ok(())
     }
@@ -862,21 +755,81 @@ impl MockStorage {
             .collect())
     }
 
-    pub async fn quarantine_all_active_withdrawals(
+    pub async fn unreleased_withdrawal_nonce_bounds(
+        &self,
+        min_nonce: i64,
+    ) -> Result<Option<(i64, i64)>, StorageError> {
+        self.unreleased_bounds_floors
+            .lock()
+            .unwrap()
+            .push(min_nonce);
+        self.check_should_fail("unreleased_withdrawal_nonce_bounds")?;
+        let pending = self.pending_transactions.lock().unwrap();
+        // Mirror the SQL's complement-of-terminal status set.
+        let nonces: Vec<i64> = pending
+            .iter()
+            .filter(|txn| {
+                txn.transaction_type == TransactionType::Withdrawal
+                    && matches!(
+                        txn.status,
+                        TransactionStatus::Pending
+                            | TransactionStatus::Processing
+                            | TransactionStatus::Parked
+                            | TransactionStatus::PendingRemint
+                            | TransactionStatus::ManualReview
+                    )
+            })
+            // A NULL nonce is skipped by MIN/MAX, so it sets no bound here either.
+            .filter_map(|txn| txn.withdrawal_nonce)
+            .filter(|nonce| *nonce >= min_nonce)
+            .collect();
+
+        Ok(match (nonces.iter().min(), nonces.iter().max()) {
+            (Some(lowest), Some(highest)) => Some((*lowest, *highest)),
+            _ => None,
+        })
+    }
+
+    pub async fn quarantine_active_withdrawals(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, StorageError> {
-        self.check_should_fail("quarantine_all_active_withdrawals")?;
+        self.check_should_fail("quarantine_active_withdrawals")?;
+        // Snapshot the journal before taking the row lock so the two guards are
+        // never held at once.
+        let journal = self.release_signatures.lock().unwrap().clone();
         let mut pending = self.pending_transactions.lock().unwrap();
         let mut affected = 0u64;
         for txn in pending.iter_mut() {
+            // Mirror the SQL's active-status set: pending, processing, parked.
             let quarantinable = matches!(
                 txn.status,
-                TransactionStatus::Pending | TransactionStatus::Processing
+                TransactionStatus::Pending
+                    | TransactionStatus::Processing
+                    | TransactionStatus::Parked
             );
             let excluded = exclude_id.is_some_and(|id| txn.id == id);
-            if txn.transaction_type == TransactionType::Withdrawal && quarantinable && !excluded {
+            // A NULL nonce fails the SQL comparison, so it is never swept
+            // once a floor is set.
+            let above_floor = min_nonce
+                .is_none_or(|floor| txn.withdrawal_nonce.is_some_and(|nonce| nonce >= floor));
+            if txn.transaction_type == TransactionType::Withdrawal
+                && quarantinable
+                && !excluded
+                && above_floor
+            {
                 txn.status = TransactionStatus::ManualReview;
+                // Mirror the SQL COALESCE: journalled release signatures are
+                // carried onto the row so the reconcile sweep can still see it.
+                if let Some(stored) = journal.get(&txn.id).filter(|s| !s.is_empty()) {
+                    let (sigs, heights): (Vec<String>, Vec<i64>) = stored
+                        .iter()
+                        .map(|e| (e.signature.clone(), e.last_valid_block_height))
+                        .unzip();
+                    txn.remint_signatures = Some(sigs);
+                    txn.remint_last_valid_block_heights = Some(heights);
+                }
                 affected += 1;
             }
         }
@@ -885,9 +838,9 @@ impl MockStorage {
 
     pub async fn get_stale_processing_transactions(
         &self,
-        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stale_processing_transactions")?;
         let threshold_chrono = chrono::Duration::from_std(threshold)
@@ -990,9 +943,9 @@ impl MockStorage {
 
     pub async fn get_stale_parked_transactions(
         &self,
-        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         self.check_should_fail("get_stale_parked_transactions")?;
         let threshold_chrono = chrono::Duration::from_std(threshold)
@@ -1069,10 +1022,80 @@ impl MockStorage {
         Ok(false)
     }
 
+    /// Mirror `get_stalled_withdrawals_with_signatures_internal`, including the
+    /// evidence predicates: a missing nonce, an absent/empty signature array, or
+    /// a missing heights array makes the row unclassifiable, so it is not
+    /// returned. A row whose refund was already claimed or landed is excluded
+    /// too, so a release promotion cannot pay the nonce a second time.
+    pub async fn get_stalled_withdrawals_with_signatures(
+        &self,
+        status: TransactionStatus,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        self.check_should_fail("get_stalled_withdrawals_with_signatures")?;
+        let claimed = self.remint_signatures.lock().unwrap();
+        let pending = self.pending_transactions.lock().unwrap();
+        let mut matched: Vec<DbTransaction> = pending
+            .iter()
+            .filter(|t| t.transaction_type == TransactionType::Withdrawal && t.status == status)
+            .filter(|t| t.withdrawal_nonce.is_some())
+            .filter(|t| t.remint_signatures.as_ref().is_some_and(|s| !s.is_empty()))
+            .filter(|t| t.remint_last_valid_block_heights.is_some())
+            .filter(|t| t.landed_remint_signature.is_none())
+            .filter(|t| claimed.get(&t.id).is_none_or(|sigs| sigs.is_empty()))
+            .filter(|t| t.id > after_id)
+            .cloned()
+            .collect();
+        matched.sort_by_key(|t| t.id);
+        matched.truncate(limit as usize);
+        Ok(matched)
+    }
+
+    /// Mirror `try_complete_stalled_withdrawal_internal`: the source status is
+    /// pinned to the two stalled statuses regardless of what the caller binds.
+    pub async fn try_complete_stalled_withdrawal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("try_complete_stalled_withdrawal")?;
+        if !matches!(
+            from_status,
+            TransactionStatus::ManualReview | TransactionStatus::PendingRemint
+        ) {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        for txn in pending.iter_mut() {
+            if txn.id == transaction_id
+                && txn.transaction_type == TransactionType::Withdrawal
+                && txn.status == from_status
+                && txn.updated_at == expected_updated_at
+            {
+                txn.status = TransactionStatus::Completed;
+                if counterpart_signature.is_some() {
+                    txn.counterpart_signature = counterpart_signature;
+                }
+                let now = Utc::now();
+                txn.processed_at = Some(now);
+                txn.updated_at = now;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Mirror `try_quarantine_processing_internal`, `COALESCE` included: a
+    /// `None` argument leaves the existing column value in place.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: DateTime<Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_quarantine_processing")?;
         let mut pending = self.pending_transactions.lock().unwrap();
@@ -1082,6 +1105,12 @@ impl MockStorage {
                 && txn.updated_at == expected_updated_at
             {
                 txn.status = TransactionStatus::ManualReview;
+                if remint_signatures.is_some() {
+                    txn.remint_signatures = remint_signatures;
+                }
+                if remint_last_valid_block_heights.is_some() {
+                    txn.remint_last_valid_block_heights = remint_last_valid_block_heights;
+                }
                 let now = Utc::now();
                 txn.processed_at = Some(now);
                 txn.updated_at = now;
@@ -1186,6 +1215,45 @@ impl MockStorage {
             .unwrap()
             .remove(&transaction_id);
         Ok(())
+    }
+
+    pub async fn delete_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("delete_release_signature")?;
+        let mut map = self.release_signatures.lock().unwrap();
+        if let Some(signatures) = map.get_mut(&transaction_id) {
+            signatures.retain(|stored| stored.signature != signature);
+            if signatures.is_empty() {
+                map.remove(&transaction_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn insert_observed_releases_batch(
+        &self,
+        releases: &[DbObservedRelease],
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("insert_observed_releases_batch")?;
+        let mut store = self.observed_releases.lock().unwrap();
+        for release in releases {
+            // Mirror `ON CONFLICT (withdrawal_nonce) DO NOTHING`: first write wins.
+            store
+                .entry(release.withdrawal_nonce)
+                .or_insert_with(|| release.clone());
+        }
+        Ok(())
+    }
+
+    pub async fn get_observed_release(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<DbObservedRelease>, StorageError> {
+        self.check_should_fail("get_observed_release")?;
+        Ok(self.observed_releases.lock().unwrap().get(&nonce).cloned())
     }
 
     pub async fn gc_stale_release_signatures(&self) -> Result<u64, StorageError> {
@@ -1304,14 +1372,22 @@ impl MockStorage {
         self.check_should_fail("gc_stale_remint_signatures")?;
         // Mirror the Postgres predicate: keep sigs whose parent is still
         // `PendingRemint`; an unknown transaction id counts as non-pending.
-        let pending_remint_ids: std::collections::HashSet<i64> = self
-            .pending_remint_transactions
-            .lock()
-            .unwrap()
+        // The SQL reads one table, so the live mirror wins over the rehydration
+        // list for any row that appears in both.
+        let live = self.pending_transactions.lock().unwrap();
+        let rehydrate = self.pending_remint_transactions.lock().unwrap();
+        let pending_remint_ids: std::collections::HashSet<i64> = live
             .iter()
+            .chain(
+                rehydrate
+                    .iter()
+                    .filter(|t| !live.iter().any(|l| l.id == t.id)),
+            )
             .filter(|t| t.status == TransactionStatus::PendingRemint)
             .map(|t| t.id)
             .collect();
+        drop(live);
+        drop(rehydrate);
         let mut map = self.remint_signatures.lock().unwrap();
         let mut removed = 0u64;
         map.retain(|txn_id, sigs| {

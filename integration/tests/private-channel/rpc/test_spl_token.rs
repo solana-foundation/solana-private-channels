@@ -101,12 +101,19 @@ async fn setup_solana_escrow_instance(solana_ctx: &SolanaContext) -> Result<()> 
     }
     println!("Instance PDA account not found, creating...");
 
+    let (withdrawal_bitmap_pda, bitmap_bump) = Pubkey::find_program_address(
+        &[b"withdrawal_bitmap", instance_pda.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    );
+
     let create_instance_ix = CreateInstanceBuilder::new()
         .payer(solana_ctx.operator_key.pubkey())
         .admin(solana_ctx.operator_key.pubkey())
         .instance_seed(solana_ctx.escrow_instance.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .bump(instance_bump)
+        .bitmap_bump(bitmap_bump)
         .instruction();
 
     let blockhash = solana_ctx.get_latest_blockhash().await?;

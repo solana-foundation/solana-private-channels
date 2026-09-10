@@ -84,6 +84,7 @@ fn make_db_transaction(sig: &str, txn_type: TransactionType) -> DbTransaction {
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     }
 }
 
@@ -441,11 +442,12 @@ async fn lock_pending_second_call_empty() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Withdrawals dequeue under a nonce frontier: a lower active (non-Pending)
-/// nonce blocks every higher nonce, so a boundary can't be handed out ahead of
-/// an unresolved lower withdrawal.
+/// Bitmap bits are independent, so an unresolved lower nonce must not withhold
+/// higher ones. This pins the rejection of the SMT-era dequeue frontier: a
+/// frontier would be a liveness cost here, not a safety property.
 #[tokio::test(flavor = "multi_thread")]
-async fn withdrawal_dequeue_respects_nonce_frontier() -> Result<(), Box<dyn std::error::Error>> {
+async fn withdrawal_dequeue_ignores_lower_active_nonces() -> Result<(), Box<dyn std::error::Error>>
+{
     let (pool, storage, _pg) = start_postgres().await?;
 
     // Sequential inserts get sequential nonces (0, 1, 2) from the trigger.
@@ -455,7 +457,7 @@ async fn withdrawal_dequeue_respects_nonce_frontier() -> Result<(), Box<dyn std:
     let w1 = storage
         .insert_db_transaction(&make_db_transaction("w1", TransactionType::Withdrawal))
         .await?;
-    storage
+    let w2 = storage
         .insert_db_transaction(&make_db_transaction("w2", TransactionType::Withdrawal))
         .await?;
 
@@ -465,17 +467,15 @@ async fn withdrawal_dequeue_respects_nonce_frontier() -> Result<(), Box<dyn std:
         .execute(&pool)
         .await?;
 
-    // Only Pending nonces below the parked one are eligible → just w0.
-    // w2 is Pending but sits above the frontier, so it must be withheld.
     let locked = storage
         .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
         .await?;
+    let ids: Vec<i64> = locked.iter().map(|txn| txn.id).collect();
     assert_eq!(
-        locked.len(),
-        1,
-        "only the nonce below the frontier is dequeued"
+        ids,
+        vec![w0, w2],
+        "a parked lower nonce must not hold back a higher pending one"
     );
-    assert_eq!(locked[0].id, w0);
 
     Ok(())
 }
@@ -577,216 +577,6 @@ async fn checkpoint_update_higher_slot() -> Result<(), Box<dyn std::error::Error
 
     let cp = storage.get_committed_checkpoint("prog").await?;
     assert_eq!(cp, Some(99));
-    Ok(())
-}
-
-/// Settled means the nonce owes nothing on the closing tree: released, written off, or
-/// reminted back to the user.
-#[tokio::test(flavor = "multi_thread")]
-async fn lowest_unreleased_withdrawal_below_ignores_settled_statuses(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (pool, storage, _pg) = start_postgres().await?;
-
-    // Nonces are trigger-assigned from a sequence, so insert order fixes them: 0, 1, 2.
-    for (nonce, status) in [(0, "completed"), (1, "failed"), (2, "failed_reminted")] {
-        let row = make_db_transaction(&format!("settled_{nonce}"), TransactionType::Withdrawal);
-        let id = storage.insert_db_transaction(&row).await?;
-        sqlx::query("UPDATE transactions SET status = $1::text::transaction_status WHERE id = $2")
-            .bind(status)
-            .bind(id)
-            .execute(&pool)
-            .await?;
-    }
-
-    assert_eq!(storage.lowest_unreleased_withdrawal_below(3).await?, None);
-    Ok(())
-}
-
-/// Every live status blocks, `MIN` picks the lowest, and the boundary nonce never blocks
-/// its own rotation. The `processing` step is the one that matters most: this query counts
-/// it where `has_active_withdrawal_below` does not, which is what makes the gate hold
-/// after a restart dropped the sender's in-flight map.
-#[tokio::test(flavor = "multi_thread")]
-async fn lowest_unreleased_withdrawal_below_counts_every_live_status(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (pool, storage, _pg) = start_postgres().await?;
-
-    // Insert order fixes the trigger-assigned nonces 0..4.
-    let mut ids = Vec::new();
-    for nonce in 0..5 {
-        let row = make_db_transaction(&format!("live_{nonce}"), TransactionType::Withdrawal);
-        ids.push(storage.insert_db_transaction(&row).await?);
-    }
-    let set_status = |id: i64, status: &'static str| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query(
-                "UPDATE transactions SET status = $1::text::transaction_status WHERE id = $2",
-            )
-            .bind(status)
-            .bind(id)
-            .execute(&pool)
-            .await
-        }
-    };
-
-    // Settled one at a time, so each assertion names the status that is now lowest, and
-    // the walk ends with only the processing row live.
-    set_status(ids[0], "manual_review").await?;
-    set_status(ids[1], "parked").await?;
-    set_status(ids[2], "pending_remint").await?;
-    set_status(ids[3], "processing").await?;
-    set_status(ids[4], "completed").await?;
-
-    assert_eq!(
-        storage.lowest_unreleased_withdrawal_below(5).await?,
-        Some(0),
-        "manual_review blocks and is the lowest"
-    );
-
-    set_status(ids[0], "completed").await?;
-    assert_eq!(
-        storage.lowest_unreleased_withdrawal_below(5).await?,
-        Some(1),
-        "parked blocks"
-    );
-
-    set_status(ids[1], "completed").await?;
-    assert_eq!(
-        storage.lowest_unreleased_withdrawal_below(5).await?,
-        Some(2),
-        "pending_remint blocks"
-    );
-
-    // Only the processing row is live now, which is exactly where the two queries differ.
-    set_status(ids[2], "completed").await?;
-    assert_eq!(
-        storage.lowest_unreleased_withdrawal_below(5).await?,
-        Some(3),
-        "processing blocks the sender's submit"
-    );
-    assert!(
-        !storage.has_active_withdrawal_below(5).await?,
-        "while the processor's dispatch-time query ignores it, by design"
-    );
-
-    assert_eq!(
-        storage.lowest_unreleased_withdrawal_below(3).await?,
-        None,
-        "the boundary nonce belongs to the tree being opened, so it cannot block its own rotation"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn owed_rotation_target_no_row_returns_none() -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _pg) = start_postgres().await?;
-    assert!(storage
-        .get_owed_rotation_target("withdraw")
-        .await?
-        .is_none());
-    Ok(())
-}
-
-/// Arming a rotation must not fabricate a checkpoint. The row it creates carries no slot,
-/// and reporting one would tell startup a never-indexed program had been indexed.
-#[tokio::test(flavor = "multi_thread")]
-async fn owed_rotation_target_does_not_create_a_checkpoint(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _pg) = start_postgres().await?;
-
-    storage.set_owed_rotation_target("withdraw", 7).await?;
-
-    assert_eq!(
-        storage.get_committed_checkpoint("withdraw").await?,
-        None,
-        "a row created only to hold a rotation target must report no checkpoint"
-    );
-    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(7));
-    Ok(())
-}
-
-/// The monotonic guard has to keep working over a row whose slot is still unset, so the
-/// first real checkpoint lands and a later lower one is still rejected.
-#[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_upsert_over_a_null_row() -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _pg) = start_postgres().await?;
-
-    storage.set_owed_rotation_target("withdraw", 3).await?;
-    storage.update_committed_checkpoint("withdraw", 500).await?;
-    assert_eq!(
-        storage.get_committed_checkpoint("withdraw").await?,
-        Some(500),
-        "the first checkpoint must land on a row that had no slot"
-    );
-
-    storage.update_committed_checkpoint("withdraw", 400).await?;
-    assert_eq!(
-        storage.get_committed_checkpoint("withdraw").await?,
-        Some(500),
-        "a lower slot must still be rejected"
-    );
-    Ok(())
-}
-
-/// The set must work whether or not the program's `indexer_state` row exists yet: the
-/// sender's boot re-arm reads it, so an insert that silently no-ops would drop the
-/// rotation the same way the in-memory-only arm did.
-#[tokio::test(flavor = "multi_thread")]
-async fn owed_rotation_target_set_inserts_then_updates() -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _pg) = start_postgres().await?;
-
-    storage.set_owed_rotation_target("withdraw", 1).await?;
-    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(1));
-
-    // Row now exists (and carries a checkpoint), so this takes the ON CONFLICT path.
-    storage.update_committed_checkpoint("withdraw", 42).await?;
-    storage.set_owed_rotation_target("withdraw", 2).await?;
-    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(2));
-    assert_eq!(
-        storage.get_committed_checkpoint("withdraw").await?,
-        Some(42),
-        "arming a rotation must not disturb the slot cursor on the same row"
-    );
-    Ok(())
-}
-
-/// A clear names the target it proved landed. Anything else must leave the rotation
-/// owed, or a stale clear would retire a rotation that still has to happen.
-#[tokio::test(flavor = "multi_thread")]
-async fn owed_rotation_target_clear_only_matching_target() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (_pool, storage, _pg) = start_postgres().await?;
-
-    storage.set_owed_rotation_target("withdraw", 7).await?;
-
-    storage.clear_owed_rotation_target("withdraw", 6).await?;
-    assert_eq!(
-        storage.get_owed_rotation_target("withdraw").await?,
-        Some(7),
-        "a clear for a different target must not retire the owed rotation"
-    );
-
-    storage.clear_owed_rotation_target("withdraw", 7).await?;
-    assert!(
-        storage
-            .get_owed_rotation_target("withdraw")
-            .await?
-            .is_none(),
-        "the proven target must retire"
-    );
-    Ok(())
-}
-
-/// Both roles can share a database, so each reads only its own owed rotation.
-#[tokio::test(flavor = "multi_thread")]
-async fn owed_rotation_target_is_per_program_type() -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _pg) = start_postgres().await?;
-
-    storage.set_owed_rotation_target("withdraw", 3).await?;
-
-    assert!(storage.get_owed_rotation_target("escrow").await?.is_none());
-    assert_eq!(storage.get_owed_rotation_target("withdraw").await?, Some(3));
     Ok(())
 }
 
@@ -1018,6 +808,142 @@ async fn completed_withdrawal_nonces_empty() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+// ── unreleased withdrawal nonce bounds ───────────────────────────────────────
+
+/// Insert a withdrawal, then force its status and nonce to exactly what the
+/// case under test needs. Both are set directly because the insert trigger picks
+/// the nonce and every row starts `pending`.
+async fn seed_withdrawal(
+    pool: &PgPool,
+    storage: &Storage,
+    tag: &str,
+    nonce: i64,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let row = make_db_transaction(tag, TransactionType::Withdrawal);
+    let id = storage.insert_db_transaction(&row).await?;
+    sqlx::query("UPDATE transactions SET status = $2::transaction_status, withdrawal_nonce = $3 WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .bind(nonce)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The split the rotation gate depends on: a released or written-off nonce can
+/// never need its window again, everything else still might.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_counts_live_and_ignores_terminal(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let live = [
+        "pending",
+        "processing",
+        "parked",
+        "pending_remint",
+        "manual_review",
+    ];
+    // Nonces are chosen well above whatever the insert trigger hands out, since
+    // the column is uniquely indexed and the trigger numbers rows from zero.
+    for (offset, status) in live.iter().enumerate() {
+        seed_withdrawal(&pool, &storage, status, 1_010 + offset as i64, status).await?;
+    }
+    // Terminal rows sit on both sides of the live range, so including any of
+    // them by mistake would move a bound and fail this.
+    for (offset, status) in ["completed", "failed", "failed_reminted"]
+        .iter()
+        .enumerate()
+    {
+        seed_withdrawal(&pool, &storage, status, 1_000 + offset as i64, status).await?;
+        seed_withdrawal(
+            &pool,
+            &storage,
+            &format!("{status}_high"),
+            1_100 + offset as i64,
+            status,
+        )
+        .await?;
+    }
+
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        Some((1_010, 1_014)),
+        "bounds must span the live withdrawals and nothing else"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_ignores_deposits_and_null_nonces(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let deposit = make_db_transaction("dep", TransactionType::Deposit);
+    storage.insert_db_transaction(&deposit).await?;
+
+    let orphan = make_db_transaction("null_nonce", TransactionType::Withdrawal);
+    let orphan_id = storage.insert_db_transaction(&orphan).await?;
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(orphan_id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        None,
+        "neither a deposit nor a NULL nonce may set a bound"
+    );
+
+    seed_withdrawal(&pool, &storage, "live", 1_007, "pending").await?;
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        Some((1_007, 1_007)),
+        "only the live withdrawal that carries a nonce counts"
+    );
+    Ok(())
+}
+
+/// The floor is what lets the rotation gate ignore nonces whose window already
+/// closed, so the SQL has to apply it to both aggregates.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_honours_the_floor() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    seed_withdrawal(&pool, &storage, "stranded", 1_003, "manual_review").await?;
+    seed_withdrawal(&pool, &storage, "waiting", 1_011, "pending").await?;
+    seed_withdrawal(&pool, &storage, "later", 1_020, "parked").await?;
+
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(1_010).await?,
+        Some((1_011, 1_020)),
+        "a nonce below the floor sets neither bound"
+    );
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(1_021).await?,
+        None,
+        "a floor above every live nonce leaves nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_nonce_bounds_none_when_no_live_rows() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    assert_eq!(storage.unreleased_withdrawal_nonce_bounds(0).await?, None);
+
+    seed_withdrawal(&pool, &storage, "done", 1_001, "completed").await?;
+    assert_eq!(
+        storage.unreleased_withdrawal_nonce_bounds(0).await?,
+        None,
+        "an all-terminal table owes nothing"
+    );
+    Ok(())
+}
+
 // ── set_pending_remint status guard ──────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1034,7 +960,7 @@ async fn set_pending_remint_succeeds_when_processing() -> Result<(), Box<dyn std
 
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     storage
-        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline)
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline, false)
         .await?;
 
     Ok(())
@@ -1054,7 +980,7 @@ async fn set_pending_remint_fails_when_not_processing() -> Result<(), Box<dyn st
 
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     let result = storage
-        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline)
+        .set_pending_remint(id, vec!["sig1".to_string()], vec![0], deadline, false)
         .await;
 
     assert!(result.is_err(), "should fail when status is not processing");
@@ -1079,12 +1005,12 @@ async fn set_pending_remint_replays_identical_payload_only(
     let deadline = Utc::now() + chrono::Duration::seconds(32);
     let signatures = vec!["sig1".to_string(), "sig2".to_string()];
     storage
-        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline)
+        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline, false)
         .await?;
 
     // The row is already PendingRemint; the same payload must still be accepted.
     storage
-        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline)
+        .set_pending_remint(id, signatures.clone(), vec![10, 20], deadline, false)
         .await?;
 
     let stored: Vec<String> =
@@ -1095,7 +1021,7 @@ async fn set_pending_remint_replays_identical_payload_only(
     assert_eq!(stored, signatures, "replay must preserve the signatures");
 
     let other = storage
-        .set_pending_remint(id, vec!["different".to_string()], vec![30], deadline)
+        .set_pending_remint(id, vec!["different".to_string()], vec![30], deadline, false)
         .await;
     assert!(
         other.is_err(),
@@ -1445,7 +1371,7 @@ async fn stale_processing_query_is_type_exclusive() -> Result<(), Box<dyn std::e
 
     let threshold = std::time::Duration::from_secs(5 * 60);
     let deposits = storage
-        .get_stale_processing_transactions(TransactionType::Deposit, threshold, 100)
+        .get_stale_processing_transactions(threshold, 100, TransactionType::Deposit)
         .await?;
     assert_eq!(
         deposits.iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -1453,7 +1379,7 @@ async fn stale_processing_query_is_type_exclusive() -> Result<(), Box<dyn std::e
         "deposit scope must return exactly the deposit row"
     );
     let withdrawals = storage
-        .get_stale_processing_transactions(TransactionType::Withdrawal, threshold, 100)
+        .get_stale_processing_transactions(threshold, 100, TransactionType::Withdrawal)
         .await?;
     assert_eq!(
         withdrawals.iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -1481,7 +1407,7 @@ async fn stale_parked_query_is_type_exclusive() -> Result<(), Box<dyn std::error
 
     let threshold = std::time::Duration::from_secs(5 * 60);
     let withdrawals = storage
-        .get_stale_parked_transactions(TransactionType::Withdrawal, threshold, 100)
+        .get_stale_parked_transactions(threshold, 100, TransactionType::Withdrawal)
         .await?;
     assert_eq!(
         withdrawals.iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -1489,7 +1415,7 @@ async fn stale_parked_query_is_type_exclusive() -> Result<(), Box<dyn std::error
         "withdrawal scope must return exactly the withdrawal row"
     );
     let deposits = storage
-        .get_stale_parked_transactions(TransactionType::Deposit, threshold, 100)
+        .get_stale_parked_transactions(threshold, 100, TransactionType::Deposit)
         .await?;
     assert_eq!(
         deposits.iter().map(|t| t.id).collect::<Vec<_>>(),
@@ -1646,6 +1572,314 @@ async fn try_requeue_processing_stale_cas_leaves_counter_unchanged(
         requeue_attempts_of(&pool, id).await,
         0,
         "no-op CAS must NOT bump the counter"
+    );
+    Ok(())
+}
+
+// ── stalled-withdrawal reconciliation ────────────────────────────────────────
+
+/// Insert a row and force it into `status` without going through the operator.
+async fn seed_with_status(
+    pool: &PgPool,
+    storage: &Storage,
+    sig: &str,
+    txn_type: TransactionType,
+    status: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(sig, txn_type))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = $2::transaction_status WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await?;
+    Ok(id)
+}
+
+/// I1: the promote CAS refuses every source status but `manual_review` and
+/// `pending_remint`, refuses deposits, and honours the `updated_at` compare.
+#[tokio::test(flavor = "multi_thread")]
+async fn try_complete_stalled_withdrawal_guard_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // (label, seeded status, bound from-status, transaction type, use a stale CAS, expected)
+    let cases: &[(&str, &str, TransactionStatus, TransactionType, bool, bool)] = &[
+        (
+            "manual_review fresh",
+            "manual_review",
+            TransactionStatus::ManualReview,
+            TransactionType::Withdrawal,
+            false,
+            true,
+        ),
+        (
+            "pending_remint fresh",
+            "pending_remint",
+            TransactionStatus::PendingRemint,
+            TransactionType::Withdrawal,
+            false,
+            true,
+        ),
+        (
+            "processing fresh",
+            "processing",
+            TransactionStatus::Processing,
+            TransactionType::Withdrawal,
+            false,
+            false,
+        ),
+        (
+            "completed fresh",
+            "completed",
+            TransactionStatus::Completed,
+            TransactionType::Withdrawal,
+            false,
+            false,
+        ),
+        (
+            "manual_review stale cas",
+            "manual_review",
+            TransactionStatus::ManualReview,
+            TransactionType::Withdrawal,
+            true,
+            false,
+        ),
+        (
+            "deposit manual_review",
+            "manual_review",
+            TransactionStatus::ManualReview,
+            TransactionType::Deposit,
+            false,
+            false,
+        ),
+    ];
+
+    for (i, (label, seeded, from_status, txn_type, stale, expected)) in cases.iter().enumerate() {
+        let id = seed_with_status(&pool, &storage, &format!("cas_{i}"), *txn_type, seeded).await?;
+        let mut captured = updated_at_of(&pool, id).await;
+        if *stale {
+            captured -= chrono::Duration::seconds(60);
+        }
+
+        let promoted = storage
+            .try_complete_stalled_withdrawal(id, captured, *from_status, Some(format!("sig-{i}")))
+            .await?;
+        assert_eq!(promoted, *expected, "{label}: unexpected CAS result");
+
+        if *expected {
+            assert_eq!(status_of(&pool, id).await, "completed", "{label}");
+            let sig: Option<String> =
+                sqlx::query_scalar("SELECT counterpart_signature FROM transactions WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(sig.as_deref(), Some(format!("sig-{i}").as_str()), "{label}");
+        } else {
+            assert_eq!(
+                status_of(&pool, id).await,
+                *seeded,
+                "{label}: a refused CAS must leave the row exactly as it was"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Backdate `updated_at` past the trigger that would otherwise stamp NOW().
+async fn force_updated_at(
+    pool: &PgPool,
+    id: i64,
+    ts: chrono::DateTime<Utc>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query("ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE transactions SET updated_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(ts)
+        .execute(pool)
+        .await?;
+    sqlx::query("ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn set_remint_signatures(
+    pool: &PgPool,
+    id: i64,
+    sigs: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let heights: Option<Vec<i64>> = sigs.as_ref().map(|s| vec![0i64; s.len()]);
+    sqlx::query(
+        "UPDATE transactions SET remint_signatures = $2, remint_last_valid_block_heights = $3
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(sigs)
+    .bind(heights)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// I2: the fetch predicates and ordering, which the mock cannot verify
+/// (`array_length` and the NULL-nonce filter are SQL-only).
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_withdrawal_query_predicates_and_ordering() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let base = Utc::now() - chrono::Duration::hours(1);
+    let sigs = || Some(vec!["sig-a".to_string()]);
+
+    // Three matching manual_review rows, seeded out of `updated_at` order.
+    let newest = seed_with_status(
+        &pool,
+        &storage,
+        "q_new",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    let oldest = seed_with_status(
+        &pool,
+        &storage,
+        "q_old",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    let middle = seed_with_status(
+        &pool,
+        &storage,
+        "q_mid",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    for (id, offset) in [(newest, 30i64), (oldest, 10), (middle, 20)] {
+        set_remint_signatures(&pool, id, sigs()).await?;
+        force_updated_at(&pool, id, base + chrono::Duration::seconds(offset)).await?;
+    }
+
+    // One pending_remint row: visible only to the PendingRemint query.
+    let remint = seed_with_status(
+        &pool,
+        &storage,
+        "q_pr",
+        TransactionType::Withdrawal,
+        "pending_remint",
+    )
+    .await?;
+    set_remint_signatures(&pool, remint, sigs()).await?;
+
+    // Every shape the predicates must exclude.
+    let wrong_status = seed_with_status(
+        &pool,
+        &storage,
+        "q_done",
+        TransactionType::Withdrawal,
+        "completed",
+    )
+    .await?;
+    set_remint_signatures(&pool, wrong_status, sigs()).await?;
+    let deposit = seed_with_status(
+        &pool,
+        &storage,
+        "q_dep",
+        TransactionType::Deposit,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, deposit, sigs()).await?;
+    let null_nonce = seed_with_status(
+        &pool,
+        &storage,
+        "q_nonce",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, null_nonce, sigs()).await?;
+    sqlx::query("UPDATE transactions SET withdrawal_nonce = NULL WHERE id = $1")
+        .bind(null_nonce)
+        .execute(&pool)
+        .await?;
+    let empty_sigs = seed_with_status(
+        &pool,
+        &storage,
+        "q_empty",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, empty_sigs, Some(Vec::new())).await?;
+    let no_sigs = seed_with_status(
+        &pool,
+        &storage,
+        "q_null",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    set_remint_signatures(&pool, no_sigs, None).await?;
+    // Reachable on a database upgraded between the two column migrations:
+    // signatures present, the parallel heights array never backfilled.
+    let no_heights = seed_with_status(
+        &pool,
+        &storage,
+        "q_heights",
+        TransactionType::Withdrawal,
+        "manual_review",
+    )
+    .await?;
+    sqlx::query("UPDATE transactions SET remint_signatures = $2 WHERE id = $1")
+        .bind(no_heights)
+        .bind(vec!["sig-orphan".to_string()])
+        .execute(&pool)
+        .await?;
+
+    // Ids ascend in insertion order, which is deliberately not `updated_at`
+    // order here: a row left untouched keeps its `updated_at` forever, so the
+    // sweep pages on the one key that always advances.
+    let by_id = vec![newest, oldest, middle];
+
+    let found = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
+        .await?;
+    assert_eq!(
+        found.iter().map(|t| t.id).collect::<Vec<_>>(),
+        by_id,
+        "only rows with usable evidence, ascending id"
+    );
+
+    let found_remint = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::PendingRemint, 0, 100)
+        .await?;
+    assert_eq!(
+        found_remint.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![remint],
+        "the status bind must not leak rows from the other stalled status"
+    );
+
+    // Paging must cover every row exactly once: the second page starts strictly
+    // after the last id of the first, so nothing repeats and nothing is skipped.
+    let page_one = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 2)
+        .await?;
+    assert_eq!(
+        page_one.iter().map(|t| t.id).collect::<Vec<_>>(),
+        by_id[..2].to_vec(),
+        "first page is the two lowest ids"
+    );
+    let page_two = storage
+        .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, by_id[1], 2)
+        .await?;
+    assert_eq!(
+        page_two.iter().map(|t| t.id).collect::<Vec<_>>(),
+        by_id[2..].to_vec(),
+        "the cursor must resume after the previous page, not repeat it"
     );
     Ok(())
 }
@@ -1914,6 +2148,106 @@ async fn probe_distinguishes_held_from_free_and_from_other_keys(
         "pg_try_advisory_lock returns true on a free lock, which is exactly why it \
          cannot be used as the ownership probe"
     );
+    Ok(())
+}
+
+async fn remint_columns_of(
+    pool: &PgPool,
+    id: i64,
+) -> Result<(Option<Vec<String>>, Option<Vec<i64>>), Box<dyn std::error::Error>> {
+    let row: (Option<Vec<String>>, Option<Vec<i64>>) = sqlx::query_as(
+        "SELECT remint_signatures, remint_last_valid_block_heights FROM transactions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// I3: the quarantine CAS stores the evidence in the same statement that flips
+/// the status, and a `None` call leaves the columns exactly as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_cas_writes_signatures_and_coalesces_none(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let sigs = vec!["sig-quarantine".to_string()];
+
+    let with_sigs = seed_with_status(
+        &pool,
+        &storage,
+        "q3_write",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    let captured = updated_at_of(&pool, with_sigs).await;
+    let quarantined = storage
+        .try_quarantine_processing(with_sigs, captured, Some(sigs.clone()), Some(vec![777i64]))
+        .await?;
+    assert!(quarantined, "fresh CAS must succeed");
+    assert_eq!(status_of(&pool, with_sigs).await, "manual_review");
+    let (stored_sigs, stored_heights) = remint_columns_of(&pool, with_sigs).await?;
+    assert_eq!(stored_sigs, Some(sigs));
+    assert_eq!(stored_heights, Some(vec![777i64]));
+
+    // NOW() is the transaction timestamp, so these two agree only if the status
+    // flip and the column write happened in one statement. A "write columns,
+    // then CAS" pair would leave two distinct timestamps (and the CAS could
+    // never match, since the first write already bumped updated_at).
+    let (updated, processed): (chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT updated_at, processed_at FROM transactions WHERE id = $1")
+            .bind(with_sigs)
+            .fetch_one(&pool)
+            .await?;
+    assert!(updated > captured, "the trigger must bump updated_at");
+    assert_eq!(
+        Some(updated),
+        processed,
+        "one statement means one NOW(); a second write would desync these"
+    );
+
+    // A None call must not erase columns an earlier transition already wrote.
+    let preloaded = seed_with_status(
+        &pool,
+        &storage,
+        "q3_keep",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    set_remint_signatures(&pool, preloaded, Some(vec!["sig-existing".to_string()])).await?;
+    let captured = updated_at_of(&pool, preloaded).await;
+    assert!(
+        storage
+            .try_quarantine_processing(preloaded, captured, None, None)
+            .await?
+    );
+    let (kept_sigs, kept_heights) = remint_columns_of(&pool, preloaded).await?;
+    assert_eq!(kept_sigs, Some(vec!["sig-existing".to_string()]));
+    assert_eq!(kept_heights, Some(vec![0i64]));
+
+    // A losing racer writes nothing at all, columns included.
+    let stale_row = seed_with_status(
+        &pool,
+        &storage,
+        "q3_stale",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    let stale = updated_at_of(&pool, stale_row).await - chrono::Duration::seconds(60);
+    assert!(
+        !storage
+            .try_quarantine_processing(
+                stale_row,
+                stale,
+                Some(vec!["sig-race".to_string()]),
+                Some(vec![1])
+            )
+            .await?
+    );
+    assert_eq!(status_of(&pool, stale_row).await, "processing");
+    assert_eq!(remint_columns_of(&pool, stale_row).await?, (None, None));
     Ok(())
 }
 
@@ -2542,5 +2876,67 @@ async fn the_lock_session_sets_its_own_tcp_keepalives() -> Result<(), Box<dyn st
         ],
         "the lock session must carry its own keepalives"
     );
+    Ok(())
+}
+
+// ── merged-lineage schema ─────────────────────────────────────────────────────
+
+/// The merged schema is the union of two lineages, so it has to be checked as a
+/// whole: the bitmap redesign's `observed_releases` and `release_refused_on_chain`
+/// must be present, the SMT lineage's `owed_rotation_target` must be gone, and
+/// re-running `init_schema` over a database the pre-merge code created must be a
+/// no-op rather than a failed migration.
+#[tokio::test(flavor = "multi_thread")]
+async fn merged_schema_drops_owed_rotation_target_and_is_idempotent(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    let owed: Option<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'indexer_state' AND column_name = 'owed_rotation_target'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    assert!(
+        owed.is_none(),
+        "the SMT rotation-arming column must not exist in the merged schema"
+    );
+
+    for (table, column) in [
+        ("transactions", "release_refused_on_chain"),
+        ("indexer_state", "last_committed_slot"),
+        ("pending_release_signatures", "blockhash_slot"),
+    ] {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_optional(&pool)
+        .await?;
+        assert!(
+            found.is_some(),
+            "{table}.{column} must exist after the merge"
+        );
+    }
+
+    for table in [
+        "observed_releases",
+        "pending_remint_signatures",
+        "reconciliation_halt",
+    ] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(table)
+            .fetch_one(&pool)
+            .await?;
+        assert!(found.is_some(), "{table} must exist after the merge");
+    }
+
+    // Re-running the migration over the schema it just built is what an
+    // already-deployed database does on the next boot.
+    storage.init_schema().await?;
+    storage.init_schema().await?;
+
     Ok(())
 }

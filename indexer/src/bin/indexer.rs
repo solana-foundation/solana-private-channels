@@ -156,6 +156,11 @@ enum Mode {
         /// switched on in a deployment's env file.
         #[arg(long)]
         destroy_existing_data: bool,
+        /// Solana RPC that can read the escrow's withdrawal bitmap. A withdraw resync
+        /// refuses to run without it (and common.escrow_instance_id), because a rebuild
+        /// restarts the nonce sequence and must first prove the chain has issued no nonce.
+        #[arg(long)]
+        escrow_rpc_url: Option<String>,
     },
 }
 
@@ -221,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             genesis_slot,
             channel_rpc_url,
             destroy_existing_data,
+            escrow_rpc_url,
         } => {
             run_resync(
                 figment,
@@ -228,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 genesis_slot,
                 channel_rpc_url,
                 destroy_existing_data,
+                escrow_rpc_url,
             )
             .await
         }
@@ -460,6 +467,7 @@ async fn run_resync(
     genesis_slot: u64,
     channel_rpc_url: Option<String>,
     destroy_existing_data: bool,
+    escrow_rpc_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Checked before anything connects, so a mistyped subcommand cannot get as far as
     // opening the database. The live-state lock is the real guard; this only makes the
@@ -566,6 +574,12 @@ async fn run_resync(
             authority: private_channel_indexer::operator::SignerUtil::get_admin_pubkey(),
         },
     );
+    // A withdraw rebuild checks the escrow's withdrawal bitmap before dropping anything
+    // and refuses without this RPC. The service reports the missing input itself.
+    let resync_service = match escrow_rpc_url {
+        Some(url) => resync_service.with_withdrawal_bitmap_rpc(url),
+        None => resync_service,
+    };
 
     // Run resync
     resync_service.run(genesis_slot).await?;

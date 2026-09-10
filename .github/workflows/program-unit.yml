@@ -6,7 +6,6 @@ on:
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
-      - "dvp-swap-program/**"
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
   pull_request:
@@ -14,7 +13,6 @@ on:
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
-      - "dvp-swap-program/**"
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
 
@@ -71,8 +69,6 @@ jobs:
             coverage/coverage-escrow-html/
             coverage/coverage-withdraw-unit.lcov
             coverage/coverage-withdraw-html/
-            coverage/coverage-dvp-swap-unit.lcov
-            coverage/coverage-dvp-swap-html/
           if-no-files-found: warn
           retention-days: 30
 
@@ -91,15 +87,6 @@ jobs:
         with:
           component: Withdraw Program
           lcov-file: coverage/coverage-withdraw-unit.lcov
-          artifact-name: unit-coverage-reports
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Update PR coverage — DvP Swap Program
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/update-coverage-row
-        with:
-          component: DvP Swap Program
-          lcov-file: coverage/coverage-dvp-swap-unit.lcov
           artifact-name: unit-coverage-reports
           github-token: ${{ secrets.GITHUB_TOKEN }}
 

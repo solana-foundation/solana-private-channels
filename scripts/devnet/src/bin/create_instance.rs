@@ -14,10 +14,18 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const INSTANCE_SEED: &[u8] = b"instance";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
+const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
 
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED, instance_seed.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    )
+}
+
+fn find_withdrawal_bitmap_pda(instance_pda: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[WITHDRAWAL_BITMAP_SEED, instance_pda.as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
@@ -53,21 +61,26 @@ fn main() -> Result<()> {
     // Create new instance seed
     let instance_seed = Keypair::new();
     let (instance_pda, bump) = find_instance_pda(&instance_seed.pubkey());
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
     let (event_authority_pda, _) = find_event_authority_pda();
 
     println!("\nCreating escrow instance...");
     println!("Instance seed: {}", instance_seed.pubkey());
     println!("Instance PDA: {}", instance_pda);
+    println!("Withdrawal bitmap PDA: {}", withdrawal_bitmap_pda);
 
+    // The 8 KB bitmap costs the payer about 0.058 SOL of rent on top of the instance.
     let instruction = CreateInstanceBuilder::new()
         .payer(admin_keypair.pubkey())
         .admin(admin_keypair.pubkey())
         .instance_seed(instance_seed.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .bitmap_bump(bitmap_bump)
         .instruction();
 
     let recent_blockhash = client.get_latest_blockhash()?;

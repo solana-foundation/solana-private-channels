@@ -32,7 +32,9 @@ pub struct AccountAddresses {
     pub allowed_mint: AddressStorage,
     /// Escrow ATA (ATA of the instance PDA).
     pub instance_ata: AddressStorage,
-    /// Operator keypair authorised to call `ReleaseFunds` and `ResetSmtRoot`.
+    /// Withdrawal nonce bitmap PDA: `["withdrawal_bitmap", instance]`.
+    pub withdrawal_bitmap: AddressStorage,
+    /// Operator keypair authorised to call `ReleaseFunds` and `RotateBitmap`.
     pub operator: AddressStorage,
     /// Operator permission PDA: `["operator", instance, operator]`.
     pub operator_pda: AddressStorage,
@@ -66,6 +68,13 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
     accounts
         .event_authority
         .insert_with_address(event_authority_pda);
+    let (withdrawal_bitmap_pda, bitmap_bump) = Pubkey::find_program_address(
+        &[b"withdrawal_bitmap", instance_pda.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    );
+    accounts
+        .withdrawal_bitmap
+        .insert_with_address(withdrawal_bitmap_pda);
 
     let res = trident.process_transaction(
         &[CreateInstanceBuilder::new()
@@ -73,10 +82,12 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
             .admin(admin)
             .instance_seed(instance_seed)
             .instance(instance_pda)
+            .withdrawal_bitmap(withdrawal_bitmap_pda)
             .system_program(SYSTEM_PROGRAM_ID)
             .event_authority(event_authority_pda)
             .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
             .bump(instance_bump)
+            .bitmap_bump(bitmap_bump)
             .instruction()],
         Some("create_instance"),
     );

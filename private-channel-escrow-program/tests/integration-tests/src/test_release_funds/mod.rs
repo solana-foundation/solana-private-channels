@@ -1,25 +1,26 @@
 mod double_spend;
-mod malformed_proofs;
 
 use crate::{
-    pda_utils::{find_allowed_mint_pda, find_event_authority_pda, find_operator_pda},
-    smt_utils::{ProcessorSMT, MAX_TREE_LEAVES},
+    assertions::assert_nonce_consumed,
+    pda_utils::{
+        find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
+        find_withdrawal_bitmap_pda,
+    },
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
-        assert_get_or_deposit, assert_get_or_release_funds, assert_get_or_reset_smt_root,
+        assert_get_or_deposit, assert_get_or_release_funds, assert_get_or_rotate_bitmap,
     },
     utils::{
         assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account_2022, get_token_balance, set_mint,
         setup_test_balances, TestContext, ATA_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR,
-        INVALID_OPERATOR_ERROR, INVALID_SMT_PROOF_ERROR,
-        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
+        NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
 
 use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
-use private_channel_escrow_program_client::Instance;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     signature::{Keypair, Signer},
@@ -29,7 +30,7 @@ use spl_token::ID as TOKEN_PROGRAM_ID;
 
 const DEPOSIT_AMOUNT: u64 = 1_000_000; // 1 token with 6 decimals
 const RELEASE_AMOUNT: u64 = 500_000; // 0.5 tokens with 6 decimals
-const TRANSACTION_NONCE: u64 = 42; // Transaction nonce for SMT exclusion
+const TRANSACTION_NONCE: u64 = 42; // Withdrawal nonce consumed from the bitmap
 
 #[test]
 fn test_release_funds_success() {
@@ -91,13 +92,6 @@ fn test_release_funds_success() {
     )
     .expect("Deposit should succeed");
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-
-    // Calculate the new root after adding the transaction nonce
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
-
     // Release funds using utility function
     assert_get_or_release_funds(
         &mut context,
@@ -108,9 +102,7 @@ fn test_release_funds_success() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_withdrawal_root,
         TRANSACTION_NONCE,
-        sibling_proofs,
         true,
     )
     .expect("ReleaseFunds should succeed");
@@ -164,13 +156,6 @@ fn test_release_funds_insufficient_funds() {
         0, // Set instance balance to 0 to create insufficient funds scenario
     );
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-
-    // Calculate the new root after adding the transaction nonce
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
-
     let result = assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -180,9 +165,7 @@ fn test_release_funds_insufficient_funds() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_withdrawal_root,
         TRANSACTION_NONCE,
-        sibling_proofs,
         false,
     );
 
@@ -286,17 +269,13 @@ fn test_release_funds_not_operator() {
         &TOKEN_PROGRAM_ID,
     );
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-
-    // Calculate the new root after adding the transaction nonce
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
 
     let instruction = ReleaseFundsBuilder::new()
         .payer(context.payer.pubkey())
         .operator(fake_operator.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .operator_pda(fake_operator_pda)
         .mint(mint.pubkey())
         .allowed_mint(allowed_mint_pda)
@@ -308,9 +287,7 @@ fn test_release_funds_not_operator() {
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
-        .new_withdrawal_root(new_withdrawal_root)
         .transaction_nonce(TRANSACTION_NONCE)
-        .sibling_proofs(sibling_proofs)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&fake_operator]);
@@ -392,16 +369,10 @@ fn test_release_funds_operator_not_signer() {
     )
     .expect("Deposit should succeed");
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-
-    // Calculate the new root after adding the transaction nonce
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
-
     // Try to release funds with operator not marked as signer
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
 
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
@@ -414,11 +385,12 @@ fn test_release_funds_operator_not_signer() {
         &TOKEN_PROGRAM_ID,
     );
 
-    // Create instruction where operator is NOT marked as signer (12 accounts)
+    // Create instruction where operator is NOT marked as signer (13 accounts)
     let accounts = vec![
         AccountMeta::new(context.payer.pubkey(), true), // payer (signer, writable)
         AccountMeta::new_readonly(operator.pubkey(), false), // operator (NOT signer)
-        AccountMeta::new(instance_pda, false),          // instance (writable)
+        AccountMeta::new_readonly(instance_pda, false), // instance
+        AccountMeta::new(withdrawal_bitmap_pda, false), // withdrawal_bitmap (writable)
         AccountMeta::new_readonly(operator_pda, false), // operator_pda
         AccountMeta::new_readonly(mint.pubkey(), false), // mint
         AccountMeta::new_readonly(allowed_mint_pda, false), // allowed_mint
@@ -433,9 +405,7 @@ fn test_release_funds_operator_not_signer() {
     let mut data = vec![7]; // discriminator for ReleaseFunds
     data.extend_from_slice(&RELEASE_AMOUNT.to_le_bytes()); // amount (8 bytes)
     data.extend_from_slice(user.pubkey().as_ref()); // user (32 bytes)
-    data.extend_from_slice(&new_withdrawal_root); // new_withdrawal_root (32 bytes)
     data.extend_from_slice(&TRANSACTION_NONCE.to_le_bytes()); // transaction_nonce (8 bytes)
-    data.extend_from_slice(&sibling_proofs); // sibling_proofs (512 bytes)
 
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -449,7 +419,7 @@ fn test_release_funds_operator_not_signer() {
 }
 
 #[test]
-fn test_release_funds_smt_exclusion() {
+fn test_release_funds_bitmap_tracks_many_nonces() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let operator = Keypair::new();
@@ -499,10 +469,10 @@ fn test_release_funds_smt_exclusion() {
         large_deposit, // Give escrow full amount
     );
 
-    let mut instance_smt = ProcessorSMT::new();
     let mut used_nonces = std::collections::HashSet::new();
 
-    // Test scenarios: mix of valid and duplicate nonces
+    // Nonces spread across many bytes of the bitmap, interleaved with replays of
+    // ones already consumed. Setting a later bit must not free an earlier one.
     let test_nonces = [
         1, 2, 3, 5, 8, 13, 21, 34, 55, 89, // Valid unique nonces
         144, 233, 377, 610, 987, 1597, // More valid nonces
@@ -513,152 +483,35 @@ fn test_release_funds_smt_exclusion() {
     ];
 
     for &nonce in test_nonces.iter() {
-        let is_duplicate = used_nonces.contains(&nonce);
+        // A replay carries the same instruction bytes as its first attempt, so
+        // without a fresh blockhash it would be rejected as a duplicate
+        // signature before ever reaching the program.
+        context.svm.expire_blockhash();
 
-        if is_duplicate {
-            // For duplicates, nonce already exists in our SMT - exclusion proof should fail
+        let result = assert_get_or_release_funds(
+            &mut context,
+            &operator,
+            &instance_pda,
+            &operator_pda,
+            &mint.pubkey(),
+            &TOKEN_PROGRAM_ID,
+            release_amount,
+            &user.pubkey(),
+            nonce,
+            false,
+        );
 
-            // Use current SMT root and generate fake proof (won't work anyway)
-            let current_root = instance_smt.current_root();
-            let fake_sibling_proofs = [0u8; 512]; // Invalid proof
-
-            let result = assert_get_or_release_funds(
-                &mut context,
-                &operator,
-                &instance_pda,
-                &operator_pda,
-                &mint.pubkey(),
-                &TOKEN_PROGRAM_ID,
-                release_amount,
-                &user.pubkey(),
-                current_root, // Same root since we're not adding anything
-                nonce,
-                fake_sibling_proofs,
-                false,
-            );
-
-            assert_program_error(result, INVALID_SMT_PROOF_ERROR);
+        if used_nonces.contains(&nonce) {
+            assert_program_error(result, NONCE_ALREADY_USED_ERROR);
         } else {
-            // For new nonces, generate valid exclusion proof against current SMT state
-            let (_, sibling_proofs) = instance_smt.generate_exclusion_proof_for_verification(nonce);
-
-            // Calculate what the new root will be after adding this nonce
-            let mut new_smt = instance_smt.clone();
-            new_smt.insert(nonce);
-            let new_withdrawal_root = new_smt.current_root();
-
-            let result = assert_get_or_release_funds(
-                &mut context,
-                &operator,
-                &instance_pda,
-                &operator_pda,
-                &mint.pubkey(),
-                &TOKEN_PROGRAM_ID,
-                release_amount,
-                &user.pubkey(),
-                new_withdrawal_root,
-                nonce,
-                sibling_proofs,
-                false,
-            );
-
             assert!(result.is_ok(), "New nonce {} should succeed", nonce);
-
-            // Success: Update our SMT to mirror the instance's new state
             used_nonces.insert(nonce);
-            instance_smt.insert(nonce);
         }
     }
 }
 
 #[test]
-fn test_release_funds_invalid_inclusion_proof() {
-    let mut context = TestContext::new();
-    let admin = Keypair::new();
-    let operator = Keypair::new();
-    let user = Keypair::new();
-    let mint = Keypair::new();
-
-    let instance_seed = Keypair::new();
-
-    set_mint(&mut context, &mint.pubkey());
-
-    let (instance_pda, _) =
-        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
-            .expect("CreateInstance should succeed");
-
-    assert_get_or_allow_mint(
-        &mut context,
-        &admin,
-        &instance_pda,
-        &mint.pubkey(),
-        false,
-        false,
-    )
-    .expect("AllowMint should succeed");
-
-    let (operator_pda, _) = assert_get_or_add_operator(
-        &mut context,
-        &admin,
-        &instance_pda,
-        &operator.pubkey(),
-        false,
-        false,
-    )
-    .expect("AddOperator should succeed");
-
-    setup_test_balances(
-        &mut context,
-        &user,
-        &instance_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        DEPOSIT_AMOUNT,
-        RELEASE_AMOUNT,
-    );
-
-    assert_get_or_deposit(
-        &mut context,
-        &user,
-        &instance_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        DEPOSIT_AMOUNT,
-        None,
-        false,
-    )
-    .expect("Deposit should succeed");
-
-    // Generate valid exclusion proof from empty SMT
-    let smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-
-    // Provide WRONG new root - this will pass exclusion but fail inclusion proof
-    // The exclusion proof will be valid against empty tree, but inclusion proof
-    // will fail because wrong_new_root doesn't match what the tree would look like
-    // after adding the nonce
-    let wrong_new_root = [42u8; 32]; // Arbitrary wrong root
-
-    let result = assert_get_or_release_funds(
-        &mut context,
-        &operator,
-        &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        RELEASE_AMOUNT,
-        &user.pubkey(),
-        wrong_new_root,
-        TRANSACTION_NONCE,
-        sibling_proofs,
-        false,
-    );
-
-    assert_program_error(result, INVALID_SMT_PROOF_ERROR);
-}
-
-#[test]
-fn test_release_funds_with_smt_reset() {
+fn test_release_funds_with_bitmap_rotation() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let operator = Keypair::new();
@@ -707,31 +560,9 @@ fn test_release_funds_with_smt_reset() {
         large_deposit, // Give escrow the full amount
     );
 
-    // Verify initial tree index is 0
-    let instance_data = context
-        .get_account(&instance_pda)
-        .expect("Instance account should exist")
-        .data
-        .clone();
-    let instance = Instance::from_bytes(&instance_data).expect("Should deserialize instance");
+    // === FIRST RELEASE (generation 0) ===
+    let first_nonce = 42u64; // Nonce in range 0..65535 for generation 0
 
-    assert_eq!(
-        instance.current_tree_index, 0,
-        "Initial tree index should be 0"
-    );
-
-    // === FIRST RELEASE (Tree Index = 0) ===
-    let first_nonce = 42u64; // Nonce in range 0-65535 for tree_index=0
-
-    let mut first_smt = ProcessorSMT::new();
-    let (_, first_sibling_proofs) =
-        first_smt.generate_exclusion_proof_for_verification(first_nonce);
-
-    // Calculate new root after adding the nonce
-    first_smt.insert(first_nonce);
-    let first_new_root = first_smt.current_root();
-
-    // First release should succeed
     assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -741,42 +572,18 @@ fn test_release_funds_with_smt_reset() {
         &TOKEN_PROGRAM_ID,
         release_amount,
         &user.pubkey(),
-        first_new_root,
         first_nonce,
-        first_sibling_proofs,
         false,
     )
     .expect("First release should succeed");
 
-    // === RESET SMT ROOT ===
-    assert_get_or_reset_smt_root(&mut context, &operator, &instance_pda, &operator_pda, false)
-        .expect("Reset SMT root should succeed");
+    // === ROTATE (generation 0 -> 1) ===
+    assert_get_or_rotate_bitmap(&mut context, &operator, &instance_pda, &operator_pda, false)
+        .expect("RotateBitmap should succeed");
 
-    // Verify tree index incremented to 1
-    let instance_data = context
-        .get_account(&instance_pda)
-        .expect("Instance account should exist")
-        .data
-        .clone();
-    let instance = Instance::from_bytes(&instance_data).expect("Should deserialize instance");
+    // === SECOND RELEASE (generation 1) ===
+    let second_nonce = NONCES_PER_GENERATION; // First nonce of generation 1
 
-    assert_eq!(
-        instance.current_tree_index, 1,
-        "Tree index should be 1 after reset"
-    );
-
-    // === SECOND RELEASE (Tree Index = 1) ===
-    let second_nonce = 65536u64; // First nonce for tree_index=1 (65536 / 65536 = 1)
-
-    let mut second_smt = ProcessorSMT::new(); // Fresh SMT after reset
-    let (_, second_sibling_proofs) =
-        second_smt.generate_exclusion_proof_for_verification(second_nonce);
-
-    // Calculate new root after adding the nonce
-    second_smt.insert(second_nonce);
-    let second_new_root = second_smt.current_root();
-
-    // Second release with correct nonce range should succeed
     assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -786,22 +593,14 @@ fn test_release_funds_with_smt_reset() {
         &TOKEN_PROGRAM_ID,
         release_amount,
         &user.pubkey(),
-        second_new_root,
         second_nonce,
-        second_sibling_proofs,
         false,
     )
-    .expect("Second release with nonce 65536 should succeed");
+    .expect("Second release with the first nonce of generation 1 should succeed");
 
-    // === NEGATIVE TEST: Try old nonce after reset (should fail) ===
-    let old_range_nonce = 123u64; // Different nonce in range 0-65535 (tree_index=0)
-    let mut old_nonce_smt = ProcessorSMT::new();
-    let (_, old_sibling_proofs) =
-        old_nonce_smt.generate_exclusion_proof_for_verification(old_range_nonce);
-    old_nonce_smt.insert(old_range_nonce);
-    let old_new_root = old_nonce_smt.current_root();
-
-    // Try to use nonce in old range (123) after reset - should fail due to tree index mismatch
+    // A never-used nonce from the previous generation is still refused: rotation
+    // clears the bits, so only the generation check keeps the old range closed.
+    let old_range_nonce = 123u64;
     let result = assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -811,26 +610,14 @@ fn test_release_funds_with_smt_reset() {
         &TOKEN_PROGRAM_ID,
         release_amount,
         &user.pubkey(),
-        old_new_root,
-        old_range_nonce, // This is now invalid for tree_index=1
-        old_sibling_proofs,
+        old_range_nonce,
         false,
     );
 
-    // Should fail with specific error for invalid transaction nonce for current tree index
-    assert_program_error(
-        result,
-        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
-    );
+    assert_program_error(result, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR);
 
-    // === NEGATIVE TEST: Try wrong range nonce (should fail) ===
-    let wrong_nonce = MAX_TREE_LEAVES as u64 * 10;
-    let mut wrong_smt = ProcessorSMT::new();
-    let (_, wrong_sibling_proofs) =
-        wrong_smt.generate_exclusion_proof_for_verification(wrong_nonce);
-    wrong_smt.insert(wrong_nonce);
-    let wrong_new_root = wrong_smt.current_root();
-
+    // A nonce from a far future generation is refused for the same reason.
+    let future_nonce = NONCES_PER_GENERATION * 10;
     let result = assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -840,16 +627,11 @@ fn test_release_funds_with_smt_reset() {
         &TOKEN_PROGRAM_ID,
         release_amount,
         &user.pubkey(),
-        wrong_new_root,
-        wrong_nonce,
-        wrong_sibling_proofs,
+        future_nonce,
         false,
     );
 
-    assert_program_error(
-        result,
-        INVALID_TRANSACTION_NONCE_FOR_CURRENT_TREE_INDEX_ERROR,
-    );
+    assert_program_error(result, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR);
 }
 
 #[test]
@@ -898,14 +680,8 @@ fn test_release_funds_nonce_zero_boundary() {
         DEPOSIT_AMOUNT,
     );
 
-    // Use nonce = 0 (boundary value)
+    // Use nonce = 0 (boundary value: first bit of the first byte)
     let nonce: u64 = 0;
-
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(nonce);
-
-    smt.insert(nonce);
-    let new_withdrawal_root = smt.current_root();
 
     assert_get_or_release_funds(
         &mut context,
@@ -916,137 +692,16 @@ fn test_release_funds_nonce_zero_boundary() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_withdrawal_root,
         nonce,
-        sibling_proofs,
         false,
     )
     .expect("Release with nonce=0 should succeed");
 }
 
 #[test]
-fn test_release_funds_single_leaf_smt() {
-    // Test SMT operations with exactly one leaf inserted
-    let mut context = TestContext::new();
-    let admin = Keypair::new();
-    let operator = Keypair::new();
-    let user = Keypair::new();
-    let mint = Keypair::new();
-
-    let instance_seed = Keypair::new();
-
-    set_mint(&mut context, &mint.pubkey());
-
-    let (instance_pda, _) =
-        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
-            .expect("CreateInstance should succeed");
-
-    assert_get_or_allow_mint(
-        &mut context,
-        &admin,
-        &instance_pda,
-        &mint.pubkey(),
-        false,
-        false,
-    )
-    .expect("AllowMint should succeed");
-
-    let (operator_pda, _) = assert_get_or_add_operator(
-        &mut context,
-        &admin,
-        &instance_pda,
-        &operator.pubkey(),
-        false,
-        false,
-    )
-    .expect("AddOperator should succeed");
-
-    let large_deposit = 10_000_000;
-    let release_amount = 100_000;
-
-    setup_test_balances(
-        &mut context,
-        &user,
-        &instance_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        0,
-        large_deposit,
-    );
-
-    // Insert exactly one leaf and verify the tree works correctly
-    let single_nonce: u64 = 1;
-
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(single_nonce);
-
-    smt.insert(single_nonce);
-    let new_root = smt.current_root();
-
-    // First release with the single nonce should succeed
-    assert_get_or_release_funds(
-        &mut context,
-        &operator,
-        &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        release_amount,
-        &user.pubkey(),
-        new_root,
-        single_nonce,
-        sibling_proofs,
-        false,
-    )
-    .expect("Single-leaf SMT release should succeed");
-
-    // A different nonce should also work against the single-leaf tree
-    let second_nonce: u64 = 2;
-    let (_, second_proofs) = smt.generate_exclusion_proof_for_verification(second_nonce);
-
-    smt.insert(second_nonce);
-    let second_root = smt.current_root();
-
-    assert_get_or_release_funds(
-        &mut context,
-        &operator,
-        &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        release_amount,
-        &user.pubkey(),
-        second_root,
-        second_nonce,
-        second_proofs,
-        false,
-    )
-    .expect("Second release against single-leaf SMT should succeed");
-
-    // Replaying the single nonce should fail (SMT now has two leaves)
-    let replay_result = assert_get_or_release_funds(
-        &mut context,
-        &operator,
-        &instance_pda,
-        &operator_pda,
-        &mint.pubkey(),
-        &TOKEN_PROGRAM_ID,
-        release_amount,
-        &user.pubkey(),
-        second_root,
-        single_nonce,
-        sibling_proofs, // Old proofs for the single nonce
-        false,
-    );
-
-    assert_program_error(replay_result, INVALID_SMT_PROOF_ERROR);
-}
-
-#[test]
-fn test_release_funds_max_depth_smt_proof() {
-    // Verify the full 16-level depth of the SMT works end-to-end.
-    // Use a nonce that exercises all 16 bits of the leaf position
-    // (position = nonce % 65536). Nonce 65535 = 0xFFFF sets all bits.
+fn test_release_funds_last_nonce_in_generation() {
+    // Nonce 65535 is the last bit of the last byte of the bitmap, so this pins
+    // the byte index arithmetic at the far end of the account.
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let operator = Keypair::new();
@@ -1091,14 +746,8 @@ fn test_release_funds_max_depth_smt_proof() {
         DEPOSIT_AMOUNT,
     );
 
-    // Use nonce that maps to last leaf position (65535 = all bits set)
-    let max_position_nonce: u64 = (MAX_TREE_LEAVES as u64) - 1;
-
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(max_position_nonce);
-
-    smt.insert(max_position_nonce);
-    let new_root = smt.current_root();
+    // Highest nonce the generation covers: the last bit of the last bitmap byte.
+    let last_nonce: u64 = NONCES_PER_GENERATION - 1;
 
     assert_get_or_release_funds(
         &mut context,
@@ -1109,12 +758,10 @@ fn test_release_funds_max_depth_smt_proof() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_root,
-        max_position_nonce,
-        sibling_proofs,
+        last_nonce,
         false,
     )
-    .expect("Release with max-position nonce (all bits set) should succeed");
+    .expect("Release with the last nonce of the generation should succeed");
 }
 
 #[test]
@@ -1203,16 +850,14 @@ fn test_release_funds_wrong_user_ata() {
         &TOKEN_PROGRAM_ID,
     );
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
 
     // Pass other_user's ATA but user's pubkey in instruction data — mismatch
     let instruction = ReleaseFundsBuilder::new()
         .payer(context.payer.pubkey())
         .operator(operator.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .operator_pda(operator_pda)
         .mint(mint.pubkey())
         .allowed_mint(allowed_mint_pda)
@@ -1224,9 +869,7 @@ fn test_release_funds_wrong_user_ata() {
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
-        .new_withdrawal_root(new_withdrawal_root)
         .transaction_nonce(TRANSACTION_NONCE)
-        .sibling_proofs(sibling_proofs)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&operator]);
@@ -1291,11 +934,6 @@ fn test_release_funds_full_balance() {
     )
     .expect("Deposit should succeed");
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
-
     // Release the entire balance — instance ATA should land at zero
     assert_get_or_release_funds(
         &mut context,
@@ -1306,9 +944,7 @@ fn test_release_funds_full_balance() {
         &TOKEN_PROGRAM_ID,
         DEPOSIT_AMOUNT,
         &user.pubkey(),
-        new_withdrawal_root,
         TRANSACTION_NONCE,
-        sibling_proofs,
         false,
     )
     .expect("Full balance release should succeed");
@@ -1409,10 +1045,7 @@ fn test_release_funds_token_2022_transfer_fee_success() {
     let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
     let (event_authority_pda, _) = find_event_authority_pda();
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
 
     let user_balance_before = get_token_balance(&mut context, &user_ata);
     let instance_balance_before = get_token_balance(&mut context, &instance_ata);
@@ -1421,6 +1054,7 @@ fn test_release_funds_token_2022_transfer_fee_success() {
         .payer(context.payer.pubkey())
         .operator(operator.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .operator_pda(operator_pda)
         .mint(mint.pubkey())
         .allowed_mint(allowed_mint_pda)
@@ -1432,9 +1066,7 @@ fn test_release_funds_token_2022_transfer_fee_success() {
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .amount(RELEASE_AMOUNT)
         .user(user.pubkey())
-        .new_withdrawal_root(new_withdrawal_root)
         .transaction_nonce(TRANSACTION_NONCE)
-        .sibling_proofs(sibling_proofs)
         .instruction();
 
     context
@@ -1467,4 +1099,364 @@ fn test_release_funds_token_2022_transfer_fee_success() {
         user_balance_before + expected_received,
         "User should receive release amount minus transfer fee"
     );
+}
+
+/// A fresh instance sits on generation 0, so a nonce from any later generation
+/// must be refused before a rotation ever happens. Without this the operator
+/// could consume a far-future nonce's bit and strand it for its real generation.
+#[test]
+fn test_release_funds_nonce_from_future_generation_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+
+    // First nonce of generation 1, on an instance still at generation 0.
+    let result = assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        NONCES_PER_GENERATION,
+        false,
+    );
+
+    assert_program_error(result, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR);
+
+    context.svm.expire_blockhash();
+
+    // A nonce far beyond the current generation must be refused the same way.
+    let result = assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        NONCES_PER_GENERATION * 100,
+        false,
+    );
+
+    assert_program_error(result, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR);
+}
+
+/// A zero-amount release still consumes its nonce. Letting it through without
+/// setting the bit would leave the nonce replayable for a real amount.
+#[test]
+fn test_release_funds_zero_amount_consumes_nonce() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+
+    let nonce: u64 = 7;
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        &user.pubkey(),
+        nonce,
+        false,
+    )
+    .expect("Zero amount release should succeed");
+
+    context.svm.expire_blockhash();
+
+    let result = assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        nonce,
+        false,
+    );
+
+    assert_program_error(result, NONCE_ALREADY_USED_ERROR);
+}
+
+/// The bitmap is a separate account, so an operator could hand this instance's
+/// ReleaseFunds another instance's bitmap: the nonce would burn over there while
+/// the funds leave here, making it replayable against this instance forever.
+/// `WithdrawalBitmap::validate` re-derives the PDA from the instance to stop it.
+#[test]
+fn test_release_funds_foreign_bitmap_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+    let other_instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    // A second instance, whose bitmap we will try to substitute.
+    let (other_instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &other_instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (other_bitmap_pda, _) = find_withdrawal_bitmap_pda(&other_instance_pda);
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(other_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, INVALID_WITHDRAWAL_BITMAP_ERROR);
+
+    // Neither bitmap may record the nonce, and no funds may move.
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        false,
+    );
+    assert_nonce_consumed(&mut context, &other_bitmap_pda, TRANSACTION_NONCE, false);
+    assert_eq!(
+        get_token_balance(&mut context, &instance_ata),
+        DEPOSIT_AMOUNT,
+        "escrow balance must be untouched"
+    );
+}
+
+/// Rotation must free the exact bit position it cleared. Releasing nonce N in one
+/// generation and N + NONCES_PER_GENERATION in the next targets the same bit, so
+/// a rotation that failed to clear it would surface here as NonceAlreadyUsed.
+#[test]
+fn test_release_funds_rotation_frees_same_bit_position() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+
+    let nonce = 42u64;
+
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        nonce,
+        false,
+    )
+    .expect("Release in generation 0 should succeed");
+
+    assert_get_or_rotate_bitmap(&mut context, &operator, &instance_pda, &operator_pda, false)
+        .expect("RotateBitmap should succeed");
+
+    // Same bit position, next generation.
+    assert_get_or_release_funds(
+        &mut context,
+        &operator,
+        &instance_pda,
+        &operator_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        RELEASE_AMOUNT,
+        &user.pubkey(),
+        nonce + NONCES_PER_GENERATION,
+        false,
+    )
+    .expect("Same bit position must be reusable after rotation");
 }

@@ -7,8 +7,8 @@ use tracing::{info, warn};
 use crate::{
     error::StorageError,
     storage::common::models::{
-        DbMint, DbMintStatus, DbTransaction, HaltInfo, MintDbBalance, MintInFlightAmount,
-        MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
+        DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
+        MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::RequeueOutcome,
@@ -41,6 +41,7 @@ mod transaction_cols {
     pub const INSTRUCTION_INDEX: &str = "instruction_index";
     pub const INNER_INDEX: &str = "inner_index";
     pub const LANDED_REMINT_SIGNATURE: &str = "landed_remint_signature";
+    pub const RELEASE_REFUSED_ON_CHAIN: &str = "release_refused_on_chain";
 }
 
 /// ON CONFLICT target for the transactions composite uniqueness. inner_index is
@@ -444,6 +445,23 @@ impl PostgresDb {
         .await?;
         info!("landed_remint_signature migration complete");
 
+        // A release the program refused is proof no payout occurred and the only
+        // such proof that outlives a bitmap rotation, so it is persisted with the
+        // pending remint. NOT NULL DEFAULT FALSE: every row written before this
+        // column existed was queued without a refusal, so false is its true value.
+        info!("Running release_refused_on_chain migration if needed...");
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE transactions
+                ADD COLUMN IF NOT EXISTS release_refused_on_chain BOOLEAN NOT NULL DEFAULT FALSE;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("release_refused_on_chain migration complete");
+
         // Widen a legacy BIGINT amount column to NUMERIC(20,0). BIGINT wraps amounts
         // above i64::MAX negative; the cast is lossless and the guard makes it a no-op
         // once already NUMERIC. Required because the BigDecimal decoder rejects BIGINT.
@@ -547,15 +565,6 @@ impl PostgresDb {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_indexer_state_program ON indexer_state (program_type)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Tree generation the sender still owes the chain. NULL means none owed.
-        // Written before the rotation is dispatched, cleared only once a chain read
-        // shows the tree reached it, so a crash leaves the rotation re-armable.
-        sqlx::query(
-            "ALTER TABLE indexer_state ADD COLUMN IF NOT EXISTS owed_rotation_target BIGINT",
         )
         .execute(&self.pool)
         .await?;
@@ -740,6 +749,24 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Every ReleaseFunds the indexer saw succeed on chain, keyed by the nonce
+        // it consumed. A refund reads this to tell a nonce that was never paid out
+        // from one that was, which nothing else can answer once the nonce's
+        // generation has rotated. The nonce is the primary key because the program
+        // lets exactly one release consume it.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS observed_releases (
+                withdrawal_nonce BIGINT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                slot BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         // Write-ahead log for compensating remint MintTo signatures. Separate
         // from pending_release_signatures because these land on the source
         // (PrivateChannel) chain and are classified against source_rpc_client,
@@ -861,6 +888,14 @@ impl PostgresDb {
 
         // Drop tables with CASCADE to handle dependencies
         sqlx::query("DROP TABLE IF EXISTS pending_release_signatures CASCADE")
+            .execute(&self.pool)
+            .await?;
+
+        // Dropped with the rest because the nonce sequence goes too: a resync
+        // reassigns nonces from zero, so any surviving row would name a
+        // different withdrawal than the one it was written for. The backfill
+        // replays from the genesis slot and rebuilds the table as it goes.
+        sqlx::query("DROP TABLE IF EXISTS observed_releases CASCADE")
             .execute(&self.pool)
             .await?;
 
@@ -1098,7 +1133,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -1128,6 +1164,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -1150,7 +1187,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
@@ -1179,6 +1217,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
@@ -1188,6 +1227,59 @@ impl PostgresDb {
         .bind(TransactionStatus::PendingRemint)
         .bind(TransactionType::Withdrawal)
         .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Fetch the withdrawal row owning `nonce`, whatever its status.
+    pub async fn get_withdrawal_by_nonce_internal(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = $1 AND {} = $2
+            ORDER BY {} DESC
+            LIMIT 1
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::INNER_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            // Filters
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::TRANSACTION_TYPE,
+            // Newest first, so a re-armed row wins over an abandoned predecessor.
+            transaction_cols::ID,
+        ))
+        .bind(nonce)
+        .bind(TransactionType::Withdrawal)
+        .fetch_optional(&self.pool)
         .await
     }
 
@@ -1263,7 +1355,8 @@ impl PostgresDb {
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = $1
             ORDER BY {} DESC
@@ -1293,6 +1386,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filter
             transaction_cols::TRANSACTION_TYPE,
             // Ordering
@@ -1343,118 +1437,26 @@ impl PostgresDb {
         Ok(())
     }
 
-    pub async fn get_owed_rotation_target_internal(
-        &self,
-        program_type: &str,
-    ) -> Result<Option<u64>, sqlx::Error> {
-        let result: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT owed_rotation_target FROM indexer_state WHERE program_type = $1",
-        )
-        .bind(program_type)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(result
-            .and_then(|(target,)| target)
-            .map(|target| target as u64))
-    }
-
-    pub async fn set_owed_rotation_target_internal(
-        &self,
-        program_type: &str,
-        target_tree_index: u64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            INSERT INTO indexer_state (program_type, owed_rotation_target, updated_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (program_type)
-            DO UPDATE SET
-                owed_rotation_target = EXCLUDED.owed_rotation_target,
-                updated_at = NOW()
-            "#,
-        )
-        .bind(program_type)
-        .bind(target_tree_index as i64)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Clear only if the stored target is still the one the caller proved landed, so a
-    /// clear can never retire a rotation that is still owed.
-    pub async fn clear_owed_rotation_target_internal(
-        &self,
-        program_type: &str,
-        target_tree_index: u64,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            UPDATE indexer_state
-            SET owed_rotation_target = NULL
-            WHERE program_type = $1
-              AND owed_rotation_target = $2
-            "#,
-        )
-        .bind(program_type)
-        .bind(target_tree_index as i64)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
     pub async fn get_and_lock_pending_transactions_internal(
         &self,
         transaction_type: TransactionType,
         limit: i64,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
-        // Deposits dequeue FIFO by created_at. Withdrawals dequeue by nonce and
-        // enforce a frontier: never hand out a nonce while a lower one is still
-        // active, or the lower nonce gets stranded on a closed SMT tree after a
-        // boundary rotation. The `< MIN(lower active nonce)` filter is the
-        // frontier; dropping SKIP LOCKED stops a second worker from skipping a
-        // locked lower nonce and leapfrogging to a higher one.
-        let is_withdrawal = matches!(transaction_type, TransactionType::Withdrawal);
-        let (order_col, frontier_filter, lock_clause) = if is_withdrawal {
-            (
-                transaction_cols::WITHDRAWAL_NONCE,
-                // NULL-nonce rows are poison (e.g. a corrupt withdrawal); they have
-                // no tree, so the frontier doesn't apply - still dequeue them so the
-                // processor can quarantine them. ORDER BY ... ASC sorts them last.
-                format!(
-                    " AND ({nonce} IS NULL OR {nonce} < COALESCE((SELECT MIN({nonce}) \
-                     FROM transactions WHERE {ttype} = $2 AND {status} IN \
-                     ('processing', 'parked', 'pending_remint', 'manual_review')), {max}))",
-                    nonce = transaction_cols::WITHDRAWAL_NONCE,
-                    ttype = transaction_cols::TRANSACTION_TYPE,
-                    status = transaction_cols::STATUS,
-                    max = i64::MAX,
-                ),
-                "FOR UPDATE",
-            )
-        } else {
-            (
-                transaction_cols::CREATED_AT,
-                String::new(),
-                "FOR UPDATE SKIP LOCKED",
-            )
-        };
-
         // Use a transaction to ensure atomicity
         let mut tx = self.pool.begin().await?;
 
+        // Lock rows with FOR UPDATE SKIP LOCKED
         let mut transactions = sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
-            WHERE {} = $1 AND {} = $2{frontier}
+            WHERE {} = $1 AND {} = $2
             ORDER BY {} ASC
             LIMIT $3
-            {lock}
+            FOR UPDATE SKIP LOCKED
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1480,13 +1482,12 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::TRANSACTION_TYPE,
-            // Ordering: nonce for withdrawals, created_at for deposits
-            order_col,
-            frontier = frontier_filter,
-            lock = lock_clause,
+            // Ordering (FIFO)
+            transaction_cols::CREATED_AT,
         ))
         .bind(TransactionStatus::Pending)
         .bind(transaction_type)
@@ -1494,9 +1495,9 @@ impl PostgresDb {
         .fetch_all(&mut *tx)
         .await?;
 
-        // Update status to Processing and RETURNING the trigger-bumped
-        // `updated_at`, so the fetched row carries its true post-lock token (the
-        // deposit sender CASes on it at broadcast, not the stale Pending value).
+        // Update status to Processing, returning the trigger-bumped `updated_at`
+        // so the fetched row carries its true post-lock token; the sender CASes
+        // on that at broadcast, not on the stale Pending value.
         if !transactions.is_empty() {
             let ids: Vec<i64> = transactions.iter().map(|txn| txn.id).collect();
             let bumped: Vec<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(
@@ -1524,68 +1525,6 @@ impl PostgresDb {
         tx.commit().await?;
 
         Ok(transactions)
-    }
-
-    /// True if any withdrawal with a lower nonce is unresolved and not yet handed
-    /// to the sender. Gates the boundary rotation: rotating past such a nonce
-    /// would strand it on the closed tree. `Processing` rows are excluded on
-    /// purpose - they are already dispatched ahead of the rotation, so the
-    /// sender's in-flight guard holds the rotation until they settle.
-    pub async fn has_active_withdrawal_below_internal(
-        &self,
-        nonce: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let exists: bool = sqlx::query_scalar(&format!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM transactions
-                WHERE {ttype} = $2
-                  AND {nonce} < $1
-                  AND {status} IN ('pending', 'parked', 'pending_remint', 'manual_review')
-            )
-            "#,
-            ttype = transaction_cols::TRANSACTION_TYPE,
-            nonce = transaction_cols::WITHDRAWAL_NONCE,
-            status = transaction_cols::STATUS,
-        ))
-        .bind(nonce)
-        .bind(TransactionType::Withdrawal)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(exists)
-    }
-
-    /// Lowest withdrawal nonce below `nonce` that still owes a release, or `None` if every
-    /// lower nonce is terminal. Gates the sender's rotation submit: rotating past a nonce
-    /// that still owes a release closes the only tree that release can ever land on.
-    ///
-    /// Evaluated fresh on every attempt, so it covers rows that entered a live status
-    /// after the rotation was dispatched (a recovery demote to `pending`, a park, a queued
-    /// remint, a quarantine). `Processing` is included where
-    /// `has_active_withdrawal_below_internal` omits it: that query runs in the processor,
-    /// where a `Processing` row is one the sender holds in memory, and this one must hold
-    /// after a restart dropped that memory. Terminal means `completed` (released) or
-    /// `failed`/`failed_reminted` (written off or reminted), which are safe to rotate past.
-    pub async fn lowest_unreleased_withdrawal_below_internal(
-        &self,
-        nonce: i64,
-    ) -> Result<Option<i64>, sqlx::Error> {
-        let lowest: Option<i64> = sqlx::query_scalar(&format!(
-            r#"
-            SELECT MIN({nonce_col}) FROM transactions
-            WHERE {ttype} = $2
-              AND {nonce_col} < $1
-              AND {status} IN ('pending', 'processing', 'parked', 'pending_remint', 'manual_review')
-            "#,
-            ttype = transaction_cols::TRANSACTION_TYPE,
-            nonce_col = transaction_cols::WITHDRAWAL_NONCE,
-            status = transaction_cols::STATUS,
-        ))
-        .bind(nonce)
-        .bind(TransactionType::Withdrawal)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(lowest)
     }
 
     /// Returns true if the row was updated; false if already terminal.
@@ -1625,22 +1564,23 @@ impl PostgresDb {
     /// Stale `Processing` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_processing_transactions_internal(
         &self,
-        transaction_type: TransactionType,
         threshold: Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         let threshold_secs = threshold.as_secs() as f64;
         sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'processing'
               AND {} < NOW() - make_interval(secs => $1)
-              AND {} = $2
+              AND {} = $3
             ORDER BY {} ASC
-            LIMIT $3
+            LIMIT $2
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1666,6 +1606,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -1674,8 +1615,8 @@ impl PostgresDb {
             transaction_cols::UPDATED_AT,
         ))
         .bind(threshold_secs)
-        .bind(transaction_type)
         .bind(limit)
+        .bind(transaction_type)
         .fetch_all(&self.pool)
         .await
     }
@@ -1807,22 +1748,23 @@ impl PostgresDb {
     /// Stale `Parked` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_parked_transactions_internal(
         &self,
-        transaction_type: TransactionType,
         threshold: Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, sqlx::Error> {
         let threshold_secs = threshold.as_secs() as f64;
         sqlx::query_as::<_, DbTransaction>(&format!(
             r#"
             SELECT
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}
             FROM transactions
             WHERE {} = 'parked'
               AND {} < NOW() - make_interval(secs => $1)
-              AND {} = $2
+              AND {} = $3
             ORDER BY {} ASC
-            LIMIT $3
+            LIMIT $2
             "#,
             transaction_cols::ID,
             transaction_cols::SIGNATURE,
@@ -1848,6 +1790,7 @@ impl PostgresDb {
             transaction_cols::INSTRUCTION_INDEX,
             transaction_cols::INNER_INDEX,
             transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
             // Filters
             transaction_cols::STATUS,
             transaction_cols::UPDATED_AT,
@@ -1856,8 +1799,8 @@ impl PostgresDb {
             transaction_cols::UPDATED_AT,
         ))
         .bind(threshold_secs)
-        .bind(transaction_type)
         .bind(limit)
+        .bind(transaction_type)
         .fetch_all(&self.pool)
         .await
     }
@@ -1917,15 +1860,26 @@ impl PostgresDb {
     }
 
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    ///
+    /// The optional signature arrays are persisted by the same statement rather
+    /// than a preceding one. Splitting them is not merely slower, it cannot
+    /// work: the `updated_at` trigger fires on the first write, after which this
+    /// statement's `updated_at` compare can never match and the row would be
+    /// stranded in `processing` forever. `COALESCE` keeps a `None` call inert,
+    /// so callers with no evidence to record leave both columns as they were.
     pub async fn try_quarantine_processing_internal(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE transactions
             SET status = 'manual_review',
+                remint_signatures = COALESCE($3, remint_signatures),
+                remint_last_valid_block_heights = COALESCE($4, remint_last_valid_block_heights),
                 processed_at = NOW()
             WHERE id = $1
               AND status = 'processing'
@@ -1934,14 +1888,150 @@ impl PostgresDb {
         )
         .bind(transaction_id)
         .bind(expected_updated_at)
+        .bind(remint_signatures)
+        .bind(remint_last_valid_block_heights)
         .execute(&self.pool)
         .await?;
 
         Ok(result.rows_affected() == 1)
     }
 
-    /// Transitions a withdrawal to PendingRemint status, storing the
-    /// withdrawal signatures needed for the finality check on restart.
+    /// Withdrawals stalled in `status` that still carry stored release
+    /// signatures, keyed forward from `after_id`.
+    ///
+    /// The evidence predicates are in SQL so a row that can never be classified
+    /// (structurally corrupt, or quarantined before anything was broadcast) is
+    /// never fetched and never costs an RPC round trip. A NULL nonce is excluded
+    /// for the same reason: no nonce means no release was ever built, so the row
+    /// cannot account for a bit the on-chain bitmap is holding. The two arrays
+    /// are index-paired, and they arrived in separate migrations, so a row can
+    /// legitimately carry signatures with no heights; that is unclassifiable too.
+    ///
+    /// A row whose refund was already claimed or landed is excluded as well:
+    /// completing it on release evidence alone would pay the nonce twice and
+    /// then let the GC drop the claim. The bitmap check adjudicates those.
+    ///
+    /// Paging is keyed on `id` rather than offset by `updated_at`. A row that
+    /// does not classify is left untouched by design, so its `updated_at` never
+    /// moves; ordering on it would return the same blocked rows on every sweep
+    /// and starve everything behind them. `id` gives the caller a cursor that
+    /// always advances.
+    pub async fn get_stalled_withdrawals_with_signatures_internal(
+        &self,
+        status: TransactionStatus,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, sqlx::Error> {
+        sqlx::query_as::<_, DbTransaction>(&format!(
+            r#"
+            SELECT
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            FROM transactions
+            WHERE {} = 'withdrawal'
+              AND {} = $1
+              AND {} IS NOT NULL
+              AND {} IS NOT NULL
+              AND array_length({}, 1) > 0
+              AND {} IS NOT NULL
+              AND {} IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_remint_signatures p
+                  WHERE p.transaction_id = transactions.{}
+              )
+              AND {} > $2
+            ORDER BY {} ASC
+            LIMIT $3
+            "#,
+            transaction_cols::ID,
+            transaction_cols::SIGNATURE,
+            transaction_cols::TRACE_ID,
+            transaction_cols::SLOT,
+            transaction_cols::INITIATOR,
+            transaction_cols::RECIPIENT,
+            transaction_cols::MINT,
+            transaction_cols::AMOUNT,
+            transaction_cols::MEMO,
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::STATUS,
+            transaction_cols::CREATED_AT,
+            transaction_cols::UPDATED_AT,
+            transaction_cols::PROCESSED_AT,
+            transaction_cols::COUNTERPART_SIGNATURE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            transaction_cols::PENDING_REMINT_DEADLINE_AT,
+            transaction_cols::FINALITY_CHECK_ATTEMPTS,
+            transaction_cols::RECOVERY_REQUEUE_ATTEMPTS,
+            transaction_cols::INSTRUCTION_INDEX,
+            transaction_cols::INNER_INDEX,
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::RELEASE_REFUSED_ON_CHAIN,
+            // Filters
+            transaction_cols::TRANSACTION_TYPE,
+            transaction_cols::STATUS,
+            transaction_cols::WITHDRAWAL_NONCE,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_SIGNATURES,
+            transaction_cols::REMINT_LAST_VALID_BLOCK_HEIGHTS,
+            // Refund interlock
+            transaction_cols::LANDED_REMINT_SIGNATURE,
+            transaction_cols::ID,
+            // Keyset cursor
+            transaction_cols::ID,
+            // Ordering must match the cursor so paging cannot repeat or skip
+            transaction_cols::ID,
+        ))
+        .bind(status)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// CAS a stalled withdrawal to `Completed` once its release is proven landed.
+    ///
+    /// `from_status` is bound by the caller, but the statement additionally pins
+    /// the allowed source statuses inline. That redundancy is deliberate: the
+    /// guard is what stops this from resurrecting a terminal row or stealing a
+    /// `processing` row from a live sender, and it belongs in the SQL rather
+    /// than resting on every present and future caller binding the right value.
+    pub async fn try_complete_stalled_withdrawal_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'completed',
+                counterpart_signature = COALESCE($4, counterpart_signature),
+                processed_at = NOW()
+            WHERE id = $1
+              AND updated_at = $2
+              AND status = $3
+              AND status IN ('manual_review', 'pending_remint')
+              AND transaction_type = 'withdrawal'
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .bind(from_status)
+        .bind(counterpart_signature)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Transitions a withdrawal to PendingRemint status, storing the withdrawal
+    /// signatures needed for the finality check on restart and whether the
+    /// program itself refused the release. The refusal rides in this same UPDATE
+    /// so a crash can never leave a queued refund without the proof that lets it
+    /// be paid out once the bitmap has rotated past the nonce.
     ///
     /// Idempotent for an identical payload: a row already PendingRemint with the
     /// same signatures is re-written, so a retry after a lost acknowledgement
@@ -1952,6 +2042,7 @@ impl PostgresDb {
         remint_signatures: Vec<String>,
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: chrono::DateTime<chrono::Utc>,
+        release_refused_on_chain: bool,
     ) -> Result<(), sqlx::Error> {
         let result = self
             .run_sender_owned(move |conn| {
@@ -1964,6 +2055,7 @@ impl PostgresDb {
                             remint_signatures = $3,
                             remint_last_valid_block_heights = $4,
                             pending_remint_deadline_at = $5,
+                            release_refused_on_chain = $6,
                             updated_at = NOW()
                         WHERE id = $1
                             AND (status = 'processing'
@@ -1975,6 +2067,7 @@ impl PostgresDb {
                     .bind(remint_signatures)
                     .bind(remint_last_valid_block_heights)
                     .bind(deadline_at)
+                    .bind(release_refused_on_chain)
                     .execute(conn)
                     .await
                 })
@@ -2217,6 +2310,63 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Delete one stored release signature, keeping the transaction's others.
+    pub async fn delete_release_signature_internal(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM pending_release_signatures WHERE transaction_id = $1 AND signature = $2",
+        )
+        .bind(transaction_id)
+        .bind(signature)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record the releases seen in one slot; idempotent on the nonce.
+    pub async fn insert_observed_releases_batch_internal(
+        &self,
+        releases: &[DbObservedRelease],
+    ) -> Result<(), sqlx::Error> {
+        for release in releases {
+            sqlx::query(
+                r#"
+                INSERT INTO observed_releases (withdrawal_nonce, signature, slot)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (withdrawal_nonce) DO NOTHING
+                "#,
+            )
+            .bind(release.withdrawal_nonce)
+            .bind(&release.signature)
+            .bind(release.slot)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The release recorded for `nonce`, if the indexer has seen one.
+    pub async fn get_observed_release_internal(
+        &self,
+        nonce: i64,
+    ) -> Result<Option<DbObservedRelease>, sqlx::Error> {
+        sqlx::query_as::<_, DbObservedRelease>(
+            r#"
+            SELECT withdrawal_nonce, signature, slot
+            FROM observed_releases
+            WHERE withdrawal_nonce = $1
+            "#,
+        )
+        .bind(nonce)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Drop release signatures whose parent transaction is no longer
+    /// `processing`. Returns the number of rows removed.
     /// Only genuinely terminal rows are reclaimed; every non-terminal
     /// status keeps its write-ahead journal. A demoted, quarantined, parked, or
     /// pending-remint row can still be picked up or reminted, and the pre-mint
@@ -2349,16 +2499,26 @@ impl PostgresDb {
         Ok(result.rows_affected())
     }
 
-    /// Flip every `Pending`/`Processing` withdrawal to `ManualReview`.
+    /// Flip active withdrawals at or above `min_nonce` to `ManualReview`.
     ///
     /// `exclude_id` is the poison row that the caller has already quarantined
     /// via the async `storage_tx` writer. That update may not have hit the DB
-    /// yet when this sweep runs, so the row's status is still
-    /// `Pending`/`Processing` here; excluding it prevents a second
-    /// `ManualReview` webhook for the same transaction.
+    /// yet when this sweep runs, so the row's status is still active here;
+    /// excluding it prevents a second `ManualReview` webhook for the same
+    /// transaction.
+    ///
+    /// `min_nonce` is the poison row's own nonce. Bounding the sweep keeps
+    /// lower-nonce rows out of it: such a row may already be signed or
+    /// broadcast by the sender, and terminalizing one drops its later
+    /// `Completed` write. A NULL `withdrawal_nonce` never satisfies the
+    /// comparison, so such a row is left alone. `None` sweeps everything.
     ///
     /// Terminal rows are left untouched so the webhook does not re-alert on
     /// already-handled transactions. Returns the number of rows affected.
+    ///
+    /// Journalled release signatures are copied onto the row in the same
+    /// UPDATE. The journal is GC'd once the row leaves `Processing`, and the
+    /// reconcile sweep only fetches rows carrying those columns.
     ///
     /// Scope is intentionally DB-wide over `transaction_type = 'withdrawal'`
     /// to match the fetcher's own scope. The data model assumes a single
@@ -2366,26 +2526,42 @@ impl PostgresDb {
     /// require an `instance_pda` column on `transactions` that does not exist
     /// today.
     // Coverage-ignore rationale (category b, defensive recovery):
-    //   `quarantine_all_active_withdrawals_internal` is only invoked by
+    //   `quarantine_active_withdrawals_internal` is only invoked by
     //   the poison-pill pipeline in `operator/processor.rs`
-    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded —
-    //   integration tests do not produce malformed rows that would trip
+    //   (`halt_withdrawal_pipeline`), which is itself LCOV-excluded.
+    //   Integration tests do not produce malformed rows that would trip
     //   it. The SQL itself is trivial; the behavior is covered via the
-    //   `Storage::Mock` variant in in-crate tests.
-    pub async fn quarantine_all_active_withdrawals_internal(
+    //   `Storage::Mock` variant in in-crate tests and by the runbook drills.
+    pub async fn quarantine_active_withdrawals_internal(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE transactions
-            SET status = 'manual_review', updated_at = NOW()
+            SET status = 'manual_review',
+                updated_at = NOW(),
+                remint_signatures = COALESCE(
+                    (SELECT array_agg(p.signature ORDER BY p.id)
+                     FROM pending_release_signatures p
+                     WHERE p.transaction_id = transactions.id),
+                    remint_signatures
+                ),
+                remint_last_valid_block_heights = COALESCE(
+                    (SELECT array_agg(p.last_valid_block_height ORDER BY p.id)
+                     FROM pending_release_signatures p
+                     WHERE p.transaction_id = transactions.id),
+                    remint_last_valid_block_heights
+                )
             WHERE transaction_type = 'withdrawal'
               AND status IN ('pending', 'processing', 'parked')
               AND ($1::BIGINT IS NULL OR id <> $1)
+              AND ($2::BIGINT IS NULL OR withdrawal_nonce >= $2)
             "#,
         )
         .bind(exclude_id)
+        .bind(min_nonce)
         .execute(&self.pool)
         .await?;
 
@@ -2753,6 +2929,44 @@ impl PostgresDb {
         .await?;
 
         Ok(count)
+    }
+
+    /// Lowest and highest withdrawal nonce at or above `min_nonce` that still
+    /// owes a release.
+    ///
+    /// The status set is the complement of the terminal ones. `completed` was
+    /// released, `failed` and `failed_reminted` were written off or refunded, and
+    /// none of the three can ever need their generation's window again, so the
+    /// rotation is free to move past them. Everything else may still have to land
+    /// on the bitmap as it stands today, `manual_review` included, because a human
+    /// can still resolve one of those rows into a release.
+    ///
+    /// Both aggregates are NULL together when nothing matches, and MIN/MAX skip
+    /// NULL nonces on their own, so a row without one contributes no bound.
+    pub async fn unreleased_withdrawal_nonce_bounds_internal(
+        &self,
+        min_nonce: i64,
+    ) -> Result<Option<(i64, i64)>, sqlx::Error> {
+        let bounds: (Option<i64>, Option<i64>) = sqlx::query_as(&format!(
+            r#"
+            SELECT MIN({nonce}), MAX({nonce}) FROM transactions
+            WHERE {ttype} = $1
+              AND {nonce} >= $2
+              AND {status} IN ('pending', 'processing', 'parked', 'pending_remint', 'manual_review')
+            "#,
+            nonce = transaction_cols::WITHDRAWAL_NONCE,
+            ttype = transaction_cols::TRANSACTION_TYPE,
+            status = transaction_cols::STATUS,
+        ))
+        .bind(TransactionType::Withdrawal)
+        .bind(min_nonce)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(match bounds {
+            (Some(lowest), Some(highest)) => Some((lowest, highest)),
+            _ => None,
+        })
     }
 
     pub async fn get_completed_withdrawal_nonces_internal(

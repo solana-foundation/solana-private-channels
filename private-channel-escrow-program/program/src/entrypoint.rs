@@ -4,7 +4,7 @@ use crate::{
     processor::{
         process_add_operator, process_allow_mint, process_block_mint, process_create_instance,
         process_deposit, process_emit_event::process_emit_event, process_release_funds,
-        process_remove_operator, process_reset_smt_root, process_set_new_admin,
+        process_remove_operator, process_rotate_bitmap, process_set_new_admin,
     },
     state::discriminator::PrivateChannelEscrowInstructionDiscriminators,
 };
@@ -48,8 +48,8 @@ pub fn process_instruction(
         PrivateChannelEscrowInstructionDiscriminators::ReleaseFunds => {
             process_release_funds(program_id, accounts, instruction_data)
         }
-        PrivateChannelEscrowInstructionDiscriminators::ResetSmtRoot => {
-            process_reset_smt_root(program_id, accounts, instruction_data)
+        PrivateChannelEscrowInstructionDiscriminators::RotateBitmap => {
+            process_rotate_bitmap(program_id, accounts, instruction_data)
         }
         PrivateChannelEscrowInstructionDiscriminators::EmitEvent => {
             process_emit_event(program_id, accounts)

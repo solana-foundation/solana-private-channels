@@ -7,18 +7,19 @@ use crate::utils::{
 use crate::{
     assertions::{
         assert_account_exists, assert_account_not_exists, assert_add_operator_account,
-        assert_allow_mint_account, assert_block_mint_account, assert_instance_account,
-        assert_instance_admin_updated, assert_instance_smt_reset, assert_remove_operator_account,
+        assert_allow_mint_account, assert_bitmap_bits_cleared, assert_bitmap_rotated,
+        assert_block_mint_account, assert_instance_account, assert_instance_admin_updated,
+        assert_nonce_consumed, assert_remove_operator_account, assert_withdrawal_bitmap_account,
     },
-    pda_utils::{find_instance_pda, find_operator_pda},
+    pda_utils::{find_instance_pda, find_operator_pda, find_withdrawal_bitmap_pda},
     utils::{TestContext, TOKEN_2022_PROGRAM_ID},
 };
 use private_channel_escrow_program_client::instructions::{
     AddOperatorBuilder, AllowMintBuilder, BlockMintBuilder, CreateInstanceBuilder,
     ReleaseFundsBuilder, RemoveOperatorBuilder, SetNewAdminBuilder,
 };
-use private_channel_escrow_program_client::instructions::{DepositBuilder, ResetSmtRootBuilder};
-use private_channel_escrow_program_client::Instance;
+use private_channel_escrow_program_client::instructions::{DepositBuilder, RotateBitmapBuilder};
+use private_channel_escrow_program_client::WithdrawalBitmap;
 use solana_sdk::system_program::ID as SYSTEM_PROGRAM_ID;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -44,6 +45,7 @@ pub fn assert_get_or_create_instance(
     }
 
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
 
     // Use the generated client (this works in test_create_instance_invalid_pda)
     let instruction = CreateInstanceBuilder::new()
@@ -51,10 +53,12 @@ pub fn assert_get_or_create_instance(
         .admin(admin.pubkey())
         .instance_seed(instance_seed.pubkey())
         .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .system_program(SYSTEM_PROGRAM_ID)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .bitmap_bump(bitmap_bump)
         .instruction();
 
     let transaction_metadata = context
@@ -72,8 +76,11 @@ pub fn assert_get_or_create_instance(
         &admin.pubkey(),
         bump,
         &instance_seed.pubkey(),
-        0,
     );
+
+    // A fresh instance must start on generation 0 with no nonce consumed.
+    assert_withdrawal_bitmap_account(context, &withdrawal_bitmap_pda, bitmap_bump, 0);
+    assert_bitmap_bits_cleared(context, &withdrawal_bitmap_pda);
 
     // Assert CreateInstance event was emitted
     assert_event_discriminator_present(
@@ -433,15 +440,14 @@ pub fn assert_get_or_release_funds(
     token_program: &Pubkey,
     amount: u64,
     user: &Pubkey,
-    new_withdrawal_root: [u8; 32],
     transaction_nonce: u64,
-    sibling_proofs: [u8; 512],
     with_profiling: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     context.airdrop_if_required(&operator.pubkey(), 1_000_000_000)?;
 
     let (allowed_mint_pda, _) = find_allowed_mint_pda(instance_pda, mint);
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(instance_pda);
 
     let user_ata = get_associated_token_address_with_program_id(user, mint, token_program);
     let instance_ata =
@@ -455,6 +461,7 @@ pub fn assert_get_or_release_funds(
         .payer(context.payer.pubkey())
         .operator(operator.pubkey())
         .instance(*instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .operator_pda(*operator_pda)
         .mint(*mint)
         .allowed_mint(allowed_mint_pda)
@@ -466,9 +473,7 @@ pub fn assert_get_or_release_funds(
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .amount(amount)
         .user(*user)
-        .new_withdrawal_root(new_withdrawal_root)
         .transaction_nonce(transaction_nonce)
-        .sibling_proofs(sibling_proofs)
         .instruction();
 
     let transaction_metadata = context.send_transaction_with_signers_with_transaction_result(
@@ -487,15 +492,8 @@ pub fn assert_get_or_release_funds(
         amount,
     );
 
-    // Assert withdrawal transactions root was updated
-    let instance = context
-        .get_account(instance_pda)
-        .expect("Instance account should exist");
-
-    let instance =
-        Instance::from_bytes(&instance.data).expect("Should deserialize instance account");
-
-    assert_eq!(instance.withdrawal_transactions_root, new_withdrawal_root);
+    // The nonce must be consumed so a replay of the same withdrawal is refused.
+    assert_nonce_consumed(context, &withdrawal_bitmap_pda, transaction_nonce, true);
 
     // Assert ReleaseFunds event was emitted (discriminator 7)
     assert_event_discriminator_present(&transaction_metadata, 7);
@@ -503,7 +501,7 @@ pub fn assert_get_or_release_funds(
     Ok(())
 }
 
-pub fn assert_get_or_reset_smt_root(
+pub fn assert_get_or_rotate_bitmap(
     context: &mut TestContext,
     operator: &Keypair,
     instance_pda: &Pubkey,
@@ -513,26 +511,28 @@ pub fn assert_get_or_reset_smt_root(
     context.airdrop_if_required(&operator.pubkey(), 1_000_000_000)?;
 
     let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(instance_pda);
 
-    let current_instance = context
-        .get_account(instance_pda)
-        .expect("Instance account should exist")
+    let current_bitmap = context
+        .get_account(&withdrawal_bitmap_pda)
+        .expect("Withdrawal bitmap account should exist")
         .data
         .clone();
 
-    let current_instance =
-        Instance::from_bytes(&current_instance).expect("Should deserialize instance account");
+    let current_bitmap = WithdrawalBitmap::from_bytes(&current_bitmap)
+        .expect("Should deserialize withdrawal bitmap account");
 
-    let previous_tree_index = current_instance.current_tree_index;
+    let previous_generation = current_bitmap.generation;
 
-    let instruction = ResetSmtRootBuilder::new()
+    let instruction = RotateBitmapBuilder::new()
         .payer(context.payer.pubkey())
         .operator(operator.pubkey())
         .instance(*instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
         .operator_pda(*operator_pda)
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .expected_current_tree_index(previous_tree_index)
+        .expected_generation(previous_generation)
         .instruction();
 
     let transaction_metadata = context.send_transaction_with_signers_with_transaction_result(
@@ -542,10 +542,10 @@ pub fn assert_get_or_reset_smt_root(
         None,
     )?;
 
-    // Assert instance SMT was reset and previous_tree_index incremented
-    assert_instance_smt_reset(context, instance_pda, previous_tree_index);
+    // Assert the bitmap was cleared and the generation incremented
+    assert_bitmap_rotated(context, &withdrawal_bitmap_pda, previous_generation);
 
-    // Assert ResetSmtRoot event was emitted (discriminator 8)
+    // Assert RotateBitmap event was emitted (discriminator 8)
     assert_event_discriminator_present(&transaction_metadata, 8);
 
     Ok(())

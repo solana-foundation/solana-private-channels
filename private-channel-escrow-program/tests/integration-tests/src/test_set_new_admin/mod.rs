@@ -1,6 +1,5 @@
 use crate::{
     pda_utils::find_event_authority_pda,
-    smt_utils::ProcessorSMT,
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
         assert_get_or_deposit, assert_get_or_release_funds, assert_get_or_set_new_admin,
@@ -297,11 +296,6 @@ fn test_set_new_admin_existing_operators_still_valid() {
     assert_get_or_set_new_admin(&mut context, &admin, &instance_pda, &new_admin, false)
         .expect("SetNewAdmin should succeed");
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(1);
-    smt.insert(1);
-    let new_root = smt.current_root();
-
     assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -311,9 +305,7 @@ fn test_set_new_admin_existing_operators_still_valid() {
         &TOKEN_PROGRAM_ID,
         500_000,
         &user.pubkey(),
-        new_root,
         1,
-        sibling_proofs,
         false,
     )
     .expect("Operator should still be valid after admin change");

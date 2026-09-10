@@ -423,6 +423,9 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     // admin-vm malformed InitializeMint coverage.
     run_admin_vm_initialize_mint_malformed_test(private_channel_ctx).await;
 
+    // admin-vm InitializeMint persistence + account_keys mirror coverage.
+    run_admin_vm_initialize_mint_persists_test(private_channel_ctx).await;
+
     // parallel-SVM SnapshotCallback coverage (20-tx burst).
     run_parallel_svm_burst_test(private_channel_ctx).await;
 

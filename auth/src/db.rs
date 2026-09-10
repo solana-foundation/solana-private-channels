@@ -161,6 +161,17 @@ pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<User>>
     Ok(row.map(user_from_row))
 }
 
+/// Look up a user's username by id. Used to name the account in the wallet challenge message.
+pub async fn find_username_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as(r#"SELECT username FROM private_channel_auth.users WHERE id = $1"#)
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row.map(|(username,)| username))
+}
+
 pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> AppResult<User> {
     let row: (Uuid, String, String, String, DateTime<Utc>) = sqlx::query_as(
         r#"

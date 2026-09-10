@@ -1,7 +1,7 @@
 use crate::{
     accounts::utils::encode_transaction_data,
     rpc::{
-        constants::MAX_SIMULATION_ACCOUNTS_BYTES,
+        constants::{estimated_encoded_bytes, MAX_SIMULATION_ACCOUNTS_BYTES},
         error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
         ReadDeps,
     },
@@ -24,7 +24,7 @@ use solana_sdk::{
     account::ReadableAccount,
     message::{v0::LoadedAddresses, SimpleAddressLoader},
     pubkey::Pubkey,
-    transaction::{MessageHash, VersionedTransaction},
+    transaction::{MessageHash, SanitizedTransaction, VersionedTransaction, MAX_TX_ACCOUNT_LOCKS},
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use solana_svm_callback::TransactionProcessingCallback;
@@ -63,14 +63,6 @@ fn validate_accounts_config(
     }
 
     Ok(())
-}
-
-/// Allowance per account for its metadata fields and the JSON punctuation.
-const PER_ACCOUNT_JSON_OVERHEAD: usize = 256;
-
-/// Estimated JSON bytes one encoded account contributes.
-fn estimated_encoded_bytes(data_len: usize) -> usize {
-    data_len.div_ceil(3) * 4 + PER_ACCOUNT_JSON_OVERHEAD
 }
 
 /// Resolves every requested address, then encodes only if the whole reply fits.
@@ -187,6 +179,10 @@ pub async fn simulate_transaction(
     )
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
+
+    // Refuse here what sendTransaction refuses, so preflight cannot bless a tx that will never land.
+    SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
+        .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
 
     // Checked here so a bad address list never pays for a simulation.
     if let Some(accounts_config) = config.accounts.as_ref() {
@@ -375,6 +371,7 @@ pub async fn simulate_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::constants::PER_ACCOUNT_JSON_OVERHEAD;
     use solana_account_decoder_client_types::UiAccountData;
     use solana_sdk::account::AccountSharedData;
     use solana_svm_callback::InvokeContextCallback;

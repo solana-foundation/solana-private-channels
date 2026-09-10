@@ -31,7 +31,7 @@ This document defines the safety and correctness invariants that Solana Private 
 |----|-----------|-------|--------|-----|
 | P1 | Escrow program MUST require SPL transfers on escrow | MUST | Done | #18 |
 | P2 | Escrow program MUST reject SPL transfers for unauthorized mints | MUST | Done | #10 |
-| P3 | Withdrawal program MUST require admin transaction to release funds AND a valid withdrawal proof | MUST | Done | #9, #10, #29 |
+| P3 | Withdrawal program MUST require admin transaction to release funds AND that the withdrawal's nonce is unconsumed in the current bitmap generation | MUST | Done | #9, #10, #29 |
 
 ## Indexer
 

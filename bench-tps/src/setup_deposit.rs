@@ -49,6 +49,7 @@ use {
 };
 
 const INSTANCE_SEED_PREFIX: &[u8] = b"instance";
+const WITHDRAWAL_BITMAP_SEED_PREFIX: &[u8] = b"withdrawal_bitmap";
 const ALLOWED_MINT_SEED_PREFIX: &[u8] = b"allowed_mint";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 
@@ -61,6 +62,15 @@ const AIRDROP_LAMPORTS: u64 = 100_000_000_000;
 pub fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[INSTANCE_SEED_PREFIX, instance_seed.as_ref()],
+        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    )
+}
+
+/// Derive the withdrawal bitmap PDA for an instance. Created alongside the
+/// instance, so setup has to pass both the address and the bump.
+pub fn find_withdrawal_bitmap_pda(instance_pda: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[WITHDRAWAL_BITMAP_SEED_PREFIX, instance_pda.as_ref()],
         &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     )
 }
@@ -135,6 +145,7 @@ pub async fn run_setup_deposit_phase(
     };
     let instance_seed_pubkey = instance_seed_keypair.pubkey();
     let (instance_pda, instance_bump) = find_instance_pda(&instance_seed_pubkey);
+    let (bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
     let (event_authority, _) = find_event_authority();
     info!(
         %instance_seed_pubkey,
@@ -208,12 +219,14 @@ pub async fn run_setup_deposit_phase(
                         admin: admin_keypair.pubkey(),
                         instance_seed: instance_seed_pubkey,
                         instance: instance_pda,
+                        withdrawal_bitmap: bitmap_pda,
                         system_program: program::id(),
                         event_authority,
                         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(CreateInstanceInstructionArgs {
                         bump: instance_bump,
+                        bitmap_bump,
                     });
                     let tx = Transaction::new_signed_with_payer(
                         &[create_ix],

@@ -6,40 +6,24 @@ use pinocchio::Address;
 pub const INSTANCE_SEED: &[u8] = b"instance";
 pub const OPERATOR_SEED: &[u8] = b"operator";
 pub const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
+pub const WITHDRAWAL_BITMAP_SEED: &[u8] = b"withdrawal_bitmap";
 
 // Instance
 pub const INSTANCE_VERSION: u8 = 1;
 
 #[cfg(not(feature = "test-tree"))]
-pub mod tree_constants {
-    pub const TREE_HEIGHT: usize = 16;
-    pub const MAX_TREE_LEAVES: usize = 2_usize.pow(16);
-
-    pub const EMPTY_TREE_ROOT: [u8; 32] = [
-        143, 230, 177, 104, 146, 86, 192, 211, 133, 244, 47, 91, 190, 32, 39, 162, 44, 25, 150,
-        225, 16, 186, 151, 193, 113, 211, 229, 148, 141, 233, 43, 235,
-    ];
+pub mod bitmap_constants {
+    // Nonces covered by one bitmap generation, one bit each.
+    pub const NONCES_PER_GENERATION: u64 = 65_536;
+    pub const BITMAP_BYTES: usize = (NONCES_PER_GENERATION / 8) as usize;
 }
 
-// 8 leaves for testing
+// 8 nonces for testing
 #[cfg(feature = "test-tree")]
-pub mod tree_constants {
-    pub const TREE_HEIGHT: usize = 3;
-    pub const MAX_TREE_LEAVES: usize = 2_usize.pow(3);
-
-    pub const EMPTY_TREE_ROOT: [u8; 32] = [
-        199, 128, 9, 253, 240, 127, 197, 106, 17, 241, 34, 55, 6, 88, 163, 83, 170, 165, 66, 237,
-        99, 228, 76, 75, 193, 95, 244, 205, 16, 90, 179, 60,
-    ];
+pub mod bitmap_constants {
+    pub const NONCES_PER_GENERATION: u64 = 8;
+    pub const BITMAP_BYTES: usize = (NONCES_PER_GENERATION / 8) as usize;
 }
-
-// This is the leaf value of a non-present nonce (empty leaf)
-pub const EMPTY_LEAF: [u8; 32] = [0u8; 32];
-
-// This is the leaf value of a present nonce (non-empty leaf)
-pub const NON_EMPTY_LEAF_HASH: [u8; 32] = const_crypto::sha2::Sha256::new()
-    .update(&[1u8; 32])
-    .finalize();
 
 // Seeds and PDAs
 pub const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";

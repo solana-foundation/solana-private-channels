@@ -1,6 +1,6 @@
 # Withdrawing Tokens from Solana Private Channels
 
-This guide explains how to withdraw tokens from the Solana Private Channels payment channel back to Solana Mainnet using Sparse Merkle Tree (SMT) proofs.
+This guide explains how to withdraw tokens from the Solana Private Channels payment channel back to Solana Mainnet, and how the on-chain withdrawal bitmap stops a withdrawal from being released twice.
 
 Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-withdrawal-on-private_channel)
 
@@ -9,125 +9,114 @@ Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-w
 Withdrawals move tokens from the Solana Private Channels payment channel to Solana Mainnet through a three-step process:
 
 1. **Burn on Solana Private Channels**: User calls `WithdrawFunds` instruction to burn tokens on the Solana Private Channels payment channel
-2. **Backend Processing**: Indexer detects burn event, builds SMT proof, and submits to Mainnet
-3. **Release on Mainnet**: Operator calls `ReleaseFunds` instruction with cryptographic proof to unlock escrowed tokens
+2. **Backend Processing**: Indexer detects the burn event and submits the release to Mainnet
+3. **Release on Mainnet**: Operator calls `ReleaseFunds`, which consumes the withdrawal's nonce in the instance's bitmap and unlocks the escrowed tokens
 
 The [Indexer/Operator](../indexer/src/operator/) handles steps 2 and 3 automatically. This guide explains how the withdraw process works and how to manually initiate a withdrawal on Solana Private Channels.
 
-## Understanding the Sparse Merkle Tree (SMT)
+## Understanding the withdrawal bitmap
 
-Solana Private Channels uses a **Sparse Merkle Tree** to prevent double-spending of withdrawals. Each withdrawal is assigned a unique `transaction_nonce` that gets recorded in the tree. The mainnet escrow program validates each withdrawal's nonce and tree index to prevent double processing of the same withdrawal.
+Solana Private Channels prevents a withdrawal from being released twice with an
+on-chain **withdrawal bitmap**: one bit per withdrawal nonce. Each withdrawal is
+assigned a unique `transaction_nonce`, and releasing it sets that nonce's bit.
+The mainnet escrow program refuses any release whose bit is already set.
 
-### Tree Structure
-- **Height**: 16 levels
-- **Max Leaves**: 65,536 (2^16) transaction nonces per tree
-- **Leaf Value**:
-  - Empty leaf: `[0u8; 32]` (nonce not present)
-  - Non-empty leaf: `SHA256([1u8; 32])` (nonce present)
-- **Root Hash**: 32-byte commitment to all recorded nonces
+### Account layout
 
-```
-                        Root Hash (32 bytes)
-                       /                    \
-                 Hash(L, R)                Hash(L, R)
-                /         \                /         \
-          Hash(L, R)   Hash(L, R)   Hash(L, R)   Hash(L, R)
-          /      \      /      \      /      \      /      \
-        ...    ...    ...    ...    ...    ...    ...    ...
-       /  \   /  \   /  \   /  \   /  \   /  \   /  \   /  \
-   Leaf0  1  2   3  4   5  6   7  8   9  10 11 12 13 14 15 ...
-   (nonces recorded as leaf positions using their value modulo 65536)
-```
+The bitmap lives in its own PDA, one per instance, derived from
+`[b"withdrawal_bitmap", instance_pda]` and created alongside the instance:
 
-### Why SMT?
+| Offset | Field | Size |
+|---|---|---|
+| 0 | account discriminator | 1 byte |
+| 1 | PDA bump | 1 byte |
+| 2 | `generation` (u64, little-endian) | 8 bytes |
+| 10 | bits, one per nonce | 8,192 bytes |
 
-Traditional Merkle trees require storing all intermediate nodes. SMTs are "sparse" because:
-- Most leaves are empty (default `[0u8; 32]`)
-- Only compute/store paths for non-empty leaves
-- Efficient for tracking which nonces have been used (prevents replay attacks)
-- The Mainnet escrow program withdraw instruction verifies that the nonce is _not_ already in the current tree by providing an exclusion proof AND that the nonce is _in_ the new tree by providing an inclusion proof.
+8,192 bytes cover 65,536 nonces. A nonce's bit lives at byte
+`10 + (nonce % 65_536) / 8`, position `(nonce % 65_536) % 8`.
 
-### The Rotating Tree Index System
+### Why a bitmap
 
-Solana Private Channels uses a **rotating tree index** mechanism to handle unlimited withdrawals while keeping the SMT bounded and limited in size. This helps minimize account size, transaction size, and processing costs/compute.
+The bit is a direct, constant-cost answer to the only question that matters:
+has this nonce been released? There is no proof to construct off-chain, nothing
+to keep in sync, and no way for an operator's view to disagree with the chain's.
+Setting a bit costs one byte write; checking one costs one byte read.
 
-Each Solana Private Channels instance has its own tree with two important fields stored in the `Instance` state:
-- `withdrawal_transactions_root`: The root hash of the tree
-- `current_tree_index`: The index of the current tree
+### Generations
+
+To stay bounded, the bitmap covers a **generation** of nonces at a time and is
+rotated when that window fills. `generation` is stored in the account:
 
 ```rust
-pub struct Instance {
-    pub withdrawal_transactions_root: [u8; 32],
-    pub current_tree_index: u64,
-    // ... other fields
-}
+let nonce_generation = transaction_nonce / NONCES_PER_GENERATION; // 65_536
 ```
 
-The `current_tree_index` determines which "generation" of the tree a nonce belongs to:
-
-```rust
-let expected_tree_index = transaction_nonce.checked_div(MAX_TREE_LEAVES as u64)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-```
-
-The `expected_tree_index` is validated against the instance's `current_tree_index` to prevent double processing of the same withdrawal.
-
-The `leaf_position` determines the position of the leaf in the tree:
-
-```rust
-let leaf_position = transaction_nonce as usize % MAX_TREE_LEAVES;
-```
+A release is accepted only when `nonce_generation` equals the bitmap's stored
+`generation`; otherwise the program returns `NonceOutsideCurrentGeneration`.
 
 **Examples:**
-| Transaction Nonce | Tree Index | Position in Tree |
-|------------------|------------|------------------|
-| 0 | 0 | Leaf 0 |
-| 1 | 0 | Leaf 1 |
-| 65,535 | 0 | Leaf 65,535 |
-| 65,536 | 1 | Leaf 0 (new tree) |
-| 65,537 | 1 | Leaf 1 (new tree) |
-| 131,071 | 1 | Leaf 65,535 (new tree) |
-| 131,072 | 2 | Leaf 0 (new tree) |
 
-### Tree Lifecycle
+| Transaction nonce | Generation | Bit position in window |
+|---|---|---|
+| 0 | 0 | 0 |
+| 1 | 0 | 1 |
+| 65,535 | 0 | 65,535 |
+| 65,536 | 1 | 0 |
+| 65,537 | 1 | 1 |
+| 131,071 | 1 | 65,535 |
+| 131,072 | 2 | 0 |
 
-**Initial State:**
+### Rotation
+
+The operator sends `RotateBitmap`, which clears every bit and advances
+`generation` by one:
+
 ```rust
-Instance {
-    withdrawal_transactions_root: EMPTY_TREE_ROOT, // All zeros
-    current_tree_index: 0,
+// Operator-only instruction (dispatched automatically, see below)
+RotateBitmap {
+    expected_generation: 0, // must equal the stored generation
 }
 ```
 
-**After 65,536 Withdrawals (Tree Full):**
+Rotation is driven by state, not by any particular withdrawal. On a timer the
+sender compares the bitmap's generation against the lowest withdrawal nonce that
+still owes a release. When that nonce belongs to a later generation, the current
+window is finished with and a rotation is armed. The same comparison also
+withholds the rotation while a lower nonce is still unresolved, since rotating
+past it would close the only window its release could ever land in.
 
-The operator calls `ResetSmtRoot` to rotate to the next tree:
+`expected_generation` makes rotation non-idempotent: a replayed rotation is
+rejected with `UnexpectedGeneration` rather than skipping a whole generation of
+nonces.
 
-```rust
-// Operator-only instruction (automatically handled)
-ResetSmtRoot {
-    withdrawal_transactions_root: EMPTY_TREE_ROOT, // Reset to empty
-    current_tree_index: 1,                         // Increment to next generation
-}
+**Key properties:**
+- **No replay across generations**: a nonce from generation 0 is rejected once
+  the bitmap is on generation 1, even though its bit was cleared.
+- **Unbounded withdrawals**: rotate indefinitely (generation 0, 1, 2, ...).
+- **Constant verification cost**: one bit read and one bit write per release,
+  independent of how many nonces have already been consumed.
+
+### Visual example
+
+```
+Generation 0 (nonces 0-65,535)              Generation 1 (nonces 65,536-131,071)
++----------------------------+             +----------------------------+
+| generation: 0              |             | generation: 1              |
+| Nonces used: 65,536/65,536 |   Rotate    | Nonces used: 0/65,536      |
+| Status: FULL               |   ------>   | Status: ACTIVE             |
++----------------------------+             +----------------------------+
+      (window exhausted)                          (all bits cleared)
 ```
 
-**Key Properties:**
-- **No replay attacks**: Old nonces (tree_index 0) cannot be used in new tree (tree_index 1)
-- **Unbounded withdrawals**: Rotate trees indefinitely (tree_index 0→1→2→...→2^64)
-- **Constant verification cost**: Always verify against 16-level tree (O(log n) complexity)
+### Rejections you may see
 
-### Visual Example
-
-```
-Tree Index 0 (nonces 0-65,535)              Tree Index 1 (nonces 65,536-131,071)
-┌────────────────────────────┐             ┌────────────────────────────┐
-│ Root: 0x8fe6...            │             │  Root: 0x8fe6... (reset)   │
-│ Nonces Used: 65,536/65,536 │   Rotate    │  Nonces Used: 0/65,536     │
-│ Status: FULL               │   ──────>   │  Status: ACTIVE            │
-└────────────────────────────┘             └────────────────────────────┘
-         (Tree exhausted)                          (Fresh tree)
-```
-
+| Error | Meaning |
+|---|---|
+| `NonceAlreadyUsed` | The bit is already set: this nonce was released. |
+| `NonceOutsideCurrentGeneration` | The nonce belongs to a different generation than the bitmap covers. |
+| `UnexpectedGeneration` | A rotation was submitted against a stale generation. |
+| `InvalidWithdrawalBitmap` | The passed account is not this instance's bitmap. |
 
 ## Initiate a Withdrawal on Solana Private Channels
 

@@ -206,6 +206,16 @@ impl RpcClientWithRetry {
         .await
     }
 
+    /// Get the current slot with retry. The refund gate uses it as the last slot
+    /// a release could have landed in, which is what the indexer's checkpoint
+    /// then has to cover before an absent release record counts as evidence.
+    pub async fn get_slot(&self) -> Result<u64, Box<client_error::Error>> {
+        self.with_retry("get_slot", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_slot().await
+        })
+        .await
+    }
+
     /// Read the latest blockhash at `commitment` together with the response
     /// context slot, returning `(context_slot, last_valid_block_height)`. One RPC
     /// call so the slot and height come from the same backend and are mutually
@@ -228,6 +238,16 @@ impl RpcClientWithRetry {
                     .map(|resp| (resp.context.slot, resp.value.last_valid_block_height))
             },
         )
+        .await
+    }
+
+    /// Get the estimated production time of `slot` with retry. The resync
+    /// pre-flight compares it against wall clock to prove the node it is about
+    /// to read the bitmap from is at the live tip and not replaying a snapshot.
+    pub async fn get_block_time(&self, slot: u64) -> Result<i64, Box<client_error::Error>> {
+        self.with_retry("get_block_time", RetryPolicy::Idempotent, || async {
+            self.rpc_client.get_block_time(slot).await
+        })
         .await
     }
 

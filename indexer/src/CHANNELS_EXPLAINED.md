@@ -26,7 +26,7 @@
 **Decision**: ✅ **MPSC** (Multiple producers, Single consumer)
 **Implementation**: `tokio::sync::mpsc`
 
-**Why**: Multiple fetchers, single processor. MPMC impossible due to tree rotation coordination at nonce boundaries - multiple processors would race to send ResetSmtRoot transactions.
+**Why**: Multiple fetchers, single processor. MPMC impossible due to rotation coordination at nonce boundaries - multiple processors would race to send RotateBitmap transactions.
 
 ---
 
@@ -34,7 +34,7 @@
 **Decision**: ✅ **SPSC** (Single producer, Single consumer)
 **Implementation**: `tokio::sync::mpsc` (used as SPSC)
 
-**Why**: Single processor → single sender. Perfect 1:1 topology. Sender must be single-threaded for SMT updates.
+**Why**: Single processor to single sender. Perfect 1:1 topology. Sender is single-threaded so a rotation never overtakes an in-flight release.
 
 ---
 

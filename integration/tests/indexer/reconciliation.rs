@@ -9,6 +9,8 @@
 //! 2. DB has a phantom deposit (mint registered, tokens never on-chain) → blocks startup.
 //! 3. Same phantom deposit but threshold covers the gap → passes with warning.
 //! 4. Real tokens minted to escrow ATA, DB matches → passes with strict threshold.
+//! 5. Extra tokens minted to escrow ATA with no DB row (attacker surplus) → passes
+//!    with strict threshold, since a surplus is benign and never blocks startup.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -334,6 +336,102 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
     assert!(
         result.is_ok(),
         "DB matching real on-chain balance must pass: {:?}",
+        result
+    );
+    Ok(())
+}
+
+/// An attacker inflates the escrow ATA by minting extra tokens into it without any
+/// matching DB row, producing a pure surplus (custody above liabilities). This must
+/// not block startup, otherwise anyone could cheaply DoS the boot by sending tokens.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconciliation_attacker_surplus_does_not_block(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (test_validator, faucet_keypair, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        test_validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    // Fund an authority keypair that pays for transactions and signs minting.
+    let authority = Keypair::new();
+    setup_wallets(client.as_ref(), &faucet_keypair, &[&authority]).await?;
+
+    // Create an SPL mint with `authority` as the mint authority.
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
+
+    // Derive the escrow instance PDA and mint the balanced amount to its ATA.
+    let seed_keypair = Keypair::new();
+    let pda = instance_pda(&seed_keypair.pubkey());
+
+    const AMOUNT: u64 = 1_000_000;
+    const ATTACKER_EXTRA: u64 = 500_000;
+    mint_to_owner(
+        client.as_ref(),
+        &authority,
+        mint_pubkey,
+        pda,
+        &authority,
+        AMOUNT,
+    )
+    .await?;
+    seed_mint_and_deposit(&pool, &mint_pubkey.to_string(), AMOUNT as i64).await?;
+
+    // Attacker mints extra tokens into the same escrow ATA, leaving the DB untouched.
+    mint_to_owner(
+        client.as_ref(),
+        &authority,
+        mint_pubkey,
+        pda,
+        &authority,
+        ATTACKER_EXTRA,
+    )
+    .await?;
+
+    // run_startup_reconciliation queries at `finalized`; wait for the inflated
+    // balance to be visible at that commitment before proceeding.
+    {
+        let finalized_client =
+            RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::finalized());
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &pda,
+            &mint_pubkey,
+            &spl_token::id(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let balance = finalized_client.get_token_account_balance(&ata).await;
+            if let Ok(b) = balance {
+                if b.amount.parse::<u64>().unwrap_or(0) == AMOUNT + ATTACKER_EXTRA {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Timed out waiting for finalized ATA balance"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    let result = run_startup_reconciliation(
+        &ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        },
+        ProgramType::Escrow,
+        &storage,
+        &test_validator.rpc_url(),
+        // Single-validator harness: channel-supply invariant reads the same node.
+        Some(&test_validator.rpc_url()),
+        &pda,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "attacker-induced surplus must not block startup: {:?}",
         result
     );
     Ok(())

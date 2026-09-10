@@ -38,6 +38,9 @@ mod test_simulate_transaction_preflight;
 // admin-vm malformed InitializeMint coverage.
 mod test_admin_vm_initialize_mint_malformed;
 
+// admin-vm InitializeMint persistence + account_keys mirror coverage.
+mod test_admin_vm_initialize_mint_persists;
+
 // parallel-SVM SnapshotCallback coverage.
 mod test_parallel_svm_burst;
 
@@ -77,4 +80,5 @@ pub use test_simulate_transaction_account_writes::run_simulate_transaction_accou
 pub use test_simulate_transaction_preflight::run_simulate_transaction_preflight_test;
 
 pub use test_admin_vm_initialize_mint_malformed::run_admin_vm_initialize_mint_malformed_test;
+pub use test_admin_vm_initialize_mint_persists::run_admin_vm_initialize_mint_persists_test;
 pub use test_parallel_svm_burst::run_parallel_svm_burst_test;

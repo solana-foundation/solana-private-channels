@@ -90,6 +90,21 @@ pub async fn count_transactions(pool: &PgPool) -> Result<i64, sqlx::Error> {
     count_transactions_with_filter(pool, None, None).await
 }
 
+/// The nonce the next withdrawal row will be given.
+///
+/// Read from the highest nonce already stored rather than from a row count: the
+/// insert trigger draws every nonce from a sequence, so a gap left by a rolled
+/// back insert would make a count under-report where the sequence actually is.
+pub async fn next_withdrawal_nonce(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(withdrawal_nonce) + 1, 0) FROM transactions \
+         WHERE transaction_type = 'withdrawal'::transaction_type",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 as u64)
+}
+
 async fn wait_for_count_with_filter(
     pool: &PgPool,
     expected: i64,
