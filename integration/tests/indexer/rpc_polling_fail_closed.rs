@@ -209,9 +209,9 @@ fn drain(rx: &mut mpsc::Receiver<ProcessorMessage>) -> Vec<ProcessorMessage> {
 }
 
 fn completed_slot_100(messages: &[ProcessorMessage]) -> bool {
-    messages
-        .iter()
-        .any(|message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100))
+    messages.iter().any(
+        |message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot == 100),
+    )
 }
 
 fn emitted_instruction(messages: &[ProcessorMessage]) -> bool {
