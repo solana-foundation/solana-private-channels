@@ -1,5 +1,7 @@
 use crate::config::{ProgramType, ReconciliationConfig};
-use crate::error::{CheckpointError, DataSourceError, IndexerError, ReconciliationError};
+use crate::error::{
+    CheckpointError, DataSourceError, IndexerError, ReconciliationError, StorageError,
+};
 use crate::{
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
@@ -60,16 +62,24 @@ enum Supervision {
     /// stop, a fatal write-exhaustion error, or a panic.
     ProcessorEnded(Result<Result<(), IndexerError>, tokio::task::JoinError>),
     /// A shutdown signal arrived while the processor was still running.
-    ShutdownSignalled(std::io::Result<()>),
+    ShutdownSignalled(std::io::Result<ShutdownReason>),
+}
+
+/// Why this indexer is stopping. The two are handled differently: an interrupt earns
+/// the usual drain, a lost lock does not, because a resync may already be dropping the
+/// tables the drain would write to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownReason {
+    Interrupted,
+    LiveLockLost,
 }
 
 /// The reasons this indexer stops on its own: an operator interrupt, or losing the
-/// live-state lock. Both take the same graceful path, since both mean this process
-/// must stop writing and let a restart sort it out.
-async fn shutdown_signal(lock_lost: CancellationToken) -> std::io::Result<()> {
+/// live-state lock.
+async fn shutdown_signal(lock_lost: CancellationToken) -> std::io::Result<ShutdownReason> {
     tokio::select! {
-        result = signal::ctrl_c() => result,
-        _ = lock_lost.cancelled() => Ok(()),
+        result = signal::ctrl_c() => result.map(|_| ShutdownReason::Interrupted),
+        _ = lock_lost.cancelled() => Ok(ShutdownReason::LiveLockLost),
     }
 }
 
@@ -79,7 +89,7 @@ async fn shutdown_signal(lock_lost: CancellationToken) -> std::io::Result<()> {
 /// clean shutdown.
 async fn supervise(
     processor_handle: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
-    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: impl std::future::Future<Output = std::io::Result<ShutdownReason>>,
 ) -> Supervision {
     tokio::select! {
         biased;
@@ -410,11 +420,15 @@ pub async fn run(
     // database holds it exclusively, and starting underneath one would write rows into
     // tables it is about to drop. Held for the whole run, so a resync cannot start
     // either. Refusing here is the point: the supervisor retries once the resync exits.
+    // The lock gets a token of its own so a lost lock stays distinguishable from an
+    // interrupt at the shutdown site. The two earn different treatment: only one of them
+    // means a resync may already be dropping the tables underneath us.
+    let live_lock_lost = CancellationToken::new();
     let _live_lock = storage
         .try_acquire_live_lock(
             LiveLockMode::Shared,
             INDEXER_LOCK_ROLE,
-            cancellation_token.clone(),
+            live_lock_lost.clone(),
             LIVE_LOCK_HEARTBEAT_INTERVAL,
         )
         .await
@@ -873,12 +887,7 @@ pub async fn run(
     // and by the datasource), so the processor side only fires on a fatal write
     // failure or a panic - both must crash the process so the supervisor
     // restarts it and the failed slot replays from the durable checkpoint.
-    match supervise(
-        &mut processor_handle,
-        shutdown_signal(cancellation_token.clone()),
-    )
-    .await
-    {
+    match supervise(&mut processor_handle, shutdown_signal(live_lock_lost)).await {
         Supervision::ProcessorEnded(res) => {
             // Flush batched checkpoints for already-committed slots so a restart resumes
             // from the latest durable point; timeout-bounded since a dead DB would stall it.
@@ -903,7 +912,21 @@ pub async fn run(
             }
         }
         Supervision::ShutdownSignalled(signal_res) => {
-            signal_res.map_err(|_| IndexerError::ShutdownChannelSend)?;
+            let reason = signal_res.map_err(|_| IndexerError::ShutdownChannelSend)?;
+
+            // A lost lock is not a graceful stop. Postgres frees the lock the instant our
+            // session dies, so a resync may already be dropping these tables; draining
+            // would keep writing into them and flush a checkpoint over the rebuild. Stop
+            // the writers outright instead, which costs no more than an abrupt kill: the
+            // durable checkpoint stands and a restart replays from it.
+            if reason == ShutdownReason::LiveLockLost {
+                error!("Live-state lock lost; stopping without draining");
+                cancellation_token.cancel();
+                processor_handle.abort();
+                checkpoint_handle.abort();
+                return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
+            }
+
             info!("Shutdown signal received, initiating graceful shutdown...");
 
             // 10. Graceful shutdown
@@ -1002,7 +1025,11 @@ mod tests {
         // Let the task run to completion so its future is ready when raced.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let outcome = supervise(&mut handle, std::future::ready(Ok(()))).await;
+        let outcome = supervise(
+            &mut handle,
+            std::future::ready(Ok(ShutdownReason::Interrupted)),
+        )
+        .await;
 
         match outcome {
             Supervision::ProcessorEnded(Ok(Err(IndexerError::CheckpointChannelClosed))) => {}
@@ -1010,11 +1037,11 @@ mod tests {
         }
     }
 
-    /// U4. Losing the live-state lock has to reach the same graceful shutdown a
-    /// ctrl-c takes, or the indexer would keep writing to a database it no longer
-    /// has the right to write to.
+    /// U4. Losing the live-state lock has to stop the indexer, and it has to be
+    /// distinguishable from a ctrl-c. A lost lock means a resync may already be
+    /// dropping these tables, so the drain a ctrl-c earns would race that drop.
     #[tokio::test]
-    async fn shutdown_signal_resolves_when_the_lock_token_is_cancelled() {
+    async fn shutdown_signal_reports_a_lost_lock_as_its_own_reason() {
         let token = CancellationToken::new();
         let mut handle = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -1025,8 +1052,11 @@ mod tests {
         let outcome = supervise(&mut handle, shutdown_signal(token)).await;
 
         assert!(
-            matches!(outcome, Supervision::ShutdownSignalled(Ok(()))),
-            "a cancelled lock token must drive the graceful shutdown path"
+            matches!(
+                outcome,
+                Supervision::ShutdownSignalled(Ok(ShutdownReason::LiveLockLost))
+            ),
+            "a cancelled lock token must report itself as a lost lock, not as an interrupt"
         );
         handle.abort();
     }
@@ -1056,9 +1086,16 @@ mod tests {
             Ok(())
         });
 
-        let outcome = supervise(&mut handle, std::future::ready(Ok(()))).await;
+        let outcome = supervise(
+            &mut handle,
+            std::future::ready(Ok(ShutdownReason::Interrupted)),
+        )
+        .await;
 
-        assert!(matches!(outcome, Supervision::ShutdownSignalled(Ok(()))));
+        assert!(matches!(
+            outcome,
+            Supervision::ShutdownSignalled(Ok(ShutdownReason::Interrupted))
+        ));
         handle.abort();
     }
 
@@ -1070,7 +1107,11 @@ mod tests {
             tokio::spawn(async { panic!("processor boom") });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let outcome = supervise(&mut handle, std::future::pending::<std::io::Result<()>>()).await;
+        let outcome = supervise(
+            &mut handle,
+            std::future::pending::<std::io::Result<ShutdownReason>>(),
+        )
+        .await;
 
         assert!(matches!(outcome, Supervision::ProcessorEnded(Err(_))));
     }

@@ -85,6 +85,14 @@ impl Storage {
         drop_tables::drop_tables(self).await
     }
 
+    /// Drop every table on the live-state lock's own session, so it cannot outlive the lock.
+    pub async fn drop_tables_fenced(
+        &self,
+        lock: &live_lock::LiveLockGuard,
+    ) -> Result<(), StorageError> {
+        drop_tables::drop_tables_fenced(self, lock).await
+    }
+
     /// Insert a new transaction
     pub async fn insert_db_transaction(
         &self,

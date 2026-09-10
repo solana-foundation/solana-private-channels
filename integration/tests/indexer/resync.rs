@@ -1758,5 +1758,20 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
         ),
         "a lock lost mid-rebuild must abort the rebuild, got: {result:?}"
     );
+
+    // The frontier is what makes a half-rebuilt database look complete, so it is the one
+    // thing that must never survive a lost lock. Every phase of the rebuild is watched
+    // for exactly this reason, including the flush that runs after the fill returns.
+    let pool = fresh_pool(&db_url).await;
+    let committed: Option<i64> =
+        sqlx::query_scalar("SELECT last_committed_slot FROM indexer_state LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+    assert!(
+        committed.is_none_or(|slot| slot <= genesis_slot as i64),
+        "a lost lock must not leave a durable frontier over a half-rebuilt database, got {committed:?}"
+    );
     Ok(())
 }

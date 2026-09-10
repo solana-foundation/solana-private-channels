@@ -32,6 +32,11 @@ pub(crate) async fn run_lock_heartbeat<P, Fut, L>(
     L: FnMut(&str, &str),
 {
     let mut confirmed_at = tokio::time::Instant::now();
+    // Set only by an unanswered probe, and the only state in which the waits below are
+    // clamped. Clamping unconditionally would spin: a zero budget leaves nothing
+    // remaining even on a healthy loop, and a busy connection continues without
+    // refreshing `confirmed_at`, so either would drive the sleep to zero.
+    let mut unanswered = false;
 
     loop {
         if interval.is_zero() {
@@ -39,24 +44,43 @@ pub(crate) async fn run_lock_heartbeat<P, Fut, L>(
             return;
         }
 
+        // Never wait past the budget, so the deadline it names is an upper bound rather
+        // than an approximation of one. Clamped twice because the sleep spends budget
+        // too, so the probe's share is only known once the sleep has happened.
+        let clamped = unanswered && !budget.is_zero();
+        let remaining = || budget.saturating_sub(confirmed_at.elapsed());
+        let wait = if clamped {
+            interval.min(remaining())
+        } else {
+            interval
+        };
+
         // Not raced against the stop token: dropping a query mid-flight ruins the connection.
         tokio::select! {
             biased;
             _ = stop.cancelled() => return,
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
 
         const UNANSWERED: &str = "probe did not answer within the timeout";
 
-        match tokio::time::timeout(PROBE_TIMEOUT, probe()).await {
+        let probe_cap = if clamped {
+            PROBE_TIMEOUT.min(remaining())
+        } else {
+            PROBE_TIMEOUT
+        };
+
+        match tokio::time::timeout(probe_cap, probe()).await {
             Ok(Ok(ProbeOutcome::Held)) => {
                 confirmed_at = tokio::time::Instant::now();
+                unanswered = false;
                 continue;
             }
             // A synchronous check holds the connection, which proves the session is
             // alive on its own, so the last real confirmation still stands.
             Ok(Ok(ProbeOutcome::Busy)) => {
                 debug!("Lock probe skipped; connection in use");
+                unanswered = false;
                 continue;
             }
             // A fenced write already reported and cancelled, so do not count it twice.
@@ -73,7 +97,7 @@ pub(crate) async fn run_lock_heartbeat<P, Fut, L>(
                 return;
             }
             // Unanswered. Falls through to the budget below.
-            Err(_) => {}
+            Err(_) => unanswered = true,
         }
 
         // A timeout says the server is slow, not that the lock is gone. Retry while the
@@ -663,6 +687,92 @@ mod tests {
             started.elapsed() >= BUDGET,
             "the role must not stop before the budget has passed, stopped after {:?}",
             started.elapsed()
+        );
+        // The runbook quotes the budget as a deadline, so it has to be an upper bound
+        // too. Waiting a whole interval and then a whole probe timeout before testing
+        // it would overshoot by both.
+        assert!(
+            started.elapsed() <= BUDGET,
+            "the budget must be an upper bound, stopped after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The budget cap must never apply to a zero budget. That is what the sender lock
+    /// passes, and there the remaining budget is always zero, so a cap would drive the
+    /// sleep to zero and spin the loop against Postgres instead of pacing it.
+    #[tokio::test]
+    async fn zero_budget_paces_a_healthy_probe_at_the_interval() {
+        const INTERVAL: Duration = Duration::from_millis(20);
+        const WINDOW: Duration = Duration::from_millis(300);
+
+        let stop = CancellationToken::new();
+        let probes = Arc::new(AtomicU32::new(0));
+        let counted = probes.clone();
+
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WINDOW).await;
+            stopper.cancel();
+        });
+
+        run_lock_heartbeat(
+            INTERVAL,
+            Duration::ZERO,
+            stop,
+            |_, _| panic!("a healthy probe must never report a loss"),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(ProbeOutcome::Held))
+            },
+        )
+        .await;
+
+        // Interval pacing puts this near 15. A spin puts it in the thousands, so the
+        // bound is loose on purpose and still catches the failure by orders of magnitude.
+        let count = probes.load(Ordering::SeqCst);
+        assert!(
+            count <= 60,
+            "a zero budget must stay interval-paced, probed {count} times in {WINDOW:?}"
+        );
+    }
+
+    /// A busy connection continues without refreshing the last confirmation, so once it
+    /// has been busy longer than the budget the remaining budget is zero. Capping the
+    /// wait on that outcome would spin. Reachable in production: the fenced drop holds
+    /// the lock session for its whole duration.
+    #[tokio::test]
+    async fn a_busy_connection_past_the_budget_does_not_spin() {
+        const INTERVAL: Duration = Duration::from_millis(20);
+        const BUDGET: Duration = Duration::from_millis(40);
+        const WINDOW: Duration = Duration::from_millis(300);
+
+        let stop = CancellationToken::new();
+        let probes = Arc::new(AtomicU32::new(0));
+        let counted = probes.clone();
+
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WINDOW).await;
+            stopper.cancel();
+        });
+
+        run_lock_heartbeat(
+            INTERVAL,
+            BUDGET,
+            stop,
+            |_, _| panic!("a busy connection must never report a loss"),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(ProbeOutcome::Busy))
+            },
+        )
+        .await;
+
+        let count = probes.load(Ordering::SeqCst);
+        assert!(
+            count <= 60,
+            "a busy connection must stay interval-paced, probed {count} times in {WINDOW:?}"
         );
     }
 

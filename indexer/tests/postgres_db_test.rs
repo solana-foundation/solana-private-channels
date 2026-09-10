@@ -2940,3 +2940,75 @@ async fn merged_schema_drops_owed_rotation_target_and_is_idempotent(
 
     Ok(())
 }
+
+// ── Fenced drop ───────────────────────────────────────────────────────────────
+//
+// The drop has to run on the session that holds the lock. Issued through the pool
+// it can outlive the lock: Postgres frees a session lock the moment its backend
+// dies, so a worker can start while the drop is still running.
+
+/// Does `transactions` still exist? Stands in for the whole schema, since the drop
+/// is all-or-nothing.
+async fn transactions_table_exists(pool: &PgPool) -> bool {
+    sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass('transactions')::text")
+        .fetch_one(pool)
+        .await
+        .expect("regclass lookup")
+        .is_some()
+}
+
+/// I12. The fenced drop must still do its job while the lock is genuinely held.
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_drop_removes_the_tables_while_the_lock_is_held(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage.init_schema().await?;
+    assert!(
+        transactions_table_exists(&pool).await,
+        "the schema must exist before the drop"
+    );
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "i12_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    storage.drop_tables_fenced(&guard).await?;
+
+    assert!(
+        !transactions_table_exists(&pool).await,
+        "a fenced drop under a held lock must remove the schema"
+    );
+    Ok(())
+}
+
+/// I13. Once the lock session is gone the lock is free, so a resync must not be able
+/// to keep dropping: any worker may now be starting.
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_drop_refuses_once_the_lock_session_is_gone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "i13_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    assert!(
+        storage.drop_tables_fenced(&guard).await.is_err(),
+        "a drop must not run on a session that no longer holds the lock"
+    );
+    assert!(
+        transactions_table_exists(&pool).await,
+        "the refused drop must leave the schema standing"
+    );
+    Ok(())
+}

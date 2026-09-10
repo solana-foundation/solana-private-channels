@@ -13,6 +13,7 @@ use crate::{
     storage::postgres::db::probe_advisory_lock_held,
     storage::postgres::lock_connection::{ProbeOutcome, PROBE_TIMEOUT},
 };
+use futures::future::BoxFuture;
 use sqlx::{Connection, PgConnection};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -197,6 +198,22 @@ impl LiveLockGuard {
             Self::Noop => {}
         }
     }
+
+    /// Run `f` on the session that holds the lock.
+    ///
+    /// The point is that the two cannot be separated: the lock lives exactly as long as
+    /// this session, so work issued here can never outlive it. A probe answers only for
+    /// the instant it ran, which is not enough for anything destructive.
+    pub(crate) async fn run_fenced<T, F>(&self, f: F) -> Result<T, StorageError>
+    where
+        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
+    {
+        match self {
+            Self::Postgres(handle) => handle.run_fenced(f).await,
+            #[cfg(any(test, feature = "test-mock-storage"))]
+            Self::Noop => Err(StorageError::LiveStateLockLost),
+        }
+    }
 }
 
 impl LiveLockHandle {
@@ -214,6 +231,22 @@ impl LiveLockHandle {
             Ok(Ok(true)) => Ok(()),
             _ => Err(StorageError::LiveStateLockLost),
         }
+    }
+
+    async fn run_fenced<T, F>(&self, f: F) -> Result<T, StorageError>
+    where
+        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
+    {
+        let mut guard = self.session.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return Err(StorageError::LiveStateLockLost);
+        };
+        // Any failure here is a lost lock as far as the caller is concerned. The session
+        // is the lock, so a statement it could not run is one we could not fence.
+        f(conn).await.map_err(|e| {
+            error!("Fenced work on the live-state lock session failed: {e}");
+            StorageError::LiveStateLockLost
+        })
     }
 }
 

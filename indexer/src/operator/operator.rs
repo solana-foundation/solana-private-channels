@@ -1,5 +1,5 @@
 use crate::config::OperatorConfig;
-use crate::error::OperatorError;
+use crate::error::{OperatorError, StorageError};
 use crate::metrics;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
@@ -43,11 +43,17 @@ pub async fn run(
     // mint and release against tables it is about to drop. Held for the whole run, so a
     // resync cannot start either. Refusing here is the point: orchestration retries
     // once the resync exits.
+    //
+    // It gets a token of its own rather than the operator's. The sender lock cancels
+    // that one on its own loss, and that path is already correct: it keeps its session
+    // open through the drain so no replacement can start. Only a lost live-state lock
+    // needs the abrupt stop below, so the two reasons have to stay tellable apart.
+    let live_lock_lost = CancellationToken::new();
     let _live_lock = storage
         .try_acquire_live_lock(
             LiveLockMode::Shared,
             OPERATOR_LOCK_ROLE,
-            cancellation_token.clone(),
+            live_lock_lost.clone(),
             LIVE_LOCK_HEARTBEAT_INTERVAL,
         )
         .await
@@ -383,6 +389,22 @@ pub async fn run(
         result = tokio::signal::ctrl_c() => {
             result.map_err(|_| OperatorError::ShutdownChannelSend)?;
             info!("Shutdown signal received, initiating graceful shutdown...");
+        }
+        // A lost live-state lock skips the graceful path entirely. Postgres frees the
+        // lock the instant our session dies, so a resync may already be dropping these
+        // tables; draining would broadcast and write into them. Stopping outright costs
+        // no more than an abrupt kill, which the recovery worker already handles.
+        _ = live_lock_lost.cancelled() => {
+            error!("Live-state lock lost; stopping without draining");
+            cancellation_token.cancel();
+            fetcher_handle.abort();
+            processor_handle.abort();
+            sender_handle.abort();
+            storage_writer_handle.abort();
+            recovery_handle.abort();
+            reconciliation_handle.abort();
+            feepayer_monitor_handle.abort();
+            return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
         }
         _ = &mut fetcher_handle => {
             critical_exit(pt_label, "fetcher");

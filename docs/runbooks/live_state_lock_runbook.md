@@ -84,7 +84,13 @@ lock is gone, or the session itself is dead, and both are proof. `probe_timeout`
 different, and only fires after ownership has gone unconfirmed for 30s, so it means the
 database was unreachable or too slow to answer for that whole window rather than a
 single slow query. Expect a lost-lock alert to trail the underlying event by up to that
-long.
+long, and no longer: the 30s is an upper bound, not an approximation.
+
+A role that loses the lock stops without draining and exits non-zero, so its supervisor
+restarts it. That is deliberate. Postgres frees the lock the moment the session dies, so
+a resync may already be dropping these tables, and a drain would keep writing into them.
+Nothing is lost that an abrupt restart would not also lose: the durable checkpoint stands
+and the role replays from it once the resync has finished and the lock is free again.
 
 Resync stops on the same verdict but cannot page here: it is a one-shot command with
 no metrics server, so a losing resync surfaces as a failed command with the error in

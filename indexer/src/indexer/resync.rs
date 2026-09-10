@@ -334,19 +334,24 @@ impl ResyncService {
         let consumed = self.build_consumed_set().await?;
 
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
-        // The heartbeat bounds a silently lost lock to one interval, which is fine for a
-        // worker that only has to stop. The drop is irreversible, so prove ownership
-        // synchronously here instead of trusting the last tick.
+        // Not a safety check: the drop below runs on the lock's own session and so cannot
+        // outlive the lock whatever this says. Asking first turns a lock already lost into
+        // a clean refusal rather than an error from halfway through the drop.
         live_lock.ensure_held().await.inspect_err(|e| {
             error!("Refusing to drop tables: {}", e);
         })?;
 
-        // Step 1: Drop existing tables
+        // Step 1: Drop existing tables, on the session holding the lock. Through the pool
+        // the drop would keep running after the lock session died and the lock was freed,
+        // which is exactly when a worker is free to start.
         info!("Dropping existing database tables...");
-        self.storage.drop_tables().await.map_err(|e| {
-            error!("Failed to drop database tables during resync: {}", e);
-            e
-        })?;
+        self.storage
+            .drop_tables_fenced(&live_lock)
+            .await
+            .map_err(|e| {
+                error!("Failed to drop database tables during resync: {}", e);
+                e
+            })?;
         info!("Database tables dropped successfully");
 
         // Step 2: Recreate schema
@@ -409,65 +414,81 @@ impl ResyncService {
             genesis_slot, current_slot, total_slots
         );
 
-        // Losing the lock mid-rebuild means a worker can now start against a database
-        // that is only half rebuilt, so stop filling rather than race it. The rebuild is
-        // repeatable, and the next run starts from a lock it actually holds.
-        tokio::select! {
-            biased;
-            _ = lock_lost.cancelled() => {
-                error!("Live-state lock lost during the rebuild; aborting the backfill");
-                // Both writers are stopped outright rather than drained. Closing the
-                // checkpoint channel is the writer's cue to flush what it has, which
-                // would commit a durable frontier over a database this run only half
-                // rebuilt and leave no gap for a later run to detect.
-                processor_handle.abort();
-                checkpoint_handle.abort();
-                return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
-            }
-            result = backfill_service.run(instruction_tx.clone()) => {
-                result.map_err(|e| {
+        // Kept so the loss branch below can stop both writers after their join handles
+        // have moved into the rebuild future.
+        let processor_abort = processor_handle.abort_handle();
+        let checkpoint_abort = checkpoint_handle.abort_handle();
+        let storage = self.storage.clone();
+
+        // Everything that writes to the rebuilt database, as one future. The whole of it
+        // is watched below, not just the fill: the checkpoint flush at the end is the most
+        // dangerous write here, since a durable frontier over a half-rebuilt database
+        // leaves no gap for a later run to detect.
+        let rebuild = async move {
+            backfill_service
+                .run(instruction_tx.clone())
+                .await
+                .map_err(|e| {
                     error!(
                         "Backfill service failed during resync from slot {} to {}: {}",
                         genesis_slot, current_slot, e
                     );
                     e
                 })?;
+            info!("Backfill service completed");
+
+            // Drop instruction_tx to signal no more instructions coming
+            drop(instruction_tx);
+
+            // Wait for processor to finish processing all instructions
+            match processor_handle.await {
+                Ok(Ok(())) => info!("Transaction processor completed successfully"),
+                Ok(Err(e)) => {
+                    error!("Transaction processor failed during resync: {}", e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    error!("Transaction processor task panicked during resync: {:?}", e);
+                    return Err(IndexerError::ShutdownChannelSend);
+                }
             }
-        }
-        info!("Backfill service completed");
 
-        // Drop instruction_tx to signal no more instructions coming
-        drop(instruction_tx);
-
-        // Wait for processor to finish processing all instructions
-        match processor_handle.await {
-            Ok(Ok(())) => info!("Transaction processor completed successfully"),
-            Ok(Err(e)) => {
-                error!("Transaction processor failed during resync: {}", e);
+            // Perform cleanup after backfill, with no completeness target to check. A rebuild
+            // resolves its range inside the backfill service and never surfaces the top slot,
+            // so there is nothing to compare against here. Leaving it unchecked is acceptable
+            // because a stale checkpoint after a rebuild heals itself: the next live start
+            // detects the gap below the tip and fills it.
+            if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
+                checkpoint_handle,
+                checkpoint_tx,
+                storage,
+                None,
+            )
+            .await
+            {
+                error!("Cleanup after resync backfill failed: {}", e);
+                // Returned as-is so the operator sees which stage failed, not a generic one.
                 return Err(e);
             }
-            Err(e) => {
-                error!("Transaction processor task panicked during resync: {:?}", e);
-                return Err(IndexerError::ShutdownChannelSend);
-            }
-        }
+            Ok(())
+        };
 
-        // Perform cleanup after backfill, with no completeness target to check. A rebuild
-        // resolves its range inside the backfill service and never surfaces the top slot,
-        // so there is nothing to compare against here. Leaving it unchecked is acceptable
-        // because a stale checkpoint after a rebuild heals itself: the next live start
-        // detects the gap below the tip and fills it.
-        if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
-            checkpoint_handle,
-            checkpoint_tx,
-            self.storage.clone(),
-            None,
-        )
-        .await
-        {
-            error!("Cleanup after resync backfill failed: {}", e);
-            // Returned as-is so the operator sees which stage failed, not a generic one.
-            return Err(e);
+        // Losing the lock mid-rebuild means a worker can now start against a database
+        // that is only half rebuilt, so stop writing rather than race it. The rebuild is
+        // repeatable, and the next run starts from a lock it actually holds.
+        tokio::select! {
+            biased;
+            _ = lock_lost.cancelled() => {
+                error!("Live-state lock lost during the rebuild; stopping it");
+                // Both writers are stopped outright rather than drained. Closing the
+                // checkpoint channel is the writer's cue to flush what it has, which
+                // would commit a durable frontier over a database this run only half
+                // rebuilt and leave no gap for a later run to detect.
+                processor_abort.abort();
+                checkpoint_abort.abort();
+                return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
+            }
+            result = rebuild => result?,
         }
 
         info!(
