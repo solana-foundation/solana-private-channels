@@ -91,8 +91,10 @@ const WITHDRAW_PROGRAM_PATH: &str = concat!(
 pub const HOOK_FIXTURE_PROGRAM_ID: solana_sdk::pubkey::Pubkey =
     solana_sdk::pubkey!("hookEjHJAu757hfesyLchyGLxH6BeNuEbcztVEFT4K4");
 
-const HOOK_FIXTURE_PROGRAM_PATH: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/programs/transfer_hook_fixture.so");
+const HOOK_FIXTURE_PROGRAM_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/programs/transfer_hook_fixture.so"
+);
 
 #[cfg(target_os = "macos")]
 const GEYSER_PLUGIN_PATH: &str = concat!(

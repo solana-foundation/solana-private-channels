@@ -11,8 +11,8 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
-    pausable::PausableConfig, permanent_delegate::PermanentDelegate,
-    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
+    pausable::PausableConfig, permanent_delegate::PermanentDelegate, transfer_hook::TransferHook,
+    BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::Account as Token2022AccountState;
 use spl_token_2022::state::AccountState;

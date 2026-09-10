@@ -11,11 +11,8 @@ use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
-use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
-use spl_transfer_hook_interface::{
-    get_extra_account_metas_address, instruction::ExecuteInstruction,
-};
 use spl_pod::optional_keys::OptionalNonZeroPubkey;
+use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 use spl_token::{
     state::{Account as TokenAccount, Mint},
     ID as TOKEN_PROGRAM_ID,
@@ -29,6 +26,9 @@ use spl_token_2022::{
         BaseStateWithExtensionsMut, ExtensionType,
     },
     state::Mint as Token2022Mint,
+};
+use spl_transfer_hook_interface::{
+    get_extra_account_metas_address, instruction::ExecuteInstruction,
 };
 
 use solana_program::clock::Clock;
@@ -47,8 +47,7 @@ pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: Pubkey =
 pub const TOKEN_2022_PROGRAM_ID: Pubkey = spl_token_2022::ID;
 /// Transfer-hook program loaded into LiteSVM for hook-bearing Token-2022
 /// mints. Matches `declare_id!` in `tests/transfer-hook-fixture`.
-pub const HOOK_FIXTURE_PROGRAM_ID: Pubkey =
-    pubkey!("hookEjHJAu757hfesyLchyGLxH6BeNuEbcztVEFT4K4");
+pub const HOOK_FIXTURE_PROGRAM_ID: Pubkey = pubkey!("hookEjHJAu757hfesyLchyGLxH6BeNuEbcztVEFT4K4");
 
 // PrivateChannel Escrow Program Error Codes (using generated error enum)
 pub const INVALID_EVENT_AUTHORITY_ERROR: u32 =
@@ -121,7 +120,8 @@ impl TestContext {
             include_bytes!("../../../../target/deploy/private_channel_escrow_program.so");
         let _ = svm.add_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, program_data);
 
-        let hook_fixture_data = include_bytes!("../../../../target/deploy/transfer_hook_fixture.so");
+        let hook_fixture_data =
+            include_bytes!("../../../../target/deploy/transfer_hook_fixture.so");
         let _ = svm.add_program(HOOK_FIXTURE_PROGRAM_ID, hook_fixture_data);
 
         let payer = Keypair::new();
@@ -708,12 +708,11 @@ fn set_extra_account_meta_list(
 pub fn setup_hook_mint(context: &mut TestContext, mint: &Pubkey) {
     set_mint_2022_with_transfer_hook(context, mint, &HOOK_FIXTURE_PROGRAM_ID);
 
-    let extras = [ExtraAccountMeta::new_with_pubkey(
-        &solana_program::system_program::ID,
-        false,
-        false,
-    )
-    .unwrap()];
+    let extras =
+        [
+            ExtraAccountMeta::new_with_pubkey(&solana_program::system_program::ID, false, false)
+                .unwrap(),
+        ];
     set_extra_account_meta_list(context, mint, &extras);
 }
 

@@ -2,12 +2,12 @@ use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance, assert_get_or_deposit},
     utils::{
-        assert_program_error, create_mint_2022_with_transfer_fee, hook_extras_for_mint,
+        assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account, get_or_create_associated_token_account_2022,
-        get_token_balance, malicious_hook_extras, set_mint, set_mint_2022_basic,
-        set_mint_with_decimals, set_token_2022_with_hook_account, set_token_balance,
-        setup_hook_mint, setup_malicious_hook_mint, setup_test_balances, TestContext,
-        ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
+        get_token_balance, hook_extras_for_mint, malicious_hook_extras, set_mint,
+        set_mint_2022_basic, set_mint_with_decimals, set_token_2022_with_hook_account,
+        set_token_balance, setup_hook_mint, setup_malicious_hook_mint, setup_test_balances,
+        TestContext, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
         INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
@@ -507,7 +507,13 @@ fn test_deposit_token_2022_transfer_hook_forwards_extras() {
         &user.pubkey(),
         DEPOSIT_AMOUNT,
     );
-    set_token_2022_with_hook_account(&mut context, &instance_ata, &mint.pubkey(), &instance_pda, 0);
+    set_token_2022_with_hook_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        0,
+    );
 
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
@@ -595,7 +601,13 @@ fn test_deposit_token_2022_transfer_hook_without_extras_fails() {
         &user.pubkey(),
         DEPOSIT_AMOUNT,
     );
-    set_token_2022_with_hook_account(&mut context, &instance_ata, &mint.pubkey(), &instance_pda, 0);
+    set_token_2022_with_hook_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        0,
+    );
 
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
@@ -681,7 +693,13 @@ fn test_deposit_rejects_signer_bearing_hook_extra() {
         &user.pubkey(),
         DEPOSIT_AMOUNT,
     );
-    set_token_2022_with_hook_account(&mut context, &instance_ata, &mint.pubkey(), &instance_pda, 0);
+    set_token_2022_with_hook_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        0,
+    );
 
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)

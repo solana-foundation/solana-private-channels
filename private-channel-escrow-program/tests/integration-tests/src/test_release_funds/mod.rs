@@ -11,13 +11,14 @@ use crate::{
         assert_get_or_deposit, assert_get_or_release_funds, assert_get_or_rotate_bitmap,
     },
     utils::{
-        assert_program_error, create_mint_2022_with_transfer_fee, hook_extras_for_mint,
-        get_or_create_associated_token_account_2022, get_token_balance, malicious_hook_extras,
-        set_mint, set_token_2022_with_hook_account, setup_hook_mint, setup_malicious_hook_mint,
-        setup_test_balances, TestContext, ATA_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR,
-        INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        assert_program_error, create_mint_2022_with_transfer_fee,
+        get_or_create_associated_token_account_2022, get_token_balance, hook_extras_for_mint,
+        malicious_hook_extras, set_mint, set_token_2022_with_hook_account, setup_hook_mint,
+        setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        INVALID_INSTRUCTION_DATA_ERROR, INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR,
+        MISSING_REQUIRED_SIGNATURE_ERROR, NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR,
+        NONCE_OUTSIDE_CURRENT_GENERATION_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
 
@@ -1573,7 +1574,12 @@ fn test_release_funds_token_2022_transfer_hook_forwards_extras() {
         get_token_balance(&mut context, &instance_ata),
         DEPOSIT_AMOUNT - RELEASE_AMOUNT
     );
-    assert_nonce_consumed(&mut context, &withdrawal_bitmap_pda, TRANSACTION_NONCE, true);
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        true,
+    );
 }
 
 // The release leg is where a hostile hook has the most to gain: the escrow
@@ -1683,5 +1689,10 @@ fn test_release_funds_rejects_signer_bearing_hook_extra() {
         "the attacker must receive nothing"
     );
     // The release reverted, so the nonce is still spendable.
-    assert_nonce_consumed(&mut context, &withdrawal_bitmap_pda, TRANSACTION_NONCE, false);
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        false,
+    );
 }
