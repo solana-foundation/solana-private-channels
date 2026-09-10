@@ -5,7 +5,7 @@ use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
     RetryConfig, RpcClientWithRetry,
 };
-use crate::shutdown_utils::shutdown_operator;
+use crate::shutdown_utils::{shutdown_operator, stop_signal, StopReason};
 use crate::storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL};
 use crate::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
@@ -382,29 +382,35 @@ pub async fn run(
     let mut recovery_handle = recovery_handle;
     let pt_label = program_type.as_label();
 
-    // `biased;` makes ctrl-c win on concurrent readiness — avoids a
-    // false-positive `critical_exit` when a task ends at the same instant.
+    // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
+    // branch, so a task ending at the same instant cannot turn a deliberate stop into a
+    // false-positive `critical_exit`. Within the stop signal itself a lost lock outranks
+    // an interrupt, which is what stop_signal settles.
     tokio::select! {
         biased;
-        result = tokio::signal::ctrl_c() => {
-            result.map_err(|_| OperatorError::ShutdownChannelSend)?;
-            info!("Shutdown signal received, initiating graceful shutdown...");
-        }
-        // A lost live-state lock skips the graceful path entirely. Postgres frees the
-        // lock the instant our session dies, so a resync may already be dropping these
-        // tables; draining would broadcast and write into them. Stopping outright costs
-        // no more than an abrupt kill, which the recovery worker already handles.
-        _ = live_lock_lost.cancelled() => {
-            error!("Live-state lock lost; stopping without draining");
-            cancellation_token.cancel();
-            fetcher_handle.abort();
-            processor_handle.abort();
-            sender_handle.abort();
-            storage_writer_handle.abort();
-            recovery_handle.abort();
-            reconciliation_handle.abort();
-            feepayer_monitor_handle.abort();
-            return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
+        reason = stop_signal(tokio::signal::ctrl_c(), live_lock_lost.clone()) => {
+            match reason.map_err(|_| OperatorError::ShutdownChannelSend)? {
+                // A lost live-state lock skips the graceful path entirely. Postgres frees
+                // the lock the instant our session dies, so a resync may already be
+                // dropping these tables; draining would broadcast and write into them.
+                // Stopping outright costs no more than an abrupt kill, which the recovery
+                // worker already handles.
+                StopReason::LiveLockLost => {
+                    error!("Live-state lock lost; stopping without draining");
+                    cancellation_token.cancel();
+                    fetcher_handle.abort();
+                    processor_handle.abort();
+                    sender_handle.abort();
+                    storage_writer_handle.abort();
+                    recovery_handle.abort();
+                    reconciliation_handle.abort();
+                    feepayer_monitor_handle.abort();
+                    return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
+                }
+                StopReason::Interrupted => {
+                    info!("Shutdown signal received, initiating graceful shutdown...");
+                }
+            }
         }
         _ = &mut fetcher_handle => {
             critical_exit(pt_label, "fetcher");
