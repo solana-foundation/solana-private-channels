@@ -893,6 +893,37 @@ mod tests {
     // parse_deposit Tests
     // ============================================================================
 
+    // A deposit of a transfer-hook mint carries the hook's accounts after the
+    // fixed 12. Tightening the account check to an equality would stop indexing
+    // those deposits while the tokens still land in escrow, so pin that the
+    // trailing accounts are tolerated and the fixed slots still resolve.
+    #[test]
+    fn test_deposit_tolerates_trailing_hook_accounts() {
+        let borsh_data = create_deposit_borsh_data();
+        let instruction = create_instruction_with_accounts(15, "dummy".to_string());
+        let account_keys = create_n_account_keys(15);
+
+        let result = parse_deposit(
+            &borsh_data,
+            &instruction,
+            &account_keys,
+            &create_deposit_inner_instructions(990),
+            InstructionLocation::top_level(0),
+        );
+
+        let parsed = result.unwrap().expect("Some");
+        if let EscrowInstruction::Deposit {
+            accounts, event, ..
+        } = parsed
+        {
+            assert_eq!(event.amount, 990);
+            assert_eq!(accounts.mint, account_keys[3]);
+            assert_eq!(accounts.private_channel_escrow_program, account_keys[11]);
+        } else {
+            panic!("Expected Deposit instruction");
+        }
+    }
+
     #[test]
     fn test_deposit_valid_accounts() {
         let borsh_data = create_deposit_borsh_data();

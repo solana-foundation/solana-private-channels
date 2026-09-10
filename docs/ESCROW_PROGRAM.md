@@ -345,7 +345,7 @@ The program defines the following custom errors:
 | 3 | `InvalidInstanceId` | Instance ID invalid or does not respect rules |
 | 4 | `InvalidInstance` | Invalid instance provided |
 | 5 | `InvalidAdmin` | Invalid admin provided |
-| 6 | `TransferHookNotAllowed` | Transfer hook extension not allowed |
+| 6 | `TransferHookNotAllowed` | Retired. Transfer-hook mints are supported; the code is kept so the ones after it do not shift |
 | 7 | `InvalidOperatorPda` | Invalid operator PDA provided |
 | 8 | `InvalidTokenAccount` | Invalid token account provided |
 | 9 | `InvalidEscrowBalance` | Invalid escrow balance |

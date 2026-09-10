@@ -47,6 +47,7 @@ sqlx = { workspace = true, features = [
     "bigdecimal",
 ] }
 spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
+spl-transfer-hook-interface = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = "0.7.16"
 tracing = { workspace = true }

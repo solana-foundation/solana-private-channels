@@ -1,4 +1,14 @@
-use pinocchio::{account::AccountView, address::Address, error::ProgramError, ProgramResult};
+use core::mem::MaybeUninit;
+use core::slice::from_raw_parts;
+
+use pinocchio::{
+    account::AccountView,
+    address::Address,
+    cpi::{invoke_signed_with_bounds, Signer},
+    error::ProgramError,
+    instruction::{InstructionAccount, InstructionView},
+    ProgramResult,
+};
 use pinocchio_associated_token_account::instructions::CreateIdempotent;
 use pinocchio_token::{
     state::{Mint as TokenMint, TokenAccount},
@@ -8,9 +18,7 @@ use pinocchio_token_2022::{
     state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
     ID as TOKEN_2022_PROGRAM_ID,
 };
-use spl_token_2022::extension::{
-    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
-};
+use spl_token_2022::extension::StateWithExtensions;
 use spl_token_2022::state::Mint as Token2022MintState;
 
 use crate::error::PrivateChannelEscrowProgramError;
@@ -110,28 +118,120 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(PrivateChannelEscrowProgramError::InvalidMint.into())
 }
 
-/// Validates the mint's data parses as a Token-2022 mint and rejects
-/// mints carrying the `TransferHook` extension.
+/// Validates the account really is a mint. The decimals read above is
+/// unchecked, so this is what proves the bytes behind it.
 ///
-/// Pausable and permanent-delegate mints are accepted — the operator
-/// enforces pause and drain states off-chain via a withdrawal pre-flight.
-/// `TransferHook` is a different class of problem: honoring the hook would
-/// require the program to resolve `ExtraAccountMetaList` PDAs and forward
-/// them through the `TransferChecked` CPI, which the current pinocchio
-/// builder does not do. Accepting such a mint would cause every deposit /
-/// release to fail on-chain (Token-2022 invokes the hook program without
-/// the required extra accounts), so we reject it at the validation seam
-/// rather than let downstream transfers burn fees.
+/// No extension is rejected. Pause and permanent delegate are handled
+/// off-chain by the operator's withdrawal pre-flight, and `TransferHook`
+/// mints transfer through [`transfer_checked_cpi`] with client-resolved
+/// extras. Called at AllowMint, where decimals are pinned into state with
+/// no transfer CPI behind them; the transfer paths rely on
+/// `TransferChecked`, which re-validates the mint against both ATAs.
 #[inline(always)]
-pub fn validate_token2022_extensions(mint_info: &AccountView) -> ProgramResult {
+pub fn validate_mint(mint_info: &AccountView) -> ProgramResult {
     let data = mint_info.try_borrow()?;
 
-    let mint = StateWithExtensions::<Token2022MintState>::unpack(&data)
-        .map_err(|_| PrivateChannelEscrowProgramError::InvalidMint)?;
+    if mint_info.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        StateWithExtensions::<Token2022MintState>::unpack(&data)
+            .map_err(|_| PrivateChannelEscrowProgramError::InvalidMint)?;
+        return Ok(());
+    }
 
-    if mint.get_extension::<TransferHook>().is_ok() {
-        return Err(PrivateChannelEscrowProgramError::TransferHookNotAllowed.into());
+    // Legacy mints carry no extensions, so the exact size separates one
+    // from a token account (165) or a multisig (355).
+    if data.len() != TokenMint::LEN {
+        return Err(PrivateChannelEscrowProgramError::InvalidMint.into());
     }
 
     Ok(())
+}
+
+/// Max transfer-hook accounts per `TransferChecked` CPI: hook program,
+/// validation PDA, and whatever the mint's `ExtraAccountMetaList` resolves
+/// to. Bounded because the metas array below is stack-allocated under a
+/// const generic. Well above what real hooks declare, and under the
+/// 64-account transaction ceiling that v1 leaves unchanged.
+pub const MAX_HOOK_REMAINING_ACCOUNTS: usize = 32;
+const MAX_TRANSFER_CHECKED_ACCOUNTS: usize = 4 + MAX_HOOK_REMAINING_ACCOUNTS;
+
+/// SPL Token / Token-2022 `TransferChecked` discriminator.
+const TRANSFER_CHECKED_DISCRIMINATOR: u8 = 12;
+
+/// `TransferChecked` CPI carrying a trailing slice of transfer-hook extras.
+/// Hand-built because the pinocchio builder's account list is fixed at 4;
+/// an empty slice behaves like a plain `TransferChecked`.
+///
+/// The extras are not validated here. Token-2022 resolves the mint's
+/// `ExtraAccountMetaList` itself and rejects the CPI if they do not satisfy
+/// it, so resolving them is the client's job.
+///
+/// Each extra is forwarded with its writable flag but never its signer bit:
+/// a hostile `ExtraAccountMetaList` can name an account that signed this
+/// transaction, and stripping the bit keeps the hook from receiving that
+/// signature.
+///
+/// Ported from <https://github.com/solana-foundation/dvp>.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn transfer_checked_cpi(
+    from: &AccountView,
+    mint: &AccountView,
+    to: &AccountView,
+    authority: &AccountView,
+    amount: u64,
+    decimals: u8,
+    token_program: &Address,
+    hook_extras: &[AccountView],
+    signers: &[Signer],
+) -> ProgramResult {
+    if hook_extras.len() > MAX_HOOK_REMAINING_ACCOUNTS {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let total = 4 + hook_extras.len();
+
+    const UNINIT_META: MaybeUninit<InstructionAccount> = MaybeUninit::uninit();
+    let mut metas = [UNINIT_META; MAX_TRANSFER_CHECKED_ACCOUNTS];
+    metas[0].write(InstructionAccount::writable(from.address()));
+    metas[1].write(InstructionAccount::readonly(mint.address()));
+    metas[2].write(InstructionAccount::writable(to.address()));
+    metas[3].write(InstructionAccount::readonly_signer(authority.address()));
+    for (index, account) in hook_extras.iter().enumerate() {
+        let meta = if account.is_writable() {
+            InstructionAccount::writable(account.address())
+        } else {
+            InstructionAccount::readonly(account.address())
+        };
+        metas[4 + index].write(meta);
+    }
+    // SAFETY: the first `total` slots were just initialized above.
+    let metas_slice: &[InstructionAccount] =
+        unsafe { from_raw_parts(metas.as_ptr() as *const InstructionAccount, total) };
+
+    let mut data = [0u8; 10];
+    data[0] = TRANSFER_CHECKED_DISCRIMINATOR;
+    data[1..9].copy_from_slice(&amount.to_le_bytes());
+    data[9] = decimals;
+
+    let instruction = InstructionView {
+        program_id: token_program,
+        accounts: metas_slice,
+        data: &data,
+    };
+
+    // `&AccountView` is Copy: fill with `from`, overwrite the prefix, and
+    // only the first `total` entries are read.
+    let mut infos: [&AccountView; MAX_TRANSFER_CHECKED_ACCOUNTS] =
+        [from; MAX_TRANSFER_CHECKED_ACCOUNTS];
+    infos[1] = mint;
+    infos[2] = to;
+    infos[3] = authority;
+    for (index, account) in hook_extras.iter().enumerate() {
+        infos[4 + index] = account;
+    }
+
+    invoke_signed_with_bounds::<MAX_TRANSFER_CHECKED_ACCOUNTS>(
+        &instruction,
+        &infos[..total],
+        signers,
+    )
 }

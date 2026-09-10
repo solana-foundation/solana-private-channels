@@ -774,6 +774,76 @@ async fn check_withdrawal_preflights_inner(
     Ok(None)
 }
 
+/// Append the mint's transfer-hook accounts to a built release, so Token-2022
+/// can resolve the hook. A no-op for mints without one.
+///
+/// Returns a bail when the mint's validation account is absent: no transfer of
+/// that mint can resolve, so the row parks rather than the task restarting on a
+/// transient forever. A failed read stays an error, since that is a node
+/// problem and not a row problem.
+async fn attach_hook_extras(
+    processor_state: &mut ProcessorState,
+    transaction: &DbTransaction,
+    release_funds_tx: &mut TransactionBuilder,
+) -> Result<Option<BailReason>, OperatorError> {
+    let TransactionBuilder::ReleaseFunds(release) = release_funds_tx else {
+        return Ok(None);
+    };
+
+    let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
+        pubkey: transaction.mint.clone(),
+        reason: e.to_string(),
+    })?;
+
+    // Only Token-2022 mints can carry a hook, so legacy mints pay nothing.
+    let token_program = processor_state
+        .mint_cache
+        .get_mint_metadata(&mint)
+        .await?
+        .token_program;
+    if token_program != spl_token_2022::ID {
+        return Ok(None);
+    }
+
+    let recipient =
+        Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
+            pubkey: transaction.recipient.clone(),
+            reason: e.to_string(),
+        })?;
+    let recipient_ata =
+        get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
+
+    let release_funds_state = processor_state
+        .release_funds_state
+        .as_mut()
+        .ok_or(OperatorError::MissingBuilder)?;
+    let instance_pda = release_funds_state.instance_pda;
+    let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
+
+    let Some(hook_extras) = processor_state
+        .mint_cache
+        .resolve_hook_extras(
+            &mint,
+            &instance_ata,
+            &recipient_ata,
+            &instance_pda,
+            transaction.amount.value(),
+        )
+        .await?
+    else {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
+            format!("transfer-hook validation account missing for mint: {mint}"),
+        )));
+    };
+
+    if !hook_extras.is_empty() {
+        release.builder.add_remaining_accounts(&hook_extras);
+    }
+
+    Ok(None)
+}
+
 pub async fn process_release_funds(
     processor_state: &mut ProcessorState,
     mut fetcher_rx: mpsc::Receiver<DbTransaction>,
@@ -807,7 +877,7 @@ pub async fn process_release_funds(
             // classifier to halt the pipeline on. Building also warms
             // `MintCache.cache`, so the pre-flight below does not pay an extra
             // database or RPC round-trip for `get_mint_metadata`.
-            let release_funds_tx = build_release_funds(processor_state, &transaction).await?;
+            let mut release_funds_tx = build_release_funds(processor_state, &transaction).await?;
 
             // Pre-flight for Token-2022 pause / permanent-delegate drain. These
             // are row-specific, so bails route to ManualReview and continue the
@@ -816,6 +886,15 @@ pub async fn process_release_funds(
             // the on-chain CPI, leaving that to the sender retry path. RPC errors
             // bubble up as Transient and restart the task.
             if let Some(bail) = check_withdrawal_preflights(processor_state, &transaction).await? {
+                park_row(&storage_tx, pt_label, &transaction, bail).await;
+                return Ok(());
+            }
+
+            // Runs after the pre-flights so a mint that is not payable anyway
+            // never pays for hook resolution.
+            if let Some(bail) =
+                attach_hook_extras(processor_state, &transaction, &mut release_funds_tx).await?
+            {
                 park_row(&storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
             }
@@ -1303,11 +1382,12 @@ mod tests {
         }
     }
 
-    /// Treat `mint` as already proved allowlisted and unfreezable, skipping both
-    /// gates in tests whose subject is a later step of the loop.
+    /// Treat `mint` as already proved allowlisted, unfreezable and hook-free,
+    /// skipping those gates in tests whose subject is a later step of the loop.
     fn assume_mint_allowlisted(ps: &mut ProcessorState, mint: &Pubkey) {
         ps.mint_cache.record_existence_floor(mint, 1);
         ps.mint_cache.record_freeze_authority(mint, false);
+        ps.mint_cache.record_transfer_hook(mint, false);
     }
 
     /// Mocked `getAccountInfo` reply for an escrow-owned AllowedMint account.

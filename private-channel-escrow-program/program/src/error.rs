@@ -29,7 +29,9 @@ pub enum PrivateChannelEscrowProgramError {
     #[error("Invalid admin provided")]
     InvalidAdmin,
 
-    /// (6) Transfer hook extension not allowed
+    /// (6) Retired. Transfer-hook mints are supported: both transfer paths
+    /// forward the hook extras to the token program. Kept so the codes after
+    /// it do not shift.
     #[error("Transfer hook extension not allowed")]
     TransferHookNotAllowed,
 

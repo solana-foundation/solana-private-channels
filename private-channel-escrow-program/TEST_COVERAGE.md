@@ -33,7 +33,7 @@
 - `test_create_instance_invalid_event_authority` — invalid event authority PDA
 - `test_create_instance_invalid_system_program` — wrong system program address
 
-### AllowMint (9 integration tests)
+### AllowMint (10 integration tests)
 
 - `test_allow_mint_success` — SPL Token mint
 - `test_allow_mint_duplicate` — duplicate mint fails
@@ -44,7 +44,7 @@
 - `test_allow_mint_token_2022_basic_success` — Token2022 mint allowed
 - `test_allow_mint_token_2022_permanent_delegate_accepted` — permanent-delegate Token-2022 mint allowed; drain detection is enforced by the operator at withdrawal time
 - `test_allow_mint_token_2022_pausable_accepted` — pausable Token-2022 mint allowed; pause state is enforced by the operator at withdrawal time
-- `test_allow_mint_token_2022_transfer_hook_blocked` — TransferHookNotAllowed; the program's `TransferChecked` CPI does not resolve extra-account metas, so hook mints are rejected at validation
+- `test_allow_mint_token_2022_transfer_hook_allowed` — hook mints are allowlistable, and the escrow ATA the CPI creates carries `TransferHookAccount`
 
 ### BlockMint (11 integration tests)
 
@@ -88,7 +88,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (15 integration tests)
+### Deposit (17 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -97,7 +97,9 @@
 - `test_deposit_invalid_instruction_data_too_short` — malformed data
 - `test_deposit_not_enough_accounts` — missing accounts
 - `test_deposit_token_2022_basic_success` — Token2022 deposit
-- `test_deposit_token_2022_transfer_hook_rejected` — TransferHookNotAllowed on deposit path (live swap of mint data post-AllowMint proves the check runs at deposit, not only at AllowMint)
+- `test_deposit_token_2022_transfer_hook_forwards_extras` — the hook runs exactly once and sees every account its `ExtraAccountMetaList` declares
+- `test_deposit_token_2022_transfer_hook_without_extras_fails` — omitting the extras fails the transfer rather than skipping the hook
+- `test_deposit_rejects_signer_bearing_hook_extra` — a hostile `ExtraAccountMetaList` names the fee payer as a signer extra; the stripped signer bit leaves the hook's drain CPI unsigned, so the deposit reverts and the attacker gets nothing
 - `test_deposit_token_2022_transfer_fee_success` — the escrow credits the measured balance delta, so the depositor is credited net of the fee
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
@@ -106,7 +108,7 @@
 - `test_deposit_rejected_after_mint_decimals_change` — MintProfileChanged; TransferChecked cannot catch this since it validates the decimals it is handed against the mint itself
 - `test_deposit_rejected_after_mint_token_program_change` — MintProfileChanged; the ATAs for the new program are left uncreated, so this also pins the check running before `validate_ata`
 
-### ReleaseFunds (19 integration tests)
+### ReleaseFunds (21 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -127,6 +129,8 @@
 - `test_release_funds_wrong_user_ata` — passing another user's ATA as user_ata while keeping the correct user pubkey in instruction data is rejected with InvalidInstructionData
 - `test_release_funds_full_balance` — releasing the entire deposited balance succeeds and leaves the instance ATA at zero
 - `test_release_funds_token_2022_transfer_fee_success` — escrow is debited the full release amount and the user receives it minus the fee, so the fee falls on the user, not the escrow
+- `test_release_funds_token_2022_transfer_hook_forwards_extras` — the hook runs once on the way out of escrow and the nonce is consumed
+- `test_release_funds_rejects_signer_bearing_hook_extra` — the release leg of the signer-strip guard, where the escrow PDA is the transfer authority; the release reverts and the nonce stays spendable
 
 ### RotateBitmap (6 integration tests)
 

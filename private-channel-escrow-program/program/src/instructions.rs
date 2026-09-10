@@ -142,6 +142,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
     SetNewAdmin {} = 5,
 
     /// Deposit tokens from user ATA to instance escrow ATA (permissionless).
+    ///
+    /// Append the mint's transfer-hook extras after the fixed accounts: hook
+    /// program, validation PDA, and whatever its `ExtraAccountMetaList`
+    /// resolves to. Omit for mints without a hook. Codama drops trailing
+    /// accounts, so they are not in the generated account list.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "user", docs = "User depositing tokens", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to validate"))]
@@ -179,6 +184,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
     } = 6,
 
     /// Release funds from escrow to user (operator-only).
+    ///
+    /// Append the mint's transfer-hook extras after the fixed accounts: hook
+    /// program, validation PDA, and whatever its `ExtraAccountMetaList`
+    /// resolves to. Omit for mints without a hook. Codama drops trailing
+    /// accounts, so they are not in the generated account list.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "operator", docs = "Operator releasing the funds", signer))]
     #[codama(account(

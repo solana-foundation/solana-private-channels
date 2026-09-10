@@ -60,6 +60,10 @@ name = "permanent_delegate_mint_integration"
 path = "tests/indexer/permanent_delegate_mint.rs"
 
 [[test]]
+name = "transfer_hook_mint_integration"
+path = "tests/indexer/transfer_hook_mint.rs"
+
+[[test]]
 name = "mock_rpc_retry"
 path = "tests/indexer/mock_rpc_retry.rs"
 
@@ -275,6 +279,8 @@ spl-associated-token-account = { workspace = true }
 spl-memo = { workspace = true }
 spl-token = { workspace = true }
 spl-token-2022 = { workspace = true }
+spl-tlv-account-resolution = "0.10.0"
+spl-transfer-hook-interface = { workspace = true }
 sqlx = { workspace = true }
 mockito = "1.7"
 redis = { workspace = true }

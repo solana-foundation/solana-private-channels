@@ -8,7 +8,7 @@ use crate::{
         shared::{
             account_check::{verify_signer, verify_system_program},
             event_utils::emit_event,
-            token_utils::{validate_ata, validate_token2022_extensions},
+            token_utils::{transfer_checked_cpi, validate_ata},
         },
         verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
@@ -18,9 +18,8 @@ use crate::{
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
-use pinocchio_token_2022::{
-    instructions::TransferChecked as TransferChecked2022, ID as TOKEN_2022_PROGRAM_ID,
-};
+/// Fixed account prefix; anything past it is transfer-hook extras.
+const FIXED_ACCOUNTS_LEN: usize = 12;
 
 /// Processes the Deposit instruction.
 ///
@@ -38,6 +37,11 @@ use pinocchio_token_2022::{
 /// 10. `[]` event_authority - Event authority PDA for emitting events
 /// 11. `[]` private_channel_escrow_program - Current program for CPI
 ///
+/// Trailing accounts (variable): transfer-hook extras for the mint (hook
+/// program, validation PDA, and whatever its `ExtraAccountMetaList`
+/// resolves to), forwarded to the token program. Empty for mints without
+/// a hook. The client resolves them; the IDL cannot express them.
+///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to deposit
 /// * `recipient` (Option<Pubkey>) - Optional recipient for private_channel tracking
@@ -47,8 +51,12 @@ pub fn process_deposit(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+    if accounts.len() < FIXED_ACCOUNTS_LEN {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
     let [payer_info, user_info, instance_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
-        accounts
+        fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -113,22 +121,19 @@ pub fn process_deposit(
         token_program_info,
     )?;
 
-    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
-        validate_token2022_extensions(mint_info)?;
-    }
-
     let escrow_token_balance_before = get_token_account_balance(instance_ata_info)?;
 
-    TransferChecked2022 {
-        from: user_ata_info,
-        to: instance_ata_info,
-        authority: user_info,
-        amount: args.amount,
-        token_program: token_program_info.address(),
-        mint: mint_info,
-        decimals: mint_decimals,
-    }
-    .invoke_signed(&[])?;
+    transfer_checked_cpi(
+        user_ata_info,
+        mint_info,
+        instance_ata_info,
+        user_info,
+        args.amount,
+        mint_decimals,
+        token_program_info.address(),
+        hook_extras,
+        &[],
+    )?;
 
     let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
     let received = escrow_token_balance_after

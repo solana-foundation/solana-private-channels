@@ -174,14 +174,16 @@ pub const BAIL_REASON_TARGET_MINT_MISSING: &str = "target_mint_missing";
 pub const BAIL_REASON_MINT_PAUSED: &str = "mint_paused";
 pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
 pub const BAIL_REASON_ESCROW_FROZEN: &str = "escrow_frozen";
+pub const BAIL_REASON_HOOK_UNRESOLVABLE: &str = "hook_unresolvable";
 
-pub const BAIL_REASONS: [&str; 6] = [
+pub const BAIL_REASONS: [&str; 7] = [
     BAIL_REASON_UNSUPPORTED_MINT,
     BAIL_REASON_WITHDRAWALS_BLOCKED,
     BAIL_REASON_TARGET_MINT_MISSING,
     BAIL_REASON_MINT_PAUSED,
     BAIL_REASON_ESCROW_DRAINED,
     BAIL_REASON_ESCROW_FROZEN,
+    BAIL_REASON_HOOK_UNRESOLVABLE,
 ];
 
 // Supervision: a critical task inside the operator exited.  The supervisor

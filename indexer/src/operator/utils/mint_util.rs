@@ -7,16 +7,19 @@ use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::request::RpcError;
 use solana_sdk::account::Account;
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
-    pausable::PausableConfig, permanent_delegate::PermanentDelegate, BaseStateWithExtensions,
-    StateWithExtensions,
+    pausable::PausableConfig, permanent_delegate::PermanentDelegate,
+    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::Account as Token2022AccountState;
 use spl_token_2022::state::AccountState;
 use spl_token_2022::state::Mint as Token2022MintState;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
+use spl_transfer_hook_interface::get_extra_account_metas_address;
+use spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -80,6 +83,15 @@ pub struct MintCache {
     rpc_client: Option<Arc<RpcClientWithRetry>>,
     cache: HashMap<String, MintMetadata>,
     extension_flags_cache: HashMap<String, (bool, bool)>,
+    /// Whether the mint carries `TransferHook`, gating per-withdrawal hook
+    /// resolution. Only the presence is cached; the hook program id is read live
+    /// because its authority can swap it.
+    ///
+    /// A stale `true` self-heals: it only skips the shortcut, so the next read
+    /// corrects it. A stale `false` needs the mint closed at zero supply and
+    /// recreated with a hook, since extensions are fixed at creation. That
+    /// release then fails on-chain and remints, and a restart re-resolves.
+    transfer_hook_cache: HashMap<String, bool>,
     /// Whether the mint has a `freeze_authority`, which gates the escrow-ATA
     /// freeze check. In-memory only: a freeze authority can be revoked but never
     /// added, so a stale `true` only costs one avoidable read and a stale value
@@ -103,6 +115,7 @@ impl MintCache {
             rpc_client: None,
             cache: HashMap::new(),
             extension_flags_cache: HashMap::new(),
+            transfer_hook_cache: HashMap::new(),
             freeze_authority_cache: HashMap::new(),
             existence_floor: HashMap::new(),
         }
@@ -114,6 +127,7 @@ impl MintCache {
             rpc_client: Some(rpc_client),
             cache: HashMap::new(),
             extension_flags_cache: HashMap::new(),
+            transfer_hook_cache: HashMap::new(),
             freeze_authority_cache: HashMap::new(),
             existence_floor: HashMap::new(),
         }
@@ -135,6 +149,12 @@ impl MintCache {
     pub fn record_freeze_authority(&mut self, mint: &Pubkey, present: bool) {
         self.freeze_authority_cache
             .insert(mint.to_string(), present);
+    }
+
+    /// Record whether this mint carries `TransferHook`, for a caller that has
+    /// already read the mint. Saves the hook resolution its own read.
+    pub fn record_transfer_hook(&mut self, mint: &Pubkey, present: bool) {
+        self.transfer_hook_cache.insert(mint.to_string(), present);
     }
 
     /// Whether a caller has already proved this mint exists on the target chain.
@@ -333,6 +353,131 @@ impl MintCache {
 
         self.freeze_authority_cache.insert(mint_str, present);
         Ok(present)
+    }
+
+    /// Hook program the mint's `TransferHook` points at, or `None` for a mint
+    /// with no hook.
+    async fn transfer_hook_program(
+        &mut self,
+        mint: &Pubkey,
+    ) -> Result<Option<Pubkey>, OperatorError> {
+        let mint_str = mint.to_string();
+
+        if self.transfer_hook_cache.get(&mint_str) == Some(&false) {
+            return Ok(None);
+        }
+
+        let floor = self.existence_floor(mint);
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError(format!(
+                "MintCache needs RPC to resolve the transfer hook for mint {mint_str}",
+            ))
+        })?;
+
+        let account = read_target_mint_account(rpc, mint, floor).await?;
+
+        let state =
+            StateWithExtensions::<Token2022MintState>::unpack(&account.data).map_err(|_| {
+                AccountError::InvalidMint {
+                    pubkey: *mint,
+                    reason: "failed to parse Token-2022 mint".to_string(),
+                }
+            })?;
+        let hook_program = state
+            .get_extension::<TransferHook>()
+            .ok()
+            .and_then(|hook| Option::<Pubkey>::from(hook.program_id));
+
+        self.transfer_hook_cache
+            .insert(mint_str, hook_program.is_some());
+        Ok(hook_program)
+    }
+
+    /// Accounts a transfer of `mint` must carry for Token-2022 to run its
+    /// transfer hook: the hook program, its validation account, and whatever the
+    /// `ExtraAccountMetaList` resolves to. Empty for a mint with no hook.
+    ///
+    /// `None` means the validation account is absent, so no transfer of this
+    /// mint can resolve; the caller parks instead of retrying.
+    ///
+    /// Resolved per withdrawal rather than cached, since an
+    /// `ExtraAccountMetaList` can derive accounts from the amount and
+    /// destination.
+    pub async fn resolve_hook_extras(
+        &mut self,
+        mint: &Pubkey,
+        source: &Pubkey,
+        destination: &Pubkey,
+        authority: &Pubkey,
+        amount: u64,
+    ) -> Result<Option<Vec<AccountMeta>>, OperatorError> {
+        let Some(hook_program) = self.transfer_hook_program(mint).await? else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError("hook resolution requires an RPC client".to_string())
+        })?;
+        let commitment = rpc.rpc_client.commitment();
+
+        // Read the validation account first so an absent one is told apart from
+        // an unreachable node: absent is permanent, a failed read is not.
+        let validation_pda = get_extra_account_metas_address(mint, &hook_program);
+        let response = rpc
+            .get_account_with_context(&validation_pda, commitment)
+            .await
+            .map_err(|e| OperatorError::RpcError(format!("get_account({validation_pda}): {e}")))?;
+        if response.value.is_none() {
+            return Ok(None);
+        }
+
+        // The resolver requires source, mint, destination and authority in the
+        // first four slots, which the escrow's layout does not have, so it runs
+        // against a scratch instruction and we keep the tail.
+        let mut instruction = Instruction::new_with_bytes(
+            hook_program,
+            &[],
+            vec![
+                AccountMeta::new_readonly(*source, false),
+                AccountMeta::new_readonly(*mint, false),
+                AccountMeta::new_readonly(*destination, false),
+                AccountMeta::new_readonly(*authority, false),
+            ],
+        );
+
+        let fetch_rpc = Arc::clone(rpc);
+        add_extra_account_metas_for_execute(
+            &mut instruction,
+            &hook_program,
+            source,
+            mint,
+            destination,
+            authority,
+            amount,
+            move |address| {
+                let rpc = Arc::clone(&fetch_rpc);
+                async move {
+                    let account = rpc.get_account_with_context(&address, commitment).await?;
+                    Ok(account.value.map(|account| account.data))
+                }
+            },
+        )
+        .await
+        .map_err(|e| OperatorError::RpcError(format!("hook resolution for mint {mint}: {e}")))?;
+
+        // Signer bits are dropped: the escrow strips them before the CPI too, and
+        // the operator must never hand its own signature to a mint's hook.
+        let extras = instruction
+            .accounts
+            .split_off(4)
+            .into_iter()
+            .map(|meta| AccountMeta {
+                is_signer: false,
+                ..meta
+            })
+            .collect();
+
+        Ok(Some(extras))
     }
 
     /// Live fetch of a token account's raw balance (base units).
@@ -1066,6 +1211,49 @@ mod tests {
             cache.rpc_client = None;
             assert_eq!(cache.has_freeze_authority(&mint).await.unwrap(), expected);
         }
+    }
+
+    /// A mint with no `TransferHook` resolves to no extras, and the answer is
+    /// cached: a hook-less mint pays one read for the life of the process, and
+    /// every withdrawal of it after that pays nothing.
+    #[tokio::test]
+    async fn resolve_hook_extras_is_empty_and_cached_without_a_hook() {
+        let response = serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(create_mock_mint_account_data(6)), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        });
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, response);
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache =
+            MintCache::with_rpc(storage, Arc::new(RpcClientWithRetry::new_mocked(mocks)));
+
+        let mint = create_test_mint();
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+
+        let extras = cache
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000)
+            .await
+            .unwrap()
+            .expect("a hook-less mint is resolvable");
+        assert!(extras.is_empty(), "no hook means no accounts to append");
+
+        cache.rpc_client = None;
+        assert!(cache
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000)
+            .await
+            .unwrap()
+            .expect("the cached answer needs no RPC")
+            .is_empty());
     }
 
     #[tokio::test]

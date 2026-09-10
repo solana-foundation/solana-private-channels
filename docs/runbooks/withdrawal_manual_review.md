@@ -42,6 +42,7 @@ have prefixes.
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
+| `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
@@ -211,6 +212,16 @@ to say explicitly what the user is owed.
      row. No operator restart is needed: a blocked mint is never cached as clear.
      Blocking withdrawals is deliberate, so confirm with whoever set it before
      re-opening. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook validation account missing for mint:` - the mint's
+     `TransferHook` points at a hook program whose `ExtraAccountMetaList` does not
+     exist, so Token-2022 can resolve no transfer of it and no release can settle.
+     The escrow still holds the funds and the row is intact. Nothing on our side
+     creates that account: only the hook program can, so contact the mint issuer.
+     Its address is the `["extra-account-metas", mint]` PDA of the hook program the
+     mint names; re-arm the row once `solana account <that address>` shows it
+     exists. Expect every withdrawal of that mint to park here. Deposits of it fail
+     on-chain for the same reason, so consider blocking deposits (`BlockMint` with
+     `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
    - `withdrawal mint absent on target chain:` - the mint was allowlisted, so its
      account existed then, and the node answered from a slot at or past that allow
      before reporting nothing. A lagging node cannot produce this message; it

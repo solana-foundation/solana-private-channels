@@ -13,8 +13,8 @@ use crate::{
             pda_utils::create_pda_account,
             token_utils::{get_mint_decimals, get_or_create_ata},
         },
-        validate_token2022_extensions, verify_account_owner, verify_ata_program,
-        verify_current_program, verify_token_programs,
+        validate_mint, verify_account_owner, verify_ata_program, verify_current_program,
+        verify_token_programs,
     },
     require_len,
     state::{discriminator::AccountSerialize, AllowedMint, Instance},
@@ -27,7 +27,6 @@ use pinocchio::{
     sysvars::{rent::Rent, Sysvar},
     Address, ProgramResult,
 };
-use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
 /// Processes the AllowMint instruction.
 ///
@@ -68,9 +67,7 @@ pub fn process_allow_mint(
     validate_event_authority!(event_authority_info);
 
     verify_account_owner(mint_info, token_program_info.address())?;
-    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
-        validate_token2022_extensions(mint_info)?;
-    }
+    validate_mint(mint_info)?;
 
     let mint_decimals = get_mint_decimals(mint_info)?;
 

@@ -3,13 +3,13 @@ use crate::{
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance},
     utils::{
         assert_program_error, set_mint, set_mint_2022_basic, set_mint_2022_with_pausable,
-        set_mint_2022_with_permanent_delegate, set_mint_2022_with_transfer_hook, TestContext,
+        set_mint_2022_with_permanent_delegate, setup_hook_mint, TestContext,
         INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
         MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID,
-        TRANSFER_HOOK_NOT_ALLOWED_ERROR,
     },
 };
 use private_channel_escrow_program_client::instructions::AllowMintBuilder;
+use solana_program_pack::Pack;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -17,7 +17,7 @@ use solana_sdk::{
     system_program::ID as SYSTEM_PROGRAM_ID,
 };
 use spl_associated_token_account::ID as ATA_PROGRAM_ID;
-use spl_token::ID as TOKEN_PROGRAM_ID;
+use spl_token::{state::Account as TokenAccount, ID as TOKEN_PROGRAM_ID};
 
 #[test]
 fn test_allow_mint_success() {
@@ -371,18 +371,19 @@ fn test_allow_mint_token_2022_pausable_accepted() {
     .expect("AllowMint should succeed for a pausable Token-2022 mint");
 }
 
+// Transfer-hook mints are allowlistable: Deposit and ReleaseFunds forward
+// the hook extras to the token program. AllowMint runs no transfer, so the
+// hook is never invoked here, but the instance ATA it creates has to come
+// out of the CPI carrying the TransferHookAccount extension.
 #[test]
-fn test_allow_mint_token_2022_transfer_hook_blocked() {
+fn test_allow_mint_token_2022_transfer_hook_allowed() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let mint = Keypair::new();
-    // Hook program id is arbitrary — the check fires on the extension's
-    // presence, not on whether the hook program exists on-chain.
-    let hook_program_id = Pubkey::new_unique();
 
     let instance_seed = Keypair::new();
 
-    set_mint_2022_with_transfer_hook(&mut context, &mint.pubkey(), &hook_program_id);
+    setup_hook_mint(&mut context, &mint.pubkey());
 
     let (instance_pda, _) =
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
@@ -415,7 +416,19 @@ fn test_allow_mint_token_2022_transfer_hook_blocked() {
         .bump(bump)
         .instruction();
 
-    let result = context.send_transaction_with_signers(instruction, &[&admin]);
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("AllowMint should succeed for a transfer-hook mint");
 
-    assert_program_error(result, TRANSFER_HOOK_NOT_ALLOWED_ERROR);
+    assert!(
+        context.get_account(&allowed_mint_pda).is_some(),
+        "the AllowedMint PDA must be created"
+    );
+    let instance_ata_data = context
+        .get_account_data(&instance_ata)
+        .expect("the instance ATA must be created");
+    assert!(
+        instance_ata_data.len() > TokenAccount::LEN,
+        "the escrow ATA must carry the TransferHookAccount extension"
+    );
 }

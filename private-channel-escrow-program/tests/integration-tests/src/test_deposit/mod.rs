@@ -2,14 +2,14 @@ use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance, assert_get_or_deposit},
     utils::{
-        assert_program_error, create_mint_2022_with_transfer_fee,
+        assert_program_error, create_mint_2022_with_transfer_fee, hook_extras_for_mint,
         get_or_create_associated_token_account, get_or_create_associated_token_account_2022,
-        get_token_balance, set_mint, set_mint_2022_basic, set_mint_2022_with_transfer_hook,
-        set_mint_with_decimals, set_token_balance, setup_test_balances, TestContext,
+        get_token_balance, malicious_hook_extras, set_mint, set_mint_2022_basic,
+        set_mint_with_decimals, set_token_2022_with_hook_account, set_token_balance,
+        setup_hook_mint, setup_malicious_hook_mint, setup_test_balances, TestContext,
         ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
         INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
-        TRANSFER_HOOK_NOT_ALLOWED_ERROR,
     },
 };
 
@@ -454,27 +454,25 @@ fn test_deposit_token_2022_transfer_fee_success() {
     );
 }
 
-// `validate_token2022_extensions` runs on the deposit path as well as AllowMint
-// (deposit.rs:100, allow_mint.rs:70). Without a deposit-side test, a future
-// refactor that moves the check out of `validate_token2022_extensions` for
-// just one path would pass CI. Test strategy mirrors the old
-// `test_deposit_token_2022_permanent_delegate_rejected`: stand up a clean
-// Token-2022 mint, AllowMint it (check passes), prime the user's balance,
-// then swap the mint account data for a TransferHook mint via the litesvm
-// cheat code. The deposit must then fail with TransferHookNotAllowed — proving
-// the check is live on the deposit path, independent of AllowMint.
+// The fixture logs how many accounts Token-2022 handed it. With one extra
+// declared in the mint's ExtraAccountMetaList that is 6: source, mint,
+// destination, authority, validation PDA, and the extra. Asserting the log
+// is what proves every declared account actually reached the hook.
+const HOOK_LOG: &str = "hook accounts: 6";
+
+// A Token-2022 mint carrying a TransferHook deposits normally: the trailing
+// accounts are forwarded to the token program, which resolves the mint's
+// ExtraAccountMetaList and invokes the hook.
 #[test]
-fn test_deposit_token_2022_transfer_hook_rejected() {
+fn test_deposit_token_2022_transfer_hook_forwards_extras() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let user = Keypair::new();
-    let good_mint = Keypair::new();
-    let bad_mint = Keypair::new();
+    let mint = Keypair::new();
 
     let instance_seed = Keypair::new();
 
-    // 1. Clean Token-2022 mint (no extensions) — passes AllowMint.
-    set_mint_2022_basic(&mut context, &good_mint.pubkey());
+    setup_hook_mint(&mut context, &mint.pubkey());
 
     let (instance_pda, _) =
         assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
@@ -484,60 +482,131 @@ fn test_deposit_token_2022_transfer_hook_rejected() {
         &mut context,
         &admin,
         &instance_pda,
-        &good_mint.pubkey(),
+        &mint.pubkey(),
         false,
         false,
     )
-    .expect("AllowMint should succeed for normal mint");
+    .expect("AllowMint should succeed for a transfer-hook mint");
 
-    setup_test_balances(
-        &mut context,
-        &user,
-        &instance_pda,
-        &good_mint.pubkey(),
+    // Both sides need the TransferHookAccount extension: process_transfer
+    // flips `transferring` on each of them.
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
         &TOKEN_2022_PROGRAM_ID,
-        DEPOSIT_AMOUNT,
-        0,
     );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    set_token_2022_with_hook_account(
+        &mut context,
+        &user_ata,
+        &mint.pubkey(),
+        &user.pubkey(),
+        DEPOSIT_AMOUNT,
+    );
+    set_token_2022_with_hook_account(&mut context, &instance_ata, &mint.pubkey(), &instance_pda, 0);
 
-    // 2. Build a separate mint account with the TransferHook extension
-    //    initialized — we only need its account data.
-    let hook_program_id = Keypair::new().pubkey();
-    set_mint_2022_with_transfer_hook(&mut context, &bad_mint.pubkey(), &hook_program_id);
-
-    // 3. litesvm cheat: overwrite the good mint's account with the bad mint's
-    //    data. AllowMint has already landed, but the deposit handler re-runs
-    //    `validate_token2022_extensions` against the live mint account.
-    let bad_mint_account = context
-        .get_account(&bad_mint.pubkey())
-        .expect("Bad mint account should exist");
-    context
-        .svm
-        .set_account(good_mint.pubkey(), bad_mint_account)
-        .expect("Failed to overwrite good mint with TransferHook mint data");
-
-    // 4. Attempt to deposit — the deposit-side validation must reject.
     context
         .airdrop_if_required(&user.pubkey(), 1_000_000_000)
         .unwrap();
     let (event_authority_pda, _) = find_event_authority_pda();
 
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .add_remaining_accounts(&hook_extras_for_mint(&mint.pubkey()))
+        .instruction();
+
+    let metadata = context
+        .send_transaction_with_signers_with_transaction_result(instruction, &[&user], false, None)
+        .expect("Deposit through a transfer-hook mint should succeed");
+
+    let hook_runs = metadata
+        .logs
+        .iter()
+        .filter(|log| log.contains(HOOK_LOG))
+        .count();
+    assert_eq!(hook_runs, 1, "the hook must run exactly once");
+
+    assert_eq!(get_token_balance(&mut context, &user_ata), 0);
+    assert_eq!(
+        get_token_balance(&mut context, &instance_ata),
+        DEPOSIT_AMOUNT
+    );
+}
+
+// Omitting the extras must fail rather than transfer without running the
+// hook. Token-2022 resolves the ExtraAccountMetaList itself and rejects the
+// CPI when an account it names is missing, so this pins that the program
+// cannot silently bypass a hook it should be honouring.
+#[test]
+fn test_deposit_token_2022_transfer_hook_without_extras_fails() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    setup_hook_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed for a transfer-hook mint");
+
     let user_ata = get_associated_token_address_with_program_id(
         &user.pubkey(),
-        &good_mint.pubkey(),
+        &mint.pubkey(),
         &TOKEN_2022_PROGRAM_ID,
     );
     let instance_ata = get_associated_token_address_with_program_id(
         &instance_pda,
-        &good_mint.pubkey(),
+        &mint.pubkey(),
         &TOKEN_2022_PROGRAM_ID,
     );
+    set_token_2022_with_hook_account(
+        &mut context,
+        &user_ata,
+        &mint.pubkey(),
+        &user.pubkey(),
+        DEPOSIT_AMOUNT,
+    );
+    set_token_2022_with_hook_account(&mut context, &instance_ata, &mint.pubkey(), &instance_pda, 0);
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+    let (event_authority_pda, _) = find_event_authority_pda();
 
     let instruction = DepositBuilder::new()
         .payer(context.payer.pubkey())
         .user(user.pubkey())
         .instance(instance_pda)
-        .mint(good_mint.pubkey())
+        .mint(mint.pubkey())
         .allowed_mint(allowed_mint_pda)
         .user_ata(user_ata)
         .instance_ata(instance_ata)
@@ -551,7 +620,111 @@ fn test_deposit_token_2022_transfer_hook_rejected() {
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
-    assert_program_error(result, TRANSFER_HOOK_NOT_ALLOWED_ERROR);
+    assert!(
+        result.is_err(),
+        "a hook mint must not transfer without its hook accounts"
+    );
+    assert_eq!(get_token_balance(&mut context, &instance_ata), 0);
+}
+
+// A hostile mint names the fee payer, which signs this transaction, as a
+// signer-bearing hook extra, and the fixture tries to move lamports out of
+// it. A client resolver forwards that account faithfully, so the only thing
+// between the payer and a drained wallet is the program stripping the
+// signer bit off every forwarded extra.
+//
+// The payer is the victim because it is the one account here that is both
+// writable and signing: a readonly signer like `user` reaches the hook
+// non-writable, so the drain would fail on writability and the test would
+// pass without the signer strip doing any work.
+#[test]
+fn test_deposit_rejects_signer_bearing_hook_extra() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let attacker = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+    let victim = context.payer.pubkey();
+
+    setup_malicious_hook_mint(&mut context, &mint.pubkey(), &victim, &attacker.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed for a transfer-hook mint");
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    set_token_2022_with_hook_account(
+        &mut context,
+        &user_ata,
+        &mint.pubkey(),
+        &user.pubkey(),
+        DEPOSIT_AMOUNT,
+    );
+    set_token_2022_with_hook_account(&mut context, &instance_ata, &mint.pubkey(), &instance_pda, 0);
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .add_remaining_accounts(&malicious_hook_extras(
+            &mint.pubkey(),
+            &victim,
+            &attacker.pubkey(),
+        ))
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    // Without the signer bit the hook's drain CPI is missing a required
+    // signature, which fails and takes the whole deposit down with it.
+    assert!(
+        result.is_err(),
+        "a hook abusing a forwarded signer must not settle"
+    );
+    assert_eq!(
+        context
+            .get_account(&attacker.pubkey())
+            .map(|account| account.lamports)
+            .unwrap_or(0),
+        0,
+        "the attacker must receive nothing"
+    );
 }
 
 #[test]
