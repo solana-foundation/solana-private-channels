@@ -972,24 +972,33 @@ mod tests {
             .unwrap();
     }
 
-    /// A block missing from the middle of the window is the replay hole: its
-    /// transactions named older hashes that are still live, so restoring without
-    /// it would let every one of them execute a second time.
+    /// A block missing from the middle is survivable by dropping everything at or
+    /// below it: those hashes leave the live set, so the transactions that named
+    /// them are refused as unknown before the cache is ever consulted.
     #[tokio::test(flavor = "multi_thread")]
-    async fn restart_refuses_an_interior_block_gap() {
+    async fn restart_restores_the_suffix_above_an_interior_block_gap() {
         let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
-        store_chain(&mut db, 5).await;
+        let chain = store_chain(&mut db, 5).await;
 
         delete_block(&db, 20).await;
 
-        let error = load_dedup_state(&db, 150)
+        let (live, _cache) = load_dedup_state(&db, 150)
             .await
-            .expect_err("a window with a hole must not restore")
-            .to_string();
-        assert!(
-            error.contains("height 3") && error.contains("height 1"),
-            "the error must name the heights either side of the hole, got {error:?}"
+            .expect("a gap below the tip must restore the suffix above it");
+
+        let restored: Vec<Hash> = live.into_iter().collect();
+        let expected: Vec<Hash> = chain[3..].iter().map(|b| b.blockhash).collect();
+        assert_eq!(
+            restored, expected,
+            "only the blocks above the hole must restore"
         );
+        for dropped in &chain[..3] {
+            assert!(
+                !restored.contains(&dropped.blockhash),
+                "a blockhash at or below the hole must not be live: {}",
+                dropped.blockhash
+            );
+        }
     }
 
     /// The newest rows going missing is invisible to the row query, which returns

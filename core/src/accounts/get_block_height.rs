@@ -53,6 +53,9 @@ async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64
 /// The upgrade fallback: the highest stored slot. Before the counters became
 /// independent every slot carried a block and the height was the slot, so this is
 /// the same answer without decoding a block payload on a hot read path.
+///
+/// The dedup restore refuses this substitute on purpose: it would answer for a
+/// counter deleted from a live ledger and wave a window through unproven.
 async fn last_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
     let pool = db.pool.clone();
 

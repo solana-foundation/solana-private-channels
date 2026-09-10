@@ -334,11 +334,11 @@ async fn a_blockhash_expires_after_max_blockhashes_blocks() -> Result<()> {
     Ok(())
 }
 
-/// A block row lost from the middle of the window must stop the node coming back
-/// up. Its transactions named older hashes that are still live, so a restore that
-/// skipped it would leave every one of them replayable.
+/// A block row lost from the middle of the window must not brick the node. It
+/// comes back on the blocks above the hole, and the hashes at or below it are
+/// gone from the live set, so nothing they held can be replayed.
 #[tokio::test(flavor = "multi_thread")]
-async fn restart_refuses_an_interior_block_gap() -> Result<()> {
+async fn restart_survives_an_interior_block_gap() -> Result<()> {
     let (mut node, pg_url, _pg) = start_node(150).await?;
     sleep(HEARTBEAT * 4).await;
     node.handles
@@ -360,15 +360,11 @@ async fn restart_refuses_an_interior_block_gap() -> Result<()> {
         .execute(&pool)
         .await?;
 
-    // Started directly rather than through the helper, which expects a node that
-    // comes up.
-    let error = match run_node(node_config(&pg_url, get_free_port(), 150)).await {
-        Ok(_) => panic!("the node must refuse to restore a window with a hole"),
-        Err(e) => e.to_string(),
-    };
+    let node = start_node_on(&pg_url, 150).await?;
+    let height = node.client.get_block_height().await?;
     assert!(
-        error.contains("dedup restore window has a gap"),
-        "the node must refuse over the missing block, got {error:?}"
+        node.client.get_latest_blockhash().await.is_ok(),
+        "the node must serve the restored window at height {height}"
     );
     Ok(())
 }
