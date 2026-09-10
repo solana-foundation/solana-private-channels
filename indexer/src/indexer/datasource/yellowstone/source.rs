@@ -22,6 +22,7 @@ use crate::error::{DataSourceError, DataSourceRpcError};
 use crate::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
 use crate::indexer::datasource::common::parser::withdraw::parse_withdraw_instruction;
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
+use crate::indexer::datasource::rpc_polling::decoder::targets_configured_instance;
 use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
 use crate::storage::Storage;
 
@@ -47,6 +48,8 @@ pub struct YellowstoneSource {
     escrow_instance_id: Option<Pubkey>,
     #[cfg(feature = "datasource-rpc")]
     rpc_poller: Option<Arc<RpcPoller>>,
+    #[cfg(feature = "datasource-rpc")]
+    fallback_rpc_poller: Option<Arc<RpcPoller>>,
     #[cfg(feature = "datasource-rpc")]
     max_gap_slots: u64,
     #[cfg(feature = "datasource-rpc")]
@@ -78,6 +81,8 @@ impl YellowstoneSource {
             #[cfg(feature = "datasource-rpc")]
             rpc_poller: None,
             #[cfg(feature = "datasource-rpc")]
+            fallback_rpc_poller: None,
+            #[cfg(feature = "datasource-rpc")]
             max_gap_slots: 0,
             #[cfg(feature = "datasource-rpc")]
             batch_size: 0,
@@ -105,10 +110,12 @@ impl YellowstoneSource {
     pub fn with_gap_detection(
         mut self,
         rpc_poller: Arc<RpcPoller>,
+        fallback_rpc_poller: Option<Arc<RpcPoller>>,
         max_gap_slots: u64,
         batch_size: usize,
     ) -> Self {
         self.rpc_poller = Some(rpc_poller);
+        self.fallback_rpc_poller = fallback_rpc_poller;
         self.max_gap_slots = max_gap_slots;
         self.batch_size = batch_size;
         self
@@ -172,6 +179,7 @@ async fn fill_reconnect_gap_to<F, Fut>(
     floor: Option<u64>,
     get_checkpoint: F,
     rpc_poller: &RpcPoller,
+    fallback_poller: Option<&RpcPoller>,
     max_gap_slots: u64,
     batch_size: usize,
     program_type: ProgramType,
@@ -271,6 +279,7 @@ where
 
         match fill_slot_range(
             rpc_poller,
+            fallback_poller,
             replay_anchor,
             target,
             batch_size,
@@ -304,6 +313,9 @@ where
 #[cfg(feature = "datasource-rpc")]
 struct ReconnectGapCtx {
     poller: Arc<RpcPoller>,
+    /// Re-fetches a slot the primary served in an unusable state. `None` disables the
+    /// failover, leaving the fill to hold the checkpoint until an operator repoints it.
+    fallback_poller: Option<Arc<RpcPoller>>,
     storage: Arc<Storage>,
     max_gap_slots: u64,
     batch_size: usize,
@@ -380,6 +392,7 @@ async fn arm_reconnect_gap(
     }
 
     let poller = ctx.poller.clone();
+    let fallback_poller = ctx.fallback_poller.clone();
     let storage = ctx.storage.clone();
     let program_type = ctx.program_type;
     let escrow_instance_id = ctx.escrow_instance_id;
@@ -394,6 +407,7 @@ async fn arm_reconnect_gap(
             floor_slot,
             || get_last_checkpoint(&storage, program_type),
             &poller,
+            fallback_poller.as_deref(),
             max_gap_slots,
             batch_size,
             program_type,
@@ -460,14 +474,16 @@ impl DataSource for YellowstoneSource {
         let endpoint = self.endpoint.clone();
         let x_token = self.x_token.clone();
         let program_type = self.program_type;
-        // Only the reconnect gap-fill (RPC path) still needs the instance id.
-        #[cfg(feature = "datasource-rpc")]
+        // Scopes the live parse to our own escrow instance, exactly as the RPC decoder does,
+        // and anchors the reconnect gap-fill.
         let escrow_instance_id = self.escrow_instance_id;
         let health = self.health.clone();
         let stall_timeout = self.stall_timeout;
 
         #[cfg(feature = "datasource-rpc")]
         let rpc_poller = self.rpc_poller.clone();
+        #[cfg(feature = "datasource-rpc")]
+        let fallback_rpc_poller = self.fallback_rpc_poller.clone();
         #[cfg(feature = "datasource-rpc")]
         let max_gap_slots = self.max_gap_slots;
         #[cfg(feature = "datasource-rpc")]
@@ -483,6 +499,7 @@ impl DataSource for YellowstoneSource {
             let gap_ctx_opt = match (rpc_poller, storage) {
                 (Some(poller), Some(storage)) => Some(ReconnectGapCtx {
                     poller,
+                    fallback_poller: fallback_rpc_poller,
                     storage,
                     max_gap_slots,
                     batch_size,
@@ -509,6 +526,7 @@ impl DataSource for YellowstoneSource {
                     x_token.clone(),
                     commitment_level,
                     program_type,
+                    escrow_instance_id,
                     tx.clone(),
                     cancellation_token.clone(),
                     health.as_ref(),
@@ -567,6 +585,7 @@ async fn connect_and_stream(
     x_token: Option<String>,
     commitment: CommitmentLevel,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     tx: InstructionSender,
     cancellation_token: CancellationToken,
     health: Option<&Arc<private_channel_metrics::HealthState>>,
@@ -760,7 +779,10 @@ async fn connect_and_stream(
 
                     // Fail-closed: any parse/send failure returns Err (reconnect + gap-fill
                     // replays the slot) and no SlotComplete is emitted for it.
-                    if let Err(e) = handle_block(block, &program_id, program_type, &tx).await {
+                    if let Err(e) =
+                        handle_block(block, &program_id, program_type, escrow_instance_id, &tx)
+                            .await
+                    {
                         error!("Error handling block: {}", e);
                         return Err(DataSourceError::Rpc(e));
                     }
@@ -800,6 +822,7 @@ async fn connect_and_stream(
 mod tests {
     use super::*;
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+    use crate::test_utils::escrow_fixtures::deposit_ix_bytes as escrow_deposit_ix_bytes;
     use crate::test_utils::rpc_mocks::mock_get_blocks;
     use mockito::Server;
     use serde_json::json;
@@ -882,6 +905,7 @@ mod tests {
     fn test_gap_ctx(server: &Server, storage: Arc<Storage>, max_gap_slots: u64) -> ReconnectGapCtx {
         ReconnectGapCtx {
             poller: Arc::new(test_poller(server)),
+            fallback_poller: None,
             storage,
             max_gap_slots,
             batch_size: 10,
@@ -910,6 +934,7 @@ mod tests {
             None,
             checkpoint_ok(100),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -948,6 +973,7 @@ mod tests {
             None,
             checkpoint_ok(100),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -987,6 +1013,7 @@ mod tests {
                 None,
                 checkpoint_absent(),
                 &poller,
+                None,
                 1000,
                 10,
                 ProgramType::Escrow,
@@ -1038,6 +1065,7 @@ mod tests {
             None,
             checkpoint_ok(0),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -1090,6 +1118,7 @@ mod tests {
             None,
             get_checkpoint,
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -1144,6 +1173,7 @@ mod tests {
                 None,
                 checkpoint_ok(100),
                 &poller,
+                None,
                 1000,
                 10,
                 ProgramType::Escrow,
@@ -1208,6 +1238,7 @@ mod tests {
                 None,
                 checkpoint_ok(100),
                 &poller,
+                None,
                 10,
                 10,
                 ProgramType::Escrow,
@@ -1258,6 +1289,7 @@ mod tests {
                 None,
                 get_checkpoint,
                 &poller,
+                None,
                 1000,
                 10,
                 ProgramType::Escrow,
@@ -1432,6 +1464,7 @@ mod tests {
                     Some(100),
                     checkpoint_shared(checkpoint),
                     &poller,
+                    None,
                     10,
                     10,
                     ProgramType::Escrow,
@@ -1500,6 +1533,7 @@ mod tests {
             Some(100),
             checkpoint_ok(10),
             &poller,
+            None,
             1000,
             10,
             ProgramType::Escrow,
@@ -1743,7 +1777,7 @@ mod tests {
         let tx_update = withdraw_tx_update(signature.clone(), &program_id, 2);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -1777,7 +1811,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -1821,7 +1855,7 @@ mod tests {
         });
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, &tx)
+        handle_transaction(tx_update, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -1954,7 +1988,7 @@ mod tests {
             escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &escrow, ProgramType::Escrow, &tx)
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2033,7 +2067,7 @@ mod tests {
         );
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_transaction(tx_update, &escrow, ProgramType::Escrow, &tx)
+        handle_transaction(tx_update, &escrow, ProgramType::Escrow, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2087,7 +2121,7 @@ mod tests {
         let block = block_update(500, vec![tx_a, tx_b]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2126,7 +2160,7 @@ mod tests {
         let block = block_update(700, vec![]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2154,7 +2188,7 @@ mod tests {
         let block = block_update(800, vec![foreign]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2193,7 +2227,7 @@ mod tests {
         let block = block_update(900, vec![bad]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, None, &tx).await;
         assert!(res.is_err(), "a malformed tx must fail the block");
         drop(tx);
 
@@ -2220,7 +2254,7 @@ mod tests {
         let block = block_update(1000, vec![tx]);
 
         let (chan, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &chan)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &chan)
             .await
             .unwrap();
         drop(chan);
@@ -2255,7 +2289,7 @@ mod tests {
         let block = block_update(1100, vec![failed]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        handle_block(block, &program_id, ProgramType::Withdraw, &tx)
+        handle_block(block, &program_id, ProgramType::Withdraw, None, &tx)
             .await
             .unwrap();
         drop(tx);
@@ -2290,7 +2324,7 @@ mod tests {
         let block = block_update(1200, vec![no_meta]);
 
         let (tx, mut rx) = mpsc::channel(8);
-        let res = handle_block(block, &program_id, ProgramType::Withdraw, &tx).await;
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, None, &tx).await;
         assert!(res.is_err(), "a tx without meta must fail the block");
         drop(tx);
 
@@ -2302,6 +2336,159 @@ mod tests {
         }
         assert!(!saw_complete, "slot must not complete when a tx lacks meta");
     }
+
+    /// A deposit belonging to someone else's escrow instance must be skipped, not fail the
+    /// block. The RPC gap-fill that recovers a failed block filters foreign instances out
+    /// before parsing, so failing here would tear the stream down for a slot the recovery
+    /// path then completes without objection: reconnect, recover, hit the next foreign
+    /// deposit, forever. The same block still fails closed when it is in scope, which is
+    /// what makes this a scope check rather than a hole.
+    #[tokio::test]
+    async fn foreign_instance_undecodable_deposit_is_skipped_not_failed() {
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        let mut account_keys: Vec<Vec<u8>> = (0u8..12)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0] = i + 1;
+                b.to_vec()
+            })
+            .collect();
+        account_keys[0] = escrow.to_bytes().to_vec();
+        let in_scope_instance = Pubkey::try_from(account_keys[1].as_slice()).unwrap();
+
+        // A foreign top-level instruction that CPIs one escrow deposit.
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: vec![],
+        }];
+        // The deposit carries no DepositEvent in its subtree, so the parser cannot resolve
+        // an amount for it. This is the runbook's "cause 1", the realistic trigger.
+        let inner_set = vec![proto::InnerInstructions {
+            index: 0,
+            instructions: vec![proto::InnerInstruction {
+                program_id_index: 0,
+                accounts: (0u8..12).collect(),
+                data: escrow_deposit_ix_bytes(1000, None),
+                stack_height: Some(2),
+            }],
+        }];
+
+        let foreign_block = block_update(
+            1400,
+            vec![escrow_tx_update(
+                vec![9u8; 64],
+                account_keys.clone(),
+                top.clone(),
+                inner_set.clone(),
+                vec![],
+                vec![],
+            )
+            .transaction
+            .unwrap()],
+        );
+
+        // Out of scope: skipped, and the slot completes so the stream keeps running.
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_block(
+            foreign_block,
+            &escrow,
+            ProgramType::Escrow,
+            Some(Pubkey::new_unique()),
+            &tx,
+        )
+        .await
+        .expect("a foreign instance's undecodable deposit must not fail the block");
+        drop(tx);
+
+        let mut completed = false;
+        let mut indexed = 0;
+        while let Some(message) = rx.recv().await {
+            match message {
+                ProcessorMessage::SlotComplete { .. } => completed = true,
+                ProcessorMessage::Instruction(_) => indexed += 1,
+                ProcessorMessage::Regate { .. } => panic!("no Regate expected here"),
+            }
+        }
+        assert!(completed, "an out-of-scope slot must still complete");
+        assert_eq!(indexed, 0, "a foreign instance's deposit is never indexed");
+
+        // In scope: the same block fails closed.
+        let in_scope_block = block_update(
+            1400,
+            vec![
+                escrow_tx_update(vec![9u8; 64], account_keys, top, inner_set, vec![], vec![])
+                    .transaction
+                    .unwrap(),
+            ],
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        let res = handle_block(
+            in_scope_block,
+            &escrow,
+            ProgramType::Escrow,
+            Some(in_scope_instance),
+            &tx,
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "an in-scope undecodable deposit must still fail the block"
+        );
+    }
+
+    /// An instruction the indexer claims to support but cannot decode leaves the slot's
+    /// contents unknown, so the whole block fails closed and the slot is not completed.
+    /// Dropping it instead would checkpoint past a real on-chain action nothing indexed,
+    /// and the reconnect gap-fill would never come back for it.
+    #[tokio::test]
+    async fn block_undecodable_instruction_errs_without_completing() {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        // A WithdrawFunds carrying only its discriminator: the parser recognizes it and
+        // fails on the missing borsh body.
+        let mut tx_info = withdraw_tx_update(vec![9u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        tx_info
+            .transaction
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .instructions[0]
+            .data = vec![0u8];
+        let block = block_update(1300, vec![tx_info]);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = handle_block(block, &program_id, ProgramType::Withdraw, None, &tx).await;
+        assert!(
+            res.is_err(),
+            "an undecodable supported instruction must fail the block"
+        );
+        drop(tx);
+
+        let mut saw_complete = false;
+        let mut saw_instruction = false;
+        while let Some(message) = rx.recv().await {
+            match message {
+                ProcessorMessage::SlotComplete { .. } => saw_complete = true,
+                ProcessorMessage::Instruction(_) => saw_instruction = true,
+                ProcessorMessage::Regate { .. } => panic!("no Regate expected here"),
+            }
+        }
+        assert!(
+            !saw_complete,
+            "slot must not complete when an instruction will not decode"
+        );
+        assert!(
+            !saw_instruction,
+            "no instruction may be emitted from a block that failed to decode"
+        );
+    }
 }
 
 /// Parse all of the block's transactions, then send SlotComplete last so a completion never
@@ -2310,12 +2497,21 @@ async fn handle_block(
     block: yellowstone_grpc_proto::geyser::SubscribeUpdateBlock,
     program_id: &Pubkey,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
     let slot = block.slot;
 
     for tx_info in block.transactions {
-        handle_transaction_info(tx_info, slot, program_id, program_type, channel).await?;
+        handle_transaction_info(
+            tx_info,
+            slot,
+            program_id,
+            program_type,
+            escrow_instance_id,
+            channel,
+        )
+        .await?;
     }
 
     send_guaranteed(
@@ -2338,6 +2534,7 @@ async fn handle_transaction(
     tx_update: yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
     program_id: &Pubkey,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
     let slot = tx_update.slot;
@@ -2348,7 +2545,15 @@ async fn handle_transaction(
             reason: "Missing transaction info".to_string(),
         })?;
 
-    handle_transaction_info(tx_info, slot, program_id, program_type, channel).await
+    handle_transaction_info(
+        tx_info,
+        slot,
+        program_id,
+        program_type,
+        escrow_instance_id,
+        channel,
+    )
+    .await
 }
 
 async fn handle_transaction_info(
@@ -2356,6 +2561,7 @@ async fn handle_transaction_info(
     slot: u64,
     program_id: &Pubkey,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
     // A tx without meta cannot be proven successful or in scope (it loses its revert status,
@@ -2442,6 +2648,16 @@ async fn handle_transaction_info(
     let mut account_keys = static_keys;
     account_keys.extend(loaded_pubkeys);
 
+    // Scope to our own escrow instance before parsing anything, matching the RPC decoder.
+    // Without this the live stream fails the block on a foreign instance's undecodable
+    // instruction while the gap-fill that recovers the slot skips that transaction
+    // outright, so the stream would tear down and reconnect on every one of them.
+    if let Some(instance_id) = escrow_instance_id {
+        if !account_keys.contains(&instance_id) {
+            return Ok(());
+        }
+    }
+
     info!(
         "Yellowstone received transaction at slot {}, signature: {}, {} instructions",
         slot,
@@ -2477,6 +2693,7 @@ async fn handle_transaction_info(
             &inner_instructions_vec,
             location,
             program_type,
+            escrow_instance_id,
             slot,
             &signature,
             channel,
@@ -2509,6 +2726,7 @@ async fn handle_transaction_info(
                 &inner_instructions_vec,
                 location,
                 program_type,
+                escrow_instance_id,
                 slot,
                 &signature,
                 channel,
@@ -2556,66 +2774,82 @@ async fn parse_and_send(
     inner_instructions: &[InnerInstructions],
     location: InstructionLocation,
     program_type: ProgramType,
+    escrow_instance_id: Option<Pubkey>,
     slot: u64,
     signature: &str,
     channel: &InstructionSender,
 ) -> Result<(), DataSourceRpcError> {
-    let instruction_data = match program_type {
+    let parsed = match program_type {
         ProgramType::Escrow => {
-            match parse_escrow_instruction(compiled_ix, account_keys, inner_instructions, location)
-            {
-                Ok(Some(inst)) => Some(ProgramInstruction::Escrow(Box::new(inst))),
-                Ok(None) => {
-                    debug!("Yellowstone: Unsupported escrow instruction at slot {slot}");
-                    None
-                }
-                Err(e) => {
-                    error!("Failed to parse escrow instruction at slot {slot}: {e}");
-                    None
-                }
-            }
+            parse_escrow_instruction(compiled_ix, account_keys, inner_instructions, location)
+                .map(|parsed| parsed.map(|inst| ProgramInstruction::Escrow(Box::new(inst))))
         }
         ProgramType::Withdraw => {
-            match parse_withdraw_instruction(
-                compiled_ix,
-                account_keys,
-                inner_instructions,
-                location,
-            ) {
-                Ok(Some(inst)) => Some(ProgramInstruction::Withdraw(Box::new(inst))),
-                Ok(None) => {
-                    debug!("Yellowstone: Unsupported withdraw instruction at slot {slot}");
-                    None
-                }
-                Err(e) => {
-                    error!("Failed to parse withdraw instruction at slot {slot}: {e}");
-                    None
-                }
-            }
+            parse_withdraw_instruction(compiled_ix, account_keys, inner_instructions, location)
+                .map(|parsed| parsed.map(|inst| ProgramInstruction::Withdraw(Box::new(inst))))
         }
     };
 
-    if let Some(instruction_data) = instruction_data {
-        let instruction_meta = InstructionWithMetadata {
-            instruction: instruction_data,
-            slot,
-            program_type,
-            signature: Some(signature.to_string()),
-            // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
-            instruction_index: location.top_level_index,
-            inner_index: location.inner.map(|i| i.inner_index),
-        };
+    let inner_index = location.inner.map(|inner| inner.inner_index);
+    let instruction_data = match parsed {
+        Ok(Some(instruction_data)) => instruction_data,
+        Ok(None) => {
+            debug!("Yellowstone: unsupported {program_type:?} instruction at slot {slot}");
+            return Ok(());
+        }
+        // A discriminator we support that will not decode leaves this slot's contents
+        // unknown. Failing the block here skips its SlotComplete, so the checkpoint holds
+        // and the reconnect gap-fill replays the slot over RPC.
+        //
+        // Counted under its own label rather than `parse_failed`, because the two need
+        // different responses. `parse_failed` means the checkpoint is stuck and nothing is
+        // being indexed. Here the gap-fill usually decodes the slot from an endpoint with
+        // fuller metadata, so no data is lost and the checkpoint keeps moving; what is wrong
+        // is that a systematic cause (a feed that cannot express CPI stack heights) makes
+        // this recur per block, so the stream tears down continuously and contributes
+        // nothing while RPC quietly does its job. That is worth knowing about, but it is not
+        // an emergency, and paging `parse_failed` for it would cry wolf on a healthy slot.
+        Err(e) => {
+            if !targets_configured_instance(compiled_ix, account_keys, escrow_instance_id.as_ref())
+            {
+                debug!("Yellowstone: skipped undecodable instruction for a foreign instance");
+                return Ok(());
+            }
+            error!(
+                "Slot {slot} transaction {signature} instruction {} (inner {inner_index:?}) will not decode: {e}; refusing to complete the slot",
+                location.top_level_index
+            );
+            metrics::INDEXER_RPC_ERRORS
+                .with_label_values(&[program_type.as_label(), "parse_failed_stream"])
+                .inc();
+            return Err(DataSourceRpcError::Protocol {
+                reason: format!(
+                    "slot {slot} transaction {signature} instruction {} will not decode: {e}",
+                    location.top_level_index
+                ),
+            });
+        }
+    };
 
-        send_guaranteed(
-            channel,
-            ProcessorMessage::Instruction(instruction_meta),
-            "instruction (yellowstone)",
-        )
-        .await
-        .map_err(|e| DataSourceRpcError::Protocol {
-            reason: format!("Instruction send failed: {e}"),
-        })?;
-    }
+    let instruction_meta = InstructionWithMetadata {
+        instruction: instruction_data,
+        slot,
+        program_type,
+        signature: Some(signature.to_string()),
+        // A Solana tx holds at most a few hundred instructions, far below u32/i32 max, so this cast cannot wrap.
+        instruction_index: location.top_level_index,
+        inner_index,
+    };
+
+    send_guaranteed(
+        channel,
+        ProcessorMessage::Instruction(instruction_meta),
+        "instruction (yellowstone)",
+    )
+    .await
+    .map_err(|e| DataSourceRpcError::Protocol {
+        reason: format!("Instruction send failed: {e}"),
+    })?;
 
     Ok(())
 }

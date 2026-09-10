@@ -127,6 +127,10 @@ path = "tests/indexer/yellowstone_reconnect_gap.rs"
 name = "reconnect_gap_fill_fail_closed"
 path = "tests/indexer/reconnect_gap_fill_fail_closed.rs"
 
+[[test]]
+name = "rpc_polling_fail_closed"
+path = "tests/indexer/rpc_polling_fail_closed.rs"
+
 # Startup anchor persisted by `run` before the Yellowstone stream starts.
 [[test]]
 name = "startup_anchor"
