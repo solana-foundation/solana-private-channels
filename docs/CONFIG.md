@@ -20,7 +20,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--sigverify-queue-size` | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded queue between dedup and sigverify |
 | `--ingress-queue-capacity` | `PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY` | `10000` | Bounded RPC→dedup queue; a full queue sheds (`sendTransaction` returns `-32003`, retryable) and increments `rpc_ingress_shed_total` |
 | `--sequencer-queue-capacity` | `PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY` | `1000` | Bounded sigverify→sequencer queue; a full queue applies upstream backpressure |
-| `--execution-results-capacity` | `PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY` | `1000` | Bounded executor→settler queue; a full queue applies upstream backpressure. The settler also stops draining once a tick's buffered account bytes reach an internal budget, so the queue is bounded by bytes as well as depth |
+| `--execution-results-capacity` | `PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY` | `1000` | Bounded queue from the executor to the settler; a full queue applies upstream backpressure. Also bounded by an internal in-flight byte budget, and the settler stops draining once a tick's buffered account bytes reach a budget of their own |
 | `--max-tx-per-batch` | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
 | `--max-connections` | `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
 | `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Tick interval (ms). A block is produced only when the tick carried transactions or the 1s idle heartbeat came due, and the slot it lands on counts every tick since the last block |

@@ -8,7 +8,7 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::{retained_bytes_of, AccountSettlements, ExecutedBatch},
+        stages::{retained_bytes_of, AccountSettlements, ExecutedBatch, WeightBudget},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
@@ -123,6 +123,9 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
         )
         .await;
 
+        // Stage-private: nothing outside the executor takes from this budget.
+        let results_budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+
         let mut total_transactions_executed = 0u64;
         let mut total_batches_processed = 0u64;
 
@@ -161,6 +164,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                                 execution_result.admin_transactions,
                                 execution_result.admin_generation,
                                 MAX_SEND_CHUNK_BYTES,
+                                &results_budget,
                                 &metrics,
                             )
                             .await
@@ -188,6 +192,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                                 execution_result.regular_transactions,
                                 execution_result.regular_generation,
                                 MAX_SEND_CHUNK_BYTES,
+                                &results_budget,
                                 &metrics,
                             )
                             .await
@@ -329,12 +334,28 @@ pub(crate) const MAX_SEND_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 /// A chunk must never exceed the settler budget it is measured against.
 const _: () = assert!(MAX_SEND_CHUNK_BYTES <= crate::stages::MAX_BUFFERED_SETTLE_BYTES);
 
+/// Cap on retained account bytes sent to the settler but not yet received.
+/// Two whole chunks, so the executor can hand one over while the settler still
+/// holds the previous one and ordinary traffic never waits on the budget.
+pub(crate) const MAX_IN_FLIGHT_RESULT_BYTES: usize = 2 * MAX_SEND_CHUNK_BYTES;
+
+/// A chunk that could not fit the budget would wait for room that never comes.
+const _: () = assert!(MAX_SEND_CHUNK_BYTES <= MAX_IN_FLIGHT_RESULT_BYTES);
+
 /// Outcome of a settler send. There is no shutdown variant: abandoning a send
 /// would discard a batch that has already executed and already mutated the
 /// in-memory accounts, and the settler is still draining when this stage exits.
 pub(crate) enum SendOutcome {
     Sent,
     ChannelClosed,
+}
+
+/// One chunk of a batch: where it starts and ends, and the account bytes it
+/// retains. Carrying the byte sum out means the send path can take its share of
+/// the in-flight budget without walking every account a second time.
+struct ChunkRange {
+    range: std::ops::Range<usize>,
+    bytes: usize,
 }
 
 /// Where to split a batch, as end-exclusive index ranges over its transactions.
@@ -344,7 +365,7 @@ fn chunk_ranges_by_bytes(
     results: &[TransactionProcessingResult],
     transactions: &[SanitizedTransaction],
     cap: usize,
-) -> Vec<std::ops::Range<usize>> {
+) -> Vec<ChunkRange> {
     // A length mismatch is the settler's error to report, so send the batch whole.
     if results.len() != transactions.len() {
         return Vec::new();
@@ -355,14 +376,20 @@ fn chunk_ranges_by_bytes(
     for (index, (result, transaction)) in results.iter().zip(transactions.iter()).enumerate() {
         let bytes = retained_bytes_of(result, transaction);
         if index > start && buffered + bytes > cap {
-            ranges.push(start..index);
+            ranges.push(ChunkRange {
+                range: start..index,
+                bytes: buffered,
+            });
             start = index;
             buffered = 0;
         }
         buffered += bytes;
     }
     if start < results.len() {
-        ranges.push(start..results.len());
+        ranges.push(ChunkRange {
+            range: start..results.len(),
+            bytes: buffered,
+        });
     }
     ranges
 }
@@ -404,14 +431,32 @@ async fn send_results_chunked(
     transactions: Vec<SanitizedTransaction>,
     generation: u64,
     cap: usize,
+    budget: &WeightBudget,
     metrics: &SharedMetrics,
 ) -> SendOutcome {
     let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
     if ranges.len() <= 1 {
-        return match send_one(results_tx, (output, transactions, generation)).await {
+        // Empty only when the batch is empty or its lengths disagree, and the
+        // settler rejects the latter on arrival, so nothing is left unweighed.
+        let weight = ranges.first().map_or(0, |chunk| chunk.bytes);
+        let Some(permit) = budget.acquire(weight, results_tx).await else {
+            record_unsent(&transactions, &[], metrics);
+            return SendOutcome::ChannelClosed;
+        };
+        return match send_one(
+            results_tx,
+            ExecutedBatch {
+                output,
+                transactions,
+                generation,
+                permit,
+            },
+        )
+        .await
+        {
             Ok(()) => SendOutcome::Sent,
-            Err((_, transactions, _)) => {
-                record_unsent(&transactions, &[], metrics);
+            Err(batch) => {
+                record_unsent(&batch.transactions, &[], metrics);
                 SendOutcome::ChannelClosed
             }
         };
@@ -431,8 +476,8 @@ async fn send_results_chunked(
 
     let last = ranges.len() - 1;
     let mut sent = 0usize;
-    for (position, range) in ranges.iter().enumerate() {
-        let take = range.end - range.start;
+    for (position, chunk_range) in ranges.iter().enumerate() {
+        let take = chunk_range.range.end - chunk_range.range.start;
         let (error_metrics, execute_timings, balance_collector) =
             head.take().unwrap_or_else(|| {
                 (
@@ -450,16 +495,33 @@ async fn send_results_chunked(
         let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
         // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
         let chunk_generation = if position == last { generation } else { 0 };
-        match send_one(results_tx, (chunk, chunk_transactions, chunk_generation)).await {
+        let Some(permit) = budget.acquire(chunk_range.bytes, results_tx).await else {
+            if sent > 0 {
+                metrics.executor_results_sent(sent);
+            }
+            record_unsent(&chunk_transactions, &transactions, metrics);
+            return SendOutcome::ChannelClosed;
+        };
+        match send_one(
+            results_tx,
+            ExecutedBatch {
+                output: chunk,
+                transactions: chunk_transactions,
+                generation: chunk_generation,
+                permit,
+            },
+        )
+        .await
+        {
             Ok(()) => sent += take,
-            Err((_, chunk_transactions, _)) => {
+            Err(batch) => {
                 // Report what actually landed; the caller only counts a whole batch.
                 if sent > 0 {
                     metrics.executor_results_sent(sent);
                 }
                 // The chunks still undrained never left either, so they belong
                 // in the same record as the one that just failed.
-                record_unsent(&chunk_transactions, &transactions, metrics);
+                record_unsent(&batch.transactions, &transactions, metrics);
                 return SendOutcome::ChannelClosed;
             }
         }
@@ -1223,16 +1285,28 @@ mod tests {
             assert_eq!(ranges.len(), expected_chunks, "chunk count for {}", name);
 
             let mut next = 0usize;
-            for r in &ranges {
-                assert_eq!(r.start, next, "gap or overlap in {}", name);
-                assert!(r.end > r.start, "empty chunk in {}", name);
-                next = r.end;
+            for chunk in &ranges {
+                assert_eq!(chunk.range.start, next, "gap or overlap in {}", name);
+                assert!(
+                    chunk.range.end > chunk.range.start,
+                    "empty chunk in {}",
+                    name
+                );
+                next = chunk.range.end;
             }
             assert_eq!(next, sizes.len(), "chunks must cover every tx in {}", name);
 
-            for r in &ranges {
-                if r.end - r.start > 1 {
-                    let bytes = retained_account_bytes(&results[r.clone()], &txs[r.clone()]);
+            for chunk in &ranges {
+                let range = chunk.range.clone();
+                // The sender takes its budget from this sum instead of walking
+                // the accounts again, so it has to match what that walk finds.
+                let bytes = retained_account_bytes(&results[range.clone()], &txs[range]);
+                assert_eq!(
+                    chunk.bytes, bytes,
+                    "reported bytes disagree with the batch in {}",
+                    name
+                );
+                if chunk.range.end - chunk.range.start > 1 {
                     assert!(bytes <= cap, "chunk over cap in {}: {}", name, bytes);
                 }
             }
@@ -1251,13 +1325,22 @@ mod tests {
         // Each transaction alone exceeds the cap, so this splits into three.
         let (results, txs) = sized_batch(&[5000, 5000, 5000]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let outcome =
-            send_results_chunked(&chan_tx, output_of(results), txs, 42, cap, &metrics).await;
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            42,
+            cap,
+            &budget,
+            &metrics,
+        )
+        .await;
         assert!(matches!(outcome, SendOutcome::Sent));
 
         let mut gens = Vec::new();
-        while let Ok((_, _, g)) = rx.try_recv() {
-            gens.push(g);
+        while let Ok(batch) = rx.try_recv() {
+            gens.push(batch.generation);
         }
         assert_eq!(
             gens,
@@ -1269,12 +1352,13 @@ mod tests {
         let (results, txs) = sized_batch(&[10, 10]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
         let outcome =
-            send_results_chunked(&chan_tx, output_of(results), txs, 7, cap, &metrics).await;
+            send_results_chunked(&chan_tx, output_of(results), txs, 7, cap, &budget, &metrics)
+                .await;
         assert!(matches!(outcome, SendOutcome::Sent));
 
         let mut gens = Vec::new();
-        while let Ok((_, _, g)) = rx.try_recv() {
-            gens.push(g);
+        while let Ok(batch) = rx.try_recv() {
+            gens.push(batch.generation);
         }
         assert_eq!(gens, vec![7], "an unsplit batch stays one message");
     }
@@ -1313,6 +1397,7 @@ mod tests {
             txs,
             1,
             MAX_SEND_CHUNK_BYTES,
+            &WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES),
             &metrics,
         )
         .await;
@@ -1325,32 +1410,129 @@ mod tests {
     }
 
     /// A split batch fails partway. The chunks that never went are just as
-    /// executed and just as uncommitted as the one whose send failed.
-    #[tokio::test]
+    /// executed and just as uncommitted as the one whose send failed, whichever
+    /// of the two limits the executor happened to be parked on.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_channel_mid_chunk_records_the_remainder() {
         let _guard = DISCARD_METRIC_LOCK.lock().await;
         let metrics: SharedMetrics = Arc::new(PrometheusMetrics);
-        let before = discarded_total();
 
-        // One transaction per chunk, and room for only the first.
-        let (results, txs) = sized_batch(&[5000, 5000, 5000]);
-        let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(1);
-        // The receiver never drains, so the second chunk parks. Closing it then
-        // is what the settler does when it gives up mid-handover.
-        let closer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            drop(rx);
+        // Every row splits into three chunks with room for only the first: on
+        // the first the depth is what fills, on the second the byte budget.
+        let cases: [(&str, usize, usize, usize); 2] = [
+            ("parked on queue depth", 1, MAX_IN_FLIGHT_RESULT_BYTES, 5000),
+            ("parked on the byte budget", 16, 1000, 900),
+        ];
+
+        for (name, capacity, total, bytes) in cases {
+            let before = discarded_total();
+            let (results, txs) = sized_batch(&[bytes; 3]);
+            let (chan_tx, rx) = mpsc::channel::<ExecutedBatch>(capacity);
+            let budget = WeightBudget::new(total);
+            // The receiver never drains, so the second chunk parks. Closing it
+            // then is what the settler does when it gives up mid-handover.
+            let closer = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                drop(rx);
+            });
+            let outcome = send_results_chunked(
+                &chan_tx,
+                output_of(results),
+                txs,
+                9,
+                1000,
+                &budget,
+                &metrics,
+            )
+            .await;
+
+            assert!(matches!(outcome, SendOutcome::ChannelClosed), "{}", name);
+            assert_eq!(
+                discarded_total() - before,
+                2.0,
+                "the failed chunk and the undrained remainder must both be recorded, {}",
+                name
+            );
+            let _ = closer.await;
+        }
+    }
+
+    /// Bytes, not messages, are what park the executor: a 16-slot channel has
+    /// room for both chunks and the second still waits. The settler returns the
+    /// weight by receiving, without touching the permit itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chunk_parks_on_bytes_and_the_receive_returns_them() {
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let (results, txs) = sized_batch(&[600, 600]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let budget = Arc::new(WeightBudget::new(1000));
+
+        let sender = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move {
+                send_results_chunked(
+                    &chan_tx,
+                    output_of(results),
+                    txs,
+                    3,
+                    1000,
+                    &budget,
+                    &metrics,
+                )
+                .await
+            }
         });
-        let outcome =
-            send_results_chunked(&chan_tx, output_of(results), txs, 9, 1000, &metrics).await;
 
-        assert!(matches!(outcome, SendOutcome::ChannelClosed));
-        assert_eq!(
-            discarded_total() - before,
-            2.0,
-            "the failed chunk and the undrained remainder must both be recorded"
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(rx.len(), 1, "only the first chunk got through");
+        assert!(
+            !sender.is_finished(),
+            "the second chunk waits on bytes: the 16 slots are not the limit"
         );
-        let _ = closer.await;
+
+        drop(rx.recv().await.expect("first chunk"));
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the freed bytes must unpark the second chunk")
+            .expect("second chunk");
+        drop(second);
+
+        assert!(matches!(sender.await.unwrap(), SendOutcome::Sent));
+        assert_eq!(
+            budget.available(),
+            1000,
+            "every permit comes back with its message"
+        );
+    }
+
+    /// The weight is the retained account bytes of what is being sent, so one
+    /// unsplit message can take far more of the budget than one slot's worth.
+    #[tokio::test]
+    async fn an_unsplit_batch_takes_its_retained_bytes() {
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let (results, txs) = sized_batch(&[300, 400]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let budget = WeightBudget::new(1000);
+
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            1,
+            1000,
+            &budget,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+        assert_eq!(
+            budget.available(),
+            300,
+            "the queued message holds all 700 of its retained bytes"
+        );
+
+        drop(rx.recv().await.expect("the one message"));
+        assert_eq!(budget.available(), 1000);
     }
 
     /// A token-like data account (program-owned, non-empty data) with `lamports`.
