@@ -2,12 +2,17 @@ mod mint;
 mod proof;
 mod remint;
 mod state;
+#[cfg(test)]
+mod test_support;
 mod transaction;
 pub mod types;
 
-pub use mint::{enumerate_consumed_mints, ConsumedMintKind, ConsumedSet, JitOutcome};
+pub use mint::{
+    enumerate_consumed_mints, find_existing_mint_signature_with_memo, ConsumedMintKind,
+    ConsumedSet, JitOutcome,
+};
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
-pub(crate) use state::{validate_smt_root, verify_release_landed, ReleaseVerdict};
+pub(crate) use state::{validate_bitmap_consistency, verify_release_landed, ReleaseVerdict};
 pub use types::TransactionStatusUpdate;
 
 #[cfg(any(test, feature = "test-mock-storage"))]
@@ -21,7 +26,6 @@ pub mod test_hooks {
 
     pub use super::remint::DeferredRemintOutcome;
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new_sender_state(
         config: &PrivateChannelIndexerConfig,
         operator_commitment: CommitmentLevel,
@@ -76,7 +80,7 @@ pub mod test_hooks {
         state: &SenderState,
         entry: super::types::PendingRemint,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-    ) -> super::remint::DeferredRemintOutcome {
+    ) -> DeferredRemintOutcome {
         super::remint::execute_deferred_remint(state, entry, storage_tx).await
     }
 
@@ -89,16 +93,6 @@ pub mod test_hooks {
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
     ) {
         super::transaction::poll_in_flight(state, storage_tx).await
-    }
-
-    /// Drives one `drain_rotation_retry_queue` pass. Classifies each queued
-    /// tree-mismatched withdrawal as future (requeue), matched (rebuild+submit),
-    /// or stale (escalate to ManualReview).
-    pub async fn drain_rotation_retry_queue(
-        state: &mut SenderState,
-        storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-    ) {
-        super::drain_rotation_retry_queue(state, storage_tx).await
     }
 
     /// Drives `handle_confirmation_result` end-to-end. Used by tests
@@ -159,67 +153,51 @@ pub mod test_hooks {
         .await
     }
 
-    /// Drives one `fire_and_store_task` for a deposit-mint fire. Acquires a
-    /// permit from the sender's semaphore, then builds, claims + persists, and
-    /// broadcasts. Lets tests pin the ownership-claim routing (abort vs
-    /// broadcast) without the sender loop. Returns `false` if the semaphore was
-    /// already at capacity.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_fire_and_store_task(
-        state: &SenderState,
-        instruction: super::types::InstructionWithSigners,
-        compute_unit_price: Option<u64>,
-        ctx: super::types::TransactionContext,
-        retry_policy: crate::operator::utils::instruction_util::RetryPolicy,
-        extra_error_checks_policy: crate::operator::utils::instruction_util::ExtraErrorCheckPolicy,
+    /// Drives a whole submission: builds the instruction and then sends and
+    /// confirms it. This is the only path that binds a rotation to a generation,
+    /// so it is what a re-arm has to be driven through.
+    pub async fn submit_transaction(
+        state: &mut SenderState,
+        tx_builder: TransactionBuilder,
         storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
-        durability: super::types::SendDurability,
-    ) -> bool {
-        let Ok(permit) = Arc::clone(&state.semaphore).try_acquire_owned() else {
-            return false;
-        };
-        super::transaction::fire_and_store_task(
-            state.rpc_client.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            state.program_type,
-            instruction,
-            compute_unit_price,
-            ctx,
-            retry_policy,
-            extra_error_checks_policy,
-            storage_tx.clone(),
-            durability,
-            permit,
-        )
-        .await;
-        true
+    ) {
+        super::transaction::handle_transaction_submission(state, tx_builder, storage_tx).await
+    }
+
+    /// Drives one pass of the rotation driver: reads what is still unreleased,
+    /// compares it against the chain, and arms a rotation if one is owed.
+    pub async fn originate_rotation_if_needed(state: &mut SenderState) {
+        super::proof::originate_rotation_if_needed(state).await
+    }
+
+    /// Takes an armed rotation once the in-flight barrier allows it, which is
+    /// what the periodic tick does before submitting one.
+    pub async fn take_pending_rotation_if_ready(
+        state: &mut SenderState,
+    ) -> Option<Box<private_channel_escrow_program_client::instructions::RotateBitmapBuilder>> {
+        super::proof::take_pending_rotation_if_ready(state).await
     }
 }
 
-use crate::channel_utils::send_guaranteed;
 use crate::error::OperatorError;
-use crate::operator::tree_constants::MAX_TREE_LEAVES;
-use crate::operator::utils::instruction_util::TransactionBuilder;
-use crate::operator::ReleaseFundsBuilderWithNonce;
+use crate::operator::utils::instruction_util::{
+    ExtraErrorCheckPolicy, RetryPolicy, TransactionBuilder,
+};
 use crate::operator::RpcClientWithRetry;
-use crate::storage::common::models::TransactionStatus;
 use crate::storage::common::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use crate::ProgramType;
-use chrono::Utc;
+use private_channel_metrics::MetricLabel;
 use solana_sdk::commitment_config::CommitmentLevel;
-use std::cmp::Ordering;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
-use private_channel_metrics::MetricLabel;
-use proof::cleanup_failed_transaction;
+use proof::{originate_rotation_if_needed, take_pending_rotation_if_ready};
 use transaction::{
-    drive_pending_rotation, handle_transaction_submission, poll_in_flight, route_poll_results,
-    run_poll_task,
+    handle_transaction_submission, poll_in_flight, route_poll_results, run_poll_task,
+    send_and_confirm, GenerationWindow,
 };
 use types::{PollTaskResult, SenderState};
 
@@ -229,6 +207,12 @@ use types::{PollTaskResult, SenderState};
 /// small-integer advisory locks on a shared database.
 const ESCROW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_45_53_43_52; // "SND_ESCR"
 const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
+
+/// How often the driver asks whether a rotation is owed. A generation covers
+/// tens of thousands of nonces, so this is slow on purpose: the cost of a late
+/// rotation is one interval of extra wait for withdrawals that are already
+/// parked, and the cost of a fast one is a database read on every tick forever.
+const ROTATION_ORIGINATION_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the sender re-proves it owns its advisory lock.
 ///
@@ -250,7 +234,7 @@ pub fn sender_lock_key(program_type: ProgramType) -> i64 {
 /// Sends transactions to the blockchain and updates their status
 ///
 /// Receives TransactionBuilder (either ReleaseFunds or Mint) from processor,
-/// completes with SMT proofs if needed, submits to blockchain, and handles failures
+/// submits to blockchain, and handles failures
 #[allow(clippy::too_many_arguments)]
 pub async fn run_sender(
     config: &PrivateChannelIndexerConfig,
@@ -313,21 +297,13 @@ pub async fn run_sender(
     // next tick
     state.recover_pending_remints(&storage_tx).await?;
 
-    // Re-arm the tree rotation this operator still owes, if a crash left one behind.
-    state.rearm_owed_rotation().await?;
+    // Periodic check for pending rotation (every 500ms)
+    let mut rotation_check_interval = interval(Duration::from_millis(500));
 
-    // Deferred remints and the two retry queues (every 500ms)
-    let mut queue_check_interval = interval(Duration::from_millis(500));
-
-    // Rotation cadence, deliberately slower than the queue tick: an owed reset is
-    // retried until the chain reaches its target, each attempt costs an on-chain tree
-    // index read, and 500ms would hammer a failing RPC. A rotation with no in-flight
-    // releases is submitted straight off the processor arm, so this paces one queued
-    // behind in-flight work, plus its retries.
-    let mut rotation_interval = interval(Duration::from_secs(5));
-    // Never burst through missed ticks: after the loop blocks in a long send, a
-    // catch-up burst would collapse the pacing back to a spin.
-    rotation_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Rotation is needed once per generation of nonces, so the check that starts
+    // one runs far more slowly than the one that submits it. The slower cadence
+    // also paces re-origination after a rotation has used up its send budget.
+    let mut rotation_origination_interval = interval(ROTATION_ORIGINATION_INTERVAL);
 
     // Channel for the poll task to deliver batched confirmation results back to the sender loop.
     let (poll_result_tx, mut poll_result_rx) = mpsc::channel(32);
@@ -407,19 +383,21 @@ pub async fn run_sender(
                 }
             }
 
-            _ = rotation_interval.tick() => {
-                // Submit or retry the rotation the sender owes the chain
-                drive_pending_rotation(&mut state, &storage_tx).await;
+            _ = rotation_origination_interval.tick() => {
+                originate_rotation_if_needed(&mut state).await;
             }
 
-            _ = queue_check_interval.tick() => {
+            _ = rotation_check_interval.tick() => {
+                // Check if pending rotation can now be executed
+                if let Some(rotation_builder) = take_pending_rotation_if_ready(&mut state).await {
+                    info!("Executing queued RotateBitmap transaction");
+                    let tx_builder = TransactionBuilder::RotateBitmap(rotation_builder);
+                    handle_transaction_submission(&mut state, tx_builder, &storage_tx).await;
+                }
+
                 // Process matured deferred remints
                 remint::process_pending_remints(&mut state, &storage_tx).await;
 
-                // Retry withdrawals parked while an ambiguous nonce blocked their tree
-                drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
-
-                // Retry withdrawals blocked by a tree-index mismatch after rotation
                 drain_rotation_retry_queue(&mut state, &storage_tx).await;
             }
 
@@ -455,156 +433,114 @@ pub async fn run_sender(
     Ok(())
 }
 
-/// Retry withdrawals blocked by a tree-index mismatch after a rotation.
-/// Drains a snapshot, not the live queue: a still-mismatched item is requeued
-/// for a later tick, never re-popped in this pass (the live queue would spin).
+/// Retry withdrawals refused for a generation that had not opened yet: one
+/// attempt per entry per tick, and none while a rotation is still queued.
+///
+/// Every entry here has a `Parked` row behind it, so each one is taken back with
+/// a CAS before it is broadcast. Only a positive answer authorises the send: an
+/// unparked row belongs to someone else now, and an unreadable one says nothing
+/// about who owns it.
 pub(super) async fn drain_rotation_retry_queue(
     state: &mut SenderState,
     storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
 ) {
-    for (ctx, builder) in std::mem::take(&mut state.rotation_retry_queue) {
-        let nonce = ctx
-            .withdrawal_nonce
-            .expect("rotation retry must have nonce");
-        let Some(current_tree_index) = state.smt_state.as_ref().map(|s| s.smt_state.tree_index())
-        else {
-            // No local SMT (not expected here); keep it for the next tick.
-            state.rotation_retry_queue.push((ctx, builder));
+    for (ctx, instruction) in std::mem::take(&mut state.rotation_retry_queue) {
+        let Some(transaction_id) = ctx.transaction_id else {
+            error!("Dropping a queued release that carries no row to unpark");
             continue;
         };
-        let expected_tree_index = nonce / MAX_TREE_LEAVES as u64;
 
-        match expected_tree_index.cmp(&current_tree_index) {
-            // Stale: tree rotated past this nonce; retrying can never succeed.
-            // Never broadcast, so the release never landed: scrub state and
-            // escalate to ManualReview (runbook: withdrawal_manual_review).
-            Ordering::Less => {
-                let Some(transaction_id) = ctx.transaction_id else {
-                    error!(
-                        "Stale rotation retry for nonce {} has no transaction_id; skipping escalation",
-                        nonce
-                    );
-                    continue;
-                };
-                warn!(
-                    "Stale rotation retry: nonce {} belongs to tree {} but sender is on {} - escalating to ManualReview",
-                    nonce, expected_tree_index, current_tree_index
+        // Read before any CAS, so an entry the drain cannot act on strands no row mid-transition.
+        let Some(nonce) = ctx.withdrawal_nonce else {
+            error!(
+                transaction_id,
+                "Dropping a queued release that names no nonce; leaving its row for recovery"
+            );
+            continue;
+        };
+
+        if state.pending_rotation.is_some() {
+            hold_queued_release(state, ctx, instruction, transaction_id).await;
+            continue;
+        }
+
+        // The rotation this entry waits on can be lost, and a send into a shut window pays a fee to be refused.
+        let (window, chain_generation) = state.release_window(nonce).await;
+        match window {
+            GenerationWindow::Open => {}
+            GenerationWindow::NotYetOpen => {
+                hold_queued_release(state, ctx, instruction, transaction_id).await;
+                continue;
+            }
+            // No rotation reopens this window, so holding the row only starves the sweep that would settle it.
+            GenerationWindow::Closed => {
+                error!(
+                    nonce,
+                    chain_generation,
+                    transaction_id,
+                    "Queued release belongs to a generation the bitmap has rotated past; \
+                     leaving its parked row for recovery"
                 );
-                cleanup_failed_transaction(state, Some(nonce));
-                send_guaranteed(
-                    storage_tx,
-                    TransactionStatusUpdate {
-                        transaction_id,
-                        trace_id: ctx.trace_id.clone(),
-                        status: TransactionStatus::ManualReview,
-                        counterpart_signature: None,
-                        processed_at: Some(Utc::now()),
-                        error_message: Some(format!(
-                            "stale tree index: nonce {} belongs to tree {}, sender on {}; release can never land on current SMT",
-                            nonce, expected_tree_index, current_tree_index
-                        )),
-                        remint_signature: None,
-                        remint_attempted: false,
-                        release_signatures: None,
-                    },
-                    "transaction status update",
-                )
-                .await
-                .ok();
-            }
-            // Future: local tree hasn't reached this nonce's tree; requeue and wait.
-            Ordering::Greater => {
-                state.rotation_retry_queue.push((ctx, builder));
-            }
-            // Tree caught up: rebuild and submit.
-            Ordering::Equal => {
-                let transaction_id = ctx
-                    .transaction_id
-                    .expect("rotation retry must have transaction_id");
-                let trace_id = ctx
-                    .trace_id
-                    .clone()
-                    .expect("rotation retry must have trace_id");
-                let remint_info = state.remint_cache.get(&nonce).cloned();
-                if remint_info.is_none() {
-                    error!("Missing remint_info for rotation retry nonce {} - remint will not be possible on failure", nonce);
-                }
-                // Nothing was written to the row while it waited on the rotation,
-                // so the lease held for this nonce is still the live token.
-                let Some(fetched_updated_at) = state.release_leases.get(&nonce).copied() else {
-                    error!(
-                        transaction_id,
-                        nonce,
-                        "No ownership lease held for rotation retry; leaving row Processing for recovery"
-                    );
-                    continue;
-                };
-                info!(trace_id = %trace_id, "Retrying blocked nonce {} after rotation", nonce);
-                let tx_builder =
-                    TransactionBuilder::ReleaseFunds(Box::new(ReleaseFundsBuilderWithNonce {
-                        builder,
-                        nonce,
-                        transaction_id,
-                        trace_id,
-                        remint_info,
-                        fetched_updated_at,
-                    }));
-                handle_transaction_submission(state, tx_builder, storage_tx).await;
+                continue;
             }
         }
+
+        match state.storage.try_unpark_to_processing(transaction_id).await {
+            // The park heartbeat and this unpark both bumped the row, so the token
+            // the entry arrived with is dead; carry the one we just won.
+            Ok(Some(lease)) => {
+                state.release_leases.insert(nonce, lease);
+            }
+            // Another actor took the row, so this sender no longer owns the
+            // work and must stop rather than broadcast it a second time.
+            Ok(None) => {
+                warn!(
+                    transaction_id,
+                    "Queued release is no longer parked; another actor owns it now"
+                );
+                continue;
+            }
+            // Not knowing who owns the row is not permission to send. The row is
+            // still parked, so the entry simply waits for a tick that can read it.
+            Err(e) => {
+                warn!(transaction_id, "Could not unpark the queued release: {e}");
+                state.rotation_retry_queue.push((ctx, instruction));
+                continue;
+            }
+        }
+
+        info!(
+            trace_id = ctx.trace_id.as_deref().unwrap_or("none"),
+            "Retrying blocked nonce {} after rotation", nonce
+        );
+        // Back in flight from here, so a queued rotation waits on it.
+        state.in_flight_withdrawals.insert(nonce);
+        let compute_unit_price = instruction.compute_unit_price;
+        // The same policies `TransactionBuilder::ReleaseFunds` reports.
+        send_and_confirm(
+            state,
+            instruction,
+            compute_unit_price,
+            &ctx,
+            RetryPolicy::Idempotent,
+            &ExtraErrorCheckPolicy::None,
+            storage_tx,
+        )
+        .await;
     }
 }
 
-/// Retry withdrawals parked while an ambiguous nonce blocked their tree.
-/// Call after process_pending_remints, which may have cleared the blocker.
-pub(super) async fn drain_ambiguous_retry_queue(
+/// Keep waiting on a queued release, refreshing its park so recovery does not take work this sender still holds.
+async fn hold_queued_release(
     state: &mut SenderState,
-    storage_tx: &mpsc::Sender<TransactionStatusUpdate>,
+    ctx: types::TransactionContext,
+    instruction: types::InstructionWithSigners,
+    transaction_id: i64,
 ) {
-    // Take the whole queue and walk the copy; the real queue starts empty and
-    // anything still blocked goes back in for the next tick. Each parked builder
-    // carries its own remint_info, so there is nothing to look up.
-    for builder_with_nonce in std::mem::take(&mut state.ambiguous_retry_queue) {
-        let tree = builder_with_nonce.nonce / MAX_TREE_LEAVES as u64;
-
-        // Still blocked: re-write Parked each tick so updated_at stays fresh,
-        // which tells recovery a live sender still owns this row.
-        if state.has_unresolved_ambiguous_nonce(tree) {
-            let id = builder_with_nonce.transaction_id;
-            if let Err(e) = state.storage.try_park_processing(id).await {
-                warn!(transaction_id = id, "Re-park heartbeat write failed: {e}");
-            }
-            state.ambiguous_retry_queue.push(builder_with_nonce);
-            continue;
-        }
-
-        // Unblocked: flip the row back to Processing, then send it.
-        let id = builder_with_nonce.transaction_id;
-        match state.storage.try_unpark_to_processing(id).await {
-            // We won the flip, the row is ours to send.
-            Ok(Some(lease)) => {
-                // The park heartbeat and this unpark both bumped the row, so the
-                // token the builder arrived with is dead; carry the one we just won.
-                let mut builder_with_nonce = builder_with_nonce;
-                builder_with_nonce.fetched_updated_at = lease;
-                let tx_builder = TransactionBuilder::ReleaseFunds(builder_with_nonce);
-                handle_transaction_submission(state, tx_builder, storage_tx).await;
-            }
-            // Row is no longer Parked: recovery already requeued it, so another
-            // path owns this nonce now. Drop our copy to avoid sending twice.
-            Ok(None) => {
-                warn!(
-                    transaction_id = id,
-                    "Unpark CAS no-op; dropping stale parked builder"
-                )
-            }
-            // DB hiccup: keep it and try again next tick.
-            Err(e) => {
-                warn!(transaction_id = id, "Unpark write failed: {e}; re-queuing");
-                state.ambiguous_retry_queue.push(builder_with_nonce);
-            }
-        }
+    if let Err(e) = state.storage.try_park_processing(transaction_id).await {
+        warn!(transaction_id, "Could not refresh the park: {e}");
     }
+    state.rotation_retry_queue.push((ctx, instruction));
 }
 
 /// Wait for all in-flight fire-and-forget transactions to reach a terminal state.
@@ -658,94 +594,32 @@ mod tests {
     use super::*;
     use crate::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
     use crate::config::{PostgresConfig, ProgramType, StorageType};
+    use crate::operator::sender::test_support::{
+        mock_with_parked_row, mock_with_processing_row, row_status, row_updated_at,
+        sender_state as make_sender_state, sender_state_with_storage,
+    };
     use crate::operator::sender::types::{
-        InFlightQueue, InFlightTx, InstructionWithSigners, PendingRemint, SenderSMTState,
-        SenderState, TransactionContext, MAX_IN_FLIGHT,
+        InFlightTx, InstructionWithSigners, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
-        ExtraErrorCheckPolicy, ReleaseFundsBuilderWithNonce, RetryPolicy, SourceEventId,
-        WithdrawalRemintInfo,
+        ExtraErrorCheckPolicy, RetryPolicy, TransactionKind,
     };
-    use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
-    use crate::operator::utils::smt_util::SmtState;
-    use crate::operator::MintCache;
-    use crate::storage::common::amount::TokenAmount;
-    use crate::storage::common::models::{DbTransaction, TransactionStatus, TransactionType};
+    use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::PrivateChannelIndexerConfig;
-    use chrono::Utc;
-    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
     use solana_keychain::Signer;
-    use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
+    use solana_sdk::commitment_config::CommitmentLevel;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::{mpsc, Semaphore};
     use tokio_util::sync::CancellationToken;
-
-    static INIT_TEST_SIGNER: std::sync::Once = std::sync::Once::new();
-
-    /// The submission path resolves the admin signer eagerly, so any test that
-    /// drives it needs one configured before the process-wide Lazy is forced.
-    fn ensure_test_signer() {
-        INIT_TEST_SIGNER.call_once(|| {
-            let kp = solana_sdk::signer::keypair::Keypair::new();
-            let b58 = bs58::encode(kp.to_bytes()).into_string();
-            std::env::set_var("ADMIN_SIGNER", "memory");
-            std::env::set_var("ADMIN_PRIVATE_KEY", &b58);
-        });
-    }
-
-    fn make_sender_state(rpc_url: &str) -> SenderState {
-        let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
-            rpc_url.to_string(),
-            RetryConfig {
-                max_attempts: 1,
-                base_delay: std::time::Duration::from_millis(1),
-                max_delay: std::time::Duration::from_millis(1),
-            },
-            CommitmentConfig::confirmed(),
-        ));
-        SenderState {
-            rpc_client: rpc_client.clone(),
-            source_rpc_client: rpc_client.clone(),
-            fallback_rpc_client: None,
-            storage: storage.clone(),
-            instance_pda: None,
-            smt_state: None,
-            retry_counts: HashMap::new(),
-            mint_builders: HashMap::new(),
-            mint_cache: MintCache::new(storage),
-            retry_max_attempts: 3,
-            confirmation_poll_interval_ms: 1,
-            rotation_retry_queue: Vec::new(),
-            ambiguous_retry_queue: Vec::new(),
-            pending_rotation: None,
-            program_type: ProgramType::Escrow,
-            remint_cache: HashMap::new(),
-            pending_signatures: HashMap::new(),
-            release_leases: HashMap::new(),
-            pending_remints: Vec::new(),
-            in_flight: InFlightQueue::new(),
-            semaphore: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-        }
-    }
-
-    /// Local SMT pinned to `tree_index`, so a test can pick the mismatch direction
-    /// against a queued nonce (test config: MAX_TREE_LEAVES = 8, so tree = nonce / 8).
-    fn smt_at(tree_index: u64) -> SenderSMTState {
-        SenderSMTState {
-            smt_state: SmtState::new(tree_index),
-            nonce_to_builder: HashMap::new(),
-        }
-    }
 
     fn make_in_flight_tx(txn_id: i64) -> InFlightTx {
         InFlightTx {
             signature: Signature::new_unique(),
             ctx: TransactionContext {
+                kind: TransactionKind::Mint,
                 transaction_id: Some(txn_id),
                 withdrawal_nonce: None,
                 trace_id: None,
@@ -810,7 +684,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
-            Duration::from_secs(5),
+            SENDER_LOCK_HEARTBEAT_INTERVAL,
         )
         .await;
 
@@ -844,11 +718,408 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
-            Duration::from_secs(5),
+            SENDER_LOCK_HEARTBEAT_INTERVAL,
         )
         .await;
 
         assert!(result.is_ok());
+    }
+
+    // ── drain_rotation_retry_queue ────────────────────────────────────
+
+    /// Script a node that accepts the broadcast, refuses it with the generation
+    /// error, and reports a bitmap still one generation behind the nonce.
+    ///
+    /// That is exactly the state a queued withdrawal is retried into before its
+    /// rotation lands, which is the case the drain has to survive.
+    async fn mock_generation_refusal(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "blockhash": "11111111111111111111111111111111",
+                            "lastValidBlockHeight": 1000
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "slot": 10,
+                            "confirmations": null,
+                            "err": {"InstructionError": [0, {"Custom": 13}]},
+                            "status": {"Err": {"InstructionError": [0, {"Custom": 13}]}},
+                            "confirmationStatus": "finalized"
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        crate::operator::sender::test_support::mock_bitmap_account(server, 0, &[]);
+
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    // The client rejects a reply carrying another signature.
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await
+    }
+
+    /// The row every queued release in these tests belongs to.
+    const QUEUED_ROW: i64 = 70;
+
+    /// A `sendTransaction` route that must never be taken, behind a blockhash
+    /// route that works, so the send would go through if anything let it.
+    async fn expect_no_broadcast(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getLatestBlockhash""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "blockhash": "11111111111111111111111111111111",
+                            "lastValidBlockHeight": 1000
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string(),
+            )
+            .expect(0)
+            .create_async()
+            .await
+    }
+
+    fn queued_release(nonce: u64) -> (TransactionContext, InstructionWithSigners) {
+        (
+            TransactionContext {
+                kind: TransactionKind::ReleaseFunds,
+                transaction_id: Some(QUEUED_ROW),
+                withdrawal_nonce: Some(nonce),
+                trace_id: Some("trace-70".to_string()),
+                deposit_claim_lease: None,
+            },
+            InstructionWithSigners {
+                instructions: vec![],
+                fee_payer: Pubkey::new_unique(),
+                signers: Vec::<&'static Signer>::new(),
+                compute_unit_price: None,
+                compute_budget: None,
+            },
+        )
+    }
+
+    /// A withdrawal the program refuses goes straight back on the queue, so a
+    /// drain that reads the live queue re-sends the same nonce over and over
+    /// within one tick and pays a fee for every refusal. One tick must cost one
+    /// attempt per entry, whatever the rejection handler does behind it.
+    #[tokio::test]
+    async fn rotation_retry_drain_gives_each_entry_one_attempt_per_tick() {
+        let mut server = mockito::Server::new_async().await;
+        let send = mock_generation_refusal(&mut server).await;
+
+        // Inside the window the bitmap reports, so the send happens and its refusal is what the entry survives.
+        let nonce = 5;
+        let mut state = sender_state_with_storage(&server.url(), mock_with_parked_row(QUEUED_ROW));
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(nonce));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            1,
+            "a still-blocked withdrawal must wait for the next tick"
+        );
+        assert_eq!(
+            state.retry_counts.get(&nonce).copied().unwrap_or(0),
+            0,
+            "a refusal we already expected must not spend the withdrawal's retries"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a queued withdrawal has no terminal outcome yet"
+        );
+    }
+
+    /// A lost rotation releases the drain's only hold, and each tick then pays a fee per entry for a certain refusal.
+    #[tokio::test]
+    async fn rotation_retry_drain_holds_an_entry_whose_window_has_not_opened() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        crate::operator::sender::test_support::mock_bitmap_account(&mut server, 0, &[]);
+
+        let nonce = crate::operator::bitmap_constants::NONCES_PER_GENERATION;
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let before = row_updated_at(&mock, QUEUED_ROW).expect("seeded row");
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(nonce));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            1,
+            "the entry still waits for the window to open"
+        );
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "a release that was never sent must stay parked"
+        );
+        assert!(
+            row_updated_at(&mock, QUEUED_ROW).expect("row still present") > before,
+            "a held entry must keep its row fresh or recovery will take it"
+        );
+    }
+
+    /// A window the chain rotated past never reopens, so holding the row only keeps recovery from settling it.
+    #[tokio::test]
+    async fn rotation_retry_drain_releases_an_entry_whose_window_has_closed() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+        crate::operator::sender::test_support::mock_bitmap_account(&mut server, 2, &[]);
+
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(7));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert!(
+            state.rotation_retry_queue.is_empty(),
+            "an entry no rotation can unblock must stop being held"
+        );
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "the row is left where the recovery sweep can find it"
+        );
+    }
+
+    /// An entry with no nonce must be caught before the row moves, or the sender dies leaving it mid-transition.
+    #[tokio::test]
+    async fn rotation_retry_drain_drops_an_entry_that_names_no_nonce() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let (mut ctx, instruction) = queued_release(7);
+        ctx.withdrawal_nonce = None;
+        state.rotation_retry_queue.push((ctx, instruction));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert!(state.rotation_retry_queue.is_empty());
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "the row must not be left mid-transition"
+        );
+    }
+
+    /// The drain takes the row back before it broadcasts. Sending first would
+    /// put a release on chain for a row this sender may no longer own.
+    ///
+    /// The refusal that follows the send would normally re-park the row, so the
+    /// re-park is armed to fail here and the row's final state still shows the
+    /// unpark that preceded the broadcast.
+    #[tokio::test]
+    async fn rotation_retry_drain_unparks_before_it_sends() {
+        let mut server = mockito::Server::new_async().await;
+        let send = mock_generation_refusal(&mut server).await;
+
+        // Inside the window, so the drain reaches the broadcast under test.
+        let nonce = 5;
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        mock.set_should_fail("try_park_processing", true);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(nonce));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Processing),
+            "the row must be taken back out of Parked before the broadcast"
+        );
+    }
+
+    /// `Ok(false)` means the row is no longer parked, so another actor owns it.
+    /// Broadcasting anyway would send work this sender has already lost.
+    #[tokio::test]
+    async fn rotation_retry_drain_drops_an_entry_it_no_longer_owns() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+
+        // A Processing row: recovery or another sender already took it back.
+        let mock = mock_with_processing_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage(&server.url(), mock);
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(7));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert!(
+            state.rotation_retry_queue.is_empty(),
+            "a lost lease must drop the entry, not resend it"
+        );
+    }
+
+    /// An unreadable ownership answer is not permission to send. The row is
+    /// still parked durably, so the entry waits for a tick that can read it.
+    #[tokio::test]
+    async fn rotation_retry_drain_keeps_an_entry_whose_unpark_errored() {
+        let mut server = mockito::Server::new_async().await;
+        let send = expect_no_broadcast(&mut server).await;
+
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        mock.set_should_fail("try_unpark_to_processing", true);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.rotation_retry_queue.push(queued_release(7));
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert_eq!(
+            state.rotation_retry_queue.len(),
+            1,
+            "an unreadable answer retries next tick rather than sending"
+        );
+        assert_eq!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "the durable copy is untouched by a failed read"
+        );
+    }
+
+    /// A rotation wait can outlast the stale threshold. Without the per-tick
+    /// refresh the recovery sweep ages the row out and requeues it to Pending
+    /// underneath an entry this sender still holds.
+    #[tokio::test]
+    async fn rotation_retry_drain_refreshes_the_park_while_it_holds_an_entry() {
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let before = row_updated_at(&mock, QUEUED_ROW).expect("seeded row");
+        let mut state = sender_state_with_storage("http://localhost:8899", mock.clone());
+        state.rotation_retry_queue.push(queued_release(7));
+        state.pending_rotation = Some(pending_rotation_builder());
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        assert_eq!(state.rotation_retry_queue.len(), 1);
+        assert!(
+            row_updated_at(&mock, QUEUED_ROW).expect("row still present") > before,
+            "a held entry must keep its row fresh or recovery will take it"
+        );
+    }
+
+    fn pending_rotation_builder(
+    ) -> Box<private_channel_escrow_program_client::instructions::RotateBitmapBuilder> {
+        let mut builder =
+            private_channel_escrow_program_client::instructions::RotateBitmapBuilder::new();
+        let pk = Pubkey::new_unique();
+        builder
+            .payer(pk)
+            .operator(pk)
+            .instance(pk)
+            .withdrawal_bitmap(pk)
+            .operator_pda(pk)
+            .expected_generation(0);
+        Box::new(builder)
+    }
+
+    /// A queued rotation is what the blocked withdrawals are waiting on.
+    #[tokio::test]
+    async fn rotation_retry_drain_holds_entries_while_a_rotation_is_queued() {
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage("http://localhost:8899", mock);
+        state.rotation_retry_queue.push(queued_release(7));
+        state.pending_rotation = Some(pending_rotation_builder());
+
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        assert_eq!(state.rotation_retry_queue.len(), 1);
+        assert!(state.in_flight_withdrawals.is_empty());
     }
 
     // ── drain_in_flight ───────────────────────────────────────────────
@@ -919,416 +1190,6 @@ mod tests {
         assert_eq!(
             remaining, 1,
             "unresolved entry must still be in in_flight after timeout"
-        );
-    }
-
-    // ── drain_ambiguous_retry_queue ──────────────────────────────────
-
-    /// A `Parked` withdrawal row as the drain finds it in the DB.
-    fn make_parked_withdrawal_row(id: i64, nonce: u64) -> DbTransaction {
-        let now = Utc::now();
-        DbTransaction {
-            id,
-            signature: format!("sig-{id}"),
-            trace_id: format!("trace-{id}"),
-            slot: 100,
-            initiator: Pubkey::new_unique().to_string(),
-            recipient: Pubkey::new_unique().to_string(),
-            mint: Pubkey::new_unique().to_string(),
-            amount: TokenAmount(1_000),
-            memo: None,
-            transaction_type: TransactionType::Withdrawal,
-            withdrawal_nonce: Some(nonce as i64),
-            status: TransactionStatus::Parked,
-            created_at: now,
-            updated_at: now,
-            processed_at: None,
-            counterpart_signature: None,
-            remint_signatures: None,
-            remint_last_valid_block_heights: None,
-            pending_remint_deadline_at: None,
-            finality_check_attempts: 0,
-            recovery_requeue_attempts: 0,
-            instruction_index: 0,
-            inner_index: None,
-            landed_remint_signature: None,
-        }
-    }
-
-    /// A parked withdrawal whose blocker is still unresolved must be put back in
-    /// the queue, not sent. Proves the snapshot drain neither loops nor drops it.
-    #[tokio::test]
-    async fn drain_reparks_while_blocker_unresolved() {
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // Blocker: nonce 2 (tree 0) still in pending_remints.
-        state.pending_remints.push(PendingRemint {
-            ctx: TransactionContext {
-                transaction_id: Some(1),
-                withdrawal_nonce: Some(2),
-                trace_id: Some("t".to_string()),
-                deposit_claim_lease: None,
-            },
-            remint_info: WithdrawalRemintInfo {
-                transaction_id: 1,
-                source_event_id: crate::operator::instruction_util::SourceEventId::new(
-                    "remint-sig-1",
-                    0,
-                    None,
-                ),
-                trace_id: "t".to_string(),
-                mint: Pubkey::new_unique(),
-                user: Pubkey::new_unique(),
-                user_ata: Pubkey::new_unique(),
-                token_program: spl_token::id(),
-                amount: 1000,
-            },
-            signatures: vec![],
-            original_error: "x".to_string(),
-            deadline: Utc::now(),
-            finality_check_attempts: 0,
-        });
-
-        // Parked withdrawal nonce 3, same tree.
-        state
-            .ambiguous_retry_queue
-            .push(Box::new(ReleaseFundsBuilderWithNonce {
-                builder: ReleaseFundsBuilder::new(),
-                nonce: 3,
-                transaction_id: 99,
-                trace_id: "trace-99".to_string(),
-                remint_info: None,
-                fetched_updated_at: chrono::Utc::now(),
-            }));
-
-        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
-
-        assert_eq!(
-            state.ambiguous_retry_queue.len(),
-            1,
-            "still-blocked withdrawal must re-park"
-        );
-        assert_eq!(state.ambiguous_retry_queue[0].nonce, 3);
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "no status update while re-parked"
-        );
-    }
-
-    /// Unblocked, but the unpark CAS loses (no Parked row in the DB, e.g. recovery
-    /// already requeued it). The builder must be dropped, not sent, so the nonce
-    /// is not submitted twice.
-    #[tokio::test]
-    async fn drain_drops_builder_when_unpark_cas_loses() {
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // No blocker → unblocked. The mock has no row for this id, so the unpark
-        // CAS returns Ok(false).
-        state
-            .ambiguous_retry_queue
-            .push(Box::new(ReleaseFundsBuilderWithNonce {
-                builder: ReleaseFundsBuilder::new(),
-                nonce: 5,
-                transaction_id: 500,
-                trace_id: "t".to_string(),
-                remint_info: None,
-                fetched_updated_at: chrono::Utc::now(),
-            }));
-
-        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
-
-        assert!(
-            state.ambiguous_retry_queue.is_empty(),
-            "builder must be dropped when the unpark CAS loses"
-        );
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "dropped builder emits no status update"
-        );
-    }
-
-    /// The park heartbeat and the unpark both bump the row, so a parked builder's
-    /// arrival token is dead by the time it is sent. The unpark CAS hands back the
-    /// incarnation the sender now owns, and that is the lease the release claim
-    /// must present: the arrival token no longer claims anything.
-    #[tokio::test]
-    async fn unpark_refreshes_release_lease() {
-        ensure_test_signer();
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, _storage_rx) = mpsc::channel(10);
-        // Local SMT on tree 0 and a nonce in tree 1, so the unparked builder stops
-        // at the tree-index mismatch instead of reaching an RPC this test has none of.
-        let nonce = MAX_TREE_LEAVES as u64;
-        state.smt_state = Some(smt_at(0));
-
-        let arrival_token = Utc::now() - chrono::Duration::minutes(10);
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        let mut row = make_parked_withdrawal_row(7, nonce);
-        row.updated_at = arrival_token;
-        mock.pending_transactions.lock().unwrap().push(row);
-
-        state
-            .ambiguous_retry_queue
-            .push(Box::new(ReleaseFundsBuilderWithNonce {
-                builder: ReleaseFundsBuilder::new(),
-                nonce,
-                transaction_id: 7,
-                trace_id: "trace-7".to_string(),
-                remint_info: None,
-                fetched_updated_at: arrival_token,
-            }));
-
-        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
-
-        let lease = state
-            .release_leases
-            .get(&nonce)
-            .copied()
-            .expect("an unparked withdrawal holds a lease");
-        assert_ne!(
-            lease, arrival_token,
-            "the unpark must replace the token the builder arrived with"
-        );
-
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        assert!(
-            mock.claim_and_persist_signature(7, arrival_token, "stale".to_string(), 1, None)
-                .await
-                .unwrap()
-                .is_none(),
-            "the arrival token is dead after park + unpark"
-        );
-        assert!(
-            mock.claim_and_persist_signature(7, lease, "fresh".to_string(), 1, None)
-                .await
-                .unwrap()
-                .is_some(),
-            "the lease carried out of the unpark is the claimable incarnation"
-        );
-    }
-
-    /// While the blocker is unresolved, the drain re-writes Parked each tick and
-    /// refreshes updated_at. That freshness is what keeps recovery from treating
-    /// a live parked row as a restart orphan.
-    #[tokio::test]
-    async fn drain_heartbeats_parked_row_while_blocked() {
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // Blocker: nonce 2 (tree 0) unresolved.
-        state.pending_remints.push(PendingRemint {
-            ctx: TransactionContext {
-                transaction_id: Some(1),
-                withdrawal_nonce: Some(2),
-                trace_id: Some("t".to_string()),
-                deposit_claim_lease: None,
-            },
-            remint_info: WithdrawalRemintInfo {
-                transaction_id: 1,
-                source_event_id: crate::operator::instruction_util::SourceEventId::new(
-                    "remint-sig-1",
-                    0,
-                    None,
-                ),
-                trace_id: "t".to_string(),
-                mint: Pubkey::new_unique(),
-                user: Pubkey::new_unique(),
-                user_ata: Pubkey::new_unique(),
-                token_program: spl_token::id(),
-                amount: 1000,
-            },
-            signatures: vec![],
-            original_error: "x".to_string(),
-            deadline: Utc::now(),
-            finality_check_attempts: 0,
-        });
-
-        // Parked withdrawal nonce 3 (same tree). Seed its DB row as stale Parked.
-        let stale = Utc::now() - chrono::Duration::minutes(10);
-        if let Storage::Mock(mock) = &*state.storage {
-            let mut row = make_parked_withdrawal_row(3, 3);
-            row.created_at = stale;
-            row.updated_at = stale;
-            mock.pending_transactions.lock().unwrap().push(row);
-        }
-        state
-            .ambiguous_retry_queue
-            .push(Box::new(ReleaseFundsBuilderWithNonce {
-                builder: ReleaseFundsBuilder::new(),
-                nonce: 3,
-                transaction_id: 3,
-                trace_id: "trace-3".to_string(),
-                remint_info: None,
-                fetched_updated_at: chrono::Utc::now(),
-            }));
-
-        drain_ambiguous_retry_queue(&mut state, &storage_tx).await;
-
-        // Still blocked: builder re-queued.
-        assert_eq!(state.ambiguous_retry_queue.len(), 1);
-        assert_eq!(state.ambiguous_retry_queue[0].nonce, 3);
-
-        // Heartbeat fired: row still Parked, updated_at refreshed.
-        if let Storage::Mock(mock) = &*state.storage {
-            let rows = mock.pending_transactions.lock().unwrap();
-            assert_eq!(rows[0].status, TransactionStatus::Parked);
-            assert!(
-                rows[0].updated_at > stale,
-                "heartbeat must refresh updated_at"
-            );
-        }
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "heartbeat is a direct CAS, not a status update"
-        );
-    }
-
-    // ── drain_rotation_retry_queue ────────────────────────────────────
-
-    /// Future mismatch: the nonce's tree is ahead of the local SMT, so it can't
-    /// build yet. It must be requeued for a later tick, never retried in this pass.
-    /// Reaching the asserts proves the snapshot drain returns instead of spinning.
-    #[tokio::test]
-    async fn rotation_drain_future_requeues() {
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // Local SMT on tree 0; first nonce of tree 1 is a future mismatch.
-        let future_nonce = MAX_TREE_LEAVES as u64;
-        state.smt_state = Some(smt_at(0));
-        state.rotation_retry_queue.push((
-            TransactionContext {
-                transaction_id: Some(80),
-                withdrawal_nonce: Some(future_nonce),
-                trace_id: Some("trace-8".to_string()),
-                deposit_claim_lease: None,
-            },
-            ReleaseFundsBuilder::new(),
-        ));
-
-        drain_rotation_retry_queue(&mut state, &storage_tx).await;
-
-        // Item is back in the queue for the next tick, unchanged.
-        assert_eq!(state.rotation_retry_queue.len(), 1);
-        assert_eq!(
-            state.rotation_retry_queue[0].0.withdrawal_nonce,
-            Some(future_nonce)
-        );
-        // Not escalated: no status update emitted.
-        assert!(storage_rx.try_recv().is_err());
-    }
-
-    /// Stale mismatch: the local SMT has rotated past this nonce's tree, so a
-    /// retry can never succeed. It must leave the queue, get its remint_cache
-    /// entry scrubbed, and be escalated to ManualReview.
-    #[tokio::test]
-    async fn rotation_drain_stale_escalates_to_manual_review() {
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // Local SMT on tree 1; nonce 2 belongs to tree 0 (stale, can't return).
-        let stale_nonce = 2u64;
-        state.smt_state = Some(smt_at(1));
-        state.remint_cache.insert(
-            stale_nonce,
-            WithdrawalRemintInfo {
-                transaction_id: 20,
-                trace_id: "trace-2".to_string(),
-                mint: Pubkey::new_unique(),
-                user: Pubkey::new_unique(),
-                user_ata: Pubkey::new_unique(),
-                token_program: spl_token::id(),
-                amount: 1000,
-                source_event_id: SourceEventId::new("sig-20", 0, None),
-            },
-        );
-        state.rotation_retry_queue.push((
-            TransactionContext {
-                transaction_id: Some(20),
-                withdrawal_nonce: Some(stale_nonce),
-                trace_id: Some("trace-2".to_string()),
-                deposit_claim_lease: None,
-            },
-            ReleaseFundsBuilder::new(),
-        ));
-
-        drain_rotation_retry_queue(&mut state, &storage_tx).await;
-
-        // Dropped from the queue, not retried.
-        assert!(state.rotation_retry_queue.is_empty());
-        // In-memory state scrubbed.
-        assert!(!state.remint_cache.contains_key(&stale_nonce));
-        // Escalated to ManualReview for the right row.
-        let update = storage_rx.try_recv().expect("a status update");
-        assert_eq!(update.transaction_id, 20);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-    }
-
-    /// One drain pass classifies a mixed batch correctly: the future item is
-    /// requeued, the stale item is escalated, and the pass returns (no re-pop).
-    #[tokio::test]
-    async fn rotation_drain_mixed_batch_single_pass() {
-        let mut state = make_sender_state("http://localhost:8899");
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
-
-        // Local SMT on tree 1: nonce 2 is stale (tree 0), first nonce of tree 2
-        // is future.
-        let stale_nonce = 2u64;
-        let future_nonce = 2 * MAX_TREE_LEAVES as u64;
-        state.smt_state = Some(smt_at(1));
-        state.remint_cache.insert(
-            stale_nonce,
-            WithdrawalRemintInfo {
-                transaction_id: 20,
-                trace_id: "trace-2".to_string(),
-                mint: Pubkey::new_unique(),
-                user: Pubkey::new_unique(),
-                user_ata: Pubkey::new_unique(),
-                token_program: spl_token::id(),
-                amount: 1000,
-                source_event_id: SourceEventId::new("sig-20", 0, None),
-            },
-        );
-        state.rotation_retry_queue.push((
-            TransactionContext {
-                transaction_id: Some(20),
-                withdrawal_nonce: Some(stale_nonce),
-                trace_id: Some("trace-2".to_string()),
-                deposit_claim_lease: None,
-            },
-            ReleaseFundsBuilder::new(),
-        ));
-        state.rotation_retry_queue.push((
-            TransactionContext {
-                transaction_id: Some(200),
-                withdrawal_nonce: Some(future_nonce),
-                trace_id: Some("trace-future".to_string()),
-                deposit_claim_lease: None,
-            },
-            ReleaseFundsBuilder::new(),
-        ));
-
-        drain_rotation_retry_queue(&mut state, &storage_tx).await;
-
-        // Only the future item remains, queued for a later tick.
-        assert_eq!(state.rotation_retry_queue.len(), 1);
-        assert_eq!(
-            state.rotation_retry_queue[0].0.withdrawal_nonce,
-            Some(future_nonce)
-        );
-        // The stale item was escalated to ManualReview.
-        let update = storage_rx.try_recv().expect("a status update");
-        assert_eq!(update.transaction_id, 20);
-        assert_eq!(update.status, TransactionStatus::ManualReview);
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "only the stale item escalates"
         );
     }
 }

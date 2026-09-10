@@ -52,7 +52,7 @@ const DISC_REMOVE_OPERATOR: u8 = 4;
 const DISC_SET_NEW_ADMIN: u8 = 5;
 const DISC_DEPOSIT: u8 = 6;
 const DISC_RELEASE_FUNDS: u8 = 7;
-const DISC_RESET_SMT: u8 = 8;
+const DISC_ROTATE_BITMAP: u8 = 8;
 
 /// Known program IDs
 const ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU";
@@ -139,7 +139,7 @@ fn disc_to_type(disc: u8) -> &'static str {
         DISC_SET_NEW_ADMIN => "set_admin",
         DISC_DEPOSIT => "deposit",
         DISC_RELEASE_FUNDS => "release",
-        DISC_RESET_SMT => "reset_smt",
+        DISC_ROTATE_BITMAP => "rotate_bitmap",
         _ => "unknown",
     }
 }

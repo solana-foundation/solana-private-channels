@@ -1,6 +1,5 @@
 use crate::{
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
-    smt_utils::ProcessorSMT,
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_block_mint,
         assert_get_or_create_instance, assert_get_or_deposit, assert_get_or_release_funds,
@@ -569,11 +568,6 @@ fn test_block_mint_deposits_only_still_allows_release() {
     )
     .expect("BlockMint should succeed");
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
-
     assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -583,9 +577,7 @@ fn test_block_mint_deposits_only_still_allows_release() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_withdrawal_root,
         TRANSACTION_NONCE,
-        sibling_proofs,
         false,
     )
     .expect("ReleaseFunds must still work when only deposits are blocked");
@@ -661,11 +653,6 @@ fn test_block_mint_withdrawals_prevents_release() {
     )
     .expect("BlockMint should succeed");
 
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(TRANSACTION_NONCE);
-    smt.insert(TRANSACTION_NONCE);
-    let new_withdrawal_root = smt.current_root();
-
     let result = assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -675,9 +662,7 @@ fn test_block_mint_withdrawals_prevents_release() {
         &TOKEN_PROGRAM_ID,
         RELEASE_AMOUNT,
         &user.pubkey(),
-        new_withdrawal_root,
         TRANSACTION_NONCE,
-        sibling_proofs,
         false,
     );
 

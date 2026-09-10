@@ -6,25 +6,29 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                     |
-| ----------------------------- | ------------ | ----------------------------------------------------------- |
-| Instruction handlers          | 100% (9/9)   | All handlers have success + error tests                     |
-| Account validation paths      | 95% (19/20)  | Signer, PDA, owner, mutability, ATA program, system program |
-| Business logic error branches | 93% (14/15)  | SMT proofs, balance verification, Token2022 extensions      |
-| Custom error codes exercised  | 100% (13/13) | All custom errors tested                                    |
-| State & trait coverage (unit) | 100% (14/14) | Instruction data parsing for all handlers                   |
-| Event coverage                | 100% (9/9)   | All events emitted in integration tests                     |
-| Security edge cases           | 100% (14/14) | Double-spend, malformed proofs, Token2022, nonce boundaries |
-| **Overall (risk-weighted)**   | **~95%**     |                                                             |
+| Category                      | Coverage     | Details                                                        |
+| ----------------------------- | ------------ | -------------------------------------------------------------- |
+| Instruction handlers          | 100% (9/9)   | All handlers have success + error tests                        |
+| Account validation paths      | 95% (19/20)  | Signer, PDA, owner, mutability, ATA program, system program    |
+| Business logic error branches | 93% (14/15)  | Nonce replay, balance verification, Token2022 extensions       |
+| Custom error codes exercised  | 100% (13/13) | All custom errors tested                                       |
+| State & trait coverage (unit) | 100% (14/14) | Instruction data parsing for all handlers                      |
+| Event coverage                | 100% (9/9)   | All events emitted in integration tests                        |
+| Security edge cases           | 100% (14/14) | Double-spend, foreign bitmap, Token2022, generation boundaries |
+| **Overall (risk-weighted)**   | **~95%**     |                                                                |
+
+> The percentages above predate the SMT-to-bitmap migration and have not been
+> re-derived against the current surface. The inventory below is accurate.
 
 ## Test Inventory
 
-**66 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, SMT proof logic) + **84 integration tests** (end-to-end behavior).
+**55 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **84 integration tests** (end-to-end behavior).
 
-### CreateInstance (4 integration tests)
+### CreateInstance (6 integration tests)
 
-- `test_create_instance_success` — happy path
+- `test_create_instance_success` — happy path; also asserts the withdrawal bitmap is created on generation 0 with every bit clear
 - `test_create_instance_duplicate` — duplicate creation fails
+- `test_create_instance_invalid_pda` — wrong instance PDA rejected
 - `test_create_instance_invalid_admin_not_signer` — unsigned admin rejected
 - `test_create_instance_invalid_event_authority` — invalid event authority PDA
 - `test_create_instance_invalid_system_program` — wrong system program address
@@ -102,64 +106,62 @@
 - `test_deposit_rejected_after_mint_decimals_change` — MintProfileChanged; TransferChecked cannot catch this since it validates the decimals it is handed against the mint itself
 - `test_deposit_rejected_after_mint_token_program_change` — MintProfileChanged; the ATAs for the new program are left uncreated, so this also pins the check running before `validate_ata`
 
-### ReleaseFunds (24 integration tests)
+### ReleaseFunds (19 integration tests)
 
-- `test_release_funds_success` — happy path with SMT proof
+- `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_insufficient_funds` — insufficient balance error
 - `test_release_funds_not_operator` — wrong operator rejected
 - `test_release_funds_invalid_instruction_data_too_short` — malformed data
 - `test_release_funds_operator_not_signer` — unsigned operator rejected
-- `test_release_funds_smt_exclusion` — SMT exclusion proof scenarios
-- `test_release_funds_invalid_inclusion_proof` — wrong root rejected
-- `test_release_funds_with_smt_reset` — full SMT lifecycle
-- `test_release_funds_nonce_zero_boundary` — nonce=0 edge case
-- `test_release_funds_single_leaf_smt` — single-leaf tree operations
-- `test_release_funds_max_depth_smt_proof` — maximum depth verification
-- `test_double_spend_same_nonce_after_tree_reset` — cross-tree replay
-- `test_double_spend_smt_exclusion_rejects_used_nonce` — nonce reuse
-- `test_double_spend_sequential_releases_then_replay` — sequential replay
-- `test_malformed_proof_all_zero_siblings` — zeroed proof data
-- `test_malformed_proof_wrong_nonce_siblings` — wrong nonce siblings
-- `test_malformed_proof_nonce_outside_tree_range` — out-of-range nonce
-- `test_malformed_proof_nonce_far_outside_range` — far out-of-range nonce
-- `test_boundary_nonce_last_valid_for_tree_index_zero` — boundary nonce
-- `test_zero_amount_release` — zero amount edge case
+- `test_release_funds_bitmap_tracks_many_nonces` — nonces spread across many bitmap bytes, interleaved with replays; setting a later bit must not free an earlier one
+- `test_release_funds_with_bitmap_rotation` — full generation lifecycle across a rotation
+- `test_release_funds_nonce_zero_boundary` — nonce=0, the first bit of the first byte
+- `test_release_funds_last_nonce_in_generation` — nonce 65535, the last bit of the last byte
+- `test_release_funds_nonce_from_future_generation_rejected` — a fresh instance refuses nonces from later generations, before any rotation
+- `test_release_funds_zero_amount_consumes_nonce` — a zero-amount release still burns its nonce
+- `test_release_funds_foreign_bitmap_rejected` — another instance's bitmap is rejected; neither bitmap records the nonce and no funds move
+- `test_release_funds_rotation_frees_same_bit_position` — nonce N and N+65536 map to the same bit; the second must succeed after a rotation
+- `test_double_spend_same_nonce_after_bitmap_rotation` — a previous-generation nonce stays closed even though rotation cleared its bit
+- `test_double_spend_bitmap_rejects_used_nonce` — replay within a generation rejected by the bit alone
+- `test_double_spend_sequential_releases_then_replay` — three neighbouring nonces in one byte, then a replay of the first
 - `test_release_funds_wrong_user_ata` — passing another user's ATA as user_ata while keeping the correct user pubkey in instruction data is rejected with InvalidInstructionData
 - `test_release_funds_full_balance` — releasing the entire deposited balance succeeds and leaves the instance ATA at zero
 - `test_release_funds_token_2022_transfer_fee_success` — escrow is debited the full release amount and the user receives it minus the fee, so the fee falls on the user, not the escrow
 
-### ResetSmtRoot (4 integration tests)
+### RotateBitmap (6 integration tests)
 
-- `test_reset_smt_root_success` — happy path
-- `test_reset_smt_root_not_operator` — wrong operator rejected
-- `test_reset_smt_root_operator_not_signer` — unsigned operator rejected
-- `test_reset_smt_root_updates_nonce` — tree index incremented
+- `test_rotate_bitmap_success` — happy path
+- `test_rotate_bitmap_not_operator` — wrong operator rejected
+- `test_rotate_bitmap_operator_not_signer` — unsigned operator rejected
+- `test_rotate_bitmap_advances_generation` — two rotations advance the generation twice
+- `test_rotate_bitmap_replay_with_stale_generation_rejected` — a replayed rotation carrying a stale expected generation cannot skip a generation
+- `test_rotate_bitmap_foreign_bitmap_rejected` — another instance's bitmap is rejected and left on its own generation
 
 ### EmitEvent (2 integration tests)
 
 - `test_emit_event_wrong_event_authority` — discriminator 228 routes to process_emit_event; any address other than the canonical event_authority PDA is rejected with InvalidEventAuthority
 - `test_emit_event_no_accounts` — calling emit_event with an empty account list is rejected with NotEnoughAccountKeys
 
-### Unit Tests (66 tests across processor and program modules)
+### Unit Tests (55 tests across processor and program modules)
 
 **Instruction data parsing** (processor modules):
 
-- `create_instance`: 3 tests (valid data, insufficient data, empty data)
+- `create_instance`: 4 tests (valid data, insufficient data, empty data, payload missing the bitmap bump)
 - `allow_mint`: 2 tests (valid bump, empty data)
-- `deposit`: 5 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
+- `deposit`: 6 tests (with/without recipient, insufficient length, empty accounts, has_recipient flag set but recipient bytes absent)
 - `release_funds`: 3 tests (valid data, insufficient length, empty accounts)
-- `reset_smt_root`: 1 test (empty accounts)
+- `rotate_bitmap`: 1 test (empty accounts)
 - `add_operator`: 2 tests (valid instruction data, empty instruction data)
 
-**SMT proof logic** (`processor/shared/smt_utils.rs`):
+**Withdrawal bitmap logic** (`state/withdrawal_bitmap.rs`):
 
-- 19 tests covering `hash_combine` (determinism, order-dependence, avalanche effect) and `verify_smt_exclusion_proof` / `verify_smt_inclusion_proof` (empty tree, different nonces, with siblings, wrong root, corrupted siblings, edge-case nonces, early termination, all-bits-set, exclusion-vs-inclusion for same nonce)
+- 9 tests covering `consume_nonce` (replay rejected, neighbouring bits in one byte do not collide), `validate_generation` (accepts the whole current window, rejects the next generation, rejects the previous one after a rotation), `rotate` (clears bits and advances, rejects a stale expected generation, rejects overflow at u64::MAX), and `init` (rejects an already-initialized account without disturbing it, rejects an undersized account)
 
 **State serialization and validation** (`state/`):
 
 - `allowed_mint`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
 - `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
-- `instance`: 9 tests (constructor, checked_add overflow on tree index, nonce zero boundary, nonce boundary at tree index 1, serialization roundtrip, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization, second tree nonce validation)
+- `instance`: 5 tests (constructor, serialization roundtrip with length check, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization)
 - `discriminator`: 2 tests (all 10 valid instruction discriminator bytes accepted, unmapped bytes rejected)
 
 **Error ABI stability** (`error.rs`):
@@ -168,10 +170,10 @@
 
 **Event encoding** (`events.rs`):
 
-- 9 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, ResetSmtRoot) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix
+- 9 tests, one per event type (CreateInstance, AllowMint, BlockMint, AddOperator, RemoveOperator, SetNewAdmin, Deposit, ReleaseFunds, RotateBitmap) — each verifies the discriminator byte, field values, serialized byte length, and the `EVENT_IX_TAG_LE` prefix
 
 ## Documented Gaps
 
 ### Untested Edge Cases
 
-- `checked_add` overflow on tree index (u64::MAX) — requires direct account state manipulation to set tree_index to MAX, impractical in integration tests without dedicated test infrastructure
+- Generation overflow at u64::MAX is covered as a unit test on `WithdrawalBitmap::rotate`, but not end-to-end: driving an instance to that generation on-chain would take 2^64 rotations, so an integration test would need direct account state manipulation

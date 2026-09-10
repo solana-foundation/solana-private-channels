@@ -136,10 +136,9 @@ Polls database for pending transactions with row-level locking to prevent duplic
 
 #### 2. Processor
 
-Validates transactions and builds Solana instructions that are managed by the Solana Private Channels instance's authorized operators/admins. The processor is responsible for three main tasks:
+Validates transactions and builds Solana instructions that are managed by the Solana Private Channels instance's authorized operators/admins. The processor is responsible for two main tasks:
 - Processing deposits (Mainnet → Solana Private Channels) - handles building a `MintTo` instruction for the user on the Solana Private Channels payment channel.
-- Processing withdrawals (Solana Private Channels → Mainnet) - handles building a `ReleaseFunds` instruction (using the Escrow Program's SMT proof) for the user on Mainnet.
-- Rotating the SMT root on the Mainnet escrow instance to prevent double spending of withdrawals.
+- Processing withdrawals (Solana Private Channels to Mainnet) - handles building a `ReleaseFunds` instruction for the user on Mainnet, which consumes that withdrawal's nonce in the escrow instance's withdrawal bitmap.
 
 **Location**: [`indexer/src/operator/processor.rs`](../indexer/src/operator/processor.rs)
 
@@ -151,6 +150,7 @@ Submits transactions to the respective cluster with:
 - Transaction confirmation polling
 - Status updates to database (processing → completed/failed)
 - Just-in-time mint initialization (if mint is not yet initialized on the Solana Private Channels payment channel, the Sender will include an `InitializeMint` instruction in the transaction prior to the `MintTo` instruction)
+- Rotating the withdrawal bitmap on the Mainnet escrow instance. On a timer the sender compares the bitmap's generation against the lowest withdrawal nonce that still owes a release, and arms a `RotateBitmap` when that nonce belongs to a later generation. Driving it from state rather than from a particular withdrawal means the rotation still happens when the row on the boundary was quarantined or never written.
 
 **Location**: [`indexer/src/operator/sender/`](../indexer/src/operator/sender/)
 

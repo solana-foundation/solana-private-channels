@@ -9,7 +9,7 @@ The withdrawal failure path normally goes
 The terminal `failed` status is set by `send_fatal_error` in
 `indexer/src/operator/sender/transaction.rs`, which is reached when the
 sender's `TransactionContext` carries no remint info - primarily for non-
-withdrawal transactions (deposits, mint init, SMT rotation).
+withdrawal transactions (deposits, mint init, bitmap rotation).
 
 A withdrawal row reaching `failed` therefore means one of:
 - The row was misrouted (a non-withdrawal tx that incorrectly carried

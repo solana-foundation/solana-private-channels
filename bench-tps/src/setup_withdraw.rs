@@ -24,7 +24,7 @@
 use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
-        setup_deposit::find_instance_pda,
+        setup_deposit::{find_instance_pda, find_withdrawal_bitmap_pda},
         types::{BenchState, WithdrawConfig, MINT_DECIMALS, SETUP_BATCH_SIZE},
     },
     anyhow::{Context, Result},
@@ -137,6 +137,7 @@ pub async fn run_setup_withdraw_phase(
     };
     let instance_seed_pubkey = instance_seed_keypair.pubkey();
     let (instance_pda, instance_bump) = find_instance_pda(&instance_seed_pubkey);
+    let (bitmap_pda, bitmap_bump) = find_withdrawal_bitmap_pda(&instance_pda);
     let (event_authority, _) = find_event_authority();
     let (operator_pda, operator_bump) = find_operator_pda(&instance_pda, &admin_keypair.pubkey());
     info!(
@@ -210,12 +211,14 @@ pub async fn run_setup_withdraw_phase(
                         admin: admin_keypair.pubkey(),
                         instance_seed: instance_seed_pubkey,
                         instance: instance_pda,
+                        withdrawal_bitmap: bitmap_pda,
                         system_program: program::id(),
                         event_authority,
                         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
                     }
                     .instruction(CreateInstanceInstructionArgs {
                         bump: instance_bump,
+                        bitmap_bump,
                     });
                     let tx = Transaction::new_signed_with_payer(
                         &[create_ix],

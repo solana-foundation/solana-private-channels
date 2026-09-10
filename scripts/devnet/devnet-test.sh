@@ -101,6 +101,8 @@ echo "Cleaned up old containers and volumes"
 USER_BALANCE_BEFORE=$(get_token_balance "$USER" "$MINT")
 echo "User token balance (before): $USER_BALANCE_BEFORE"
 
+# Creates the instance and its withdrawal bitmap in one instruction. The bitmap
+# is 8 KB, so the admin keypair needs about 0.058 SOL of rent beyond the usual.
 echo "=== Step 1: Create Instance ==="
 OUTPUT=$(cargo run --quiet --manifest-path scripts/devnet/Cargo.toml --bin create_instance -- \
   "$RPC_URL" \
@@ -110,6 +112,9 @@ echo "$OUTPUT"
 # Parse instance ID from output (line: escrow_instance_id = "...")
 INSTANCE_ID=$(echo "$OUTPUT" | grep 'escrow_instance_id' | sed 's/.*"\(.*\)".*/\1/')
 echo "Instance ID: $INSTANCE_ID"
+
+BITMAP_PDA=$(echo "$OUTPUT" | grep 'Withdrawal bitmap PDA:' | awk '{print $NF}')
+echo "Withdrawal bitmap PDA: $BITMAP_PDA"
 
 # Parse transaction signature and get slot
 TX_SIG=$(echo "$OUTPUT" | grep 'Transaction signature:' | awk '{print $NF}')

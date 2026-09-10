@@ -8,6 +8,7 @@ use crate::indexer::datasource::common::parser::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
 use crate::operator::SignerUtil;
+use crate::storage::common::models::TransactionType;
 
 /// Program type to index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
@@ -37,6 +38,20 @@ impl ProgramType {
             ProgramType::Withdraw => {
                 Pubkey::from_str(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID).expect("Invalid program ID")
             }
+        }
+    }
+
+    /// The one transaction type this role owns and may act on.
+    ///
+    /// Both operators share a single transactions table but point their RPC
+    /// clients at opposite chains: escrow mints deposits on PrivateChannel,
+    /// withdraw releases withdrawals on Solana. Every read that selects rows to
+    /// act on must be scoped through this mapping, or a role ends up checking
+    /// another role's signatures against a chain they were never sent to.
+    pub fn owned_transaction_type(&self) -> TransactionType {
+        match self {
+            ProgramType::Escrow => TransactionType::Deposit,
+            ProgramType::Withdraw => TransactionType::Withdrawal,
         }
     }
 }
@@ -184,15 +199,15 @@ impl PrivateChannelIndexerConfig {
 /// Only applies when `program_type = escrow`. Skipped for `withdraw` indexers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReconciliationConfig {
-    /// Maximum absolute mismatch (in raw token units) allowed before blocking startup.
-    /// 0 (default) means any mismatch blocks startup.
-    /// Mismatches above this value log error + emit alert and abort.
-    /// Mismatches at or below this value (but > 0) log a warning and continue.
+    /// Maximum custody shortfall (in raw token units) tolerated before blocking startup.
+    /// The shortfall is db_expected minus the on-chain balance: the escrow holding less
+    /// than the DB expects is the only solvency-relevant direction. 0 (default) means any
+    /// shortfall blocks startup; a shortfall at or below this value logs a warning and continues.
     ///
-    /// There is a small race window between the DB balance query and the on-chain RPC
-    /// fetch: a deposit arriving in that window will appear in the ATA but not yet in
-    /// the DB, producing a transient false positive. If spurious failures occur in
-    /// production, set this to the raw amount of one or two minimum deposits.
+    /// A surplus (on-chain balance above db_expected) never blocks startup: anyone can send
+    /// tokens to an escrow-owned account, and holding more than expected is not a solvency
+    /// risk. This also removes the old race-window false positive where a deposit landed in
+    /// the ATA before the DB query observed it.
     pub mismatch_threshold_raw: u64,
 }
 
@@ -464,6 +479,23 @@ mod tests {
         };
         let err = config.validate().unwrap_err();
         assert!(err.contains("source_rpc_url required"));
+    }
+
+    // ============================================================================
+    // Role Ownership Tests
+    // ============================================================================
+
+    /// The single source of truth the fetcher and both recovery sweeps share.
+    #[test]
+    fn owned_transaction_type_maps_each_role() {
+        assert_eq!(
+            ProgramType::Escrow.owned_transaction_type(),
+            TransactionType::Deposit
+        );
+        assert_eq!(
+            ProgramType::Withdraw.owned_transaction_type(),
+            TransactionType::Withdrawal
+        );
     }
 
     // ============================================================================

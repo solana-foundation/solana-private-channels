@@ -9,8 +9,9 @@ Triggered by webhook payload `status=manual_review` for a withdrawal row.
 - May or may not be paired with a pipeline halt: if the trigger error
   was a build-side deterministic failure (Path A.halting below), the
   operator's `halt_withdrawal_pipeline` ran and bulk-flipped every
-  active withdrawal to `manual_review`. Multiple webhooks for the same
-  timestamp burst confirm a halt occurred.
+  active withdrawal at or above the poison row's nonce to
+  `manual_review`. Multiple webhooks for the same timestamp burst
+  confirm a halt occurred.
 
 ## Triage - dispatch by `error_message`
 
@@ -36,7 +37,7 @@ have prefixes.
 |---|---|---|---|
 | `invalid_pubkey`, `invalid_builder`, `program_error` | A.halting | yes | `processor.rs` quarantine |
 | `withdrawal pipeline halted after poison-pill` | A.halting (collateral row) | yes | halt sweep, channel drain |
-| (empty `error_message`, status flipped without a quarantine update) | A.halting (collateral row) | yes | `quarantine_all_active_withdrawals` |
+| (empty `error_message`, status flipped without a quarantine update) | A.halting (collateral row) | yes | `quarantine_active_withdrawals` |
 | `mint paused:` | A.non-halting | no | pre-flight |
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
@@ -52,16 +53,49 @@ have prefixes.
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |
 | `recovery requeues without progress` | G - requeue cap exhausted (release never landed) | no | recovery worker quarantine |
-| `stale tree index:` ... `release can never land on current SMT` | H - stale tree index (release can never land) | no | `sender/mod.rs` rotation drain |
+
+## An unresolved row holds the bitmap rotation
+
+Before triaging, understand the clock you are on. The withdrawal bitmap covers
+one generation of nonces at a time, and the operator will not rotate it past a
+withdrawal that is not yet terminal. `manual_review` counts as not terminal,
+because a human can still resolve one of these rows into a release.
+
+So a row left in `manual_review` inside the generation the chain is currently on
+blocks the rotation into the next one, and every withdrawal with a higher nonce
+parks and waits. Those withdrawals are not lost and nothing is at risk, but they
+do not settle until this row reaches `completed`, `failed`, or `failed_reminted`.
+
+Confirm that is what is happening:
+
+```
+private_channel_operator_transaction_errors_total{error_reason="rotation_blocked_by_lower_nonce"}
+```
+
+A rising count means the operator wants to rotate and has been held back for
+more than five minutes. It stays flat while a boundary is merely being crossed,
+so a count that moves is a row someone has to resolve, not ordinary traffic. The
+accompanying WARN log names the blocking nonce, which is the row to resolve
+first. Resolving it is what releases the block; no rotation command exists and
+none is needed.
 
 ## Path A.halting - build error that halted the pipeline
 
-The trigger row's data is bad in a way that would corrupt the SMT (NULL
+The trigger row's data is bad in a way that makes it unreleasable (NULL
 nonce, malformed pubkey, builder rejection). The processor quarantined the
 trigger and ran `halt_withdrawal_pipeline`, which drained the fetcher
-channel and bulk-flipped every `pending`/`processing` withdrawal to
-`manual_review`. Recovery has to handle both the trigger and the
-collateral.
+channel and bulk-flipped every active withdrawal **at or above the trigger
+row's `withdrawal_nonce`** to `manual_review`. Recovery has to handle both
+the trigger and the collateral.
+
+Withdrawals *below* the trigger's nonce are deliberately left in
+`processing` or `parked`. Those rows were already signed or handed to the
+sender, and terminalizing one discards the `completed` write that lands
+when its release confirms, which leaves the next boot's bitmap diff seeing
+a set bit with no `completed` row. The stuck-row recovery worker and
+the stale-parked sweep own those rows; do not bulk-flip them by hand. If
+the trigger row has no `withdrawal_nonce` at all the sweep is unbounded and
+every active withdrawal is collateral.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for the trigger row. Expected verdict: `NOT_LANDED` (build failed before
@@ -80,7 +114,7 @@ collateral.
    Subsequent rows are collateral from the halt sweep - those came in as
    webhooks too, but with no quarantine `error_message` (the sweep doesn't
    send a `TransactionStatusUpdate` per row; status is flipped in bulk via
-   `quarantine_all_active_withdrawals`).
+   `quarantine_active_withdrawals`).
 3. **Decide the trigger row's fate.**
    - Bad data, unrecoverable (e.g. malformed mint pubkey, NULL nonce):
      ```sql
@@ -212,7 +246,7 @@ surfaced as an `OperatorError::Program`), the classifier in
 on the side of caution rather than retrying. This is the intended
 behavior: misclassifying a deterministic error as transient could put
 the operator into a tight retry loop that consumes nonces against a
-broken row and corrupts the SMT. The asymmetric cost favors a noisy
+broken row and burns its nonce. The asymmetric cost favors a noisy
 quarantine over a silent retry.
 
 What this means for recovery: the trigger row is safe to retry, not
@@ -274,8 +308,9 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > **A row with no recorded signature is no longer quarantined on sight.**
 > The signature is written in the same transaction that claims the row, so
 > an empty journal means the release never broadcast. Recovery corroborates
-> that against the on-chain SMT root and re-arms the row to `pending`
-> automatically when the nonce is provably absent - this is the manual
+> that against the on-chain withdrawal bitmap - a fresh read of the
+> generation and the consumed-nonce bits - and re-arms the row to `pending`
+> automatically when the nonce's bit is provably unset; this is the manual
 > `NOT_LANDED` decision in Step 3 below, now automated with the same proof.
 > Such rows never reach manual review, so a signatureless row that does
 > arrive here means a read it depends on stayed broken for 10 minutes of
@@ -297,6 +332,21 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > A sender that could not establish the `PendingRemint` handoff leaves the row
 > `Processing` (metric `pending_remint_state_unknown`) rather than quarantining
 > it, so it reaches this path through the recovery sweep above.
+
+> **Some Path C rows resolve themselves; check before you act.** The
+> quarantine now copies the broadcast signatures onto the row
+> (`remint_signatures`), and every recovery tick plus each operator boot
+> re-classifies them. A row quarantined with `could not verify release
+> landed (...)` was quarantined because the RPC was unreachable, not because
+> the release failed, so once the RPC catches up that row promotes itself to
+> `completed` with the landed signature. A row quarantined with `no broadcast
+> signatures recorded ...` has nothing to re-check and will never self-clear.
+> Re-read the row's status before starting the steps below: if it is already
+> `completed`, the sweep resolved the bookkeeping and the alert can be closed
+> against that signature. The promotion is bookkeeping only and needs no
+> operator restart to take effect: the sender holds no local copy of the
+> released-nonce set, and every release is authorized against the on-chain
+> bitmap itself.
 
 1. **Verify on-chain.** Run
    [`_verify_onchain_release.md`](_verify_onchain_release.md). This is
@@ -472,7 +522,7 @@ SELECT signature, last_valid_block_height, created_at
 
 For each, `solana confirm -v <signature> --url <solana-rpc-url>` to read
 the `InstructionError`. A repeating deterministic error (escrow
-underfunded, SMT/proof rejection, account state) means re-sending will not
+underfunded, nonce already consumed, account state) means re-sending will not
 help - [escalate](_escalation.md) (Tier 2/3) to engineering. A transient
 cause (blockhash expiry under load, RPC outage during the send window)
 may already have cleared.
@@ -497,54 +547,6 @@ coordination:
 UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
-
-## Path H - stale tree index (release can never land)
-
-`error_message`: `stale tree index: nonce <n> belongs to tree <a>, sender on
-<b>; release can never land on current SMT`. The sender held this withdrawal
-in its rotation-retry queue, but the local SMT rotated forward past the
-nonce's tree (`a < b`). The withdrawal's tree window is closed, so forward
-rotation can never make the release valid again - retrying or re-arming will
-not help (distinct from Path A/C, where a re-arm can succeed). The release
-failed at build and was never broadcast, so it definitively never landed.
-
-### Step 1 - verify on-chain
-
-Run [`_verify_onchain_release.md`](_verify_onchain_release.md). Expected
-verdict: `NOT_LANDED` (build-time failure, no RPC call). If `LANDED` -> the
-tree-index check is reading a stale local SMT; switch to Path C reconciliation
-and [escalate](_escalation.md) (Tier 2) - the sender's tree tracking has a
-defect.
-
-### Step 2 - confirm the burn, then escalate for refund
-
-`signature` is the originating PrivateChannel burn. Confirm whether the user's
-tokens were burned (`solana confirm -v <signature> --url <private-channel-rpc>`,
-as in Path F Step 2). Burned, release can never land -> the
-user's funds are stuck and there is no automated recovery: forward rotation
-will not reopen the tree. [Escalate](_escalation.md) (Tier 1) for out-of-band
-restoration (manual `release_funds` to the depositor or a manual remint of the
-burned tokens), then mark the row terminal:
-
-```sql
-UPDATE transactions SET status = 'failed', updated_at = NOW()
- WHERE id = :transaction_id;
-```
-
-If the burn is proven not to have landed (`not found` with ledger coverage of
-the row's `slot`, per Path C Step 3), there is no user impact; close the alert
-and mark `failed`. If coverage cannot be established, do not close the alert:
-[escalate](_escalation.md) (Tier 2) to resolve the verdict first. The tree
-window is already closed, so a burned row closed as a non-event leaves the
-user's funds stuck with nobody looking.
-
-### Step 3 - capture why the sender fell behind its own tree
-
-A stale tree index means the rotation-retry queue outran the local SMT (e.g.
-the queue held a withdrawal across two rotations). [Escalate](_escalation.md)
-(Tier 3) with the row's nonce, the two tree indices from the message, and the
-surrounding rotation logs so engineering can confirm whether the rotation
-cadence or the queue retention needs tightening.
 
 ## Post-incident artifacts (required)
 

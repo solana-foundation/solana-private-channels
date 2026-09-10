@@ -78,6 +78,13 @@ const ACCOUNT_GATED_METHODS: &[&str] = &[
     GET_SIGNATURES_FOR_ADDRESS,
 ];
 
+/// Whether `method` requires any auth check (operator-only or account-gated).
+/// Callers use this to skip JWT verification and the operator DB re-check for
+/// public methods.
+pub fn is_gated(method: &str) -> bool {
+    OPERATOR_ONLY_METHODS.contains(&method) || ACCOUNT_GATED_METHODS.contains(&method)
+}
+
 /// Transaction history. Gated like the two above.
 pub const GET_SIGNATURES_FOR_ADDRESS: &str = "getSignaturesForAddress";
 
@@ -108,15 +115,18 @@ pub fn redacts_transaction_errors(
     decoding_key: &DecodingKey,
     method: &str,
 ) -> bool {
+    redacts_transaction_errors_for(verify_bearer(auth_header, decoding_key).as_ref(), method)
+}
+
+/// Same rule, decided from claims already resolved against the auth DB. Gated
+/// methods must use this form so a demoted operator loses the raw diagnostics
+/// at the same moment it loses access, not when its token expires.
+pub fn redacts_transaction_errors_for(claims: Option<&Claims>, method: &str) -> bool {
     if !ERROR_BEARING_METHODS.contains(&method) {
         return false;
     }
 
-    let role = auth_header
-        .and_then(|header| verify_bearer(header, decoding_key))
-        .map(|claims| claims.role);
-
-    role != Some(Role::Operator)
+    claims.map(|c| &c.role) != Some(&Role::Operator)
 }
 
 // ---------------------------------------------------------------------------
@@ -195,26 +205,25 @@ pub enum AuthDecision {
 // Auth entry point — called by enforce_auth
 // ---------------------------------------------------------------------------
 
-/// Checks whether the request is authorised to call `method` with `params`.
+/// Checks whether the request is authorised to call `method` with `params`,
+/// given the caller's already-verified `claims` (`None` if the JWT was missing,
+/// invalid, or expired).
 ///
-/// - If the method is not gated, returns `Proceed` immediately.
-/// - If the JWT is missing or invalid, returns `Reject(401)`.
-/// - If the caller is an Operator, returns `Proceed` (unrestricted access).
-/// - If the caller is a User, returns `NeedsAccountFetch` so the caller can
-///   fetch the raw account data and run the ownership check in
-///   `check_account_data_ownership`.
+/// `claims.role` is treated as the caller's effective role: the caller confirms
+/// an Operator claim against the DB first and passes `User` when it was revoked,
+/// so no DB lookup happens here for the role.
 ///
-/// No DB lookup is performed here. Users almost always query ATAs or other
-/// PDAs rather than their wallet pubkeys directly, so checking
-/// `verified_wallets` up-front would almost always be a wasted round-trip.
-/// `check_account_data_ownership` handles both token accounts (via owner/
-/// delegate byte inspection) and direct wallet pubkeys (fallback pubkey check).
-pub fn check_request_auth(
-    auth_header: Option<&str>,
-    decoding_key: &DecodingKey,
-    method: &str,
-    params: &Value,
-) -> AuthDecision {
+/// - Method not gated: `Proceed`.
+/// - No valid token on a gated method: `Reject(401)`.
+/// - Operator: `Proceed` (unrestricted read access).
+/// - User: `NeedsAccountFetch`, so the caller can fetch the raw account data and
+///   run the ownership check in `check_account_data_ownership`.
+///
+/// The User path defers the ownership DB lookup to `check_account_data_ownership`
+/// because users almost always query ATAs or PDAs rather than their wallet
+/// pubkeys directly, so checking `verified_wallets` up-front would usually be a
+/// wasted round-trip.
+pub fn check_request_auth(claims: Option<&Claims>, method: &str, params: &Value) -> AuthDecision {
     let is_operator_only = OPERATOR_ONLY_METHODS.contains(&method);
     let is_account_gated = ACCOUNT_GATED_METHODS.contains(&method);
 
@@ -222,7 +231,7 @@ pub fn check_request_auth(
         return AuthDecision::Proceed;
     }
 
-    let claims = match auth_header.and_then(|h| verify_bearer(h, decoding_key)) {
+    let claims = match claims {
         Some(c) => c,
         None => return AuthDecision::Reject(StatusCode::UNAUTHORIZED, unauthorized_body()),
     };
@@ -387,8 +396,8 @@ pub fn decode_account_data(encoded: &str) -> Option<Vec<u8>> {
 
 /// Extracts and verifies a Bearer token from the raw `Authorization` header value.
 /// Returns `Some(Claims)` on success, `None` if missing, malformed, or expired.
-fn verify_bearer(auth_header: &str, decoding_key: &DecodingKey) -> Option<Claims> {
-    let token = auth_header.strip_prefix("Bearer ")?;
+pub fn verify_bearer(auth_header: Option<&str>, decoding_key: &DecodingKey) -> Option<Claims> {
+    let token = auth_header?.strip_prefix("Bearer ")?;
     let mut validation = Validation::default();
     validation.set_issuer(&[JWT_ISSUER]);
     validation.set_audience(&[JWT_AUDIENCE]);
@@ -404,6 +413,7 @@ fn verify_bearer(auth_header: &str, decoding_key: &DecodingKey) -> Option<Claims
 //   -32001  Unauthorized — missing, invalid, or expired JWT
 //   -32002  Forbidden   — account not owned by the calling user
 //   -32003  Forbidden   — method requires operator role
+//   -32603  Internal    — a DB lookup (ownership or role) failed
 //   -32004  Unavailable — ownership check could not reach the read node
 // ---------------------------------------------------------------------------
 
@@ -447,6 +457,15 @@ fn db_error_body() -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": { "code": -32603, "message": "Internal error: could not verify account ownership" }
+        })
+        .to_string(),
+    )
+}
+
+pub fn role_check_error_body() -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "error": { "code": -32603, "message": "Internal error: could not verify caller role" }
         })
         .to_string(),
     )
@@ -504,6 +523,16 @@ mod tests {
         .unwrap()
     }
 
+    /// Build verified `Claims` for the policy tests. `check_request_auth` treats
+    /// the role as already confirmed, so tests pass the effective role directly.
+    fn claims(role: Role) -> Claims {
+        Claims {
+            sub: Uuid::new_v4().to_string(),
+            role,
+            exp: (Utc::now().timestamp() + 3600) as usize,
+        }
+    }
+
     /// A lazy pool that never actually connects — safe to use in tests that
     /// return before hitting the DB (e.g. the mint-size rejection path).
     fn lazy_pool() -> PgPool {
@@ -512,48 +541,49 @@ mod tests {
             .unwrap()
     }
 
+    // ── verify_bearer ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_bearer_accepts_valid_token() {
+        let token = forge_token(Role::Operator, 3600);
+        let parsed = verify_bearer(Some(&format!("Bearer {token}")), &decoding_key());
+        assert_eq!(parsed.map(|c| c.role), Some(Role::Operator));
+    }
+
+    #[test]
+    fn verify_bearer_rejects_expired_token() {
+        let token = forge_token(Role::Operator, -3600);
+        assert!(verify_bearer(Some(&format!("Bearer {token}")), &decoding_key()).is_none());
+    }
+
+    #[test]
+    fn verify_bearer_rejects_wrong_secret() {
+        let token = forge_token(Role::Operator, 3600);
+        let wrong_key = DecodingKey::from_secret(b"wrong-secret");
+        assert!(verify_bearer(Some(&format!("Bearer {token}")), &wrong_key).is_none());
+    }
+
+    #[test]
+    fn verify_bearer_rejects_missing_bearer_prefix() {
+        let token = forge_token(Role::Operator, 3600);
+        assert!(verify_bearer(Some(&token), &decoding_key()).is_none());
+    }
+
     // ── check_request_auth ────────────────────────────────────────────────────
+    //
+    // check_request_auth trusts claims.role as the caller's effective role;
+    // enforce_auth resolves it against the DB first. These tests pass Claims
+    // directly via the `claims` helper.
 
     #[test]
     fn ungated_method_proceeds_without_token() {
-        let decision = check_request_auth(None, &decoding_key(), "getSlot", &json!([]));
+        let decision = check_request_auth(None, "getSlot", &json!([]));
         assert!(matches!(decision, AuthDecision::Proceed));
     }
 
     #[test]
     fn operator_only_missing_token_is_401() {
-        let decision = check_request_auth(None, &decoding_key(), "getBlock", &json!([]));
-        assert!(matches!(
-            decision,
-            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
-        ));
-    }
-
-    #[test]
-    fn operator_only_expired_token_is_401() {
-        let token = forge_token(Role::Operator, -3600);
-        let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
-            "getBlock",
-            &json!([]),
-        );
-        assert!(matches!(
-            decision,
-            AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
-        ));
-    }
-
-    #[test]
-    fn operator_only_wrong_secret_is_401() {
-        let token = forge_token(Role::Operator, 3600);
-        let wrong_key = DecodingKey::from_secret(b"wrong-secret");
-        let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &wrong_key,
-            "getBlock",
-            &json!([]),
-        );
+        let decision = check_request_auth(None, "getBlock", &json!([]));
         assert!(matches!(
             decision,
             AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
@@ -562,13 +592,7 @@ mod tests {
 
     #[test]
     fn operator_only_user_role_is_403() {
-        let token = forge_token(Role::User, 3600);
-        let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
-            "getBlock",
-            &json!([]),
-        );
+        let decision = check_request_auth(Some(&claims(Role::User)), "getBlock", &json!([]));
         assert!(matches!(
             decision,
             AuthDecision::Reject(StatusCode::FORBIDDEN, _)
@@ -577,25 +601,14 @@ mod tests {
 
     #[test]
     fn operator_only_operator_role_proceeds() {
-        let token = forge_token(Role::Operator, 3600);
-        let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
-            "getBlock",
-            &json!([]),
-        );
+        let decision = check_request_auth(Some(&claims(Role::Operator)), "getBlock", &json!([]));
         assert!(matches!(decision, AuthDecision::Proceed));
     }
 
     #[test]
     fn simulate_transaction_operator_only() {
-        let token = forge_token(Role::User, 3600);
-        let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
-            "simulateTransaction",
-            &json!([]),
-        );
+        let decision =
+            check_request_auth(Some(&claims(Role::User)), "simulateTransaction", &json!([]));
         assert!(matches!(
             decision,
             AuthDecision::Reject(StatusCode::FORBIDDEN, _)
@@ -604,12 +617,7 @@ mod tests {
 
     #[test]
     fn account_gated_no_token_is_401() {
-        let decision = check_request_auth(
-            None,
-            &decoding_key(),
-            "getAccountInfo",
-            &json!(["SomePubkey"]),
-        );
+        let decision = check_request_auth(None, "getAccountInfo", &json!(["SomePubkey"]));
         assert!(matches!(
             decision,
             AuthDecision::Reject(StatusCode::UNAUTHORIZED, _)
@@ -618,10 +626,8 @@ mod tests {
 
     #[test]
     fn account_gated_operator_role_proceeds() {
-        let token = forge_token(Role::Operator, 3600);
         let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
+            Some(&claims(Role::Operator)),
             "getAccountInfo",
             &json!(["SomePubkey"]),
         );
@@ -630,10 +636,8 @@ mod tests {
 
     #[test]
     fn account_gated_user_role_returns_needs_account_fetch() {
-        let token = forge_token(Role::User, 3600);
         let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
+            Some(&claims(Role::User)),
             "getAccountInfo",
             &json!(["SomePubkey"]),
         );
@@ -645,13 +649,7 @@ mod tests {
 
     #[test]
     fn account_gated_missing_pubkey_is_400() {
-        let token = forge_token(Role::User, 3600);
-        let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
-            "getAccountInfo",
-            &json!([]),
-        );
+        let decision = check_request_auth(Some(&claims(Role::User)), "getAccountInfo", &json!([]));
         assert!(matches!(
             decision,
             AuthDecision::Reject(StatusCode::BAD_REQUEST, _)
@@ -662,7 +660,6 @@ mod tests {
     fn get_signatures_for_address_no_token_is_401() {
         let decision = check_request_auth(
             None,
-            &decoding_key(),
             "getSignaturesForAddress",
             &json!(["So11111111111111111111111111111111111111112"]),
         );
@@ -674,10 +671,8 @@ mod tests {
 
     #[test]
     fn get_signatures_for_address_operator_proceeds() {
-        let token = forge_token(Role::Operator, 3600);
         let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
+            Some(&claims(Role::Operator)),
             "getSignaturesForAddress",
             &json!(["So11111111111111111111111111111111111111112"]),
         );
@@ -686,10 +681,8 @@ mod tests {
 
     #[test]
     fn get_signatures_for_address_user_role_returns_needs_account_fetch() {
-        let token = forge_token(Role::User, 3600);
         let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
+            Some(&claims(Role::User)),
             "getSignaturesForAddress",
             &json!(["So11111111111111111111111111111111111111112"]),
         );
@@ -701,10 +694,8 @@ mod tests {
 
     #[test]
     fn get_signatures_for_address_user_missing_pubkey_is_400() {
-        let token = forge_token(Role::User, 3600);
         let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
+            Some(&claims(Role::User)),
             "getSignaturesForAddress",
             &json!([]),
         );
@@ -716,10 +707,8 @@ mod tests {
 
     #[test]
     fn get_token_account_balance_gated_for_user() {
-        let token = forge_token(Role::User, 3600);
         let decision = check_request_auth(
-            Some(&format!("Bearer {token}")),
-            &decoding_key(),
+            Some(&claims(Role::User)),
             "getTokenAccountBalance",
             &json!(["SomePubkey"]),
         );

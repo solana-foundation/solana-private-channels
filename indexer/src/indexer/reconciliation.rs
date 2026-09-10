@@ -22,9 +22,9 @@
 //!    so it is unaffected by how far behind the DB is and can never be repaired by
 //!    indexing more slots. A supply that cannot be read at all aborts too, since an
 //!    unreadable channel and a solvent one look the same from here.
-//! 5. If any |on_chain - db_expected| > threshold → log error, emit alert, abort startup.
-//! 6. If any mismatch ≤ threshold (but > 0) → log warning, continue.
-//! 7. If all balanced (or both sides empty) → log info, continue.
+//! 5. A mint whose shortfall (db_expected minus on-chain) exceeds the threshold means the escrow may not cover its liabilities: log an error, emit an alert, and abort startup.
+//! 6. A surplus (on-chain minus db_expected) is benign and attacker-inducible, so it only logs a warning and never blocks; a shortfall within the threshold also just warns.
+//! 7. If all mints balance (or both sides are empty), log info and continue.
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
@@ -55,20 +55,29 @@ pub struct MintReconciliation {
     pub db_expected: u64,
     /// Actual raw token balance in the escrow ATA on-chain.
     pub on_chain_actual: u64,
-    /// Absolute difference: |on_chain_actual − db_expected|.  Derived from the
-    /// two fields above — use `MintReconciliation::new` to ensure consistency.
-    pub mismatch: u64,
 }
 
 impl MintReconciliation {
     pub fn new(mint: String, db_expected: u64, on_chain_actual: u64) -> Self {
-        let mismatch = compute_mismatch(db_expected, on_chain_actual);
         Self {
             mint,
             db_expected,
             on_chain_actual,
-            mismatch,
         }
+    }
+
+    /// Custody shortfall below DB-expected liabilities. This is the only
+    /// solvency-relevant direction: a shortfall past the threshold means the
+    /// escrow may not cover withdrawals, so it blocks startup.
+    pub fn shortfall(&self) -> u64 {
+        self.db_expected.saturating_sub(self.on_chain_actual)
+    }
+
+    /// Custody surplus above DB-expected liabilities. Benign and attacker-inducible
+    /// because anyone can send tokens to an escrow-owned account, so it only warns
+    /// and never blocks startup.
+    pub fn surplus(&self) -> u64 {
+        self.on_chain_actual.saturating_sub(self.db_expected)
     }
 }
 
@@ -517,11 +526,14 @@ async fn log_orphan_deposit_rows_at_startup(storage: &Storage) {
     }
 }
 
-/// Convert a per-mint net (deposits - withdrawals) into the unsigned expected balance.
-/// Negative (withdrawals > deposits) means the DB is missing deposit history (fresh or
-/// partial DB, or a withdrawal indexed before its deposit): clamp to 0 and warn, since any
-/// real on-chain balance still trips the mismatch. Over-u64 can't happen for a real escrow
-/// (the ATA balance is itself a u64), so treat it as corruption and abort startup.
+/// Turn a mint's net (deposits - withdrawals) into the expected escrow balance (a u64).
+/// Three cases:
+/// - In range: return it as-is.
+/// - Negative (more withdrawals than deposits): the DB is missing deposit history, so
+///   clamp to 0 and warn. Expected 0 against a real on-chain balance is just a surplus,
+///   which warns but never blocks.
+/// - Above u64::MAX: impossible for a real escrow (the ATA balance is a u64), so treat it
+///   as DB corruption and abort startup.
 fn net_db_expected(
     net: &bigdecimal::BigDecimal,
     mint_address: &str,
@@ -543,25 +555,20 @@ fn net_db_expected(
     }
 }
 
-/// Compute the absolute difference between on-chain balance and DB expected value.
-/// Both sides are u64; the diff cannot exceed u64::MAX.
-pub fn compute_mismatch(db_expected: u64, on_chain_actual: u64) -> u64 {
-    on_chain_actual.abs_diff(db_expected)
-}
-
 /// Log results and decide whether to allow or block startup.
 fn classify_and_report(
     config: &ReconciliationConfig,
     results: &[MintReconciliation],
 ) -> Result<(), IndexerError> {
+    // Only a shortfall past the threshold is fatal: custody below liabilities.
     let exceeding: Vec<&MintReconciliation> = results
         .iter()
-        .filter(|r| r.mismatch > config.mismatch_threshold_raw)
+        .filter(|r| r.shortfall() > config.mismatch_threshold_raw)
         .collect();
 
     let within_tolerance: Vec<&MintReconciliation> = results
         .iter()
-        .filter(|r| r.mismatch > 0 && r.mismatch <= config.mismatch_threshold_raw)
+        .filter(|r| r.shortfall() > 0 && r.shortfall() <= config.mismatch_threshold_raw)
         .collect();
 
     if !exceeding.is_empty() {
@@ -571,9 +578,9 @@ fn classify_and_report(
                 mint = %r.mint,
                 db_expected = r.db_expected,
                 on_chain_actual = r.on_chain_actual,
-                mismatch = r.mismatch,
+                shortfall = r.shortfall(),
                 threshold = config.mismatch_threshold_raw,
-                "RECONCILIATION ALERT: escrow ATA balance mismatch exceeds threshold"
+                "RECONCILIATION ALERT: escrow custody shortfall below DB-expected liabilities exceeds threshold"
             );
         }
 
@@ -585,22 +592,40 @@ fn classify_and_report(
         ));
     }
 
+    // A surplus is benign and attacker-inducible, so it only warns and never blocks.
+    for r in results.iter().filter(|r| r.surplus() > 0) {
+        warn!(
+            mint = %r.mint,
+            db_expected = r.db_expected,
+            on_chain_actual = r.on_chain_actual,
+            surplus = r.surplus(),
+            "Reconciliation: escrow holds more than DB expects (benign surplus, not a solvency issue), continuing startup"
+        );
+    }
+
     for r in &within_tolerance {
         warn!(
             mint = %r.mint,
             db_expected = r.db_expected,
             on_chain_actual = r.on_chain_actual,
-            mismatch = r.mismatch,
+            shortfall = r.shortfall(),
             threshold = config.mismatch_threshold_raw,
-            "Reconciliation: balance mismatch within tolerance, continuing startup"
+            "Reconciliation: custody shortfall within tolerance, continuing startup"
         );
     }
 
-    let balanced = results.iter().filter(|r| r.mismatch == 0).count();
+    // Every passing mint is exactly one of balanced, within-tolerance shortfall, or
+    // surplus, so these three counts sum to total_mints.
+    let surplus = results.iter().filter(|r| r.surplus() > 0).count();
+    let balanced = results
+        .iter()
+        .filter(|r| r.shortfall() == 0 && r.surplus() == 0)
+        .count();
     info!(
         total_mints = results.len(),
         balanced,
         within_tolerance = within_tolerance.len(),
+        surplus,
         "Startup reconciliation passed"
     );
 
@@ -612,36 +637,39 @@ mod tests {
     use super::*;
 
     // =========================================================================
-    // compute_mismatch tests
+    // directional accessor tests
     // =========================================================================
 
     #[test]
-    fn test_compute_mismatch_balanced() {
-        assert_eq!(compute_mismatch(1000, 1000), 0);
+    fn shortfall_when_db_exceeds_chain() {
+        let r = make_result("mint", 1000, 900);
+        assert_eq!(r.shortfall(), 100);
+        assert_eq!(r.surplus(), 0);
     }
 
     #[test]
-    fn test_compute_mismatch_on_chain_excess() {
-        // on-chain has 100 more than DB expects (unlikely but defensively handled)
-        assert_eq!(compute_mismatch(900, 1000), 100);
+    fn surplus_when_chain_exceeds_db() {
+        let r = make_result("mint", 900, 1000);
+        assert_eq!(r.surplus(), 100);
+        assert_eq!(r.shortfall(), 0);
     }
 
     #[test]
-    fn test_compute_mismatch_db_excess() {
-        // DB expects 100 more than on-chain (tokens not yet settled or slippage)
-        assert_eq!(compute_mismatch(1100, 1000), 100);
+    fn balanced_is_zero_both_directions() {
+        let r = make_result("mint", 1000, 1000);
+        assert_eq!(r.shortfall(), 0);
+        assert_eq!(r.surplus(), 0);
     }
 
     #[test]
-    fn test_compute_mismatch_zero_both() {
-        assert_eq!(compute_mismatch(0, 0), 0);
-    }
-
-    #[test]
-    fn test_compute_mismatch_full_u64_range() {
-        // A wiped DB (expected 0) against a u64::MAX escrow must not overflow.
-        assert_eq!(compute_mismatch(0, u64::MAX), u64::MAX);
-        assert_eq!(compute_mismatch(u64::MAX, 0), u64::MAX);
+    fn accessors_saturate_across_full_u64_range() {
+        // Saturating subtraction keeps both directions lossless and panic-free at the extremes.
+        let s = make_result("mint", 0, u64::MAX);
+        assert_eq!(s.surplus(), u64::MAX);
+        assert_eq!(s.shortfall(), 0);
+        let d = make_result("mint", u64::MAX, 0);
+        assert_eq!(d.shortfall(), u64::MAX);
+        assert_eq!(d.surplus(), 0);
     }
 
     // =========================================================================
@@ -695,32 +723,32 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_mismatch_within_tolerance() {
+    fn test_classify_shortfall_within_tolerance() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
         };
-        // mismatch = 5, threshold = 10 → should pass with warning
-        let results = vec![make_result("mint1", 1000, 1005)];
+        // shortfall = 5, threshold = 10 => should pass with warning
+        let results = vec![make_result("mint1", 1005, 1000)];
         assert!(classify_and_report(&config, &results).is_ok());
     }
 
     #[test]
-    fn test_classify_mismatch_equals_threshold() {
+    fn test_classify_shortfall_equals_threshold() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 5,
         };
-        // mismatch == threshold → within tolerance (not exceeding)
-        let results = vec![make_result("mint1", 1000, 1005)];
+        // shortfall == threshold => within tolerance (not exceeding)
+        let results = vec![make_result("mint1", 1005, 1000)];
         assert!(classify_and_report(&config, &results).is_ok());
     }
 
     #[test]
-    fn test_classify_mismatch_exceeds_threshold_blocks() {
+    fn test_classify_shortfall_exceeds_threshold_blocks() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 4,
         };
-        // mismatch = 5 > threshold = 4 → error
-        let results = vec![make_result("mint1", 1000, 1005)];
+        // shortfall = 5 > threshold = 4 => error
+        let results = vec![make_result("mint1", 1005, 1000)];
         let err = classify_and_report(&config, &results).unwrap_err();
         match err {
             IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
@@ -735,23 +763,34 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_strict_zero_threshold_any_mismatch_blocks() {
+    fn test_classify_strict_zero_threshold_any_shortfall_blocks() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 0,
         };
-        let results = vec![make_result("mint1", 1000, 1001)];
+        let results = vec![make_result("mint1", 1001, 1000)];
         assert!(classify_and_report(&config, &results).is_err());
     }
 
     #[test]
-    fn test_classify_multiple_mints_one_exceeds() {
+    fn test_classify_surplus_never_blocks() {
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        // A large surplus at the strictest threshold must still pass: surplus is benign.
+        let results = vec![make_result("mint1", 1000, 1_000_000)];
+        assert!(classify_and_report(&config, &results).is_ok());
+    }
+
+    #[test]
+    fn test_classify_surplus_does_not_inflate_block_count() {
         let config = ReconciliationConfig {
             mismatch_threshold_raw: 10,
         };
         let results = vec![
-            make_result("mint1", 1000, 1000), // balanced
-            make_result("mint2", 1000, 1005), // mismatch 5 ≤ 10 → warn
-            make_result("mint3", 1000, 1020), // mismatch 20 > 10 → error
+            make_result("mint1", 1000, 1000),      // balanced
+            make_result("mint2", 1000, 1_000_000), // large surplus => warn only
+            make_result("mint3", 1005, 1000),      // shortfall 5 <= 10 => warn
+            make_result("mint4", 1020, 1000),      // shortfall 20 > 10 => the only blocker
         ];
         let err = classify_and_report(&config, &results).unwrap_err();
         match err {
@@ -823,7 +862,8 @@ mod tests {
         assert_eq!(results[0].mint, "MintAAAA");
         assert_eq!(results[0].db_expected, 800);
         assert_eq!(results[0].on_chain_actual, 0);
-        assert_eq!(results[0].mismatch, 800);
+        assert_eq!(results[0].shortfall(), 800);
+        assert_eq!(results[0].surplus(), 0);
     }
 
     #[test]
@@ -835,7 +875,8 @@ mod tests {
         assert_eq!(results[0].mint, mint.to_string());
         assert_eq!(results[0].db_expected, 0);
         assert_eq!(results[0].on_chain_actual, 1234);
-        assert_eq!(results[0].mismatch, 1234);
+        assert_eq!(results[0].surplus(), 1234);
+        assert_eq!(results[0].shortfall(), 0);
     }
 
     #[test]
@@ -845,7 +886,8 @@ mod tests {
         let results =
             build_reconciliation_set(&[db_balance(&mint.to_string(), 1000, 0)], &on_chain).unwrap();
         assert_eq!(results.len(), 1, "same mint must merge to one entry");
-        assert_eq!(results[0].mismatch, 0);
+        assert_eq!(results[0].shortfall(), 0);
+        assert_eq!(results[0].surplus(), 0);
     }
 
     #[test]
@@ -1013,9 +1055,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconciliation_empty_db_with_nonempty_escrow_blocks() {
-        // The SOLA3-7 regression: a fresh/partial DB (no `mints` rows) against a
-        // live escrow balance must fail closed instead of passing blind.
+    async fn test_reconciliation_empty_db_with_nonempty_escrow_passes_as_surplus() {
+        // A fresh or partial DB against a live escrow is a pure surplus: the escrow
+        // holds more than the DB expects. Custody above liabilities is not a solvency
+        // risk and is attacker-inducible, so startup continues with a warning instead
+        // of failing closed.
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000)]).await;
@@ -1037,16 +1081,45 @@ mod tests {
         )
         .await;
 
-        match result {
-            Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
-                count,
-                ..
-            })) => assert_eq!(count, 1),
-            other => panic!(
-                "live escrow with empty DB must block startup, got: {:?}",
-                other
-            ),
-        }
+        assert!(
+            result.is_ok(),
+            "live escrow with empty DB is a benign surplus and must not block startup: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_surplus_does_not_block() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        // DB expects 1000, on-chain has 1_000_000 => pure surplus, strict threshold 0.
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000_000)]).await;
+        // A readable supply below custody, so the invariant holds and the surplus
+        // rule is what the test actually exercises.
+        mock_channel_supply(&mut server, 1_000).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        };
+        let seed = Pubkey::new_unique();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &server.url(),
+            Some(&server.url()),
+            &seed,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a surplus must never block startup: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -1078,11 +1151,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconciliation_mismatch_within_threshold_passes() {
+    async fn test_reconciliation_shortfall_within_threshold_passes() {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
-        // DB expects 1000, on-chain has 1005 => mismatch 5 <= threshold 10 => ok
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_005)]).await;
+        // DB expects 1000, on-chain has 995 => shortfall 5 <= threshold 10 => ok
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 995)]).await;
         // Healthy supply, so the ledger comparison stays the thing under test.
         mock_channel_supply(&mut server, 1_000).await;
 
@@ -1105,19 +1178,20 @@ mod tests {
         .await;
         assert!(
             result.is_ok(),
-            "mismatch within threshold should pass: {:?}",
+            "shortfall within threshold should pass: {:?}",
             result
         );
     }
 
     #[tokio::test]
-    async fn test_reconciliation_mismatch_exceeds_threshold_blocks() {
+    async fn test_reconciliation_shortfall_exceeds_threshold_blocks() {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
-        // DB expects 1000, on-chain has 1020 => mismatch 20 > threshold 10 => err
-        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_020)]).await;
-        // Healthy supply, so the ledger comparison stays the thing under test.
-        mock_channel_supply(&mut server, 1_000).await;
+        // DB expects 1000, on-chain has 980 => shortfall 20 > threshold 10 => err
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
+        // Supply matches custody, so the supply invariant passes and the ledger
+        // comparison is the only thing left to fail.
+        mock_channel_supply(&mut server, 980).await;
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
@@ -1721,5 +1795,74 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "supply <= custody must pass: {:?}", result);
+    }
+
+    /// The two rules that survived the main merge point in opposite directions,
+    /// and both directions have to hold in one place so neither is later
+    /// "simplified" into the other. A custody surplus is benign and never
+    /// blocks; a channel supply above custody is insolvency and always does.
+    #[tokio::test]
+    async fn startup_reconciliation_surplus_passes_but_supply_breach_halts() {
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+        };
+        let seed = Pubkey::new_unique();
+
+        // Direction 1: custody far above the ledger, supply within custody.
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 1_000_000)]).await;
+        mock_channel_supply(&mut server, 1_000).await;
+        let surplus_storage = MockStorage::new();
+        surplus_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        let surplus_storage = Storage::Mock(surplus_storage);
+        let url = server.url();
+        let surplus = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &surplus_storage,
+            &url,
+            Some(&url),
+            &seed,
+        )
+        .await;
+        assert!(
+            surplus.is_ok(),
+            "a custody surplus must never block startup: {:?}",
+            surplus
+        );
+
+        // Direction 2: same balanced ledger, but the channel minted past custody.
+        let mut breach_server = mockito::Server::new_async().await;
+        let breach_mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut breach_server, &[(breach_mint.to_string(), 1_000)]).await;
+        mock_channel_supply(&mut breach_server, 1_200).await;
+        let breach_storage = MockStorage::new();
+        breach_storage.set_mint_balances(vec![make_mint_balance(
+            &breach_mint.to_string(),
+            1000,
+            0,
+        )]);
+        let breach_storage = Storage::Mock(breach_storage);
+        let breach_url = breach_server.url();
+        let breach = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &breach_storage,
+            &breach_url,
+            Some(&breach_url),
+            &seed,
+        )
+        .await;
+        assert!(
+            matches!(
+                breach,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "supply over custody must still halt: {:?}",
+            breach
+        );
     }
 }

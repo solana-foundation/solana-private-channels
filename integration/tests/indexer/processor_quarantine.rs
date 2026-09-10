@@ -18,7 +18,7 @@
 //! Deposits (Escrow program type) don't halt the pipeline — they
 //! quarantine the single row and keep flowing (614-635 path). This
 //! keeps the test focused on the observable contract without needing
-//! the full withdrawal SMT harness.
+//! the full withdrawal harness.
 
 use {
     chrono::Utc,
@@ -59,6 +59,7 @@ fn make_bad_deposit(id: i64) -> DbTransaction {
         instruction_index: 0,
         inner_index: None,
         landed_remint_signature: None,
+        release_refused_on_chain: false,
     }
 }
 

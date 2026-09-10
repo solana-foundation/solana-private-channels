@@ -77,7 +77,7 @@ pub enum ReconciliationError {
     #[error("RPC error for mint {mint}: {reason}")]
     Rpc { mint: String, reason: String },
 
-    #[error("{count} mint(s) exceed mismatch threshold of {threshold} raw units; see logs for per-mint details")]
+    #[error("{count} mint(s) have a custody shortfall exceeding the threshold of {threshold} raw units; see logs for per-mint details")]
     MismatchExceedsThreshold { count: usize, threshold: u64 },
 
     /// Minted channel supply is above the custody backing it. Kept separate from a
@@ -122,6 +122,35 @@ pub enum ReconciliationError {
     /// aborts before any destruction so the live DB is left intact.
     #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
     ConsumedSetUnavailable { reason: String },
+
+    /// The on-chain withdrawal bitmap has already issued nonces. A rebuild restarts the
+    /// nonce sequence at 0, so every rebuilt withdrawal would be numbered against a
+    /// window the chain has moved past. Resync aborts before any destruction.
+    #[error(
+        "withdrawal bitmap has advanced (generation {generation}, {set_bits} set bit(s)); a \
+         resync would restart the nonce sequence at 0 against it. Aborted before drop, the \
+         database is intact. See docs/runbooks/resync_bitmap_advanced.md"
+    )]
+    WithdrawalBitmapAdvanced { generation: u64, set_bits: usize },
+
+    /// The local database already holds completed withdrawals, so their nonces are set on
+    /// the chain's bitmap whatever an RPC reports. This is refused before any RPC is read.
+    #[error(
+        "the database records {completed} completed withdrawal(s), so the chain's bitmap has \
+         issued their nonces; a resync would restart the nonce sequence at 0 under them. \
+         Aborted before drop, the database is intact. See \
+         docs/runbooks/resync_bitmap_advanced.md"
+    )]
+    WithdrawalNoncesReleased { completed: usize },
+
+    /// The bitmap could not be read, so the advance check never ran. An unreadable
+    /// bitmap is not evidence that the chain is fresh, so resync refuses rather than skips.
+    #[error(
+        "withdrawal bitmap could not be verified, resync aborted before drop: {reason}. An \
+         unreadable bitmap is not evidence that resyncing is safe. See \
+         docs/runbooks/resync_bitmap_advanced.md"
+    )]
+    WithdrawalBitmapUnverified { reason: String },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

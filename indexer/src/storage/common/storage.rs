@@ -4,9 +4,9 @@ pub use try_requeue_prebroadcast::RequeueOutcome;
 pub mod bump_pending_remint_finality_attempt;
 pub mod claim_and_persist_signature;
 pub mod claim_remint_attempt;
-pub mod clear_owed_rotation_target;
 pub mod close;
 pub mod count_pending_transactions;
+pub mod delete_release_signature;
 pub mod delete_release_signatures;
 pub mod delete_remint_signatures;
 pub mod drop_tables;
@@ -21,37 +21,39 @@ pub mod get_in_flight_amounts_by_mint;
 pub mod get_mint;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
+pub mod get_observed_release;
 pub mod get_orphan_deposit_ids;
-pub mod get_owed_rotation_target;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
 pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
+pub mod get_stalled_withdrawals_with_signatures;
 pub mod get_transaction_status;
-pub mod has_active_withdrawal_below;
+pub mod get_withdrawal_by_nonce;
 pub mod init_schema;
 pub mod insert_db_transaction;
 pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
+pub mod insert_observed_releases_batch;
 pub mod insert_release_signature;
-pub mod lowest_unreleased_withdrawal_below;
-pub mod quarantine_all_active_withdrawals;
+pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod sender_lock;
 pub mod set_mint_extension_flags;
-pub mod set_owed_rotation_target;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
+pub mod try_complete_stalled_withdrawal;
 pub mod try_park_processing;
 pub mod try_quarantine_processing;
 pub mod try_requeue_parked;
 pub mod try_requeue_prebroadcast;
 pub mod try_requeue_processing;
 pub mod try_unpark_to_processing;
+pub mod unreleased_withdrawal_nonce_bounds;
 pub mod update_committed_checkpoint;
 pub mod update_transaction_status;
 pub mod upsert_mints_batch;
@@ -150,38 +152,6 @@ impl Storage {
         update_committed_checkpoint::update_committed_checkpoint(self, program_type, slot).await
     }
 
-    /// Tree generation the sender owes the chain; `None` if none is owed.
-    pub async fn get_owed_rotation_target(
-        &self,
-        program_type: &str,
-    ) -> Result<Option<u64>, StorageError> {
-        get_owed_rotation_target::get_owed_rotation_target(self, program_type).await
-    }
-
-    /// Record the owed tree generation before its rotation is dispatched.
-    pub async fn set_owed_rotation_target(
-        &self,
-        program_type: &str,
-        target_tree_index: u64,
-    ) -> Result<(), StorageError> {
-        set_owed_rotation_target::set_owed_rotation_target(self, program_type, target_tree_index)
-            .await
-    }
-
-    /// Retire the owed rotation once a chain read proved the target landed.
-    pub async fn clear_owed_rotation_target(
-        &self,
-        program_type: &str,
-        target_tree_index: u64,
-    ) -> Result<(), StorageError> {
-        clear_owed_rotation_target::clear_owed_rotation_target(
-            self,
-            program_type,
-            target_tree_index,
-        )
-        .await
-    }
-
     /// Terminal status write; `Ok(false)` if row already off Processing.
     pub async fn update_transaction_status(
         &self,
@@ -220,6 +190,25 @@ impl Storage {
     /// `mint_status_history` transition. No-op for mints without a row.
     pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
         sync_mint_status::sync_mint_status(self, mint_addresses).await
+    }
+
+    /// Record the `ReleaseFunds` instructions a slot was seen to contain.
+    /// Idempotent on the withdrawal nonce, so live indexing, a backfill and a
+    /// resync can all report the same release without erroring on the second
+    /// write or leaving a duplicate behind.
+    pub async fn insert_observed_releases_batch(
+        &self,
+        releases: &[DbObservedRelease],
+    ) -> Result<(), StorageError> {
+        insert_observed_releases_batch::insert_observed_releases_batch(self, releases).await
+    }
+
+    /// The release recorded for `nonce`, if the indexer has seen one.
+    pub async fn get_observed_release(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<DbObservedRelease>, StorageError> {
+        get_observed_release::get_observed_release(self, nonce).await
     }
 
     /// Resolve a mint's status (Allowed / Blocked / NeverAllowed) as of `slot`.
@@ -321,20 +310,6 @@ impl Storage {
         count_pending_transactions::count_pending_transactions(self, transaction_type).await
     }
 
-    pub async fn has_active_withdrawal_below(&self, nonce: i64) -> Result<bool, StorageError> {
-        has_active_withdrawal_below::has_active_withdrawal_below(self, nonce).await
-    }
-
-    /// Lowest withdrawal nonce below `nonce` that still owes a release; `None` if all
-    /// lower nonces are terminal. Counts `Processing` where `has_active_withdrawal_below`
-    /// does not, so it holds on the sender's submit path across a restart.
-    pub async fn lowest_unreleased_withdrawal_below(
-        &self,
-        nonce: i64,
-    ) -> Result<Option<i64>, StorageError> {
-        lowest_unreleased_withdrawal_below::lowest_unreleased_withdrawal_below(self, nonce).await
-    }
-
     /// Get completed withdrawal nonces in the given range [min_nonce, max_nonce)
     pub async fn get_completed_withdrawal_nonces(
         &self,
@@ -345,14 +320,40 @@ impl Storage {
             .await
     }
 
-    /// Transitions a withdrawal to PendingRemint, storing withdrawal
-    /// signatures + lvbh for the finality check on restart.
+    /// Withdrawals stalled in `status` that still carry stored release
+    /// signatures, oldest-first. Rows with no usable evidence are excluded.
+    pub async fn get_stalled_withdrawals_with_signatures(
+        &self,
+        status: TransactionStatus,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<DbTransaction>, StorageError> {
+        get_stalled_withdrawals_with_signatures::get_stalled_withdrawals_with_signatures(
+            self, status, after_id, limit,
+        )
+        .await
+    }
+
+    /// The withdrawal row that owns `nonce`, if any.
+    pub async fn get_withdrawal_by_nonce(
+        &self,
+        nonce: u64,
+    ) -> Result<Option<DbTransaction>, StorageError> {
+        get_withdrawal_by_nonce::get_withdrawal_by_nonce(self, nonce).await
+    }
+
+    /// Transitions a withdrawal to PendingRemint, storing the withdrawal
+    /// signatures and their lvbh for the finality check on restart, plus whether
+    /// the program itself refused the release. That refusal is proof no payout
+    /// occurred and the only such proof that outlives a bitmap rotation, so it is
+    /// durable from the moment the refund is queued.
     pub async fn set_pending_remint(
         &self,
         transaction_id: i64,
         remint_signatures: Vec<String>,
         remint_last_valid_block_heights: Vec<i64>,
         deadline_at: chrono::DateTime<chrono::Utc>,
+        release_refused_on_chain: bool,
     ) -> Result<(), StorageError> {
         set_pending_remint::set_pending_remint(
             self,
@@ -360,6 +361,7 @@ impl Storage {
             remint_signatures,
             remint_last_valid_block_heights,
             deadline_at,
+            release_refused_on_chain,
         )
         .await
     }
@@ -432,19 +434,23 @@ impl Storage {
         .await
     }
 
-    /// Mark every `Pending`/`Processing` withdrawal row as `ManualReview`.
+    /// Mark active withdrawal rows at or above `min_nonce` as `ManualReview`.
     ///
-    /// Invoked by the processor when a single withdrawal is unprocessable:
-    /// the whole withdrawal pipeline halts so a human can inspect and
-    /// decide on rotation/reinsert before drains resume. `exclude_id` is
-    /// the poison row already quarantined through the async status-update
-    /// channel — excluding it here avoids a duplicate webhook. Returns the
-    /// number of rows flipped.
-    pub async fn quarantine_all_active_withdrawals(
+    /// Invoked by the processor when a single withdrawal is unprocessable.
+    /// The pipeline halts so the withdrawal bitmap cannot rotate past the
+    /// quarantined row's generation, which would make its nonce permanently
+    /// unreleasable and remove the operator's re-arm option. `min_nonce`
+    /// keeps the sweep off lower rows that are still releasable; `None`
+    /// sweeps every active row. `exclude_id` is the poison row already
+    /// quarantined through the async status-update channel, excluded here
+    /// to avoid a duplicate webhook. Returns the number of rows flipped.
+    pub async fn quarantine_active_withdrawals(
         &self,
         exclude_id: Option<i64>,
+        min_nonce: Option<i64>,
     ) -> Result<u64, StorageError> {
-        quarantine_all_active_withdrawals::quarantine_all_active_withdrawals(self, exclude_id).await
+        quarantine_active_withdrawals::quarantine_active_withdrawals(self, exclude_id, min_nonce)
+            .await
     }
 
     /// Stale `Processing` rows of one type past the threshold (used by recovery).
@@ -452,15 +458,15 @@ impl Storage {
     /// the chain its RPC client points at.
     pub async fn get_stale_processing_transactions(
         &self,
-        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         get_stale_processing_transactions::get_stale_processing_transactions(
             self,
-            transaction_type,
             threshold,
             limit,
+            transaction_type,
         )
         .await
     }
@@ -504,15 +510,15 @@ impl Storage {
     /// Stale `Parked` rows of one type older than the threshold, oldest-first.
     pub async fn get_stale_parked_transactions(
         &self,
-        transaction_type: TransactionType,
         threshold: std::time::Duration,
         limit: i64,
+        transaction_type: TransactionType,
     ) -> Result<Vec<DbTransaction>, StorageError> {
         get_stale_parked_transactions::get_stale_parked_transactions(
             self,
-            transaction_type,
             threshold,
             limit,
+            transaction_type,
         )
         .await
     }
@@ -546,16 +552,41 @@ impl Storage {
         .await
     }
 
+    /// CAS a stalled withdrawal (`ManualReview` or `PendingRemint`) to
+    /// `Completed` on `updated_at`; `Ok(false)` if stale or guard-rejected.
+    pub async fn try_complete_stalled_withdrawal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+        from_status: TransactionStatus,
+        counterpart_signature: Option<String>,
+    ) -> Result<bool, StorageError> {
+        try_complete_stalled_withdrawal::try_complete_stalled_withdrawal(
+            self,
+            transaction_id,
+            expected_updated_at,
+            from_status,
+            counterpart_signature,
+        )
+        .await
+    }
+
     /// CAS `Processing` → `ManualReview`; reason rides on the webhook, not DB.
+    /// The optional signature arrays are recorded on the row in the same write;
+    /// `None` leaves both columns untouched.
     pub async fn try_quarantine_processing(
         &self,
         transaction_id: i64,
         expected_updated_at: chrono::DateTime<chrono::Utc>,
+        remint_signatures: Option<Vec<String>>,
+        remint_last_valid_block_heights: Option<Vec<i64>>,
     ) -> Result<bool, StorageError> {
         try_quarantine_processing::try_quarantine_processing(
             self,
             transaction_id,
             expected_updated_at,
+            remint_signatures,
+            remint_last_valid_block_heights,
         )
         .await
     }
@@ -615,6 +646,27 @@ impl Storage {
     /// Delete all stored release signatures for a transaction.
     pub async fn delete_release_signatures(&self, transaction_id: i64) -> Result<(), StorageError> {
         delete_release_signatures::delete_release_signatures(self, transaction_id).await
+    }
+
+    /// Delete one stored release signature, keeping the transaction's others.
+    pub async fn delete_release_signature(
+        &self,
+        transaction_id: i64,
+        signature: &str,
+    ) -> Result<(), StorageError> {
+        delete_release_signature::delete_release_signature(self, transaction_id, signature).await
+    }
+
+    /// Lowest and highest withdrawal nonce at or above `min_nonce` that still
+    /// owes a release, or `None` when none do. Drives the rotation gate: the low
+    /// bound says whether the current generation is finished with, the high
+    /// bound whether any work is waiting beyond it.
+    pub async fn unreleased_withdrawal_nonce_bounds(
+        &self,
+        min_nonce: i64,
+    ) -> Result<Option<(i64, i64)>, StorageError> {
+        unreleased_withdrawal_nonce_bounds::unreleased_withdrawal_nonce_bounds(self, min_nonce)
+            .await
     }
 
     /// Drop release signatures only for genuinely terminal parents (completed,
@@ -713,6 +765,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         }
     }
 
@@ -824,6 +877,82 @@ mod tests {
             locked2.len(),
             1,
             "only the remaining Pending deposit re-locks"
+        );
+    }
+
+    /// The resolved dequeue has no nonce frontier and orders by `created_at`.
+    /// Seeded so nonce order and insertion order disagree, the mock must follow
+    /// `created_at` and must not let the quarantined lower nonce withhold anything.
+    #[tokio::test]
+    async fn get_and_lock_withdrawals_ignores_lower_active_nonces_and_orders_by_created_at() {
+        let (storage, mock) = make_mock_storage();
+        let base = Utc::now();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            for (id, nonce, status, age_secs) in [
+                (1_i64, 5_i64, TransactionStatus::ManualReview, 0_i64),
+                (2, 7, TransactionStatus::Pending, 1),
+                (3, 6, TransactionStatus::Pending, 2),
+            ] {
+                let mut txn = make_db_transaction();
+                txn.id = id;
+                txn.transaction_type = TransactionType::Withdrawal;
+                txn.status = status;
+                txn.withdrawal_nonce = Some(nonce);
+                txn.created_at = base + chrono::Duration::seconds(age_secs);
+                pending.push(txn);
+            }
+        }
+
+        let locked = storage
+            .get_and_lock_pending_transactions(TransactionType::Withdrawal, 100)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = locked.iter().map(|txn| txn.id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "both Pending withdrawals above the quarantined nonce are dequeued, oldest first"
+        );
+    }
+
+    /// `set_pending_remint` is one row in Postgres, so the refusal flag has to be
+    /// readable through every path, not just the rehydration list.
+    #[tokio::test]
+    async fn set_pending_remint_refusal_is_visible_by_nonce() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut pending = mock.pending_transactions.lock().unwrap();
+            let mut txn = make_db_transaction();
+            txn.id = 42;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Processing;
+            txn.withdrawal_nonce = Some(9);
+            pending.push(txn);
+        }
+
+        storage
+            .set_pending_remint(
+                42,
+                vec!["sig1".to_string()],
+                vec![100],
+                Utc::now() + chrono::Duration::seconds(32),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let by_nonce = storage.get_withdrawal_by_nonce(9).await.unwrap().unwrap();
+        assert!(
+            by_nonce.release_refused_on_chain,
+            "the authoritative row carries the on-chain refusal"
+        );
+
+        let rehydrated = storage.get_pending_remint_transactions().await.unwrap();
+        assert_eq!(rehydrated.len(), 1);
+        assert!(
+            rehydrated[0].release_refused_on_chain,
+            "the rehydration copy still carries it too"
         );
     }
 
@@ -1336,6 +1465,42 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// The escalation exists because the outcome is unknown, and the broadcast
+    /// signatures are the only thing that can still settle it. Every other
+    /// terminal status names a decided outcome with nothing left to reconstruct,
+    /// so the sweep still reclaims those.
+    #[tokio::test]
+    async fn release_signature_gc_keeps_processing_and_manual_review_only() {
+        let cases = [
+            (TransactionStatus::Processing, true),
+            (TransactionStatus::ManualReview, true),
+            (TransactionStatus::Completed, false),
+            (TransactionStatus::Failed, false),
+            (TransactionStatus::FailedReminted, false),
+        ];
+
+        for (status, retained) in cases {
+            let (storage, mock) = make_mock_storage();
+            let mut row = make_db_transaction();
+            row.id = 1;
+            row.status = status;
+            mock.pending_transactions.lock().unwrap().push(row);
+            storage
+                .insert_release_signature(1, "sig-gc".to_string(), 10, None)
+                .await
+                .unwrap();
+
+            storage.gc_stale_release_signatures().await.unwrap();
+
+            assert_eq!(
+                !storage.get_release_signatures(1).await.unwrap().is_empty(),
+                retained,
+                "{status:?} must {} its signatures",
+                if retained { "keep" } else { "lose" }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_get_committed_checkpoint_via_mock() {
         let (storage, _mock) = make_mock_storage();
@@ -1355,45 +1520,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_owed_rotation_target_via_mock() {
-        let (storage, _mock) = make_mock_storage();
-        assert!(storage
-            .get_owed_rotation_target("withdraw")
-            .await
-            .unwrap()
-            .is_none());
-
-        storage
-            .set_owed_rotation_target("withdraw", 7)
-            .await
-            .unwrap();
-        assert_eq!(
-            storage.get_owed_rotation_target("withdraw").await.unwrap(),
-            Some(7)
-        );
-
-        // A clear naming a different target must leave the owed one alone.
-        storage
-            .clear_owed_rotation_target("withdraw", 6)
-            .await
-            .unwrap();
-        assert_eq!(
-            storage.get_owed_rotation_target("withdraw").await.unwrap(),
-            Some(7)
-        );
-
-        storage
-            .clear_owed_rotation_target("withdraw", 7)
-            .await
-            .unwrap();
-        assert!(storage
-            .get_owed_rotation_target("withdraw")
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
     async fn dispatch_insert_db_transactions_batch_via_mock() {
         let (storage, mock) = make_mock_storage();
         let txns = vec![make_db_transaction(), make_db_transaction()];
@@ -1402,13 +1528,13 @@ mod tests {
         assert_eq!(mock.inserted_transactions.lock().unwrap().len(), 1);
     }
 
-    // ── quarantine_all_active_withdrawals ─────────────────────────────
+    // ── quarantine_active_withdrawals ─────────────────────────────
 
     /// Only Pending and Processing withdrawals flip to ManualReview.
     /// Returns the exact number of rows affected so the caller can log
     /// the blast radius.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_flips_pending_and_processing_only() {
+    async fn quarantine_active_withdrawals_flips_pending_and_processing_only() {
         let (storage, mock) = make_mock_storage();
         {
             let mut db = mock.pending_transactions.lock().unwrap();
@@ -1425,7 +1551,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 2);
@@ -1440,7 +1566,7 @@ mod tests {
     /// poisoned withdrawal must not strand deposits, which have no nonce
     /// and no gap semantics.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_leaves_deposits_untouched() {
+    async fn quarantine_active_withdrawals_leaves_deposits_untouched() {
         let (storage, mock) = make_mock_storage();
         {
             let mut db = mock.pending_transactions.lock().unwrap();
@@ -1456,7 +1582,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 1);
@@ -1479,7 +1605,7 @@ mod tests {
     /// are left alone so the webhook does not re-alert on already-handled
     /// rows.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_leaves_terminal_rows_untouched() {
+    async fn quarantine_active_withdrawals_leaves_terminal_rows_untouched() {
         let (storage, mock) = make_mock_storage();
         let terminal = [
             TransactionStatus::Completed,
@@ -1499,7 +1625,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 0);
@@ -1513,24 +1639,189 @@ mod tests {
     /// Storage-level failure surfaces as an `Err` so the processor can log
     /// and continue the channel drain without silent loss.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_propagates_mock_failure() {
+    async fn quarantine_active_withdrawals_propagates_mock_failure() {
         let (storage, mock) = make_mock_storage();
-        mock.set_should_fail("quarantine_all_active_withdrawals", true);
+        mock.set_should_fail("quarantine_active_withdrawals", true);
         assert!(storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .is_err());
     }
 
     /// The empty-DB case returns `0` — a successful no-op, not an error.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_empty_db_returns_zero() {
+    async fn quarantine_active_withdrawals_empty_db_returns_zero() {
         let (storage, _mock) = make_mock_storage();
         let affected = storage
-            .quarantine_all_active_withdrawals(None)
+            .quarantine_active_withdrawals(None, None)
             .await
             .unwrap();
         assert_eq!(affected, 0);
+    }
+
+    /// `Parked` is an active status the SQL sweeps alongside Pending and
+    /// Processing, so the mock has to sweep it too or every unit test in
+    /// this module pins a contract production does not implement.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_flips_parked_rows() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut parked = make_db_transaction();
+            parked.transaction_type = TransactionType::Withdrawal;
+            parked.status = TransactionStatus::Parked;
+            parked.withdrawal_nonce = Some(1);
+            db.push(parked);
+        }
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        assert_eq!(rows[0].status, TransactionStatus::ManualReview);
+    }
+
+    /// Seed three active withdrawals at nonces 1, 2 and 3.
+    fn seed_three_active_withdrawals(mock: &MockStorage) {
+        let mut db = mock.pending_transactions.lock().unwrap();
+        for nonce in 1..=3 {
+            let mut txn = make_db_transaction();
+            txn.id = nonce;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Pending;
+            txn.withdrawal_nonce = Some(nonce);
+            db.push(txn);
+        }
+    }
+
+    /// Rows below the poison nonce are releasable and sender-owned, so the
+    /// halt sweep must leave them alone.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_min_nonce_leaves_lower_rows_untouched() {
+        let (storage, mock) = make_mock_storage();
+        seed_three_active_withdrawals(&mock);
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(affected, 2);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        let low = rows.iter().find(|t| t.withdrawal_nonce == Some(1)).unwrap();
+        assert_eq!(low.status, TransactionStatus::Pending);
+        for nonce in [2, 3] {
+            let row = rows
+                .iter()
+                .find(|t| t.withdrawal_nonce == Some(nonce))
+                .unwrap();
+            assert_eq!(row.status, TransactionStatus::ManualReview);
+        }
+    }
+
+    /// A `None` floor keeps the original unbounded sweep, which is the
+    /// fail-closed fallback for a poison row that has no nonce at all.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_none_min_nonce_sweeps_all() {
+        let (storage, mock) = make_mock_storage();
+        seed_three_active_withdrawals(&mock);
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+        assert_eq!(affected, 3);
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        for txn in rows.iter() {
+            assert_eq!(txn.status, TransactionStatus::ManualReview);
+        }
+    }
+
+    /// The halt sweep must carry the journalled release signatures onto the
+    /// row, otherwise the reconcile sweep that repairs a landed release can
+    /// never select it and the nonce stays diverged forever.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_mirrors_release_journal() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut txn = make_db_transaction();
+            txn.id = 100;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Processing;
+            txn.withdrawal_nonce = Some(100);
+            txn.remint_signatures = None;
+            txn.remint_last_valid_block_heights = None;
+            db.push(txn);
+        }
+        mock.insert_release_signature(100, "release-sig".to_string(), 4242, None)
+            .await
+            .unwrap();
+
+        let affected = storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        {
+            let rows = mock.pending_transactions.lock().unwrap();
+            let row = rows.iter().find(|t| t.id == 100).expect("row present");
+            assert_eq!(row.status, TransactionStatus::ManualReview);
+            assert_eq!(
+                row.remint_signatures.as_deref(),
+                Some(["release-sig".to_string()].as_slice())
+            );
+            assert_eq!(
+                row.remint_last_valid_block_heights.as_deref(),
+                Some([4242i64].as_slice())
+            );
+        }
+
+        let stalled = mock
+            .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(stalled.len(), 1, "quarantined row must stay reconcilable");
+        assert_eq!(stalled[0].id, 100);
+    }
+
+    /// An empty journal leaves the columns alone, mirroring the SQL COALESCE:
+    /// a row quarantined before anything was broadcast keeps its NULLs.
+    #[tokio::test]
+    async fn quarantine_active_withdrawals_keeps_existing_signatures_when_journal_empty() {
+        let (storage, mock) = make_mock_storage();
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            let mut txn = make_db_transaction();
+            txn.id = 7;
+            txn.transaction_type = TransactionType::Withdrawal;
+            txn.status = TransactionStatus::Processing;
+            txn.withdrawal_nonce = Some(7);
+            txn.remint_signatures = Some(vec!["kept".to_string()]);
+            txn.remint_last_valid_block_heights = Some(vec![9]);
+            db.push(txn);
+        }
+
+        storage
+            .quarantine_active_withdrawals(None, None)
+            .await
+            .unwrap();
+
+        let rows = mock.pending_transactions.lock().unwrap();
+        let row = rows.iter().find(|t| t.id == 7).expect("row present");
+        assert_eq!(
+            row.remint_signatures.as_deref(),
+            Some(["kept".to_string()].as_slice())
+        );
+        assert_eq!(
+            row.remint_last_valid_block_heights.as_deref(),
+            Some([9i64].as_slice())
+        );
     }
 
     // ── insert_mint_statuses_batch ────────────────────────────────────
@@ -1763,6 +2054,7 @@ mod tests {
             instruction_index: 0,
             inner_index: None,
             landed_remint_signature: None,
+            release_refused_on_chain: false,
         });
     }
 
@@ -1837,7 +2129,7 @@ mod tests {
     /// the caller has already quarantined it via the async status-update
     /// channel and a second flip here would fire a duplicate webhook.
     #[tokio::test]
-    async fn quarantine_all_active_withdrawals_exclude_id_skips_poison_row() {
+    async fn quarantine_active_withdrawals_exclude_id_skips_poison_row() {
         let (storage, mock) = make_mock_storage();
         {
             let mut db = mock.pending_transactions.lock().unwrap();
@@ -1856,7 +2148,7 @@ mod tests {
         }
 
         let affected = storage
-            .quarantine_all_active_withdrawals(Some(42))
+            .quarantine_active_withdrawals(Some(42), None)
             .await
             .unwrap();
         assert_eq!(affected, 1);
@@ -1866,6 +2158,206 @@ mod tests {
         assert_eq!(poison.status, TransactionStatus::Processing);
         let sibling = rows.iter().find(|t| t.id == 43).unwrap();
         assert_eq!(sibling.status, TransactionStatus::ManualReview);
+    }
+
+    /// The mock must reject exactly what the SQL rejects, otherwise every
+    /// mock-backed test of the reconcile sweep rests on a filter that does not
+    /// exist in production.
+    #[tokio::test]
+    async fn stalled_withdrawal_query_filters_match_sql() {
+        let (storage, mock) = make_mock_storage();
+        let stalled = |id: i64, sigs: Option<Vec<String>>| {
+            let mut row = make_db_transaction();
+            row.id = id;
+            row.transaction_type = TransactionType::Withdrawal;
+            row.status = TransactionStatus::ManualReview;
+            row.withdrawal_nonce = Some(id);
+            row.remint_last_valid_block_heights = sigs.as_ref().map(|s| vec![0i64; s.len()]);
+            row.remint_signatures = sigs;
+            row
+        };
+        {
+            let mut db = mock.pending_transactions.lock().unwrap();
+            db.push(stalled(1, Some(vec!["sig-a".to_string()])));
+
+            let mut wrong_status = stalled(2, Some(vec!["sig-b".to_string()]));
+            wrong_status.status = TransactionStatus::PendingRemint;
+            db.push(wrong_status);
+
+            let mut deposit = stalled(3, Some(vec!["sig-c".to_string()]));
+            deposit.transaction_type = TransactionType::Deposit;
+            db.push(deposit);
+
+            let mut no_nonce = stalled(4, Some(vec!["sig-d".to_string()]));
+            no_nonce.withdrawal_nonce = None;
+            db.push(no_nonce);
+
+            db.push(stalled(5, Some(Vec::new())));
+            db.push(stalled(6, None));
+
+            // Reachable on a database upgraded between the two column
+            // migrations: signatures present, heights never backfilled.
+            let mut no_heights = stalled(7, Some(vec!["sig-e".to_string()]));
+            no_heights.remint_last_valid_block_heights = None;
+            db.push(no_heights);
+
+            // Refund already landed, and refund already claimed: promoting
+            // either on release evidence would pay the nonce twice.
+            let mut landed_refund = stalled(8, Some(vec!["sig-f".to_string()]));
+            landed_refund.landed_remint_signature = Some("sig-refund".to_string());
+            db.push(landed_refund);
+            db.push(stalled(9, Some(vec!["sig-g".to_string()])));
+        }
+        mock.claim_remint_attempt(9, "sig-claim".to_string(), 0, None, &[])
+            .await
+            .unwrap();
+
+        let found = storage
+            .get_stalled_withdrawals_with_signatures(TransactionStatus::ManualReview, 0, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            found.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![1],
+            "only the row with a usable signature set may be returned"
+        );
+    }
+
+    // ── unreleased withdrawal nonce bounds ───────────────────────────
+
+    /// Seed a withdrawal at `nonce` in `status` into the mock's row table.
+    fn seed_withdrawal(mock: &MockStorage, id: i64, nonce: Option<i64>, status: TransactionStatus) {
+        let mut txn = make_db_transaction();
+        txn.id = id;
+        txn.transaction_type = TransactionType::Withdrawal;
+        txn.withdrawal_nonce = nonce;
+        txn.status = status;
+        mock.pending_transactions.lock().unwrap().push(txn);
+    }
+
+    /// Every status that still owes a release, and every status that does not.
+    /// One list drives both the inclusion and the exclusion tests so the two can
+    /// never drift apart, and it is the same split the SQL encodes.
+    const LIVE_STATUSES: [TransactionStatus; 5] = [
+        TransactionStatus::Pending,
+        TransactionStatus::Processing,
+        TransactionStatus::Parked,
+        TransactionStatus::PendingRemint,
+        TransactionStatus::ManualReview,
+    ];
+    const TERMINAL_STATUSES: [TransactionStatus; 3] = [
+        TransactionStatus::Completed,
+        TransactionStatus::Failed,
+        TransactionStatus::FailedReminted,
+    ];
+
+    /// A released or written-off nonce can never need its window again, so it
+    /// must not hold the rotation back.
+    #[tokio::test]
+    async fn nonce_bounds_ignores_terminal_statuses() {
+        for (offset, status) in TERMINAL_STATUSES.into_iter().enumerate() {
+            let (storage, mock) = make_mock_storage();
+            seed_withdrawal(&mock, offset as i64 + 1, Some(5), status);
+            assert_eq!(
+                storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+                None,
+                "{status:?} is terminal and must not count as unreleased"
+            );
+        }
+    }
+
+    /// Rotating past any of these closes the only window their release can land in.
+    #[tokio::test]
+    async fn nonce_bounds_counts_every_live_status() {
+        for (offset, status) in LIVE_STATUSES.into_iter().enumerate() {
+            let (storage, mock) = make_mock_storage();
+            seed_withdrawal(&mock, offset as i64 + 1, Some(7), status);
+            assert_eq!(
+                storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+                Some((7, 7)),
+                "{status:?} still owes a release and must count"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nonce_bounds_none_when_no_live_rows() {
+        let (storage, mock) = make_mock_storage();
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            None,
+            "an empty table owes nothing"
+        );
+
+        for (offset, status) in TERMINAL_STATUSES.into_iter().enumerate() {
+            seed_withdrawal(&mock, offset as i64 + 1, Some(offset as i64), status);
+        }
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            None,
+            "an all-terminal table owes nothing"
+        );
+    }
+
+    /// Deposits carry no nonce and a NULL nonce cannot be compared to a
+    /// generation, so neither may contribute a bound.
+    #[tokio::test]
+    async fn nonce_bounds_ignores_deposits_and_null_nonces() {
+        let (storage, mock) = make_mock_storage();
+
+        let mut deposit = make_db_transaction();
+        deposit.id = 1;
+        deposit.withdrawal_nonce = Some(1);
+        mock.pending_transactions.lock().unwrap().push(deposit);
+        seed_withdrawal(&mock, 2, None, TransactionStatus::Pending);
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            None,
+            "neither a deposit nor a NULL nonce may set a bound"
+        );
+
+        seed_withdrawal(&mock, 3, Some(4), TransactionStatus::Pending);
+        seed_withdrawal(&mock, 4, Some(9), TransactionStatus::Parked);
+        assert_eq!(
+            storage.unreleased_withdrawal_nonce_bounds(0).await.unwrap(),
+            Some((4, 9)),
+            "bounds span only the live withdrawals that carry a nonce"
+        );
+    }
+
+    /// The floor is what lets the rotation gate ignore nonces whose window has
+    /// already closed, so it has to exclude them from both bounds.
+    #[tokio::test]
+    async fn nonce_bounds_honours_the_floor() {
+        let (storage, mock) = make_mock_storage();
+        seed_withdrawal(&mock, 1, Some(3), TransactionStatus::ManualReview);
+        seed_withdrawal(&mock, 2, Some(11), TransactionStatus::Pending);
+        seed_withdrawal(&mock, 3, Some(20), TransactionStatus::Parked);
+
+        assert_eq!(
+            storage
+                .unreleased_withdrawal_nonce_bounds(10)
+                .await
+                .unwrap(),
+            Some((11, 20)),
+            "a nonce below the floor sets neither bound"
+        );
+        assert_eq!(
+            storage
+                .unreleased_withdrawal_nonce_bounds(21)
+                .await
+                .unwrap(),
+            None,
+            "a floor above every live nonce leaves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_bounds_respects_should_fail() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_should_fail("unreleased_withdrawal_nonce_bounds", true);
+        assert!(storage.unreleased_withdrawal_nonce_bounds(0).await.is_err());
     }
 
     // ── reconciliation halt flag ──────────────────────────────────────

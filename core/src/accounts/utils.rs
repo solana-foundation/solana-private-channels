@@ -235,4 +235,76 @@ mod tests {
             "failed executed tx must still record its error status"
         );
     }
+
+    /// An admin-shaped mirror (accounts aligned to account_keys) produces
+    /// stored-meta balance arrays whose length equals account_keys().len(),
+    /// guarding the get_stored_transaction consumer.
+    #[test]
+    fn test_stored_transaction_admin_mirror_balances_aligned() {
+        use {
+            solana_sdk::{
+                account::AccountSharedData,
+                instruction::{AccountMeta, Instruction},
+                message::Message,
+                pubkey::Pubkey,
+                signature::{Keypair, Signer},
+                transaction::Transaction,
+            },
+            solana_svm::{
+                account_loader::LoadedTransaction,
+                transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+            },
+            solana_svm_transaction::svm_message::SVMMessage,
+            std::collections::{HashMap, HashSet},
+        };
+
+        // Admin-shaped tx: account_keys = [payer, mint, spl_token].
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: spl_token::id(),
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new(payer.pubkey(), true),
+            ],
+            data: vec![0u8; 35],
+        };
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let legacy = Transaction::new(&[&payer], msg, solana_sdk::hash::Hash::default());
+        let tx =
+            SanitizedTransaction::try_from_legacy_transaction(legacy, &HashSet::new()).unwrap();
+
+        // Full mirror: one slot per account key.
+        let account_keys = tx.account_keys();
+        let accounts: Vec<(Pubkey, AccountSharedData)> = (0..account_keys.len())
+            .map(|i| {
+                (
+                    account_keys.get(i).copied().unwrap(),
+                    AccountSharedData::new(1, 0, &Pubkey::default()),
+                )
+            })
+            .collect();
+
+        let executed = ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts,
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                status: Ok(()),
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+                accounts_data_len_delta: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        };
+        let processed = ProcessedTransaction::Executed(Box::new(executed));
+
+        let stored = get_stored_transaction(&tx, 1, 0, &processed);
+        let expected = account_keys.len();
+        assert_eq!(stored.meta.pre_balances.len(), expected);
+        assert_eq!(stored.meta.post_balances.len(), expected);
+    }
 }

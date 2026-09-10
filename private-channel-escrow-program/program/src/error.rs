@@ -49,27 +49,31 @@ pub enum PrivateChannelEscrowProgramError {
     #[error("Invalid allowed mint")]
     InvalidAllowedMint,
 
-    /// (11) Invalid SMT proof provided
-    #[error("Invalid SMT proof provided")]
-    InvalidSmtProof,
+    /// (11) Withdrawal bitmap account is malformed or not the expected PDA
+    #[error("Invalid withdrawal bitmap account")]
+    InvalidWithdrawalBitmap,
 
-    /// (12) Invalid transaction nonce for current tree index
-    #[error("Invalid transaction nonce for current tree index")]
-    InvalidTransactionNonceForCurrentTreeIndex,
+    /// (12) Withdrawal nonce has already been released
+    #[error("Withdrawal nonce already released")]
+    NonceAlreadyUsed,
 
-    /// (13) ResetSmtRoot pre-state mismatch. Blocks replaying a landed reset.
-    #[error("Unexpected current tree index for SMT root reset")]
-    UnexpectedTreeIndex,
+    /// (13) Withdrawal nonce belongs to a different bitmap generation
+    #[error("Withdrawal nonce outside the current bitmap generation")]
+    NonceOutsideCurrentGeneration,
 
-    /// (14) Admin has blocked deposits for this mint
+    /// (14) Bitmap rotation pre-state mismatch. Blocks replaying a landed rotation.
+    #[error("Unexpected generation for bitmap rotation")]
+    UnexpectedGeneration,
+
+    /// (15) Admin has blocked deposits for this mint
     #[error("Deposits are blocked for this mint")]
     DepositsBlockedForMint,
 
-    /// (15) Admin has blocked withdrawals for this mint
+    /// (16) Admin has blocked withdrawals for this mint
     #[error("Withdrawals are blocked for this mint")]
     WithdrawalsBlockedForMint,
 
-    /// (16) Mint no longer matches the profile recorded when it was allowed
+    /// (17) Mint no longer matches the profile recorded when it was allowed
     #[error("Mint no longer matches the profile recorded at AllowMint")]
     MintProfileChanged,
 }
@@ -104,12 +108,13 @@ mod tests {
             (InvalidTokenAccount, 8),
             (InvalidEscrowBalance, 9),
             (InvalidAllowedMint, 10),
-            (InvalidSmtProof, 11),
-            (InvalidTransactionNonceForCurrentTreeIndex, 12),
-            (UnexpectedTreeIndex, 13),
-            (DepositsBlockedForMint, 14),
-            (WithdrawalsBlockedForMint, 15),
-            (MintProfileChanged, 16),
+            (InvalidWithdrawalBitmap, 11),
+            (NonceAlreadyUsed, 12),
+            (NonceOutsideCurrentGeneration, 13),
+            (UnexpectedGeneration, 14),
+            (DepositsBlockedForMint, 15),
+            (WithdrawalsBlockedForMint, 16),
+            (MintProfileChanged, 17),
         ];
 
         for (error, expected_code) in cases {

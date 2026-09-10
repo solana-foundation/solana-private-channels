@@ -13,8 +13,8 @@ use crate::{
     operator::{instruction_util::SourceEventId, ConsumedMintKind, ConsumedSet},
     storage::{
         common::models::{
-            DbMint, DbMintStatus, DbTransaction, DbTransactionBuilder, TransactionStatus,
-            TransactionType,
+            DbMint, DbMintStatus, DbObservedRelease, DbTransaction, DbTransactionBuilder,
+            TransactionStatus, TransactionType,
         },
         Storage,
     },
@@ -235,10 +235,11 @@ impl TransactionProcessor {
         let mut mints = Vec::new();
         let mut mint_statuses: Vec<DbMintStatus> = Vec::new();
         let mut transactions = Vec::new();
+        let mut observed_releases: Vec<DbObservedRelease> = Vec::new();
 
         let slot_instructions = self.slot_buffers.remove(&slot).unwrap_or_default();
         for instruction_meta in &slot_instructions {
-            let (mint_opt, status_opt, transaction_opt) = convert_to_db_models(
+            let (mint_opt, status_opt, transaction_opt, release_opt) = convert_to_db_models(
                 instruction_meta,
                 self.configured_escrow_instance_id.as_ref(),
             );
@@ -262,6 +263,10 @@ impl TransactionProcessor {
             if let Some(transaction) = transaction_opt {
                 transactions.push(transaction);
             }
+
+            if let Some(release) = release_opt {
+                observed_releases.push(release);
+            }
         }
 
         // Reconcile rebuilt rows against already-serviced channel mints (resync only).
@@ -273,7 +278,14 @@ impl TransactionProcessor {
         let mut attempt = 1;
         loop {
             match self
-                .write_slot(slot, program_type, &mints, &mint_statuses, &transactions)
+                .write_slot(
+                    slot,
+                    program_type,
+                    &mints,
+                    &mint_statuses,
+                    &transactions,
+                    &observed_releases,
+                )
                 .await
             {
                 Ok(()) => break,
@@ -345,6 +357,7 @@ impl TransactionProcessor {
         mints: &[DbMint],
         mint_statuses: &[DbMintStatus],
         transactions: &[DbTransaction],
+        observed_releases: &[DbObservedRelease],
     ) -> Result<(), StorageError> {
         // Insert mints FIRST (before transactions that might reference them)
         if !mints.is_empty() {
@@ -394,6 +407,33 @@ impl TransactionProcessor {
             if let Err(e) = self.storage.sync_mint_status(&touched).await {
                 error!("Failed to sync mint status mirror for slot {}: {}", slot, e);
                 return Err(e);
+            }
+        }
+
+        // Written inside the retried attempt, before the checkpoint can advance
+        // past this slot: that is what lets a committed checkpoint stand for
+        // release coverage. Returning Err fails the slot rather than withholding
+        // the checkpoint, so the next slot cannot leapfrog an unrecorded one.
+        if !observed_releases.is_empty() {
+            match self
+                .storage
+                .insert_observed_releases_batch(observed_releases)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "Recorded {} observed release(s) from slot {}",
+                        observed_releases.len(),
+                        slot
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to record observed releases for slot {}: {}",
+                        slot, e
+                    );
+                    return Err(e);
+                }
             }
         }
 
@@ -460,11 +500,12 @@ struct MintStatusChange {
     status: MintStatus,
 }
 
-/// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction)` triple,
-/// each element independently optional:
+/// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction,
+/// DbObservedRelease)` tuple, each element independently optional:
 /// - `AllowMint` → mints-row upsert + `"allowed"` transition.
 /// - `BlockMint` → deposit-gate transition only (mints row already exists).
 /// - `Deposit` / `WithdrawFunds` → transaction row only.
+/// - `ReleaseFunds` yields an observed-release row only.
 ///
 /// Returns all-`None` for untracked instructions and for escrow instructions
 /// whose `accounts.instance` doesn't match the configured instance — the
@@ -476,10 +517,11 @@ fn convert_to_db_models(
     Option<DbMint>,
     Option<MintStatusChange>,
     Option<DbTransaction>,
+    Option<DbObservedRelease>,
 ) {
     let signature = match instruction_meta.signature.as_ref() {
         Some(sig) => sig,
-        None => return (None, None, None),
+        None => return (None, None, None, None),
     };
 
     match &instruction_meta.instruction {
@@ -492,7 +534,7 @@ fn convert_to_db_models(
                     configured = ?configured_escrow_instance_id,
                     "dropping escrow instruction: instance mismatch"
                 );
-                return (None, None, None);
+                return (None, None, None, None);
             }
             match escrow_ix.as_ref() {
                 EscrowInstruction::Deposit {
@@ -522,6 +564,7 @@ fn convert_to_db_models(
                             .inner_index(instruction_meta.inner_index.map(|i| i as i32))
                             .build(),
                         ),
+                        None,
                     )
                 }
                 EscrowInstruction::AllowMint {
@@ -539,6 +582,7 @@ fn convert_to_db_models(
                             status: MintStatus::Allowed,
                         }),
                         None,
+                        None,
                     )
                 }
                 // This status tracks the deposit gate only, since its one reader
@@ -555,8 +599,23 @@ fn convert_to_db_models(
                         },
                     }),
                     None,
+                    None,
                 ),
-                _ => (None, None, None),
+                // Only successful transactions reach the processor, so this
+                // instruction is a payout that actually happened rather than one
+                // that was attempted. Both account layouts carry the nonce, so a
+                // resync from the genesis slot records the older ones too.
+                EscrowInstruction::ReleaseFunds { data, .. } => (
+                    None,
+                    None,
+                    None,
+                    Some(DbObservedRelease {
+                        withdrawal_nonce: data.transaction_nonce as i64,
+                        signature: signature.clone(),
+                        slot: instruction_meta.slot as i64,
+                    }),
+                ),
+                _ => (None, None, None, None),
             }
         }
 
@@ -581,6 +640,7 @@ fn convert_to_db_models(
                         .inner_index(instruction_meta.inner_index.map(|i| i as i32))
                         .build(),
                     ),
+                    None,
                 )
             }
         },
@@ -593,8 +653,8 @@ mod tests {
     use crate::indexer::checkpoint::CheckpointWriter;
     use crate::indexer::datasource::common::parser::{
         AllowMintAccounts, AllowMintData, AllowMintEvent, BlockMintAccounts, BlockMintData,
-        DepositAccounts, DepositData, DepositEvent, ResetSmtRootAccounts, WithdrawFundsAccounts,
-        WithdrawFundsData,
+        DepositAccounts, DepositData, DepositEvent, ReleaseFundsAccounts, ReleaseFundsData,
+        RotateBitmapAccounts, WithdrawFundsAccounts, WithdrawFundsData,
     };
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
@@ -616,8 +676,8 @@ mod tests {
         make_pubkey(12)
     }
 
-    /// Instance pubkey hardcoded by `make_reset_smt_root_instruction`.
-    fn reset_smt_instance() -> Pubkey {
+    /// Instance pubkey hardcoded by `make_rotate_bitmap_instruction`.
+    fn rotate_bitmap_instance() -> Pubkey {
         make_pubkey(21)
     }
 
@@ -756,16 +816,68 @@ mod tests {
         }
     }
 
-    fn make_reset_smt_root_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
+    fn make_rotate_bitmap_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
         InstructionWithMetadata {
-            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::ResetSmtRoot {
-                accounts: ResetSmtRootAccounts {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::RotateBitmap {
+                accounts: RotateBitmapAccounts {
                     payer: make_pubkey(10),
                     operator: make_pubkey(11),
-                    instance: reset_smt_instance(),
+                    instance: rotate_bitmap_instance(),
+                    withdrawal_bitmap: make_pubkey(12),
                     operator_pda: make_pubkey(13),
                     event_authority: make_pubkey(14),
                     private_channel_escrow_program: make_pubkey(15),
+                },
+            })),
+            slot,
+            program_type: ProgramType::Escrow,
+            signature: sig,
+            instruction_index: 0,
+            inner_index: None,
+        }
+    }
+
+    /// Instance pubkey hardcoded by `make_release_funds_instruction`.
+    fn release_funds_instance() -> Pubkey {
+        make_pubkey(22)
+    }
+
+    /// A successful `ReleaseFunds` on the instance this processor watches.
+    fn make_release_funds_instruction(
+        slot: u64,
+        sig: Option<String>,
+        nonce: u64,
+    ) -> InstructionWithMetadata {
+        make_release_funds_instruction_on_instance(slot, sig, nonce, release_funds_instance())
+    }
+
+    fn make_release_funds_instruction_on_instance(
+        slot: u64,
+        sig: Option<String>,
+        nonce: u64,
+        instance: Pubkey,
+    ) -> InstructionWithMetadata {
+        InstructionWithMetadata {
+            instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::ReleaseFunds {
+                accounts: ReleaseFundsAccounts {
+                    payer: make_pubkey(10),
+                    operator: make_pubkey(11),
+                    instance,
+                    withdrawal_bitmap: make_pubkey(12),
+                    operator_pda: make_pubkey(13),
+                    mint: make_pubkey(2),
+                    allowed_mint: make_pubkey(14),
+                    user_ata: make_pubkey(15),
+                    instance_ata: make_pubkey(16),
+                    token_program: make_pubkey(17),
+                    associated_token_program: make_pubkey(18),
+                    event_authority: make_pubkey(19),
+                    private_channel_escrow_program: make_pubkey(20),
+                },
+                data: ReleaseFundsData {
+                    amount: 750,
+                    user: make_pubkey(1),
+                    transaction_nonce: nonce,
                 },
             })),
             slot,
@@ -784,7 +896,7 @@ mod tests {
     fn convert_deposit_with_explicit_recipient() {
         let recipient = make_pubkey(99);
         let ix = make_deposit_instruction(100, Some("sig1".to_string()), Some(recipient));
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&deposit_instance()));
         assert!(mint.is_none());
         assert!(status.is_none());
         let txn = txn.unwrap();
@@ -801,7 +913,7 @@ mod tests {
     #[test]
     fn convert_deposit_none_recipient_defaults_to_user() {
         let ix = make_deposit_instruction(50, Some("sig2".to_string()), None);
-        let (_, _, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        let (_, _, txn, _) = convert_to_db_models(&ix, Some(&deposit_instance()));
         let txn = txn.unwrap();
         // recipient should default to accounts.user
         assert_eq!(txn.recipient, make_pubkey(1).to_string());
@@ -810,7 +922,7 @@ mod tests {
     #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
         let ix = make_allow_mint_instruction(200, Some("sig3".to_string()));
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         assert!(txn.is_none());
         let status = status.expect("AllowMint must emit a status change");
         assert_eq!(status.status, MintStatus::Allowed);
@@ -828,7 +940,7 @@ mod tests {
     #[test]
     fn convert_block_mint_returns_blocked_status_no_mint_no_txn() {
         let ix = make_block_mint_instruction(210, Some("sig-block-1".to_string()), true, false);
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         // Block never upserts a mints row and never produces a transaction —
         // only a "blocked" status transition for the already-allowed mint.
         assert!(mint.is_none());
@@ -848,7 +960,7 @@ mod tests {
             false,
             true,
         );
-        let (_, status, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
+        let (_, status, _, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         let status = status.expect("BlockMint must emit a status change");
         assert_eq!(status.status, MintStatus::Allowed);
     }
@@ -856,7 +968,7 @@ mod tests {
     #[test]
     fn convert_withdraw_funds() {
         let ix = make_withdraw_instruction(300, Some("sig4".to_string()));
-        let (mint, status, txn) = convert_to_db_models(&ix, None);
+        let (mint, status, txn, _) = convert_to_db_models(&ix, None);
         assert!(mint.is_none());
         assert!(status.is_none());
         let txn = txn.unwrap();
@@ -874,8 +986,8 @@ mod tests {
         let mut ix1 = make_deposit_instruction(100, Some(sig.clone()), None);
         ix1.instruction_index = 1;
 
-        let (_, _, txn0) = convert_to_db_models(&ix0, Some(&deposit_instance()));
-        let (_, _, txn1) = convert_to_db_models(&ix1, Some(&deposit_instance()));
+        let (_, _, txn0, _) = convert_to_db_models(&ix0, Some(&deposit_instance()));
+        let (_, _, txn1, _) = convert_to_db_models(&ix1, Some(&deposit_instance()));
 
         let txn0 = txn0.unwrap();
         let txn1 = txn1.unwrap();
@@ -888,7 +1000,7 @@ mod tests {
     #[test]
     fn convert_no_signature_returns_none() {
         let ix = make_deposit_instruction(100, None, None);
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&deposit_instance()));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&deposit_instance()));
         assert!(mint.is_none());
         assert!(status.is_none());
         assert!(txn.is_none());
@@ -896,8 +1008,8 @@ mod tests {
 
     #[test]
     fn convert_catchall_escrow_variant_returns_none() {
-        let ix = make_reset_smt_root_instruction(100, Some("sig5".to_string()));
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&reset_smt_instance()));
+        let ix = make_rotate_bitmap_instruction(100, Some("sig5".to_string()));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&rotate_bitmap_instance()));
         assert!(mint.is_none());
         assert!(status.is_none());
         assert!(txn.is_none());
@@ -937,7 +1049,7 @@ mod tests {
             inner_index: None,
         };
 
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&watched));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&watched));
         assert!(mint.is_none());
         assert!(status.is_none());
         assert!(txn.is_none());
@@ -973,7 +1085,7 @@ mod tests {
             inner_index: None,
         };
 
-        let (mint, status, txn) = convert_to_db_models(&ix, Some(&watched));
+        let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&watched));
         assert!(mint.is_none());
         assert!(status.is_none());
         assert!(txn.is_none());
@@ -1165,6 +1277,144 @@ mod tests {
 
         let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 250);
+    }
+
+    // ========================================================================
+    // observed release recording
+    // ========================================================================
+
+    /// One row of the observed-release table.
+    struct ObservedReleaseCase {
+        label: &'static str,
+        nonce: u64,
+        slot: u64,
+        signature: &'static str,
+    }
+
+    /// The refund gate reads this record, so a release the indexer saw land has
+    /// to reach storage with its nonce, signature and slot intact.
+    #[tokio::test]
+    async fn finalize_records_observed_release() {
+        let cases = [
+            ObservedReleaseCase {
+                label: "first release",
+                nonce: 42,
+                slot: 300,
+                signature: "sig-release-current",
+            },
+            ObservedReleaseCase {
+                label: "later release",
+                nonce: 43,
+                slot: 301,
+                signature: "sig-release-later",
+            },
+        ];
+
+        for case in cases {
+            let (mut processor, mut checkpoint_rx, mock) =
+                make_processor_with_mock(release_funds_instance());
+            processor.buffer(make_release_funds_instruction(
+                case.slot,
+                Some(case.signature.to_string()),
+                case.nonce,
+            ));
+            processor
+                .finalize_and_checkpoint(case.slot, ProgramType::Escrow)
+                .await
+                .expect("the slot must finalize");
+
+            let recorded = mock
+                .get_observed_release(case.nonce as i64)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{} must record the release", case.label));
+            assert_eq!(
+                recorded.withdrawal_nonce, case.nonce as i64,
+                "{}",
+                case.label
+            );
+            assert_eq!(recorded.signature, case.signature, "{}", case.label);
+            assert_eq!(recorded.slot, case.slot as i64, "{}", case.label);
+
+            let cp = recv_slot(&mut checkpoint_rx).await;
+            assert_eq!(cp.slot, case.slot, "{}", case.label);
+        }
+    }
+
+    /// Live indexing, a backfill and a resync all see the same release, so
+    /// re-observing one must neither error nor leave a second row behind. The
+    /// first observation is the one kept, so a replay cannot rewrite the
+    /// signature a refund would be judged against.
+    #[tokio::test]
+    async fn finalize_reobserving_a_release_is_idempotent() {
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(release_funds_instance());
+
+        for _ in 0..2 {
+            processor.buffer(make_release_funds_instruction(
+                310,
+                Some("sig-release-replay".to_string()),
+                44,
+            ));
+            processor
+                .finalize_and_checkpoint(310, ProgramType::Escrow)
+                .await
+                .expect("the slot must finalize");
+            recv_slot(&mut checkpoint_rx).await;
+        }
+
+        let store = mock.observed_releases.lock().unwrap();
+        assert_eq!(store.len(), 1, "a replayed release must not duplicate");
+        assert_eq!(store.get(&44).unwrap().signature, "sig-release-replay");
+    }
+
+    /// A release on an instance this indexer does not watch is not ours to
+    /// record. Recording it would let anyone who can call the escrow program on
+    /// an instance of their own choosing plant a record that blocks a refund
+    /// this operator owes.
+    #[tokio::test]
+    async fn finalize_drops_observed_release_on_foreign_instance() {
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(release_funds_instance());
+        processor.buffer(make_release_funds_instruction_on_instance(
+            320,
+            Some("sig-release-foreign".to_string()),
+            45,
+            make_pubkey(99),
+        ));
+        processor
+            .finalize_and_checkpoint(320, ProgramType::Escrow)
+            .await
+            .expect("the slot must finalize");
+
+        assert!(mock.observed_releases.lock().unwrap().is_empty());
+        recv_slot(&mut checkpoint_rx).await;
+    }
+
+    /// The checkpoint is what says a slot's releases are on record, so a slot
+    /// whose releases will not write has to fail outright. Merely withholding
+    /// the checkpoint is not enough: `CheckpointState::apply` takes a plain
+    /// `max`, so the next slot would leapfrog this one and the hole would read
+    /// as a clean negative forever after.
+    #[tokio::test]
+    async fn finalize_observed_release_failure_fails_the_slot() {
+        let (mut processor, mut checkpoint_rx, mock) =
+            make_processor_with_mock(release_funds_instance());
+        mock.set_should_fail("insert_observed_releases_batch", true);
+        processor.buffer(make_release_funds_instruction(
+            330,
+            Some("sig-release-fail".to_string()),
+            46,
+        ));
+        let result = processor
+            .finalize_and_checkpoint(330, ProgramType::Escrow)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a release write that outlives the retry budget must fail the slot"
+        );
+        assert!(checkpoint_rx.try_recv().is_err());
     }
 
     /// A transient write failure is ridden out by the retry: the slot finalizes

@@ -1,6 +1,5 @@
 use crate::{
     pda_utils::{find_event_authority_pda, find_operator_pda},
-    smt_utils::ProcessorSMT,
     state_utils::{
         assert_get_or_add_operator, assert_get_or_allow_mint, assert_get_or_create_instance,
         assert_get_or_deposit, assert_get_or_release_funds, assert_get_or_remove_operator,
@@ -290,11 +289,6 @@ fn test_remove_operator_prevents_release_funds() {
     .expect("RemoveOperator should succeed");
 
     // Operator PDA is now closed — release_funds must fail
-    let mut smt = ProcessorSMT::new();
-    let (_, sibling_proofs) = smt.generate_exclusion_proof_for_verification(1);
-    smt.insert(1);
-    let new_root = smt.current_root();
-
     let result = assert_get_or_release_funds(
         &mut context,
         &operator,
@@ -304,9 +298,7 @@ fn test_remove_operator_prevents_release_funds() {
         &TOKEN_PROGRAM_ID,
         500_000,
         &user.pubkey(),
-        new_root,
         1,
-        sibling_proofs,
         false,
     );
 

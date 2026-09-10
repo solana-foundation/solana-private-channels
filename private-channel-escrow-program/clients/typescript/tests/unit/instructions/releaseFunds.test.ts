@@ -5,14 +5,13 @@ import {
     RELEASE_FUNDS_DISCRIMINATOR,
     findOperatorPda,
     findAllowedMintPda,
+    findWithdrawalBitmapPda,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
 import {
     mockTransactionSigner,
     TEST_ADDRESSES,
     EXPECTED_PROGRAM_ADDRESS,
-    TEST_ROOT,
-    TEST_SIBLING_PROOFS,
     TEST_TRANSACTION_NONCE,
 } from '../../setup/mocks';
 import { AccountRole, assertIsAddress, type Address } from '@solana/kit';
@@ -22,12 +21,11 @@ import { TOKEN_2022_PROGRAM_ADDRESS } from '@solana-program/token-2022';
 // Token program addresses
 describe('releaseFunds', () => {
     describe('Instruction data validation', () => {
-        it('should encode instruction data with correct discriminator (7), amount, user, and newWithdrawalRoot', async () => {
+        it('should encode instruction data with correct discriminator (7), amount, user, and transactionNonce', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000); // 1 USDC (6 decimals)
             const testUser = TEST_ADDRESSES.WALLET;
-            const testWithdrawalRoot = TEST_ROOT;
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -37,9 +35,7 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -56,16 +52,15 @@ describe('releaseFunds', () => {
             expect(decodedData.user).toBe(testUser);
             assertIsAddress(decodedData.user);
 
-            // Verify withdrawal root is correctly encoded (32 bytes)
-            expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testWithdrawalRoot));
-            expect(decodedData.newWithdrawalRoot).toHaveLength(32);
+            // Verify the nonce is correctly encoded: it is the only replay guard
+            expect(decodedData.transactionNonce).toBe(BigInt(TEST_TRANSACTION_NONCE));
+            expect(typeof decodedData.transactionNonce).toBe('bigint');
         });
 
         it('should handle amount parameter correctly (u64 as bigint)', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = TEST_ROOT;
 
             // Test various valid u64 values as both number and bigint
             const testAmounts = [
@@ -86,9 +81,7 @@ describe('releaseFunds', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     user: testUser,
-                    newWithdrawalRoot: testWithdrawalRoot,
                     transactionNonce: TEST_TRANSACTION_NONCE,
-                    siblingProofs: TEST_SIBLING_PROOFS,
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -101,7 +94,6 @@ describe('releaseFunds', () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Test with different valid user addresses
             const testUsers = [
@@ -120,9 +112,7 @@ describe('releaseFunds', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     user: testUser,
-                    newWithdrawalRoot: testWithdrawalRoot,
                     transactionNonce: TEST_TRANSACTION_NONCE,
-                    siblingProofs: TEST_SIBLING_PROOFS,
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -130,21 +120,17 @@ describe('releaseFunds', () => {
             }
         });
 
-        it('should handle newWithdrawalRoot parameter correctly (32 bytes)', async () => {
+        it('should handle transactionNonce parameter correctly (u64)', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
 
-            // Test various 32-byte withdrawal roots
-            const testRoots = [
-                Array.from(new Uint8Array(32).fill(0)), // All zeros
-                Array.from(new Uint8Array(32).fill(255)), // All 0xFF
-                Array.from({ length: 32 }, (_, i) => i), // Sequential bytes
-                Array.from(crypto.getRandomValues(new Uint8Array(32))), // Random bytes
-            ];
+            // Boundaries of the bitmap indexing: first bit, last bit of a
+            // generation, first bit of the next, and the u64 ceiling.
+            const testNonces = [0n, 65535n, 65536n, BigInt('18446744073709551615')];
 
-            for (const testRoot of testRoots) {
+            for (const transactionNonce of testNonces) {
                 const instruction = await getReleaseFundsInstructionAsync({
                     payer,
                     operator,
@@ -153,14 +139,11 @@ describe('releaseFunds', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     user: testUser,
-                    newWithdrawalRoot: testRoot,
-                    transactionNonce: TEST_TRANSACTION_NONCE,
-                    siblingProofs: TEST_SIBLING_PROOFS,
+                    transactionNonce,
                 });
 
                 const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
-                expect(decodedData.newWithdrawalRoot).toEqual(testRoot);
-                expect(decodedData.newWithdrawalRoot).toHaveLength(32);
+                expect(decodedData.transactionNonce).toBe(transactionNonce);
             }
         });
 
@@ -169,7 +152,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(2500000000); // 2.5K USDC
             const testUser = TEST_ADDRESSES.ADMIN as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(123));
 
             // Create instruction with specific data
             const instruction = await getReleaseFundsInstructionAsync({
@@ -180,9 +162,7 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             // Decode the instruction data
@@ -192,21 +172,19 @@ describe('releaseFunds', () => {
             expect(decodedData.discriminator).toBe(RELEASE_FUNDS_DISCRIMINATOR);
             expect(decodedData.amount).toBe(testAmount);
             expect(decodedData.user).toBe(testUser);
-            expect(decodedData.newWithdrawalRoot).toEqual(Array.from(testWithdrawalRoot));
+            expect(decodedData.transactionNonce).toBe(BigInt(TEST_TRANSACTION_NONCE));
 
             // Verify data types
             expect(typeof decodedData.discriminator).toBe('number');
             expect(typeof decodedData.amount).toBe('bigint');
             expect(typeof decodedData.user).toBe('string');
-            expect(Array.isArray(decodedData.newWithdrawalRoot)).toBe(true);
+            expect(typeof decodedData.transactionNonce).toBe('bigint');
 
             // Re-encode and verify it matches
             const reEncodedData = getReleaseFundsInstructionDataCodec().encode({
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
             expect(reEncodedData).toEqual(instruction.data);
         });
@@ -218,7 +196,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -228,13 +205,11 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             // Based on program instruction definition, ReleaseFunds should have 12 accounts
-            expect(instruction.accounts).toHaveLength(12);
+            expect(instruction.accounts).toHaveLength(13);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -244,44 +219,50 @@ describe('releaseFunds', () => {
             const operatorAccount = instruction.accounts[1];
             expect(operatorAccount.address).toBe(TEST_ADDRESSES.OPERATOR);
 
-            // Account 2: instance (Writable)
+            // Account 2: instance (Readonly)
             const instanceAccount = instruction.accounts[2];
             expect(instanceAccount.address).toBe(TEST_ADDRESSES.INSTANCE);
 
-            // Account 3: operatorPda (Readonly PDA - auto-derived)
-            const operatorPdaAccount = instruction.accounts[3];
+            // Account 3: withdrawalBitmap (Writable PDA - auto-derived)
+            const [expectedBitmapPda] = await findWithdrawalBitmapPda({
+                instance: TEST_ADDRESSES.INSTANCE,
+            });
+            expect(instruction.accounts[3].address).toBe(expectedBitmapPda);
+
+            // Account 4: operatorPda (Readonly PDA - auto-derived)
+            const operatorPdaAccount = instruction.accounts[4];
             expect(operatorPdaAccount.address).toBeDefined();
 
-            // Account 4: mint (Readonly)
-            const mintAccount = instruction.accounts[4];
+            // Account 5: mint (Readonly)
+            const mintAccount = instruction.accounts[5];
             expect(mintAccount.address).toBe(TEST_ADDRESSES.USDC_MINT);
 
-            // Account 5: allowedMint (Readonly PDA - auto-derived)
-            const allowedMintAccount = instruction.accounts[5];
+            // Account 6: allowedMint (Readonly PDA - auto-derived)
+            const allowedMintAccount = instruction.accounts[6];
             expect(allowedMintAccount.address).toBeDefined();
 
-            // Account 6: userAta (Writable)
-            const userAtaAccount = instruction.accounts[6];
+            // Account 7: userAta (Writable)
+            const userAtaAccount = instruction.accounts[7];
             expect(userAtaAccount.address).toBe(TEST_ADDRESSES.INSTANCE_ATA);
 
-            // Account 7: instanceAta (Writable - auto-derived)
-            const instanceAtaAccount = instruction.accounts[7];
+            // Account 8: instanceAta (Writable - auto-derived)
+            const instanceAtaAccount = instruction.accounts[8];
             expect(instanceAtaAccount.address).toBeDefined();
 
-            // Account 8: tokenProgram (Readonly)
-            const tokenProgramAccount = instruction.accounts[8];
+            // Account 9: tokenProgram (Readonly)
+            const tokenProgramAccount = instruction.accounts[9];
             expect(tokenProgramAccount.address).toBe(TOKEN_PROGRAM_ADDRESS);
 
-            // Account 9: associatedTokenProgram (Readonly)
-            const associatedTokenProgramAccount = instruction.accounts[9];
+            // Account 10: associatedTokenProgram (Readonly)
+            const associatedTokenProgramAccount = instruction.accounts[10];
             expect(associatedTokenProgramAccount.address).toBe(ASSOCIATED_TOKEN_PROGRAM_ADDRESS);
 
-            // Account 10: eventAuthority (Readonly)
-            const eventAuthorityAccount = instruction.accounts[10];
+            // Account 11: eventAuthority (Readonly)
+            const eventAuthorityAccount = instruction.accounts[11];
             expect(eventAuthorityAccount.address).toBeDefined();
 
-            // Account 11: privateChannelEscrowProgram (Readonly)
-            const privateChannelEscrowProgramAccount = instruction.accounts[11];
+            // Account 12: privateChannelEscrowProgram (Readonly)
+            const privateChannelEscrowProgramAccount = instruction.accounts[12];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
 
@@ -290,7 +271,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -300,9 +280,7 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             // Account 0: payer - should be WritableSigner
@@ -313,44 +291,47 @@ describe('releaseFunds', () => {
             const operatorAccount = instruction.accounts[1];
             expect(operatorAccount.role).toBe(AccountRole.READONLY_SIGNER);
 
-            // Account 2: instance - should be Writable (PDA, not a signer)
+            // Account 2: instance - only read now, it just signs the transfer
             const instanceAccount = instruction.accounts[2];
-            expect(instanceAccount.role).toBe(AccountRole.WRITABLE);
+            expect(instanceAccount.role).toBe(AccountRole.READONLY);
+
+            // Account 3: withdrawalBitmap - Writable, the nonce bit is set here
+            expect(instruction.accounts[3].role).toBe(AccountRole.WRITABLE);
 
             // Account 3: operatorPda - should be Readonly (PDA, not a signer)
-            const operatorPdaAccount = instruction.accounts[3];
+            const operatorPdaAccount = instruction.accounts[4];
             expect(operatorPdaAccount.role).toBe(AccountRole.READONLY);
 
             // Account 4: mint - should be Readonly
-            const mintAccount = instruction.accounts[4];
+            const mintAccount = instruction.accounts[5];
             expect(mintAccount.role).toBe(AccountRole.READONLY);
 
             // Account 5: allowedMint - should be Readonly (PDA, not a signer)
-            const allowedMintAccount = instruction.accounts[5];
+            const allowedMintAccount = instruction.accounts[6];
             expect(allowedMintAccount.role).toBe(AccountRole.READONLY);
 
             // Account 6: userAta - should be Writable
-            const userAtaAccount = instruction.accounts[6];
+            const userAtaAccount = instruction.accounts[7];
             expect(userAtaAccount.role).toBe(AccountRole.WRITABLE);
 
             // Account 7: instanceAta - should be Writable (ATA, not a signer)
-            const instanceAtaAccount = instruction.accounts[7];
+            const instanceAtaAccount = instruction.accounts[8];
             expect(instanceAtaAccount.role).toBe(AccountRole.WRITABLE);
 
             // Account 8: tokenProgram - should be Readonly
-            const tokenProgramAccount = instruction.accounts[8];
+            const tokenProgramAccount = instruction.accounts[9];
             expect(tokenProgramAccount.role).toBe(AccountRole.READONLY);
 
             // Account 9: associatedTokenProgram - should be Readonly
-            const associatedTokenProgramAccount = instruction.accounts[9];
+            const associatedTokenProgramAccount = instruction.accounts[10];
             expect(associatedTokenProgramAccount.role).toBe(AccountRole.READONLY);
 
             // Account 10: eventAuthority - should be Readonly (PDA, not a signer)
-            const eventAuthorityAccount = instruction.accounts[10];
+            const eventAuthorityAccount = instruction.accounts[11];
             expect(eventAuthorityAccount.role).toBe(AccountRole.READONLY);
 
             // Account 11: privateChannelEscrowProgram - should be Readonly
-            const privateChannelEscrowProgramAccount = instruction.accounts[11];
+            const privateChannelEscrowProgramAccount = instruction.accounts[12];
             expect(privateChannelEscrowProgramAccount.role).toBe(AccountRole.READONLY);
         });
 
@@ -359,7 +340,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -369,9 +349,7 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             // Verify the instruction uses the correct program address
@@ -379,15 +357,15 @@ describe('releaseFunds', () => {
             expect(instruction.programAddress).toBe(EXPECTED_PROGRAM_ADDRESS);
 
             // Verify tokenProgram uses the correct address
-            const tokenProgramAccount = instruction.accounts[8];
+            const tokenProgramAccount = instruction.accounts[9];
             expect(tokenProgramAccount.address).toBe(TOKEN_PROGRAM_ADDRESS);
 
             // Verify associatedTokenProgram uses the correct address
-            const associatedTokenProgramAccount = instruction.accounts[9];
+            const associatedTokenProgramAccount = instruction.accounts[10];
             expect(associatedTokenProgramAccount.address).toBe(ASSOCIATED_TOKEN_PROGRAM_ADDRESS);
 
             // Verify privateChannelEscrowProgram uses the correct address
-            const privateChannelEscrowProgramAccount = instruction.accounts[11];
+            const privateChannelEscrowProgramAccount = instruction.accounts[12];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
         });
     });
@@ -398,7 +376,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Get expected operator PDA using findOperatorPda
             const [expectedOperatorPda] = await findOperatorPda({
@@ -415,14 +392,12 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
                 // Not providing operatorPda - should be auto-derived
             });
 
             // Verify the automatically derived operatorPda matches expected address
-            expect(instruction.accounts[3].address).toBe(expectedOperatorPda);
+            expect(instruction.accounts[4].address).toBe(expectedOperatorPda);
         });
 
         it('should automatically derive allowedMint when not provided', async () => {
@@ -430,7 +405,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Get expected allowed mint PDA using findAllowedMintPda
             const [expectedAllowedMintPda] = await findAllowedMintPda({
@@ -447,14 +421,12 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
                 // Not providing allowedMint - should be auto-derived
             });
 
             // Verify the automatically derived allowedMint matches expected address
-            expect(instruction.accounts[5].address).toBe(expectedAllowedMintPda);
+            expect(instruction.accounts[6].address).toBe(expectedAllowedMintPda);
         });
 
         it('should automatically derive instanceAta when not provided', async () => {
@@ -462,7 +434,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const [expectedInstanceAta] = await findAssociatedTokenPda({
                 mint: TEST_ADDRESSES.USDC_MINT,
@@ -479,13 +450,11 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
                 // Not providing instanceAta - should be auto-derived as ATA
             });
             // Verify instanceAta is derived (should be a valid address)
-            const instanceAtaAccount = instruction.accounts[7];
+            const instanceAtaAccount = instruction.accounts[8];
             expect(instanceAtaAccount.address).toBe(expectedInstanceAta);
         });
         it('should automatically derive instanceAta when not provided (token 2022)', async () => {
@@ -493,7 +462,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const [expectedInstanceAta] = await findAssociatedTokenPda({
                 mint: TEST_ADDRESSES.USDC_MINT,
@@ -511,18 +479,16 @@ describe('releaseFunds', () => {
                 amount: testAmount,
                 user: testUser,
                 tokenProgram: TOKEN_2022_PROGRAM_ADDRESS,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
                 // Not providing instanceAta - should be auto-derived as ATA
             });
 
             // Verify the automatically derived instance ATA is defined
-            const instanceAtaAccount = instruction.accounts[7];
+            const instanceAtaAccount = instruction.accounts[8];
             expect(instanceAtaAccount.address).toBe(expectedInstanceAta);
 
             // Verify Token 2022 program is used
-            const tokenProgramAccount = instruction.accounts[8];
+            const tokenProgramAccount = instruction.accounts[9];
             expect(tokenProgramAccount.address).toBe(TOKEN_2022_PROGRAM_ADDRESS);
         });
 
@@ -531,7 +497,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Use different addresses to override auto-derivation
             const overriddenOperatorPda = TEST_ADDRESSES.OPERATOR; // Use as override
@@ -549,15 +514,13 @@ describe('releaseFunds', () => {
                 instanceAta: overriddenInstanceAta,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             // Verify the provided addresses are used instead of auto-derived ones
-            expect(instruction.accounts[3].address).toBe(overriddenOperatorPda);
-            expect(instruction.accounts[5].address).toBe(overriddenAllowedMint);
-            expect(instruction.accounts[7].address).toBe(overriddenInstanceAta);
+            expect(instruction.accounts[4].address).toBe(overriddenOperatorPda);
+            expect(instruction.accounts[6].address).toBe(overriddenAllowedMint);
+            expect(instruction.accounts[8].address).toBe(overriddenInstanceAta);
         });
     });
 
@@ -567,7 +530,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -577,9 +539,7 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             // Verify operator account is a signer
@@ -592,7 +552,6 @@ describe('releaseFunds', () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Test with different valid operator addresses
             const testOperators = [
@@ -610,9 +569,7 @@ describe('releaseFunds', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     user: testUser,
-                    newWithdrawalRoot: testWithdrawalRoot,
                     transactionNonce: TEST_TRANSACTION_NONCE,
-                    siblingProofs: TEST_SIBLING_PROOFS,
                 });
 
                 // Verify operator account uses the correct address
@@ -626,7 +583,6 @@ describe('releaseFunds', () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             // Test with different operators and verify operatorPda derives correctly
             const testOperators = [
@@ -649,13 +605,11 @@ describe('releaseFunds', () => {
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     user: testUser,
-                    newWithdrawalRoot: testWithdrawalRoot,
                     transactionNonce: TEST_TRANSACTION_NONCE,
-                    siblingProofs: TEST_SIBLING_PROOFS,
                 });
 
                 // Verify operatorPda is derived correctly for this operator
-                const operatorPdaAccount = instruction.accounts[3];
+                const operatorPdaAccount = instruction.accounts[4];
                 expect(operatorPdaAccount.address).toBe(expectedOperatorPda);
             }
         });
@@ -667,7 +621,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(0);
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -677,9 +630,7 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
@@ -691,7 +642,6 @@ describe('releaseFunds', () => {
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt('18446744073709551615'); // Max u64
             const testUser = TEST_ADDRESSES.WALLET as Address;
-            const testWithdrawalRoot = Array.from(new Uint8Array(32).fill(0));
 
             const instruction = await getReleaseFundsInstructionAsync({
                 payer,
@@ -701,44 +651,37 @@ describe('releaseFunds', () => {
                 userAta: TEST_ADDRESSES.INSTANCE_ATA,
                 amount: testAmount,
                 user: testUser,
-                newWithdrawalRoot: testWithdrawalRoot,
                 transactionNonce: TEST_TRANSACTION_NONCE,
-                siblingProofs: TEST_SIBLING_PROOFS,
             });
 
             const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
             expect(decodedData.amount).toBe(testAmount);
         });
 
-        it('should handle different withdrawal root patterns', async () => {
+        // The bitmap must track the instance it belongs to, or a release would
+        // consume its nonce against the wrong instance's replay state.
+        it('should derive withdrawalBitmap from the instance it is given', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
             const testUser = TEST_ADDRESSES.WALLET as Address;
 
-            // Test edge case withdrawal roots
-            const testRoots = [
-                Array.from(new Uint8Array(32).fill(0)), // All zeros
-                Array.from(new Uint8Array(32).fill(255)), // All 0xFF
-                [...Array(32).keys()], // 0-31 pattern
-            ];
+            const testInstances = [TEST_ADDRESSES.INSTANCE, TEST_ADDRESSES.INSTANCE_SEED] as Address[];
 
-            for (const testRoot of testRoots) {
+            for (const instance of testInstances) {
                 const instruction = await getReleaseFundsInstructionAsync({
                     payer,
                     operator,
-                    instance: TEST_ADDRESSES.INSTANCE,
+                    instance,
                     mint: TEST_ADDRESSES.USDC_MINT,
                     userAta: TEST_ADDRESSES.INSTANCE_ATA,
                     amount: testAmount,
                     user: testUser,
-                    newWithdrawalRoot: testRoot,
                     transactionNonce: TEST_TRANSACTION_NONCE,
-                    siblingProofs: TEST_SIBLING_PROOFS,
                 });
 
-                const decodedData = getReleaseFundsInstructionDataCodec().decode(instruction.data);
-                expect(decodedData.newWithdrawalRoot).toEqual(testRoot);
+                const [expectedBitmapPda] = await findWithdrawalBitmapPda({ instance });
+                expect(instruction.accounts[3].address).toBe(expectedBitmapPda);
             }
         });
     });

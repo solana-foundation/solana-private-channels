@@ -82,13 +82,18 @@ pub async fn wait_for_operator_completion(
 /// Wait until a specific transaction reaches `completed` status.
 ///
 /// Fails immediately (rather than timing out) if the transaction is already
-/// in `failed` status — this avoids burning the full `timeout_secs` when the
-/// operator has already decided the transaction is unprocessable.
+/// in `failed` status, which avoids burning the whole budget when the operator
+/// has already decided the transaction is unprocessable.
+///
+/// The budget is `WAIT_TIMEOUT_SECS` and is deliberately not a parameter. A
+/// caller-chosen number is tuned against whatever build the author ran, and a
+/// coverage-instrumented run is several times slower, so those numbers turn
+/// into CI flakes that look like hangs.
 pub async fn wait_for_transaction_completion(
     pool: &sqlx::PgPool,
     signature: &str,
-    timeout_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout_secs = *WAIT_TIMEOUT_SECS;
     let start = std::time::Instant::now();
 
     while start.elapsed().as_secs() < timeout_secs {
