@@ -2,7 +2,7 @@ use {
     super::{postgres::PostgresAccountsDB, traits::BlockInfo},
     crate::accounts::address_index_watermark::ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
     anyhow::{anyhow, Context, Result},
-    sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row},
+    sqlx::{Connection, Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row},
     std::{
         collections::HashSet,
         fs,
@@ -82,17 +82,19 @@ pub async fn truncate_slots(
     let pool = db.pool.clone();
 
     // The lock belongs to one session, so acquire and release have to run on the
-    // same connection. Taken from the pool, a statement lands on whichever
-    // connection is free, and unlocking from a different one is a silent no-op
-    // that strands the lock on the acquiring connection until it is recycled.
-    let mut lock_conn = pool
-        .acquire()
+    // same connection. Unlocking from a different one is a silent no-op that
+    // strands the lock until that connection is recycled.
+    //
+    // The session is opened outside the pool, not reserved from it: the work below
+    // needs the pool, and a one-connection pool is a legal setting. sqlx also does
+    // not reset a returned connection, so a stranded lock would never free.
+    let mut lock_conn = PgConnection::connect_with(&pool.connect_options())
         .await
-        .context("Failed to reserve a connection for the truncation lock")?;
+        .context("Failed to open the truncation lock session")?;
 
     let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .fetch_one(&mut *lock_conn)
+        .fetch_one(&mut lock_conn)
         .await
         .context("Failed to acquire advisory lock")?;
     if !acquired {
@@ -107,7 +109,7 @@ pub async fn truncate_slots(
     // hold the lock, which is the bug above and must not pass unnoticed.
     let released = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .fetch_one(&mut *lock_conn)
+        .fetch_one(&mut lock_conn)
         .await
         .context("Failed to release advisory lock")?;
     if !released {
@@ -852,6 +854,33 @@ mod tests {
             held, 0,
             "truncate_slots must release its advisory lock before returning"
         );
+    }
+
+    /// A one-connection pool is a legal setting, so the lock session must not come
+    /// out of the pool: taking it from there leaves nothing for the truncation
+    /// itself, which then waits out the acquire timeout and fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_runs_on_a_single_connection_pool() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        // A short timeout so a regression fails in seconds rather than the 30s default.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("single-connection pool connects");
+        let starved = PostgresAccountsDB {
+            pool: std::sync::Arc::new(pool),
+            read_only: false,
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let report = truncate_slots(&starved, &apply_opts(5, 100, tmp.path()))
+            .await
+            .expect("truncation must not starve itself of connections");
+        assert_eq!(report.blocks_deleted, 15);
     }
 
     fn apply_opts(keep_slots: u64, batch_size: usize, backup: &Path) -> TruncateOptions {
