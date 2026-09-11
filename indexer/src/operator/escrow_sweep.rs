@@ -12,7 +12,7 @@ use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use solana_account_decoder_client_types::UiAccountData;
 use solana_client::rpc_request::TokenAccountsFilter;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
@@ -266,7 +266,7 @@ mod tests {
     use super::*;
     use crate::operator::RetryConfig;
     use base64::Engine as _;
-    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_commitment_config::CommitmentConfig;
     use spl_token::solana_program::program_option::COption;
     use spl_token::state::AccountState;
 

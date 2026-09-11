@@ -40,10 +40,12 @@
 use {
     crate::{
         accounts::{precompiles::PRECOMPILES, AccountsDB},
+        processor::CHANNEL_SLOT,
         stages::AccountSettlements,
     },
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
+        clock::Slot,
         pubkey::Pubkey,
         transaction::SanitizedTransaction,
     },
@@ -577,10 +579,12 @@ impl BOB {
     }
 }
 
-impl InvokeContextCallback for BOB {}
-
-impl TransactionProcessingCallback for BOB {
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+impl BOB {
+    /// Reads an account without the slot the SVM callback wants alongside it.
+    ///
+    /// Kept inherent so callers inside this crate keep the plain option, and so
+    /// the trait below is only the shape the SVM asks for.
+    pub fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         // First check precompiles (always in memory)
         if let Some(precompile) = self.precompiles.get(pubkey) {
             return Some(precompile.clone());
@@ -596,10 +600,13 @@ impl TransactionProcessingCallback for BOB {
 
         None
     }
+}
 
-    fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
-        self.get_account_shared_data(account)
-            .and_then(|account| owners.iter().position(|key| account.owner().eq(key)))
+impl InvokeContextCallback for BOB {}
+
+impl TransactionProcessingCallback for BOB {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+        BOB::get_account_shared_data(self, pubkey).map(|account| (account, CHANNEL_SLOT))
     }
 }
 
@@ -619,7 +626,7 @@ mod tests {
             ExecutedTransaction, TransactionExecutionDetails,
         },
         solana_svm_callback::TransactionProcessingCallback,
-        solana_timings::ExecuteTimings,
+        solana_svm_timings::ExecuteTimings,
     };
 
     fn create_test_bob() -> (BOB, mpsc::UnboundedSender<AccountSettlements>) {
@@ -662,7 +669,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }))
@@ -830,7 +837,7 @@ mod tests {
                         inner_instructions: None,
                         return_data: None,
                         executed_units: 0,
-                        accounts_data_len_delta: 0,
+                        accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                     },
                     programs_modified_by_tx: HashMap::new(),
                 },
@@ -1673,8 +1680,8 @@ mod tests {
         let result = TransactionProcessingCallback::get_account_shared_data(&bob, &pubkey);
         assert_eq!(
             result.unwrap(),
-            account,
-            "Live account must be returned to SVM"
+            (account, CHANNEL_SLOT),
+            "Live account must be returned to SVM at the channel slot"
         );
     }
 
@@ -2407,7 +2414,7 @@ mod tests {
                 transaction_error_metrics::TransactionErrorMetrics,
                 transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
             },
-            solana_timings::ExecuteTimings,
+            solana_svm_timings::ExecuteTimings,
         };
         let executed = ExecutedTransaction {
             loaded_transaction: LoadedTransaction {
@@ -2420,7 +2427,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         };

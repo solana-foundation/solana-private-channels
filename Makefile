@@ -177,6 +177,8 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test test_duplicate_writer -- --nocapture
 	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
 	@cd integration && cargo test --test ingress_backpressure -- --nocapture
+	@cd integration && cargo test --test ordered_shutdown_e2e -- --nocapture
+	@cd integration && cargo test --test v1_transaction_e2e -- --nocapture
 	@cd integration && cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== prod-feature indexer group ==="
 	@cd integration && cargo test --test reconciliation_integration -- --nocapture
@@ -661,7 +663,7 @@ help:
 	@echo "  all-coverage         - Run all coverage tasks"
 	@echo ""
 	@echo "Integration Test Setup:"
-	@echo "  yellowstone-prepare      - Download & patch Yellowstone for Agave 3.0"
+	@echo "  yellowstone-prepare      - Download & patch Yellowstone for Agave 4.2"
 	@echo "  yellowstone-build-plugin - Build Yellowstone Geyser plugin"
 	@echo "  yellowstone-clean        - Clean Geyser build artifacts"
 	@echo ""

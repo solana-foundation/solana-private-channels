@@ -30,6 +30,7 @@ argon2 = "0.5"
 async-channel = "2"
 base64 = "0.21"
 bincode = "1.3.3"
+wincode = "0.5"
 borsh = "1.5.5"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
@@ -38,6 +39,11 @@ const-crypto = "0.3.0"
 enum_dispatch = "0.3.13"
 figment = { version = "0.10", features = ["toml", "env"] }
 futures = "0.3"
+# Workaround for an upstream packaging gap. `solana-keypair` 3.1.2 converts a
+# base58 decode error into a signature error, which needs that error to implement
+# the standard error trait, but it does not turn on the feature that provides the
+# implementation. Declaring it here switches the feature on for the whole graph.
+five8_core = { version = "0.1", features = ["std"] }
 governor = "0.6"
 hex = "0.4"
 http-body-util = "0.1"
@@ -46,7 +52,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 hyper-rustls = { version = "0.27", features = ["http2", "webpki-roots", "ring"] }
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-litesvm = "=0.7.0"
+litesvm = "0.16"
 num-derive = "0.4.1"
 once_cell = "1.20"
 num-traits = "0.2.19"
@@ -69,55 +75,56 @@ rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 codama = "^0.7.2"
-solana-account = "3.0.0"
-solana-account-info = "3.0.0"
-solana-account-decoder = "2.3.10"
-solana-account-decoder-client-types = "2.3.10"
-solana-address = "1.0.0"
-solana-bpf-loader-program = "2.3.0"
-solana-client = "3.0.0"
-solana-compute-budget = "2.3.0"
-solana-epoch-info = "2.2.1"
-solana-epoch-schedule = "2.2.1"
-solana-fee-calculator = "2.2.1"
-solana-cpi = "3.0.0"
-solana-hash = "2.3.0"
-solana-instruction = "3.0.0"
-solana-loader-v3-interface = "5.0.0"
-solana-logger = "2.3.0"
-solana-program = "3.0.0"
-solana-program-entrypoint = "3.1.0"
-solana-program-error = "3.0.0"
-solana-program-pack = "3.0.0"
-solana-program-runtime = "2.3.0"
-solana-pubkey = "3.0.0"
-solana-rent-collector = "2.3.0"
-solana-rpc = "3.0"
-solana-rpc-client-api = "2.3.10"
-solana-rpc-client-types = "2.3.10"
-solana-runtime-transaction = "2.3.10"
-solana-sdk = "2.3.0"
-solana-sdk-ids = "2.2.1"
-solana-svm = { version = "2.3.0", features = ["dev-context-only-utils"] }
-solana-svm-callback = "2.3.0"
-solana-svm-feature-set = "2.3.0"
-solana-svm-rent-collector = "2.3.0"
-solana-svm-transaction = "2.3.0"
-solana-commitment-config = "2.2"
-solana-system-interface = "1.0"
-solana-system-program = "2.3.0"
-# 3.1.13 is the target binary (see versions.env). However crates.io's latest publish
-# is 3.1.12. Use 3.1.12 — wire-compatible with the 3.1.13 CLI within a patch.
-solana-test-validator = "3.1.12"
-solana-transaction-error = "2.2.1"
-solana-transaction-status = "2.3.0"
-solana-transaction-status-client-types = "2.3.0"
-solana-timings = "2.3.0"
+solana-account = "4"
+solana-account-info = "3"
+solana-account-decoder = { version = "4.2", features = ["agave-unstable-api"] }
+solana-account-decoder-client-types = { version = "4.2", features = ["agave-unstable-api"] }
+solana-address = "2"
+solana-bpf-loader-program = { version = "4.2", features = ["agave-unstable-api"] }
+solana-client = "4.2"
+solana-compute-budget-interface = "3"
+solana-compute-budget = { version = "4.2", features = ["agave-unstable-api"] }
+solana-epoch-info = "3"
+solana-epoch-schedule = "3"
+solana-fee-calculator = "3"
+solana-cpi = "3"
+solana-hash = "4"
+solana-instruction = "3"
+solana-loader-v3-interface = { version = "7.0.0", features = ["serde"] }
+# Not part of the 4.2 release line; 3.0 is its last publish.
+solana-logger = "3"
+solana-program = "4"
+solana-program-entrypoint = "3"
+solana-program-error = "3"
+solana-program-pack = "3"
+solana-program-runtime = { version = "4.2", features = ["agave-unstable-api"] }
+solana-pubkey = "4"
+solana-reward-info = { version = "6.2", features = ["serde"] }
+solana-rpc = "4.2"
+solana-rpc-client-api = "4.2"
+solana-rpc-client-types = "4.2"
+solana-runtime-transaction = { version = "4.2", features = ["agave-unstable-api"] }
+solana-sdk = "=4.0.1"
+solana-sdk-ids = "3"
+solana-svm = { version = "4.2", features = ["dev-context-only-utils", "agave-unstable-api"] }
+solana-svm-callback = { version = "4.2", features = ["agave-unstable-api"] }
+solana-svm-feature-set = { version = "4.2", features = ["agave-unstable-api"] }
+solana-svm-transaction = "4.2"
+solana-syscalls = { version = "4.2", features = ["agave-unstable-api"] }
+solana-commitment-config = "3"
+solana-system-interface = "3"
+solana-system-program = { version = "4.2", features = ["agave-unstable-api"] }
+solana-test-validator = { version = "4.2.2", features = ["agave-unstable-api"] }
+solana-transaction-error = "3"
+solana-transaction-context = { version = "4.2", features = ["agave-unstable-api"] }
+solana-transaction-status = { version = "4.2", features = ["agave-unstable-api"] }
+solana-transaction-status-client-types = { version = "4.2", features = ["agave-unstable-api"] }
+solana-svm-timings = { version = "4.2", features = ["agave-unstable-api"] }
 socket2 = "0.6"
-spl-associated-token-account = "7.0.0"
-spl-memo = "6.0.0"
-spl-token = "8.0.0"
-spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "8.0.0", features = ["no-entrypoint"] }
+spl-memo = { version = "7.0.0", features = ["no-entrypoint"] }
+spl-token = { version = "9.0.0", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "11.0.0", features = ["no-entrypoint"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
 tempfile = "3.14"
 testcontainers = "0.25"
@@ -139,8 +146,8 @@ uuid = { version = "1", features = ["v4"] }
 # were not re-published for 12.3 (next published version is 13.0), so ~12.2
 # is the correct client pin against a 12.3 server — the proto surface is
 # unchanged between the two.
-yellowstone-grpc-client = "~12.2"
-yellowstone-grpc-proto = "~12.2"
+yellowstone-grpc-client = "13.5"
+yellowstone-grpc-proto = "12.7"
 private-channel-core = { path = "core" }
 private-channel-metrics = { path = "metrics" }
 private-channel-escrow-program-client = { path = "private-channel-escrow-program/clients/rust", features = [

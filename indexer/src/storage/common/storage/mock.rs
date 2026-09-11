@@ -858,7 +858,7 @@ impl MockStorage {
             })
             .cloned()
             .collect();
-        matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        matched.sort_by_key(|t| t.updated_at);
         matched.truncate(limit as usize);
         Ok(matched)
     }
@@ -963,7 +963,7 @@ impl MockStorage {
             })
             .cloned()
             .collect();
-        matched.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        matched.sort_by_key(|t| t.updated_at);
         matched.truncate(limit as usize);
         Ok(matched)
     }

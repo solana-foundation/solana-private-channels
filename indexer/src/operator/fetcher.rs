@@ -138,7 +138,7 @@ mod tests {
             retry_max_attempts: 3,
             retry_base_delay: Duration::from_millis(100),
             channel_buffer_size: 100,
-            rpc_commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed,
+            rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
             alert_webhook_url: None,
             reconciliation_interval: Duration::from_secs(300),
             reconciliation_tolerance_bps: 10,

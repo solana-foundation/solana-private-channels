@@ -2,10 +2,8 @@ use {
     private_channel_core::nodes::node::{NodeConfig, NodeMode},
     private_channel_core::stage_metrics::NoopMetrics,
     solana_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig, signature::Keypair, signer::Signer,
-        transaction::Transaction,
-    },
+    solana_commitment_config::CommitmentConfig,
+    solana_sdk::{signature::Keypair, signer::Signer, transaction::Transaction},
     spl_associated_token_account::get_associated_token_address,
     std::{sync::Arc, time::Duration},
     tokio::time::sleep,

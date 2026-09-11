@@ -1,3 +1,4 @@
+use solana_commitment_config::CommitmentConfig;
 use {
     anyhow::Result,
     solana_client::{
@@ -6,7 +7,6 @@ use {
     },
     solana_sdk::{
         clock::Slot,
-        commitment_config::CommitmentConfig,
         epoch_info::EpochInfo,
         epoch_schedule::EpochSchedule,
         hash::Hash,

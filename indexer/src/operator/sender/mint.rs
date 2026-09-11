@@ -8,8 +8,8 @@ use crate::operator::{
     REMINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use serde_json::Value;
+use solana_commitment_config::CommitmentConfig;
 use solana_keychain::SolanaSigner;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::program_option::COption;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -1038,7 +1038,7 @@ mod consumed_set_tests {
     use super::{enumerate_consumed_mints, ConsumedMintKind};
     use crate::operator::instruction_util::{mint_idempotency_memo, SourceEventId};
     use crate::operator::{RetryConfig, RpcClientWithRetry};
-    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
 

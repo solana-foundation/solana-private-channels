@@ -1,5 +1,5 @@
 use crate::rpc::{
-    constants::PACKET_DATA_SIZE,
+    decode::decode_transaction,
     error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE},
     WriteDeps,
 };
@@ -7,13 +7,12 @@ use crate::transactions::{
     has_address_table_lookups, is_allowed_program_instruction, ADDRESS_LOOKUP_UNSUPPORTED,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use bincode::Options;
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcSendTransactionConfig;
 use solana_runtime_transaction::runtime_transaction::RuntimeTransaction;
 use solana_sdk::{
     message::{v0::LoadedAddresses, SimpleAddressLoader},
-    transaction::{MessageHash, SanitizedTransaction, VersionedTransaction, MAX_TX_ACCOUNT_LOCKS},
+    transaction::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
 };
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
@@ -31,32 +30,7 @@ pub async fn send_transaction_impl(
         )
     })?;
 
-    if tx_data.len() > PACKET_DATA_SIZE {
-        return Err(custom_error(
-            INVALID_PARAMS_CODE,
-            format!(
-                "Transaction too large: {} bytes (max: {} bytes)",
-                tx_data.len(),
-                PACKET_DATA_SIZE
-            ),
-        ));
-    }
-
-    // Use bincode options matching Agave's decode_and_deserialize
-    let bincode_options = bincode::options()
-        .with_limit(PACKET_DATA_SIZE as u64)
-        .with_fixint_encoding()
-        .allow_trailing_bytes();
-
-    // Try to deserialize as VersionedTransaction first (standard format)
-    let versioned_tx = bincode_options
-        .deserialize::<VersionedTransaction>(&tx_data)
-        .map_err(|e| {
-            custom_error(
-                INVALID_PARAMS_CODE,
-                format!("Failed to deserialize transaction: {}", e),
-            )
-        })?;
+    let versioned_tx = decode_transaction(&tx_data)?;
 
     if has_address_table_lookups(&versioned_tx.message) {
         return Err(custom_error(
@@ -76,6 +50,7 @@ pub async fn send_transaction_impl(
             readonly: vec![],
         }),
         &HashSet::new(),
+        true,
     )
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
@@ -149,10 +124,14 @@ mod tests {
     use super::*;
     use crate::rpc::{error::NODE_AT_CAPACITY_CODE, WriteDeps};
     use crate::stage_metrics::{NoopMetrics, PrometheusMetrics, SharedMetrics};
+    use solana_sdk::transaction::VersionedTransaction;
     use solana_sdk::{
         hash::Hash,
-        instruction::{CompiledInstruction, Instruction},
-        message::{v0, v0::MessageAddressTableLookup, MessageHeader, VersionedMessage},
+        instruction::Instruction,
+        message::{
+            compiled_instruction::CompiledInstruction, v0, v0::MessageAddressTableLookup,
+            MessageHeader, VersionedMessage,
+        },
         pubkey::Pubkey,
         signature::{Keypair, Signer},
         transaction::{SanitizedTransaction, Transaction},

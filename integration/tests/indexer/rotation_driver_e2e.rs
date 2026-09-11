@@ -7,6 +7,7 @@
 //!
 //! Uses testcontainers for isolated Postgres instances.
 
+use solana_commitment_config::CommitmentLevel;
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
     private_channel_indexer::operator::utils::instruction_util::TransactionBuilder,
@@ -23,7 +24,7 @@ use {
         },
     },
     serde_json::json,
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey},
+    solana_sdk::pubkey::Pubkey,
     std::sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, Once,
@@ -283,7 +284,7 @@ fn signed_generation(encoded_tx: &str) -> u64 {
         .message
         .instructions()
         .iter()
-        .find(|ix| keys[ix.program_id_index as usize] != solana_sdk::compute_budget::id())
+        .find(|ix| keys[ix.program_id_index as usize] != solana_compute_budget_interface::id())
         .map(|ix| ix.data.clone())
         .expect("the transaction must carry a rotation instruction");
     u64::from_le_bytes(data[1..9].try_into().unwrap())

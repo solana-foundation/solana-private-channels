@@ -9,7 +9,9 @@ use solana_sdk::{
 use solana_svm::{
     account_loader::{LoadedTransaction, TransactionCheckResult},
     transaction_error_metrics::TransactionErrorMetrics,
-    transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+    transaction_execution_result::{
+        AccountsDeltas, ExecutedTransaction, TransactionExecutionDetails,
+    },
     transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
     transaction_processor::{
         LoadAndExecuteSanitizedTransactionsOutput, TransactionProcessingConfig,
@@ -17,8 +19,8 @@ use solana_svm::{
     },
 };
 use solana_svm_callback::TransactionProcessingCallback;
+use solana_svm_timings::ExecuteTimings;
 use solana_svm_transaction::svm_transaction::SVMTransaction;
-use solana_timings::ExecuteTimings;
 use spl_token::solana_program::program_option::COption;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
@@ -126,12 +128,18 @@ impl AdminVm {
                 ..Default::default()
             },
             execution_details: TransactionExecutionDetails {
+                // Upstream keeps the deltas only for a transaction that
+                // succeeded. This VM only ever creates mints at their exact
+                // size and uninitialises nothing, so both deltas are zero.
+                accounts_deltas: status.is_ok().then_some(AccountsDeltas {
+                    accounts_resize_delta: 0,
+                    accounts_uninitialized_size: 0,
+                }),
                 status,
                 log_messages: None,
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
             },
             programs_modified_by_tx: HashMap::new(),
         }
@@ -251,7 +259,11 @@ impl AdminVm {
                         let account = if created_mints.iter().any(|(mi, _, _)| *mi == i) {
                             AccountSharedData::default()
                         } else {
-                            callbacks.get_account_shared_data(&key).unwrap_or_default()
+                            // The slot beside the account is not tracked here.
+                            callbacks
+                                .get_account_shared_data(&key)
+                                .map(|(account, _slot)| account)
+                                .unwrap_or_default()
                         };
                         (key, account)
                     })
@@ -325,10 +337,15 @@ impl AdminVm {
         let account_keys = tx.account_keys();
         let mint_index = instruction.accounts[0] as usize;
         let Some(mint_pubkey) = account_keys.get(mint_index).copied() else {
+            // Deprecated upstream, kept so existing rows and clients see the same error.
+            #[allow(deprecated)]
             return Err(InstructionError::NotEnoughAccountKeys);
         };
 
-        let existing = callbacks.get_account_shared_data(&mint_pubkey);
+        // The slot beside the account is not tracked here.
+        let existing = callbacks
+            .get_account_shared_data(&mint_pubkey)
+            .map(|(account, _slot)| account);
         if let Err(err) =
             Self::check_initialize_mint_target(existing.as_ref(), tx.is_writable(mint_index))
         {
@@ -349,7 +366,9 @@ impl AdminVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::CHANNEL_SLOT;
     use solana_sdk::account::{Account, ReadableAccount, WritableAccount};
+    use solana_sdk::clock::Slot;
     use solana_sdk::instruction::{AccountMeta, Instruction};
     use solana_sdk::message::Message;
     use solana_sdk::signature::{Keypair, Signer};
@@ -424,10 +443,7 @@ mod tests {
     // uninitialized account" paths are exercisable.
     struct DummyCb;
     impl solana_svm_callback::TransactionProcessingCallback for DummyCb {
-        fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<AccountSharedData> {
-            None
-        }
-        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
+        fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
             None
         }
     }
@@ -438,19 +454,15 @@ mod tests {
         mint: Pubkey,
     }
     impl solana_svm_callback::TransactionProcessingCallback for StubCbWithInitializedMint {
-        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
             if *pubkey == self.mint {
-                Some(AdminVm::create_mint_account(
-                    6,
-                    &Pubkey::new_unique().to_bytes(),
-                    None,
+                Some((
+                    AdminVm::create_mint_account(6, &Pubkey::new_unique().to_bytes(), None),
+                    CHANNEL_SLOT,
                 ))
             } else {
                 None
             }
-        }
-        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
-            None
         }
     }
     impl solana_svm_callback::InvokeContextCallback for StubCbWithInitializedMint {}
@@ -462,15 +474,12 @@ mod tests {
         mint: Pubkey,
     }
     impl solana_svm_callback::TransactionProcessingCallback for StubCbWithUninitialized {
-        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
             if *pubkey == self.mint {
-                Some(mint_allocation())
+                Some((mint_allocation(), CHANNEL_SLOT))
             } else {
                 None
             }
-        }
-        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
-            None
         }
     }
     impl solana_svm_callback::InvokeContextCallback for StubCbWithUninitialized {}
@@ -489,7 +498,17 @@ mod tests {
     ) -> LoadAndExecuteSanitizedTransactionsOutput {
         let vm = AdminVm::default();
         let check_results = crate::processor::get_transaction_check_results(txs.len());
-        let env = solana_svm::transaction_processor::TransactionProcessingEnvironment::default();
+        // The admin path ignores the environment, so a mock one is enough.
+        let env = solana_svm::transaction_processor::TransactionProcessingEnvironment {
+            blockhash: solana_sdk::hash::Hash::default(),
+            blockhash_lamports_per_signature: 0,
+            alpenglow_migration_succeeded: false,
+            epoch_total_stake: 0,
+            feature_set: solana_svm_feature_set::SVMFeatureSet::all_enabled(),
+            program_runtime_environments:
+                solana_program_runtime::loaded_programs::ProgramRuntimeEnvironments::mock(),
+            rent: solana_sdk::rent::Rent::free(),
+        };
         let config = solana_svm::transaction_processor::TransactionProcessingConfig::default();
         vm.load_and_execute_sanitized_transactions(cb, txs, check_results, &env, &config)
     }
@@ -649,15 +668,12 @@ mod tests {
         account: AccountSharedData,
     }
     impl solana_svm_callback::TransactionProcessingCallback for StubCbForPubkey {
-        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
             if *pubkey == self.key {
-                Some(self.account.clone())
+                Some((self.account.clone(), CHANNEL_SLOT))
             } else {
                 None
             }
-        }
-        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
-            None
         }
     }
     impl solana_svm_callback::InvokeContextCallback for StubCbForPubkey {}
@@ -1249,7 +1265,7 @@ mod tests {
     #[test]
     fn test_check_target_foreign_owner_rejected() {
         let mut account = mint_allocation();
-        account.set_owner(solana_sdk::system_program::id());
+        account.set_owner(solana_sdk_ids::system_program::id());
         assert_eq!(
             AdminVm::check_initialize_mint_target(Some(&account), true),
             Err(InstructionError::ExternalAccountDataModified)

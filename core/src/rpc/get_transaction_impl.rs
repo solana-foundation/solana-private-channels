@@ -1,12 +1,14 @@
 use crate::rpc::{
-    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+    error::{
+        custom_error, unsupported_transaction_version, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR,
+    },
     ReadDeps,
 };
 use jsonrpsee::core::RpcResult;
 use serde_json::{json, Value};
 use solana_rpc_client_types::config::{RpcEncodingConfigWrapper, RpcTransactionConfig};
 use solana_sdk::signature::Signature;
-use solana_transaction_status_client_types::UiTransactionEncoding;
+use solana_transaction_status_client_types::{EncodeError, UiTransactionEncoding};
 use std::str::FromStr;
 
 pub async fn get_transaction_impl(
@@ -33,12 +35,16 @@ pub async fn get_transaction_impl(
         })?;
 
     if let Some(stored_tx) = stored {
+        // The only failure is a stored version above the caller's ceiling, which
+        // is the caller's problem to fix and must not fault the connection.
         let encoded_tx = stored_tx
             .encoded_transaction(
                 &config.encoding.unwrap_or(UiTransactionEncoding::Json),
                 config.max_supported_transaction_version,
             )
-            .unwrap();
+            .map_err(|EncodeError::UnsupportedTransactionVersion(version)| {
+                unsupported_transaction_version(version)
+            })?;
 
         Ok(Some(json!(encoded_tx)))
     } else {

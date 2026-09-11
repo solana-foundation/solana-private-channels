@@ -8,7 +8,7 @@ use crate::indexer::datasource::rpc_polling::decoder;
 use crate::metrics;
 use async_trait::async_trait;
 use private_channel_metrics::{HealthState, MetricLabel};
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 use std::time::Duration;
@@ -589,7 +589,7 @@ mod tests {
             10,
             1,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
             None,
             None,
@@ -640,7 +640,7 @@ mod tests {
             10,
             10,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
             None,
             None,
@@ -691,7 +691,7 @@ mod tests {
             10,        // error_retry_interval_ms, quick retry on error
             1,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
             None,
             None,
@@ -746,7 +746,7 @@ mod tests {
             10,
             10,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
             None,
             None,
@@ -798,7 +798,7 @@ mod tests {
             10,
             1,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
             None,
             None,
@@ -867,7 +867,7 @@ mod tests {
             10,
             10,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
             None,
             Some(fallback.url()),
@@ -922,7 +922,7 @@ mod tests {
             10,
             1,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
             None,
             Some(fallback.url()),
@@ -978,7 +978,7 @@ mod tests {
             10,
             1,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Withdraw,
             None,
             Some(fallback.url()),
@@ -1064,7 +1064,7 @@ mod tests {
             10,
             10,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
             None,
             None,
@@ -1117,7 +1117,7 @@ mod tests {
             10,
             10,
             solana_transaction_status::UiTransactionEncoding::Json,
-            solana_sdk::commitment_config::CommitmentLevel::Finalized,
+            solana_commitment_config::CommitmentLevel::Finalized,
             ProgramType::Escrow,
             None,
             None,

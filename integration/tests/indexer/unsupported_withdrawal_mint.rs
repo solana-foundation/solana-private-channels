@@ -40,8 +40,8 @@ use {
     },
     setup::{TestEnvironment, TEST_ADMIN_KEYPAIR},
     solana_client::nonblocking::rpc_client::RpcClient,
+    solana_commitment_config::CommitmentConfig,
     solana_sdk::{
-        commitment_config::CommitmentConfig,
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
     },
@@ -61,7 +61,7 @@ fn default_operator_config() -> OperatorConfig {
         retry_max_attempts: 15,
         retry_base_delay: Duration::from_millis(500),
         channel_buffer_size: 100,
-        rpc_commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed,
+        rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
         alert_webhook_url: None,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,

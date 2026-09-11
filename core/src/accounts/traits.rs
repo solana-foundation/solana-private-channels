@@ -522,7 +522,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -783,7 +783,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1109,7 +1109,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1173,7 +1173,7 @@ mod tests {
                     inner_instructions: None,
                     return_data: None,
                     executed_units: 0,
-                    accounts_data_len_delta: 0,
+                    accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                 },
                 programs_modified_by_tx: HashMap::new(),
             }))
@@ -1241,7 +1241,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1387,7 +1387,7 @@ mod tests {
                         inner_instructions: None,
                         return_data: None,
                         executed_units: 0,
-                        accounts_data_len_delta: 0,
+                        accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                     },
                     programs_modified_by_tx: HashMap::new(),
                 }));
@@ -1446,7 +1446,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));

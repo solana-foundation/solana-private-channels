@@ -403,7 +403,7 @@ mod tests {
     async fn bitmap_read_failure_is_reported_as_unavailable() {
         use crate::error::ProgramError;
         use crate::operator::utils::rpc_util::RetryConfig;
-        use solana_sdk::commitment_config::CommitmentConfig;
+        use solana_commitment_config::CommitmentConfig;
 
         let mut server = mockito::Server::new_async().await;
         let _down = server

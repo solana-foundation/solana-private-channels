@@ -20,11 +20,11 @@ use private_channel_escrow_program_client::instructions::{
 };
 use private_channel_escrow_program_client::instructions::{DepositBuilder, RotateBitmapBuilder};
 use private_channel_escrow_program_client::WithdrawalBitmap;
-use solana_sdk::system_program::ID as SYSTEM_PROGRAM_ID;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
+use solana_sdk_ids::system_program::ID as SYSTEM_PROGRAM_ID;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 

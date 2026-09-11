@@ -2,12 +2,12 @@ use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_response::{Response, RpcBlockhash};
+use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcTransactionConfig};
 use solana_rpc_client_api::request::{RpcError, RpcRequest};
 use solana_sdk::account::Account;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -355,9 +355,18 @@ impl RpcClientWithRetry {
                     commitment: Some(commitment),
                     min_context_slot,
                 };
-                self.rpc_client
-                    .get_account_with_config(pubkey, config)
-                    .await
+                // The client returns the encoded form now, so decode it back to
+                // keep this wrapper's contract. Base64 is requested above, and a
+                // value that will not decode is reported as absent, which is the
+                // same answer the caller already handles for a missing account.
+                let response = self
+                    .rpc_client
+                    .get_ui_account_with_config(pubkey, config)
+                    .await?;
+                Ok::<_, client_error::Error>(Response {
+                    context: response.context,
+                    value: response.value.and_then(|account| account.to_account()),
+                })
             },
         )
         .await

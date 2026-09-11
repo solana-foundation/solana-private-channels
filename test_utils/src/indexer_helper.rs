@@ -1,10 +1,11 @@
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         storage::{PostgresDb, Storage},
         BackfillConfig, DatasourceType, IndexerConfig, PostgresConfig, PrivateChannelIndexerConfig,
         ProgramType, RpcPollingConfig, StorageType, YellowstoneConfig,
     },
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey},
+    solana_sdk::pubkey::Pubkey,
     solana_transaction_status::UiTransactionEncoding,
     std::sync::Arc,
     tokio::task::JoinHandle,

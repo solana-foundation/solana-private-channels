@@ -14,14 +14,15 @@ use {
             admin::AdminVm,
             clock::set_clock_now,
             gasless_callback::{GaslessCallback, SnapshotCallback, DEFAULT_FEE_PAYER_LAMPORTS},
-            gasless_rent_collector::GaslessRentCollector,
         },
     },
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
+    solana_program_runtime::loaded_programs::ProgramRuntimeEnvironments,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
         hash::Hash,
         pubkey::Pubkey,
+        rent::Rent,
         transaction::{SanitizedTransaction, TransactionError},
     },
     solana_svm::{
@@ -33,8 +34,8 @@ use {
         },
     },
     solana_svm_feature_set::SVMFeatureSet,
-    solana_svm_transaction::svm_message::SVMMessage,
-    solana_timings::ExecuteTimings,
+    solana_svm_timings::ExecuteTimings,
+    solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage},
     std::{
         collections::{HashSet, LinkedList},
         sync::{Arc, RwLock},
@@ -76,6 +77,12 @@ pub struct ExecutionDeps {
     pub max_svm_workers: usize,
     /// Shared live-blockhash window
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    /// The environments the program cache entries were compiled against.
+    ///
+    /// The cache matches an entry to an environment by pointer, so framing a
+    /// batch with anything else silently recompiles every program on every
+    /// batch. Cloning this is a refcount bump.
+    pub program_runtime_environments: ProgramRuntimeEnvironments,
 
     // Must prevent this from being dropped
     _fork_graph: Arc<RwLock<PrivateChannelForkGraph>>,
@@ -238,43 +245,59 @@ pub async fn get_execution_deps(
     let bob = BOB::new(accounts_db, settled_accounts_rx).await;
     let feature_set = SVMFeatureSet::all_enabled();
     let compute_budget = SVMTransactionExecutionBudget::default();
-    let (vm, _fork_graph) =
+    let batch_processor =
         create_transaction_batch_processor(&bob, &feature_set, &compute_budget).unwrap();
     let admin_vm = AdminVm::default();
     ExecutionDeps {
         bob,
-        vm,
+        vm: batch_processor.processor,
         admin_vm,
         max_svm_workers,
         live_blockhashes,
-        _fork_graph,
+        program_runtime_environments: batch_processor.environments,
+        _fork_graph: batch_processor.fork_graph,
     }
 }
 
-/// Execute a chunk of transactions on the shared SVM with a dedicated
-/// per-thread processing environment.
+/// Build the frame one batch executes under.
 ///
-/// Each thread creates its own `TransactionProcessingEnvironment` because it
-/// contains `Option<&dyn SVMRentCollector>` and that trait has no `Sync`
-/// supertrait — so the environment can't be shared across threads. The
-/// environment is trivially cheap to construct, so per-thread construction has
-/// negligible cost compared to the SVM call it frames.
+/// Rent is expressed as a rate of zero rather than a hook, which is the only
+/// shape the SVM accepts now. Every rent check runs through the minimum balance,
+/// which is the byte count times the rate, so at a zero rate nothing is ever
+/// charged and every funded account is exempt whatever its size.
+fn processing_environment(
+    environments: &ProgramRuntimeEnvironments,
+) -> TransactionProcessingEnvironment {
+    TransactionProcessingEnvironment {
+        // TODO: Replace with proper blockhash for replay protection
+        blockhash: Hash::default(),
+        // Gasless - no lamports per signature
+        blockhash_lamports_per_signature: 0,
+        alpenglow_migration_succeeded: false,
+        epoch_total_stake: 0,
+        feature_set: SVMFeatureSet::all_enabled(),
+        // The pair is rebuilt from the same two handles rather than compiled
+        // again, so this costs two refcount bumps and the cache still matches
+        // every program it already holds.
+        program_runtime_environments: ProgramRuntimeEnvironments::new(
+            environments.get_env_for_execution().clone(),
+            environments.get_env_for_deployment().clone(),
+        ),
+        rent: Rent::free(),
+    }
+}
+
+/// Execute a chunk of transactions on the shared SVM.
+///
+/// Each worker frames its own batch, which costs one refcount bump on the shared
+/// environments and nothing else.
 fn execute_chunk(
     vm: &TransactionBatchProcessor<PrivateChannelForkGraph>,
     callback: &SnapshotCallback,
     transactions: &[SanitizedTransaction],
+    environments: &ProgramRuntimeEnvironments,
 ) -> LoadAndExecuteSanitizedTransactionsOutput {
-    let gasless_rent_collector = GaslessRentCollector::new();
-    let processing_environment = TransactionProcessingEnvironment {
-        blockhash: Hash::default(),
-        blockhash_lamports_per_signature: 0,
-        feature_set: SVMFeatureSet::all_enabled(),
-        rent_collector: Some(
-            &gasless_rent_collector
-                as &dyn solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
-        ),
-        ..Default::default()
-    };
+    let processing_environment = processing_environment(environments);
     let processing_config = TransactionProcessingConfig::default();
     let check_results = get_transaction_check_results(transactions.len());
 
@@ -490,6 +513,7 @@ fn execute_parallel(
     snapshot: &SnapshotCallback,
     transactions: &[SanitizedTransaction],
     max_svm_workers: usize,
+    environments: &ProgramRuntimeEnvironments,
 ) -> LoadAndExecuteSanitizedTransactionsOutput {
     debug_assert!(
         max_svm_workers >= 2,
@@ -519,13 +543,13 @@ fn execute_parallel(
         let mut handles = Vec::with_capacity(chunks.len().saturating_sub(1));
         for chunk in &chunks[1..] {
             let chunk: &[SanitizedTransaction] = chunk;
-            handles.push(s.spawn(move || execute_chunk(vm, snapshot, chunk)));
+            handles.push(s.spawn(move || execute_chunk(vm, snapshot, chunk, environments)));
         }
 
         // Do chunks[0] inline on this thread while workers run.
         let mut outputs: Vec<LoadAndExecuteSanitizedTransactionsOutput> =
             Vec::with_capacity(chunks.len());
-        outputs.push(execute_chunk(vm, snapshot, chunks[0]));
+        outputs.push(execute_chunk(vm, snapshot, chunks[0], environments));
 
         // Join in spawn order to preserve original transaction ordering.
         // A panic in any worker propagates to the executor — we want the
@@ -774,26 +798,11 @@ pub async fn execute_batch(
     // the sysvar cache during syscalls, so a mid-batch write would deadlock.
     set_clock_now(&execution_deps.vm);
 
-    // Create processing environment and config
-    let feature_set: SVMFeatureSet = SVMFeatureSet::all_enabled();
     // TODO: Use non-default blockhash for TransactionProcessingEnvironment
     // This would add replay attack prevention by ensuring each batch has a unique blockhash
     // Could use a combination of slot number, batch index, or timestamp to generate unique hashes
-
-    // For gasless operation, use our custom gasless rent collector
-    let gasless_rent_collector = GaslessRentCollector::new();
-    let rent_collector = Some(
-        &gasless_rent_collector
-            as &dyn solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
-    );
-
-    let processing_environment = TransactionProcessingEnvironment {
-        blockhash: Hash::default(), // TODO: Replace with proper blockhash for replay protection
-        blockhash_lamports_per_signature: 0, // Gasless - no lamports per signature
-        feature_set,
-        rent_collector,
-        ..Default::default()
-    };
+    let processing_environment =
+        processing_environment(&execution_deps.program_runtime_environments);
 
     let processing_config = TransactionProcessingConfig {
         ..Default::default()
@@ -883,6 +892,7 @@ pub async fn execute_batch(
                     &snapshot,
                     &regular_transactions,
                     execution_deps.max_svm_workers,
+                    &execution_deps.program_runtime_environments,
                 )
             })
         } else {
@@ -978,7 +988,6 @@ mod tests {
         transaction::Transaction,
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
-    use solana_svm_callback::TransactionProcessingCallback;
     use std::collections::{HashSet, LinkedList};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -1106,12 +1115,14 @@ mod tests {
                     ..Default::default()
                 },
                 execution_details: TransactionExecutionDetails {
+                    // Deltas exist only for a transaction that succeeded, so a
+                    // caller asking for a failure gets the shape the SVM emits.
+                    accounts_deltas: status.is_ok().then(crate::test_helpers::no_accounts_deltas),
                     status,
                     log_messages: None,
                     inner_instructions: None,
                     return_data: None,
                     executed_units: 0,
-                    accounts_data_len_delta: 0,
                 },
                 programs_modified_by_tx: std::collections::HashMap::new(),
             },
@@ -1331,7 +1342,8 @@ mod tests {
     /// sanitization counts them, nothing here verifies them.
     fn tx_over(keys: &[Pubkey], writable: usize) -> SanitizedTransaction {
         use solana_sdk::{
-            instruction::CompiledInstruction, message::MessageHeader, signature::Signature,
+            message::{compiled_instruction::CompiledInstruction, MessageHeader},
+            signature::Signature,
         };
         let mut account_keys = keys.to_vec();
         account_keys.push(solana_sdk_ids::system_program::ID);
@@ -2023,7 +2035,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unrelated_writable_account_is_untouched() {
         use solana_sdk::{
-            account::WritableAccount, instruction::CompiledInstruction, message::MessageHeader,
+            account::WritableAccount,
+            message::{compiled_instruction::CompiledInstruction, MessageHeader},
         };
 
         let (accounts_db, _pg) = start_test_postgres().await;
@@ -2777,7 +2790,7 @@ mod tests {
 
     #[test]
     fn test_merge_svm_outputs_accumulates_execute_timings() {
-        use solana_timings::ExecuteTimingType;
+        use solana_svm_timings::ExecuteTimingType;
         use std::num::Saturating;
 
         let mut chunk_a = fabricate_output(vec![]);

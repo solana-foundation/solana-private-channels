@@ -1,4 +1,4 @@
 # SHA-256 of libyellowstone_grpc_geyser.so committed alongside this file.
 # Upstream source: https://github.com/rpcpool/yellowstone-grpc tag YELLOWSTONE_TAG (see versions.env).
 # Verify locally with: cd test_utils/geyser && sha256sum -c libyellowstone_grpc_geyser.so.sha256
-1d69be5b31e542b87ef813436d3549741c60bd58046cb8860f9b8327db5a42de  libyellowstone_grpc_geyser.so
+c65a8fc2de1b125f1107fdf39c8d6ed73299a5450a6fc16cb70554053cbcb6ac  libyellowstone_grpc_geyser.so

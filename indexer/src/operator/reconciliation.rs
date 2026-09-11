@@ -723,7 +723,7 @@ mod tests {
     // `operator::escrow_sweep` (both encodings, multi-account summing, skip/error arms).
 
     fn make_operator_config() -> OperatorConfig {
-        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_commitment_config::CommitmentLevel;
         OperatorConfig {
             db_poll_interval: std::time::Duration::from_secs(1),
             batch_size: 10,
@@ -744,7 +744,7 @@ mod tests {
     async fn run_reconciliation_returns_ok_when_precancelled() {
         use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
         use crate::storage::common::storage::{mock::MockStorage, Storage};
-        use solana_sdk::commitment_config::CommitmentConfig;
+        use solana_commitment_config::CommitmentConfig;
         use std::sync::Arc;
 
         let mock = MockStorage::new();
@@ -1267,7 +1267,7 @@ mod tests {
     async fn supply_read_failure_holds_counters_and_does_not_halt() {
         use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
         use crate::storage::common::models::MintDbBalance;
-        use solana_sdk::commitment_config::CommitmentConfig;
+        use solana_commitment_config::CommitmentConfig;
 
         let fast = || RetryConfig {
             max_attempts: 1,
@@ -1348,7 +1348,7 @@ mod tests {
         // latched for the process lifetime: a manual clear (runbook) must let a
         // fresh insolvency re-trip, and a still-set flag keeps re-firing suppressed.
         use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
-        use solana_sdk::commitment_config::CommitmentConfig;
+        use solana_commitment_config::CommitmentConfig;
 
         // Unreachable RPC: the custody fetch fails fast, but only after the guard
         // has already been resynced from the flag at the top of the check.

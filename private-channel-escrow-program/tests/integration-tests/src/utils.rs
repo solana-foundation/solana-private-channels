@@ -1,17 +1,17 @@
 use litesvm::{types::TransactionMetadata, LiteSVM};
 use private_channel_escrow_program_client::PrivateChannelEscrowProgramError;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_nullable::MaybeNull;
 use solana_program::pubkey;
 use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     program_option::COption,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
-use spl_pod::optional_keys::OptionalNonZeroPubkey;
 use spl_token::{
     state::{Account as TokenAccount, Mint},
     ID as TOKEN_PROGRAM_ID,
@@ -531,7 +531,7 @@ pub fn set_mint_2022_with_permanent_delegate(context: &mut TestContext, mint: &P
     // Initialize the extension first, then the base mint
     let permanent_delegate = state.init_extension::<PermanentDelegate>(true).unwrap();
     *permanent_delegate = PermanentDelegate {
-        delegate: OptionalNonZeroPubkey::try_from(Some(context.payer.pubkey())).unwrap(),
+        delegate: MaybeNull::try_from(Some(context.payer.pubkey())).unwrap(),
     };
 
     let pod_mint = PodMint {
@@ -572,7 +572,7 @@ pub fn set_mint_2022_with_pausable(context: &mut TestContext, mint: &Pubkey, aut
     let pausable_config = state.init_extension::<PausableConfig>(true).unwrap();
     *pausable_config = PausableConfig {
         paused: false.into(),
-        authority: OptionalNonZeroPubkey::try_from(Some(*authority)).unwrap(),
+        authority: MaybeNull::try_from(Some(*authority)).unwrap(),
     };
 
     let pod_mint = PodMint {
@@ -616,8 +616,8 @@ pub fn set_mint_2022_with_transfer_hook(
 
     let transfer_hook = state.init_extension::<TransferHook>(true).unwrap();
     *transfer_hook = TransferHook {
-        authority: OptionalNonZeroPubkey::try_from(Some(context.payer.pubkey())).unwrap(),
-        program_id: OptionalNonZeroPubkey::try_from(Some(*hook_program_id)).unwrap(),
+        authority: MaybeNull::try_from(Some(context.payer.pubkey())).unwrap(),
+        program_id: MaybeNull::try_from(Some(*hook_program_id)).unwrap(),
     };
 
     let pod_mint = PodMint {
@@ -660,7 +660,7 @@ pub fn create_mint_2022_with_transfer_fee(
     .unwrap();
     let rent = context.svm.minimum_balance_for_rent_exemption(space);
 
-    let create_account_ix = solana_sdk::system_instruction::create_account(
+    let create_account_ix = solana_system_interface::instruction::create_account(
         &context.payer.pubkey(),
         &mint.pubkey(),
         rent,

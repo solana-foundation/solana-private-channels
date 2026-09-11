@@ -5,7 +5,7 @@ use {
     solana_sdk::{
         account::AccountSharedData,
         hash::Hash,
-        instruction::CompiledInstruction,
+        message::compiled_instruction::CompiledInstruction,
         message::{v0, v0::MessageAddressTableLookup, Message, MessageHeader, VersionedMessage},
         program_pack::Pack,
         pubkey::Pubkey,

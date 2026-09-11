@@ -1,6 +1,7 @@
 use {
+    crate::processor::CHANNEL_SLOT,
     anyhow::Result,
-    solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
+    solana_sdk::{account::AccountSharedData, clock::Slot, pubkey::Pubkey},
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     sqlx::{postgres::PgPoolOptions, PgPool},
     std::sync::Arc,
@@ -100,7 +101,7 @@ impl TransactionProcessingCallback for PostgresAccountsDB {
     // The upstream signature cannot carry a failure, so a load error is logged
     // and collapses to `None` here. Nothing in production reaches this impl: the
     // SVM always runs against BOB or a gasless callback, both in-memory.
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
         let db = super::traits::AccountsDB::Postgres(self.clone());
         let pubkey = *pubkey;
         tokio::task::block_in_place(|| {
@@ -111,24 +112,7 @@ impl TransactionProcessingCallback for PostgresAccountsDB {
                         error!("account load failed at the SVM callback boundary: {}", e);
                         None
                     })
-            })
-        })
-    }
-
-    // Same boundary as above: an unanswerable read is logged and reads as "no
-    // match" only because the upstream signature offers nowhere else to go.
-    fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
-        let db = super::traits::AccountsDB::Postgres(self.clone());
-        let account = *account;
-        let owners = owners.to_vec();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                super::account_matches_owners::account_matches_owners(&db, &account, &owners)
-                    .await
-                    .unwrap_or_else(|e| {
-                        error!("account load failed at the SVM callback boundary: {}", e);
-                        None
-                    })
+                    .map(|account| (account, CHANNEL_SLOT))
             })
         })
     }
@@ -383,15 +367,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// The synchronous TransactionProcessingCallback::account_matches_owners
-    /// returns None when the account does not exist.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn transaction_callback_account_matches_owners_missing_returns_none() {
-        let (db, _pg) = start_test_postgres_raw().await;
-        let result = db.account_matches_owners(&Pubkey::new_unique(), &[Pubkey::new_unique()]);
-        assert!(result.is_none());
-    }
-
     /// Store an account via the production set_account path and read back
     /// via the synchronous TransactionProcessingCallback.
     #[tokio::test(flavor = "multi_thread")]
@@ -467,33 +442,6 @@ mod tests {
         assert!(no_pw.is_err(), "missing password must be rejected");
     }
 
-    /// Store an account via the production path and verify account_matches_owners.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn transaction_callback_account_matches_owners_returns_some_when_found() {
-        let (mut db, _pg) = start_test_postgres().await;
-
-        let pubkey = Pubkey::new_unique();
-        let owner = Pubkey::new_unique();
-        let account = AccountSharedData::new(100, 0, &owner);
-
-        // Use production write path
-        db.set_account(pubkey, account).await;
-
-        let pg_db = match &db {
-            crate::accounts::AccountsDB::Postgres(pg) => pg,
-            _ => panic!("expected Postgres variant"),
-        };
-
-        // Query with the matching owner
-        let result = pg_db.account_matches_owners(&pubkey, &[owner]);
-        assert_eq!(result, Some(0));
-
-        // Query with owner in second position
-        let other_owner = Pubkey::new_unique();
-        let result = pg_db.account_matches_owners(&pubkey, &[other_owner, owner]);
-        assert_eq!(result, Some(1));
-    }
-
     /// Store an account via the production path and verify deserialized data.
     #[tokio::test(flavor = "multi_thread")]
     async fn transaction_callback_get_account_shared_data_deserializes_correctly() {
@@ -513,26 +461,10 @@ mod tests {
         };
         let result = pg_db.get_account_shared_data(&pubkey);
         assert!(result.is_some());
-        let retrieved = result.unwrap();
+        let (retrieved, slot) = result.unwrap();
         assert_eq!(retrieved.lamports(), lamports, "Lamports should match");
         assert_eq!(retrieved.owner(), &owner, "Owner should match");
-    }
-
-    /// account_matches_owners with empty owners list returns None (no match possible).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn transaction_callback_account_matches_owners_empty_owners() {
-        let (mut db, _pg) = start_test_postgres().await;
-
-        let pubkey = Pubkey::new_unique();
-        let account = AccountSharedData::new(100, 0, &Pubkey::new_unique());
-        db.set_account(pubkey, account).await;
-
-        let pg_db = match &db {
-            crate::accounts::AccountsDB::Postgres(pg) => pg,
-            _ => panic!("expected Postgres variant"),
-        };
-        let result = pg_db.account_matches_owners(&pubkey, &[]);
-        assert!(result.is_none(), "empty owners list should never match");
+        assert_eq!(slot, CHANNEL_SLOT, "Reads report the channel slot");
     }
 
     /// PostgresAccountsDB::new with read_only=true skips table creation.
@@ -552,26 +484,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "accounts table should exist and be empty");
-    }
-
-    /// Account exists in database but no queried owner matches.
-    /// Validates the None return path when account is found but owner mismatch occurs.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn transaction_callback_account_matches_owners_no_match_existing_account() {
-        let (mut db, _pg) = start_test_postgres().await;
-
-        let pubkey = Pubkey::new_unique();
-        let owner = Pubkey::new_unique();
-        db.set_account(pubkey, AccountSharedData::new(100, 0, &owner))
-            .await;
-
-        let pg_db = match &db {
-            crate::accounts::AccountsDB::Postgres(pg) => pg,
-            _ => panic!("expected Postgres variant"),
-        };
-
-        // Account exists but wrong owner — should return None
-        let result = pg_db.account_matches_owners(&pubkey, &[Pubkey::new_unique()]);
-        assert!(result.is_none(), "no owner match should return None");
     }
 }

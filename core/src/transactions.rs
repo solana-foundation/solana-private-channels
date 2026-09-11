@@ -65,7 +65,14 @@ pub const ADDRESS_LOOKUP_UNSUPPORTED: &str =
 /// that cannot exist. Admitting one unresolved would leave the transaction's
 /// account keys missing every address the lookup was supposed to supply.
 pub fn has_address_table_lookups(message: &VersionedMessage) -> bool {
-    matches!(message, VersionedMessage::V0(m) if !m.address_table_lookups.is_empty())
+    // Exhaustive on purpose: a future message version must be classified here
+    // rather than falling through to a silent false.
+    match message {
+        VersionedMessage::Legacy(_) => false,
+        VersionedMessage::V0(m) => !m.address_table_lookups.is_empty(),
+        // The v1 format has no lookup tables at all.
+        VersionedMessage::V1(_) => false,
+    }
 }
 
 #[cfg(test)]

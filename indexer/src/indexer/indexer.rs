@@ -753,7 +753,7 @@ pub async fn run(
 
             #[cfg(feature = "datasource-rpc")]
             let source = {
-                use solana_sdk::commitment_config::CommitmentLevel as SdkCommitmentLevel;
+                use solana_commitment_config::CommitmentLevel as SdkCommitmentLevel;
                 use solana_transaction_status::UiTransactionEncoding;
 
                 let encoding = indexer_config
@@ -1018,7 +1018,7 @@ mod tests {
             mock_get_slot,
         };
         use mockito::Server;
-        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_commitment_config::CommitmentLevel;
         use solana_transaction_status::UiTransactionEncoding;
         use std::time::Duration;
 

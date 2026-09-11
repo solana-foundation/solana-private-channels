@@ -34,6 +34,8 @@ integration-test:
 	@cargo test --test test_duplicate_writer -- --nocapture
 	@# Backpressure CI guards (health + no-deadlock); the RSS load test stays #[ignore] for staging.
 	@cargo test --test ingress_backpressure -- --nocapture
+	@cargo test --test ordered_shutdown_e2e -- --nocapture
+	@cargo test --test v1_transaction_e2e -- --nocapture
 	@cargo test --test test_redis_cache_path -- --nocapture --test-threads=1
 	@echo "=== Building escrow with test-tree for test-tree-feature group ==="
 	@$(MAKE) -C ../private-channel-escrow-program build-test
@@ -172,10 +174,13 @@ COV_IGNORE_PATTERNS := \
 # e.g. "a b c" → "(a|b|c)"
 COV_IGNORE_REGEX := ($(shell echo '$(COV_IGNORE_PATTERNS)' | tr -s ' \t\n' '|' | sed 's/^|//;s/|$$//'))
 
+# Suites that load the geyser plugin retry only on the upstream validator broadcast race.
+RETRY_ON_RACE := ../scripts/retry-on-known-race.sh 3
+
 integration-coverage-private-channel:
 	@echo "Running private_channel integration tests with coverage instrumentation..."
 	@cargo llvm-cov clean --workspace
-	@cargo llvm-cov nextest --no-report --workspace --test private_channel_integration
+	@$(RETRY_ON_RACE) cargo llvm-cov nextest --no-report --workspace --test private_channel_integration
 	@echo "Running HTTP malformed-body tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test test_rpc_http_malformed -- --nocapture
 	@echo "Running simulate-transaction guards tests with coverage instrumentation..."
@@ -192,6 +197,10 @@ integration-coverage-private-channel:
 	@cargo llvm-cov test --no-report --workspace --test test_duplicate_writer -- --nocapture
 	@# Kept in sync with the integration-test group; runs the backpressure CI guards (RSS test stays #[ignore]).
 	@cargo llvm-cov test --no-report --workspace --test ingress_backpressure -- --nocapture
+	@echo "Running ordered-shutdown drain tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test ordered_shutdown_e2e -- --nocapture
+	@echo "Running v1 transaction end-to-end tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test v1_transaction_e2e -- --nocapture
 
 # Redis cache coverage.
 # Runs Postgres+Redis nodes to cover the settle worker's cache setup, the
@@ -227,7 +236,7 @@ integration-coverage-indexer:
 	@echo "=== test-tree feature group ==="
 	@echo "PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS=$$PRIVATE_CHANNEL_TEST_WAIT_TIMEOUT_SECS (coverage headroom)"
 	@echo "Running indexer integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --features test-tree --test indexer_integration -- --nocapture
+	@$(RETRY_ON_RACE) cargo llvm-cov test --no-report --workspace --features test-tree --test indexer_integration -- --nocapture
 	@echo "Running operator lifecycle integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --features test-tree --test operator_lifecycle_integration -- --nocapture
 	@echo "Running withdrawal NULL-nonce quarantine tests with coverage instrumentation..."
@@ -239,9 +248,9 @@ integration-coverage-indexer:
 	@$(MAKE) -C ../private-channel-escrow-program build-no-clients
 	@echo "=== prod feature group ==="
 	@echo "Running reconciliation integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture
+	@$(RETRY_ON_RACE) cargo llvm-cov test --no-report --workspace --test reconciliation_integration -- --nocapture
 	@echo "Running gap detection integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
+	@$(RETRY_ON_RACE) cargo llvm-cov test --no-report --workspace --test gap_detection_integration -- --nocapture
 	@echo "Running backfill-only e2e tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test backfill_only_e2e -- --nocapture
 	@echo "Running truncate integration tests with coverage instrumentation..."
@@ -251,9 +260,9 @@ integration-coverage-indexer:
 	@echo "Running permanent delegate mint integration tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test permanent_delegate_mint_integration -- --nocapture
 	@echo "Running resync integration tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture --test-threads=1
+	@$(RETRY_ON_RACE) cargo llvm-cov test --no-report --workspace --test resync_integration -- --nocapture --test-threads=1
 	@echo "Running reconciliation e2e tests with coverage instrumentation..."
-	@cargo llvm-cov test --no-report --workspace --test reconciliation_e2e_test -- --nocapture
+	@$(RETRY_ON_RACE) cargo llvm-cov test --no-report --workspace --test reconciliation_e2e_test -- --nocapture
 	@echo "Running startup backfill/reconcile ordering tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test startup_backfill_reconcile -- --nocapture
 	@echo "Running mock-rpc retry tests with coverage instrumentation..."

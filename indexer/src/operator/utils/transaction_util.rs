@@ -5,13 +5,11 @@ use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::ExtraErrorCheckPolicy;
 use crate::operator::{sender::types::InstructionWithSigners, RpcClientWithRetry};
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
+use solana_commitment_config::CommitmentConfig;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_keychain::SolanaSigner;
-use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::InstructionError;
-use solana_sdk::{
-    commitment_config::CommitmentConfig, message::Message, signature::Signature,
-    transaction::Transaction,
-};
+use solana_sdk::{message::Message, signature::Signature, transaction::Transaction};
 use tracing::{debug, warn};
 
 pub const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
@@ -88,7 +86,7 @@ pub async fn build_and_sign(
 
     for signer in ix_with_signers.signers.iter() {
         signer
-            .sign_partial_transaction(&mut transaction)
+            .sign_transaction(&mut transaction)
             .await
             .map_err(TransactionError::Signer)?;
     }

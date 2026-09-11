@@ -1,4 +1,3 @@
-pub mod account_matches_owners;
 pub mod address_index_repair;
 pub mod address_index_watermark;
 pub mod bob;

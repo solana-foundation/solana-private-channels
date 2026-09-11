@@ -25,7 +25,7 @@ use {
     serde_json::{json, Value},
     solana_sdk::{
         hash::Hash,
-        instruction::CompiledInstruction,
+        message::compiled_instruction::CompiledInstruction,
         message::{Message, MessageHeader},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
@@ -100,7 +100,11 @@ fn tx_with_account_keys(total_keys: usize) -> Transaction {
     );
     let payer = Keypair::new();
     let recipient = Pubkey::new_unique();
-    let mut account_keys = vec![payer.pubkey(), recipient, solana_sdk::system_program::ID];
+    let mut account_keys = vec![
+        payer.pubkey(),
+        recipient,
+        solana_sdk_ids::system_program::ID,
+    ];
     while account_keys.len() < total_keys {
         account_keys.push(Pubkey::new_unique());
     }

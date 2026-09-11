@@ -11,7 +11,7 @@ use crate::{
     },
     storage::Storage,
 };
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -411,7 +411,7 @@ mod tests {
     use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
-    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
     use std::sync::Arc;
 

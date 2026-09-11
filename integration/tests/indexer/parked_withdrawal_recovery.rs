@@ -13,6 +13,7 @@
 //!
 //! Uses testcontainers for isolated Postgres instances.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
@@ -26,7 +27,7 @@ use {
         storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
-    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
     std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
 };
