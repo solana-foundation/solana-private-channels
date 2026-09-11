@@ -944,6 +944,132 @@ mod tests {
         drop(ingress_tx);
     }
 
+    /// Store `count` blocks the way an idle settler does: one height per block,
+    /// ten slots apart, each naming the slot before it. `store_block` writes the
+    /// durable counters alongside the row, so the tip stays consistent.
+    async fn store_chain(db: &mut AccountsDB, count: u64) -> Vec<BlockInfo> {
+        let mut stored = Vec::with_capacity(count as usize);
+        for height in 0..count {
+            let slot = height * 10;
+            let mut block = make_block_at(slot, Hash::new_unique(), &[], Some(0));
+            block.block_height = Some(height);
+            block.parent_slot = slot.saturating_sub(10);
+            db.store_block(block.clone()).await.unwrap();
+            stored.push(block);
+        }
+        stored
+    }
+
+    /// Drop one stored block row, which is what a lost or corrupted row looks like.
+    async fn delete_block(db: &AccountsDB, slot: u64) {
+        let AccountsDB::Postgres(pg) = db else {
+            panic!("the test database must be Postgres");
+        };
+        sqlx::query("DELETE FROM blocks WHERE slot = $1")
+            .bind(slot as i64)
+            .execute(pg.pool.as_ref())
+            .await
+            .unwrap();
+    }
+
+    /// A block missing from the middle is survivable by dropping everything at or
+    /// below it: those hashes leave the live set, so the transactions that named
+    /// them are refused as unknown before the cache is ever consulted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_restores_the_suffix_above_an_interior_block_gap() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let chain = store_chain(&mut db, 5).await;
+
+        delete_block(&db, 20).await;
+
+        let (live, _cache) = load_dedup_state(&db, 150)
+            .await
+            .expect("a gap below the tip must restore the suffix above it");
+
+        let restored: Vec<Hash> = live.into_iter().collect();
+        let expected: Vec<Hash> = chain[3..].iter().map(|b| b.blockhash).collect();
+        assert_eq!(
+            restored, expected,
+            "only the blocks above the hole must restore"
+        );
+        for dropped in &chain[..3] {
+            assert!(
+                !restored.contains(&dropped.blockhash),
+                "a blockhash at or below the hole must not be live: {}",
+                dropped.blockhash
+            );
+        }
+    }
+
+    /// The newest rows going missing is invisible to the row query, which returns
+    /// whatever exists. The durable counter is what proves the window reaches the
+    /// chain tip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_refuses_a_missing_newest_block() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        store_chain(&mut db, 5).await;
+
+        delete_block(&db, 40).await;
+
+        let error = load_dedup_state(&db, 150)
+            .await
+            .expect_err("a window short of the tip must not restore")
+            .to_string();
+        assert!(
+            error.contains("counter is 4"),
+            "the error must name the durable height the window falls short of, got {error:?}"
+        );
+    }
+
+    /// The counter is read raw, without the height reader's fallback to the
+    /// highest slot. That fallback would answer 40 here and wave the window
+    /// through by comparing a slot against a height.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_refuses_a_lost_height_counter() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        store_chain(&mut db, 5).await;
+
+        let AccountsDB::Postgres(pg) = &db else {
+            panic!("the test database must be Postgres");
+        };
+        sqlx::query("DELETE FROM metadata WHERE key = 'block_height'")
+            .execute(pg.pool.as_ref())
+            .await
+            .unwrap();
+
+        let error = load_dedup_state(&db, 150)
+            .await
+            .expect_err("a window with no durable height must not restore")
+            .to_string();
+        assert!(
+            error.contains("counter is missing"),
+            "the error must say the counter is gone, got {error:?}"
+        );
+    }
+
+    /// Truncation deletes oldest first and a young chain has never had more, so a
+    /// window shorter than the limit must still boot. A dropped block's
+    /// transactions can only name a blockhash that dropped with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_tolerates_a_truncated_prefix() {
+        let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let chain = store_chain(&mut db, 5).await;
+
+        delete_block(&db, 0).await;
+        delete_block(&db, 10).await;
+
+        let (live, _cache) = load_dedup_state(&db, 150)
+            .await
+            .expect("a truncated prefix is not a gap");
+
+        let restored: Vec<Hash> = live.into_iter().collect();
+        let expected: Vec<Hash> = chain[2..].iter().map(|b| b.blockhash).collect();
+        assert_eq!(
+            restored, expected,
+            "the surviving blocks must restore in height order"
+        );
+    }
+
     /// The window counts blocks, not slots. A slot range that wide holds far fewer
     /// blocks on a sparse chain, so restoring by slot range would drop hashes the
     /// node had just published a `lastValidBlockHeight` for.
@@ -952,20 +1078,15 @@ mod tests {
         let (mut db, _pg) = crate::test_helpers::start_test_postgres().await;
 
         // One block every ten slots, which is what an idle node produces.
-        let hashes: Vec<Hash> = (0..5).map(|_| Hash::new_unique()).collect();
-        for (index, hash) in hashes.iter().enumerate() {
-            db.store_block(make_block_at(index as u64 * 10, *hash, &[], Some(0)))
-                .await
-                .unwrap();
-        }
+        let chain = store_chain(&mut db, 5).await;
 
-        let (live, _cache) = load_dedup_state(&db, hashes.len()).await.unwrap();
+        let (live, _cache) = load_dedup_state(&db, chain.len()).await.unwrap();
 
         assert_eq!(
             live.len(),
-            hashes.len(),
+            chain.len(),
             "the last {} blocks must all be restored, whatever slots they occupy",
-            hashes.len()
+            chain.len()
         );
     }
 

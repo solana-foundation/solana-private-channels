@@ -2,7 +2,7 @@ use {
     super::{postgres::PostgresAccountsDB, traits::BlockInfo},
     crate::accounts::address_index_watermark::ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
     anyhow::{anyhow, Context, Result},
-    sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row},
+    sqlx::{Connection, Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row},
     std::{
         collections::HashSet,
         fs,
@@ -83,27 +83,21 @@ pub async fn truncate_slots(
     let pool = db.pool.clone();
 
     // The lock belongs to one session, so acquire and release have to run on the
-    // same connection. Taken from the pool, a statement lands on whichever
-    // connection is free, and unlocking from a different one is a silent no-op
-    // that strands the lock on the acquiring connection until it is recycled.
-    let mut lock_conn = pool
-        .acquire()
+    // same connection. Unlocking from a different one is a silent no-op that
+    // strands the lock until that connection is recycled.
+    //
+    // The session is opened outside the pool, not reserved from it: the work below
+    // needs the pool, and a one-connection pool is a legal setting. sqlx also does
+    // not reset a returned connection, so a stranded lock would never free.
+    let mut lock_conn = PgConnection::connect_with(&pool.connect_options())
         .await
-        .context("Failed to reserve a connection for the truncation lock")?;
+        .context("Failed to open the truncation lock session")?;
 
-    let acquired = match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+    let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .fetch_one(&mut *lock_conn)
+        .fetch_one(&mut lock_conn)
         .await
-    {
-        Ok(acquired) => acquired,
-        Err(e) => {
-            // The server may have taken the lock before the answer was lost, so this
-            // connection cannot be proven clean. Close it rather than pool it.
-            drop(lock_conn.detach());
-            return Err(anyhow!(e).context("Failed to acquire advisory lock"));
-        }
-    };
+        .context("Failed to acquire advisory lock")?;
     if !acquired {
         return Err(anyhow!(
             "Another truncation process is already running (advisory lock held)"
@@ -116,23 +110,18 @@ pub async fn truncate_slots(
     // hold the lock, which is the bug above and must not pass unnoticed.
     let released = match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .fetch_one(&mut *lock_conn)
+        .fetch_one(&mut lock_conn)
         .await
     {
         Ok(released) => released,
         Err(e) => {
-            // Returning a still-locked connection to the pool would strand the key and
-            // refuse every later truncation until that connection happened to be
-            // recycled. Closing the socket ends the session, and the lock with it.
-            drop(lock_conn.detach());
+            // Returning drops the session, and closing its socket frees the lock.
             if let Err(run_err) = result {
                 error!("Truncation failed before its lock could be released: {run_err:#}");
             }
             return Err(anyhow!(e).context("Failed to release advisory lock"));
         }
     };
-    // No detach here: the server has answered that this session does not hold the key,
-    // so the connection carries nothing and is safe to reuse.
     if !released {
         if let Err(run_err) = result {
             error!("Truncation failed, and its lock was not held by this session: {run_err:#}");
@@ -626,7 +615,6 @@ fn is_noop_archive_command(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Connection;
     use std::sync::Arc;
 
     #[test]
@@ -882,6 +870,33 @@ mod tests {
         );
     }
 
+    /// A one-connection pool is a legal setting, so the lock session must not come
+    /// out of the pool: taking it from there leaves nothing for the truncation
+    /// itself, which then waits out the acquire timeout and fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_runs_on_a_single_connection_pool() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        // A short timeout so a regression fails in seconds rather than the 30s default.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("single-connection pool connects");
+        let starved = PostgresAccountsDB {
+            pool: Arc::new(pool),
+            read_only: false,
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let report = truncate_slots(&starved, &apply_opts(5, 100, tmp.path()))
+            .await
+            .expect("truncation must not starve itself of connections");
+        assert_eq!(report.blocks_deleted, 15);
+    }
+
     /// A pool whose sessions resolve `pg_advisory_unlock` to a function that raises.
     ///
     /// The acquire still takes the real lock, so this reproduces the one case that
@@ -904,19 +919,15 @@ mod tests {
         }
         setup.close().await.expect("setup closes");
 
+        // Set at connect time rather than in a hook, so the lock session opened from the
+        // pool's options is shadowed too. pg_catalog is named second so the shadow wins.
+        let options = url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("test url parses")
+            .options([("search_path", "shadow,pg_catalog,public")]);
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(8)
-            .after_connect(|conn, _| {
-                Box::pin(async move {
-                    // pg_catalog is searched first unless it is named, so naming it second
-                    // is what lets the shadow win for unlock alone.
-                    sqlx::query("SET search_path = shadow, pg_catalog, public")
-                        .execute(conn)
-                        .await
-                        .map(|_| ())
-                })
-            })
-            .connect(url)
+            .connect_with(options)
             .await
             .expect("shadowed pool connects")
     }

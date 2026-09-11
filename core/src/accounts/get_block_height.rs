@@ -16,12 +16,16 @@ pub async fn get_block_height(db: &AccountsDB) -> Result<Option<u64>> {
     }
 }
 
-async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
-    let pool = db.pool.clone();
-
+/// The stored counter and nothing else: `None` means the key is absent or
+/// undecodable. Callers that must not accept a substitute for it read this, and
+/// it takes an executor so one can read it in the same snapshot as the blocks.
+pub(super) async fn read_block_height_counter<'e, E>(executor: E) -> Result<Option<u64>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let result = sqlx::query_scalar::<_, Vec<u8>>("SELECT value FROM metadata WHERE key = $1")
         .bind(BLOCK_HEIGHT_KEY)
-        .fetch_optional(pool.as_ref())
+        .fetch_optional(executor)
         .await;
 
     let stored = match result {
@@ -31,7 +35,13 @@ async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64
         Err(e) => return Err(anyhow::Error::from(e).context("Failed to query block height")),
     };
 
-    match stored.as_deref().and_then(super::counter::decode) {
+    Ok(stored.as_deref().and_then(super::counter::decode))
+}
+
+async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
+    let pool = db.pool.clone();
+
+    match read_block_height_counter(pool.as_ref()).await? {
         Some(height) => Ok(Some(height)),
         // A node upgrading in place has no counter yet. The last stored block
         // carries the height the old build assigned it, so continuing from there
@@ -43,6 +53,9 @@ async fn get_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64
 /// The upgrade fallback: the highest stored slot. Before the counters became
 /// independent every slot carried a block and the height was the slot, so this is
 /// the same answer without decoding a block payload on a hot read path.
+///
+/// The dedup restore refuses this substitute on purpose: it would answer for a
+/// counter deleted from a live ledger and wave a window through unproven.
 async fn last_block_height_postgres(db: &PostgresAccountsDB) -> Result<Option<u64>> {
     let pool = db.pool.clone();
 
