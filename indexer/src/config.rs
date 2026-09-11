@@ -195,6 +195,56 @@ impl PrivateChannelIndexerConfig {
     }
 }
 
+/// Refuse a fallback that is spelled the same as the node serving blocks: failing over to it
+/// re-fetches from the endpoint that just served the slot unusably, so it can never help
+/// while still making the deploy look like it has a failover.
+///
+/// Catches an identical endpoint only, ignoring a trailing slash. It cannot prove two
+/// endpoints are independent nodes: an alias, an IP for a hostname, or a load-balancer VIP
+/// all read as different here. Treat it as a guard against the obvious copy-paste, not as
+/// an independence check.
+///
+/// Which URLs serve blocks depends on the datasource. Live polling fetches from
+/// `common.rpc_url`, plus `backfill.rpc_url` when startup backfill is enabled.
+/// Yellowstone streams its blocks and reaches RPC only through `backfill.rpc_url`, which
+/// serves both its reconnect gap-fill and its startup backfill.
+pub fn validate_fallback_endpoint(
+    common: &PrivateChannelIndexerConfig,
+    indexer: &IndexerConfig,
+) -> Result<(), String> {
+    let Some(fallback) = normalized(&common.fallback_rpc_url) else {
+        return Ok(());
+    };
+    let fallback = fallback.trim_end_matches('/');
+
+    let mut sources = Vec::new();
+    match indexer.datasource_type {
+        DatasourceType::RpcPolling => {
+            sources.push(common.rpc_url.trim());
+            // Startup backfill is the only other block source here, and it is built
+            // only under `backfill.enabled`, so a disabled one fetches nothing.
+            if indexer.backfill.enabled {
+                sources.push(indexer.backfill.rpc_url.trim());
+            }
+        }
+        // The reconnect gap-fill is armed whatever `backfill.enabled` says, so this URL
+        // always serves blocks on this datasource.
+        DatasourceType::Yellowstone => sources.push(indexer.backfill.rpc_url.trim()),
+    }
+
+    if let Some(primary) = sources
+        .iter()
+        .find(|source| source.trim_end_matches('/') == fallback)
+    {
+        return Err(format!(
+            "fallback_rpc_url must differ from the block source ({primary}): failing over to the \
+             same node re-fetches from the endpoint that just failed"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Configuration for startup reconciliation against on-chain state.
 ///
 /// Only applies when `program_type = escrow`. Skipped for `withdraw` indexers.
@@ -418,6 +468,105 @@ mod tests {
             },
             reconciliation: ReconciliationConfig::default(),
         }
+    }
+
+    // ============================================================================
+    // Fallback endpoint validation
+    // ============================================================================
+
+    /// A fallback pointed at the polling datasource's own block source cannot help, so the
+    /// config is refused rather than starting with a failover that is a no-op.
+    #[test]
+    fn fallback_equal_to_the_polling_block_source_is_refused() {
+        let mut common = create_common_config();
+        common.fallback_rpc_url = Some(common.rpc_url.clone());
+        let indexer = create_indexer_config();
+
+        let err = validate_fallback_endpoint(&common, &indexer).unwrap_err();
+
+        assert!(
+            err.contains("must differ from the block source"),
+            "unexpected error: {err}"
+        );
+
+        // The same endpoint with a trailing slash is the same endpoint.
+        common.fallback_rpc_url = Some(format!("{}/", common.rpc_url));
+        assert!(
+            validate_fallback_endpoint(&common, &indexer).is_err(),
+            "a trailing slash must not smuggle the block source past the check"
+        );
+    }
+
+    /// Yellowstone streams its blocks and reaches RPC only through the gap-fill, so the
+    /// URL its fallback must differ from is `backfill.rpc_url`, not `common.rpc_url`.
+    /// Comparing against the wrong one would let this config through.
+    #[test]
+    fn fallback_equal_to_the_gap_fill_block_source_is_refused() {
+        let mut common = create_common_config();
+        common.rpc_url = "http://primary-is-unused-here:8899".to_string();
+        let mut indexer = create_indexer_config();
+        indexer.datasource_type = DatasourceType::Yellowstone;
+        common.fallback_rpc_url = Some(indexer.backfill.rpc_url.clone());
+
+        let err = validate_fallback_endpoint(&common, &indexer).unwrap_err();
+
+        assert!(
+            err.contains(&indexer.backfill.rpc_url),
+            "the error must name the gap-fill block source: {err}"
+        );
+
+        // The gap-fill is armed regardless of `backfill.enabled`, so unlike the polling
+        // path this URL still serves blocks with backfill switched off.
+        indexer.backfill.enabled = false;
+        assert!(
+            validate_fallback_endpoint(&common, &indexer).is_err(),
+            "the gap-fill fetches blocks whether or not startup backfill is enabled"
+        );
+    }
+
+    /// An enabled startup backfill is a second block source under polling, so a fallback
+    /// pointed at it re-fetches from the endpoint that just served the slot unusably, which
+    /// is the boot loop this check exists to prevent, with a failover in the config making it
+    /// look handled. Disabled, that URL fetches nothing (the service is only built under
+    /// `backfill.enabled`), so the same config is a working failover and must be accepted.
+    #[test]
+    fn fallback_equal_to_the_startup_fill_source_is_refused_only_when_backfill_runs() {
+        let startup_fill_url = "http://backfill-node:8899";
+        let mut common = create_common_config();
+        common.fallback_rpc_url = Some(startup_fill_url.to_string());
+        let mut indexer = create_indexer_config();
+        indexer.backfill.rpc_url = startup_fill_url.to_string();
+
+        let err = validate_fallback_endpoint(&common, &indexer).unwrap_err();
+
+        assert!(
+            err.contains(startup_fill_url),
+            "the error must name the startup fill's block source: {err}"
+        );
+
+        indexer.backfill.enabled = false;
+        assert!(
+            validate_fallback_endpoint(&common, &indexer).is_ok(),
+            "a disabled backfill's rpc_url serves no blocks, so it must not block startup"
+        );
+    }
+
+    /// An independent endpoint is the whole point, and an unset or blank fallback is a
+    /// supported deploy, so neither may be refused.
+    #[test]
+    fn independent_or_absent_fallback_is_accepted() {
+        let indexer = create_indexer_config();
+
+        let mut independent = create_common_config();
+        independent.fallback_rpc_url = Some("http://archival:8899".to_string());
+        assert!(validate_fallback_endpoint(&independent, &indexer).is_ok());
+
+        let absent = create_common_config();
+        assert!(validate_fallback_endpoint(&absent, &indexer).is_ok());
+
+        let mut blank = create_common_config();
+        blank.fallback_rpc_url = Some("   ".to_string());
+        assert!(validate_fallback_endpoint(&blank, &indexer).is_ok());
     }
 
     // ============================================================================

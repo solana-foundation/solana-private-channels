@@ -7,7 +7,10 @@ use crate::{
         checkpoint::{get_last_checkpoint, program_key, start_floor, BACKFILL_START_SETTING},
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
-            rpc_polling::{decoder, rpc::RpcPoller, rpc::MAX_LOOKAHEAD_SLOTS, types::BlockFetch},
+            rpc_polling::{
+                decoder, decoder::SlotRejection, refetch_slot_via_fallback, rpc::RpcPoller,
+                rpc::MAX_LOOKAHEAD_SLOTS, types::BlockFetch,
+            },
         },
     },
     storage::Storage,
@@ -141,11 +144,33 @@ async fn fetch_blocks_with_retry(
     Ok(fetched)
 }
 
+/// The backfill error a rejected slot surfaces as, so the caller can tell an incomplete
+/// block apart from an undecodable instruction without re-inspecting the block.
+fn rejected_slot_error(slot: u64, rejection: SlotRejection) -> IndexerError {
+    match rejection {
+        SlotRejection::MissingMeta { signature } => {
+            BackfillError::MissingMeta { slot, signature }.into()
+        }
+        SlotRejection::Undecodable(failure) => BackfillError::InstructionUndecodable {
+            slot,
+            signature: failure.signature,
+            instruction_index: failure.instruction_index,
+            inner_index: failure.inner_index,
+            reason: failure.source.to_string(),
+        }
+        .into(),
+    }
+}
+
 /// Fill a range of slots by fetching blocks via RPC and sending parsed instructions.
 /// Shared by startup backfill and reconnect gap-fill.
+/// `fallback_poller` re-fetches a slot the primary served in an unusable state; `None`
+/// disables that failover.
 /// Returns the number of processed slots.
+#[allow(clippy::too_many_arguments)]
 pub async fn fill_slot_range(
     rpc_poller: &RpcPoller,
+    fallback_poller: Option<&RpcPoller>,
     from_slot: u64,
     to_slot: u64,
     batch_size: usize,
@@ -189,25 +214,56 @@ pub async fn fill_slot_range(
         for (slot, block_fetch) in blocks {
             match block_fetch {
                 BlockFetch::Present(block) => {
-                    // A missing-meta block is unverifiable: abort before the SlotComplete send so the
-                    // checkpoint never advances past it; the caller surfaces the error and retries.
-                    if let Some(signature) = decoder::first_missing_meta(&block) {
-                        error!(
-                            "Backfill slot {} has transaction {} missing meta; aborting before checkpoint",
-                            slot, signature
-                        );
-                        metrics::INDEXER_RPC_ERRORS
-                            .with_label_values(&[program_type.as_label(), "missing_meta"])
-                            .inc();
-                        return Err(BackfillError::MissingMeta { slot, signature }.into());
-                    }
-
-                    let instructions_with_meta = decoder::parse_block(
+                    // A block with incomplete meta, or holding a supported instruction that
+                    // will not decode, leaves the slot's contents unknown. Try one fallback
+                    // re-fetch, then abort before the SlotComplete send so the checkpoint
+                    // never advances past it. Re-parsing the primary's bytes fails the same
+                    // way, so only a fuller endpoint or a code fix clears it.
+                    let instructions_with_meta = match decoder::decode_slot(
                         &block,
                         slot,
                         program_type,
                         escrow_instance_id.as_ref(),
-                    );
+                    ) {
+                        Ok(instructions) => instructions,
+                        Err(rejection) => {
+                            let recovered = match fallback_poller {
+                                Some(fallback) => {
+                                    refetch_slot_via_fallback(
+                                        fallback,
+                                        slot,
+                                        &block.blockhash,
+                                        program_type,
+                                        escrow_instance_id.as_ref(),
+                                    )
+                                    .await
+                                }
+                                None => None,
+                            };
+                            match recovered {
+                                Some(instructions) => {
+                                    info!(
+                                        "Backfill slot {} recovered from fallback RPC after primary returned {}",
+                                        slot, rejection
+                                    );
+                                    instructions
+                                }
+                                None => {
+                                    error!(
+                                        "Backfill slot {} {}; aborting before checkpoint",
+                                        slot, rejection
+                                    );
+                                    metrics::INDEXER_RPC_ERRORS
+                                        .with_label_values(&[
+                                            program_type.as_label(),
+                                            rejection.metric_label(),
+                                        ])
+                                        .inc();
+                                    return Err(rejected_slot_error(slot, rejection));
+                                }
+                            }
+                        }
+                    };
 
                     for instruction_meta in instructions_with_meta {
                         send_guaranteed(
@@ -371,6 +427,10 @@ pub struct StartupRange {
 pub struct BackfillService {
     storage: Arc<Storage>,
     rpc_poller: Arc<RpcPoller>,
+    /// Re-fetches a slot the primary served in an unusable state. Startup backfill runs
+    /// unattended on every process start and its failure exits the process, so without this
+    /// a slot the live poller would heal in one round-trip becomes a boot loop.
+    fallback_poller: Option<Arc<RpcPoller>>,
     program_type: ProgramType,
     config: BackfillConfig,
     escrow_instance_id: Option<Pubkey>,
@@ -387,10 +447,17 @@ impl BackfillService {
         Self {
             storage,
             rpc_poller,
+            fallback_poller: None,
             program_type,
             config,
             escrow_instance_id,
         }
+    }
+
+    /// Arms the archival re-fetch for slots the primary serves in an unusable state.
+    pub fn with_fallback_poller(mut self, fallback_poller: Option<Arc<RpcPoller>>) -> Self {
+        self.fallback_poller = fallback_poller;
+        self
     }
 
     /// Work out which slots backfill needs to fill: `Some((from_slot, target))`, or
@@ -486,6 +553,7 @@ impl BackfillService {
     ) -> Result<(), IndexerError> {
         fill_slot_range(
             &self.rpc_poller,
+            self.fallback_poller.as_deref(),
             from_slot,
             to_slot,
             self.config.batch_size,
@@ -869,7 +937,9 @@ mod tests {
     #[cfg(feature = "datasource-rpc")]
     mod fill_slot_range_tests {
         use super::*;
+        use crate::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
+        use crate::test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes};
         use crate::test_utils::rpc_mocks::{
             chain, mock_get_block_at, mock_get_blocks, mock_get_blocks_with_limit,
         };
@@ -937,6 +1007,205 @@ mod tests {
                 .create()
         }
 
+        /// getBlock returns a complete block holding an escrow Deposit with no borsh body:
+        /// a discriminator the indexer supports that cannot be decoded. Deposit's borsh
+        /// deserialize runs before its account and event checks, so a one-byte payload is
+        /// enough. The block and its meta are well-formed, so only the parser catches it.
+        fn mock_get_block_undecodable_deposit(server: &mut Server, slot: u64) -> mockito::Mock {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash11111111111111111111111111111",
+                            "parentSlot": slot - 1,
+                            "transactions": [{
+                                "transaction": {
+                                    "signatures": ["sig_undecodable"],
+                                    "message": {
+                                        "accountKeys": [PRIVATE_CHANNEL_ESCROW_PROGRAM_ID],
+                                        "instructions": [{
+                                            "programIdIndex": 0,
+                                            "accounts": [],
+                                            "data": bs58::encode([6u8]).into_string()
+                                        }]
+                                    }
+                                },
+                                "meta": {
+                                    "err": null,
+                                    "logMessages": null,
+                                    "innerInstructions": null,
+                                    "loadedAddresses": null
+                                }
+                            }]
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        /// getBlock returns a complete block holding a decodable escrow Deposit: the 12
+        /// accounts it needs plus the DepositEvent self-CPI it reads its amount from. Carries
+        /// the same blockhash as the undecodable mock above, which is what a fallback serving
+        /// the same block with fuller metadata looks like.
+        fn mock_get_block_decodable_deposit(server: &mut Server, slot: u64) -> mockito::Mock {
+            let mut account_keys = vec![PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string()];
+            for seed in 1u8..12 {
+                account_keys.push(crate::test_utils::pubkey::test_pubkey(seed).to_string());
+            }
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [slot]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash11111111111111111111111111111",
+                            "parentSlot": slot - 1,
+                            "transactions": [{
+                                "transaction": {
+                                    "signatures": ["sig_decodable"],
+                                    "message": {
+                                        "accountKeys": account_keys,
+                                        "instructions": [{
+                                            "programIdIndex": 0,
+                                            "accounts": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                                            "data": bs58::encode(deposit_ix_bytes(1000, None)).into_string()
+                                        }]
+                                    }
+                                },
+                                "meta": {
+                                    "err": null,
+                                    "logMessages": null,
+                                    "loadedAddresses": null,
+                                    "innerInstructions": [{
+                                        "index": 0,
+                                        "instructions": [{
+                                            "programIdIndex": 0,
+                                            "accounts": [],
+                                            "data": bs58::encode(deposit_event_bytes(555)).into_string()
+                                        }]
+                                    }]
+                                }
+                            }]
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create()
+        }
+
+        /// The primary serves a slot undecodably and the fallback serves the same block
+        /// decodably, so the fill clears the slot instead of aborting. The reconnect gap-fill
+        /// runs through here, and it is the one unattended path that carries a fallback.
+        #[tokio::test]
+        async fn fill_slot_range_undecodable_instruction_recovers_from_fallback() {
+            let mut primary = Server::new_async().await;
+            let mut fallback = Server::new_async().await;
+
+            // Batch over (100, 102] = [101, 102]; slot 101 will not decode on the primary.
+            let _blocks = mock_get_blocks(&mut primary, 101, 102, &[101, 102]);
+            let _m1 = mock_get_block_undecodable_deposit(&mut primary, 101);
+            let _m2 = mock_get_block_at(&mut primary, 102, 101);
+            let m_fallback = mock_get_block_decodable_deposit(&mut fallback, 101);
+
+            let primary_poller = poller(&primary);
+            let fallback_poller = poller(&fallback);
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result = fill_slot_range(
+                &primary_poller,
+                Some(&fallback_poller),
+                100,
+                102,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "the fallback must clear the slot, got {result:?}"
+            );
+            m_fallback.assert();
+
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let completed: Vec<u64> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    ProcessorMessage::SlotComplete { slot, .. } => Some(*slot),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                completed,
+                vec![101, 102],
+                "both slots must complete once the fallback clears 101"
+            );
+            let indexed = messages
+                .iter()
+                .filter(|message| matches!(message, ProcessorMessage::Instruction(_)))
+                .count();
+            assert_eq!(indexed, 1, "the fallback block's Deposit must be indexed");
+        }
+
+        /// A batch where slot N holds an instruction the indexer supports but cannot decode
+        /// must abort before SlotComplete{N} (and before any SlotComplete after N), so the
+        /// checkpoint never advances past a slot whose contents were never read. Retrying
+        /// the same endpoint re-parses the same bytes, so only fuller meta clears it.
+        #[tokio::test]
+        async fn fill_slot_range_undecodable_instruction_aborts_before_slot_complete() {
+            let mut server = Server::new_async().await;
+
+            // Batch over (100, 102] = [101, 102]; slot 101 will not decode.
+            let _blocks = mock_get_blocks(&mut server, 101, 102, &[101, 102]);
+            let _m1 = mock_get_block_undecodable_deposit(&mut server, 101);
+            let _m2 = mock_get_block_at(&mut server, 102, 101);
+
+            let poller = poller(&server);
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+
+            let err = result.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("will not decode"),
+                "unexpected error: {message}"
+            );
+            assert!(
+                message.contains("101"),
+                "error should name the slot: {message}"
+            );
+
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let advanced = messages.iter().any(
+                |message| matches!(message, ProcessorMessage::SlotComplete { slot, .. } if *slot >= 101),
+            );
+            assert!(
+                !advanced,
+                "no SlotComplete must be sent for slot 101 or beyond on an undecodable instruction"
+            );
+        }
+
         #[tokio::test]
         async fn fill_slot_range_empty_blocks() {
             let mut server = Server::new_async().await;
@@ -947,7 +1216,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 103, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 103, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 3);
             drop(tx);
@@ -987,7 +1256,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 2);
             drop(tx);
@@ -1021,7 +1290,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let err = result.unwrap_err();
             let msg = err.to_string();
@@ -1050,7 +1319,7 @@ mod tests {
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 101, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 101, 10, ProgramType::Escrow, None, &tx).await;
 
             assert!(result.is_err());
         }
@@ -1076,7 +1345,7 @@ mod tests {
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             assert!(result.is_err());
             // Every attempt was made, not just the first.
@@ -1096,7 +1365,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let msg = result.unwrap_err().to_string();
             assert!(msg.contains("unwitnessed"), "unexpected error: {msg}");
@@ -1126,7 +1395,7 @@ mod tests {
 
             let (tx, mut rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 102, 10, ProgramType::Escrow, None, &tx).await;
 
             let err = result.unwrap_err();
             let msg = err.to_string();
@@ -1153,7 +1422,7 @@ mod tests {
 
             let (tx, _rx) = mpsc::channel(64);
             let result =
-                fill_slot_range(&poller, 100, 100, 10, ProgramType::Escrow, None, &tx).await;
+                fill_slot_range(&poller, None, 100, 100, 10, ProgramType::Escrow, None, &tx).await;
 
             assert_eq!(result.unwrap(), 0);
             untouched.assert();

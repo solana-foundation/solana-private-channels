@@ -1,5 +1,5 @@
 use super::rpc::RpcPoller;
-use super::types::{BlockFetch, RpcBlock};
+use super::types::BlockFetch;
 use crate::channel_utils::send_guaranteed;
 use crate::config::ProgramType;
 use crate::error::{DataSourceError, DataSourceRpcError};
@@ -13,7 +13,7 @@ use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct RpcPollingSource {
     rpc_url: String,
@@ -68,27 +68,42 @@ impl RpcPollingSource {
     }
 }
 
-/// Re-fetches `slot` once from the fallback RPC, returning the block only if it now
-/// passes the missing-meta guard AND its blockhash matches `expected_blockhash` (the
+/// Re-fetches `slot` once from the fallback RPC, returning its decoded instructions only
+/// if the block now decodes in full AND its blockhash matches `expected_blockhash` (the
 /// primary's). The blockhash check prevents a misconfigured (wrong-cluster, pruned) or
 /// compromised fallback from substituting a divergent-fork or fabricated block for the
-/// same slot number. Any error, absent slot, hash mismatch, or still-missing meta yields None.
+/// same slot number. It does not stand in the way of a legitimate recovery: a blockhash
+/// covers the block's contents, not how much metadata an endpoint chose to serialize, so a
+/// fuller copy of the same block still matches. Any error, absent slot, hash mismatch, or
+/// repeated rejection yields None.
+/// Decoding (not just the meta guard) is what qualifies the block, so a fallback serving
+/// the same undecodable instruction is rejected here rather than accepted and failed later.
 /// Uses the single-block entry point, not the batch classifier: one arbitrary slot has
 /// no anchor to prove absence from, and this caller only ever wanted contents or nothing.
-async fn refetch_missing_meta_via_fallback(
+pub(crate) async fn refetch_slot_via_fallback(
     fallback: &RpcPoller,
     slot: u64,
     expected_blockhash: &str,
-) -> Option<RpcBlock> {
-    match fallback.get_block_present(slot).await {
-        Ok(Some(block))
-            if block.blockhash == expected_blockhash
-                && decoder::first_missing_meta(&block).is_none() =>
-        {
-            Some(block)
+    program_type: ProgramType,
+    escrow_instance_id: Option<&solana_sdk::pubkey::Pubkey>,
+) -> Option<Vec<InstructionWithMetadata>> {
+    let block = match fallback.get_block_present(slot).await {
+        Ok(Some(block)) if block.blockhash == expected_blockhash => block,
+        // A different hash for the same slot means the fallback is on another cluster or a
+        // divergent fork, so it can never substitute. Said out loud because the rejection
+        // is otherwise invisible: a misconfigured fallback looks exactly like a correctly
+        // configured one that happens never to help.
+        Ok(Some(block)) => {
+            warn!(
+                "Fallback RPC served slot {} as blockhash {} but the primary served {}; rejecting it (wrong cluster or divergent fork)",
+                slot, block.blockhash, expected_blockhash
+            );
+            return None;
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+
+    decoder::decode_slot(&block, slot, program_type, escrow_instance_id).ok()
 }
 
 #[async_trait]
@@ -104,13 +119,22 @@ impl DataSource for RpcPollingSource {
             self.commitment,
         ));
 
-        // Built once, used only on the rare missing-meta path. Empty means unset
-        // (env renders unconfigured as ""), so no poller is aimed at "".
+        // Built once, used only when a slot arrives unusable. Blank means unset (env renders
+        // an unconfigured var as ""), and the value is trimmed rather than merely tested, so
+        // a whitespace-only setting reads as absent everywhere instead of aiming a poller at
+        // "   " and spending one doomed request per rejected slot.
         let fallback_poller = self
             .fallback_rpc_url
-            .clone()
+            .as_deref()
+            .map(str::trim)
             .filter(|url| !url.is_empty())
-            .map(|url| Arc::new(RpcPoller::new(url, self.encoding, self.commitment)));
+            .map(|url| {
+                Arc::new(RpcPoller::new(
+                    url.to_string(),
+                    self.encoding,
+                    self.commitment,
+                ))
+            });
 
         // Current slot is either the from slot or the latest slot
         let mut current_slot = if let Some(slot) = self.from_slot {
@@ -177,39 +201,49 @@ impl DataSource for RpcPollingSource {
                 for (slot, block_result) in blocks {
                     match block_result {
                         Ok(BlockFetch::Present(block)) => {
-                            // A missing-meta block is unverifiable: try one fallback re-fetch, and if that
-                            // is unavailable or also incomplete, fail closed (no SlotComplete, no advance).
-                            let block = match decoder::first_missing_meta(&block) {
-                                None => block,
-                                Some(signature) => {
+                            // A block with incomplete meta, or holding a supported instruction
+                            // that will not decode, leaves the slot's contents unknown. Try
+                            // one fallback re-fetch; if that is unconfigured, unavailable or
+                            // also rejected, fail closed like an unavailable block: no
+                            // SlotComplete, no advance, re-fetch on the next poll.
+                            let instructions_with_meta = match decoder::decode_slot(
+                                &block,
+                                slot,
+                                program_type,
+                                escrow_instance_id.as_ref(),
+                            ) {
+                                Ok(instructions) => instructions,
+                                Err(rejection) => {
                                     let recovered = match &fallback_poller {
-                                        Some(fb) => {
-                                            refetch_missing_meta_via_fallback(
-                                                fb,
+                                        Some(fallback) => {
+                                            refetch_slot_via_fallback(
+                                                fallback,
                                                 slot,
                                                 &block.blockhash,
+                                                program_type,
+                                                escrow_instance_id.as_ref(),
                                             )
                                             .await
                                         }
                                         None => None,
                                     };
                                     match recovered {
-                                        Some(clean) => {
+                                        Some(instructions) => {
                                             info!(
-                                                "Slot {} recovered from fallback RPC after primary returned transaction {} missing meta",
-                                                slot, signature
+                                                "Slot {} recovered from fallback RPC after primary returned {}",
+                                                slot, rejection
                                             );
-                                            clean
+                                            instructions
                                         }
                                         None => {
                                             error!(
-                                                "Slot {} has transaction {} missing meta; refusing to checkpoint past an incomplete block",
-                                                slot, signature
+                                                "Slot {} {}; refusing to checkpoint past unknown contents",
+                                                slot, rejection
                                             );
                                             metrics::INDEXER_RPC_ERRORS
                                                 .with_label_values(&[
                                                     program_type.as_label(),
-                                                    "missing_meta",
+                                                    rejection.metric_label(),
                                                 ])
                                                 .inc();
                                             tokio::time::sleep(Duration::from_millis(
@@ -221,14 +255,6 @@ impl DataSource for RpcPollingSource {
                                     }
                                 }
                             };
-
-                            // Parse program-specific instructions from block with metadata
-                            let instructions_with_meta = decoder::parse_block(
-                                &block,
-                                slot,
-                                program_type,
-                                escrow_instance_id.as_ref(),
-                            );
 
                             if !instructions_with_meta.is_empty() {
                                 info!(

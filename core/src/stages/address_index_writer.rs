@@ -10,7 +10,10 @@ use {
     },
     sqlx::{postgres::PgPoolOptions, PgPool},
     std::{sync::Arc, time::Duration},
-    tokio::{sync::mpsc, time::Instant},
+    tokio::{
+        sync::{mpsc, OwnedSemaphorePermit},
+        time::Instant,
+    },
     tracing::{debug, error, info, warn},
 };
 
@@ -25,8 +28,20 @@ const WRITER_POOL_SIZE: u32 = 2;
 /// than tearing the node down on a transient blip.
 const FLUSH_RETRY_BACKOFF_MS: [u64; 4] = [250, 1000, 3000, 5000];
 
+/// Cap on rows queued to this writer but not yet folded into a flush. About
+/// 100 MB of rows, and at high load roughly the writer's own retry budget, so a
+/// writer further behind than this is one the node is about to exit on anyway.
+pub(crate) const MAX_QUEUED_ADDRESS_ROWS: usize = 512_000;
+
+/// One block's address-index rows, carrying the queue budget they occupy.
+pub struct AddressSignatureBatch {
+    pub rows: Vec<AddressSignatureRow>,
+    /// Returns the rows' share of the budget to the settler when dropped.
+    pub permit: OwnedSemaphorePermit,
+}
+
 pub struct AddressIndexWriterArgs {
-    pub rows_rx: mpsc::Receiver<Vec<AddressSignatureRow>>,
+    pub rows_rx: mpsc::Receiver<AddressSignatureBatch>,
     pub accountsdb_connection_url: String,
     pub flush_chunk_size: usize,
     pub metrics: SharedMetrics,
@@ -63,7 +78,7 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
         };
 
         // Buffer accumulates whatever recv_many delivers per tick.
-        let mut buf: Vec<Vec<AddressSignatureRow>> = Vec::with_capacity(64);
+        let mut buf: Vec<AddressSignatureBatch> = Vec::with_capacity(64);
         let mut flat: Vec<AddressSignatureRow> = Vec::with_capacity(flush_chunk_size * 2);
 
         loop {
@@ -83,8 +98,11 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
             let depth = rows_rx.max_capacity().saturating_sub(rows_rx.capacity());
             metrics.address_signatures_queue_depth(depth);
 
-            for batch in buf.drain(..) {
-                flat.extend(batch);
+            for AddressSignatureBatch { rows, permit } in buf.drain(..) {
+                flat.extend(rows);
+                // The rows are ours now, so hand their budget back before the
+                // flush rather than holding the settler off across a COMMIT.
+                drop(permit);
                 // Flush in chunk-sized COMMITs so a single tick worth
                 // of work never produces an oversized transaction.
                 while flat.len() >= flush_chunk_size {
@@ -109,7 +127,7 @@ pub async fn start_address_index_writer(args: AddressIndexWriterArgs) -> WorkerH
 
         // Drain anything still buffered after shutdown / channel close.
         while let Ok(batch) = rows_rx.try_recv() {
-            flat.extend(batch);
+            flat.extend(batch.rows);
         }
         if !flat.is_empty() {
             if let Err(e) = flush_and_record(&pool, &flat, &[], &metrics, &heartbeat).await {
@@ -227,6 +245,15 @@ mod tests {
     };
     use std::time::Duration;
 
+    /// Wrap rows in the queued message shape, with a permit from a throwaway
+    /// budget so tests that are not about the budget do not have to build one.
+    fn rows_msg(rows: Vec<AddressSignatureRow>) -> AddressSignatureBatch {
+        AddressSignatureBatch {
+            rows,
+            permit: crate::stages::test_permit(),
+        }
+    }
+
     fn make_row(addr_byte: u8, slot: i64, sig_byte: u8) -> AddressSignatureRow {
         AddressSignatureRow {
             address: vec![addr_byte; 32],
@@ -273,9 +300,13 @@ mod tests {
         .await;
 
         for slot in 0..5i64 {
-            tx.send(vec![make_row(slot as u8 + 1, slot, slot as u8 + 1)])
-                .await
-                .unwrap();
+            tx.send(rows_msg(vec![make_row(
+                slot as u8 + 1,
+                slot,
+                slot as u8 + 1,
+            )]))
+            .await
+            .unwrap();
         }
         // Closing the sender should let the writer exit on its own.
         drop(tx);
@@ -313,7 +344,7 @@ mod tests {
                 signature: (i as u32).to_le_bytes().repeat(16),
             })
             .collect();
-        tx.send(big).await.unwrap();
+        tx.send(rows_msg(big)).await.unwrap();
         drop(tx);
 
         let join = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
@@ -374,12 +405,12 @@ mod tests {
         })
         .await;
 
-        tx.send(vec![make_row(1, 0, 1)]).await.unwrap();
+        tx.send(rows_msg(vec![make_row(1, 0, 1)])).await.unwrap();
 
         let join = tokio::time::timeout(Duration::from_secs(15), handle.handle).await;
         assert!(join.is_ok(), "writer should exit after retries exhaust");
 
-        let send_after = tx.send(vec![make_row(2, 1, 2)]).await;
+        let send_after = tx.send(rows_msg(vec![make_row(2, 1, 2)])).await;
         assert!(send_after.is_err(), "writer receiver should be closed");
     }
 
@@ -401,9 +432,13 @@ mod tests {
         // Queue several batches, then close: the writer is the last stage in the
         // drain, so it must land all of them rather than a racy subset.
         for slot in 0..10i64 {
-            tx.send(vec![make_row(slot as u8 + 10, slot, slot as u8 + 10)])
-                .await
-                .unwrap();
+            tx.send(rows_msg(vec![make_row(
+                slot as u8 + 10,
+                slot,
+                slot as u8 + 10,
+            )]))
+            .await
+            .unwrap();
         }
         drop(tx);
 
@@ -412,6 +447,53 @@ mod tests {
 
         let n = count_rows(&url).await;
         assert_eq!(n, 10, "every queued row must be flushed before exit");
+    }
+
+    /// The writer holds a batch against the settler's row budget only until it
+    /// folds it into the flush buffer, so a flush never blocks the settler on
+    /// rows the writer has already taken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writer_returns_row_permits_as_it_folds_batches() {
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+
+        let budget = crate::stages::WeightBudget::new(10);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = start_address_index_writer(AddressIndexWriterArgs {
+            rows_rx: rx,
+            accountsdb_connection_url: url.clone(),
+            flush_chunk_size: 100,
+            metrics: Arc::new(NoopMetrics),
+            heartbeat: StageHeartbeat::new(),
+        })
+        .await;
+
+        for slot in 0..3i64 {
+            let rows: Vec<AddressSignatureRow> = (0..3)
+                .map(|i| {
+                    let byte = (slot * 3 + i + 1) as u8;
+                    make_row(byte, slot, byte)
+                })
+                .collect();
+            let permit = budget
+                .acquire(rows.len(), &tx)
+                .await
+                .expect("the budget has room for three rows");
+            tx.send(AddressSignatureBatch { rows, permit })
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        let join = tokio::time::timeout(Duration::from_secs(10), handle.handle).await;
+        assert!(join.is_ok(), "writer should exit after channel close");
+
+        assert_eq!(count_rows(&url).await, 9, "every row must land");
+        assert_eq!(
+            budget.available(),
+            10,
+            "every folded batch returned its rows"
+        );
     }
 
     /// Watermark = max flushed slot when buffer drains.
@@ -431,10 +513,10 @@ mod tests {
         .await;
 
         for slot in 10i64..=12 {
-            tx.send(vec![
+            tx.send(rows_msg(vec![
                 make_row(slot as u8, slot, slot as u8),
                 make_row((slot + 100) as u8, slot, (slot + 1) as u8),
-            ])
+            ]))
             .await
             .unwrap();
         }

@@ -215,7 +215,7 @@ fn make_source(ys_url: String, rpc: &MockitoServer, storage: Arc<Storage>) -> Ye
         ProgramType::Escrow,
         None,
     )
-    .with_gap_detection(poller(rpc), 1_000, 16)
+    .with_gap_detection(poller(rpc), None, 1_000, 16)
     .with_storage(storage)
     // What `run` passes: startup accounted for everything up to the seeded anchor.
     .with_startup_floor(CHECKPOINT)
