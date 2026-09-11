@@ -8,13 +8,13 @@ Stateful fuzz tests for the escrow program using [Trident](https://github.com/Ac
 
 Tests the core escrow lifecycle in a single bitmap generation.
 
-| Flow                | Description                                                                                                              |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `fuzz_deposit`      | Deposits a random amount. Asserts exact ATA balance movement, or rejection when the deposit gate is closed.               |
-| `fuzz_release`      | 50% valid bitmap / 50% foreign bitmap. Asserts success/failure and balance invariants, including the withdrawal gate.     |
-| `fuzz_double_spend` | Replays a previously successful release verbatim — must always be rejected.                                              |
-| `fuzz_set_gates`    | `BlockMint` with a random combination of both flags. Must always succeed and must never move escrowed tokens.             |
-| `fuzz_re_allow`     | `AllowMint` on the existing PDA — the re-allow path. Re-opens both gates; escrowed balances must survive untouched.       |
+| Flow                | Description                                                                                                           |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `fuzz_deposit`      | Deposits a random amount. Asserts exact ATA balance movement, or rejection when the deposit gate is closed.           |
+| `fuzz_release`      | 50% valid bitmap / 50% foreign bitmap. Asserts success/failure and balance invariants, including the withdrawal gate. |
+| `fuzz_double_spend` | Replays a previously successful release verbatim — must always be rejected.                                           |
+| `fuzz_set_gates`    | `BlockMint` with a random combination of both flags. Must always succeed and must never move escrowed tokens.         |
+| `fuzz_re_allow`     | `AllowMint` on the existing PDA — the re-allow path. Re-opens both gates; escrowed balances must survive untouched.   |
 
 **Final invariant:** `escrow_balance == total_deposited - total_released`
 
