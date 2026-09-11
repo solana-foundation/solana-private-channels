@@ -36,7 +36,7 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_timings::ExecuteTimings,
     std::{
-        collections::{HashSet, LinkedList},
+        collections::{HashMap, HashSet, LinkedList},
         sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
@@ -76,6 +76,10 @@ pub struct ExecutionDeps {
     pub max_svm_workers: usize,
     /// Shared live-blockhash window
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    /// Account bytes one transaction may reference before it is refused.
+    pub max_tx_loaded_accounts_bytes: usize,
+    /// Account bytes one preload may pull in before the batch is split.
+    pub preload_budget_bytes: usize,
 
     // Must prevent this from being dropped
     _fork_graph: Arc<RwLock<PrivateChannelForkGraph>>,
@@ -93,6 +97,10 @@ pub struct ExecutionResult {
     /// BOB generation stamped on the regular path's account writes, 0 when the
     /// path was skipped.
     pub regular_generation: u64,
+    /// Transactions this batch could not afford to preload, in their original
+    /// order. Nothing has been done to them, so the caller reruns them as their
+    /// own batch once these results are off its hands.
+    pub deferred: Vec<SanitizedTransaction>,
 }
 
 pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
@@ -138,81 +146,22 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
                     let batch_size = batch.transactions.len();
                     debug!("Executor received batch with {} transactions", batch_size);
 
-                    let execution_result =
-                        match execute_batch(batch, &mut execution_deps, &metrics).await {
-                            Ok(result) => result,
-                            Err(e) => {
-                                // Nothing was executed or settled; a restart is
-                                // preferable to executing against unknown state.
-                                error!("Executor stopping: {}", e);
-                                break;
-                            }
-                        };
-
-                    let num_transactions_executed = execution_result.admin_transactions.len()
-                        + execution_result.regular_transactions.len();
-                    heartbeat.record_progress();
-                    if !execution_result.admin_transactions.is_empty() {
-                        if let Some(admin_results) = execution_result.admin_results {
-                            let len = execution_result.admin_transactions.len();
-                            // Bounded send applies backpressure; race shutdown so a full
-                            // settler queue never wedges executor exit. Owned values only,
-                            // no lock guard is held across this await.
-                            match send_results_chunked(
-                                &execution_results_tx,
-                                admin_results,
-                                execution_result.admin_transactions,
-                                execution_result.admin_generation,
-                                MAX_SEND_CHUNK_BYTES,
-                                &results_budget,
-                                &metrics,
-                            )
-                            .await
-                            {
-                                SendOutcome::Sent => {}
-                                SendOutcome::ChannelClosed => {
-                                    metrics.executor_results_send_failed("admin");
-                                    error!("Failed to send admin results: channel closed");
-                                    break;
-                                }
-                            }
-                            metrics.executor_results_sent(len);
-                        } else {
-                            metrics.executor_missing_results("admin");
-                            error!("Unexpected error: No result found for admin transactions");
-                            break;
+                    match process_batch(
+                        batch,
+                        &mut execution_deps,
+                        &execution_results_tx,
+                        &results_budget,
+                        &metrics,
+                        &heartbeat,
+                    )
+                    .await
+                    {
+                        BatchOutcome::Continue { executed } => {
+                            total_transactions_executed += executed as u64;
                         }
-                    }
-                    if !execution_result.regular_transactions.is_empty() {
-                        if let Some(regular_results) = execution_result.regular_results {
-                            let len = execution_result.regular_transactions.len();
-                            match send_results_chunked(
-                                &execution_results_tx,
-                                regular_results,
-                                execution_result.regular_transactions,
-                                execution_result.regular_generation,
-                                MAX_SEND_CHUNK_BYTES,
-                                &results_budget,
-                                &metrics,
-                            )
-                            .await
-                            {
-                                SendOutcome::Sent => {}
-                                SendOutcome::ChannelClosed => {
-                                    metrics.executor_results_send_failed("regular");
-                                    error!("Failed to send regular results: channel closed");
-                                    break;
-                                }
-                            }
-                            metrics.executor_results_sent(len);
-                        } else {
-                            metrics.executor_missing_results("regular");
-                            error!("Unexpected error: No result found for regular transactions");
-                            break;
-                        }
+                        BatchOutcome::Stop => break,
                     }
 
-                    total_transactions_executed += num_transactions_executed as u64;
                     total_batches_processed += 1;
 
                     if total_batches_processed.is_multiple_of(100) {
@@ -252,6 +201,8 @@ pub async fn get_execution_deps(
         admin_vm,
         max_svm_workers,
         live_blockhashes,
+        max_tx_loaded_accounts_bytes: MAX_TX_LOADED_ACCOUNTS_BYTES,
+        preload_budget_bytes: MAX_BATCH_PRELOAD_BYTES,
         _fork_graph,
     }
 }
@@ -326,6 +277,87 @@ fn merge_svm_outputs(
     merged
 }
 
+/// Account data one transaction may reference. The SVM enforces the same
+/// ceiling, but only while loading, which is after the bytes have been read out
+/// of the store; checking it here is what keeps them from being read at all.
+pub const MAX_TX_LOADED_ACCOUNTS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Account data one preload may pull in. Per-transaction limits alone bound
+/// nothing: a full batch of individually legal transactions still adds up to
+/// gigabytes, so the batch is executed in pieces that each stay under this.
+pub(crate) const MAX_BATCH_PRELOAD_BYTES: usize = 256 * 1024 * 1024;
+
+/// A transaction at the per-transaction cap has to fit an empty batch, or it
+/// would be deferred forever.
+const _: () = assert!(MAX_BATCH_PRELOAD_BYTES >= MAX_TX_LOADED_ACCOUNTS_BYTES);
+
+/// How a batch splits once its accounts have been sized, as indices into the
+/// batch's transactions.
+#[derive(Debug, Default)]
+pub(crate) struct PreloadPlan {
+    /// Runs now.
+    pub admitted: Vec<usize>,
+    /// References more account data than the SVM would ever load, so it is
+    /// failed without fetching anything.
+    pub oversized: Vec<usize>,
+    /// Would push this preload past its budget. Runs in a later sub-batch.
+    pub deferred: Vec<usize>,
+}
+
+/// Decide which transactions this preload can afford. The per-transaction sum
+/// counts stored data only, while the SVM also charges per account and counts
+/// programdata, so it can only reject what the SVM would reject anyway.
+pub(crate) fn plan_preload(
+    key_sets: &[Vec<Pubkey>],
+    sizes: &HashMap<Pubkey, usize>,
+    per_tx_limit: usize,
+    budget: usize,
+) -> PreloadPlan {
+    let mut plan = PreloadPlan::default();
+    let mut union: HashSet<Pubkey> = HashSet::new();
+    let mut union_bytes = 0usize;
+
+    for (index, keys) in key_sets.iter().enumerate() {
+        let mut tx_bytes = 0usize;
+        let mut marginal_bytes = 0usize;
+        let mut counted: HashSet<&Pubkey> = HashSet::new();
+        for key in keys {
+            let Some(size) = sizes.get(key) else {
+                continue;
+            };
+            // A key repeated within one message is still one account.
+            if !counted.insert(key) {
+                continue;
+            }
+            tx_bytes = tx_bytes.saturating_add(*size);
+            // An account several transactions name is fetched once, so the batch
+            // total charges only what this transaction adds to the union.
+            if !union.contains(key) {
+                marginal_bytes = marginal_bytes.saturating_add(*size);
+            }
+        }
+
+        if tx_bytes > per_tx_limit {
+            plan.oversized.push(index);
+            continue;
+        }
+        // Never defer the first transaction of a walk: it would come back as an
+        // identical batch and never make progress. Its own cap already bounds it.
+        if !plan.admitted.is_empty() && union_bytes.saturating_add(marginal_bytes) > budget {
+            // Stop rather than skip ahead, so the remainder keeps its order and
+            // stays a valid conflict-free batch.
+            plan.deferred.extend(index..key_sets.len());
+            break;
+        }
+
+        union.extend(keys.iter().copied());
+        union_bytes = union_bytes.saturating_add(marginal_bytes);
+        plan.admitted.push(index);
+    }
+
+    plan
+}
+
 /// Cap on retained account bytes in one message to the settler.
 /// This bounds a message built from several transactions. One transaction is
 /// never divided, so bounding that case is an admission problem, tracked apart.
@@ -348,6 +380,121 @@ const _: () = assert!(MAX_SEND_CHUNK_BYTES <= MAX_IN_FLIGHT_RESULT_BYTES);
 pub(crate) enum SendOutcome {
     Sent,
     ChannelClosed,
+}
+
+/// Whether the executor may take another batch, and how many transactions the
+/// batch actually ran.
+pub(crate) enum BatchOutcome {
+    Continue { executed: usize },
+    Stop,
+}
+
+/// Run one scheduled batch, in as many sub-batches as its preload budget needs.
+/// The loop lives here so each piece reaches the settler before the next is
+/// fetched, which keeps one preload's transient cost to the budget.
+pub(crate) async fn process_batch(
+    batch: ConflictFreeBatch,
+    execution_deps: &mut ExecutionDeps,
+    execution_results_tx: &mpsc::Sender<ExecutedBatch>,
+    results_budget: &WeightBudget,
+    metrics: &SharedMetrics,
+    heartbeat: &Arc<crate::health::StageHeartbeat>,
+) -> BatchOutcome {
+    let mut batch = batch;
+    let mut executed = 0usize;
+    loop {
+        let execution_result = match execute_batch(batch, execution_deps, metrics).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Nothing was executed or settled; a restart is
+                // preferable to executing against unknown state.
+                error!("Executor stopping: {}", e);
+                return BatchOutcome::Stop;
+            }
+        };
+
+        heartbeat.record_progress();
+        let deferred = execution_result.deferred;
+        executed +=
+            execution_result.admin_transactions.len() + execution_result.regular_transactions.len();
+
+        if !execution_result.admin_transactions.is_empty() {
+            let Some(admin_results) = execution_result.admin_results else {
+                metrics.executor_missing_results("admin");
+                error!("Unexpected error: No result found for admin transactions");
+                return BatchOutcome::Stop;
+            };
+            let len = execution_result.admin_transactions.len();
+            // Bounded send applies backpressure; race shutdown so a full
+            // settler queue never wedges executor exit. Owned values only,
+            // no lock guard is held across this await.
+            match send_results_chunked(
+                execution_results_tx,
+                admin_results,
+                execution_result.admin_transactions,
+                execution_result.admin_generation,
+                MAX_SEND_CHUNK_BYTES,
+                results_budget,
+                metrics,
+            )
+            .await
+            {
+                SendOutcome::Sent => {}
+                SendOutcome::ChannelClosed => {
+                    metrics.executor_results_send_failed("admin");
+                    error!("Failed to send admin results: channel closed");
+                    return BatchOutcome::Stop;
+                }
+            }
+            metrics.executor_results_sent(len);
+        }
+
+        if !execution_result.regular_transactions.is_empty() {
+            let Some(regular_results) = execution_result.regular_results else {
+                metrics.executor_missing_results("regular");
+                error!("Unexpected error: No result found for regular transactions");
+                return BatchOutcome::Stop;
+            };
+            let len = execution_result.regular_transactions.len();
+            match send_results_chunked(
+                execution_results_tx,
+                regular_results,
+                execution_result.regular_transactions,
+                execution_result.regular_generation,
+                MAX_SEND_CHUNK_BYTES,
+                results_budget,
+                metrics,
+            )
+            .await
+            {
+                SendOutcome::Sent => {}
+                SendOutcome::ChannelClosed => {
+                    metrics.executor_results_send_failed("regular");
+                    error!("Failed to send regular results: channel closed");
+                    return BatchOutcome::Stop;
+                }
+            }
+            metrics.executor_results_sent(len);
+        }
+
+        if deferred.is_empty() {
+            return BatchOutcome::Continue { executed };
+        }
+        // A subset of a conflict-free batch is still conflict free, and this
+        // stage is sequential, so the remainder is a valid batch as it stands.
+        batch = ConflictFreeBatch {
+            transactions: deferred
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, transaction)| crate::scheduler::TransactionWithIndex {
+                        transaction: Arc::new(transaction),
+                        index,
+                    },
+                )
+                .collect(),
+        };
+    }
 }
 
 /// One chunk of a batch: where it starts and ends, and the account bytes it
@@ -739,6 +886,79 @@ pub async fn execute_batch(
         metrics.executor_dropped_expired_blockhash(expired.len());
     }
 
+    // Size the accounts before deciding to load them. The SVM applies the same
+    // ceiling, but only once the bytes are in memory, so this is the only place
+    // a request for too much data can be refused before the store is asked.
+    let t_op = Instant::now();
+    let sized_keys: Vec<Pubkey> = {
+        let mut seen = HashSet::new();
+        all_transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.message()
+                    .account_keys()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|key| seen.insert(*key))
+            .collect()
+    };
+    let account_sizes = match execution_deps.bob.account_data_sizes(&sized_keys).await {
+        Ok(sizes) => sizes,
+        Err(e) => {
+            if let AccountLoadError::Corrupt(_) = e {
+                metrics.executor_corrupt_account();
+            }
+            metrics.executor_preload_fatal();
+            error!("execution: aborting batch, account sizing failed: {}", e);
+            return Err(e);
+        }
+    };
+    let key_sets: Vec<Vec<Pubkey>> = all_transactions
+        .iter()
+        .map(|tx| tx.message().account_keys().iter().copied().collect())
+        .collect();
+    let plan = plan_preload(
+        &key_sets,
+        &account_sizes,
+        execution_deps.max_tx_loaded_accounts_bytes,
+        execution_deps.preload_budget_bytes,
+    );
+    let t_sizing = t_op.elapsed();
+
+    // Rebuild the batch as three disjoint lists, consuming the originals so
+    // nothing is cloned.
+    let mut slots: Vec<Option<SanitizedTransaction>> =
+        all_transactions.into_iter().map(Some).collect();
+    let take = |slots: &mut Vec<Option<SanitizedTransaction>>, indices: &[usize]| {
+        indices
+            .iter()
+            .map(|i| slots[*i].take().expect("each index is claimed once"))
+            .collect::<Vec<_>>()
+    };
+    let oversized_transactions = take(&mut slots, &plan.oversized);
+    let deferred = take(&mut slots, &plan.deferred);
+    let all_transactions = take(&mut slots, &plan.admitted);
+
+    if !oversized_transactions.is_empty() {
+        for tx in &oversized_transactions {
+            warn!(
+                sig = %tx.signature(),
+                "execution: failing tx that references more account data than the SVM would load"
+            );
+        }
+        metrics.executor_oversized_transactions(oversized_transactions.len());
+    }
+    if !deferred.is_empty() {
+        debug!(
+            "execution: deferring {} txs past the {} byte preload budget",
+            deferred.len(),
+            execution_deps.preload_budget_bytes
+        );
+        metrics.executor_batch_deferred(deferred.len());
+    }
+
     // TODO: ConflictFree scheduling should do the admin/non-admin/ATA partitioning
     // This would allow better parallelization and cleaner separation of concerns
     // The scheduler could create separate batches for admin vs regular vs ATA transactions
@@ -997,13 +1217,37 @@ pub async fn execute_batch(
         None
     };
 
+    // Report them with the error the SVM would itself have produced, so every
+    // consumer downstream sees an outcome it already handles. Appending after
+    // execution keeps results aligned and these out of the path decisions.
+    let num_oversized = oversized_transactions.len();
+    let mut regular_results = regular_results;
+    if !oversized_transactions.is_empty() {
+        let results =
+            regular_results.get_or_insert_with(|| LoadAndExecuteSanitizedTransactionsOutput {
+                processing_results: Vec::new(),
+                error_metrics: TransactionErrorMetrics::default(),
+                execute_timings: ExecuteTimings::default(),
+                balance_collector: None,
+            });
+        for _ in 0..num_oversized {
+            results
+                .processing_results
+                .push(Err(TransactionError::MaxLoadedAccountsDataSizeExceeded));
+        }
+        regular_transactions.extend(oversized_transactions);
+    }
+
     let t_total = t_batch.elapsed();
     debug!(
-        "execute_batch complete: total={} admin={} regular={} | \
-         partition={:?} preload={:?} svm_admin={:?} bob_admin={:?} svm_reg={:?} bob_reg={:?} total={:?}",
+        "execute_batch complete: received={} admin={} regular={} oversized={} deferred={} | \
+         sizing={:?} partition={:?} preload={:?} svm_admin={:?} bob_admin={:?} svm_reg={:?} bob_reg={:?} total={:?}",
         batch_size,
         num_admin_transactions,
         num_regular_transactions,
+        num_oversized,
+        deferred.len(),
+        t_sizing,
         t_partition,
         t_preload,
         t_svm_admin,
@@ -1021,6 +1265,7 @@ pub async fn execute_batch(
         regular_results,
         admin_generation,
         regular_generation,
+        deferred,
     })
 }
 
@@ -1041,7 +1286,7 @@ mod tests {
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
     use solana_svm_callback::TransactionProcessingCallback;
-    use std::collections::{HashSet, LinkedList};
+    use std::collections::{HashMap, HashSet, LinkedList};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -1070,6 +1315,66 @@ mod tests {
         let tx = Transaction::new(&[payer], msg, blockhash);
         SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
             .expect("failed to create test transaction")
+    }
+
+    /// A transfer carrying `extra` as unused readonly keys, the shape that lets a
+    /// small transaction name a lot of account data. They go into the message,
+    /// not an instruction, because the SVM charges for every key it finds.
+    fn transfer_with_unused_readonly(payer: &Keypair, extra: &[Pubkey]) -> SanitizedTransaction {
+        let ix = solana_system_interface::instruction::transfer(
+            &payer.pubkey(),
+            &Pubkey::new_unique(),
+            100,
+        );
+        let mut msg = Message::new(&[ix], Some(&payer.pubkey()));
+        msg.account_keys.extend_from_slice(extra);
+        msg.header.num_readonly_unsigned_accounts += extra.len() as u8;
+        let tx = Transaction::new(&[payer], msg, Hash::default());
+        SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+            .expect("a message with unused readonly keys is still well formed")
+    }
+
+    /// Store `count` system-owned accounts of `data_len` bytes each.
+    async fn seed_sized_accounts(
+        db: &mut crate::accounts::AccountsDB,
+        count: usize,
+        data_len: usize,
+    ) -> Vec<Pubkey> {
+        let mut keys = Vec::with_capacity(count);
+        for _ in 0..count {
+            let pubkey = Pubkey::new_unique();
+            db.set_account(
+                pubkey,
+                AccountSharedData::new(1, data_len, &solana_sdk_ids::system_program::ID),
+            )
+            .await;
+            keys.push(pubkey);
+        }
+        keys
+    }
+
+    /// Execution deps whose preload budget is small enough to split a batch of
+    /// ordinary test transactions.
+    async fn deps_with_budget(
+        accounts_db: crate::accounts::AccountsDB,
+        budget: usize,
+    ) -> ExecutionDeps {
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        deps.preload_budget_bytes = budget;
+        deps
+    }
+
+    /// Execution deps with a small per-transaction cap, so the oversized path is
+    /// exercised without seeding accounts big enough to clear the real 64 MiB.
+    async fn deps_with_tx_cap(
+        accounts_db: crate::accounts::AccountsDB,
+        per_tx_limit: usize,
+    ) -> ExecutionDeps {
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        deps.max_tx_loaded_accounts_bytes = per_tx_limit;
+        deps
     }
 
     // ── Lamport-cap test helpers ──
@@ -3316,5 +3621,440 @@ mod tests {
 
         assert_eq!(result.regular_transactions.len(), 1);
         assert!(is_executed(regular_result(&result, 0)));
+    }
+    // -- preload planner --
+
+    fn sizes(pairs: &[(Pubkey, usize)]) -> HashMap<Pubkey, usize> {
+        pairs.iter().copied().collect()
+    }
+
+    /// The cap is a ceiling the SVM itself allows, so a set landing exactly on
+    /// it must still run; only a set past it is rejected.
+    #[test]
+    fn plan_preload_admits_up_to_the_limit_and_rejects_past_it() {
+        let key = Pubkey::new_unique();
+        let cases = [(999usize, true), (1_000, true), (1_001, false)];
+
+        for (size, expected_admitted) in cases {
+            let plan = plan_preload(&[vec![key]], &sizes(&[(key, size)]), 1_000, 10_000);
+            if expected_admitted {
+                assert_eq!(plan.admitted, vec![0], "{size} bytes must be admitted");
+                assert!(plan.oversized.is_empty());
+            } else {
+                assert!(plan.admitted.is_empty(), "{size} bytes must be rejected");
+                assert_eq!(plan.oversized, vec![0]);
+            }
+            assert!(plan.deferred.is_empty());
+        }
+    }
+
+    /// An account named by several transactions is fetched once, so the budget
+    /// must charge it once too.
+    #[test]
+    fn plan_preload_charges_a_shared_account_once() {
+        let shared = Pubkey::new_unique();
+        let plan = plan_preload(
+            &[vec![shared], vec![shared]],
+            &sizes(&[(shared, 600)]),
+            10_000,
+            1_000,
+        );
+
+        assert_eq!(plan.admitted, vec![0, 1], "the union is 600, not 1200");
+        assert!(plan.deferred.is_empty());
+    }
+
+    /// The walk stops at the first transaction that does not fit and defers the
+    /// rest in order, so a deferred sub-batch stays a valid conflict-free batch.
+    #[test]
+    fn plan_preload_defers_everything_after_the_first_overflow() {
+        let keys: Vec<Pubkey> = (0..4).map(|_| Pubkey::new_unique()).collect();
+        let sized = sizes(&[
+            (keys[0], 400),
+            (keys[1], 400),
+            (keys[2], 400),
+            (keys[3], 10),
+        ]);
+        let key_sets: Vec<Vec<Pubkey>> = keys.iter().map(|k| vec![*k]).collect();
+
+        let plan = plan_preload(&key_sets, &sized, 10_000, 1_000);
+
+        assert_eq!(plan.admitted, vec![0, 1]);
+        assert_eq!(
+            plan.deferred,
+            vec![2, 3],
+            "the small tx after the overflow must wait its turn, not jump it"
+        );
+        assert!(plan.oversized.is_empty());
+    }
+
+    /// The first transaction of a walk always fits an empty union, so a batch
+    /// can never stall on a transaction it will never be able to start.
+    #[test]
+    fn plan_preload_always_admits_a_first_transaction_at_the_cap() {
+        let key = Pubkey::new_unique();
+        let plan = plan_preload(&[vec![key]], &sizes(&[(key, 1_000)]), 1_000, 1_000);
+
+        assert_eq!(plan.admitted, vec![0]);
+        assert!(plan.deferred.is_empty() && plan.oversized.is_empty());
+    }
+
+    /// Progress cannot depend on the two limits being ordered. A transaction
+    /// under the per-transaction cap but over the budget must still run, or the
+    /// caller would rebuild the same batch forever.
+    #[test]
+    fn plan_preload_admits_a_first_transaction_larger_than_the_whole_budget() {
+        let key = Pubkey::new_unique();
+        let plan = plan_preload(&[vec![key]], &sizes(&[(key, 5_000)]), 10_000, 1_000);
+
+        assert_eq!(
+            plan.admitted,
+            vec![0],
+            "deferring index 0 would leave the batch unable to make progress"
+        );
+        assert!(plan.deferred.is_empty() && plan.oversized.is_empty());
+    }
+
+    /// Keys with no stored row cost nothing, and an oversized transaction is
+    /// never preloaded, so its keys must not enter the union or the running sum.
+    #[test]
+    fn plan_preload_ignores_absent_keys_and_oversized_keys() {
+        let shared = Pubkey::new_unique();
+        let huge = Pubkey::new_unique();
+        let absent = Pubkey::new_unique();
+        let sized = sizes(&[(shared, 100), (huge, 5_000)]);
+
+        let plan = plan_preload(
+            &[vec![huge, shared], vec![shared, absent]],
+            &sized,
+            1_000,
+            1_000,
+        );
+
+        assert_eq!(plan.oversized, vec![0], "5100 bytes is past the 1000 cap");
+        assert_eq!(plan.admitted, vec![1]);
+        assert!(
+            plan.deferred.is_empty(),
+            "the oversized tx must not spend budget it never loads"
+        );
+    }
+
+    // -- preload size gating in execute_batch --
+
+    /// 10 MiB, the largest an account can be, so a handful of them clears the
+    /// per-transaction cap with a transaction that still fits in a packet.
+    const BIG_ACCOUNT_BYTES: usize = 10 * 1024 * 1024;
+
+    /// A transaction naming more account data than the SVM would load must fail
+    /// without its accounts ever being read out of the store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_fails_an_oversized_tx_without_loading_its_accounts() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let big = seed_sized_accounts(&mut accounts_db, 7, BIG_ACCOUNT_BYTES).await;
+
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let oversized_payer = Keypair::new();
+        let control_payer = Keypair::new();
+        let oversized = transfer_with_unused_readonly(&oversized_payer, &big);
+        let oversized_sig = *oversized.signature();
+        let control = sanitize_transfer(&control_payer, Hash::default());
+        let control_sig = *control.signature();
+
+        let bytes_before = deps.bob.cache_stats().bytes;
+        let result = run_batch(&mut deps, &noop, vec![oversized, control]).await;
+
+        assert_eq!(
+            result.regular_transactions.len(),
+            result
+                .regular_results
+                .as_ref()
+                .expect("regular path ran")
+                .processing_results
+                .len(),
+            "results must stay aligned with the transactions they describe"
+        );
+
+        let position = |sig| {
+            result
+                .regular_transactions
+                .iter()
+                .position(|tx| *tx.signature() == sig)
+                .expect("every submitted tx must be accounted for")
+        };
+        let results = &result
+            .regular_results
+            .as_ref()
+            .expect("regular path ran")
+            .processing_results;
+
+        assert!(
+            matches!(
+                results[position(oversized_sig)],
+                Err(TransactionError::MaxLoadedAccountsDataSizeExceeded)
+            ),
+            "an oversized tx must fail exactly as the SVM would have failed it"
+        );
+        assert!(
+            results[position(control_sig)].is_ok(),
+            "the control tx must still execute"
+        );
+
+        for key in &big {
+            assert!(
+                deps.bob.get_account_shared_data(key).is_none(),
+                "an oversized tx's accounts must never be fetched"
+            );
+        }
+        let growth = deps.bob.cache_stats().bytes - bytes_before;
+        assert!(
+            growth < BIG_ACCOUNT_BYTES,
+            "cache grew by {growth} bytes, so the big accounts were loaded after all"
+        );
+    }
+
+    /// A batch that would preload more than its budget runs in pieces, and the
+    /// overflow comes back untouched rather than being dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_defers_the_transactions_past_its_preload_budget() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 3, 1_500).await;
+        let mut deps = deps_with_budget(accounts_db, 3_000).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let txs: Vec<SanitizedTransaction> = readonly
+            .iter()
+            .map(|key| transfer_with_unused_readonly(&Keypair::new(), &[*key]))
+            .collect();
+        let deferred_sig = *txs[2].signature();
+
+        let result = run_batch(&mut deps, &noop, txs).await;
+
+        assert_eq!(
+            result.regular_transactions.len(),
+            2,
+            "two txs fit the budget"
+        );
+        assert_eq!(result.deferred.len(), 1);
+        assert_eq!(*result.deferred[0].signature(), deferred_sig);
+
+        assert!(deps.bob.get_account_shared_data(&readonly[0]).is_some());
+        assert!(deps.bob.get_account_shared_data(&readonly[1]).is_some());
+        assert!(
+            deps.bob.get_account_shared_data(&readonly[2]).is_none(),
+            "a deferred tx's accounts must not be preloaded either"
+        );
+    }
+
+    /// Transactions sharing a readonly account are charged for it once, so a
+    /// budget that fits the union must not split them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_charges_a_shared_readonly_account_once() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let shared = seed_sized_accounts(&mut accounts_db, 1, 2_000).await[0];
+        let mut deps = deps_with_budget(accounts_db, 2_500).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let txs = vec![
+            transfer_with_unused_readonly(&Keypair::new(), &[shared]),
+            transfer_with_unused_readonly(&Keypair::new(), &[shared]),
+        ];
+        let result = run_batch(&mut deps, &noop, txs).await;
+
+        assert_eq!(result.regular_transactions.len(), 2);
+        assert!(
+            result.deferred.is_empty(),
+            "4000 bytes of transactions are 2000 bytes of accounts"
+        );
+    }
+
+    /// A batch whose accounts are already resident must not need the store, so
+    /// sizing cannot have introduced a round-trip on the warm path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_runs_a_warm_batch_without_the_store() {
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(
+            crate::test_helpers::dead_postgres_db(),
+            rx,
+            1,
+            default_live_blockhashes(),
+        )
+        .await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        fund(&mut deps.bob, &payer.pubkey(), 1_000_000);
+        fund(&mut deps.bob, &recipient, 1);
+        let ix = solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient, 100);
+        let msg = Message::new(&[ix], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], msg, Hash::default());
+        let tx = SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+
+        let result = run_batch(&mut deps, &noop, vec![tx]).await;
+        assert!(regular_result(&result, 0).is_ok());
+    }
+
+    /// A batch of nothing but oversized transactions still has to produce a
+    /// result per transaction, which is the shape simulation reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_reports_a_batch_that_is_entirely_oversized() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let big = seed_sized_accounts(&mut accounts_db, 1, 2_000).await;
+        let mut deps = deps_with_tx_cap(accounts_db, 1_000).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &big);
+        let result = run_batch(&mut deps, &noop, vec![tx]).await;
+
+        assert!(result.admin_results.is_none());
+        assert!(result.deferred.is_empty());
+        let results = &result
+            .regular_results
+            .as_ref()
+            .expect("an oversized tx still needs a result")
+            .processing_results;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            results[0],
+            Err(TransactionError::MaxLoadedAccountsDataSizeExceeded)
+        ));
+    }
+
+    /// The gate runs before admin routing, so an oversized admin transaction is
+    /// failed rather than handed to the admin VM.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_fails_an_oversized_admin_tx_before_routing_it() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let big = seed_sized_accounts(&mut accounts_db, 1, 2_000).await;
+        let mut deps = deps_with_tx_cap(accounts_db, 1_000).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let admin_tx = {
+            use solana_sdk::instruction::{AccountMeta, Instruction};
+
+            let payer = Keypair::new();
+            let mut data = vec![0u8; 35];
+            data[1] = 6;
+            data[2..34].copy_from_slice(&Pubkey::new_unique().to_bytes());
+            let ix = Instruction {
+                program_id: spl_token::id(),
+                accounts: vec![
+                    AccountMeta::new(Pubkey::new_unique(), false),
+                    AccountMeta::new(payer.pubkey(), true),
+                ],
+                data,
+            };
+            let mut msg = Message::new(&[ix], Some(&payer.pubkey()));
+            msg.account_keys.extend_from_slice(&big);
+            msg.header.num_readonly_unsigned_accounts += big.len() as u8;
+            let tx = Transaction::new(&[&payer], msg, Hash::default());
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new())
+                .expect("an admin tx with unused readonly keys is still well formed")
+        };
+        let result = run_batch(&mut deps, &noop, vec![admin_tx]).await;
+
+        assert!(
+            result.admin_transactions.is_empty(),
+            "an oversized tx must never reach the admin VM"
+        );
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(matches!(
+            result
+                .regular_results
+                .as_ref()
+                .expect("it is reported on the regular path")
+                .processing_results[0],
+            Err(TransactionError::MaxLoadedAccountsDataSizeExceeded)
+        ));
+    }
+
+    // -- deferred sub-batch loop --
+
+    /// A batch too big to preload at once is handed to the settler in pieces,
+    /// and each piece goes out before the next one is loaded, so no single
+    /// preload pulls more than the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_batch_forwards_each_sub_batch_before_running_the_next() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 3, 1_500).await;
+        let mut deps = deps_with_budget(accounts_db, 3_000).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let heartbeat = crate::health::StageHeartbeat::new();
+
+        let txs: Vec<SanitizedTransaction> = readonly
+            .iter()
+            .map(|key| transfer_with_unused_readonly(&Keypair::new(), &[*key]))
+            .collect();
+        let expected: HashSet<_> = txs.iter().map(|tx| *tx.signature()).collect();
+        let batch = ConflictFreeBatch {
+            transactions: txs
+                .into_iter()
+                .enumerate()
+                .map(|(index, tx)| crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(tx),
+                    index,
+                })
+                .collect(),
+        };
+
+        let (results_tx, mut results_rx) = mpsc::channel::<ExecutedBatch>(8);
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let outcome =
+            process_batch(batch, &mut deps, &results_tx, &budget, &metrics, &heartbeat).await;
+        assert!(matches!(outcome, BatchOutcome::Continue { executed: 3 }));
+        drop(results_tx);
+
+        let mut messages = 0;
+        let mut seen = HashSet::new();
+        while let Some(executed) = results_rx.recv().await {
+            messages += 1;
+            for tx in &executed.transactions {
+                assert!(seen.insert(*tx.signature()), "a tx must be settled once");
+            }
+        }
+        assert_eq!(
+            messages, 2,
+            "the batch must reach the settler in two pieces"
+        );
+        assert_eq!(
+            seen, expected,
+            "every tx must reach the settler exactly once"
+        );
+    }
+
+    /// A settler that closes mid-way must stop the executor rather than run the
+    /// deferred remainder into a channel nothing is reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_batch_stops_when_the_settler_closes_between_sub_batches() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 3, 1_500).await;
+        let mut deps = deps_with_budget(accounts_db, 3_000).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let heartbeat = crate::health::StageHeartbeat::new();
+
+        let batch = ConflictFreeBatch {
+            transactions: readonly
+                .iter()
+                .enumerate()
+                .map(|(index, key)| crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(transfer_with_unused_readonly(&Keypair::new(), &[*key])),
+                    index,
+                })
+                .collect(),
+        };
+
+        let (results_tx, results_rx) = mpsc::channel::<ExecutedBatch>(8);
+        drop(results_rx);
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let outcome =
+            process_batch(batch, &mut deps, &results_tx, &budget, &metrics, &heartbeat).await;
+
+        assert!(
+            matches!(outcome, BatchOutcome::Stop),
+            "a closed settler must stop the executor, not silently drop the remainder"
+        );
     }
 }

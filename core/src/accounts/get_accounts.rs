@@ -218,6 +218,65 @@ pub async fn get_accounts(
     Ok(results)
 }
 
+/// Bytes bincode writes around an account's data: lamports, the data length
+/// prefix, owner, executable and rent epoch. Pinned by a test, since the size
+/// query reads the stored row length and has to subtract this to get data len.
+pub const ACCOUNT_SERIALIZED_HEADER_BYTES: usize = 57;
+
+/// Stored data length per account, aligned with `accounts`, zero when absent.
+/// Sizes are asked for before bytes because `octet_length` reads the row's TOAST
+/// pointer without fetching the blob, so nothing oversized has to be loaded.
+pub async fn get_account_data_sizes(
+    db: &AccountsDB,
+    accounts: &[Pubkey],
+) -> Result<Vec<usize>, AccountLoadError> {
+    match db {
+        AccountsDB::Postgres(postgres_db) => get_account_data_sizes_postgres(postgres_db, accounts),
+        // Redis has no cheap length primitive, so sizes come from the source of truth.
+        AccountsDB::Redis(redis_db) => {
+            get_account_data_sizes_postgres(&redis_db.fallback, accounts)
+        }
+    }
+    .await
+}
+
+async fn get_account_data_sizes_postgres(
+    postgres_db: &PostgresAccountsDB,
+    accounts: &[Pubkey],
+) -> Result<Vec<usize>, AccountLoadError> {
+    let mut result = vec![0usize; accounts.len()];
+    if accounts.is_empty() {
+        return Ok(result);
+    }
+
+    let pool = Arc::clone(&postgres_db.pool);
+    let pubkey_bytes: Vec<Vec<u8>> = accounts.iter().map(|key| key.to_bytes().to_vec()).collect();
+
+    let rows = with_retry(|| async {
+        sqlx::query("SELECT pubkey, octet_length(data) AS len FROM accounts WHERE pubkey = ANY($1)")
+            .bind(&pubkey_bytes)
+            .fetch_all(pool.as_ref())
+            .await
+    })
+    .await
+    .map_err(|e| AccountLoadError::Backend(e.to_string()))?;
+
+    for row in rows {
+        let row_pubkey: Vec<u8> = row.get("pubkey");
+        let stored_len: i32 = row.get("len");
+        // Saturating because a short row is corrupt, and preload reports that.
+        let data_len = (stored_len.max(0) as usize).saturating_sub(ACCOUNT_SERIALIZED_HEADER_BYTES);
+        // Every position, not just the first: a key asked for twice must size the
+        // same both times, or a repeat would read as a free account.
+        for (index, key) in accounts.iter().enumerate() {
+            if key.to_bytes().as_slice() == row_pubkey {
+                result[index] = data_len;
+            }
+        }
+    }
+    Ok(result)
+}
+
 async fn get_accounts_postgres(
     postgres_db: &PostgresAccountsDB,
     accounts: &[Pubkey],
@@ -334,7 +393,9 @@ async fn get_accounts_redis(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{dead_postgres_db, start_test_postgres};
+    use crate::test_helpers::{
+        dead_postgres_db, start_test_postgres, start_test_postgres_raw, start_test_redis,
+    };
     use solana_sdk::account::ReadableAccount;
     use std::{
         cell::RefCell,
@@ -557,6 +618,107 @@ mod tests {
         assert!(
             matches!(result, Err(AccountLoadError::Corrupt(key)) if key == corrupt),
             "a corrupt row must be reported directly, not retried: {result:?}"
+        );
+    }
+
+    /// The header the size query subtracts must match what bincode actually
+    /// writes, or every size is wrong by a constant.
+    #[test]
+    fn serialized_header_constant_matches_bincode() {
+        let owner = Pubkey::new_unique();
+        for len in [0usize, 1, 1000] {
+            let account = AccountSharedData::new(1, len, &owner);
+            let encoded = bincode::serialize(&account).expect("account must serialize");
+            assert_eq!(
+                encoded.len(),
+                len + ACCOUNT_SERIALIZED_HEADER_BYTES,
+                "bincode layout changed for a {len}-byte account"
+            );
+        }
+        let encoded =
+            bincode::serialize(&AccountSharedData::default()).expect("default must serialize");
+        assert_eq!(encoded.len(), ACCOUNT_SERIALIZED_HEADER_BYTES);
+    }
+
+    /// A key asked for twice must size the same both times. Zero would read as
+    /// "this account is free" and under-count the caller's limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_data_sizes_sizes_a_repeated_key_every_time() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let pubkey = Pubkey::new_unique();
+        db.set_account(
+            pubkey,
+            AccountSharedData::new(1, 4_000, &Pubkey::new_unique()),
+        )
+        .await;
+
+        let sizes = get_account_data_sizes(&db, &[pubkey, pubkey])
+            .await
+            .expect("a healthy store must answer");
+        assert_eq!(sizes, vec![4_000, 4_000]);
+    }
+
+    /// Sizes come back aligned with the request, exact for stored rows and zero
+    /// for keys the store has never seen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_data_sizes_reports_exact_lengths() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let owner = Pubkey::new_unique();
+
+        let mut keys = Vec::new();
+        for len in [0usize, 1_000, 5_000] {
+            let pubkey = Pubkey::new_unique();
+            db.set_account(pubkey, AccountSharedData::new(1, len, &owner))
+                .await;
+            keys.push(pubkey);
+        }
+        let absent = Pubkey::new_unique();
+        keys.push(absent);
+
+        let sizes = get_account_data_sizes(&db, &keys)
+            .await
+            .expect("a healthy store must answer");
+        assert_eq!(sizes, vec![0, 1_000, 5_000, 0]);
+    }
+
+    /// The Redis-backed handle has no length primitive of its own, so it must
+    /// answer from the Postgres it fronts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_account_data_sizes_reads_through_redis_to_postgres() {
+        let (postgres_db, _pg) = start_test_postgres_raw().await;
+        let (redis_db, _redis) = start_test_redis(postgres_db.clone()).await;
+        let mut fallback = AccountsDB::Postgres(postgres_db);
+        let owner = Pubkey::new_unique();
+
+        let mut keys = Vec::new();
+        for len in [0usize, 1_000, 5_000] {
+            let pubkey = Pubkey::new_unique();
+            fallback
+                .set_account(pubkey, AccountSharedData::new(1, len, &owner))
+                .await;
+            keys.push(pubkey);
+        }
+        keys.push(Pubkey::new_unique());
+
+        let sizes = get_account_data_sizes(&AccountsDB::Redis(redis_db), &keys)
+            .await
+            .expect("the fallback must answer");
+        assert_eq!(sizes, vec![0, 1_000, 5_000, 0]);
+    }
+
+    /// A store that cannot answer a size query is an error, never zeroes, which
+    /// would read as "every account is empty" and admit an oversized batch.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn get_account_data_sizes_surfaces_an_unreadable_store() {
+        set_test_retry(2, 1);
+        let db = dead_postgres_db();
+        let result = get_account_data_sizes(&db, &[Pubkey::new_unique()]).await;
+        reset_test_retry();
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Backend(_))),
+            "an unreadable store must not read as absent accounts: {result:?}"
         );
     }
 }

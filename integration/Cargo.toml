@@ -12,6 +12,10 @@ name = "ingress_backpressure"
 path = "tests/private-channel/test_ingress_backpressure.rs"
 
 [[test]]
+name = "oversized_account_set"
+path = "tests/private-channel/test_oversized_account_set.rs"
+
+[[test]]
 name = "ordered_shutdown_e2e"
 path = "tests/private-channel/test_ordered_shutdown_e2e.rs"
 

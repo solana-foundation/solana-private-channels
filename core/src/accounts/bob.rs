@@ -178,6 +178,46 @@ impl BOB {
             .map(|entry| entry.account.lamports())
     }
 
+    /// Data length per account, so a caller can size a working set before
+    /// loading it. Resident entries answer from memory and only misses reach the
+    /// store. Precompiles and tombstones are left out; neither costs anything.
+    pub async fn account_data_sizes(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<HashMap<Pubkey, usize>, crate::accounts::get_accounts::AccountLoadError> {
+        let mut sizes = HashMap::with_capacity(pubkeys.len());
+        let mut miss_keys: Vec<Pubkey> = Vec::new();
+
+        for pubkey in pubkeys {
+            if self.precompiles.contains_key(pubkey) || sizes.contains_key(pubkey) {
+                continue;
+            }
+            match self.accounts.get(pubkey) {
+                Some(entry) if entry.deleted => {
+                    sizes.insert(*pubkey, 0);
+                }
+                Some(entry) => {
+                    sizes.insert(*pubkey, entry.account.data().len());
+                }
+                None => {
+                    if !miss_keys.contains(pubkey) {
+                        miss_keys.push(*pubkey);
+                    }
+                }
+            }
+        }
+
+        if miss_keys.is_empty() {
+            return Ok(sizes);
+        }
+
+        let fetched = self.accounts_db.get_account_data_sizes(&miss_keys).await?;
+        for (pubkey, size) in miss_keys.into_iter().zip(fetched) {
+            sizes.insert(pubkey, size);
+        }
+        Ok(sizes)
+    }
+
     /// Preloads accounts into BOB from the database.
     ///
     /// Returns `(fetched, cached)`: `fetched` accounts were loaded from the DB,
@@ -2464,6 +2504,74 @@ mod tests {
         assert!(
             !bob.accounts.contains_key(&spl_token::id()),
             "read-only spl_token program slot must be skipped"
+        );
+    }
+
+    /// A batch whose accounts are all resident must be sized without touching
+    /// the store, which is what keeps a warm batch free of DB round-trips.
+    #[tokio::test]
+    async fn account_data_sizes_answers_a_warm_batch_without_the_store() {
+        // Backed by a dead Postgres, so any query at all would fail the test.
+        let (mut bob, _settled_tx) = create_test_bob();
+        let small = Pubkey::new_unique();
+        let large = Pubkey::new_unique();
+        bob.insert_account_for_test(small, make_account(1, &[7u8; 10], &Pubkey::default()));
+        bob.insert_account_for_test(large, make_account(1, &[7u8; 5_000], &Pubkey::default()));
+        let precompile = Pubkey::new_unique();
+        bob.precompiles
+            .insert(precompile, make_account(1, &[9u8; 200], &Pubkey::default()));
+
+        let sizes = bob
+            .account_data_sizes(&[small, large, precompile])
+            .await
+            .expect("a fully warm batch must not need the store");
+
+        assert_eq!(sizes.get(&small).copied(), Some(10));
+        assert_eq!(sizes.get(&large).copied(), Some(5_000));
+        assert!(
+            !sizes.contains_key(&precompile),
+            "a precompile is always in memory and costs no preload budget"
+        );
+    }
+
+    /// A deleted entry is absent as far as the SVM is concerned, so it must not
+    /// be sized from the tombstone it still occupies in the map.
+    #[tokio::test]
+    async fn account_data_sizes_treats_a_tombstone_as_absent() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let closed = Pubkey::new_unique();
+        bob.accounts.insert(
+            closed,
+            AccountWithMeta {
+                account: make_account(0, &[1u8; 100], &Pubkey::default()),
+                synced_since: None,
+                deleted: true,
+                generation: None,
+            },
+        );
+
+        let sizes = bob
+            .account_data_sizes(&[closed])
+            .await
+            .expect("a tombstone is resident, so no query is needed");
+        assert_eq!(sizes.get(&closed).copied(), Some(0));
+    }
+
+    /// A store that cannot answer the size query must stop the caller, exactly
+    /// as an unreadable preload does; zeroes would admit an oversized batch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn account_data_sizes_surfaces_an_unreadable_store() {
+        use crate::accounts::get_accounts::{reset_test_retry, set_test_retry, AccountLoadError};
+
+        set_test_retry(2, 1);
+        let (bob, _settled_tx) = create_test_bob();
+        let result = bob.account_data_sizes(&[Pubkey::new_unique()]).await;
+        reset_test_retry();
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Backend(_))),
+            "an unreadable store must not be read as zero-sized accounts: {result:?}"
         );
     }
 }
