@@ -169,7 +169,9 @@ The mirror is best-effort and covers only what the cache can serve: point lookup
 
 The settler also caps the settled account bytes it buffers between ticks. Once a tick's buffer reaches that budget it stops draining the executor queue, so the executor's bounded send applies backpressure upstream rather than letting one commit grow without limit. Blocks are still produced only on the tick, never early, and the executor splits an oversized batch into byte-bounded messages so a single already-executed batch cannot overshoot the budget. The commit itself binds each column as one array parameter, so bounding the buffer is what bounds the bind; the driver is held at sqlx 0.8 or later, where an oversized bind fails loudly instead of being truncated by the binary protocol's length prefix.
 
-Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop.
+Both queues either side of the settler are bounded by the account bytes and index rows their messages carry, not only by how many messages are queued. The executor holds a byte budget for the results it has sent but the settler has not yet received, sized at two of its own chunks, and the settler holds a row budget for the address-index rows it has handed to the background writer but the writer has not yet folded into a flush. In each case the budget travels inside the message and comes back when the message is consumed or dropped, so no consumer has to account for it.
+
+Finally, the settler notifies the executor's in-memory cache (BOB) of settled accounts, completing the feedback loop. That acknowledgement is deliberately unbounded: BOB drains it only while the executor runs and the executor runs only while the settler drains, so a blocking send would deadlock the three stages. It shares the account buffers BOB is already pinning rather than copying them, so its depth costs metadata, not account data.
 
 **Location**: [`core/src/stages/settle.rs`](../core/src/stages/settle.rs)
 
