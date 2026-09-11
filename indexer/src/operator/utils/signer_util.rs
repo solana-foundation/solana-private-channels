@@ -1,228 +1,139 @@
 use once_cell::sync::Lazy;
-use solana_keychain::{Signer, SignerError, SolanaSigner};
+use solana_keychain::{GcpKmsSignerConfig, Signer, SignerError, SolanaSigner};
 use solana_sdk::pubkey::Pubkey;
-use std::env;
+use std::{env, future::Future};
 use tracing::{info, warn};
 
-/// Environment variables for admin signer
-const ADMIN_SIGNER: &str = "ADMIN_SIGNER";
-
-/// Environment variables for operator signer
-const OPERATOR_SIGNER: &str = "OPERATOR_SIGNER";
-
-// In memory env vars (per-signer)
-const ADMIN_PRIVATE_KEY: &str = "ADMIN_PRIVATE_KEY";
-const OPERATOR_PRIVATE_KEY: &str = "OPERATOR_PRIVATE_KEY";
-
-// Vault env vars (per-signer)
-const ADMIN_VAULT_ADDR: &str = "ADMIN_VAULT_ADDR";
-const ADMIN_VAULT_TOKEN: &str = "ADMIN_VAULT_TOKEN";
-const ADMIN_VAULT_KEY_NAME: &str = "ADMIN_VAULT_KEY_NAME";
-const ADMIN_VAULT_PUBKEY: &str = "ADMIN_VAULT_PUBKEY";
-const OPERATOR_VAULT_ADDR: &str = "OPERATOR_VAULT_ADDR";
-const OPERATOR_VAULT_TOKEN: &str = "OPERATOR_VAULT_TOKEN";
-const OPERATOR_VAULT_KEY_NAME: &str = "OPERATOR_VAULT_KEY_NAME";
-const OPERATOR_VAULT_PUBKEY: &str = "OPERATOR_VAULT_PUBKEY";
-
-// Turnkey env vars (per-signer)
-const ADMIN_TURNKEY_API_PUBLIC_KEY: &str = "ADMIN_TURNKEY_API_PUBLIC_KEY";
-const ADMIN_TURNKEY_API_PRIVATE_KEY: &str = "ADMIN_TURNKEY_API_PRIVATE_KEY";
-const ADMIN_TURNKEY_ORGANIZATION_ID: &str = "ADMIN_TURNKEY_ORGANIZATION_ID";
-const ADMIN_TURNKEY_PRIVATE_KEY_ID: &str = "ADMIN_TURNKEY_PRIVATE_KEY_ID";
-const ADMIN_TURNKEY_PUBKEY: &str = "ADMIN_TURNKEY_PUBKEY";
-const OPERATOR_TURNKEY_API_PUBLIC_KEY: &str = "OPERATOR_TURNKEY_API_PUBLIC_KEY";
-const OPERATOR_TURNKEY_API_PRIVATE_KEY: &str = "OPERATOR_TURNKEY_API_PRIVATE_KEY";
-const OPERATOR_TURNKEY_ORGANIZATION_ID: &str = "OPERATOR_TURNKEY_ORGANIZATION_ID";
-const OPERATOR_TURNKEY_PRIVATE_KEY_ID: &str = "OPERATOR_TURNKEY_PRIVATE_KEY_ID";
-const OPERATOR_TURNKEY_PUBKEY: &str = "OPERATOR_TURNKEY_PUBKEY";
-
-// Privy env vars (per-signer)
-const ADMIN_PRIVY_APP_ID: &str = "ADMIN_PRIVY_APP_ID";
-const ADMIN_PRIVY_APP_SECRET: &str = "ADMIN_PRIVY_APP_SECRET";
-const ADMIN_PRIVY_WALLET_ID: &str = "ADMIN_PRIVY_WALLET_ID";
-const OPERATOR_PRIVY_APP_ID: &str = "OPERATOR_PRIVY_APP_ID";
-const OPERATOR_PRIVY_APP_SECRET: &str = "OPERATOR_PRIVY_APP_SECRET";
-const OPERATOR_PRIVY_WALLET_ID: &str = "OPERATOR_PRIVY_WALLET_ID";
-
-#[derive(Debug, Clone, Copy)]
-enum SignerType {
-    Memory,
-    Vault,
-    Turnkey,
-    Privy,
+#[derive(Debug, thiserror::Error)]
+enum SignerConfigError {
+    // Local messages name variables, never their values.
+    #[error("{0}")]
+    InvalidConfig(String),
+    // Preserve Keychain's redaction of backend errors and private key material.
+    #[error(transparent)]
+    Signer(#[from] SignerError),
 }
 
-impl SignerType {
-    fn from_str(s: &str) -> Result<Self, SignerError> {
-        match s.to_lowercase().as_str() {
-            "memory" => Ok(Self::Memory),
-            "vault" => Ok(Self::Vault),
-            "turnkey" => Ok(Self::Turnkey),
-            "privy" => Ok(Self::Privy),
-            other => Err(SignerError::InvalidPrivateKey(format!(
-                "Unsupported signer type: {}. Supported: memory, vault, turnkey, privy",
-                other
-            ))),
-        }
-    }
-}
-
-/// Signer role for selecting env var prefixes
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum SignerRole {
     Admin,
     Operator,
 }
 
-/// Global admin signer (required for both programs)
+impl SignerRole {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Admin => "ADMIN",
+            Self::Operator => "OPERATOR",
+        }
+    }
+
+    fn required_env(self, suffix: &str) -> Result<String, SignerConfigError> {
+        let name = format!("{}_{suffix}", self.prefix());
+        let value = env::var(&name)
+            .map_err(|_| SignerConfigError::InvalidConfig(format!("{name} not set")))?;
+        if value.trim().is_empty() {
+            return Err(SignerConfigError::InvalidConfig(format!(
+                "{name} is set but empty"
+            )));
+        }
+        Ok(value)
+    }
+}
+
 static ADMIN_SIGNER_INSTANCE: Lazy<Signer> =
     Lazy::new(|| load_signer(SignerRole::Admin).expect("ADMIN_SIGNER must be configured"));
 
-/// Global operator signer (optional, only for release funds)
 static OPERATOR_SIGNER_INSTANCE: Lazy<Option<Signer>> =
-    Lazy::new(|| match load_signer(SignerRole::Operator) {
-        Ok(signer) => Some(signer),
-        Err(_) => {
+    Lazy::new(|| load_operator_signer().expect("OPERATOR_SIGNER configuration is invalid"));
+
+fn load_operator_signer() -> Result<Option<Signer>, SignerConfigError> {
+    match env::var("OPERATOR_SIGNER") {
+        Err(env::VarError::NotPresent) => {
             warn!("OPERATOR_SIGNER not configured - release funds will use admin as operator");
-            None
+            Ok(None)
         }
-    });
+        // A configured signer must never silently fall back to a different key.
+        _ => load_signer(SignerRole::Operator).map(Some),
+    }
+}
 
-/// Load signer from environment variables
-fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
-    let (role_name, type_var) = match role {
-        SignerRole::Admin => ("admin", ADMIN_SIGNER),
-        SignerRole::Operator => ("operator", OPERATOR_SIGNER),
-    };
+fn gcp_kms_config(role: SignerRole) -> Result<GcpKmsSignerConfig, SignerConfigError> {
+    let key_name = role.required_env("GCP_KMS_KEY_NAME")?;
+    // Pin a concrete version: rotating a KMS version changes the Solana address.
+    let parts: Vec<_> = key_name.split('/').collect();
+    if !matches!(parts.as_slice(),
+        ["projects", project, "locations", location, "keyRings", ring,
+         "cryptoKeys", key, "cryptoKeyVersions", version]
+        if [project, location, ring, key].iter().all(|part| !part.is_empty())
+            && version.bytes().all(|byte| byte.is_ascii_digit())
+            && version.parse::<u64>().is_ok_and(|version| version > 0))
+    {
+        return Err(SignerConfigError::InvalidConfig(format!(
+            "{}_GCP_KMS_KEY_NAME must be a full GCP KMS cryptoKeyVersions/<number> resource name",
+            role.prefix()
+        )));
+    }
+    let public_key = role.required_env("GCP_KMS_PUBLIC_KEY")?;
+    public_key.parse::<Pubkey>().map_err(|_| {
+        SignerConfigError::InvalidConfig(format!(
+            "{}_GCP_KMS_PUBLIC_KEY must be a base58 Solana public key",
+            role.prefix()
+        ))
+    })?;
+    Ok(GcpKmsSignerConfig {
+        key_name,
+        public_key,
+    })
+}
 
-    let signer_type_str = env::var(type_var)
-        .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", type_var)))?;
-    let signer_type = SignerType::from_str(&signer_type_str)?;
+fn initialize_remote_signer(
+    future: impl Future<Output = Result<Signer, SignerError>>,
+) -> Result<Signer, SignerError> {
+    // Called once during startup on the binary's multi-thread Tokio runtime.
+    // Yield its worker before waiting; plain Handle::block_on would panic here.
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
 
-    let signer = match signer_type {
-        SignerType::Memory => {
-            let private_key_var = match role {
-                SignerRole::Admin => ADMIN_PRIVATE_KEY,
-                SignerRole::Operator => OPERATOR_PRIVATE_KEY,
-            };
-            let private_key = env::var(private_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", private_key_var))
-            })?;
-            // Reject a set-but-empty value: env::var returns Ok("") for a blank var.
-            if private_key.trim().is_empty() {
-                return Err(SignerError::InvalidPrivateKey(format!(
-                    "{} is set but empty",
-                    private_key_var
-                )));
-            }
-
-            Signer::from_memory(&private_key)?
+fn load_signer(role: SignerRole) -> Result<Signer, SignerConfigError> {
+    let signer_type = role.required_env("SIGNER")?.to_lowercase();
+    let signer = match signer_type.as_str() {
+        "memory" => Signer::from_memory(&role.required_env("PRIVATE_KEY")?)?,
+        "vault" => Signer::from_vault(
+            role.required_env("VAULT_ADDR")?,
+            role.required_env("VAULT_TOKEN")?,
+            role.required_env("VAULT_KEY_NAME")?,
+            role.required_env("VAULT_PUBKEY")?,
+            None,
+        )?,
+        "turnkey" => Signer::from_turnkey(
+            role.required_env("TURNKEY_API_PUBLIC_KEY")?,
+            role.required_env("TURNKEY_API_PRIVATE_KEY")?,
+            role.required_env("TURNKEY_ORGANIZATION_ID")?,
+            role.required_env("TURNKEY_PRIVATE_KEY_ID")?,
+            role.required_env("TURNKEY_PUBKEY")?,
+            None,
+        )?,
+        "privy" => initialize_remote_signer(Signer::from_privy(
+            role.required_env("PRIVY_APP_ID")?,
+            role.required_env("PRIVY_APP_SECRET")?,
+            role.required_env("PRIVY_WALLET_ID")?,
+            None,
+        ))?,
+        "gcp_kms" => {
+            let config = gcp_kms_config(role)?;
+            initialize_remote_signer(Signer::from_gcp_kms(config.key_name, config.public_key))?
         }
-        SignerType::Vault => {
-            let (vault_addr_var, vault_token_var, key_name_var, pubkey_var) = match role {
-                SignerRole::Admin => (
-                    ADMIN_VAULT_ADDR,
-                    ADMIN_VAULT_TOKEN,
-                    ADMIN_VAULT_KEY_NAME,
-                    ADMIN_VAULT_PUBKEY,
-                ),
-                SignerRole::Operator => (
-                    OPERATOR_VAULT_ADDR,
-                    OPERATOR_VAULT_TOKEN,
-                    OPERATOR_VAULT_KEY_NAME,
-                    OPERATOR_VAULT_PUBKEY,
-                ),
-            };
-            let vault_addr = env::var(vault_addr_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", vault_addr_var))
-            })?;
-            let vault_token = env::var(vault_token_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", vault_token_var))
-            })?;
-
-            let key_name = env::var(key_name_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", key_name_var)))?;
-            let pubkey = env::var(pubkey_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
-            Signer::from_vault(vault_addr, vault_token, key_name, pubkey)?
-        }
-        SignerType::Turnkey => {
-            let (
-                api_public_key_var,
-                api_private_key_var,
-                organization_id_var,
-                pubkey_var,
-                private_key_id_var,
-            ) = match role {
-                SignerRole::Admin => (
-                    ADMIN_TURNKEY_API_PUBLIC_KEY,
-                    ADMIN_TURNKEY_API_PRIVATE_KEY,
-                    ADMIN_TURNKEY_ORGANIZATION_ID,
-                    ADMIN_TURNKEY_PUBKEY,
-                    ADMIN_TURNKEY_PRIVATE_KEY_ID,
-                ),
-                SignerRole::Operator => (
-                    OPERATOR_TURNKEY_API_PUBLIC_KEY,
-                    OPERATOR_TURNKEY_API_PRIVATE_KEY,
-                    OPERATOR_TURNKEY_ORGANIZATION_ID,
-                    OPERATOR_TURNKEY_PUBKEY,
-                    OPERATOR_TURNKEY_PRIVATE_KEY_ID,
-                ),
-            };
-            let api_public_key = env::var(api_public_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", api_public_key_var))
-            })?;
-            let api_private_key = env::var(api_private_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", api_private_key_var))
-            })?;
-            let organization_id = env::var(organization_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", organization_id_var))
-            })?;
-            let public_key = env::var(pubkey_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
-            let private_key_id = env::var(private_key_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", private_key_id_var))
-            })?;
-            Signer::from_turnkey(
-                api_public_key,
-                api_private_key,
-                organization_id,
-                private_key_id,
-                public_key,
-            )?
-        }
-        SignerType::Privy => {
-            let (app_id_var, app_secret_var, wallet_id_var) = match role {
-                SignerRole::Admin => (
-                    ADMIN_PRIVY_APP_ID,
-                    ADMIN_PRIVY_APP_SECRET,
-                    ADMIN_PRIVY_WALLET_ID,
-                ),
-                SignerRole::Operator => (
-                    OPERATOR_PRIVY_APP_ID,
-                    OPERATOR_PRIVY_APP_SECRET,
-                    OPERATOR_PRIVY_WALLET_ID,
-                ),
-            };
-            let app_id = env::var(app_id_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", app_id_var)))?;
-            let app_secret = env::var(app_secret_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", app_secret_var))
-            })?;
-            let wallet_id = env::var(wallet_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", wallet_id_var))
-            })?;
-
-            // Block on async initialization
-            tokio::runtime::Handle::current()
-                .block_on(Signer::from_privy(app_id, app_secret, wallet_id))?
+        _ => {
+            return Err(SignerConfigError::InvalidConfig(
+                "Unsupported signer type. Supported: memory, vault, turnkey, privy, gcp_kms".into(),
+            ))
         }
     };
-
     info!(
         "Loaded {} signer ({}): {}",
-        role_name,
-        signer_type_str,
+        role.prefix(),
+        signer_type,
         signer.pubkey()
     );
     Ok(signer)
@@ -253,238 +164,179 @@ impl SignerUtil {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // serial_test ensures env-var-mutating tests run sequentially; cargo test
-    // runs tests in parallel by default, which causes races on shared process
-    // environment variables (set_var / remove_var).
     use serial_test::serial;
+    use solana_sdk::signature::{Keypair, Signer as _};
+    use std::ffi::OsString;
 
-    /// Only "memory", "vault", "turnkey", and "privy" are valid signer types; any other
-    /// string — including an empty one — must return an InvalidPrivateKey error.
-    #[test]
-    fn signer_type_from_str_unknown_errors() {
-        let err = SignerType::from_str("unknown").unwrap_err();
-        assert!(
-            err.to_string().contains("Unsupported signer type"),
-            "unexpected error: {err}"
-        );
-        assert!(SignerType::from_str("").is_err());
-    }
+    const KEY_NAME: &str =
+        "projects/test/locations/us-central1/keyRings/channel/cryptoKeys/operator/cryptoKeyVersions/1";
+    const PUBLIC_KEY: &str = "11111111111111111111111111111111";
 
-    /// When ADMIN_SIGNER is absent, load_signer must fail immediately with a message
-    /// naming the missing variable so the operator can identify the misconfiguration.
-    #[test]
-    #[serial]
-    fn load_signer_admin_no_env_var_errors() {
-        let original = env::var(ADMIN_SIGNER).ok();
-        env::remove_var(ADMIN_SIGNER);
+    // Restore only touched variables, including when an assertion panics.
+    struct TestEnv(Vec<(String, Option<OsString>)>);
 
-        let err = load_signer(SignerRole::Admin)
-            .err()
-            .expect("expected error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("ADMIN_SIGNER") || msg.contains("not set"),
-            "error should name the missing var, got: {msg}"
-        );
-
-        if let Some(val) = original {
-            env::set_var(ADMIN_SIGNER, val);
+    impl TestEnv {
+        fn new(values: &[(&str, Option<&str>)]) -> Self {
+            let original = values
+                .iter()
+                .map(|(key, _)| (key.to_string(), env::var_os(key)))
+                .collect();
+            for (key, value) in values {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+            Self(original)
         }
     }
 
-    /// ADMIN_SIGNER=memory requires ADMIN_PRIVATE_KEY to be set; without it load_signer
-    /// must fail and name the missing variable in the error message.
-    #[test]
-    #[serial]
-    fn load_signer_memory_missing_private_key_errors() {
-        let orig_type = env::var(ADMIN_SIGNER).ok();
-        let orig_key = env::var(ADMIN_PRIVATE_KEY).ok();
-        env::set_var(ADMIN_SIGNER, "memory");
-        env::remove_var(ADMIN_PRIVATE_KEY);
-
-        let err = load_signer(SignerRole::Admin)
-            .err()
-            .expect("expected error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("ADMIN_PRIVATE_KEY") || msg.contains("not set"),
-            "error should name the missing var, got: {msg}"
-        );
-
-        env::remove_var(ADMIN_SIGNER);
-        if let Some(val) = orig_type {
-            env::set_var(ADMIN_SIGNER, val);
-        }
-        if let Some(val) = orig_key {
-            env::set_var(ADMIN_PRIVATE_KEY, val);
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
         }
     }
 
-    /// ADMIN_SIGNER=memory with a set-but-empty ADMIN_PRIVATE_KEY (the blanked-secret case)
-    /// must fail closed; env::var returns Ok("") so only an explicit emptiness check catches it.
     #[test]
     #[serial]
-    fn load_signer_memory_empty_private_key_errors() {
-        let orig_type = env::var(ADMIN_SIGNER).ok();
-        let orig_key = env::var(ADMIN_PRIVATE_KEY).ok();
-        env::set_var(ADMIN_SIGNER, "memory");
-
-        for blank in ["", "   ", "\t\n"] {
-            env::set_var(ADMIN_PRIVATE_KEY, blank);
-            let err = load_signer(SignerRole::Admin)
-                .err()
-                .expect("set-but-empty private key must be rejected");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("ADMIN_PRIVATE_KEY") && msg.contains("is set but empty"),
-                "error should flag the empty var, got: {msg}"
-            );
-        }
-
-        env::remove_var(ADMIN_SIGNER);
-        env::remove_var(ADMIN_PRIVATE_KEY);
-        if let Some(val) = orig_type {
-            env::set_var(ADMIN_SIGNER, val);
-        }
-        if let Some(val) = orig_key {
-            env::set_var(ADMIN_PRIVATE_KEY, val);
+    fn required_credentials_are_role_scoped_and_reject_missing_or_blank_values() {
+        for role in [SignerRole::Admin, SignerRole::Operator] {
+            let type_var = format!("{}_SIGNER", role.prefix());
+            for (backend, suffix) in [
+                ("memory", "SIGNER"),
+                ("memory", "PRIVATE_KEY"),
+                ("vault", "VAULT_ADDR"),
+                ("turnkey", "TURNKEY_API_PUBLIC_KEY"),
+                ("privy", "PRIVY_APP_ID"),
+                ("gcp_kms", "GCP_KMS_KEY_NAME"),
+                ("GCP_KMS", "GCP_KMS_KEY_NAME"),
+            ] {
+                let name = format!("{}_{suffix}", role.prefix());
+                let _env = TestEnv::new(&[(&type_var, Some(backend))]);
+                for value in [None, Some(""), Some(" \t\n")] {
+                    let _invalid = TestEnv::new(&[(&name, value)]);
+                    let error = load_signer(role).err().expect("invalid config must fail");
+                    assert!(error.to_string().contains(&name), "{error}");
+                }
+            }
         }
     }
 
-    /// ADMIN_SIGNER=vault requires ADMIN_VAULT_ADDR as the first credential; the error
-    /// message must identify the missing variable so misconfiguration is immediately obvious.
     #[test]
     #[serial]
-    fn load_signer_vault_missing_vault_addr_errors() {
-        let orig_type = env::var(ADMIN_SIGNER).ok();
-        let orig_addr = env::var(ADMIN_VAULT_ADDR).ok();
-        env::set_var(ADMIN_SIGNER, "vault");
-        env::remove_var(ADMIN_VAULT_ADDR);
+    fn kms_configuration_requires_a_version_and_matching_public_key_format() {
+        for role in [SignerRole::Admin, SignerRole::Operator] {
+            let key_var = format!("{}_GCP_KMS_KEY_NAME", role.prefix());
+            let pubkey_var = format!("{}_GCP_KMS_PUBLIC_KEY", role.prefix());
+            let _env = TestEnv::new(&[(&key_var, Some(KEY_NAME)), (&pubkey_var, Some(PUBLIC_KEY))]);
+            let config = gcp_kms_config(role).unwrap();
+            assert_eq!(config.key_name, KEY_NAME);
+            assert_eq!(config.public_key, PUBLIC_KEY);
 
-        let result = load_signer(SignerRole::Admin);
-        assert!(result.is_err());
-        let msg = format!("{}", result.err().expect("expected error"));
-        assert!(
-            msg.contains("ADMIN_VAULT_ADDR") || msg.contains("not set"),
-            "Unexpected error: {}",
-            msg
-        );
-
-        // Restore
-        env::remove_var(ADMIN_SIGNER);
-        if let Some(val) = orig_type {
-            env::set_var(ADMIN_SIGNER, val);
-        }
-        if let Some(val) = orig_addr {
-            env::set_var(ADMIN_VAULT_ADDR, val);
+            for key in [
+                "projects/test",
+                &KEY_NAME.replace("/1", "/latest"),
+                &KEY_NAME.replace("/1", "/0"),
+                &KEY_NAME.replace("/test/", "//"),
+                &format!("{KEY_NAME}/extra"),
+            ] {
+                let _invalid = TestEnv::new(&[(&key_var, Some(key))]);
+                assert!(gcp_kms_config(role)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains(&key_var));
+            }
+            for pubkey in [None, Some(""), Some(" "), Some("invalid-public-key")] {
+                let _invalid = TestEnv::new(&[(&pubkey_var, pubkey)]);
+                let error = gcp_kms_config(role).err().unwrap().to_string();
+                assert!(error.contains(&pubkey_var));
+                assert!(!error.contains("invalid-public-key"));
+            }
         }
     }
 
-    /// ADMIN_SIGNER=turnkey requires ADMIN_TURNKEY_API_PUBLIC_KEY as the first credential;
-    /// the error must name the exact missing variable rather than giving a generic message.
     #[test]
     #[serial]
-    fn load_signer_turnkey_missing_api_public_key_errors() {
-        let orig_type = env::var(ADMIN_SIGNER).ok();
-        let orig_key = env::var(ADMIN_TURNKEY_API_PUBLIC_KEY).ok();
-        env::set_var(ADMIN_SIGNER, "turnkey");
-        env::remove_var(ADMIN_TURNKEY_API_PUBLIC_KEY);
-
-        let result = load_signer(SignerRole::Admin);
-        assert!(result.is_err());
-        let msg = format!("{}", result.err().expect("expected error"));
-        assert!(
-            msg.contains("ADMIN_TURNKEY_API_PUBLIC_KEY") || msg.contains("not set"),
-            "Unexpected error: {}",
-            msg
+    fn only_an_absent_operator_signer_falls_back() {
+        let _env = TestEnv::new(&[("OPERATOR_SIGNER", None)]);
+        assert!(load_operator_signer().unwrap().is_none());
+        for signer_type in ["", "unknown", "gcp_kms", "memory"] {
+            let _invalid = TestEnv::new(&[
+                ("OPERATOR_SIGNER", Some(signer_type)),
+                ("OPERATOR_GCP_KMS_KEY_NAME", None),
+                ("OPERATOR_PRIVATE_KEY", None),
+            ]);
+            assert!(load_operator_signer().is_err());
+        }
+        let keypair = Keypair::new();
+        let encoded_key = keypair.to_base58_string();
+        let _valid = TestEnv::new(&[
+            ("OPERATOR_SIGNER", Some("memory")),
+            ("OPERATOR_PRIVATE_KEY", Some(&encoded_key)),
+        ]);
+        assert_eq!(
+            load_operator_signer().unwrap().unwrap().pubkey(),
+            keypair.pubkey()
         );
-
-        // Restore
-        env::remove_var(ADMIN_SIGNER);
-        if let Some(val) = orig_type {
-            env::set_var(ADMIN_SIGNER, val);
-        }
-        if let Some(val) = orig_key {
-            env::set_var(ADMIN_TURNKEY_API_PUBLIC_KEY, val);
-        }
     }
 
-    /// ADMIN_SIGNER=privy requires ADMIN_PRIVY_APP_ID as the first credential; the error
-    /// must name the missing variable so the operator knows which env var to supply.
     #[test]
     #[serial]
-    fn load_signer_privy_missing_app_id_errors() {
-        let orig_type = env::var(ADMIN_SIGNER).ok();
-        let orig_app_id = env::var(ADMIN_PRIVY_APP_ID).ok();
-        env::set_var(ADMIN_SIGNER, "privy");
-        env::remove_var(ADMIN_PRIVY_APP_ID);
-
-        let result = load_signer(SignerRole::Admin);
-        assert!(result.is_err());
-        let msg = format!("{}", result.err().expect("expected error"));
-        assert!(
-            msg.contains("ADMIN_PRIVY_APP_ID") || msg.contains("not set"),
-            "Unexpected error: {}",
-            msg
-        );
-
-        // Restore
-        env::remove_var(ADMIN_SIGNER);
-        if let Some(val) = orig_type {
-            env::set_var(ADMIN_SIGNER, val);
-        }
-        if let Some(val) = orig_app_id {
-            env::set_var(ADMIN_PRIVY_APP_ID, val);
-        }
+    fn backend_errors_do_not_expose_credentials() {
+        let secret = "invalid-private-key-do-not-log";
+        let _env = TestEnv::new(&[
+            ("OPERATOR_SIGNER", Some("memory")),
+            ("OPERATOR_PRIVATE_KEY", Some(secret)),
+        ]);
+        let error = load_operator_signer().err().unwrap();
+        assert!(matches!(error, SignerConfigError::Signer(_)));
+        assert!(!format!("{error} {error:?}").contains(secret));
     }
 
-    /// When OPERATOR_SIGNER is absent, load_signer returns an error so the caller
-    /// (the global Lazy) can fall back to the admin signer and log a warning.
-    #[test]
-    #[serial]
-    fn load_signer_operator_no_env_var_errors() {
-        let orig = env::var(OPERATOR_SIGNER).ok();
-        env::remove_var(OPERATOR_SIGNER);
-
-        let err = load_signer(SignerRole::Operator)
-            .err()
-            .expect("expected error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("OPERATOR_SIGNER") || msg.contains("not set"),
-            "error should name the missing var, got: {msg}"
-        );
-
-        if let Some(val) = orig {
-            env::set_var(OPERATOR_SIGNER, val);
-        }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_initialization_yields_and_propagates_errors() {
+        let error = initialize_remote_signer(async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Err(SignerError::RemoteApiError(
+                "test initialization failed".into(),
+            ))
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(error, SignerError::RemoteApiError(_)));
     }
 
-    /// OPERATOR_SIGNER=memory requires OPERATOR_PRIVATE_KEY; without it load_signer must
-    /// fail and name the missing variable so the caller can report a clear startup error.
-    #[test]
-    #[serial]
-    fn load_signer_operator_memory_missing_key_errors() {
-        let orig_type = env::var(OPERATOR_SIGNER).ok();
-        let orig_key = env::var(OPERATOR_PRIVATE_KEY).ok();
-        env::set_var(OPERATOR_SIGNER, "memory");
-        env::remove_var(OPERATOR_PRIVATE_KEY);
+    #[tokio::test]
+    async fn signing_preserves_both_transaction_signatures() {
+        use solana_keychain::SignTransactionResult;
+        use solana_sdk::{
+            instruction::{AccountMeta, Instruction},
+            message::Message,
+            transaction::Transaction,
+        };
 
-        let err = load_signer(SignerRole::Operator)
-            .err()
-            .expect("expected error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("OPERATOR_PRIVATE_KEY") || msg.contains("not set"),
-            "error should name the missing var, got: {msg}"
+        let admin = Signer::from_memory(&Keypair::new().to_base58_string()).unwrap();
+        let operator = Signer::from_memory(&Keypair::new().to_base58_string()).unwrap();
+        let instruction = Instruction::new_with_bytes(
+            Pubkey::new_unique(),
+            &[],
+            vec![AccountMeta::new_readonly(operator.pubkey(), true)],
         );
-
-        env::remove_var(OPERATOR_SIGNER);
-        if let Some(val) = orig_type {
-            env::set_var(OPERATOR_SIGNER, val);
-        }
-        if let Some(val) = orig_key {
-            env::set_var(OPERATOR_PRIVATE_KEY, val);
-        }
+        let mut tx = Transaction::new_unsigned(Message::new(&[instruction], Some(&admin.pubkey())));
+        assert!(matches!(
+            admin.sign_transaction(&mut tx).await.unwrap(),
+            SignTransactionResult::Partial(_)
+        ));
+        assert!(matches!(
+            operator.sign_transaction(&mut tx).await.unwrap(),
+            SignTransactionResult::Complete(_)
+        ));
+        tx.verify().unwrap();
     }
 }

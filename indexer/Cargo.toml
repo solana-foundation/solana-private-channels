@@ -77,7 +77,7 @@ yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
-solana-keychain = { version = "0.1.0", features = ["all"] }
+solana-keychain = { workspace = true }
 
 [dev-dependencies]
 bigdecimal = "0.4"

@@ -123,6 +123,38 @@ Each indexed instruction is keyed on the triple **`(signature, instruction_index
 
 Processes pending deposits/withdrawals and executes transactions between Solana Mainnet and the Solana Private Channels payment channel.
 
+### Operator signing
+
+Operators use Solana Keychain with `memory`, `vault`, `turnkey`, `privy`, or
+`gcp_kms` signers. Existing memory configurations remain supported.
+
+For a non-exportable Google Cloud KMS key, configure the operator process with:
+
+```dotenv
+ADMIN_SIGNER=gcp_kms
+ADMIN_GCP_KMS_KEY_NAME=projects/PROJECT/locations/us-central1/keyRings/RING/cryptoKeys/KEY/cryptoKeyVersions/1
+ADMIN_GCP_KMS_PUBLIC_KEY=BASE58_SOLANA_PUBLIC_KEY
+OPERATOR_SIGNER=gcp_kms
+OPERATOR_GCP_KMS_KEY_NAME=projects/PROJECT/locations/us-central1/keyRings/RING/cryptoKeys/KEY/cryptoKeyVersions/1
+OPERATOR_GCP_KMS_PUBLIC_KEY=BASE58_SOLANA_PUBLIC_KEY
+```
+
+- Use `ASYMMETRIC_SIGN` / `EC_SIGN_ED25519`, a numeric key version, and its matching
+  Solana public key. Keychain verifies returned signatures against that public key.
+- Credentials use ADC: attach a runtime service account with key-scoped
+  `roles/cloudkms.signer` and allow access to GCP metadata and KMS. No exported
+  private key or service-account JSON key is needed.
+- Compose uses `ADMIN_*` settings for both roles; also set
+  `PRIVATE_CHANNEL_ADMIN_KEYS` to this public key. Direct binary deployments may
+  configure roles independently. Omitted `OPERATOR_SIGNER` uses the admin signer;
+  explicitly invalid configuration fails startup. Signing errors never select a fallback key.
+- `ADMIN_*` is the **channel admin service identity** (receipt mint authority and
+  fee payer), not `Instance.admin`. Never mount the offline escrow administrator.
+  `ADMIN_PRIVATE_KEY` and `OPERATOR_PRIVATE_KEY` are unused with KMS.
+- A new key version means a **new Solana address**. Authorize it onchain, update
+  the channel admin allowlist, and fund it before switching. Environment changes
+  alone do not rotate existing mint authorities.
+
 ### Three-Stage Pipeline
 
 **Location**: [`indexer/src/operator/`](../indexer/src/operator/)
