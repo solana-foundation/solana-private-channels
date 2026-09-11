@@ -104,6 +104,15 @@ fn legacy_memo(blockhash: Hash, memo: &str) -> Transaction {
 
 /// A signed v1 transaction carrying one memo, built the way a wallet builds it.
 fn v1_memo(blockhash: Hash, memo: &str) -> VersionedTransaction {
+    v1_memo_with(blockhash, memo, v1::TransactionConfig::empty())
+}
+
+/// The same memo, carrying the compute budget settings a v1 message allows.
+fn v1_memo_with(
+    blockhash: Hash,
+    memo: &str,
+    config: v1::TransactionConfig,
+) -> VersionedTransaction {
     let payer = Keypair::new();
     let message = v1::Message::new(
         MessageHeader {
@@ -111,7 +120,7 @@ fn v1_memo(blockhash: Hash, memo: &str) -> VersionedTransaction {
             num_readonly_signed_accounts: 0,
             num_readonly_unsigned_accounts: 1,
         },
-        v1::TransactionConfig::empty(),
+        config,
         blockhash,
         vec![payer.pubkey(), spl_memo::id()],
         vec![CompiledInstruction {
@@ -239,4 +248,40 @@ async fn v1_and_legacy_transactions_land_and_read_back_across_a_restart() {
     );
 
     restarted.shutdown().await;
+}
+
+/// The channel runs every transaction under one gasless budget, so the compute
+/// budget a v1 message carries must be ignored. Each setting below would make
+/// the transaction fail if it were honoured, so landing it proves all of them are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_v1_transactions_own_compute_budget_is_ignored() {
+    let (_pg, db_url) = start_postgres().await;
+    let (handles, client) = start_node(node_config(db_url, free_port())).await;
+    let blockhash = client.get_latest_blockhash().await.expect("blockhash");
+
+    let hostile = v1::TransactionConfig {
+        // Far below what a memo consumes, so honouring it would exhaust compute.
+        compute_unit_limit: Some(1),
+        // Smaller than any program account, so honouring it would refuse the load.
+        loaded_accounts_data_size_limit: Some(1),
+        // More than an unfunded fee payer holds, so charging it would fail.
+        priority_fee: Some(1_000_000_000),
+        heap_size: Some(256 * 1024),
+    };
+    let signature = client
+        .send_transaction(&v1_memo_with(blockhash, "hostile budget", hostile))
+        .await
+        .expect("a v1 transaction with its own budget is accepted");
+
+    let tx = read_back(&client, &signature).await;
+    assert!(
+        !failed(&tx),
+        "a v1 transaction's budget settings must not affect execution"
+    );
+    assert!(
+        compute_units(&tx).is_some_and(|units| units > 1),
+        "the transaction must run past the 1 compute unit it asked for"
+    );
+
+    handles.shutdown().await;
 }
