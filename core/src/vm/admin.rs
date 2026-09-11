@@ -85,7 +85,7 @@ impl AdminVm {
     /// initializes in one step so mint addresses mirror mainnet.
     ///
     /// Rent exemption is deliberately not checked. Execution is gasless
-    /// (`GaslessRentCollector` reports zero rent) and `create_mint_account`
+    /// (the rent rate is zero) and `create_mint_account`
     /// holds 1 lamport by design.
     fn check_initialize_mint_target(
         existing: Option<&AccountSharedData>,
