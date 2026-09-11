@@ -5,9 +5,10 @@ use crate::{
         assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account, get_or_create_associated_token_account_2022,
         get_token_balance, hook_extras_for_mint, malicious_hook_extras, set_mint,
-        set_mint_2022_basic, set_mint_with_decimals, set_token_2022_with_hook_account,
-        set_token_balance, setup_hook_mint, setup_malicious_hook_mint, setup_test_balances,
-        TestContext, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
+        set_mint_2022_basic, set_mint_2022_with_permanent_delegate, set_mint_with_decimals,
+        set_mint_with_freeze_authority, set_token_2022_with_hook_account, set_token_balance,
+        setup_hook_mint, setup_malicious_hook_mint, setup_test_balances, TestContext,
+        ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
         INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
@@ -1232,4 +1233,236 @@ fn test_deposit_rejected_after_mint_token_program_change() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, MINT_PROFILE_CHANGED_ERROR);
+}
+
+// A clean mint is reviewed and allowed, then closed at zero supply under
+// MintCloseAuthority and recreated at the same address with a capability it did
+// not have. Decimals, token program and freeze authority all still match, so the
+// extension bitmask is the only thing that can catch it.
+#[test]
+fn test_deposit_rejected_after_mint_gains_extension() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint_2022_basic(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Same address, same 6 decimals, same token program, still no freeze
+    // authority, but now carrying PermanentDelegate.
+    set_mint_2022_with_permanent_delegate(&mut context, &mint.pubkey());
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, MINT_PROFILE_CHANGED_ERROR);
+}
+
+// A freeze authority cannot be re-enabled once revoked, so a mint carrying one
+// where the reviewed profile had none was recreated.
+#[test]
+fn test_deposit_rejected_after_mint_gains_freeze_authority() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Same address and decimals, but now freezable.
+    set_mint_with_freeze_authority(&mut context, &mint.pubkey(), &admin.pubkey());
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, MINT_PROFILE_CHANGED_ERROR);
+}
+
+// The other direction of the same rule. Revoking a freeze authority is a real
+// thing issuers do and leaves the mint strictly safer, so it must not strand
+// deposits. Tightening the check into an equality breaks this test.
+#[test]
+fn test_deposit_succeeds_after_freeze_authority_revoked() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint_with_freeze_authority(&mut context, &mint.pubkey(), &admin.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // The issuer revokes it; everything else is unchanged.
+    set_mint(&mut context, &mint.pubkey());
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&user])
+        .expect("Deposit should succeed after a freeze authority is revoked");
 }

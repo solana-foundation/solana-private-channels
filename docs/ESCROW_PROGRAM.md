@@ -324,15 +324,23 @@ profile recorded when it was allowed.
 | `withdrawals_blocked` | bool | `ReleaseFunds` rejects this mint |
 | `decimals` | u8 | Mint decimals at `AllowMint`; `Deposit` rejects a mismatch |
 | `token_program` | Pubkey | Token program at `AllowMint`; `Deposit` rejects a mismatch |
+| `extensions` | u64 | Bitmask of the mint's Token-2022 `ExtensionType` discriminants (bit N = type N), 0 for a legacy mint; `Deposit` rejects a mismatch |
+| `has_freeze_authority` | bool | Whether the mint had a freeze authority at `AllowMint`; `Deposit` rejects *gaining* one |
 
 A mint carrying `MintCloseAuthority` can be closed and recreated at the same address
-with either value changed. Closing requires zero supply, so that window is while the
+with any of these changed. Closing requires zero supply, so that window is while the
 escrow holds none of the mint — in practice between `AllowMint` and the first deposit,
 which is also when the channel-side mint is initialized from the allow-time decimals.
-`Deposit` compares both and fails with `MintProfileChanged`; an admin blocks and
+`Deposit` compares them and fails with `MintProfileChanged`; an admin blocks and
 re-allows to re-pin. A decimals change also needs the channel mint re-created,
 since re-allow leaves it on the old decimals. `ReleaseFunds` does not compare them, since the escrow can only
 hold a balance while the profile is unchangeable.
+
+Freeze authority is compared in one direction only: it can be revoked but never
+re-added, so losing one is the same mint behaving more safely while gaining one
+means a recreate. The `extensions` mask pins *which* extensions exist, not their
+contents — a transfer fee raised, a hook program swapped or a permanent delegate
+rotated leaves it unchanged, and those stay issuer-trust decisions.
 
 ## Errors
 

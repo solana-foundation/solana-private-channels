@@ -370,6 +370,7 @@ async fn setup_hook_mint_env(db_name: &str) -> Result<HookMintEnv, Box<dyn std::
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,

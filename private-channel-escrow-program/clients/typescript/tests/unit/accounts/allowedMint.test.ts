@@ -16,7 +16,9 @@ const EXPECTED_SIZE =
     1 + // depositsBlocked
     1 + // withdrawalsBlocked
     1 + // decimals
-    32; // tokenProgram
+    32 + // tokenProgram
+    8 + // extensions
+    1; // hasFreezeAuthority
 
 describe('AllowedMint Account', () => {
     describe('Encoder/Decoder functionality', () => {
@@ -28,6 +30,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: false,
                 decimals: 6,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: 0n,
+                hasFreezeAuthority: false,
             };
 
             // Test encoding
@@ -51,6 +55,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: true,
                 decimals: 9,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: 0x0000_0000_0400_000an,
+                hasFreezeAuthority: true,
             };
 
             // Test combined codec
@@ -73,6 +79,8 @@ describe('AllowedMint Account', () => {
                     withdrawalsBlocked: false,
                     decimals: 6,
                     tokenProgram: TOKEN_PROGRAM,
+                    extensions: 0n,
+                    hasFreezeAuthority: false,
                 };
 
                 const codec = getAllowedMintCodec();
@@ -81,6 +89,30 @@ describe('AllowedMint Account', () => {
 
                 expect(decodedAllowedMint.bump).toBe(bump);
                 expect(typeof decodedAllowedMint.bump).toBe('number');
+            }
+        });
+
+        // The extension bitmask is the widest field and the only one that is not
+        // a byte, so a wrong-endian or truncated read shows up here first.
+        it('should round-trip extension bitmask values (u64)', () => {
+            const testMasks = [0n, 1n, 1n << 26n, 0x0000_0000_0400_000an, (1n << 64n) - 1n];
+
+            for (const extensions of testMasks) {
+                const testAllowedMint: AllowedMint = {
+                    discriminator: 1,
+                    bump: 250,
+                    depositsBlocked: false,
+                    withdrawalsBlocked: false,
+                    decimals: 6,
+                    tokenProgram: TOKEN_PROGRAM,
+                    extensions,
+                    hasFreezeAuthority: false,
+                };
+
+                const codec = getAllowedMintCodec();
+                const decodedAllowedMint = codec.decode(codec.encode(testAllowedMint));
+
+                expect(decodedAllowedMint.extensions).toBe(extensions);
             }
         });
     });
@@ -94,6 +126,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: false,
                 decimals: 6,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: 0n,
+                hasFreezeAuthority: false,
             };
 
             // Verify all required fields are present
@@ -103,6 +137,8 @@ describe('AllowedMint Account', () => {
             expect(testAllowedMint).toHaveProperty('withdrawalsBlocked');
             expect(testAllowedMint).toHaveProperty('decimals');
             expect(testAllowedMint).toHaveProperty('tokenProgram');
+            expect(testAllowedMint).toHaveProperty('extensions');
+            expect(testAllowedMint).toHaveProperty('hasFreezeAuthority');
         });
 
         it('should validate allowedMint structure field types', () => {
@@ -113,6 +149,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: false,
                 decimals: 6,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: 0n,
+                hasFreezeAuthority: false,
             };
 
             // Verify field types
@@ -122,11 +160,13 @@ describe('AllowedMint Account', () => {
             expect(typeof testAllowedMint.withdrawalsBlocked).toBe('boolean');
             expect(typeof testAllowedMint.decimals).toBe('number');
             expect(typeof testAllowedMint.tokenProgram).toBe('string');
+            expect(typeof testAllowedMint.extensions).toBe('bigint');
+            expect(typeof testAllowedMint.hasFreezeAuthority).toBe('boolean');
         });
     });
 
     describe('Size validation', () => {
-        it('should report correct account size (37 bytes)', () => {
+        it('should report correct account size (46 bytes)', () => {
             const accountSize = getAllowedMintEncoder().fixedSize;
             expect(accountSize).toBe(EXPECTED_SIZE);
         });
@@ -139,6 +179,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: false,
                 decimals: 6,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: 0n,
+                hasFreezeAuthority: false,
             };
 
             const encoder = getAllowedMintEncoder();
@@ -160,6 +202,8 @@ describe('AllowedMint Account', () => {
                     withdrawalsBlocked: false,
                     decimals: 0,
                     tokenProgram: TOKEN_PROGRAM,
+                    extensions: 0n,
+                    hasFreezeAuthority: false,
                 },
                 {
                     discriminator: 255,
@@ -168,6 +212,8 @@ describe('AllowedMint Account', () => {
                     withdrawalsBlocked: true,
                     decimals: 255,
                     tokenProgram: TOKEN_PROGRAM,
+                    extensions: (1n << 64n) - 1n,
+                    hasFreezeAuthority: true,
                 },
                 {
                     discriminator: 127,
@@ -176,6 +222,8 @@ describe('AllowedMint Account', () => {
                     withdrawalsBlocked: false,
                     decimals: 9,
                     tokenProgram: TOKEN_PROGRAM,
+                    extensions: 1n << 14n,
+                    hasFreezeAuthority: false,
                 },
             ];
 
@@ -197,6 +245,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: false,
                 decimals: 0,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: 0n,
+                hasFreezeAuthority: false,
             };
 
             const codec = getAllowedMintCodec();
@@ -214,6 +264,8 @@ describe('AllowedMint Account', () => {
                 withdrawalsBlocked: true,
                 decimals: 255,
                 tokenProgram: TOKEN_PROGRAM,
+                extensions: (1n << 64n) - 1n,
+                hasFreezeAuthority: true,
             };
 
             const codec = getAllowedMintCodec();

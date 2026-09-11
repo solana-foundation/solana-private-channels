@@ -410,6 +410,39 @@ pub fn set_mint(context: &mut TestContext, mint: &Pubkey) {
     set_mint_with_decimals(context, mint, 6);
 }
 
+/// Same as [`set_mint`] but carrying a freeze authority, for the one-directional
+/// profile check: gaining one means a recreate, losing one does not.
+pub fn set_mint_with_freeze_authority(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    freeze_authority: &Pubkey,
+) {
+    let mint_account = Mint {
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::Some(*freeze_authority),
+        mint_authority: COption::None,
+        supply: 1_000_000,
+    };
+
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(mint_account, &mut data).expect("Failed to pack mint account");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set mint account");
+}
+
 pub fn set_mint_with_decimals(context: &mut TestContext, mint: &Pubkey, decimals: u8) {
     let mint_account = Mint {
         decimals,

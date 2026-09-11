@@ -216,10 +216,9 @@ to say explicitly what the user is owed.
      intact, so nothing is lost. Re-open the gate (`BlockMint` with
      `block_withdrawals: false`, or `AllowMint`, which re-opens both), then re-arm the
      row. Blocking withdrawals is deliberate, so confirm with whoever set it before
-     re-opening. Note the gate is only read on a mint's first withdrawal per
-     operator process, so rows for a mint it had already served terminalize through
-     remint instead of parking here; restart the operator after a block to close
-     that window. [Escalate](_escalation.md) (Tier 2).
+     re-opening. No operator restart is needed either way: the gate is mirrored onto
+     the `mints` row and read on every withdrawal, so a block and a re-open both take
+     effect once the indexer has processed that slot. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook validation account missing for mint:` - the mint's
      `TransferHook` points at a hook program whose `ExtraAccountMetaList` does not
      exist, so Token-2022 can resolve no transfer of it and no release can settle.

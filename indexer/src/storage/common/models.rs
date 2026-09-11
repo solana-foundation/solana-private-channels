@@ -164,15 +164,14 @@ pub struct DbMint {
     pub mint_address: String,
     pub decimals: i16,
     pub token_program: String,
-    /// Current allow/block state (`"allowed"` | `"blocked"`)
+    /// Current allow/block state (`"allowed"` | `"blocked"`). Mirrors the deposit
+    /// gate only; the withdrawal gate is the separate flag below.
     pub status: String,
+    /// Current withdrawal gate, mirrored from the latest `mint_status_history`
+    /// transition. Read per withdrawal so an admin blocking a live mint takes
+    /// effect without restarting the operator.
+    pub withdrawals_blocked: bool,
     pub created_at: DateTime<Utc>,
-    /// `None` = the on-chain PausableConfig extension state is unknown to us yet.
-    /// Resolved lazily by the operator's MintCache on first RPC fetch.
-    pub is_pausable: Option<bool>,
-    /// `None` = the on-chain PermanentDelegate extension state is unknown to us yet.
-    /// Resolved lazily alongside `is_pausable` in a single RPC fetch.
-    pub has_permanent_delegate: Option<bool>,
 }
 
 impl DbMint {
@@ -183,9 +182,8 @@ impl DbMint {
             token_program,
             // A DbMint is only ever constructed on the allow path.
             status: "allowed".to_string(),
+            withdrawals_blocked: false,
             created_at: Utc::now(),
-            is_pausable: None,
-            has_permanent_delegate: None,
         }
     }
 }
@@ -195,6 +193,9 @@ impl DbMint {
 pub struct DbMintStatus {
     pub mint_address: String,
     pub status: String,
+    /// Withdrawal gate as of this transition. Slot-ordered like `status`, so a
+    /// replayed or out-of-order BlockMint cannot clobber the current gate.
+    pub withdrawals_blocked: bool,
     pub effective_slot: i64,
     pub signature: String,
     pub created_at: DateTime<Utc>,

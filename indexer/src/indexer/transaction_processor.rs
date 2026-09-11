@@ -249,6 +249,7 @@ impl TransactionProcessor {
                     mint_statuses.push(DbMintStatus {
                         mint_address: change.mint_address,
                         status: change.status.as_str().to_string(),
+                        withdrawals_blocked: change.withdrawals_blocked,
                         effective_slot: slot as i64,
                         signature: sig,
                         created_at: chrono::Utc::now(),
@@ -497,7 +498,11 @@ impl MintStatus {
 /// A mint allow/block transition to record in `mint_status_history`.
 struct MintStatusChange {
     mint_address: String,
+    /// The deposit gate.
     status: MintStatus,
+    /// The withdrawal gate, carried separately because the two are independent
+    /// on chain.
+    withdrawals_blocked: bool,
 }
 
 /// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction,
@@ -580,14 +585,18 @@ fn convert_to_db_models(
                         Some(MintStatusChange {
                             mint_address,
                             status: MintStatus::Allowed,
+                            // AllowMint re-opens both gates on chain, so a
+                            // re-allow must clear the withdrawal gate too.
+                            withdrawals_blocked: false,
                         }),
                         None,
                         None,
                     )
                 }
-                // This status tracks the deposit gate only, since its one reader
-                // is the deposit-slot check. The withdrawal gate is read live
-                // from the AllowedMint account in the withdrawal pre-flight.
+                // Both gates are recorded. `status` feeds the deposit-slot check;
+                // `withdrawals_blocked` is mirrored onto the mints row and read by
+                // the withdrawal pre-flight, so a mint blocked mid-run stops
+                // releasing without an operator restart.
                 EscrowInstruction::BlockMint { accounts, data } => (
                     None,
                     Some(MintStatusChange {
@@ -597,6 +606,7 @@ fn convert_to_db_models(
                         } else {
                             MintStatus::Allowed
                         },
+                        withdrawals_blocked: data.block_withdrawals,
                     }),
                     None,
                     None,
@@ -927,14 +937,13 @@ mod tests {
         let status = status.expect("AllowMint must emit a status change");
         assert_eq!(status.status, MintStatus::Allowed);
         assert_eq!(status.mint_address, make_pubkey(2).to_string());
+        // AllowMint re-opens both gates on chain, so a re-allow must clear a
+        // withdrawal block the mirror is still carrying.
+        assert!(!status.withdrawals_blocked);
         let mint = mint.unwrap();
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
-        // The indexer leaves Token-2022 extension resolution to the operator —
-        // both flags must stay None at AllowMint time.
-        assert_eq!(mint.is_pausable, None);
-        assert_eq!(mint.has_permanent_delegate, None);
     }
 
     #[test]
@@ -948,6 +957,8 @@ mod tests {
         let status = status.expect("BlockMint must emit a status change");
         assert_eq!(status.status, MintStatus::Blocked);
         assert_eq!(status.mint_address, make_pubkey(2).to_string());
+        // Deposits only: the withdrawal gate must not be dragged along with it.
+        assert!(!status.withdrawals_blocked);
     }
 
     // The status column tracks the deposit gate, so a withdrawals-only block
@@ -963,6 +974,8 @@ mod tests {
         let (_, status, _, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         let status = status.expect("BlockMint must emit a status change");
         assert_eq!(status.status, MintStatus::Allowed);
+        // This is the flag the withdrawal pre-flight reads once it is mirrored.
+        assert!(status.withdrawals_blocked);
     }
 
     #[test]

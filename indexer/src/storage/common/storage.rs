@@ -42,7 +42,6 @@ pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
 pub mod sender_lock;
-pub mod set_mint_extension_flags;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
 pub mod try_complete_processing;
@@ -223,24 +222,6 @@ impl Storage {
     /// Get mint metadata by address
     pub async fn get_mint(&self, mint_address: &str) -> Result<Option<DbMint>, StorageError> {
         get_mint::get_mint(self, mint_address).await
-    }
-
-    /// Write-back the on-chain extension presence (PausableConfig,
-    /// PermanentDelegate) for a mint. Called by the operator's MintCache
-    /// after a single RPC fetch that resolves both flags together.
-    pub async fn set_mint_extension_flags(
-        &self,
-        mint_address: &str,
-        is_pausable: bool,
-        has_permanent_delegate: bool,
-    ) -> Result<(), StorageError> {
-        set_mint_extension_flags::set_mint_extension_flags(
-            self,
-            mint_address,
-            is_pausable,
-            has_permanent_delegate,
-        )
-        .await
     }
 
     /// Return per-mint aggregate balances (completed deposits minus withdrawals) for
@@ -1411,27 +1392,60 @@ mod tests {
         );
     }
 
-    /// A re-allow can follow a close and recreate, so the extension flags must not
-    /// survive it. Keeping them would leave the pause and drain pre-flights running
-    /// on the pre-recreate profile for the life of the row.
+    /// The withdrawal gate rides the same slot-ordered history as `status`, which
+    /// is what stops a replayed BlockMint from reopening it. The withdrawal
+    /// pre-flight reads the mirrored column per withdrawal, so this is the query
+    /// that decides whether a blocked mint actually stops releasing.
     #[tokio::test]
-    async fn upsert_mints_batch_resets_extension_flags_on_re_allow() {
+    async fn sync_mint_status_mirrors_the_withdrawal_gate_independently() {
         let (storage, _mock) = make_mock_storage();
-        let mint = DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string());
         storage
-            .upsert_mints_batch(std::slice::from_ref(&mint))
-            .await
-            .unwrap();
-        storage
-            .set_mint_extension_flags("m1", true, true)
+            .upsert_mints_batch(&[DbMint::new("m1".to_string(), 6, TOKEN_PROGRAM.to_string())])
             .await
             .unwrap();
 
-        storage.upsert_mints_batch(&[mint]).await.unwrap();
+        // Withdrawals blocked while deposits stay open: the two gates are set
+        // independently on chain, so the mirror has to keep them apart.
+        storage
+            .insert_mint_statuses_batch(&[DbMintStatus {
+                mint_address: "m1".to_string(),
+                status: "allowed".to_string(),
+                withdrawals_blocked: true,
+                effective_slot: 20,
+                signature: "sig-block-withdrawals".to_string(),
+                created_at: Utc::now(),
+            }])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
 
         let row = storage.get_mint("m1").await.unwrap().unwrap();
-        assert_eq!(row.is_pausable, None);
-        assert_eq!(row.has_permanent_delegate, None);
+        assert!(row.withdrawals_blocked);
+        assert_eq!(row.status, "allowed");
+
+        // A re-allow at a later slot reopens it, which is how an admin re-arms
+        // parked rows without restarting the operator.
+        storage
+            .insert_mint_statuses_batch(&[DbMintStatus {
+                mint_address: "m1".to_string(),
+                status: "allowed".to_string(),
+                withdrawals_blocked: false,
+                effective_slot: 30,
+                signature: "sig-reallow".to_string(),
+                created_at: Utc::now(),
+            }])
+            .await
+            .unwrap();
+        storage.sync_mint_status(&["m1".to_string()]).await.unwrap();
+
+        assert!(
+            !storage
+                .get_mint("m1")
+                .await
+                .unwrap()
+                .unwrap()
+                .withdrawals_blocked
+        );
     }
 
     #[tokio::test]
@@ -1833,6 +1847,7 @@ mod tests {
         let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
         storage
             .insert_mint_statuses_batch(&[DbMintStatus {
+                withdrawals_blocked: false,
                 mint_address: mint.clone(),
                 status: "allowed".to_string(),
                 effective_slot: 100,
@@ -1855,6 +1870,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
         let row = DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint.clone(),
             status: "allowed".to_string(),
             effective_slot: 100,
@@ -1891,6 +1907,7 @@ mod tests {
 
     fn status_row(mint: &str, status: &str, slot: i64) -> DbMintStatus {
         DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint.to_string(),
             status: status.to_string(),
             effective_slot: slot,

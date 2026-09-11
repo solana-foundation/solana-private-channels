@@ -18,7 +18,7 @@ use pinocchio_token_2022::{
     state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
     ID as TOKEN_2022_PROGRAM_ID,
 };
-use spl_token_2022::extension::StateWithExtensions;
+use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
 use spl_token_2022::state::Mint as Token2022MintState;
 
 use crate::error::PrivateChannelEscrowProgramError;
@@ -118,23 +118,53 @@ pub fn get_mint_decimals(mint_info: &AccountView) -> Result<u8, ProgramError> {
     Err(PrivateChannelEscrowProgramError::InvalidMint.into())
 }
 
-/// Validates the account really is a mint. The decimals read above is
-/// unchecked, so this is what proves the bytes behind it.
+/// The mint properties AllowMint pins and Deposit re-checks.
+pub struct MintProfile {
+    pub decimals: u8,
+    /// Bit N is set when the mint carries the `ExtensionType` whose
+    /// discriminant is N. Always 0 for a legacy SPL mint.
+    pub extensions: u64,
+    pub has_freeze_authority: bool,
+}
+
+/// Reads a mint's pinned profile, and in doing so proves the account really is
+/// a mint: `get_mint_decimals` casts unchecked, this is what validates the
+/// bytes behind it.
 ///
-/// No extension is rejected. Pause and permanent delegate are handled
-/// off-chain by the operator's withdrawal pre-flight, and `TransferHook`
-/// mints transfer through [`transfer_checked_cpi`] with client-resolved
-/// extras. Called at AllowMint, where decimals are pinned into state with
-/// no transfer CPI behind them; the transfer paths rely on
-/// `TransferChecked`, which re-validates the mint against both ATAs.
+/// No extension is rejected. Pause and permanent delegate are handled off-chain
+/// by the operator's withdrawal pre-flight, and `TransferHook` mints transfer
+/// through [`transfer_checked_cpi`] with client-resolved extras. What the
+/// profile buys is change detection: a mint closed at zero supply and recreated
+/// at the same address can come back with a different capability set, and the
+/// admin's original review would never see it.
 #[inline(always)]
-pub fn validate_mint(mint_info: &AccountView) -> ProgramResult {
+pub fn read_mint_profile(mint_info: &AccountView) -> Result<MintProfile, ProgramError> {
     let data = mint_info.try_borrow()?;
 
     if mint_info.owned_by(&TOKEN_2022_PROGRAM_ID) {
-        StateWithExtensions::<Token2022MintState>::unpack(&data)
+        let state = StateWithExtensions::<Token2022MintState>::unpack(&data)
             .map_err(|_| PrivateChannelEscrowProgramError::InvalidMint)?;
-        return Ok(());
+
+        let mut extensions: u64 = 0;
+        for extension in state
+            .get_extension_types()
+            .map_err(|_| PrivateChannelEscrowProgramError::InvalidMint)?
+        {
+            let bit = u16::from(extension);
+            // A u64 holds discriminants 0..=63; today's highest is 27. A mint
+            // carrying one past that is not a profile we can pin, so refuse it
+            // rather than record a mask that silently ignores it.
+            if bit >= 64 {
+                return Err(PrivateChannelEscrowProgramError::InvalidMint.into());
+            }
+            extensions |= 1u64 << bit;
+        }
+
+        return Ok(MintProfile {
+            decimals: state.base.decimals,
+            extensions,
+            has_freeze_authority: state.base.freeze_authority.is_some(),
+        });
     }
 
     // Legacy mints carry no extensions, so the exact size separates one
@@ -143,7 +173,12 @@ pub fn validate_mint(mint_info: &AccountView) -> ProgramResult {
         return Err(PrivateChannelEscrowProgramError::InvalidMint.into());
     }
 
-    Ok(())
+    let mint = unsafe { TokenMint::from_bytes_unchecked(&data) };
+    Ok(MintProfile {
+        decimals: mint.decimals(),
+        extensions: 0,
+        has_freeze_authority: mint.has_freeze_authority(),
+    })
 }
 
 /// Max transfer-hook accounts per `TransferChecked` CPI: hook program,

@@ -566,24 +566,25 @@ async fn build_release_funds(
     )))
 }
 
-/// Reject a withdrawal the escrow would not accept a release for. The predicate is
-/// the on-chain `AllowedMint` account, the same one `release_funds` requires, so a
-/// row that fails here could never have landed and a row that passes is not blocked.
-async fn check_withdrawal_mint_supported(
+/// Read the withdrawal's `AllowedMint`, rejecting one the escrow would not accept a
+/// release for. The predicate is the same account `release_funds` requires, so a row
+/// that fails here could never have landed and a row that passes is not blocked.
+///
+/// Read on every withdrawal rather than cached. The account carries mutable admin
+/// state (the withdrawal gate) and the mint profile the admin last reviewed, both of
+/// which change while the operator is running; a verdict kept for the process
+/// lifetime answers for a mint that may no longer be the one at that address. The
+/// returned account is the operator's only source for those properties, so the
+/// pre-flight and hook resolution take it from here instead of resolving the mint
+/// themselves.
+async fn read_withdrawal_allowed_mint(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
-) -> Result<Option<BailReason>, OperatorError> {
+) -> Result<Result<AllowedMint, BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
         reason: e.to_string(),
     })?;
-
-    // A verdict already recorded for this mint stands for the process lifetime, so a
-    // busy mint costs one allowlist read rather than one per withdrawal. An admin
-    // blocking a mint mid-run is caught on the next restart.
-    if processor_state.mint_cache.has_existence_floor(&mint) {
-        return Ok(None);
-    }
 
     let allowed_mint_pda = processor_state
         .release_funds_state
@@ -591,22 +592,31 @@ async fn check_withdrawal_mint_supported(
         .ok_or(OperatorError::MissingBuilder)?
         .get_allowed_mint_pda(&mint);
 
+    // A floor already proves this account existed, so it doubles as the freshness
+    // anchor and spares the extra round-trip on every withdrawal after the first.
+    let recorded_floor = processor_state.mint_cache.existence_floor(&mint);
+
     let rpc = processor_state
         .mint_cache
         .rpc_client()
         .ok_or_else(|| OperatorError::RpcError("mint allowlist check requires RPC".to_string()))?;
+    let commitment = rpc.rpc_client.commitment();
 
     // A null only proves "never allowlisted" if the node has caught up. Anchor on the
     // tip it reports and require the read to answer at or past it, so a lagging backend
     // errors instead of denying an allowlist entry it simply has not seen yet.
-    let commitment = rpc.rpc_client.commitment();
-    let (ref_slot, _) = rpc
-        .get_latest_blockhash_with_context(commitment)
-        .await
-        .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?;
+    let min_slot = match recorded_floor {
+        Some(floor) => floor,
+        None => {
+            rpc.get_latest_blockhash_with_context(commitment)
+                .await
+                .map_err(|e| OperatorError::RpcError(format!("allowlist freshness anchor: {e}")))?
+                .0
+        }
+    };
 
     let response = rpc
-        .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(ref_slot))
+        .get_account_with_context_min_slot(&allowed_mint_pda, commitment, Some(min_slot))
         .await
         .map_err(|e| OperatorError::RpcError(format!("get_account({allowed_mint_pda}): {e}")))?;
 
@@ -616,7 +626,7 @@ async fn check_withdrawal_mint_supported(
         .value
         .filter(|account| account.owner == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
     else {
-        return Ok(Some(BailReason::new(
+        return Ok(Err(BailReason::new(
             metrics::BAIL_REASON_UNSUPPORTED_MINT,
             format!("unsupported withdrawal mint: {mint} (no escrow allowlist account)"),
         )));
@@ -626,7 +636,7 @@ async fn check_withdrawal_mint_supported(
     // operator does not know. A release against it would fail anyway, so park
     // instead of raising a transient the task would restart on forever.
     let Ok(allowed_mint) = AllowedMint::from_bytes(&account.data) else {
-        return Ok(Some(BailReason::new(
+        return Ok(Err(BailReason::new(
             metrics::BAIL_REASON_UNSUPPORTED_MINT,
             format!("unsupported withdrawal mint: {mint} (allowlist account failed to decode)"),
         )));
@@ -635,11 +645,8 @@ async fn check_withdrawal_mint_supported(
     // release_funds rejects a withdrawal-blocked mint on-chain, and that failure is
     // permanent, so letting it broadcast would terminalize the row through the
     // remint path. Parking keeps it re-armable once the admin re-opens the gate.
-    //
-    // Checked before the existence floor below so a blocked mint is never cached as
-    // clear, which is what lets a re-armed row proceed without an operator restart.
     if allowed_mint.withdrawals_blocked {
-        return Ok(Some(BailReason::new(
+        return Ok(Err(BailReason::new(
             metrics::BAIL_REASON_WITHDRAWALS_BLOCKED,
             format!("withdrawals blocked for mint: {mint}"),
         )));
@@ -651,7 +658,23 @@ async fn check_withdrawal_mint_supported(
     processor_state
         .mint_cache
         .record_existence_floor(&mint, response.context.slot);
-    Ok(None)
+    Ok(Ok(allowed_mint))
+}
+
+/// `ExtensionType` discriminants, as the escrow program folds them into
+/// `AllowedMint.extensions`: bit N is set when the mint carries type N. Only the
+/// ones a withdrawal has to act on are named here.
+///
+/// These pin *presence*, which is fixed when a mint is created and can only change
+/// through a close and recreate that `Deposit` then rejects. The state behind each
+/// one is still read live, because it moves at any time: a pausable mint can be
+/// paused, a delegate can drain, a hook authority can swap the hook program.
+const EXTENSION_BIT_PERMANENT_DELEGATE: u8 = 12;
+const EXTENSION_BIT_TRANSFER_HOOK: u8 = 14;
+const EXTENSION_BIT_PAUSABLE: u8 = 26;
+
+fn has_extension(extensions: u64, bit: u8) -> bool {
+    extensions & (1u64 << bit) != 0
 }
 
 /// Token-2022 pre-flight for a withdrawal.
@@ -669,11 +692,12 @@ async fn check_withdrawal_mint_supported(
 async fn check_withdrawal_preflights(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
+    allowed_mint: &AllowedMint,
 ) -> Result<Option<BailReason>, OperatorError> {
     // The reads below only report a mint absent once the node has passed the slot that
     // allowlisted it, so the account was closed rather than merely not yet visible.
     // That is not fixed by retrying, so it parks the row instead of restarting us.
-    match check_withdrawal_preflights_inner(processor_state, transaction).await {
+    match check_withdrawal_preflights_inner(processor_state, transaction, allowed_mint).await {
         Err(OperatorError::Account(AccountError::TargetMintMissing { pubkey })) => {
             Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_TARGET_MINT_MISSING,
@@ -690,6 +714,7 @@ async fn check_withdrawal_preflights(
 async fn check_withdrawal_preflights_inner(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
+    allowed_mint: &AllowedMint,
 ) -> Result<Option<BailReason>, OperatorError> {
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
@@ -706,12 +731,10 @@ async fn check_withdrawal_preflights_inner(
     // every depositor for that mint. This runs before the Token-2022 gate below
     // because freeze_authority is a base-layout field on both token programs.
     // Gated on the mint having one at all, so a mint nobody can freeze costs no
-    // per-withdrawal read.
-    if processor_state
-        .mint_cache
-        .has_freeze_authority(&mint)
-        .await?
-    {
+    // per-withdrawal read. Gaining a freeze authority needs a close and recreate,
+    // which Deposit rejects against the pinned profile, so a mint pinned without
+    // one cannot be holding a balance it could freeze.
+    if allowed_mint.has_freeze_authority {
         let release_funds_state = processor_state
             .release_funds_state
             .as_mut()
@@ -732,16 +755,14 @@ async fn check_withdrawal_preflights_inner(
 
     // PausableConfig and PermanentDelegate only exist on Token-2022 mints.
     // For legacy SPL Token, stop here — saves an RPC round-trip on every
-    // withdrawal and avoids forcing extension-flag resolution for mints that
-    // can't carry the extensions in the first place.
+    // withdrawal for mints that can't carry the extensions in the first place.
     if token_program != spl_token_2022::ID {
         return Ok(None);
     }
 
-    let (is_pausable, has_permanent_delegate) = processor_state
-        .mint_cache
-        .get_extension_flags(&mint)
-        .await?;
+    let is_pausable = has_extension(allowed_mint.extensions, EXTENSION_BIT_PAUSABLE);
+    let has_permanent_delegate =
+        has_extension(allowed_mint.extensions, EXTENSION_BIT_PERMANENT_DELEGATE);
 
     if is_pausable && processor_state.mint_cache.check_paused(&mint).await? {
         return Ok(Some(BailReason::new(
@@ -789,25 +810,30 @@ async fn attach_hook_extras(
     processor_state: &mut ProcessorState,
     transaction: &DbTransaction,
     release_funds_tx: &mut TransactionBuilder,
+    allowed_mint: &AllowedMint,
 ) -> Result<Option<BailReason>, OperatorError> {
     let TransactionBuilder::ReleaseFunds(release) = release_funds_tx else {
         return Ok(None);
     };
+
+    // Hook presence comes from the reviewed profile rather than a resolved-once
+    // flag. A mint recreated with a hook can only hold a releasable balance after
+    // an admin re-allows it, which re-pins this bit, so it cannot say "no hook"
+    // for a mint whose transfers now require one.
+    if !has_extension(allowed_mint.extensions, EXTENSION_BIT_TRANSFER_HOOK) {
+        return Ok(None);
+    }
 
     let mint = Pubkey::from_str(&transaction.mint).map_err(|e| OperatorError::InvalidPubkey {
         pubkey: transaction.mint.clone(),
         reason: e.to_string(),
     })?;
 
-    // Only Token-2022 mints can carry a hook, so legacy mints pay nothing.
     let token_program = processor_state
         .mint_cache
         .get_mint_metadata(&mint)
         .await?
         .token_program;
-    if token_program != spl_token_2022::ID {
-        return Ok(None);
-    }
 
     let recipient =
         Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
@@ -879,12 +905,16 @@ pub async fn process_release_funds(
             // Settle whether the escrow will accept a release for this mint before
             // building one, so a mint it would reject costs no further work and no
             // target-chain lookup that would read as an infrastructure failure.
-            if let Some(bail) =
-                check_withdrawal_mint_supported(processor_state, &transaction).await?
-            {
-                park_row(&storage_tx, pt_label, &transaction, bail).await;
-                return Ok(());
-            }
+            // The account also carries the reviewed mint profile, which the steps
+            // below read instead of resolving the mint themselves.
+            let allowed_mint =
+                match read_withdrawal_allowed_mint(processor_state, &transaction).await? {
+                    Ok(allowed_mint) => allowed_mint,
+                    Err(bail) => {
+                        park_row(&storage_tx, pt_label, &transaction, bail).await;
+                        return Ok(());
+                    }
+                };
 
             // Build first so row-data poison, such as a NULL nonce or an
             // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
@@ -899,15 +929,22 @@ pub async fn process_release_funds(
             // It is best-effort: a delegate can still drain between this read and
             // the on-chain CPI, leaving that to the sender retry path. RPC errors
             // bubble up as Transient and restart the task.
-            if let Some(bail) = check_withdrawal_preflights(processor_state, &transaction).await? {
+            if let Some(bail) =
+                check_withdrawal_preflights(processor_state, &transaction, &allowed_mint).await?
+            {
                 park_row(&storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
             }
 
             // Runs after the pre-flights so a mint that is not payable anyway
             // never pays for hook resolution.
-            if let Some(bail) =
-                attach_hook_extras(processor_state, &transaction, &mut release_funds_tx).await?
+            if let Some(bail) = attach_hook_extras(
+                processor_state,
+                &transaction,
+                &mut release_funds_tx,
+                &allowed_mint,
+            )
+            .await?
             {
                 park_row(&storage_tx, pt_label, &transaction, bail).await;
                 return Ok(());
@@ -1285,17 +1322,17 @@ mod tests {
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
             DbMint {
+                withdrawals_blocked: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
-                is_pausable: Some(false),
-                has_permanent_delegate: Some(false),
             },
         );
         mock_storage.mint_status_history.lock().unwrap().push(
             crate::storage::common::models::DbMintStatus {
+                withdrawals_blocked: false,
                 mint_address: mint.to_string(),
                 status: "allowed".to_string(),
                 effective_slot: 0,
@@ -1333,13 +1370,12 @@ mod tests {
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
             DbMint {
+                withdrawals_blocked: false,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
-                is_pausable: None,
-                has_permanent_delegate: None,
             },
         );
     }
@@ -1396,21 +1432,26 @@ mod tests {
         }
     }
 
-    /// Treat `mint` as already proved allowlisted, unfreezable and hook-free,
-    /// skipping those gates in tests whose subject is a later step of the loop.
+    /// Treat `mint` as already proved to exist on the target chain, so the
+    /// allowlist read needs no freshness anchor and mint reads can report a
+    /// missing account as permanent.
+    ///
+    /// This no longer skips any gate: the withdrawal gate and the mint profile
+    /// are read from the `AllowedMint` account on every withdrawal, so a test
+    /// reaching the pre-flight must still answer that read.
     fn assume_mint_allowlisted(ps: &mut ProcessorState, mint: &Pubkey) {
         ps.mint_cache.record_existence_floor(mint, 1);
-        ps.mint_cache.record_freeze_authority(mint, false);
-        ps.mint_cache.record_transfer_hook(mint, false);
     }
 
-    /// Mocked `getAccountInfo` reply for an escrow-owned AllowedMint account.
-    fn allowed_mint_account_response(
-        slot: u64,
+    /// On-wire bytes of an `AllowedMint`: discriminator, bump, one byte per gate,
+    /// decimals, token_program, then the pinned profile — extensions bitmask and
+    /// has_freeze_authority. The token program is legacy SPL, which never carries
+    /// extensions, so the mask stays zero.
+    fn allowed_mint_bytes(
         deposits_blocked: bool,
         withdrawals_blocked: bool,
-    ) -> serde_json::Value {
-        // discriminator, bump, one byte per gate, decimals, then token_program.
+        has_freeze_authority: bool,
+    ) -> Vec<u8> {
         let mut data = vec![
             2u8,
             255u8,
@@ -1419,12 +1460,30 @@ mod tests {
             6u8,
         ];
         data.extend_from_slice(spl_token::id().as_ref());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.push(has_freeze_authority as u8);
+        data
+    }
+
+    /// Mocked `getAccountInfo` reply for an escrow-owned AllowedMint account.
+    fn allowed_mint_account_response(
+        slot: u64,
+        deposits_blocked: bool,
+        withdrawals_blocked: bool,
+    ) -> serde_json::Value {
         serde_json::json!({
             "context": {"slot": slot},
             "value": {
                 "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
                 "lamports": 1_000_000u64,
-                "data": [STANDARD.encode(data), "base64"],
+                "data": [
+                    STANDARD.encode(allowed_mint_bytes(
+                        deposits_blocked,
+                        withdrawals_blocked,
+                        false,
+                    )),
+                    "base64"
+                ],
                 "executable": false,
                 "rentEpoch": 0
             }
@@ -1433,6 +1492,133 @@ mod tests {
 
     fn absent_account_response() -> serde_json::Value {
         serde_json::json!({"context": {"slot": 1}, "value": null})
+    }
+
+    /// `AllowedMint` bytes for a Token-2022 mint carrying `extensions`, with both
+    /// gates open and no freeze authority. The pre-flight reads the pause and
+    /// permanent-delegate gates out of this mask.
+    fn allowed_mint_bytes_token_2022(extensions: u64) -> Vec<u8> {
+        let mut data = vec![2u8, 255u8, 0, 0, 6u8];
+        data.extend_from_slice(spl_token_2022::id().as_ref());
+        data.extend_from_slice(&extensions.to_le_bytes());
+        data.push(0u8);
+        data
+    }
+
+    /// An RPC that answers every account read with a clean `AllowedMint`. For tests
+    /// whose subject is a later step of the loop and which read no other account —
+    /// the withdrawal gate is on that account, so even those must answer it now.
+    fn allowlist_only_rpc() -> RpcClientWithRetry {
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(
+            solana_client::rpc_request::RpcRequest::GetAccountInfo,
+            allowed_mint_account_response(500, false, false),
+        );
+        RpcClientWithRetry::new_mocked(mocks)
+    }
+
+    /// A processor whose target chain answers this mint's `AllowedMint` read with
+    /// `allowed_mint`.
+    ///
+    /// Every withdrawal reads that account now, so a test whose subject is a later
+    /// step of the loop still has to answer it. Tests needing further accounts add
+    /// their own mocks to the returned server, whose guard must be held for the
+    /// length of the test or the endpoint goes away.
+    async fn processor_state_for(
+        storage: &Arc<Storage>,
+        mint: &Pubkey,
+        allowed_mint: Vec<u8>,
+    ) -> (ProcessorState, mockito::ServerGuard) {
+        let release_funds_state = make_release_funds_state();
+        let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, mint);
+
+        let mut server = mockito::Server::new_async().await;
+        mock_account_read(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint,
+        );
+
+        let processor_state = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    Default::default(),
+                    solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                )),
+            ),
+        };
+        (processor_state, server)
+    }
+
+    /// Answer `getTokenAccountBalance` with `amount`, for the escrow-drain check.
+    fn mock_token_balance(server: &mut mockito::ServerGuard, amount: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTokenAccountBalance""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "amount": amount.to_string(),
+                            "decimals": 6,
+                            "uiAmount": 0.0,
+                            "uiAmountString": "0"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// Answer `getAccountInfo` for one specific address. The canned mock keys on
+    /// request type alone, so a test needing two different accounts in one run
+    /// has to match on the address in the body instead.
+    fn mock_account_read(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        owner: &Pubkey,
+        data: Vec<u8>,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+                // Base58 is alphanumeric, so the address is already regex-safe.
+                mockito::Matcher::Regex(address.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 500},
+                        "value": {
+                            "owner": owner.to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&data), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create()
     }
 
     /// A withdrawal processor whose target chain answers every account read with
@@ -1531,9 +1717,6 @@ mod tests {
         insert_mint_row(&storage, &mint);
         let mut ps =
             processor_state_answering(&storage, allowed_mint_account_response(500, false, false));
-        // Freezing is not this test's subject, and the single mocked response
-        // cannot serve both the allowlist read and a mint read.
-        ps.mint_cache.record_freeze_authority(&mint, false);
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -1610,7 +1793,6 @@ mod tests {
         insert_mint_row(&storage, &mint);
         let mut ps =
             processor_state_answering(&storage, allowed_mint_account_response(500, true, false));
-        ps.mint_cache.record_freeze_authority(&mint, false);
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -1623,34 +1805,121 @@ mod tests {
         );
     }
 
+    /// Hook presence comes from the reviewed profile, never from a value this
+    /// process resolved once and kept. A Token-2022 mint pinned without
+    /// `TransferHook` must resolve no hook at all: the only account mocked here is
+    /// the allowlist, so any attempt to read the mint or its validation account
+    /// fails the run rather than passing quietly.
+    #[tokio::test]
+    async fn process_release_funds_pinned_hookless_mint_resolves_no_hook() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_token_2022_mint_row(&storage, &mint);
+
+        let (mut ps, _server) =
+            processor_state_for(&storage, &mint, allowed_mint_bytes_token_2022(0)).await;
+        ps.mint_cache.record_existence_floor(&mint, 1);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "no account beyond the allowlist may be read"
+        );
+        assert!(update.is_none(), "a hook-free mint is payable");
+        assert!(
+            matches!(builder, Some(TransactionBuilder::ReleaseFunds(_))),
+            "the withdrawal must be dispatched"
+        );
+    }
+
+    /// An admin blocks a mint while the operator is running, which is when they
+    /// would actually do it. A mint this process has already served once must still
+    /// stop: an earlier build cached the allowlist verdict for the process lifetime,
+    /// so releases kept going out and the sender reminted the rows instead of
+    /// parking them. Reintroducing any such short-circuit fails here.
+    #[tokio::test]
+    async fn process_release_funds_blocked_mint_parks_even_when_already_seen() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_mint_row(&storage, &mint);
+
+        // Deposits stay open, which also pins that the two gates are independent.
+        let (mut ps, _server) =
+            processor_state_for(&storage, &mint, allowed_mint_bytes(false, true, false)).await;
+        // Stands in for a mint this process has already served.
+        assume_mint_allowlisted(&mut ps, &mint);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "one blocked mint must not end the loop");
+        let update = update.expect("row must be parked");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .expect("error_message must be set")
+            .contains("withdrawals blocked for mint:"));
+        assert!(
+            builder.is_none(),
+            "a release the program would reject is not dispatched"
+        );
+    }
+
     /// A `freeze_authority` holder can freeze the pooled escrow ATA, stranding every
     /// depositor for that mint. Parking makes that visible instead of dispatching a
     /// release the token program is certain to reject.
+    ///
+    /// Needs two different accounts answered in one run — the allowlist account
+    /// that pins the freeze authority, then the escrow ATA — which the canned
+    /// single-response mock cannot do, so this one dispatches on the requested
+    /// address.
     #[tokio::test]
     async fn process_release_funds_frozen_escrow_ata_parks() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         insert_mint_row(&storage, &mint);
 
+        let release_funds_state = make_release_funds_state();
+        let instance_pda = release_funds_state.instance_pda;
+        let allowed_mint_pda = find_allowed_mint_pda(&instance_pda, &mint);
+        let instance_ata =
+            get_associated_token_address_with_program_id(&instance_pda, &mint, &spl_token::id());
+
         // Token account, 165-byte base layout: state at 108, 2 means Frozen.
         let mut ata_data = vec![0u8; 165];
         ata_data[108] = 2;
-        let frozen_ata = serde_json::json!({
-            "context": {"slot": 500},
-            "value": {
-                "owner": spl_token::id().to_string(),
-                "lamports": 1_000_000u64,
-                "data": [STANDARD.encode(&ata_data), "base64"],
-                "executable": false,
-                "rentEpoch": 0
-            }
-        });
 
-        let mut ps = processor_state_answering(&storage, frozen_ata);
-        // Lets the allowlist read short-circuit, so the one mocked response is
-        // free to serve the escrow ATA read.
+        let mut server = mockito::Server::new_async().await;
+        // Pinned with a freeze authority, which is the only reason the pre-flight
+        // reads the escrow ATA at all.
+        let _allowlist_mock = mock_account_read(
+            &mut server,
+            &allowed_mint_pda,
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, true),
+        );
+        let _ata_mock = mock_account_read(
+            &mut server,
+            &instance_ata,
+            &spl_token::id(),
+            ata_data.clone(),
+        );
+
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: Some(release_funds_state),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(RpcClientWithRetry::with_retry_config(
+                    server.url(),
+                    Default::default(),
+                    solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                )),
+            ),
+        };
         ps.mint_cache.record_existence_floor(&mint, 1);
-        ps.mint_cache.record_freeze_authority(&mint, true);
 
         let (outcome, update, builder) =
             run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
@@ -1702,9 +1971,29 @@ mod tests {
     async fn a_mint_absent_from_the_target_chain_parks_the_row() {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        // Token-2022 with unresolved flags, so the pre-flight has to read the chain.
         insert_token_2022_mint_row(&storage, &mint);
-        let mut ps = processor_state_answering(&storage, absent_account_response());
+
+        // Pausable is pinned, so the pre-flight reads the mint to check the live
+        // paused flag — and that read is the one that must find nothing.
+        let (mut ps, mut server) = processor_state_for(
+            &storage,
+            &mint,
+            allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PAUSABLE),
+        )
+        .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(mint.to_string()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"context": {"slot": 500}, "value": null}
+                })
+                .to_string(),
+            )
+            .create();
         assume_mint_allowlisted(&mut ps, &mint);
 
         let (outcome, update, builder) =
@@ -1854,7 +2143,10 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(allowlist_only_rpc()),
+            ),
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -1867,13 +2159,12 @@ mod tests {
             mock_storage.mints.lock().unwrap().insert(
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
+                    withdrawals_blocked: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
-                    is_pausable: Some(false),
-                    has_permanent_delegate: Some(false),
                 },
             );
         }
@@ -1924,19 +2215,29 @@ mod tests {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
 
-        // On-chain tree index 0 < boundary target 1, so the rotation must fire.
-        let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, bitmap_account_response(0));
-        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
-
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
-        };
-
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
+
+        // Two accounts in one run — the allowlist read, then the bitmap the
+        // rotation check reads — so the mock has to dispatch on address.
+        let (mut ps, mut server) = processor_state_for(
+            &storage,
+            &mint_pubkey,
+            allowed_mint_bytes(false, false, false),
+        )
+        .await;
+        // On-chain tree index 0 < boundary target 1, so the rotation must fire.
+        let bitmap_pda = ps
+            .release_funds_state
+            .as_ref()
+            .expect("release state")
+            .withdrawal_bitmap_pda;
+        mock_account_read(
+            &mut server,
+            &bitmap_pda,
+            &Pubkey::new_unique(),
+            bitmap_account_bytes(0, &[], 255),
+        );
         {
             let mock_storage = match storage.as_ref() {
                 Storage::Mock(m) => m,
@@ -1945,13 +2246,12 @@ mod tests {
             mock_storage.mints.lock().unwrap().insert(
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
+                    withdrawals_blocked: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
-                    is_pausable: Some(false),
-                    has_permanent_delegate: Some(false),
                 },
             );
         }
@@ -2010,33 +2310,26 @@ mod tests {
         mock.mints.lock().unwrap().insert(
             mint_pubkey.to_string(),
             DbMint {
+                withdrawals_blocked: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
-                is_pausable: Some(false),
-                has_permanent_delegate: Some(true),
             },
         );
         let storage = Arc::new(Storage::Mock(mock));
 
+        // The permanent delegate is pinned in the reviewed profile, which is what
+        // makes the pre-flight check the escrow balance at all.
+        let (mut ps, mut server) = processor_state_for(
+            &storage,
+            &mint_pubkey,
+            allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PERMANENT_DELEGATE),
+        )
+        .await;
         // Escrow balance 500 is short of the 1000 the withdrawal needs.
-        let mut mocks = std::collections::HashMap::new();
-        mocks.insert(
-            RpcRequest::GetTokenAccountBalance,
-            serde_json::json!({
-                "context": {"slot": 1},
-                "value": {"amount": "500", "decimals": 6, "uiAmount": 0.0005, "uiAmountString": "0.0005"}
-            }),
-        );
-        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
-
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
-        };
+        mock_token_balance(&mut server, 500);
 
         // The allowlist gate is not this test's subject; treat the mint as proved.
         assume_mint_allowlisted(&mut ps, &mint_pubkey);
@@ -2676,7 +2969,10 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(allowlist_only_rpc()),
+            ),
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -2688,13 +2984,12 @@ mod tests {
             mock_storage.mints.lock().unwrap().insert(
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
+                    withdrawals_blocked: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
-                    is_pausable: Some(false),
-                    has_permanent_delegate: Some(false),
                 },
             );
         }
@@ -2747,7 +3042,10 @@ mod tests {
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
+            mint_cache: crate::operator::MintCache::with_rpc(
+                storage.clone(),
+                Arc::new(allowlist_only_rpc()),
+            ),
         };
 
         let mint_pubkey = Pubkey::new_unique();
@@ -3130,21 +3428,23 @@ mod tests {
             mock_storage.mints.lock().unwrap().insert(
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
+                    withdrawals_blocked: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
-                    is_pausable: None,
-                    has_permanent_delegate: None,
                 },
             );
         }
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::new(storage.clone()),
-        };
+        // Three rows means three allowlist reads, and the canned mock is consumed
+        // after one, so this one needs a server that answers repeatedly.
+        let (mut ps, _server) = processor_state_for(
+            &storage,
+            &mint_pubkey,
+            allowed_mint_bytes(false, false, false),
+        )
+        .await;
 
         // The allowlist gate is not this test's subject; treat the mint as proved.
         assume_mint_allowlisted(&mut ps, &mint_pubkey);
@@ -3261,13 +3561,12 @@ mod tests {
             mock_storage.mints.lock().unwrap().insert(
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
+                    withdrawals_blocked: false,
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
-                    is_pausable: None,
-                    has_permanent_delegate: None,
                 },
             );
         }
@@ -3614,9 +3913,6 @@ mod tests {
     #[tokio::test]
     async fn process_release_funds_permanent_delegate_insufficient_balance_routes_to_manual_review()
     {
-        use crate::operator::rpc_util::RpcClientWithRetry;
-        use solana_client::rpc_request::RpcRequest;
-
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
 
@@ -3624,38 +3920,28 @@ mod tests {
         mock.mints.lock().unwrap().insert(
             mint_pubkey.to_string(),
             crate::storage::common::models::DbMint {
+                withdrawals_blocked: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
-                is_pausable: Some(false),
-                has_permanent_delegate: Some(true),
             },
         );
         let storage = Arc::new(Storage::Mock(mock));
 
-        // On-chain balance < amount → should bail to ManualReview.
-        let balance_response = serde_json::json!({
-            "context": {"slot": 1},
-            "value": {
-                "amount": "500",
-                "decimals": 6,
-                "uiAmount": 0.0005,
-                "uiAmountString": "0.0005"
-            }
-        });
-        let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetTokenAccountBalance, balance_response);
-        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
-
         let (storage_tx, mut storage_rx) = mpsc::channel(1);
 
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
-        };
+        // The permanent delegate is pinned in the reviewed profile, which is what
+        // makes the pre-flight check the escrow balance at all.
+        let (mut ps, mut server) = processor_state_for(
+            &storage,
+            &mint_pubkey,
+            allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PERMANENT_DELEGATE),
+        )
+        .await;
+        // On-chain balance < amount → should bail to ManualReview.
+        mock_token_balance(&mut server, 500);
 
         // The allowlist gate is not this test's subject; treat the mint as proved.
         assume_mint_allowlisted(&mut ps, &mint_pubkey);
@@ -3727,9 +4013,6 @@ mod tests {
     /// pre-flight is a no-op and the withdrawal proceeds to the sender.
     #[tokio::test]
     async fn process_release_funds_permanent_delegate_sufficient_balance_proceeds() {
-        use crate::operator::rpc_util::RpcClientWithRetry;
-        use solana_client::rpc_request::RpcRequest;
-
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
 
@@ -3737,37 +4020,27 @@ mod tests {
         mock.mints.lock().unwrap().insert(
             mint_pubkey.to_string(),
             crate::storage::common::models::DbMint {
+                withdrawals_blocked: false,
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
-                is_pausable: Some(false),
-                has_permanent_delegate: Some(true),
             },
         );
         let storage = Arc::new(Storage::Mock(mock));
 
-        let balance_response = serde_json::json!({
-            "context": {"slot": 1},
-            "value": {
-                "amount": "5000",
-                "decimals": 6,
-                "uiAmount": 0.005,
-                "uiAmountString": "0.005"
-            }
-        });
-        let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetTokenAccountBalance, balance_response);
-        let rpc_client = RpcClientWithRetry::new_mocked(mocks);
-
         let (storage_tx, mut storage_rx) = mpsc::channel(1);
 
-        let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
-            release_funds_state: Some(make_release_funds_state()),
-            mint_cache: crate::operator::MintCache::with_rpc(storage.clone(), Arc::new(rpc_client)),
-        };
+        // The permanent delegate is pinned in the reviewed profile, which is what
+        // makes the pre-flight check the escrow balance at all.
+        let (mut ps, mut server) = processor_state_for(
+            &storage,
+            &mint_pubkey,
+            allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PERMANENT_DELEGATE),
+        )
+        .await;
+        mock_token_balance(&mut server, 5000);
 
         // The allowlist gate is not this test's subject; treat the mint as proved.
         assume_mint_allowlisted(&mut ps, &mint_pubkey);

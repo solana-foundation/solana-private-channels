@@ -11,15 +11,14 @@
 //! 3. Use the permanent delegate to drain the escrow ATA below the withdrawal
 //!    amount. The escrow program is never invoked, so the indexer sees
 //!    nothing and the DB's implied balance (still 2x) diverges from on-chain.
-//! 4. Seed the DB: `mints` row with `has_permanent_delegate = None` (what the
-//!    indexer writes at AllowMint time) and a pending withdrawal for the full
-//!    amount at nonce 0.
+//! 4. Seed the DB: the `mints` row the indexer writes at AllowMint time, and a
+//!    pending withdrawal for the full amount at nonce 0.
 //! 5. Start the PrivateChannel→Solana withdrawal operator.
 //! 6. Assert the operator routes the withdrawal to `manual_review`: the row
-//!    status flips from `pending` to `manual_review`, `has_permanent_delegate`
-//!    flips from `None` to `Some(true)` (lazy RPC resolution + write-back),
-//!    and no tokens reach the recipient. Webhook firing is covered by the
-//!    db_transaction_writer unit tests.
+//!    status flips from `pending` to `manual_review`, and no tokens reach the
+//!    recipient. The drain check runs because `PermanentDelegate` is pinned in
+//!    `AllowedMint`; the balance it compares against is read live. Webhook
+//!    firing is covered by the db_transaction_writer unit tests.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -417,7 +416,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         drain_amount
     );
 
-    // Seed DB: mints row with has_permanent_delegate=None (what the indexer
+    // Seed DB: the mints row (what the indexer
     // writes at AllowMint time), and a pending withdrawal at nonce 0.
     let mint_meta = DbMint::new(
         mint_pubkey.to_string(),
@@ -427,6 +426,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
@@ -434,15 +434,6 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
             created_at: Utc::now(),
         }])
         .await?;
-    let pre = storage
-        .get_mint(&mint_pubkey.to_string())
-        .await?
-        .expect("mints row");
-    assert!(
-        pre.has_permanent_delegate.is_none(),
-        "pre-condition: DB mints row should have has_permanent_delegate = None",
-    );
-
     let withdrawal_sig = Signature::new_unique().to_string();
     let withdrawal_tx = make_withdrawal_transaction(
         withdrawal_sig.clone(),
@@ -488,16 +479,6 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
     assert_eq!(
         row.status, "manual_review",
         "drained escrow should route the withdrawal to manual_review",
-    );
-
-    let stored_mint = storage
-        .get_mint(&mint_pubkey.to_string())
-        .await?
-        .expect("mints row");
-    assert_eq!(
-        stored_mint.has_permanent_delegate,
-        Some(true),
-        "operator should have resolved has_permanent_delegate via RPC and written it back",
     );
 
     let recipient_balance =
@@ -600,7 +581,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
         "pre-condition: escrow ATA must exist and be empty",
     );
 
-    // Seed DB: mints row with has_permanent_delegate=None, pending withdrawal.
+    // Seed DB: the mints row, pending withdrawal.
     let mint_meta = DbMint::new(
         mint_pubkey.to_string(),
         MINT_DECIMALS as i16,
@@ -609,6 +590,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
@@ -660,16 +642,6 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
     assert_eq!(
         row.status, "manual_review",
         "an empty escrow ATA should route the withdrawal to manual_review, not loop the operator",
-    );
-
-    let stored_mint = storage
-        .get_mint(&mint_pubkey.to_string())
-        .await?
-        .expect("mints row");
-    assert_eq!(
-        stored_mint.has_permanent_delegate,
-        Some(true),
-        "operator should have resolved has_permanent_delegate via RPC and written it back",
     );
 
     let recipient_balance =

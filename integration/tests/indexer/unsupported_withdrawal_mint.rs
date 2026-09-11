@@ -189,6 +189,7 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
         .await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: env.mint.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,

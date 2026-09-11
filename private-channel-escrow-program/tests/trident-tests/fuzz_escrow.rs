@@ -5,17 +5,28 @@
 //! - **Foreign-bitmap rejection**: a bitmap that is not this instance's PDA must
 //!   fail without touching balances.
 //! - **Double-spend prevention**: replaying a successful release must be rejected.
+//! - **Gate independence**: the deposit and withdrawal gates are set as absolute
+//!   values in any combination, and each governs only its own instruction. A mint
+//!   with deposits blocked must still release, which is the property that keeps
+//!   blocking a mint from stranding the balances already in it.
+//! - **Gates never move tokens**: neither setting a gate nor re-allowing a mint
+//!   may change an escrow balance.
 
 mod shared;
 
 use std::collections::HashMap;
 
-use private_channel_escrow_program_client::instructions::{DepositBuilder, ReleaseFundsBuilder};
+use private_channel_escrow_program_client::instructions::{
+    AllowMintBuilder, BlockMintBuilder, DepositBuilder, ReleaseFundsBuilder,
+};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::pubkey::Pubkey;
 use trident_fuzz::fuzzing::*;
 
-use shared::{clamp_amount, setup_escrow, token_amount, AccountAddresses};
+use shared::{
+    clamp_amount, setup_escrow, token_amount, AccountAddresses,
+    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+};
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
 const NONCES_PER_GENERATION: u64 = 65_536;
@@ -47,6 +58,11 @@ pub struct FuzzTest {
     initial_user_balance: u64,
     total_deposited: u64,
     total_released: u64,
+    /// Mirror of the mint's two on-chain gates. The gates are independent, so the
+    /// model tracks them separately and every flow predicts its outcome from the
+    /// one that governs it.
+    deposits_blocked: bool,
+    withdrawals_blocked: bool,
 }
 
 #[flow_executor]
@@ -61,6 +77,9 @@ impl FuzzTest {
         self.successful_releases.clear();
         self.total_deposited = 0;
         self.total_released = 0;
+        // AllowMint leaves both gates open.
+        self.deposits_blocked = false;
+        self.withdrawals_blocked = false;
     }
 
     // ── Flows ─────────────────────────────────────────────────────────────────
@@ -100,6 +119,25 @@ impl FuzzTest {
             .instruction();
 
         let res = self.trident.process_transaction(&[ix], Some("deposit"));
+
+        if self.deposits_blocked {
+            assert!(
+                !res.is_success(),
+                "deposit landed while the mint's deposit gate was closed"
+            );
+            assert_eq!(
+                token_amount(&mut self.trident, &instance_ata),
+                instance_bal_before,
+                "instance balance changed on a blocked deposit"
+            );
+            assert_eq!(
+                token_amount(&mut self.trident, &user_ata),
+                user_bal_before,
+                "user balance changed on a blocked deposit"
+            );
+            return;
+        }
+
         if res.is_success() {
             assert_eq!(
                 token_amount(&mut self.trident, &instance_ata),
@@ -153,14 +191,19 @@ impl FuzzTest {
         let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
-        let should_succeed = use_valid
-            && !self.successful_releases.contains_key(&nonce)
-            && amount <= instance_bal_before;
-        let bitmap_account = if should_succeed {
+        // Which bitmap is the fuzzed dimension; the expected outcome is derived
+        // separately. Tying the two together would send every release the gate
+        // must refuse against a foreign bitmap, so it would fail for that reason
+        // instead and the gate would never be exercised.
+        let bitmap_account = if use_valid {
             withdrawal_bitmap
         } else {
             Pubkey::new_unique()
         };
+        let should_succeed = use_valid
+            && !self.withdrawals_blocked
+            && !self.successful_releases.contains_key(&nonce)
+            && amount <= instance_bal_before;
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
@@ -215,6 +258,113 @@ impl FuzzTest {
                 "user balance changed on failed release"
             );
         }
+    }
+
+    /// Set both gates to a random combination. Both flags are absolute, so this
+    /// covers closing either, closing both, and re-opening either.
+    ///
+    /// The admin can always set the gates, whatever they already are, so this must
+    /// succeed every time. The balances are untouched: setting a gate never moves
+    /// tokens, which is what makes blocking deposits safe for existing balances.
+    #[flow]
+    fn fuzz_set_gates(&mut self) {
+        let block_deposits = self.trident.random_from_range(0..=1u8) == 0;
+        let block_withdrawals = self.trident.random_from_range(0..=1u8) == 0;
+
+        let admin = self.fuzz_accounts.admin.get(&mut self.trident).unwrap();
+        let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let mint = self.fuzz_accounts.mint.get(&mut self.trident).unwrap();
+        let allowed_mint = self
+            .fuzz_accounts
+            .allowed_mint
+            .get(&mut self.trident)
+            .unwrap();
+        let instance_ata = self
+            .fuzz_accounts
+            .instance_ata
+            .get(&mut self.trident)
+            .unwrap();
+
+        let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
+
+        let ix = BlockMintBuilder::new()
+            .payer(self.trident.payer().pubkey())
+            .admin(admin)
+            .instance(instance)
+            .mint(mint)
+            .allowed_mint(allowed_mint)
+            .block_deposits(block_deposits)
+            .block_withdrawals(block_withdrawals)
+            .instruction();
+
+        let res = self
+            .trident
+            .process_transaction(&[ix], Some("set_gates"));
+        assert!(
+            res.is_success(),
+            "admin must always be able to set the gates: {}",
+            res.logs()
+        );
+        assert_eq!(
+            token_amount(&mut self.trident, &instance_ata),
+            instance_bal_before,
+            "setting a gate moved escrowed tokens"
+        );
+
+        self.deposits_blocked = block_deposits;
+        self.withdrawals_blocked = block_withdrawals;
+    }
+
+    /// Re-allow the mint. `AllowMint` doubles as the re-allow path: the PDA
+    /// already exists, so it is rewritten rather than created, and both gates
+    /// re-open. Escrowed balances must survive it untouched.
+    #[flow]
+    fn fuzz_re_allow(&mut self) {
+        let admin = self.fuzz_accounts.admin.get(&mut self.trident).unwrap();
+        let instance = self.fuzz_accounts.instance.get(&mut self.trident).unwrap();
+        let mint = self.fuzz_accounts.mint.get(&mut self.trident).unwrap();
+        let allowed_mint = self
+            .fuzz_accounts
+            .allowed_mint
+            .get(&mut self.trident)
+            .unwrap();
+        let instance_ata = self
+            .fuzz_accounts
+            .instance_ata
+            .get(&mut self.trident)
+            .unwrap();
+
+        let (_, allowed_mint_bump) = Pubkey::find_program_address(
+            &[b"allowed_mint", instance.as_ref(), mint.as_ref()],
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        );
+
+        let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
+
+        let ix = AllowMintBuilder::new()
+            .payer(self.trident.payer().pubkey())
+            .admin(admin)
+            .instance(instance)
+            .mint(mint)
+            .allowed_mint(allowed_mint)
+            .instance_ata(instance_ata)
+            .bump(allowed_mint_bump)
+            .instruction();
+
+        let res = self.trident.process_transaction(&[ix], Some("re_allow"));
+        assert!(
+            res.is_success(),
+            "re-allowing an existing mint must succeed: {}",
+            res.logs()
+        );
+        assert_eq!(
+            token_amount(&mut self.trident, &instance_ata),
+            instance_bal_before,
+            "re-allow moved escrowed tokens"
+        );
+
+        self.deposits_blocked = false;
+        self.withdrawals_blocked = false;
     }
 
     /// Replay an already-processed release verbatim — must be rejected.

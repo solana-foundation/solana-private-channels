@@ -88,7 +88,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (17 integration tests)
+### Deposit (20 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -107,6 +107,9 @@
 - `test_deposit_wrong_instance_ata` — passing an instance ATA for a different mint is rejected with InvalidInstructionData
 - `test_deposit_rejected_after_mint_decimals_change` — MintProfileChanged; TransferChecked cannot catch this since it validates the decimals it is handed against the mint itself
 - `test_deposit_rejected_after_mint_token_program_change` — MintProfileChanged; the ATAs for the new program are left uncreated, so this also pins the check running before `validate_ata`
+- `test_deposit_rejected_after_mint_gains_extension` — MintProfileChanged; decimals, token program and freeze authority all still match, so only the extension bitmask can catch the recreate
+- `test_deposit_rejected_after_mint_gains_freeze_authority` — MintProfileChanged; a freeze authority cannot be re-enabled once revoked, so gaining one means a recreate
+- `test_deposit_succeeds_after_freeze_authority_revoked` — the other direction; revoking leaves the mint strictly safer and must not strand deposits, so tightening the check into an equality breaks this
 
 ### ReleaseFunds (21 integration tests)
 

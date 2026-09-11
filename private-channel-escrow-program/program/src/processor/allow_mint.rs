@@ -11,10 +11,9 @@ use crate::{
             },
             event_utils::emit_event,
             pda_utils::create_pda_account,
-            token_utils::{get_mint_decimals, get_or_create_ata},
+            token_utils::{get_or_create_ata, read_mint_profile},
         },
-        validate_mint, verify_account_owner, verify_ata_program, verify_current_program,
-        verify_token_programs,
+        verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
     require_len,
     state::{discriminator::AccountSerialize, AllowedMint, Instance},
@@ -67,9 +66,11 @@ pub fn process_allow_mint(
     validate_event_authority!(event_authority_info);
 
     verify_account_owner(mint_info, token_program_info.address())?;
-    validate_mint(mint_info)?;
 
-    let mint_decimals = get_mint_decimals(mint_info)?;
+    // Also proves the account is a mint: the decimals below come from this
+    // parse rather than an unchecked cast.
+    let mint_profile = read_mint_profile(mint_info)?;
+    let mint_decimals = mint_profile.decimals;
 
     let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
@@ -89,7 +90,13 @@ pub fn process_allow_mint(
         token_program_info,
     )?;
 
-    let allowed_mint = AllowedMint::new(args.bump, mint_decimals, *token_program_info.address());
+    let allowed_mint = AllowedMint::new(
+        args.bump,
+        mint_decimals,
+        *token_program_info.address(),
+        mint_profile.extensions,
+        mint_profile.has_freeze_authority,
+    );
     allowed_mint
         .validate_pda(
             instance_info.address(),

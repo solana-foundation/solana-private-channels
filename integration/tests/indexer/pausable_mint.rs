@@ -6,14 +6,13 @@
 //!    (unpaused at creation), AllowMint it on the escrow instance, and fund
 //!    the escrow ATA so a withdrawal has tokens to release.
 //! 2. Pause the mint on-chain.
-//! 3. Seed a `DbMint` row with `is_pausable = None` (the state the indexer
-//!    leaves behind at AllowMint time) and a pending `DbTransaction`
-//!    withdrawal at nonce 0.
+//! 3. Seed a `DbMint` row and a pending `DbTransaction` withdrawal at nonce 0.
 //! 4. Start the PrivateChannel→Solana withdrawal operator.
 //! 5. Assert the operator routes the withdrawal to `manual_review`: the row
-//!    status flips from `pending` to `manual_review`, and `mints.is_pausable`
-//!    flips from `None` to `Some(true)` (lazy RPC resolution + write-back).
-//!    No tokens are released to the recipient. The webhook alert payload is
+//!    status flips from `pending` to `manual_review`. The pause gate comes from
+//!    the `Pausable` bit pinned in `AllowedMint`; the live paused flag is read
+//!    from the mint. No tokens are released to the recipient. The webhook alert
+//!    payload is
 //!    covered by unit tests in `db_transaction_writer`; here we just assert
 //!    the terminal DB state the operator bailed into.
 
@@ -346,8 +345,8 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     set_mint_paused(&client, &admin, &admin, &mint_pubkey, true).await?;
     println!("Mint paused on-chain");
 
-    // Seed DB: mints row with is_pausable=None (what the indexer would write
-    // at AllowMint time), and a pending withdrawal at nonce 0.
+    // Seed DB: the mints row the indexer would write at AllowMint time, and a
+    // pending withdrawal at nonce 0.
     let mint_meta = DbMint::new(
         mint_pubkey.to_string(),
         6,
@@ -356,6 +355,7 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_pubkey.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
@@ -363,16 +363,6 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
             created_at: Utc::now(),
         }])
         .await?;
-    assert!(
-        storage
-            .get_mint(&mint_pubkey.to_string())
-            .await?
-            .expect("mints row")
-            .is_pausable
-            .is_none(),
-        "pre-condition: DB mints row should have is_pausable = None",
-    );
-
     let withdrawal_sig = Signature::new_unique().to_string();
     let withdrawal_tx = make_withdrawal_transaction(
         withdrawal_sig.clone(),
@@ -418,16 +408,6 @@ async fn test_withdrawal_routed_to_manual_review_when_pausable_mint_is_paused(
     assert_eq!(
         row.status, "manual_review",
         "paused mint should route the withdrawal to manual_review",
-    );
-
-    let stored_mint = storage
-        .get_mint(&mint_pubkey.to_string())
-        .await?
-        .expect("mints row");
-    assert_eq!(
-        stored_mint.is_pausable,
-        Some(true),
-        "operator should have resolved is_pausable via RPC and written it back",
     );
 
     let recipient_balance =

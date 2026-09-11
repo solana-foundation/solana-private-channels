@@ -4,11 +4,11 @@ use crate::{
     error::PrivateChannelEscrowProgramError,
     events::DepositEvent,
     processor::{
-        get_mint_decimals, get_token_account_balance,
+        get_token_account_balance,
         shared::{
             account_check::{verify_signer, verify_system_program},
             event_utils::emit_event,
-            token_utils::{transfer_checked_cpi, validate_ata},
+            token_utils::{read_mint_profile, transfer_checked_cpi, validate_ata},
         },
         verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
@@ -98,15 +98,22 @@ pub fn process_deposit(
         return Err(PrivateChannelEscrowProgramError::DepositsBlockedForMint.into());
     }
 
-    // A recreate at the same address can change either value. Closing needs zero
+    // A recreate at the same address can change any of these. Closing needs zero
     // supply, so the window is while the escrow holds none of this mint, and the
     // channel mint is initialized from the allow-time decimals on the first deposit.
     // TransferChecked cannot catch it: the decimals it validates are read from the
     // mint below. Runs before validate_ata, which only rejects a changed token
     // program until someone creates the new escrow ATA.
-    let mint_decimals = get_mint_decimals(mint_info)?;
+    //
+    // Freeze authority is compared in one direction only. It can be revoked but
+    // never re-added, so a mint that lost one is the same mint behaving more
+    // safely, while one that gained a freeze authority was recreated.
+    let mint_profile = read_mint_profile(mint_info)?;
+    let mint_decimals = mint_profile.decimals;
     if allowed_mint.decimals != mint_decimals
         || allowed_mint.token_program != *token_program_info.address()
+        || allowed_mint.extensions != mint_profile.extensions
+        || (mint_profile.has_freeze_authority && !allowed_mint.has_freeze_authority)
     {
         return Err(PrivateChannelEscrowProgramError::MintProfileChanged.into());
     }
