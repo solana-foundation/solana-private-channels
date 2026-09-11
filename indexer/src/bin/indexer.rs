@@ -151,6 +151,11 @@ enum Mode {
         /// refuses to run without it so it cannot rebuild without fail-closed reconciliation.
         #[arg(long)]
         channel_rpc_url: Option<String>,
+        /// Acknowledge that this drops every table and rebuilds from chain. Required.
+        /// Deliberately not bound to an environment variable, so it cannot be left
+        /// switched on in a deployment's env file.
+        #[arg(long)]
+        destroy_existing_data: bool,
         /// Solana RPC that can read the escrow's withdrawal bitmap. A withdraw resync
         /// refuses to run without it (and common.escrow_instance_id), because a rebuild
         /// restarts the nonce sequence and must first prove the chain has issued no nonce.
@@ -220,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Resync {
             genesis_slot,
             channel_rpc_url,
+            destroy_existing_data,
             escrow_rpc_url,
         } => {
             run_resync(
@@ -227,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.verbose,
                 genesis_slot,
                 channel_rpc_url,
+                destroy_existing_data,
                 escrow_rpc_url,
             )
             .await
@@ -409,11 +416,6 @@ async fn run_operator(figment: Figment, verbose: bool) -> Result<(), Box<dyn std
             private_channel_indexer::storage::PostgresDb::new(&postgres_config).await?,
         )),
     };
-    storage
-        .init_schema()
-        .await
-        .map_err(|e| format!("Storage error: {}", e))?;
-
     let escrow_instance_id = common
         .escrow_instance_id
         .map(|id_str| {
@@ -464,8 +466,18 @@ async fn run_resync(
     verbose: bool,
     genesis_slot: u64,
     channel_rpc_url: Option<String>,
+    destroy_existing_data: bool,
     escrow_rpc_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Checked before anything connects, so a mistyped subcommand cannot get as far as
+    // opening the database. The live-state lock is the real guard; this only makes the
+    // destruction something the operator had to ask for by name.
+    if !destroy_existing_data {
+        return Err("resync drops every table and rebuilds from chain; pass \
+                    --destroy-existing-data to confirm"
+            .into());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(if verbose {
             "info,private_channel_indexer=debug"

@@ -65,6 +65,7 @@ integration-test:
 	@cargo test --test malformed_yellowstone_update -- --nocapture
 	@cargo test --test yellowstone_reconnect_gap -- --nocapture
 	@cargo test --test reconnect_gap_fill_fail_closed -- --nocapture
+	@cargo test --test rpc_polling_fail_closed -- --nocapture
 	@cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cargo test --test harness_sanity -- --nocapture
 	@cargo test --test sender_poll_rpc_error -- --nocapture
@@ -281,6 +282,8 @@ integration-coverage-indexer:
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_reconnect_gap -- --nocapture
 	@echo "Running fail-closed reconnect gap-fill tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test reconnect_gap_fill_fail_closed -- --nocapture
+	@echo "Running fail-closed RPC-polling decode tests with coverage instrumentation..."
+	@cargo llvm-cov test --no-report --workspace --test rpc_polling_fail_closed -- --nocapture
 	@echo "Running Yellowstone inner-ix + unknown-discriminator tests with coverage instrumentation..."
 	@cargo llvm-cov test --no-report --workspace --test yellowstone_inner_and_unknown -- --nocapture
 	@echo "Running OperatorMockHarness sanity test with coverage instrumentation..."

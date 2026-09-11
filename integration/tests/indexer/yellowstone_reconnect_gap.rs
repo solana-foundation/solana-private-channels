@@ -109,7 +109,7 @@ async fn gap_fill_runs_after_drop_stream() {
         ProgramType::Escrow,
         None,
     )
-    .with_gap_detection(rpc_poller, 1_000, 16)
+    .with_gap_detection(rpc_poller, None, 1_000, 16)
     .with_storage(storage);
 
     let handle = source
@@ -232,7 +232,7 @@ async fn cold_start_without_anchor_withholds_live_slots() {
         ProgramType::Escrow,
         None,
     )
-    .with_gap_detection(rpc_poller, 1_000, 16)
+    .with_gap_detection(rpc_poller, None, 1_000, 16)
     .with_storage(storage);
 
     let handle = source
@@ -436,7 +436,7 @@ async fn first_connection_arms_when_startup_backfill_anchored() {
         ProgramType::Escrow,
         None,
     )
-    .with_gap_detection(rpc_poller, 1_000, 16)
+    .with_gap_detection(rpc_poller, None, 1_000, 16)
     .with_storage(storage);
 
     let handle = source
@@ -566,7 +566,7 @@ async fn quiet_program_arms_on_the_resume_slot_not_the_first_block() {
         ProgramType::Escrow,
         None,
     )
-    .with_gap_detection(rpc_poller, MAX_GAP, 16)
+    .with_gap_detection(rpc_poller, None, MAX_GAP, 16)
     .with_storage(storage);
 
     let handle = source
@@ -671,7 +671,7 @@ async fn first_block_still_arms_when_no_slot_update_arrives() {
         ProgramType::Escrow,
         None,
     )
-    .with_gap_detection(rpc_poller, 1_000, 16)
+    .with_gap_detection(rpc_poller, None, 1_000, 16)
     .with_storage(storage);
 
     let handle = source

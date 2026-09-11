@@ -8,17 +8,25 @@ The two operators have different failure shapes: withdrawals can halt
 the pipeline (a nonce gap the chain will reject), deposits cannot. The
 dispatch table below routes by webhook + `transaction_type`.
 
-> **Six conditions are not webhook-routed.** The indexer's
-> **`block_unavailable`** wedge pages through Grafana instead, because it changes
-> no transaction row; see
-> [`indexer_block_unavailable.md`](indexer_block_unavailable.md).
+> **Seven conditions are not webhook-routed.** Two indexer wedges page through
+> Grafana instead, because they change no transaction row: **`block_unavailable`**,
+> see [`indexer_block_unavailable.md`](indexer_block_unavailable.md), and
+> **`parse_failed`**, an instruction the indexer supports but cannot decode, see
+> [`indexer_parse_failed.md`](indexer_parse_failed.md).
 >
-> **A second condition pages through Grafana, not the webhook.** The
+> **A third condition pages through Grafana, not the webhook.** The
 > **`sender-lock-lost`** alert fires when a sender cannot prove it still owns
 > its Postgres advisory lock and shuts the whole operator down to stop two
 > senders running at once. It changes no transaction row, so it is not in the
 > dispatch table; see
 > [`sender_lock_lost_runbook.md`](sender_lock_lost_runbook.md).
+>
+> **A fourth condition pages through Grafana, not the webhook.** The
+> **`live-state-lock-lost`** alert fires when an indexer, operator or resync
+> cannot prove it still owns the live-state lock, which is what keeps live
+> workers and a destructive resync off the same database. The same runbook
+> covers the two refusals that lock produces at startup; see
+> [`live_state_lock_runbook.md`](live_state_lock_runbook.md).
 >
 > **Two halts have no dedicated alert.** The **withdrawal bitmap boot
 > pre-flight** fires no "pipeline halted" event and marks no row `failed`.
@@ -119,6 +127,10 @@ The runbooks call this out at every relevant site.
   refusing to checkpoint past a slot whose block the RPC endpoint will not serve.
   Paged by the `indexer-block-unavailable` Grafana alert, not by the webhook
   dispatch table above (no transaction row changes status).
+- [`indexer_parse_failed.md`](indexer_parse_failed.md) - the indexer refusing to
+  checkpoint past a slot holding an instruction it supports but cannot decode.
+  Paged by the `indexer-parse-failed` Grafana alert. Retrying the same endpoint
+  re-parses the same bytes, so only a fuller data source or a code fix clears it.
 - [`mint_memo_cutover.md`](mint_memo_cutover.md) - a resync aborting because a
   channel mint carries a legacy-scheme idempotency memo. Log-discovered, not
   paged; the resync fails closed before dropping anything, so the database is

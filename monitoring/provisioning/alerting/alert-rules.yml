@@ -400,6 +400,84 @@ groups:
               refId: C
 
   - orgId: 1
+    name: indexer-parse-failed-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-parse-failed
+        title: "Indexer cannot decode an instruction it supports and will not advance"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} found an instruction whose discriminator it supports but whose payload it cannot decode, so it is refusing to checkpoint past that slot; the deposit or withdrawal row that drives operator processing was never written. Unlike missing_meta the block itself is well-formed, so replaying the slot re-parses identical bytes and fails identically: retrying the same endpoint is a no-op. Repoint the datasource (for Yellowstone, the backfill gap-fill RPC) at an endpoint that serves innerInstructions with stackHeight, or fix the parser if a program's instruction layout changed. The indexer retries forever and reports zero lag while wedged, so this keys off the error counter. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="parse_failed"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-parse-failed-stream-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-parse-failed-stream
+        title: "Indexer geyser stream cannot decode and is reconnecting continuously"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} keeps hitting instructions its geyser stream cannot decode. No data is lost and the checkpoint is advancing: the reconnect gap-fill re-reads each slot over RPC, which has fuller metadata. The problem is that failing a block is how the stream withholds a slot, so a systematic cause (most often a feed that omits stackHeight on inner instructions, which makes every CPI deposit undecodable) tears the stream down once per affected block. The geyser feed is then contributing nothing while the backfill RPC does its work, at the cost of continuous reconnects and archival traffic. Not an emergency, unlike parse_failed, which means the checkpoint is actually stuck. Repoint the geyser provider at one that emits stackHeight, or drop to the RPC-polling datasource and stop paying for the feed. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="parse_failed_stream"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
     name: indexer-block-unproven-alerts
     folder: Solana Private Channels Alerts
     interval: 1m
@@ -534,6 +612,40 @@ groups:
             datasourceUid: prometheus
             model:
               expr: increase(private_channel_operator_sender_lock_lost_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: live-state-lock-lost
+        title: "Live-state lock ownership could not be proven"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Role {{ $labels.role }} ({{ $labels.job }}) could not prove it still owns the live-state lock (reason {{ $labels.reason }}) and stopped itself. This lock is what keeps live workers and a destructive resync off the same database, so while it is unheld that separation is not enforced. Runbook: docs/runbooks/live_state_lock_runbook.md. Confirm the process restarted and that the database-side cause (failover, idle reaper, pooler) is understood. A reason of not_held or probe_error fired on the first bad probe; probe_timeout means the database went unanswerable for a full 30s, so this alert trails that event by up to that long. Only indexer and operator can page here; resync is a one-shot command with no metrics server, so its own loss surfaces as a failed command instead."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_live_state_lock_lost_total[5m])
               instant: true
               refId: A
           - refId: C

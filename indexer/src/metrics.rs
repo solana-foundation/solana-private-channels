@@ -268,6 +268,17 @@ counter_vec!(
     &["program_type", "reason"]
 );
 
+// A live-state lock holder could not prove it still owns the lock, so its role was
+// cancelled. `role` is one of {indexer, operator, resync}; `reason` is one of
+// {not_held, probe_error, probe_timeout}. Zero in steady state, so any increment means
+// the separation between live workers and a destructive resync was no longer enforced.
+counter_vec!(
+    LIVE_STATE_LOCK_LOST,
+    "private_channel_live_state_lock_lost_total",
+    "Role shutdowns triggered by unprovable live-state-lock ownership",
+    &["role", "reason"]
+);
+
 // Absence-based finality classification: how a null status past blockhash
 // validity resolved once the ledger-floor retention proof ran. `chain` is one of
 // {channel, solana}; `outcome` is one of {dead, uncertain}. Sized before and after
@@ -297,7 +308,10 @@ pub fn init_labels(program_type: &str) {
         "get_slots",
         "get_block",
         "missing_meta",
+        "parse_failed",
+        "parse_failed_stream",
         "block_unavailable",
+        "block_unproven",
         "gap_fill",
         "missing_anchor",
     ] {
@@ -467,6 +481,7 @@ pub fn init() {
         OPERATOR_ABSENCE_CLASSIFY,
         OPERATOR_REMINT_CLAIM_LOST,
         OPERATOR_SENDER_LOCK_LOST,
+        LIVE_STATE_LOCK_LOST,
     );
 }
 
@@ -570,5 +585,11 @@ mod tests {
                 name
             );
         }
+
+        // The live-state lock family is deliberately not in the list above. Gathering
+        // reports only families that already carry a series, and its series are created
+        // with the role label when a role takes the lock, not by init. Asserting on its
+        // absence here would depend on test ordering, since sibling tests in this same
+        // process create those series.
     }
 }

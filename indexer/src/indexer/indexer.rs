@@ -1,5 +1,7 @@
 use crate::config::{ProgramType, ReconciliationConfig};
-use crate::error::{CheckpointError, DataSourceError, IndexerError, ReconciliationError};
+use crate::error::{
+    CheckpointError, DataSourceError, IndexerError, ReconciliationError, StorageError,
+};
 use crate::{
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointWriter},
@@ -9,7 +11,8 @@ use crate::{
         },
         transaction_processor::TransactionProcessor,
     },
-    shutdown_utils::{cleanup_after_backfill, shutdown_indexer},
+    shutdown_utils::{cleanup_after_backfill, shutdown_indexer, stop_signal, StopReason},
+    storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
@@ -59,7 +62,49 @@ enum Supervision {
     /// stop, a fatal write-exhaustion error, or a panic.
     ProcessorEnded(Result<Result<(), IndexerError>, tokio::task::JoinError>),
     /// A shutdown signal arrived while the processor was still running.
-    ShutdownSignalled(std::io::Result<()>),
+    ShutdownSignalled(std::io::Result<StopReason>),
+}
+
+/// Run one startup step, refusing it if the live-state lock is lost while it runs.
+///
+/// Used only before any writer is spawned, so stopping is just returning: there is no
+/// task to abort and no drain to skip. Later stages have writers running and stop them
+/// explicitly instead.
+async fn under_live_lock<T, E>(
+    lock_lost: &CancellationToken,
+    step: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, IndexerError>
+where
+    IndexerError: From<E>,
+{
+    tokio::select! {
+        biased;
+        _ = lock_lost.cancelled() => {
+            error!("Live-state lock lost during startup; refusing to continue");
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        }
+        result = step => result.map_err(IndexerError::from),
+    }
+}
+
+/// Wind the checkpoint writer down once the processor has ended.
+///
+/// Closing its channel is the writer's cue to flush, which is what a restart needs. A lost
+/// lock turns that into a hazard: a resync may already be dropping these tables, and the
+/// flush would commit a durable frontier over the rebuild. So the writer is aborted
+/// instead, which costs no more than an abrupt kill since the durable checkpoint stands.
+async fn finish_checkpoint_writer(
+    lock_lost: &CancellationToken,
+    checkpoint_tx: mpsc::Sender<CheckpointMsg>,
+    checkpoint_handle: tokio::task::JoinHandle<()>,
+) {
+    if lock_lost.is_cancelled() {
+        error!("Live-state lock lost; abandoning the checkpoint flush");
+        checkpoint_handle.abort();
+        return;
+    }
+    drop(checkpoint_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), checkpoint_handle).await;
 }
 
 /// Race the running processor task against the shutdown signal. Biased to the
@@ -68,7 +113,7 @@ enum Supervision {
 /// clean shutdown.
 async fn supervise(
     processor_handle: &mut tokio::task::JoinHandle<Result<(), IndexerError>>,
-    shutdown: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: impl std::future::Future<Output = std::io::Result<StopReason>>,
 ) -> Supervision {
     tokio::select! {
         biased;
@@ -76,6 +121,9 @@ async fn supervise(
         sig = shutdown => Supervision::ShutdownSignalled(sig),
     }
 }
+
+/// Metric label for the live-state lock this role holds.
+const INDEXER_LOCK_ROLE: &str = "indexer";
 
 /// Reconcile attempts before a mismatch is treated as real rather than as a deposit that
 /// landed while startup was still catching up.
@@ -230,13 +278,31 @@ fn build_backfill_service(
         rpc_polling_config.commitment,
     ));
 
+    // Startup backfill runs unattended on every process start and its failure exits the
+    // process, so it needs the same archival re-fetch the live paths have; without it a
+    // recoverable slot becomes a boot loop. Empty means unset (env renders "" for an
+    // unconfigured var).
+    let fallback_poller = common_config
+        .fallback_rpc_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| {
+            Arc::new(RpcPoller::new(
+                url.to_string(),
+                rpc_polling_config.encoding,
+                rpc_polling_config.commitment,
+            ))
+        });
+
     Ok(BackfillService::new(
         storage,
         rpc_poller,
         common_config.program_type,
         indexer_config.backfill.clone(),
         common_config.escrow_instance_id,
-    ))
+    )
+    .with_fallback_poller(fallback_poller))
 }
 
 /// Spawn the processor that turns decoded instructions into rows and checkpoint updates.
@@ -273,6 +339,7 @@ async fn run_backfill_only(
     program_type: ProgramType,
     escrow_instance_id: Option<Pubkey>,
     configured_start_slot: Option<u64>,
+    live_lock_lost: CancellationToken,
 ) -> Result<(), IndexerError> {
     // Resolve first and fail closed: with no live stream there is no ungated fallback.
     let range = backfill_service.resolve_range().await?;
@@ -320,50 +387,79 @@ async fn run_backfill_only(
     );
     info!("TransactionProcessor task spawned");
 
-    // Held, not propagated, so the drain below still runs and a partial fill keeps its slots.
-    let fill_result = match range.gap {
-        Some((from_slot, target)) => {
-            backfill_service
-                .run_range(from_slot, target, instruction_tx.clone())
-                .await
-        }
-        None => {
-            info!("No backfill gap to fill");
-            Ok(())
-        }
+    // Kept so the loss branch below can stop both writers after their join handles have
+    // moved into the run future.
+    let processor_abort = processor_handle.abort_handle();
+    let checkpoint_abort = checkpoint_handle.abort_handle();
+
+    // Everything that writes to the database, as one future. The whole of it is watched
+    // below, not just the fill: the checkpoint flush at the end is the most dangerous
+    // write here, since a durable frontier committed over a database a resync is
+    // rebuilding leaves no gap for a later run to detect.
+    let run_fill = async move {
+        // Held, not propagated, so the drain below still runs and a partial fill keeps its slots.
+        let fill_result = match range.gap {
+            Some((from_slot, target)) => {
+                backfill_service
+                    .run_range(from_slot, target, instruction_tx.clone())
+                    .await
+            }
+            None => {
+                info!("No backfill gap to fill");
+                Ok(())
+            }
+        };
+
+        // Releasing the last sender is what ends the processor's receive loop.
+        drop(instruction_tx);
+        let processor_result = match processor_handle.await {
+            Ok(result) => result,
+            Err(join_err) => {
+                error!("TransactionProcessor task panicked: {:?}", join_err);
+                Err(IndexerError::ProcessorPanicked)
+            }
+        };
+
+        info!("Backfill completed, performing graceful cleanup...");
+        // The processor is joined above rather than here for a reason worth stating: it holds
+        // a clone of the checkpoint sender, so the writer cannot see its channel close while
+        // the processor is alive. Draining first would burn the full drain timeout and then
+        // flush a frontier missing every slot the processor had not finished writing yet.
+        let cleanup_result = cleanup_after_backfill(
+            checkpoint_handle,
+            checkpoint_tx,
+            storage,
+            range.gap.map(|(_, target)| (program_type, target)),
+        )
+        .await;
+
+        // Order of reporting matters because these failures cause one another. A processor
+        // that gives up on a write drops the instruction receiver, which the fill then sees
+        // as a send failure, and both leave the checkpoint short of its target. Reporting the
+        // processor first names the database error that actually started it, instead of
+        // pointing an operator at the channel or at the completeness check downstream of it.
+        processor_result?;
+        fill_result?;
+        cleanup_result
     };
 
-    // Releasing the last sender is what ends the processor's receive loop.
-    drop(instruction_tx);
-    let processor_result = match processor_handle.await {
-        Ok(result) => result,
-        Err(join_err) => {
-            error!("TransactionProcessor task panicked: {:?}", join_err);
-            Err(IndexerError::ProcessorPanicked)
+    // A lost lock means a resync may already be dropping these tables, so stop writing
+    // rather than race it. The run is repeatable and the durable checkpoint stands, so a
+    // rerun resumes from it once the rebuild has finished.
+    tokio::select! {
+        biased;
+        _ = live_lock_lost.cancelled() => {
+            error!("Live-state lock lost during the backfill; stopping it");
+            // Stopped outright rather than drained. Closing the checkpoint channel is the
+            // writer's cue to flush what it has, which is exactly the write that must not
+            // land on a database being rebuilt underneath us. Waited on, because returning
+            // frees the lock and an aborted write can still be in flight.
+            crate::shutdown_utils::abort_and_await_writers(&[processor_abort, checkpoint_abort])
+                .await;
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
         }
-    };
-
-    info!("Backfill completed, performing graceful cleanup...");
-    // The processor is joined above rather than here for a reason worth stating: it holds
-    // a clone of the checkpoint sender, so the writer cannot see its channel close while
-    // the processor is alive. Draining first would burn the full drain timeout and then
-    // flush a frontier missing every slot the processor had not finished writing yet.
-    let cleanup_result = cleanup_after_backfill(
-        checkpoint_handle,
-        checkpoint_tx,
-        storage,
-        range.gap.map(|(_, target)| (program_type, target)),
-    )
-    .await;
-
-    // Order of reporting matters because these failures cause one another. A processor
-    // that gives up on a write drops the instruction receiver, which the fill then sees
-    // as a send failure, and both leave the checkpoint short of its target. Reporting the
-    // processor first names the database error that actually started it, instead of
-    // pointing an operator at the channel or at the completeness check downstream of it.
-    processor_result?;
-    fill_result?;
-    cleanup_result
+        result = run_fill => result,
+    }
 }
 
 pub async fn run(
@@ -378,6 +474,12 @@ pub async fn run(
     info!("RPC URL: {}", common_config.rpc_url);
     info!("Backfill enabled: {}", indexer_config.backfill.enabled);
 
+    // Checked here rather than in the binary so every entry point is covered, including
+    // embedders that call run() directly. Needs both halves: the fallback is configured on
+    // `common`, the block source it must differ from depends on the datasource.
+    crate::config::validate_fallback_endpoint(&common_config, &indexer_config)
+        .map_err(|reason| DataSourceError::InvalidConfig { reason })?;
+
     // 1. Initialize storage
     let storage: Arc<Storage> = match common_config.storage_type {
         StorageType::Postgres => Arc::new(Storage::Postgres(
@@ -386,7 +488,31 @@ pub async fn run(
                 .map_err(|e| IndexerError::Storage(e.into()))?,
         )),
     };
-    storage.init_schema().await?;
+
+    // The token every stop reason funnels into, created here so the live-state lock
+    // can cancel it. Do not move this below the lock: a lost lock would then have
+    // nothing to cancel.
+    let cancellation_token = CancellationToken::new();
+
+    // Take the live-state lock before touching the schema. A resync rebuilding this
+    // database holds it exclusively, and starting underneath one would write rows into
+    // tables it is about to drop. Held for the whole run, so a resync cannot start
+    // either. Refusing here is the point: the supervisor retries once the resync exits.
+    // The lock gets a token of its own so a lost lock stays distinguishable from an
+    // interrupt at the shutdown site. The two earn different treatment: only one of them
+    // means a resync may already be dropping the tables underneath us.
+    let live_lock_lost = CancellationToken::new();
+    let _live_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            INDEXER_LOCK_ROLE,
+            live_lock_lost.clone(),
+            LIVE_LOCK_HEARTBEAT_INTERVAL,
+        )
+        .await
+        .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
+
+    under_live_lock(&live_lock_lost, storage.init_schema()).await?;
     info!("Storage initialized");
 
     // 2. Validate the escrow reconciliation wiring before doing any work.
@@ -419,7 +545,11 @@ pub async fn run(
     } else if !indexer_config.backfill.enabled {
         // No import is configured, so the ledger will not get any more complete than it
         // is right now and the comparison is as meaningful here as anywhere.
-        reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage).await?;
+        under_live_lock(
+            &live_lock_lost,
+            reconcile_escrow(&indexer_config.reconciliation, &common_config, &storage),
+        )
+        .await?;
     }
 
     // 3. Backfill-only mode is self-contained: it gates the writer to the fill range,
@@ -442,6 +572,7 @@ pub async fn run(
                 common_config.program_type,
                 common_config.escrow_instance_id,
                 indexer_config.backfill.start_slot,
+                live_lock_lost.clone(),
             )
             .await;
         }
@@ -506,30 +637,33 @@ pub async fn run(
 
         #[cfg(feature = "datasource-rpc")]
         {
-            let backfill_service =
-                build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
+            let startup_fill = async {
+                let backfill_service =
+                    build_backfill_service(storage.clone(), &common_config, &indexer_config)?;
 
-            // Settle the configured floor before any network call. It reads one config
-            // field and one row, so surfacing it first keeps a misconfiguration from
-            // being reported as whatever RPC failure happened to be hit on the way.
-            start_floor(
-                BACKFILL_START_SETTING,
-                common_config.program_type,
-                get_last_checkpoint(&storage, common_config.program_type).await?,
-                indexer_config.backfill.start_slot,
-            )?;
+                // Settle the configured floor before any network call. It reads one config
+                // field and one row, so surfacing it first keeps a misconfiguration from
+                // being reported as whatever RPC failure happened to be hit on the way.
+                start_floor(
+                    BACKFILL_START_SETTING,
+                    common_config.program_type,
+                    get_last_checkpoint(&storage, common_config.program_type).await?,
+                    indexer_config.backfill.start_slot,
+                )?;
 
-            // Only an escrow indexer has custody to compare against, so only it has a
-            // reason to hold the stream back until the fill is durable.
-            match common_config.escrow_instance_id {
-                Some(instance_id) => {
-                    for attempt in 1..=RECONCILE_MAX_ATTEMPTS {
-                        // A sweep that never settled on one slot gets the same second
-                        // chance a mismatch does: the node was moving under it, and the
-                        // next sweep may catch it still. Anything else is fatal here.
-                        let snapshot =
-                            match capture_custody_snapshot(&common_config.rpc_url, &instance_id)
-                                .await
+                // Only an escrow indexer has custody to compare against, so only it has a
+                // reason to hold the stream back until the fill is durable.
+                match common_config.escrow_instance_id {
+                    Some(instance_id) => {
+                        for attempt in 1..=RECONCILE_MAX_ATTEMPTS {
+                            // A sweep that never settled on one slot gets the same second
+                            // chance a mismatch does: the node was moving under it, and the
+                            // next sweep may catch it still. Anything else is fatal here.
+                            let snapshot = match capture_custody_snapshot(
+                                &common_config.rpc_url,
+                                &instance_id,
+                            )
+                            .await
                             {
                                 Ok(snapshot) => snapshot,
                                 Err(e)
@@ -550,136 +684,160 @@ pub async fn run(
                                 Err(e) => return Err(e),
                             };
 
-                        // The ledger must not already sit above the reading it is about to
-                        // be judged by. If it does, the node is answering from behind us
-                        // and there is no slot at which the two can be compared, so refuse
-                        // rather than reach a verdict from an incomplete custody view.
-                        let committed = get_last_checkpoint(&storage, common_config.program_type)
-                            .await?
-                            .unwrap_or(0);
-                        if snapshot.slot < committed {
-                            let behind = IndexerError::Reconciliation(
-                                ReconciliationError::CustodyBehindLedger {
-                                    snapshot_slot: snapshot.slot,
-                                    committed,
-                                },
-                            );
-                            if attempt < RECONCILE_MAX_ATTEMPTS {
-                                warn!(
-                                    "Startup reconciliation attempt {}/{}: {}, re-reading",
-                                    attempt, RECONCILE_MAX_ATTEMPTS, behind
+                            // The ledger must not already sit above the reading it is about to
+                            // be judged by. If it does, the node is answering from behind us
+                            // and there is no slot at which the two can be compared, so refuse
+                            // rather than reach a verdict from an incomplete custody view.
+                            let committed =
+                                get_last_checkpoint(&storage, common_config.program_type)
+                                    .await?
+                                    .unwrap_or(0);
+                            if snapshot.slot < committed {
+                                let behind = IndexerError::Reconciliation(
+                                    ReconciliationError::CustodyBehindLedger {
+                                        snapshot_slot: snapshot.slot,
+                                        committed,
+                                    },
                                 );
-                                tokio::time::sleep(Duration::from_millis(RECONCILE_RETRY_DELAY_MS))
+                                if attempt < RECONCILE_MAX_ATTEMPTS {
+                                    warn!(
+                                        "Startup reconciliation attempt {}/{}: {}, re-reading",
+                                        attempt, RECONCILE_MAX_ATTEMPTS, behind
+                                    );
+                                    tokio::time::sleep(Duration::from_millis(
+                                        RECONCILE_RETRY_DELAY_MS,
+                                    ))
                                     .await;
-                                continue;
+                                    continue;
+                                }
+                                return Err(behind);
                             }
-                            return Err(behind);
+
+                            let range = resolve_startup_range(&backfill_service).await?;
+
+                            // The floor, never the target: the range above it is not filled yet.
+                            #[cfg(feature = "datasource-yellowstone")]
+                            {
+                                startup_anchor_hint = Some(range.anchor);
+                            }
+
+                            // Fill up to the snapshot's slot rather than the chain tip. Stopping
+                            // exactly where custody was measured is what makes the comparison
+                            // total: the ledger ends at that slot, custody describes that slot,
+                            // and there is no band of rows above it that the comparison would
+                            // have to leave unexamined.
+                            let ledger_end = if snapshot.slot > range.anchor {
+                                arm_and_fill(
+                                    &backfill_service,
+                                    &instruction_tx,
+                                    common_config.program_type,
+                                    range.anchor,
+                                    snapshot.slot,
+                                )
+                                .await?;
+
+                                wait_for_checkpoint_commit(
+                                    &storage,
+                                    common_config.program_type,
+                                    snapshot.slot,
+                                    Duration::from_secs(CHECKPOINT_COMMIT_TIMEOUT_SECS),
+                                )
+                                .await?;
+                                info!("Backfill completed successfully");
+                                snapshot.slot
+                            } else {
+                                info!("No backfill gap; checkpoint writer left ungated");
+                                range.anchor
+                            };
+
+                            // One past whatever the ledger now covers. The fill stopped short of
+                            // the tip, so the resolved live start would leave everything between
+                            // the two unread by either producer.
+                            rpc_live_start_slot = Some(ledger_end + 1);
+
+                            match reconcile_escrow_against(
+                                &indexer_config.reconciliation,
+                                &common_config,
+                                &storage,
+                                &snapshot,
+                            )
+                            .await
+                            {
+                                Ok(()) => break,
+                                Err(e)
+                                    if attempt < RECONCILE_MAX_ATTEMPTS
+                                        && reconcile_error_may_clear(&e) =>
+                                {
+                                    warn!(
+                                        "Startup reconciliation attempt {}/{} did not balance, \
+                                     retrying with a freshly read custody snapshot: {}",
+                                        attempt, RECONCILE_MAX_ATTEMPTS, e
+                                    );
+                                    // Worth repeating only once the node has had a moment to
+                                    // settle; an immediate re-read would compare the same two
+                                    // numbers and burn the attempt for nothing.
+                                    tokio::time::sleep(Duration::from_millis(
+                                        RECONCILE_RETRY_DELAY_MS,
+                                    ))
+                                    .await;
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
-
+                    }
+                    None => {
                         let range = resolve_startup_range(&backfill_service).await?;
-
-                        // The floor, never the target: the range above it is not filled yet.
+                        rpc_live_start_slot = Some(range.live_start_slot);
                         #[cfg(feature = "datasource-yellowstone")]
                         {
                             startup_anchor_hint = Some(range.anchor);
                         }
 
-                        // Fill up to the snapshot's slot rather than the chain tip. Stopping
-                        // exactly where custody was measured is what makes the comparison
-                        // total: the ledger ends at that slot, custody describes that slot,
-                        // and there is no band of rows above it that the comparison would
-                        // have to leave unexamined.
-                        let ledger_end = if snapshot.slot > range.anchor {
-                            arm_and_fill(
-                                &backfill_service,
+                        if let Some((from_slot, target)) = range.gap {
+                            // Armed out here rather than inside the task so the gate is in
+                            // place before the datasource below can emit its first slot.
+                            arm_backfill_gate(
                                 &instruction_tx,
                                 common_config.program_type,
-                                range.anchor,
-                                snapshot.slot,
+                                from_slot,
+                                target,
                             )
                             .await?;
 
-                            wait_for_checkpoint_commit(
-                                &storage,
-                                common_config.program_type,
-                                snapshot.slot,
-                                Duration::from_secs(CHECKPOINT_COMMIT_TIMEOUT_SECS),
-                            )
-                            .await?;
-                            info!("Backfill completed successfully");
-                            snapshot.slot
+                            let instruction_tx_clone = instruction_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backfill_service
+                                    .run_range(from_slot, target, instruction_tx_clone)
+                                    .await
+                                {
+                                    error!("Backfill failed: {}", e);
+                                } else {
+                                    info!("Backfill completed successfully");
+                                }
+                            });
                         } else {
                             info!("No backfill gap; checkpoint writer left ungated");
-                            range.anchor
-                        };
-
-                        // One past whatever the ledger now covers. The fill stopped short of
-                        // the tip, so the resolved live start would leave everything between
-                        // the two unread by either producer.
-                        rpc_live_start_slot = Some(ledger_end + 1);
-
-                        match reconcile_escrow_against(
-                            &indexer_config.reconciliation,
-                            &common_config,
-                            &storage,
-                            &snapshot,
-                        )
-                        .await
-                        {
-                            Ok(()) => break,
-                            Err(e)
-                                if attempt < RECONCILE_MAX_ATTEMPTS
-                                    && reconcile_error_may_clear(&e) =>
-                            {
-                                warn!(
-                                    "Startup reconciliation attempt {}/{} did not balance, \
-                                     retrying with a freshly read custody snapshot: {}",
-                                    attempt, RECONCILE_MAX_ATTEMPTS, e
-                                );
-                                // Worth repeating only once the node has had a moment to
-                                // settle; an immediate re-read would compare the same two
-                                // numbers and burn the attempt for nothing.
-                                tokio::time::sleep(Duration::from_millis(RECONCILE_RETRY_DELAY_MS))
-                                    .await;
-                            }
-                            Err(e) => return Err(e),
                         }
                     }
                 }
-                None => {
-                    let range = resolve_startup_range(&backfill_service).await?;
-                    rpc_live_start_slot = Some(range.live_start_slot);
-                    #[cfg(feature = "datasource-yellowstone")]
-                    {
-                        startup_anchor_hint = Some(range.anchor);
-                    }
+                Ok::<(), IndexerError>(())
+            };
 
-                    if let Some((from_slot, target)) = range.gap {
-                        // Armed out here rather than inside the task so the gate is in
-                        // place before the datasource below can emit its first slot.
-                        arm_backfill_gate(
-                            &instruction_tx,
-                            common_config.program_type,
-                            from_slot,
-                            target,
-                        )
-                        .await?;
-
-                        let instruction_tx_clone = instruction_tx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = backfill_service
-                                .run_range(from_slot, target, instruction_tx_clone)
-                                .await
-                            {
-                                error!("Backfill failed: {}", e);
-                            } else {
-                                info!("Backfill completed successfully");
-                            }
-                        });
-                    } else {
-                        info!("No backfill gap; checkpoint writer left ungated");
-                    }
+            // The fill writes rows and then blocks until a durable checkpoint lands, so a
+            // lock lost part way through means a resync may already be dropping the tables
+            // underneath both writes. Stop rather than finish and commit over the rebuild.
+            tokio::select! {
+                biased;
+                _ = live_lock_lost.cancelled() => {
+                    error!("Live-state lock lost during the startup fill; stopping without draining");
+                    crate::shutdown_utils::abort_and_await_writers(&[
+                        processor_handle.abort_handle(),
+                        checkpoint_handle.abort_handle(),
+                    ])
+                    .await;
+                    return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
                 }
+                result = startup_fill => result?,
             }
         }
     }
@@ -774,6 +932,16 @@ pub async fn run(
                     commitment,
                 ));
 
+                // The gap-fill is this datasource's only way back to a slot the stream
+                // failed closed on, and it runs unattended, so it gets the archival
+                // fallback. Empty means unset (env renders an unconfigured var as "").
+                let gap_fallback_poller = common_config
+                    .fallback_rpc_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                    .map(|url| Arc::new(RpcPoller::new(url.to_string(), encoding, commitment)));
+
                 info!(
                     "Yellowstone gap detection enabled (max_gap: {}, batch_size: {})",
                     indexer_config.backfill.max_gap_slots, indexer_config.backfill.batch_size
@@ -799,6 +967,7 @@ pub async fn run(
                     .with_startup_floor(startup_floor)
                     .with_gap_detection(
                         gap_rpc_poller,
+                        gap_fallback_poller,
                         indexer_config.backfill.max_gap_slots,
                         indexer_config.backfill.batch_size,
                     )
@@ -827,9 +996,6 @@ pub async fn run(
         }
     };
 
-    // 7. Create cancellation token for graceful shutdown
-    let cancellation_token = CancellationToken::new();
-
     info!("Starting datasource...");
     let datasource_handle = datasource
         .start(instruction_tx.clone(), cancellation_token.clone())
@@ -842,18 +1008,32 @@ pub async fn run(
     // and by the datasource), so the processor side only fires on a fatal write
     // failure or a panic - both must crash the process so the supervisor
     // restarts it and the failed slot replays from the durable checkpoint.
-    match supervise(&mut processor_handle, signal::ctrl_c()).await {
+    // Kept back from the move below: the processor arm has to ask the same question the
+    // signal arm does, and a task dying is exactly when the lock tends to have gone too.
+    let processor_end_lock_lost = live_lock_lost.clone();
+    match supervise(
+        &mut processor_handle,
+        stop_signal(signal::ctrl_c(), live_lock_lost),
+    )
+    .await
+    {
         Supervision::ProcessorEnded(res) => {
             // Flush batched checkpoints for already-committed slots so a restart resumes
-            // from the latest durable point; timeout-bounded since a dead DB would stall it.
+            // from the latest durable point, unless the lock is gone and the flush would
+            // land on a rebuild.
             cancellation_token.cancel();
             drop(instruction_tx);
-            drop(checkpoint_tx);
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), checkpoint_handle).await;
+            finish_checkpoint_writer(&processor_end_lock_lost, checkpoint_tx, checkpoint_handle)
+                .await;
 
             match res {
                 Ok(Ok(())) => {
+                    // Only clean if the lock held throughout. Exiting zero otherwise would
+                    // report success for a database that may be being rebuilt underneath.
+                    if processor_end_lock_lost.is_cancelled() {
+                        error!("Live-state lock lost; the processor stopped without draining");
+                        return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
+                    }
                     info!("TransactionProcessor stopped cleanly");
                 }
                 Ok(Err(e)) => {
@@ -867,7 +1047,24 @@ pub async fn run(
             }
         }
         Supervision::ShutdownSignalled(signal_res) => {
-            signal_res.map_err(|_| IndexerError::ShutdownChannelSend)?;
+            let reason = signal_res.map_err(|_| IndexerError::ShutdownChannelSend)?;
+
+            // A lost lock is not a graceful stop. Postgres frees the lock the instant our
+            // session dies, so a resync may already be dropping these tables; draining
+            // would keep writing into them and flush a checkpoint over the rebuild. Stop
+            // the writers outright instead, which costs no more than an abrupt kill: the
+            // durable checkpoint stands and a restart replays from it.
+            if reason == StopReason::LiveLockLost {
+                error!("Live-state lock lost; stopping without draining");
+                cancellation_token.cancel();
+                crate::shutdown_utils::abort_and_await_writers(&[
+                    processor_handle.abort_handle(),
+                    checkpoint_handle.abort_handle(),
+                ])
+                .await;
+                return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
+            }
+
             info!("Shutdown signal received, initiating graceful shutdown...");
 
             // 10. Graceful shutdown
@@ -966,12 +1163,53 @@ mod tests {
         // Let the task run to completion so its future is ready when raced.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let outcome = supervise(&mut handle, std::future::ready(Ok(()))).await;
+        let outcome = supervise(&mut handle, std::future::ready(Ok(StopReason::Interrupted))).await;
 
         match outcome {
             Supervision::ProcessorEnded(Ok(Err(IndexerError::CheckpointChannelClosed))) => {}
             _ => panic!("biased select must report the finished processor's fatal error"),
         }
+    }
+
+    /// U4. Losing the live-state lock has to stop the indexer, and it has to be
+    /// distinguishable from a ctrl-c. A lost lock means a resync may already be
+    /// dropping these tables, so the drain a ctrl-c earns would race that drop.
+    #[tokio::test]
+    async fn shutdown_signal_reports_a_lost_lock_as_its_own_reason() {
+        let token = CancellationToken::new();
+        let mut handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(())
+        });
+
+        token.cancel();
+        let outcome = supervise(&mut handle, stop_signal(std::future::pending(), token)).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Supervision::ShutdownSignalled(Ok(StopReason::LiveLockLost))
+            ),
+            "a cancelled lock token must report itself as a lost lock, not as an interrupt"
+        );
+        handle.abort();
+    }
+
+    /// The signal must stay pending while nothing has happened, or every start
+    /// would immediately shut itself down.
+    #[tokio::test]
+    async fn shutdown_signal_stays_pending_without_a_reason() {
+        let token = CancellationToken::new();
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            stop_signal(std::future::pending(), token),
+        )
+        .await;
+
+        assert!(
+            pending.is_err(),
+            "an idle indexer must not shut itself down"
+        );
     }
 
     /// While the processor is still running, a ready shutdown signal wins.
@@ -982,9 +1220,12 @@ mod tests {
             Ok(())
         });
 
-        let outcome = supervise(&mut handle, std::future::ready(Ok(()))).await;
+        let outcome = supervise(&mut handle, std::future::ready(Ok(StopReason::Interrupted))).await;
 
-        assert!(matches!(outcome, Supervision::ShutdownSignalled(Ok(()))));
+        assert!(matches!(
+            outcome,
+            Supervision::ShutdownSignalled(Ok(StopReason::Interrupted))
+        ));
         handle.abort();
     }
 
@@ -996,9 +1237,61 @@ mod tests {
             tokio::spawn(async { panic!("processor boom") });
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let outcome = supervise(&mut handle, std::future::pending::<std::io::Result<()>>()).await;
+        let outcome = supervise(
+            &mut handle,
+            std::future::pending::<std::io::Result<StopReason>>(),
+        )
+        .await;
 
         assert!(matches!(outcome, Supervision::ProcessorEnded(Err(_))));
+    }
+
+    /// A writer stand-in that records whether it saw its channel close, which is the cue
+    /// it flushes on. Returns the flag and the pieces `finish_checkpoint_writer` takes.
+    fn checkpoint_writer_stub() -> (
+        Arc<std::sync::atomic::AtomicBool>,
+        mpsc::Sender<CheckpointMsg>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, mut rx) = mpsc::channel::<CheckpointMsg>(1);
+        let observed = Arc::clone(&flushed);
+        let handle = tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        (flushed, tx, handle)
+    }
+
+    /// The ordinary processor-death path still has to flush, or a restart would replay
+    /// slots that were already committed.
+    #[tokio::test]
+    async fn checkpoint_writer_flushes_when_the_lock_is_held() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+
+        finish_checkpoint_writer(&CancellationToken::new(), tx, handle).await;
+
+        assert!(
+            flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a processor that ended under a held lock must let the writer flush"
+        );
+    }
+
+    /// The same path under a lost lock must not flush: a resync may already be dropping
+    /// these tables, and the frontier would land on the rebuild.
+    #[tokio::test]
+    async fn checkpoint_writer_is_abandoned_when_the_lock_is_lost() {
+        let (flushed, tx, handle) = checkpoint_writer_stub();
+        let lost = CancellationToken::new();
+        lost.cancel();
+
+        finish_checkpoint_writer(&lost, tx, handle).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !flushed.load(std::sync::atomic::Ordering::SeqCst),
+            "a lost lock must abort the writer rather than cue its flush"
+        );
     }
 
     /// One-shot backfill: every slot recorded, and the checkpoint only reaching the target
@@ -1105,8 +1398,15 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service_starting_at(&server, storage.clone(), 5000);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(5000)).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                Some(5000),
+                CancellationToken::new(),
+            )
+            .await;
 
             let err = result.expect_err("a start slot past the checkpoint must refuse");
             assert!(
@@ -1144,8 +1444,15 @@ mod tests {
             let storage: Arc<Storage> = Arc::new(Storage::Mock(mock.clone()));
 
             let backfill = service_starting_at(&server, storage.clone(), 5000);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(5000)).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                Some(5000),
+                CancellationToken::new(),
+            )
+            .await;
 
             assert!(
                 result.is_ok(),
@@ -1163,8 +1470,15 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service_starting_at(&server, storage.clone(), 101);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, Some(101)).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                Some(101),
+                CancellationToken::new(),
+            )
+            .await;
 
             assert!(
                 result.is_ok(),
@@ -1182,8 +1496,15 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
 
             assert!(result.is_ok(), "clean backfill must succeed: {result:?}");
             assert_eq!(
@@ -1210,7 +1531,14 @@ mod tests {
             let backfill = service(&server, storage.clone(), 10_000, u64::MAX, None);
             let outcome = tokio::time::timeout(
                 Duration::from_secs(60),
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None),
+                run_backfill_only(
+                    backfill,
+                    storage,
+                    ProgramType::Escrow,
+                    None,
+                    None,
+                    CancellationToken::new(),
+                ),
             )
             .await;
 
@@ -1234,8 +1562,15 @@ mod tests {
 
             let instance = Some(deposit_fixture_instance());
             let backfill = service(&server, storage.clone(), 10, 1000, instance);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, instance, None).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                instance,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
 
             assert!(result.is_ok(), "deposit backfill must succeed: {result:?}");
             let rows: Vec<_> = mock
@@ -1270,8 +1605,15 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service(&server, storage.clone(), 2, 1000, None);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
 
             assert!(result.is_err(), "a failed fetch must fail the run");
             assert_eq!(
@@ -1292,8 +1634,15 @@ mod tests {
             mock.set_should_fail("escrow", true);
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
 
             match result {
                 Err(IndexerError::BackfillIncomplete {
@@ -1304,6 +1653,39 @@ mod tests {
                 }
                 other => panic!("a stalled checkpoint must fail the run, got: {other:?}"),
             }
+        }
+
+        /// A backfill-only run writes rows and then flushes a durable checkpoint, all
+        /// through ordinary pooled connections. If the live-state lock is gone a resync
+        /// may already be dropping those tables, so the run must stop rather than finish
+        /// and commit a frontier over the rebuild.
+        #[tokio::test]
+        async fn backfill_only_stops_without_flushing_when_the_live_lock_is_lost() {
+            let mut server = Server::new_async().await;
+            let _slot = mock_get_slot(&mut server, 103);
+            let _blocks = chain(&mut server, 101, 103, &[(101, 100), (102, 101), (103, 102)]);
+            let (mock, storage) = seeded_storage(100);
+
+            let lost = CancellationToken::new();
+            lost.cancel();
+
+            let backfill = service(&server, storage.clone(), 10, 1000, None);
+            let result =
+                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None, lost).await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+                ),
+                "a lost lock must stop a backfill-only run, got: {result:?}"
+            );
+            assert_eq!(
+                checkpoint_of(&mock),
+                Some(100),
+                "the durable checkpoint must stand where it was; flushing it here would \
+                 commit a frontier over a database a resync may be rebuilding"
+            );
         }
 
         /// Nothing to fill is a clean exit that touches neither RPC blocks nor the checkpoint.
@@ -1321,8 +1703,15 @@ mod tests {
             let (mock, storage) = seeded_storage(100);
 
             let backfill = service(&server, storage.clone(), 10, 1000, None);
-            let result =
-                run_backfill_only(backfill, storage, ProgramType::Escrow, None, None).await;
+            let result = run_backfill_only(
+                backfill,
+                storage,
+                ProgramType::Escrow,
+                None,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
 
             assert!(result.is_ok(), "an empty range must succeed: {result:?}");
             no_blocks.assert();

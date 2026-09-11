@@ -1,6 +1,6 @@
 use crate::{
     config::{BackfillConfig, ProgramType},
-    error::{indexer::ReconciliationError, DataSourceError, IndexerError},
+    error::{indexer::ReconciliationError, DataSourceError, IndexerError, StorageError},
     indexer::{
         backfill::BackfillService, checkpoint::CheckpointWriter,
         datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
@@ -9,18 +9,23 @@ use crate::{
         enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda, ConsumedSet,
         RetryConfig, RpcClientWithRetry, CONSUMED_SET_PAGE_SIZE,
     },
+    storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
     storage::Storage,
 };
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// How far behind wall clock the bitmap RPC's finalized tip may sit and still count as
 /// evidence about the live chain. Generous next to Solana's finalization, because the
 /// failure it exists to catch is a node hours behind, not one a few slots behind.
 const MAX_BITMAP_RPC_TIP_LAG_SECS: i64 = 120;
+
+/// Metric label for the live-state lock this service holds.
+const RESYNC_LOCK_ROLE: &str = "resync";
 
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
 #[derive(Clone, Debug)]
@@ -44,6 +49,8 @@ pub struct ResyncService {
     // Solana RPC that can read the escrow's withdrawal bitmap. A withdraw rebuild refuses
     // to run without it, because it cannot prove the chain has not issued nonces yet.
     withdrawal_bitmap_rpc_url: Option<String>,
+    // How often the live-state lock re-proves itself. Only tests override it.
+    lock_heartbeat_interval: Duration,
 }
 
 impl ResyncService {
@@ -62,7 +69,15 @@ impl ResyncService {
             escrow_instance_id,
             channel_reconcile: None,
             withdrawal_bitmap_rpc_url: None,
+            lock_heartbeat_interval: LIVE_LOCK_HEARTBEAT_INTERVAL,
         }
+    }
+
+    /// Probe the live-state lock on `interval` instead of the production one, so a
+    /// test can drive a lock loss without waiting out a rebuild.
+    pub fn with_lock_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.lock_heartbeat_interval = interval;
+        self
     }
 
     /// Enable reconcile-on-rebuild against the PrivateChannel's existing mints.
@@ -236,8 +251,45 @@ impl ResyncService {
 
         // ---- Pre-flight: every check runs BEFORE any destruction (fail closed). ----
         // On any failure below we return Err with the live DB completely untouched, so an
-        // advanced bitmap, a future-slot, an unreachable channel, or a legacy-scheme memo
-        // can never leave a half-wiped database.
+        // advanced bitmap, a future-slot, an unreachable channel, a legacy-scheme memo, a
+        // live worker or an unresolved halt can never leave a half-wiped database.
+
+        // Pre-flight 0: take the live-state lock exclusively, before anything else.
+        // It is what proves no indexer or operator is writing to this database, and
+        // holding it for the whole rebuild also refuses any worker that tries to start
+        // while we run. Every later check is pointless without it.
+        let lock_lost = CancellationToken::new();
+        let live_lock = self
+            .storage
+            .try_acquire_live_lock(
+                LiveLockMode::Exclusive,
+                RESYNC_LOCK_ROLE,
+                lock_lost.clone(),
+                self.lock_heartbeat_interval,
+            )
+            .await
+            .inspect_err(|e| error!("Refusing to resync: {}", e))?;
+        info!("Live-state lock acquired; no indexer or operator can run against this database");
+
+        // The reads below need the tables to exist, and a resync is also the supported
+        // way to build a database from nothing. Creating the schema is idempotent and
+        // matches what both workers do at startup.
+        self.storage.init_schema().await?;
+
+        // Pre-flight 0b: a reconciliation halt means custody and the ledger already
+        // disagree. The rebuild drops the table the flag lives in, so running now would
+        // clear an unresolved halt and destroy the evidence behind it.
+        if let Some(halt) = self.storage.is_reconciliation_halted().await? {
+            error!(
+                "Refusing to resync a halted database; halt reason: {}",
+                halt.reason
+            );
+            return Err(IndexerError::Reconciliation(
+                ReconciliationError::ReconciliationHalted {
+                    reason: halt.reason,
+                },
+            ));
+        }
 
         // Pre-flight 1: an escrow rebuild needs its instance scope. The processor filters
         // escrow instructions by it and an unset scope drops every one of them, so a rebuild
@@ -282,12 +334,26 @@ impl ResyncService {
         let consumed = self.build_consumed_set().await?;
 
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
-        // Step 1: Drop existing tables
-        info!("Dropping existing database tables...");
-        self.storage.drop_tables().await.map_err(|e| {
-            error!("Failed to drop database tables during resync: {}", e);
-            e
+        // Two different failures are covered here. A session that died takes the drop with
+        // it, because the drop runs on that session. A loss verdict that was wrong leaves
+        // the session alive and still holding the lock, so only this check can stop it,
+        // and stop it is what we want: the rebuild below watches the same token and would
+        // abort immediately after, leaving the tables dropped and nothing put back.
+        live_lock.ensure_held().await.inspect_err(|e| {
+            error!("Refusing to drop tables: {}", e);
         })?;
+
+        // Step 1: Drop existing tables, on the session holding the lock. Through the pool
+        // the drop would keep running after the lock session died and the lock was freed,
+        // which is exactly when a worker is free to start.
+        info!("Dropping existing database tables...");
+        self.storage
+            .drop_tables_fenced(&live_lock)
+            .await
+            .map_err(|e| {
+                error!("Failed to drop database tables during resync: {}", e);
+                e
+            })?;
         info!("Database tables dropped successfully");
 
         // Step 2: Recreate schema
@@ -350,50 +416,85 @@ impl ResyncService {
             genesis_slot, current_slot, total_slots
         );
 
-        backfill_service
-            .run(instruction_tx.clone())
+        // Kept so the loss branch below can stop both writers after their join handles
+        // have moved into the rebuild future.
+        let processor_abort = processor_handle.abort_handle();
+        let checkpoint_abort = checkpoint_handle.abort_handle();
+        let storage = self.storage.clone();
+
+        // Everything that writes to the rebuilt database, as one future. The whole of it
+        // is watched below, not just the fill: the checkpoint flush at the end is the most
+        // dangerous write here, since a durable frontier over a half-rebuilt database
+        // leaves no gap for a later run to detect.
+        let rebuild = async move {
+            backfill_service
+                .run(instruction_tx.clone())
+                .await
+                .map_err(|e| {
+                    error!(
+                        "Backfill service failed during resync from slot {} to {}: {}",
+                        genesis_slot, current_slot, e
+                    );
+                    e
+                })?;
+            info!("Backfill service completed");
+
+            // Drop instruction_tx to signal no more instructions coming
+            drop(instruction_tx);
+
+            // Wait for processor to finish processing all instructions
+            match processor_handle.await {
+                Ok(Ok(())) => info!("Transaction processor completed successfully"),
+                Ok(Err(e)) => {
+                    error!("Transaction processor failed during resync: {}", e);
+                    return Err(e);
+                }
+                Err(e) => {
+                    error!("Transaction processor task panicked during resync: {:?}", e);
+                    return Err(IndexerError::ShutdownChannelSend);
+                }
+            }
+
+            // Perform cleanup after backfill, with no completeness target to check. A rebuild
+            // resolves its range inside the backfill service and never surfaces the top slot,
+            // so there is nothing to compare against here. Leaving it unchecked is acceptable
+            // because a stale checkpoint after a rebuild heals itself: the next live start
+            // detects the gap below the tip and fills it.
+            if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
+                checkpoint_handle,
+                checkpoint_tx,
+                storage,
+                None,
+            )
             .await
-            .map_err(|e| {
-                error!(
-                    "Backfill service failed during resync from slot {} to {}: {}",
-                    genesis_slot, current_slot, e
-                );
-                e
-            })?;
-        info!("Backfill service completed");
-
-        // Drop instruction_tx to signal no more instructions coming
-        drop(instruction_tx);
-
-        // Wait for processor to finish processing all instructions
-        match processor_handle.await {
-            Ok(Ok(())) => info!("Transaction processor completed successfully"),
-            Ok(Err(e)) => {
-                error!("Transaction processor failed during resync: {}", e);
+            {
+                error!("Cleanup after resync backfill failed: {}", e);
+                // Returned as-is so the operator sees which stage failed, not a generic one.
                 return Err(e);
             }
-            Err(e) => {
-                error!("Transaction processor task panicked during resync: {:?}", e);
-                return Err(IndexerError::ShutdownChannelSend);
-            }
-        }
+            Ok(())
+        };
 
-        // Perform cleanup after backfill, with no completeness target to check. A rebuild
-        // resolves its range inside the backfill service and never surfaces the top slot,
-        // so there is nothing to compare against here. Leaving it unchecked is acceptable
-        // because a stale checkpoint after a rebuild heals itself: the next live start
-        // detects the gap below the tip and fills it.
-        if let Err(e) = crate::shutdown_utils::cleanup_after_backfill(
-            checkpoint_handle,
-            checkpoint_tx,
-            self.storage.clone(),
-            None,
-        )
-        .await
-        {
-            error!("Cleanup after resync backfill failed: {}", e);
-            // Returned as-is so the operator sees which stage failed, not a generic one.
-            return Err(e);
+        // Losing the lock mid-rebuild means a worker can now start against a database
+        // that is only half rebuilt, so stop writing rather than race it. The rebuild is
+        // repeatable, and the next run starts from a lock it actually holds.
+        tokio::select! {
+            biased;
+            _ = lock_lost.cancelled() => {
+                error!("Live-state lock lost during the rebuild; stopping it");
+                // Both writers are stopped outright rather than drained. Closing the
+                // checkpoint channel is the writer's cue to flush what it has, which
+                // would commit a durable frontier over a database this run only half
+                // rebuilt and leave no gap for a later run to detect. Waited on, because
+                // returning frees the lock and an aborted write can still be in flight.
+                crate::shutdown_utils::abort_and_await_writers(&[
+                    processor_abort,
+                    checkpoint_abort,
+                ])
+                .await;
+                return Err(IndexerError::Storage(StorageError::LiveStateLockLost));
+            }
+            result = rebuild => result?,
         }
 
         info!(
@@ -621,7 +722,14 @@ mod tests {
 
     fn assert_db_intact(mock: &MockStorage) {
         assert_eq!(mock.calls("drop_tables"), 0, "drop_tables must not run");
-        assert_eq!(mock.calls("init_schema"), 0, "init_schema must not run");
+        // The schema is created up front so the halt flag is readable on a database
+        // that was never indexed, so exactly one idempotent call is expected here. A
+        // second one would mean the rebuild ran.
+        assert_eq!(
+            mock.calls("init_schema"),
+            1,
+            "only the pre-flight schema creation may run"
+        );
         assert_eq!(mock.mints.lock().unwrap().len(), 1, "mint row must survive");
         assert_eq!(
             mock.committed_checkpoints.lock().unwrap().get("withdraw"),
@@ -839,6 +947,88 @@ mod tests {
                 other => panic!("missing bitmap inputs must abort the resync, got: {other:?}"),
             }
             assert_db_intact(&mock);
+        }
+    }
+
+    // ── reconciliation halt refusal ──────────────────────────────────
+
+    /// A withdraw service on a mock store, with every RPC pointed at a dead port
+    /// and no bitmap RPC configured.
+    ///
+    /// That is what makes ordering observable. Both the bitmap pre-flight and the
+    /// chain-tip fetch sit between the halt check and the drop, so any error other
+    /// than the halt one proves the halt check did not run first.
+    fn halt_test_service(storage: Arc<Storage>) -> ResyncService {
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://127.0.0.1:1".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+        ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Withdraw,
+            backfill_config,
+            None,
+        )
+    }
+
+    /// A reconciliation halt is a solvency interlock, and a rebuild would drop the
+    /// table holding it. Refuse before the drop so the evidence survives.
+    #[tokio::test]
+    async fn run_refuses_when_reconciliation_halt_is_set() {
+        let mock = MockStorage::new();
+        mock.set_reconciliation_halt("supply above custody")
+            .await
+            .unwrap();
+        let storage = Arc::new(Storage::Mock(mock));
+
+        match halt_test_service(storage.clone()).run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::ReconciliationHalted {
+                reason,
+            })) => assert!(
+                reason.contains("supply above custody"),
+                "the refusal must carry the halt reason, got: {reason}"
+            ),
+            other => panic!("a halted database must refuse to resync, got: {other:?}"),
+        }
+        match storage.as_ref() {
+            Storage::Mock(mock) => assert_eq!(
+                mock.calls("drop_tables"),
+                0,
+                "the refusal must land before any destruction"
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    /// An unreadable halt flag is not proof there is no halt, so it must stop the
+    /// rebuild too rather than destroy state it could not check.
+    #[tokio::test]
+    async fn run_aborts_when_the_halt_flag_is_unreadable() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("is_reconciliation_halted", true);
+        let storage = Arc::new(Storage::Mock(mock));
+
+        match halt_test_service(storage.clone()).run(100).await {
+            Err(IndexerError::Storage(_)) => {}
+            other => panic!("an unreadable halt flag must fail closed, got: {other:?}"),
+        }
+        match storage.as_ref() {
+            Storage::Mock(mock) => assert_eq!(
+                mock.calls("drop_tables"),
+                0,
+                "the refusal must land before any destruction"
+            ),
+            _ => unreachable!(),
         }
     }
 }

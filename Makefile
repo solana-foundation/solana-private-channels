@@ -198,6 +198,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
 	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
 	@cd integration && cargo test --test reconnect_gap_fill_fail_closed -- --nocapture
+	@cd integration && cargo test --test rpc_polling_fail_closed -- --nocapture
 	@cd integration && cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cd integration && cargo test --test harness_sanity -- --nocapture
 	@cd integration && cargo test --test sender_poll_rpc_error -- --nocapture
@@ -246,6 +247,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test malformed_yellowstone_update -- --nocapture
 	@cd integration && cargo test --test yellowstone_reconnect_gap -- --nocapture
 	@cd integration && cargo test --test reconnect_gap_fill_fail_closed -- --nocapture
+	@cd integration && cargo test --test rpc_polling_fail_closed -- --nocapture
 	@cd integration && cargo test --test yellowstone_inner_and_unknown -- --nocapture
 	@cd integration && cargo test --test harness_sanity -- --nocapture
 	@cd integration && cargo test --test sender_poll_rpc_error -- --nocapture
