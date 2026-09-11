@@ -107,6 +107,41 @@ on a database that has never been indexed, where there is no checkpoint to skip 
 skip is genuinely intended, drop the checkpoint with a destructive resync rather than
 raising the start slot.
 
+### Resync and the live-state lock
+
+`resync` drops every table and rebuilds from chain, so it is guarded three ways.
+
+1. **`--destroy-existing-data` is required.** No environment variable binding, so it
+   cannot be left switched on in a deployment's env file.
+2. **The live-state lock.** Every indexer and operator takes one Postgres advisory key
+   in shared mode for its whole life; resync takes the same key exclusively and holds
+   it for the entire rebuild. Postgres enforces the separation: workers coexist freely,
+   resync refuses to start while any worker is up, and a worker refuses to start while
+   a resync runs. Ownership is re-proved on a heartbeat, and once more synchronously
+   immediately before the tables are dropped. A role that cannot prove it still owns
+   the lock stops itself. A probe that goes unanswered is not treated as proof: the
+   server may simply be slow, and the session still holds the lock while we retry, so
+   the timeout is tolerated for 30s. An answer of "not held", or a dead session, is
+   proof and stops the role at once. The indexer and operator also increment
+   `private_channel_live_state_lock_lost_total{role,reason}`, while resync, being a
+   one-shot command with no metrics server, reports it as a failed command instead.
+3. **The reconciliation halt flag.** The rebuild drops the table that flag lives in, so
+   resync refuses while a halt is set rather than clearing an unresolved one and
+   destroying the evidence behind it.
+
+The lock session sets its own TCP keepalives, so a holder whose host vanishes is reaped
+by Postgres in under two minutes instead of the OS default of roughly two hours. Without
+that, one dead worker host would refuse every resync for that long with nothing running.
+
+Only workers running a build that takes the lock are visible to the refusal, so during
+a rolling upgrade confirm they are stopped by process, not by the refusal alone.
+Session-level advisory locks also do not survive a pooler in transaction-pooling mode,
+the same constraint the sender's singleton lock already carries.
+
+**Locations**: lock [`live_lock.rs`](../indexer/src/storage/common/storage/live_lock.rs);
+rebuild [`resync.rs`](../indexer/src/indexer/resync.rs); runbook
+[`live_state_lock_runbook.md`](runbooks/live_state_lock_runbook.md).
+
 ### Transaction Identity & CPI Indexing
 
 Each indexed instruction is keyed on the triple **`(signature, instruction_index, inner_index)`**:

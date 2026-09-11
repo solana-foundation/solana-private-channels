@@ -9,12 +9,17 @@ use bigdecimal::BigDecimal;
 use chrono::Utc;
 use private_channel_indexer::{
     config::ProgramType,
+    metrics::LIVE_STATE_LOCK_LOST,
     operator::sender_lock_key,
     storage::{
         common::amount::TokenAmount,
         common::models::{DbMint, DbMintStatus, MintStatusAtSlot, StoredSig},
+        common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
         common::storage::sender_lock::SenderLockGuard,
-        postgres::db::{probe_advisory_lock_held, release_advisory_lock},
+        postgres::db::{
+            apply_lock_session_keepalives, apply_lock_session_lock_timeout,
+            probe_advisory_lock_held, release_advisory_lock,
+        },
         DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
     },
     PostgresConfig,
@@ -2533,6 +2538,348 @@ async fn blockhash_slot_round_trips_and_stays_null_when_absent(
     Ok(())
 }
 
+// ── Live-state lock ───────────────────────────────────────────────────────────
+//
+// The lock that keeps live indexer/operator workers and a destructive resync off
+// the same database at once. Workers take it shared, resync takes it exclusive.
+
+/// A storage handle on its own pool, standing in for a separate process.
+async fn connect_storage(url: &str) -> Storage {
+    Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: url.to_string(),
+            max_connections: 5,
+        })
+        .await
+        .expect("connect"),
+    )
+}
+
+/// Kill whichever backend holds `key`, standing in for a failover or an idle-session reap.
+async fn terminate_advisory_lock_holder(url: &str, key: i64) {
+    let mut conn = pg_connect(url).await;
+    let pid: i32 = sqlx::query_scalar(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+         AND granted AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(key)
+    .fetch_one(&mut conn)
+    .await
+    .expect("exactly one backend must hold the key");
+    let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&mut conn)
+        .await
+        .expect("terminate");
+}
+
+/// Count every loss reason for one role. The counter is process-global, so a test
+/// asserting an exact value must own its role label.
+fn live_lock_lost_total(role: &str) -> f64 {
+    ["not_held", "probe_error", "probe_timeout"]
+        .iter()
+        .map(|reason| {
+            LIVE_STATE_LOCK_LOST
+                .with_label_values(&[role, reason])
+                .get()
+        })
+        .sum()
+}
+
+/// Every backend holding the live-state key, with the mode it holds it in. Read
+/// from a bystander session so it reports the server's view, not ours.
+async fn live_lock_holders(url: &str) -> Vec<String> {
+    let mut conn = pg_connect(url).await;
+    sqlx::query_scalar::<_, String>(
+        "SELECT mode FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+         AND granted AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(LIVE_STATE_LOCK_KEY)
+    .fetch_all(&mut conn)
+    .await
+    .expect("holder query")
+}
+
+/// Take the lock through the public storage API, as every production caller does.
+async fn take_live_lock(
+    storage: &Storage,
+    mode: LiveLockMode,
+    role: &'static str,
+    heartbeat: Duration,
+) -> Result<LiveLockGuard, private_channel_indexer::error::StorageError> {
+    storage
+        .try_acquire_live_lock(mode, role, CancellationToken::new(), heartbeat)
+        .await
+}
+
+/// I1. The whole guarantee in one test: workers coexist, resync is refused while
+/// any of them is up, and once resync holds the lock no worker can start. Both
+/// directions matter, since only one of them is the destructive case.
+#[tokio::test]
+async fn shared_holders_coexist_and_exclude_exclusive() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let worker_a = connect_storage(&url).await;
+    let worker_b = connect_storage(&url).await;
+
+    let a = take_live_lock(&worker_a, LiveLockMode::Shared, "i1_a", Duration::ZERO).await?;
+    let b = take_live_lock(&worker_b, LiveLockMode::Shared, "i1_b", Duration::ZERO).await?;
+    assert_eq!(
+        live_lock_holders(&url).await.len(),
+        2,
+        "two shared holders must both hold the key"
+    );
+
+    // Resync is refused while either worker is live.
+    let resync_storage = connect_storage(&url).await;
+    let refused = take_live_lock(
+        &resync_storage,
+        LiveLockMode::Exclusive,
+        "i1_resync",
+        Duration::ZERO,
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(
+                private_channel_indexer::error::StorageError::LiveStateLockHeld {
+                    requested: LiveLockMode::Exclusive
+                }
+            )
+        ),
+        "resync must be refused while workers hold the lock, got {refused:?}"
+    );
+
+    a.stop_and_wait().await;
+    b.stop_and_wait().await;
+    assert!(
+        live_lock_holders(&url).await.is_empty(),
+        "stopping every worker must free the key"
+    );
+
+    // With the workers gone resync gets in, and now it locks them out.
+    let resync = take_live_lock(
+        &resync_storage,
+        LiveLockMode::Exclusive,
+        "i1_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    let late_worker = connect_storage(&url).await;
+    let refused = take_live_lock(
+        &late_worker,
+        LiveLockMode::Shared,
+        "i1_late",
+        Duration::ZERO,
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(
+                private_channel_indexer::error::StorageError::LiveStateLockHeld {
+                    requested: LiveLockMode::Shared
+                }
+            )
+        ),
+        "a worker starting during a resync must be refused, got {refused:?}"
+    );
+
+    resync.stop_and_wait().await;
+    Ok(())
+}
+
+/// I2. The lock session must not be a pooled connection. Shutdown closes the pool
+/// and waits for anything checked out, so a pooled holder would stall every
+/// shutdown of every role until that wait timed out.
+#[tokio::test]
+async fn pool_close_does_not_wait_on_the_live_lock() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let storage = connect_storage(&url).await;
+    let guard = take_live_lock(&storage, LiveLockMode::Shared, "i2", Duration::ZERO).await?;
+
+    let started = tokio::time::Instant::now();
+    storage.close().await?;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "closing the pool must not wait on the lock session, took {elapsed:?}"
+    );
+    assert_eq!(
+        live_lock_holders(&url).await.len(),
+        1,
+        "the lock must survive its pool being closed, since the caller still holds it"
+    );
+
+    guard.stop_and_wait().await;
+    Ok(())
+}
+
+/// I3. A killed backend frees the lock server-side while the process keeps running
+/// on its other connections. Only the heartbeat notices, and it must stop the role.
+#[tokio::test]
+async fn terminated_backend_cancels_the_role_token() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let role = "i3_terminated";
+    let before = live_lock_lost_total(role);
+    let storage = connect_storage(&url).await;
+    let token = CancellationToken::new();
+    let _guard = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            role,
+            token.clone(),
+            Duration::from_secs(1),
+        )
+        .await?;
+
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), token.cancelled())
+            .await
+            .is_ok(),
+        "losing the live-state lock must stop the role"
+    );
+    assert!(
+        live_lock_lost_total(role) >= before + 1.0,
+        "losing the live-state lock must be counted"
+    );
+    Ok(())
+}
+
+/// I4. Dropping the guard must end the session, or the lock would linger and keep
+/// refusing the next resync (or the next worker) with nothing actually holding it.
+#[tokio::test]
+async fn guard_drop_frees_the_lock() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let storage = connect_storage(&url).await;
+    let guard = take_live_lock(&storage, LiveLockMode::Exclusive, "i4", Duration::ZERO).await?;
+    assert_eq!(live_lock_holders(&url).await.len(), 1);
+    drop(guard);
+
+    // Drop only signals the task, so poll until the close lands.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let taker = connect_storage(&url).await;
+    loop {
+        if take_live_lock(&taker, LiveLockMode::Exclusive, "i4_next", Duration::ZERO)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropping the guard must free the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The runbook tells an operator to find the lock by its decimal key and to read
+/// the mode column to tell a worker from a resync. Both are copied by hand into
+/// SQL there, so pin them here rather than let the runbook rot into a query that
+/// silently returns nothing during an incident.
+#[tokio::test]
+async fn runbook_query_finds_each_mode_by_its_documented_key(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    assert_eq!(
+        LIVE_STATE_LOCK_KEY, 5_497_019_676_134_429_780,
+        "the key in live_state_lock_runbook.md must match the code"
+    );
+
+    let worker = connect_storage(&url).await;
+    let worker_lock =
+        take_live_lock(&worker, LiveLockMode::Shared, "rb_worker", Duration::ZERO).await?;
+    assert_eq!(
+        live_lock_holders(&url).await,
+        vec!["ShareLock".to_string()],
+        "the runbook reads a worker as ShareLock"
+    );
+    worker_lock.stop_and_wait().await;
+
+    let resync = connect_storage(&url).await;
+    let resync_lock = take_live_lock(
+        &resync,
+        LiveLockMode::Exclusive,
+        "rb_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    assert_eq!(
+        live_lock_holders(&url).await,
+        vec!["ExclusiveLock".to_string()],
+        "the runbook reads a resync as ExclusiveLock"
+    );
+    resync_lock.stop_and_wait().await;
+    Ok(())
+}
+
+/// I5. The synchronous check resync runs immediately before it drops tables. It
+/// must answer from the server, not from a cached belief, so a lock lost between
+/// two heartbeats cannot let the destruction through.
+#[tokio::test]
+async fn ensure_held_reports_loss() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let storage = connect_storage(&url).await;
+    let guard = take_live_lock(&storage, LiveLockMode::Exclusive, "i5", Duration::ZERO).await?;
+    assert!(
+        guard.ensure_held().await.is_ok(),
+        "a held lock must prove itself"
+    );
+
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+    assert!(
+        guard.ensure_held().await.is_err(),
+        "a lost lock must fail the check that guards the drop"
+    );
+    Ok(())
+}
+
+/// I11. A host that vanishes sends no FIN, so without these the lock backend sits
+/// in recv() holding the key until the OS default expires, about two hours. That
+/// blocks every resync while nothing is actually running. Postgres reports 0 over
+/// a unix socket; the test container speaks TCP.
+#[tokio::test]
+async fn the_lock_session_sets_its_own_tcp_keepalives() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, _storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    let mut conn = pg_connect(&url).await;
+
+    apply_lock_session_keepalives(&mut conn).await;
+
+    let settings: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, setting FROM pg_settings
+         WHERE name LIKE 'tcp_keepalives%' ORDER BY name",
+    )
+    .fetch_all(&mut conn)
+    .await?;
+
+    assert_eq!(
+        settings,
+        vec![
+            ("tcp_keepalives_count".to_string(), "3".to_string()),
+            ("tcp_keepalives_idle".to_string(), "60".to_string()),
+            ("tcp_keepalives_interval".to_string(), "15".to_string()),
+        ],
+        "the lock session must carry its own keepalives"
+    );
+    Ok(())
+}
+
 // ── merged-lineage schema ─────────────────────────────────────────────────────
 
 /// The merged schema is the union of two lineages, so it has to be checked as a
@@ -2592,5 +2939,191 @@ async fn merged_schema_drops_owed_rotation_target_and_is_idempotent(
     storage.init_schema().await?;
     storage.init_schema().await?;
 
+    Ok(())
+}
+
+// ── Fenced drop ───────────────────────────────────────────────────────────────
+//
+// The drop has to run on the session that holds the lock. Issued through the pool
+// it can outlive the lock: Postgres frees a session lock the moment its backend
+// dies, so a worker can start while the drop is still running.
+
+/// Does `transactions` still exist? Stands in for the whole schema, since the drop
+/// is all-or-nothing.
+async fn transactions_table_exists(pool: &PgPool) -> bool {
+    sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass('transactions')::text")
+        .fetch_one(pool)
+        .await
+        .expect("regclass lookup")
+        .is_some()
+}
+
+/// I12. The fenced drop must still do its job while the lock is genuinely held.
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_drop_removes_the_tables_while_the_lock_is_held(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage.init_schema().await?;
+    assert!(
+        transactions_table_exists(&pool).await,
+        "the schema must exist before the drop"
+    );
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "i12_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    storage.drop_tables_fenced(&guard).await?;
+
+    assert!(
+        !transactions_table_exists(&pool).await,
+        "a fenced drop under a held lock must remove the schema"
+    );
+    Ok(())
+}
+
+/// I13. Once the lock session is gone the lock is free, so a resync must not be able
+/// to keep dropping: any worker may now be starting.
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_drop_refuses_once_the_lock_session_is_gone(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "i13_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    assert!(
+        storage.drop_tables_fenced(&guard).await.is_err(),
+        "a drop must not run on a session that no longer holds the lock"
+    );
+    assert!(
+        transactions_table_exists(&pool).await,
+        "the refused drop must leave the schema standing"
+    );
+    Ok(())
+}
+
+/// I14. The finding this test exists for: a loss verdict can be a false positive, and the
+/// heartbeat deliberately parks the session open afterwards. So the server still reports
+/// the lock as held and a probe alone says "go ahead". Acting on that drops every table
+/// and then refuses to rebuild, because the rebuild watches the same token. The guard has
+/// to refuse on our own verdict, not just on the server's answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_false_loss_verdict_refuses_the_drop() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let lost = CancellationToken::new();
+    let guard = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Exclusive,
+            "i14_resync",
+            lost.clone(),
+            Duration::ZERO,
+        )
+        .await?;
+
+    // The session is untouched, so this stands in for a verdict that was wrong.
+    lost.cancel();
+
+    assert_eq!(
+        live_lock_holders(&url).await.len(),
+        1,
+        "the session must still hold the lock, or this is not the false-positive case"
+    );
+    assert!(
+        guard.ensure_held().await.is_err(),
+        "a lock we can no longer vouch for must fail the check that guards the drop"
+    );
+    assert!(
+        storage.drop_tables_fenced(&guard).await.is_err(),
+        "the drop must be refused even though the server still reports the lock held"
+    );
+    assert!(
+        transactions_table_exists(&pool).await,
+        "a refused drop must leave the database intact"
+    );
+    Ok(())
+}
+
+/// I15. The drop needs ACCESS EXCLUSIVE on every table, so one stray reader is enough to
+/// queue it. Unbounded, that wait wedges the resync while it holds the exclusive lock and
+/// every worker stays refused, and the heartbeat cannot see it because a busy connection
+/// reads as alive. The session's own lock_timeout is what bounds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lock_session_bounds_its_lock_waits() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let mut conn = pg_connect(&url).await;
+    apply_lock_session_lock_timeout(&mut conn).await;
+
+    let lock_timeout: String = sqlx::query_scalar("SELECT current_setting('lock_timeout')")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(
+        lock_timeout, "10s",
+        "the lock session must bound how long it waits for another session's lock"
+    );
+    Ok(())
+}
+
+/// I16. The same bound, observed through the fenced drop itself: a competing table lock
+/// must make it fail rather than hang. The elapsed time is what says which bound fired,
+/// since the client-side cap is minutes away.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_drop_blocked_on_a_table_lock_fails_rather_than_hanging(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    storage.init_schema().await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "i16_resync",
+        Duration::ZERO,
+    )
+    .await?;
+
+    // A plain read is enough: it takes ACCESS SHARE, which the drop's ACCESS EXCLUSIVE
+    // has to wait out.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT 1 FROM transactions LIMIT 1")
+        .execute(&mut blocker)
+        .await?;
+
+    let started = std::time::Instant::now();
+    let blocked = storage.drop_tables_fenced(&guard).await;
+    let elapsed = started.elapsed();
+
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+
+    assert!(
+        blocked.is_err(),
+        "a drop queued behind another session's lock must fail, got {blocked:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "it must be the session's lock_timeout that fired, not the client cap; took {elapsed:?}"
+    );
+    assert!(
+        transactions_table_exists(&pool).await,
+        "a drop that never ran must leave the schema standing"
+    );
     Ok(())
 }

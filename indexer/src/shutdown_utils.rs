@@ -117,6 +117,68 @@ impl Default for ShutdownConfig {
     }
 }
 
+/// Why a role is stopping. The two earn different treatment: an interrupt gets the usual
+/// drain, a lost lock does not, because a resync may already be dropping the tables the
+/// drain would write to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Interrupted,
+    LiveLockLost,
+}
+
+/// The reasons a role stops on its own, as one future both roles select on.
+///
+/// A lost lock is listed first under `biased;` deliberately. Both can be ready in the same
+/// poll, and the lock has to win: an interrupt merely asks for a drain, while a lost lock
+/// means the tables that drain would write to may already be going away.
+///
+/// Generic over the interrupt so a test can hand it one that is ready on the first poll,
+/// which is the only way to assert branch priority rather than scheduling luck.
+pub async fn stop_signal(
+    interrupt: impl std::future::Future<Output = std::io::Result<()>>,
+    lock_lost: CancellationToken,
+) -> std::io::Result<StopReason> {
+    tokio::select! {
+        biased;
+        _ = lock_lost.cancelled() => Ok(StopReason::LiveLockLost),
+        result = interrupt => result.map(|_| StopReason::Interrupted),
+    }
+}
+
+/// How long a stop path waits for the writers it aborted to actually stop.
+const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the wait re-checks. Short, because the normal case resolves in one poll.
+const WRITER_STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Abort every writer and wait until each has actually stopped.
+///
+/// `abort` only requests cancellation: a task stops at its next await point, and a
+/// statement already sent to the database completes server-side whatever the task does.
+/// The caller frees the live-state lock by returning, so returning early would let a
+/// worker take that lock while one of these writes was still landing.
+pub async fn abort_and_await_writers(writers: &[tokio::task::AbortHandle]) {
+    abort_and_await_writers_within(writers, WRITER_STOP_TIMEOUT).await
+}
+
+/// Same, with the bound chosen by the caller so a test can drive the backstop.
+async fn abort_and_await_writers_within(writers: &[tokio::task::AbortHandle], timeout: Duration) {
+    for writer in writers {
+        writer.abort();
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while writers.iter().any(|w| !w.is_finished()) {
+        if tokio::time::Instant::now() >= deadline {
+            // Not fatal: the process is stopping regardless. Logged because a writer that
+            // outlives this wait can still write, which is what the lock was protecting.
+            warn!("Aborted writers did not all stop in time; one may still be writing");
+            return;
+        }
+        tokio::time::sleep(WRITER_STOP_POLL_INTERVAL).await;
+    }
+}
+
 /// Gracefully shutdown the indexer with timeouts and proper resource cleanup
 #[allow(clippy::too_many_arguments)]
 pub async fn shutdown_indexer(
@@ -956,5 +1018,103 @@ mod tests {
         });
         let result = wait_with_progress_test(handle, Duration::from_millis(50), "slow-task").await;
         assert!(result.is_err());
+    }
+
+    /// A lost lock and an interrupt can become ready in the same poll. The lock must win:
+    /// the interrupt only asks for a drain, and draining into tables a resync may already
+    /// be dropping is the one thing that must not happen.
+    #[tokio::test]
+    async fn a_lost_lock_outranks_a_concurrent_interrupt() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let reason = stop_signal(std::future::ready(Ok(())), token)
+            .await
+            .expect("a ready interrupt must not error");
+
+        assert_eq!(
+            reason,
+            StopReason::LiveLockLost,
+            "a cancelled lock token must outrank an interrupt that is ready at the same time"
+        );
+    }
+
+    /// The ordinary case still reports an interrupt, or ctrl-c would stop working.
+    #[tokio::test]
+    async fn an_interrupt_alone_reports_itself() {
+        let token = CancellationToken::new();
+
+        let reason = stop_signal(std::future::ready(Ok(())), token)
+            .await
+            .expect("a ready interrupt must not error");
+
+        assert_eq!(reason, StopReason::Interrupted);
+    }
+
+    /// With no reason to stop the signal must stay pending, or every start would
+    /// immediately shut itself down.
+    #[tokio::test]
+    async fn stop_signal_stays_pending_without_a_reason() {
+        let token = CancellationToken::new();
+        let pending = tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_signal(std::future::pending::<std::io::Result<()>>(), token),
+        )
+        .await;
+
+        assert!(pending.is_err(), "an idle role must not stop itself");
+    }
+
+    /// A stop path frees the live-state lock as soon as it returns, so it must not
+    /// return while an aborted writer is still running: an in-flight statement would
+    /// land after a worker had taken the freed lock. Asserted as ordering, not timing,
+    /// by proving the writer's drop ran before the wait returned.
+    #[tokio::test]
+    async fn abort_and_await_writers_returns_only_once_every_writer_has_stopped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = SetOnDrop(flag);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        // Let the task reach its await point, so an abort has somewhere to land.
+        tokio::task::yield_now().await;
+        let writer = handle.abort_handle();
+
+        abort_and_await_writers(std::slice::from_ref(&writer)).await;
+
+        assert!(
+            writer.is_finished(),
+            "the wait must not return while a writer is still running"
+        );
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the writer must have been dropped before the wait returned"
+        );
+    }
+
+    /// The wait is a backstop, not a promise: a writer that will not stop must not hold
+    /// the stop path open, since the process is going down either way.
+    #[tokio::test]
+    async fn abort_and_await_writers_gives_up_on_a_writer_that_will_not_stop() {
+        let handle = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        let writer = handle.abort_handle();
+
+        // Zero budget, and the task has never been polled, so it cannot be finished yet.
+        abort_and_await_writers_within(std::slice::from_ref(&writer), Duration::ZERO).await;
+
+        assert!(
+            !writer.is_finished(),
+            "this test is only meaningful while the writer is still unfinished"
+        );
     }
 }
