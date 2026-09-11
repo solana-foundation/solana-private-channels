@@ -250,7 +250,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Feepayer {{ $labels.job }} ({{ $labels.program_type }}) balance is {{ $values.A }} SOL — schedule a top-up"
+          summary: "[{{ $labels.deployment }}] feepayer {{ $labels.job }} ({{ $labels.program_type }}) balance is {{ $values.A }} SOL — schedule a top-up. The wallet is admin_keypair_path in private-channel-deploy/vars/{{ $labels.deployment }}.yml"
         labels:
           severity: warning
         data:
@@ -284,7 +284,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Feepayer {{ $labels.job }} ({{ $labels.program_type }}) balance is {{ $values.A }} SOL — top up immediately"
+          summary: "[{{ $labels.deployment }}] feepayer {{ $labels.job }} ({{ $labels.program_type }}) balance is {{ $values.A }} SOL — top up immediately. The wallet is admin_keypair_path in private-channel-deploy/vars/{{ $labels.deployment }}.yml"
         labels:
           severity: critical
         data:

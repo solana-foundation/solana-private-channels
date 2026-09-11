@@ -1236,6 +1236,7 @@
         src: "{{ repo_root }}/monitoring/prometheus.yml.j2"
         dest: "{{ monitoring_dir }}/prometheus/prometheus.yml"
         mode: "0644"
+      register: _prom_cfg
 
     - name: Copy blackbox.yml
       ansible.builtin.copy:
@@ -1252,6 +1253,7 @@
         dest: "{{ monitoring_dir }}/grafana/provisioning/"
         mode: "0644"
         directory_mode: "0755"
+      register: _graf_cfg
 
     - name: Copy bundled dashboard JSONs
       ansible.builtin.copy:
@@ -1264,6 +1266,21 @@
       ansible.builtin.shell: "{{ mon_compose_cmd }} up -d --wait"
       changed_when: true
       register: _mon_up
+
+    # prometheus.yml is bind-mounted as a single file, so a running container
+    # holds the inode it started with. `template` writes a temp file and
+    # renames it into place, allocating a new inode, and the container keeps
+    # reading the old one. `up -d --wait` above does not recreate a container
+    # whose spec is unchanged, and /-/reload then returns 200 having reloaded
+    # the stale file, so a scrape-config or label change silently never takes
+    # effect. Grafana reads its provisioning tree only at startup, so alert
+    # rule edits need the same treatment.
+    - name: Restart monitoring services whose config changed
+      ansible.builtin.shell: "{{ mon_compose_cmd }} restart {{ _mon_restart | join(' ') }}"
+      vars:
+        _mon_restart: "{{ (['prometheus'] if _prom_cfg.changed else []) + (['grafana'] if _graf_cfg.changed else []) }}"
+      when: _mon_restart | length > 0
+      changed_when: true
 
     - name: Verify Prometheus is ready
       ansible.builtin.uri:
