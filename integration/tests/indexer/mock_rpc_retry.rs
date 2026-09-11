@@ -15,10 +15,11 @@
 //!   - DB fault-injection via Storage::Mock
 //!   - full operator bootstrap + end-to-end status-flip assertions
 
+use solana_commitment_config::CommitmentConfig;
 use {
     private_channel_indexer::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry},
     serde_json::json,
-    solana_sdk::{commitment_config::CommitmentConfig, signature::Signature},
+    solana_sdk::signature::Signature,
     std::{str::FromStr, time::Duration},
     test_utils::mock_rpc::{MockRpcServer, Reply},
 };

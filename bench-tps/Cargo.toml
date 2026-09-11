@@ -8,6 +8,8 @@ name = "private-channel-bench-tps"
 path = "src/main.rs"
 
 [dependencies]
+solana-sdk-ids = { workspace = true }
+solana-commitment-config = { workspace = true }
 anyhow = "1.0"
 async-channel = { workspace = true }
 clap = { workspace = true }
@@ -21,7 +23,7 @@ rayon = "1.10"
 serde_json = { workspace = true }
 # Pinned to 2.3.10 (matches core/indexer/integration). Workspace declares 3.0.0
 # but { workspace = true } breaks compilation — solana-sdk is still 2.x.
-solana-client = "2.3.10"
+solana-client = { workspace = true }
 reqwest = { workspace = true }
 solana-sdk = { workspace = true }
 solana-system-interface = { workspace = true }

@@ -40,7 +40,8 @@ use crate::{
     storage::common::models::MintDbBalance,
     storage::Storage,
 };
-use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
+use solana_commitment_config::CommitmentConfig;
+use solana_sdk::pubkey::Pubkey;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{error, info, warn};
 

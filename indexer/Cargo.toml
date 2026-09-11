@@ -27,6 +27,8 @@ test-mock-storage = []
 path = "src/lib.rs"
 
 [dependencies]
+solana-compute-budget-interface = { workspace = true }
+solana-commitment-config = { workspace = true }
 bs58 = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
@@ -64,9 +66,9 @@ thiserror = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
-solana-client = { version = "2.3.10" }
+solana-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
-solana-transaction-status = { version = "2.3.10" }
+solana-transaction-status = { workspace = true }
 
 # Yellowstone gRPC (optional - enable with feature: datasource-yellowstone)
 # v12 removed the `convert`/`plugin` features from the proto crate
@@ -77,7 +79,13 @@ yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 
-solana-keychain = { version = "0.1.0", features = ["all"] }
+solana-keychain = { version = "1.4.0", default-features = false, features = [
+    "memory",
+    "vault",
+    "privy",
+    "turnkey",
+    "sdk-v4",
+] }
 
 [dev-dependencies]
 bigdecimal = "0.4"
@@ -92,7 +100,7 @@ serial_test = "3"
 solana-address = { workspace = true }
 solana-rpc = { workspace = true }
 solana-sdk = { workspace = true }
-solana-sdk-ids = "3.0"
+solana-sdk-ids = { workspace = true }
 solana-test-validator = { workspace = true }
 tempfile = { workspace = true }
 testcontainers = { workspace = true }

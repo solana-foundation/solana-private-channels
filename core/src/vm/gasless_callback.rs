@@ -1,8 +1,5 @@
-use crate::accounts::bob::BOB;
-use solana_sdk::{
-    account::{AccountSharedData, ReadableAccount},
-    pubkey::Pubkey,
-};
+use crate::{accounts::bob::BOB, processor::CHANNEL_SLOT};
+use solana_sdk::{account::AccountSharedData, clock::Slot, pubkey::Pubkey};
 use solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback};
 use std::collections::{HashMap, HashSet};
 
@@ -44,8 +41,9 @@ impl SnapshotCallback {
 
 impl InvokeContextCallback for SnapshotCallback {}
 
-impl TransactionProcessingCallback for SnapshotCallback {
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+impl SnapshotCallback {
+    /// Reads an account without the slot the SVM callback wants alongside it.
+    fn account(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         self.accounts.get(pubkey).cloned().or_else(|| {
             self.fee_payers.contains(pubkey).then(|| {
                 AccountSharedData::new(
@@ -56,14 +54,11 @@ impl TransactionProcessingCallback for SnapshotCallback {
             })
         })
     }
+}
 
-    fn account_matches_owners(
-        &self,
-        account: &solana_sdk::pubkey::Pubkey,
-        owners: &[solana_sdk::pubkey::Pubkey],
-    ) -> Option<usize> {
-        self.get_account_shared_data(account)
-            .and_then(|account| owners.iter().position(|key| account.owner().eq(key)))
+impl TransactionProcessingCallback for SnapshotCallback {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+        self.account(pubkey).map(|account| (account, CHANNEL_SLOT))
     }
 }
 
@@ -83,8 +78,9 @@ impl<'a> GaslessCallback<'a> {
 
 impl<'a> InvokeContextCallback for GaslessCallback<'a> {}
 
-impl<'a> TransactionProcessingCallback for GaslessCallback<'a> {
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+impl<'a> GaslessCallback<'a> {
+    /// Reads an account without the slot the SVM callback wants alongside it.
+    fn account(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         self.bob.get_account_shared_data(pubkey).or_else(|| {
             self.fee_payers.contains(pubkey).then(|| {
                 AccountSharedData::new(
@@ -95,14 +91,11 @@ impl<'a> TransactionProcessingCallback for GaslessCallback<'a> {
             })
         })
     }
+}
 
-    fn account_matches_owners(
-        &self,
-        account: &solana_sdk::pubkey::Pubkey,
-        owners: &[solana_sdk::pubkey::Pubkey],
-    ) -> Option<usize> {
-        self.get_account_shared_data(account)
-            .and_then(|account| owners.iter().position(|key| account.owner().eq(key)))
+impl<'a> TransactionProcessingCallback for GaslessCallback<'a> {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+        self.account(pubkey).map(|account| (account, CHANNEL_SLOT))
     }
 }
 
@@ -110,6 +103,7 @@ impl<'a> TransactionProcessingCallback for GaslessCallback<'a> {
 mod tests {
     use super::*;
     use crate::test_helpers::create_test_bob;
+    use solana_sdk::account::ReadableAccount;
     use solana_svm_callback::TransactionProcessingCallback;
 
     #[tokio::test]
@@ -118,7 +112,7 @@ mod tests {
         let fee_payer = Pubkey::new_unique();
         let cb = GaslessCallback::new(&bob, HashSet::from([fee_payer]));
 
-        let account = cb.get_account_shared_data(&fee_payer).unwrap();
+        let (account, _slot) = cb.get_account_shared_data(&fee_payer).unwrap();
         assert_eq!(account.lamports(), DEFAULT_FEE_PAYER_LAMPORTS);
         assert_eq!(account.owner(), &solana_sdk_ids::system_program::ID);
     }
@@ -131,35 +125,6 @@ mod tests {
         assert!(cb.get_account_shared_data(&Pubkey::new_unique()).is_none());
     }
 
-    #[tokio::test]
-    async fn test_account_matches_owners_fee_payer() {
-        let (bob, _tx) = create_test_bob();
-        let fee_payer = Pubkey::new_unique();
-        let cb = GaslessCallback::new(&bob, HashSet::from([fee_payer]));
-
-        // Fee payer is owned by system program
-        let system = solana_sdk_ids::system_program::ID;
-        let other = Pubkey::new_unique();
-
-        assert_eq!(
-            cb.account_matches_owners(&fee_payer, &[other, system]),
-            Some(1)
-        );
-        assert_eq!(cb.account_matches_owners(&fee_payer, &[other]), None);
-    }
-
-    #[tokio::test]
-    async fn test_account_matches_owners_unknown() {
-        let (bob, _tx) = create_test_bob();
-        let cb = GaslessCallback::new(&bob, HashSet::new());
-
-        let unknown = Pubkey::new_unique();
-        assert_eq!(
-            cb.account_matches_owners(&unknown, &[Pubkey::new_unique()]),
-            None
-        );
-    }
-
     // ── SnapshotCallback tests ──
 
     #[tokio::test]
@@ -168,7 +133,7 @@ mod tests {
         let fee_payer = Pubkey::new_unique();
         let snapshot = SnapshotCallback::from_bob(&bob, &[], HashSet::from([fee_payer]));
 
-        let account = snapshot.get_account_shared_data(&fee_payer).unwrap();
+        let (account, _slot) = snapshot.get_account_shared_data(&fee_payer).unwrap();
         assert_eq!(account.lamports(), DEFAULT_FEE_PAYER_LAMPORTS);
         assert_eq!(account.owner(), &solana_sdk_ids::system_program::ID);
     }
@@ -194,7 +159,7 @@ mod tests {
         bob.insert_account_for_test(pubkey, account.clone());
 
         let snapshot = SnapshotCallback::from_bob(&bob, &[pubkey], HashSet::new());
-        let retrieved = snapshot.get_account_shared_data(&pubkey).unwrap();
+        let (retrieved, _slot) = snapshot.get_account_shared_data(&pubkey).unwrap();
         assert_eq!(retrieved.lamports(), 42);
         assert_eq!(retrieved.owner(), &owner);
     }
@@ -206,22 +171,5 @@ mod tests {
         // Key not in BOB — snapshot should not contain it
         let snapshot = SnapshotCallback::from_bob(&bob, &[unknown], HashSet::new());
         assert!(snapshot.get_account_shared_data(&unknown).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_snapshot_account_matches_owners() {
-        let (mut bob, _tx) = create_test_bob();
-        let pubkey = Pubkey::new_unique();
-        let owner = Pubkey::new_unique();
-        let account = AccountSharedData::new(1, 0, &owner);
-        bob.insert_account_for_test(pubkey, account);
-
-        let snapshot = SnapshotCallback::from_bob(&bob, &[pubkey], HashSet::new());
-        let other = Pubkey::new_unique();
-        assert_eq!(
-            snapshot.account_matches_owners(&pubkey, &[other, owner]),
-            Some(1)
-        );
-        assert_eq!(snapshot.account_matches_owners(&pubkey, &[other]), None);
     }
 }

@@ -585,7 +585,7 @@ mod tests {
     use crate::storage::common::storage::mock::MockStorage;
     use crate::test_utils::rpc_mocks::mock_get_slot;
     use mockito::Server;
-    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
 
     // ============================================================================
@@ -945,7 +945,7 @@ mod tests {
         };
         use mockito::Server;
         use serde_json::json;
-        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_commitment_config::CommitmentLevel;
         use solana_transaction_status::UiTransactionEncoding;
         use tokio::sync::mpsc;
 
@@ -1443,7 +1443,7 @@ mod tests {
         use crate::test_utils::rpc_mocks::mock_get_blocks;
         use mockito::Server;
         use serde_json::json;
-        use solana_sdk::commitment_config::CommitmentLevel;
+        use solana_commitment_config::CommitmentLevel;
         use solana_transaction_status::UiTransactionEncoding;
         use std::sync::Arc;
         use tokio::sync::mpsc;

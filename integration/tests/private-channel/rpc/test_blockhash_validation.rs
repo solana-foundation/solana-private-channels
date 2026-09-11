@@ -20,7 +20,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
         .read_client
         .is_blockhash_valid(
             &recent_blockhash,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         )
         .await
         .unwrap();
@@ -74,7 +74,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
         .read_client
         .is_blockhash_valid(
             &first_blockhash,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         )
         .await
         .unwrap();
@@ -99,7 +99,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
         .read_client
         .is_blockhash_valid(
             &fake_blockhash,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         )
         .await
         .unwrap();
@@ -115,7 +115,7 @@ pub async fn run_blockhash_validation_test(ctx: &PrivateChannelContext) {
         .read_client
         .is_blockhash_valid(
             &fresh_blockhash,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         )
         .await
         .unwrap();

@@ -19,6 +19,7 @@ mod helpers;
 mod setup;
 
 use mockito::{Matcher, Server as MockitoServer};
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 // The indexer decides what counts as an escrow instruction by this constant, so a
 // synthetic block has to carry the same id or the fill sees nothing to import.
 use private_channel_indexer::indexer::datasource::common::parser::escrow::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
@@ -36,8 +37,6 @@ use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcBlockConfig;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
-    commitment_config::CommitmentLevel,
     instruction::Instruction,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},

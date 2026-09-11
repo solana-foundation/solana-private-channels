@@ -36,6 +36,7 @@
 //!      `Allocate` must be rejected at ingress (C1) and must leave no account
 //!      behind (C2), which is the end-to-end no-persistent-state invariant.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     super::test_context::PrivateChannelContext,
     base64::{engine::general_purpose::STANDARD, Engine as _},
@@ -43,7 +44,6 @@ use {
     serde_json::json,
     solana_client::rpc_request::RpcRequest,
     solana_sdk::{
-        commitment_config::CommitmentConfig,
         instruction::Instruction,
         signature::{Keypair, Signer},
         transaction::Transaction,

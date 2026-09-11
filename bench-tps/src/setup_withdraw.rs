@@ -21,6 +21,7 @@
 //! This bypasses operator-solana entirely — setup completes in seconds rather
 //! than waiting for the full deposit → mint pipeline.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     crate::{
         rpc::{poll_confirmations, send_parallel},
@@ -40,10 +41,7 @@ use {
     },
     rayon::prelude::*,
     solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig},
-    solana_sdk::{
-        commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Keypair, signer::Signer,
-        transaction::Transaction,
-    },
+    solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer, transaction::Transaction},
     solana_system_interface::{instruction as system_instruction, program},
     spl_associated_token_account::get_associated_token_address,
     spl_token::{solana_program::program_pack::Pack, state::Mint as SplMint},

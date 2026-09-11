@@ -6,6 +6,7 @@
 //! the store cannot answer, and still sees a null for an account that is simply
 //! not there.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     private_channel_core::{
         accounts::AccountsDB,
@@ -16,7 +17,7 @@ use {
         },
     },
     solana_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{account::AccountSharedData, commitment_config::CommitmentConfig, pubkey::Pubkey},
+    solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
     std::{
         collections::LinkedList,
         sync::{Arc, RwLock},

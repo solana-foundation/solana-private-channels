@@ -30,6 +30,7 @@
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
 
+use solana_commitment_config::CommitmentLevel;
 use {
     chrono::{DateTime, Utc},
     private_channel_indexer::{
@@ -53,7 +54,7 @@ use {
         blockhash_reply, ensure_admin_signer_env, make_config, make_instruction, make_remint_info,
         null_status_reply, send_transaction_echo_reply, withdrawal_ctx,
     },
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
     std::sync::Arc,
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,

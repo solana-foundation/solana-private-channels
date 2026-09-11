@@ -30,3 +30,10 @@ pub fn estimated_encoded_bytes(data_len: usize) -> usize {
 
 /// Maximum serialized transaction size (matches Solana's PACKET_DATA_SIZE).
 pub const PACKET_DATA_SIZE: usize = 1232;
+
+/// Maximum serialized size of a v1 transaction.
+///
+/// The v1 format raised the ceiling for itself only; legacy and v0 keep the
+/// packet size above. Both numbers match what the network enforces, so a
+/// transaction accepted here is one the network would also accept.
+pub const MAX_TRANSACTION_V1_SIZE: usize = solana_sdk::message::v1::MAX_TRANSACTION_SIZE;

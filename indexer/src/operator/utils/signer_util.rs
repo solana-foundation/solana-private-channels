@@ -144,7 +144,7 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", key_name_var)))?;
             let pubkey = env::var(pubkey_var)
                 .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
-            Signer::from_vault(vault_addr, vault_token, key_name, pubkey)?
+            Signer::from_vault(vault_addr, vault_token, key_name, pubkey, None)?
         }
         SignerType::Turnkey => {
             let (
@@ -189,6 +189,7 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 organization_id,
                 private_key_id,
                 public_key,
+                None,
             )?
         }
         SignerType::Privy => {
@@ -215,7 +216,7 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
 
             // Block on async initialization
             tokio::runtime::Handle::current()
-                .block_on(Signer::from_privy(app_id, app_secret, wallet_id))?
+                .block_on(Signer::from_privy(app_id, app_secret, wallet_id, None))?
         }
     };
 
@@ -258,14 +259,25 @@ mod tests {
     // environment variables (set_var / remove_var).
     use serial_test::serial;
 
+    /// The message a signer error carries, which its Display no longer shows.
+    /// The keychain redacts every payload from Display and Debug so a secret
+    /// cannot reach a log, but matching on the variant still reads it.
+    fn detail(err: &SignerError) -> &str {
+        match err {
+            SignerError::InvalidPrivateKey(message) => message,
+            other => panic!("expected InvalidPrivateKey, got {other:?}"),
+        }
+    }
+
     /// Only "memory", "vault", "turnkey", and "privy" are valid signer types; any other
-    /// string — including an empty one — must return an InvalidPrivateKey error.
+    /// string, including an empty one, must return an InvalidPrivateKey error.
     #[test]
     fn signer_type_from_str_unknown_errors() {
         let err = SignerType::from_str("unknown").unwrap_err();
+        let msg = detail(&err);
         assert!(
-            err.to_string().contains("Unsupported signer type"),
-            "unexpected error: {err}"
+            msg.contains("Unsupported signer type"),
+            "unexpected error: {msg}"
         );
         assert!(SignerType::from_str("").is_err());
     }
@@ -281,7 +293,7 @@ mod tests {
         let err = load_signer(SignerRole::Admin)
             .err()
             .expect("expected error");
-        let msg = err.to_string();
+        let msg = detail(&err);
         assert!(
             msg.contains("ADMIN_SIGNER") || msg.contains("not set"),
             "error should name the missing var, got: {msg}"
@@ -305,7 +317,7 @@ mod tests {
         let err = load_signer(SignerRole::Admin)
             .err()
             .expect("expected error");
-        let msg = err.to_string();
+        let msg = detail(&err);
         assert!(
             msg.contains("ADMIN_PRIVATE_KEY") || msg.contains("not set"),
             "error should name the missing var, got: {msg}"
@@ -334,7 +346,7 @@ mod tests {
             let err = load_signer(SignerRole::Admin)
                 .err()
                 .expect("set-but-empty private key must be rejected");
-            let msg = err.to_string();
+            let msg = detail(&err);
             assert!(
                 msg.contains("ADMIN_PRIVATE_KEY") && msg.contains("is set but empty"),
                 "error should flag the empty var, got: {msg}"
@@ -363,7 +375,8 @@ mod tests {
 
         let result = load_signer(SignerRole::Admin);
         assert!(result.is_err());
-        let msg = format!("{}", result.err().expect("expected error"));
+        let err = result.err().expect("expected error");
+        let msg = detail(&err);
         assert!(
             msg.contains("ADMIN_VAULT_ADDR") || msg.contains("not set"),
             "Unexpected error: {}",
@@ -392,7 +405,8 @@ mod tests {
 
         let result = load_signer(SignerRole::Admin);
         assert!(result.is_err());
-        let msg = format!("{}", result.err().expect("expected error"));
+        let err = result.err().expect("expected error");
+        let msg = detail(&err);
         assert!(
             msg.contains("ADMIN_TURNKEY_API_PUBLIC_KEY") || msg.contains("not set"),
             "Unexpected error: {}",
@@ -421,7 +435,8 @@ mod tests {
 
         let result = load_signer(SignerRole::Admin);
         assert!(result.is_err());
-        let msg = format!("{}", result.err().expect("expected error"));
+        let err = result.err().expect("expected error");
+        let msg = detail(&err);
         assert!(
             msg.contains("ADMIN_PRIVY_APP_ID") || msg.contains("not set"),
             "Unexpected error: {}",
@@ -449,7 +464,7 @@ mod tests {
         let err = load_signer(SignerRole::Operator)
             .err()
             .expect("expected error");
-        let msg = err.to_string();
+        let msg = detail(&err);
         assert!(
             msg.contains("OPERATOR_SIGNER") || msg.contains("not set"),
             "error should name the missing var, got: {msg}"
@@ -473,7 +488,7 @@ mod tests {
         let err = load_signer(SignerRole::Operator)
             .err()
             .expect("expected error");
-        let msg = err.to_string();
+        let msg = detail(&err);
         assert!(
             msg.contains("OPERATOR_PRIVATE_KEY") || msg.contains("not set"),
             "error should name the missing var, got: {msg}"

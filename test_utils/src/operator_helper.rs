@@ -1,3 +1,4 @@
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         config::{
@@ -6,7 +7,7 @@ use {
         operator,
         storage::{PostgresDb, Storage},
     },
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Keypair},
+    solana_sdk::{pubkey::Pubkey, signature::Keypair},
     std::{sync::Arc, time::Duration},
     tokio::task::JoinHandle,
 };

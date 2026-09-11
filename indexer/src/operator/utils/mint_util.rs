@@ -52,7 +52,7 @@ async fn read_target_mint_account(
 /// for non-standard RPC providers that may surface the same condition with a
 /// different code.
 fn is_account_not_found(e: &client_error::Error) -> bool {
-    let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) = &e.kind else {
+    let ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. }) = &*e.kind else {
         return false;
     };
     if *code == -32602 {
@@ -407,7 +407,7 @@ mod tests {
     use base64::Engine;
     use solana_client::nonblocking::rpc_client::RpcClient;
     use solana_client::rpc_request::RpcRequest;
-    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
     use std::time::Duration;

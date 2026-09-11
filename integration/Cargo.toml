@@ -16,6 +16,10 @@ name = "ordered_shutdown_e2e"
 path = "tests/private-channel/test_ordered_shutdown_e2e.rs"
 
 [[test]]
+name = "v1_transaction_e2e"
+path = "tests/private-channel/test_v1_transaction_e2e.rs"
+
+[[test]]
 name = "settle_retry_recovery"
 path = "tests/private-channel/test_settle_retry_recovery.rs"
 
@@ -245,6 +249,7 @@ path = "tests/private-channel/rpc/test_redis_cache_path.rs"
 test-tree = ["private-channel-indexer/test-tree"]
 
 [dependencies]
+solana-commitment-config = { workspace = true }
 anyhow = "1.0.100"
 base64 = { workspace = true }
 borsh = { workspace = true }
@@ -266,10 +271,17 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }
 serde_json = { workspace = true }
-solana-account-decoder-client-types = "2.3.10"
-solana-client = { version = "2.3.10" }
-solana-keychain = { version = "0.1.0", features = ["all"] }
-solana-pubkey = "2.4.0"
+solana-account-decoder-client-types = { workspace = true }
+solana-client = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
+solana-keychain = { version = "1.4.0", default-features = false, features = [
+    "memory",
+    "vault",
+    "privy",
+    "turnkey",
+    "sdk-v4",
+] }
+solana-pubkey = { workspace = true }
 solana-sdk = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-system-interface = { workspace = true }
@@ -300,3 +312,5 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+# Measures a v1 transaction in the wire bytes a sender puts on the network.
+wincode = { workspace = true }

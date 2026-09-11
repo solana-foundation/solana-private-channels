@@ -24,6 +24,7 @@
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
 
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError,
     private_channel_indexer::{
@@ -50,7 +51,7 @@ use {
         make_instruction, pack_mint_with_authority, send_transaction_echo_reply,
     },
     solana_keychain::SolanaSigner,
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
     spl_token::{
         solana_program::{program_option::COption, program_pack::Pack},
         state::Mint,

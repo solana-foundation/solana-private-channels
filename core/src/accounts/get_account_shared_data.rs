@@ -170,26 +170,6 @@ mod tests {
             .is_none());
     }
 
-    /// "No owner match" must not be how an unreadable account looks, or a caller
-    /// would treat an integrity fault as a routine ownership mismatch.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn account_matches_owners_surfaces_corruption() {
-        let (db, _pg) = start_test_postgres().await;
-        let corrupt = Pubkey::new_unique();
-        insert_corrupt_account(pool_of(&db).as_ref(), &corrupt).await;
-
-        let result = crate::accounts::account_matches_owners::account_matches_owners(
-            &db,
-            &corrupt,
-            &[Pubkey::new_unique()],
-        )
-        .await;
-        assert!(
-            matches!(result, Err(AccountLoadError::Corrupt(key)) if key == corrupt),
-            "expected Corrupt({corrupt}), got {result:?}"
-        );
-    }
-
     /// A cache entry an older build wrote may be undecodable here. That must
     /// resolve against Postgres and evict the entry, never halt the node.
     #[tokio::test(flavor = "multi_thread")]

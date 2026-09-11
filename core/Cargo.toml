@@ -7,6 +7,7 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
+five8_core = { workspace = true }
 anyhow = { workspace = true }
 async-channel = { workspace = true }
 axum = { workspace = true }
@@ -34,7 +35,7 @@ serde_json = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
-solana-client = { version = "2.3.10" }
+solana-client = { workspace = true }
 solana-compute-budget = { workspace = true }
 solana-epoch-info = { workspace = true }
 solana-epoch-schedule = { workspace = true }
@@ -42,7 +43,7 @@ solana-fee-calculator = { workspace = true }
 solana-hash = { workspace = true }
 solana-loader-v3-interface = { workspace = true }
 solana-program-runtime = { workspace = true }
-solana-rent-collector = { workspace = true }
+solana-reward-info = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-rpc-client-types = { workspace = true }
 solana-runtime-transaction = { workspace = true }
@@ -51,11 +52,13 @@ solana-sdk-ids = { workspace = true }
 solana-svm = { workspace = true }
 solana-svm-callback = { workspace = true }
 solana-svm-feature-set = { workspace = true }
-solana-svm-rent-collector = { workspace = true }
 solana-svm-transaction = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-system-program = { workspace = true }
-solana-timings = { workspace = true }
+solana-svm-timings = { workspace = true }
+solana-syscalls = { workspace = true }
+wincode = { workspace = true }
+solana-transaction-context = { workspace = true }
 solana-transaction-error = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }

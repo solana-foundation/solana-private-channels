@@ -7,6 +7,7 @@
 //! batch onto a `BatchQueue`.  Sender threads pop batches and call
 //! `send_transaction` against the Solana RPC endpoint.
 
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use {
     crate::{
         bench_metrics::{BENCH_SENT_TOTAL, FLOW_DEPOSIT},
@@ -15,14 +16,8 @@ use {
     private_channel_escrow_program_client::instructions::{Deposit, DepositInstructionArgs},
     solana_client::rpc_config::RpcSendTransactionConfig,
     solana_sdk::{
-        commitment_config::{CommitmentConfig, CommitmentLevel},
-        hash::Hash,
-        instruction::Instruction,
-        pubkey,
-        pubkey::Pubkey,
-        signature::Keypair,
-        signer::Signer,
-        transaction::Transaction,
+        hash::Hash, instruction::Instruction, pubkey, pubkey::Pubkey, signature::Keypair,
+        signer::Signer, transaction::Transaction,
     },
     spl_associated_token_account::get_associated_token_address,
     std::sync::{
@@ -63,7 +58,7 @@ fn build_deposit_tx(
         allowed_mint: config.allowed_mint_pda,
         user_ata,
         instance_ata: config.instance_ata,
-        system_program: solana_sdk::system_program::id(),
+        system_program: solana_sdk_ids::system_program::id(),
         token_program: spl_token::id(),
         associated_token_program: spl_associated_token_account::id(),
         event_authority: config.event_authority,

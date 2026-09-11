@@ -2,6 +2,7 @@ use crate::{
     accounts::utils::encode_transaction_data,
     rpc::{
         constants::{estimated_encoded_bytes, MAX_SIMULATION_ACCOUNTS_BYTES},
+        decode::decode_transaction,
         error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
         ReadDeps,
     },
@@ -11,7 +12,6 @@ use crate::{
     transactions::{has_address_table_lookups, ADDRESS_LOOKUP_UNSUPPORTED},
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use bincode::Options;
 use jsonrpsee::core::RpcResult;
 use solana_account_decoder::encode_ui_account;
 use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
@@ -24,7 +24,7 @@ use solana_sdk::{
     account::ReadableAccount,
     message::{v0::LoadedAddresses, SimpleAddressLoader},
     pubkey::Pubkey,
-    transaction::{MessageHash, SanitizedTransaction, VersionedTransaction, MAX_TX_ACCOUNT_LOCKS},
+    transaction::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
 };
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use solana_svm_callback::TransactionProcessingCallback;
@@ -79,9 +79,10 @@ fn encode_simulation_accounts<C: TransactionProcessingCallback>(
     let mut estimated = 0usize;
     for address in &accounts_config.addresses {
         let account = match Pubkey::from_str(address) {
+            // The slot beside the account is not reported by simulation.
             Ok(pubkey) => callbacks
                 .get_account_shared_data(&pubkey)
-                .map(|account| (pubkey, account)),
+                .map(|(account, _slot)| (pubkey, account)),
             Err(e) => {
                 warn!("Failed to get account shared data for {}: {}", address, e);
                 None
@@ -129,34 +130,7 @@ pub async fn simulate_transaction(
         )
     })?;
 
-    // Check packet size limit (1232 bytes is Solana's PACKET_DATA_SIZE)
-    const PACKET_DATA_SIZE: usize = 1232;
-    if tx_data.len() > PACKET_DATA_SIZE {
-        return Err(custom_error(
-            INVALID_PARAMS_CODE,
-            format!(
-                "Transaction too large: {} bytes (max: {} bytes)",
-                tx_data.len(),
-                PACKET_DATA_SIZE
-            ),
-        ));
-    }
-
-    // Use bincode options matching Agave's decode_and_deserialize
-    let bincode_options = bincode::options()
-        .with_limit(PACKET_DATA_SIZE as u64)
-        .with_fixint_encoding()
-        .allow_trailing_bytes();
-
-    // Try to deserialize as VersionedTransaction first (standard format)
-    let versioned_tx = bincode_options
-        .deserialize::<VersionedTransaction>(&tx_data)
-        .map_err(|e| {
-            custom_error(
-                INVALID_PARAMS_CODE,
-                format!("Failed to deserialize transaction: {}", e),
-            )
-        })?;
+    let versioned_tx = decode_transaction(&tx_data)?;
 
     if has_address_table_lookups(&versioned_tx.message) {
         return Err(custom_error(
@@ -176,6 +150,7 @@ pub async fn simulate_transaction(
             readonly: vec![],
         }),
         &HashSet::new(),
+        true,
     )
     .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
     let sanitized_tx = runtime_tx.into_inner_transaction();
@@ -324,7 +299,12 @@ pub async fn simulate_transaction(
                                 },
                             );
                         RpcSimulateTransactionResult {
-                            err: executed.execution_details.status.clone().err(),
+                            err: executed
+                                .execution_details
+                                .status
+                                .clone()
+                                .err()
+                                .map(Into::into),
                             logs,
                             accounts,
                             units_consumed,
@@ -334,10 +314,21 @@ pub async fn simulate_transaction(
                             return_data,
                             inner_instructions,
                             replacement_blockhash: None,
+                            // Balance and fee reporting arrived upstream for a
+                            // fee-charging chain. This one is gasless and does
+                            // not record balances during simulation, so the
+                            // fields are omitted rather than filled with zeros
+                            // a caller could mistake for a real reading.
+                            fee: None,
+                            pre_balances: None,
+                            post_balances: None,
+                            pre_token_balances: None,
+                            post_token_balances: None,
+                            loaded_addresses: None,
                         }
                     }
                     ProcessedTransaction::FeesOnly(fees_only) => RpcSimulateTransactionResult {
-                        err: Some(fees_only.load_error.clone()),
+                        err: Some(fees_only.load_error.clone().into()),
                         logs: None,
                         accounts: None,
                         units_consumed: None,
@@ -345,6 +336,12 @@ pub async fn simulate_transaction(
                         return_data: None,
                         inner_instructions: None,
                         replacement_blockhash: None,
+                        fee: None,
+                        pre_balances: None,
+                        post_balances: None,
+                        pre_token_balances: None,
+                        post_token_balances: None,
+                        loaded_addresses: None,
                     },
                 }
             }
@@ -371,9 +368,10 @@ pub async fn simulate_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::CHANNEL_SLOT;
     use crate::rpc::constants::PER_ACCOUNT_JSON_OVERHEAD;
     use solana_account_decoder_client_types::UiAccountData;
-    use solana_sdk::account::AccountSharedData;
+    use solana_sdk::{account::AccountSharedData, clock::Slot};
     use solana_svm_callback::InvokeContextCallback;
     use std::{
         collections::HashMap,
@@ -412,13 +410,12 @@ mod tests {
     impl InvokeContextCallback for StubAccounts {}
 
     impl TransactionProcessingCallback for StubAccounts {
-        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
             self.lookups.fetch_add(1, Ordering::Relaxed);
-            self.accounts.get(pubkey).cloned()
-        }
-
-        fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
-            None
+            self.accounts
+                .get(pubkey)
+                .cloned()
+                .map(|account| (account, CHANNEL_SLOT))
         }
     }
 

@@ -69,7 +69,6 @@ pub async fn get_signature_statuses_impl(
                 // In PrivateChannel, all found transactions are confirmed (finalized)
                 debug!(
                     signature = %signature,
-                    status = ?tx.meta.status,
                     err = ?tx.meta.err,
                     "getSignatureStatuses transaction found"
                 );

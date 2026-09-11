@@ -21,7 +21,7 @@ pub mod test_hooks {
     //! Gated behind `test-mock-storage` so production builds get the
     //! same narrow API surface they always have.
     use super::*;
-    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_commitment_config::CommitmentLevel;
     use std::sync::Arc;
 
     pub use super::remint::DeferredRemintOutcome;
@@ -188,7 +188,7 @@ use crate::storage::common::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use crate::ProgramType;
 use private_channel_metrics::MetricLabel;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -607,8 +607,8 @@ mod tests {
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::PrivateChannelIndexerConfig;
+    use solana_commitment_config::CommitmentLevel;
     use solana_keychain::Signer;
-    use solana_sdk::commitment_config::CommitmentLevel;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
     use std::sync::Arc;

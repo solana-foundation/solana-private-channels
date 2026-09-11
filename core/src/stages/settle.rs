@@ -1625,7 +1625,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 100,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: std::collections::HashMap::new(),
         }))
@@ -1651,7 +1651,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 100,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: std::collections::HashMap::new(),
         }))
@@ -2754,9 +2754,13 @@ mod tests {
         let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
             load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
             rollback_accounts: RollbackAccounts::FeePayerOnly {
-                fee_payer_account: AccountSharedData::new(900, 0, &Pubkey::default()),
+                fee_payer: (
+                    Pubkey::default(),
+                    AccountSharedData::new(900, 0, &Pubkey::default()),
+                ),
             },
             fee_details: Default::default(),
+            loaded_accounts_data_size: 0,
         }));
 
         let cases: Vec<(&str, TransactionProcessingResult, usize)> = vec![
@@ -3504,13 +3508,13 @@ mod tests {
         let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
             load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
             rollback_accounts: RollbackAccounts::FeePayerOnly {
-                fee_payer_account: AccountSharedData::new(
-                    900,
-                    0,
-                    &solana_sdk_ids::system_program::ID,
+                fee_payer: (
+                    Pubkey::default(),
+                    AccountSharedData::new(900, 0, &solana_sdk_ids::system_program::ID),
                 ),
             },
             fee_details: Default::default(),
+            loaded_accounts_data_size: 0,
         }));
         let results: Vec<(TransactionProcessingResult, _)> = vec![(Ok(fees_only), tx)];
 
@@ -4033,13 +4037,13 @@ mod tests {
         let fees_only = ProcessedTransaction::FeesOnly(Box::new(FeesOnlyTransaction {
             load_error: solana_transaction_error::TransactionError::InsufficientFundsForFee,
             rollback_accounts: RollbackAccounts::FeePayerOnly {
-                fee_payer_account: AccountSharedData::new(
-                    900,
-                    0,
-                    &solana_sdk_ids::system_program::ID,
+                fee_payer: (
+                    Pubkey::default(),
+                    AccountSharedData::new(900, 0, &solana_sdk_ids::system_program::ID),
                 ),
             },
             fee_details: Default::default(),
+            loaded_accounts_data_size: 0,
         }));
 
         let from3 = Keypair::new();
@@ -4280,7 +4284,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 100,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: std::collections::HashMap::new(),
         }));

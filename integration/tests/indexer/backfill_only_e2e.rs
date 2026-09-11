@@ -33,8 +33,8 @@ use private_channel_indexer::{
 };
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
-    commitment_config::{CommitmentConfig, CommitmentLevel},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };

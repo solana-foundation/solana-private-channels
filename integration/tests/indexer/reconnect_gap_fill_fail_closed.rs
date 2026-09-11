@@ -12,7 +12,7 @@ use private_channel_indexer::indexer::transaction_processor::TransactionProcesso
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
 use serde_json::json;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::sync::Arc;
 use std::time::Duration;
