@@ -159,3 +159,8 @@ private-channel-withdraw-program-client = { path = "private-channel-withdraw-pro
 dvp-swap-program-client = { path = "dvp-swap-program/clients/rust", features = [
     "fetch",
 ] }
+
+# Unoptimized curve25519-dalek makes the in-process test validator sign its own blocks slower
+# than it produces them, until broadcast trails the root and panics. Agave sets the same override.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3

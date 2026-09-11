@@ -175,7 +175,7 @@ COV_IGNORE_PATTERNS := \
 # e.g. "a b c" → "(a|b|c)"
 COV_IGNORE_REGEX := ($(shell echo '$(COV_IGNORE_PATTERNS)' | tr -s ' \t\n' '|' | sed 's/^|//;s/|$$//'))
 
-# Suites that load the geyser plugin retry only on the upstream validator broadcast race.
+# Suites that start a test validator retry only if its broadcast stage panics.
 RETRY_ON_RACE := ../scripts/retry-on-known-race.sh 3
 
 integration-coverage-private-channel:
