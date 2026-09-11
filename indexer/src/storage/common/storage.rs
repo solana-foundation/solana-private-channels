@@ -38,6 +38,7 @@ pub mod insert_db_transactions_batch;
 pub mod insert_mint_statuses_batch;
 pub mod insert_observed_releases_batch;
 pub mod insert_release_signature;
+pub mod live_lock;
 pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
@@ -82,6 +83,14 @@ impl Storage {
     /// Drop all database tables
     pub async fn drop_tables(&self) -> Result<(), StorageError> {
         drop_tables::drop_tables(self).await
+    }
+
+    /// Drop every table on the live-state lock's own session, so it cannot outlive the lock.
+    pub async fn drop_tables_fenced(
+        &self,
+        lock: &live_lock::LiveLockGuard,
+    ) -> Result<(), StorageError> {
+        drop_tables::drop_tables_fenced(self, lock).await
     }
 
     /// Insert a new transaction
@@ -410,6 +419,19 @@ impl Storage {
         transaction_id: i64,
     ) -> Result<Option<TransactionStatus>, StorageError> {
         get_transaction_status::get_transaction_status(self, transaction_id).await
+    }
+
+    /// Take the live-state lock, which keeps live workers and a destructive
+    /// resync off the same database at the same time. Errors say what is holding
+    /// it. `on_lost` is cancelled if ownership later stops being provable.
+    pub async fn try_acquire_live_lock(
+        &self,
+        mode: live_lock::LiveLockMode,
+        role: &'static str,
+        on_lost: tokio_util::sync::CancellationToken,
+        heartbeat_interval: std::time::Duration,
+    ) -> Result<live_lock::LiveLockGuard, StorageError> {
+        live_lock::try_acquire_live_lock(self, mode, role, on_lost, heartbeat_interval).await
     }
 
     /// Try to acquire the singleton sender lock for `key`. `Ok(None)` means

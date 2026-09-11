@@ -123,6 +123,15 @@ pub enum ReconciliationError {
     #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
     ConsumedSetUnavailable { reason: String },
 
+    /// A rebuild drops the table the halt flag lives in, so it would clear a halt
+    /// that is still unresolved and destroy the ledger evidence behind it. Resolve
+    /// the halt and clear the flag first, then resync.
+    #[error(
+        "reconciliation halt is set ({reason}); resync would erase it, so resolve and clear \
+         the halt first (see the reconciliation halt runbook)"
+    )]
+    ReconciliationHalted { reason: String },
+
     /// The on-chain withdrawal bitmap has already issued nonces. A rebuild restarts the
     /// nonce sequence at 0, so every rebuilt withdrawal would be numbered against a
     /// window the chain has moved past. Resync aborts before any destruction.

@@ -1,19 +1,24 @@
 use crate::config::OperatorConfig;
-use crate::error::OperatorError;
+use crate::error::{OperatorError, StorageError};
 use crate::metrics;
 use crate::operator::{
     feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
     RetryConfig, RpcClientWithRetry,
 };
-use crate::shutdown_utils::shutdown_operator;
+use crate::shutdown_utils::{shutdown_operator, stop_signal, StopReason};
+use crate::storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL};
 use crate::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// Metric label for the live-state lock this role holds.
+const OPERATOR_LOCK_ROLE: &str = "operator";
 
 pub async fn run(
     storage: Arc<Storage>,
@@ -33,6 +38,31 @@ pub async fn run(
     info!("Retry max attempts: {}", config.retry_max_attempts);
 
     let cancellation_token = CancellationToken::new();
+
+    // Take the live-state lock before touching the schema or any row. A resync
+    // rebuilding this database holds it exclusively, and starting underneath one would
+    // mint and release against tables it is about to drop. Held for the whole run, so a
+    // resync cannot start either. Refusing here is the point: orchestration retries
+    // once the resync exits.
+    //
+    // It gets a token of its own rather than the operator's. The sender lock cancels
+    // that one on its own loss, and that path is already correct: it keeps its session
+    // open through the drain so no replacement can start. Only a lost live-state lock
+    // needs the abrupt stop below, so the two reasons have to stay tellable apart.
+    let live_lock_lost = CancellationToken::new();
+    let _live_lock = storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            OPERATOR_LOCK_ROLE,
+            live_lock_lost.clone(),
+            LIVE_LOCK_HEARTBEAT_INTERVAL,
+        )
+        .await
+        .inspect_err(|e| error!("Operator refusing to start: {}", e))?;
+
+    // Moved here from the binary so it runs under the lock, never against tables a
+    // resync is dropping.
+    storage.init_schema().await?;
 
     // Initialize global RPC client with retry
     let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -353,13 +383,39 @@ pub async fn run(
     let mut recovery_handle = recovery_handle;
     let pt_label = program_type.as_label();
 
-    // `biased;` makes ctrl-c win on concurrent readiness — avoids a
-    // false-positive `critical_exit` when a task ends at the same instant.
+    // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
+    // branch, so a task ending at the same instant cannot turn a deliberate stop into a
+    // false-positive `critical_exit`. Within the stop signal itself a lost lock outranks
+    // an interrupt, which is what stop_signal settles.
     tokio::select! {
         biased;
-        result = tokio::signal::ctrl_c() => {
-            result.map_err(|_| OperatorError::ShutdownChannelSend)?;
-            info!("Shutdown signal received, initiating graceful shutdown...");
+        reason = stop_signal(tokio::signal::ctrl_c(), live_lock_lost.clone()) => {
+            match reason.map_err(|_| OperatorError::ShutdownChannelSend)? {
+                // A lost live-state lock skips the graceful path entirely. Postgres frees
+                // the lock the instant our session dies, so a resync may already be
+                // dropping these tables; draining would broadcast and write into them.
+                // Stopping outright costs no more than an abrupt kill, which the recovery
+                // worker already handles.
+                StopReason::LiveLockLost => {
+                    stop_without_draining(
+                        &cancellation_token,
+                        &[
+                            fetcher_handle.abort_handle(),
+                            processor_handle.abort_handle(),
+                            sender_handle.abort_handle(),
+                            storage_writer_handle.abort_handle(),
+                            recovery_handle.abort_handle(),
+                            reconciliation_handle.abort_handle(),
+                            feepayer_monitor_handle.abort_handle(),
+                        ],
+                    )
+                    .await;
+                    return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
+                }
+                StopReason::Interrupted => {
+                    info!("Shutdown signal received, initiating graceful shutdown...");
+                }
+            }
         }
         _ = &mut fetcher_handle => {
             critical_exit(pt_label, "fetcher");
@@ -376,6 +432,26 @@ pub async fn run(
         _ = &mut recovery_handle => {
             critical_exit(pt_label, "recovery");
         }
+    }
+
+    // A critical task dying and the lock going are one failure when the database is what
+    // went away, so the exit path has to ask the same question the signal path did.
+    // Draining here would broadcast and flush into tables a resync may already be dropping.
+    if live_lock_lost.is_cancelled() {
+        stop_without_draining(
+            &cancellation_token,
+            &[
+                fetcher_handle.abort_handle(),
+                processor_handle.abort_handle(),
+                sender_handle.abort_handle(),
+                storage_writer_handle.abort_handle(),
+                recovery_handle.abort_handle(),
+                reconciliation_handle.abort_handle(),
+                feepayer_monitor_handle.abort_handle(),
+            ],
+        )
+        .await;
+        return Err(OperatorError::Storage(StorageError::LiveStateLockLost));
     }
 
     // Graceful shutdown — runs on both the ctrl-c path and the critical-task-
@@ -548,6 +624,20 @@ async fn validate_withdraw_fallback(
 /// `shutdown_operator` so the remaining tasks get the usual graceful-shutdown
 /// treatment.  The process will exit naturally once `shutdown_operator`
 /// returns, and the supervisor will restart the operator.
+/// Stop every worker outright, for a lost live-state lock.
+///
+/// Nothing may drain: Postgres frees the lock the instant our session dies, so a resync may
+/// already be dropping the tables these tasks broadcast and write into. Costs no more than
+/// an abrupt kill, which the recovery worker already handles.
+///
+/// Waits for the workers to stop rather than only asking, since returning is what lets the
+/// lock go and an aborted task can still have a write in flight.
+async fn stop_without_draining(cancellation_token: &CancellationToken, workers: &[AbortHandle]) {
+    error!("Live-state lock lost; stopping without draining");
+    cancellation_token.cancel();
+    crate::shutdown_utils::abort_and_await_writers(workers).await;
+}
+
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,
@@ -561,6 +651,38 @@ fn critical_exit(program_type_label: &str, task_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every worker must be stopped outright, not asked to finish, and be stopped by the
+    /// time this returns: returning is what releases the lock, and a drain or a straggler
+    /// would write into tables a resync may already be dropping.
+    #[tokio::test]
+    async fn stop_without_draining_aborts_every_worker() {
+        let workers: Vec<_> = (0..3)
+            .map(|_| tokio::spawn(async { std::future::pending::<()>().await }))
+            .collect();
+        let aborts: Vec<_> = workers.iter().map(|w| w.abort_handle()).collect();
+        let cancellation_token = CancellationToken::new();
+
+        stop_without_draining(&cancellation_token, &aborts).await;
+
+        for abort in &aborts {
+            assert!(
+                abort.is_finished(),
+                "a worker still running when this returned could write after the lock is freed"
+            );
+        }
+        assert!(
+            cancellation_token.is_cancelled(),
+            "the shared token must be cancelled so cooperative tasks stop too"
+        );
+        for worker in workers {
+            assert!(
+                worker.await.unwrap_err().is_cancelled(),
+                "a worker that was only signalled, not aborted, could still write"
+            );
+        }
+    }
+
     use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;
