@@ -28,7 +28,7 @@ pnpm add private-channel-escrow-program @solana/kit
 1. [CreateInstance](#createinstance) - Create a new escrow instance
 2. [AllowMint](#allowmint) - Whitelist a token mint for deposits
 3. [Mint Risk Considerations](#mint-risk-considerations) - Authorities/extensions to vet before whitelisting
-4. [BlockMint](#blockmint) - Revoke deposit permissions for a mint
+4. [BlockMint](#blockmint) - Set the deposit and withdrawal gates on a mint
 5. [AddOperator](#addoperator) - Authorize a withdrawal operator
 6. [RemoveOperator](#removeoperator) - Remove an operator
 7. [SetNewAdmin](#setnewadmin) - Transfer admin control
@@ -103,9 +103,10 @@ const allowMintIx = await getAllowMintInstructionAsync({
 
 **Security Notes:**
 - Supports Token Program and Token-2022
-- Token-2022 mints with the `TransferHook` extension are rejected (the program's `TransferChecked` CPI does not resolve extra-account metas, so every deposit/release would fail on-chain)
+- Token-2022 mints with the `TransferHook` extension are supported. `Deposit` and `ReleaseFunds` forward their trailing accounts to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. The client resolves those accounts (see [Transfer-hook mints](#transfer-hook-mints)). The program caps them at 32, but a legacy transaction runs out of room around 17
 - Token-2022 mints with `PermanentDelegate` or `PausableConfig` extensions are accepted; the operator enforces drain detection and pause state off-chain via a withdrawal pre-flight
 - Only the instance admin can allow mints
+- Records the mint's `decimals`, `token_program`, extension set and whether it has a freeze authority as the reviewed profile. `Deposit` rejects the mint with `MintProfileChanged` if any of them changes, which an admin clears by blocking and re-allowing (a re-allow also re-opens both gates). Freeze authority is checked in one direction only — revoking one is fine, gaining one is not. A decimals change also needs the channel mint re-created, since re-allow leaves it on the old decimals
 - **Token-2022 usage**: The `tokenProgram` parameter defaults to the legacy Token Program. For Token-2022 mints, you must explicitly pass the Token-2022 program ID (e.g., `tokenProgram: TOKEN_2022_PROGRAM_ADDRESS`). This also applies to the `Deposit` instruction.
 
 > **Before whitelisting any mint, review [Mint Risk Considerations](#mint-risk-considerations).** The escrow program accepts several mint authorities/extensions that a third party can use to strand or drain pooled escrow. The on-chain program does not block them, so whitelisting one is a trust decision about the mint's issuer.
@@ -114,20 +115,31 @@ To derive your allowed mint PDA, refer to the [PDA Reference](#pda-reference) se
 
 ## Mint Risk Considerations
 
-The escrow program only rejects the `TransferHook` extension on-chain. Several other mint authorities and Token-2022 extensions are accepted but hand an external party control over the pooled `instance_ata`. There is no on-chain guard and the off-chain preflight only *detects* the aftermath — it cannot prevent or revert it. Whitelisting a mint that carries any of these is a trust decision about the mint's issuer (and whoever holds its authorities), not just about its current state.
+The escrow program rejects no extension on-chain. Several mint authorities and Token-2022 extensions are accepted but hand an external party control over the pooled `instance_ata`. There is no on-chain guard and the off-chain preflight only *detects* the aftermath — it cannot prevent or revert it. Whitelisting a mint that carries any of these is a trust decision about the mint's issuer (and whoever holds its authorities), not just about its current state.
 
 | Authority / extension | Risk | Operator guidance |
 |---|---|---|
-| `freeze_authority` (SPL & Token-2022) | The authority holder can `FreezeAccount` the pooled escrow ATA directly. Because the ATA is pooled per mint, one freeze strands *every* depositor's withdrawals for that mint until the holder thaws it. | Only whitelist mints whose `freeze_authority` is `None` (or held by a party you trust to never freeze escrow). |
+| `freeze_authority` (SPL & Token-2022) | The authority holder can `FreezeAccount` the pooled escrow ATA directly. Because the ATA is pooled per mint, one freeze strands *every* depositor's withdrawals for that mint until the holder thaws it. The withdrawal preflight detects a frozen escrow ATA and parks the row for manual review, but cannot prevent or undo the freeze. | Only whitelist mints whose `freeze_authority` is `None` (or held by a party you trust to never freeze escrow). |
 | `PermanentDelegate` (Token-2022) | The delegate can transfer or burn directly from the escrow ATA, outside `ReleaseFunds` and every escrow access control, draining escrow for that mint. The withdrawal preflight only notices the missing balance afterward and routes victims to manual review. | Only whitelist if you trust the permanent-delegate holder; treat the off-chain check as detection, not a mitigation. |
-| `MintCloseAuthority` (Token-2022) | Once supply reaches zero the mint can be closed and re-created at the *same pubkey* with a different extension set (e.g. adding `PermanentDelegate` or `PausableConfig`). The allowlist and the operator's safety cache are keyed only by pubkey, so a previously-reviewed "clean" mint can be swapped underneath that trust decision with no new allowlist review. | Prefer rejecting mints that carry `MintCloseAuthority`; if accepted, treat the original review as void after any close/recreate. |
+| `MintCloseAuthority` (Token-2022) | Once supply reaches zero the mint can be closed and re-created at the *same pubkey* with a different extension set (e.g. adding `PermanentDelegate` or `PausableConfig`). `AllowMint` pins the reviewed `decimals`, `token_program`, extension set and freeze-authority presence, so a recreate that changes any of them stops deposits with `MintProfileChanged` until an admin re-allows. What is *not* pinned is an extension's contents: a fee raised, a hook program swapped or a permanent delegate rotated leaves the profile identical. | Prefer rejecting mints that carry `MintCloseAuthority`; if accepted, treat the original review as void after any close/recreate. |
 | `PausableConfig` (Token-2022) | The pause authority can pause the mint, halting all transfers; while paused, `ReleaseFunds` fails and withdrawals for that mint cannot settle until it is unpaused. The operator checks pause state in the withdrawal preflight, but cannot prevent or override a pause. | Only whitelist if you trust the pause authority; treat the off-chain check as detection, not a mitigation. |
+| `TransferHook` (Token-2022) | The hook program runs inside every deposit and release and can revert either, halting transfers for that mint until its authority relents. The hook authority can also swap the hook program, or grow the `ExtraAccountMetaList` past what fits a transfer; both brick transfers rather than divert funds, and withdrawals park under `hook_unresolvable`. Forwarded hook accounts never carry a signer bit, so a hook cannot sign for an account that signed the transaction; a mint that genuinely requires a signer extra is untransferable here. | Only whitelist mints whose hook program you have reviewed and whose hook authority you trust. The extension set is pinned at `AllowMint`, so a recreate that adds or drops `TransferHook` stops deposits — but the hook *program id* is not, so a swap to a different hook leaves the profile identical. |
+| `TransferFeeConfig` (Token-2022) | The escrow is never short: both legs account by measured balance delta, so a deposit credits the channel net of the fee. On withdrawal the fee falls on the **user** — the escrow is debited the full release amount and the user's ATA receives it minus the fee, while the channel balance burned is the gross amount. The fee authority can raise the fee after users deposit, and neither the program nor the preflight caps it. | Only whitelist if you trust the fee authority not to raise the fee, and disclose to users that withdrawals settle net of the mint's transfer fee. |
 
 In every case the safe posture is the same: only whitelist mints whose close/freeze/delegate authorities are disabled or held by a party you trust, since the protocol cannot retain custody once an external authority can act on the escrow ATA.
 
+### Transfer-hook mints
+
+`Deposit` and `ReleaseFunds` hand every account after their fixed list to the token program, which resolves the mint's `ExtraAccountMetaList` and invokes the hook. Codama drops trailing accounts, so neither the IDL nor the generated clients list them: append them yourself, in resolver order (the declared extras, then the hook program, then the validation PDA). Omitting one fails the transfer rather than skipping the hook.
+
+- TypeScript: resolve with `@solana-program/token-2022`, then append the metas to the instruction's `accounts`.
+- Rust: `spl_transfer_hook_interface::offchain::add_extra_account_metas_for_execute` against a scratch instruction whose first four accounts are source, mint, destination and authority, then take everything past them. This is what the withdrawal operator does.
+
+Every forwarded account keeps its writable flag but loses its signer bit, so a hook can never receive a signature from an account that signed the transaction. Withdrawals of a mint whose validation account is missing park for manual review under the `hook_unresolvable` bail reason, since nothing can resolve them.
+
 ## BlockMint
 
-Revokes deposit permissions for a previously whitelisted mint. Closes the AllowedMint PDA and reclaims rent to the payer.
+Sets the deposit and withdrawal gates on a previously whitelisted mint. The AllowedMint PDA stays open, so blocking deposits does not strand existing balances.
 
 ### TypeScript Example
 
@@ -136,21 +148,25 @@ import {
   getBlockMintInstructionAsync,
 } from 'private-channel-escrow-program';
 
+// Stop new deposits, leave existing balances withdrawable
 const blockMintIx = await getBlockMintInstructionAsync({
   payer,
   admin, // Must be instance admin
   instance: process.env.INSTANCE_ADDRESS,
   mint: USDC_MINT,
+  blockDeposits: true,
+  blockWithdrawals: false,
 });
 
 // Sign and send transaction with payer and admin as signers
 ```
 
 **Notes:**
-- New deposits for this mint fail immediately with `InvalidAllowedMint` error
+- The gates are independent, and both flags are absolute: passing `false` for one re-opens that gate
+- With `blockDeposits`, new deposits fail with `DepositsBlockedForMint`; withdrawals are unaffected
+- With `blockWithdrawals`, `ReleaseFunds` fails with `WithdrawalsBlockedForMint`, and the operator parks the withdrawal for manual review rather than failing it
 - Existing Solana Private Channels balances are NOT affected
-- Withdraws still work for existing balances
-- Reversible: Admin can call AllowMint again to re-enable
+- Reversible: block again with `false`, or call AllowMint, which re-opens both gates
 
 ## AddOperator
 

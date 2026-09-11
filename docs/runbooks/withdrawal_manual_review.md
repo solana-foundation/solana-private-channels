@@ -42,6 +42,10 @@ have prefixes.
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
+| `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
+| `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
+| `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
+| `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
@@ -187,16 +191,44 @@ to say explicitly what the user is owed.
        and record whether to restore them by an admin mint on the channel.
        [Escalate](_escalation.md) (Tier 3): a burn of an unsupported mint means one
        was created or distributed on the channel without a matching `AllowMint`.
-     - **Allowlisted, then blocked.** `BlockMint` closes the account, and escrowed
-       funds are still held. The withdrawal cannot proceed while the mint is blocked,
-       because the escrow program rejects the release. Either re-allow the mint and
-       re-arm the row, or refund out-of-band from the escrow.
-       [Escalate](_escalation.md) (Tier 2).
+     - **Present but undecodable** (message says `allowlist account failed to decode`).
+       The account exists and is escrow-owned but its layout is not one this operator
+       build knows, so the deployed program and the operator are out of step. Do not
+       re-arm until they match. [Escalate](_escalation.md) (Tier 2).
 
      Either way, if the parked row's `withdrawal_nonce` is a multiple of the tree
      size, marking it `failed` releases later withdrawals onto a tree generation
      that was never rotated, so rotate before you terminalize it. This applies to
      any terminalized boundary row, not just this one.
+   - `escrow ATA frozen for mint:` - the mint's `freeze_authority` holder froze the
+     pooled escrow ATA, so no release for that mint can settle. The escrow still
+     holds the funds and the row is intact. Nothing on our side can thaw it: contact
+     the authority holder, and re-arm the row once
+     `solana account $(escrow-ata <instance> <mint>) --url <target-rpc>` shows the
+     account no longer frozen. Because the ATA is pooled per mint, expect every
+     withdrawal for that mint to park here, not just this one. Only the pooled
+     ATA is checked: a freeze on one user's own ATA fails on-chain instead and
+     reminds their channel balance, so it lands in
+     [withdrawal_failed_reminted.md](withdrawal_failed_reminted.md), not here.
+     [Escalate](_escalation.md) (Tier 2).
+   - `withdrawals blocked for mint:` - an admin set the mint's withdrawal gate, which
+     `release_funds` rejects on-chain. The escrow still holds the funds and the row is
+     intact, so nothing is lost. Re-open the gate (`BlockMint` with
+     `block_withdrawals: false`, or `AllowMint`, which re-opens both), then re-arm the
+     row. Blocking withdrawals is deliberate, so confirm with whoever set it before
+     re-opening. No operator restart is needed either way: the gate is mirrored onto
+     the `mints` row and read on every withdrawal, so a block and a re-open both take
+     effect once the indexer has processed that slot. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook validation account missing for mint:` - the mint's
+     `TransferHook` points at a hook program whose `ExtraAccountMetaList` does not
+     exist, so Token-2022 can resolve no transfer of it and no release can settle.
+     The escrow still holds the funds and the row is intact. Nothing on our side
+     creates that account: only the hook program can, so contact the mint issuer.
+     Its address is the `["extra-account-metas", mint]` PDA of the hook program the
+     mint names; re-arm the row once `solana account <that address>` shows it
+     exists. Expect every withdrawal of that mint to park here. Deposits of it fail
+     on-chain for the same reason, so consider blocking deposits (`BlockMint` with
+     `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
    - `withdrawal mint absent on target chain:` - the mint was allowlisted, so its
      account existed then, and the node answered from a slot at or past that allow
      before reporting nothing. A lagging node cannot produce this message; it

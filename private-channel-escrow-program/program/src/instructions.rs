@@ -67,13 +67,13 @@ pub enum PrivateChannelEscrowProgramInstruction {
         bump: u8,
     } = 1,
 
-    /// Block previously allowed mints for the instance (admin-only).
+    /// Set the deposit and withdrawal gates on an allowed mint (admin-only).
+    /// Both flags are absolute, so passing false for one re-opens that gate.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "admin", docs = "Admin of Instance", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to validate admin authority"))]
-    #[codama(account(name = "mint", docs = "Token mint to be blocked"))]
+    #[codama(account(name = "mint", docs = "Token mint whose gates are being set"))]
     #[codama(account(name = "allowed_mint", docs = "Existing Allowed Mint PDA", writable))]
-    #[codama(account(name = "system_program", docs = "System program for account creation"))]
     #[codama(account(
         name = "event_authority",
         docs = "Event authority PDA for emitting events"
@@ -82,7 +82,12 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
-    BlockMint {} = 2,
+    BlockMint {
+        /// Reject new deposits for this mint
+        block_deposits: bool,
+        /// Reject fund releases for this mint
+        block_withdrawals: bool,
+    } = 2,
 
     /// Add an operator to the instance (admin-only).
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
@@ -137,6 +142,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
     SetNewAdmin {} = 5,
 
     /// Deposit tokens from user ATA to instance escrow ATA (permissionless).
+    ///
+    /// Append the mint's transfer-hook extras after the fixed accounts: hook
+    /// program, validation PDA, and whatever its `ExtraAccountMetaList`
+    /// resolves to. Omit for mints without a hook. Codama drops trailing
+    /// accounts, so they are not in the generated account list.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "user", docs = "User depositing tokens", signer))]
     #[codama(account(name = "instance", docs = "Instance PDA to validate"))]
@@ -174,6 +184,11 @@ pub enum PrivateChannelEscrowProgramInstruction {
     } = 6,
 
     /// Release funds from escrow to user (operator-only).
+    ///
+    /// Append the mint's transfer-hook extras after the fixed accounts: hook
+    /// program, validation PDA, and whatever its `ExtraAccountMetaList`
+    /// resolves to. Omit for mints without a hook. Codama drops trailing
+    /// accounts, so they are not in the generated account list.
     #[codama(account(name = "payer", docs = "Transaction fee payer", signer, writable))]
     #[codama(account(name = "operator", docs = "Operator releasing the funds", signer))]
     #[codama(account(

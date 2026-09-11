@@ -17,7 +17,7 @@
 |-------------|-------------|---------------|
 | [`CreateInstance`](#createinstance) | Create a new escrow instance with the specified admin | 0 |
 | [`AllowMint`](#allowmint) | Allow new token mints for the instance (admin-only) | 1 |
-| [`BlockMint`](#blockmint) | Block previously allowed mints for the instance (admin-only) | 2 |
+| [`BlockMint`](#blockmint) | Set the deposit and withdrawal gates on an allowed mint (admin-only) | 2 |
 | [`AddOperator`](#addoperator) | Add an operator to the instance (admin-only) | 3 |
 | [`RemoveOperator`](#removeoperator) | Remove an operator from the instance (admin-only) | 4 |
 | [`SetNewAdmin`](#setnewadmin) | Set a new admin for the instance (current admin only) | 5 |
@@ -80,11 +80,19 @@ Discriminator: `1`
 | 10 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### BlockMint
-Blocks previously allowed mints for the instance (admin-only).
+Sets the deposit and withdrawal gates on an allowed mint (admin-only).
+
+The two gates are independent, and both flags are absolute: passing `false` for one
+re-opens that gate. The AllowedMint PDA is not closed, so blocking deposits leaves
+already-escrowed balances withdrawable. `AllowMint` also re-opens both gates.
 
 Discriminator: `2`
 
-**Parameters:** None
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `block_deposits` | bool | Reject new deposits for this mint |
+| `block_withdrawals` | bool | Reject fund releases for this mint |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -92,11 +100,10 @@ Discriminator: `2`
 | 0 | `payer` | ✓ | ✓ | Transaction fee payer |
 | 1 | `admin` | ✓ | | Admin of Instance |
 | 2 | `instance` | | | Instance PDA to validate admin authority |
-| 3 | `mint` | | | Token mint to be blocked |
+| 3 | `mint` | | | Token mint whose gates are being set |
 | 4 | `allowed_mint` | | ✓ | Existing Allowed Mint PDA |
-| 5 | `system_program` | | | System program for account creation |
-| 6 | `event_authority` | | | Event authority PDA for emitting events |
-| 7 | `private_channel_escrow_program` | | | Current program for CPI |
+| 5 | `event_authority` | | | Event authority PDA for emitting events |
+| 6 | `private_channel_escrow_program` | | | Current program for CPI |
 
 #### AddOperator
 Adds an operator to the instance (admin-only).
@@ -260,7 +267,7 @@ Discriminator: `228`
 |-------------|-------------|---------------|
 | Instance | Escrow instance that holds token funds and manages operators | 0 |
 | Operator | Authorized operator for an instance that can release funds | 1 |
-| AllowedMint | Token mint that is allowed for deposits in an instance | 2 |
+| AllowedMint | Token mint allowed in an instance, holding its deposit and withdrawal gates | 2 |
 | WithdrawalBitmap | Withdrawal nonce replay protection for an instance | 3 |
 
 ### Instance
@@ -305,13 +312,35 @@ Represents an authorized operator for an instance that can release funds.
 | `bump` | u8 | PDA bump seed |
 
 ### AllowedMint
-Represents a token mint that is allowed for deposits in an instance.
+Represents a token mint that is allowed in an instance, its two gates, and the mint
+profile recorded when it was allowed.
 
 **PDA Derivation**: `["allowed_mint", instance_pda, mint_pubkey]`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `bump` | u8 | PDA bump seed |
+| `deposits_blocked` | bool | `Deposit` rejects this mint |
+| `withdrawals_blocked` | bool | `ReleaseFunds` rejects this mint |
+| `decimals` | u8 | Mint decimals at `AllowMint`; `Deposit` rejects a mismatch |
+| `token_program` | Pubkey | Token program at `AllowMint`; `Deposit` rejects a mismatch |
+| `extensions` | u64 | Bitmask of the mint's Token-2022 `ExtensionType` discriminants (bit N = type N), 0 for a legacy mint; `Deposit` rejects a mismatch |
+| `has_freeze_authority` | bool | Whether the mint had a freeze authority at `AllowMint`; `Deposit` rejects *gaining* one |
+
+A mint carrying `MintCloseAuthority` can be closed and recreated at the same address
+with any of these changed. Closing requires zero supply, so that window is while the
+escrow holds none of the mint — in practice between `AllowMint` and the first deposit,
+which is also when the channel-side mint is initialized from the allow-time decimals.
+`Deposit` compares them and fails with `MintProfileChanged`; an admin blocks and
+re-allows to re-pin. A decimals change also needs the channel mint re-created,
+since re-allow leaves it on the old decimals. `ReleaseFunds` does not compare them, since the escrow can only
+hold a balance while the profile is unchangeable.
+
+Freeze authority is compared in one direction only: it can be revoked but never
+re-added, so losing one is the same mint behaving more safely while gaining one
+means a recreate. The `extensions` mask pins *which* extensions exist, not their
+contents — a transfer fee raised, a hook program swapped or a permanent delegate
+rotated leaves it unchanged, and those stay issuer-trust decisions.
 
 ## Errors
 
@@ -325,7 +354,7 @@ The program defines the following custom errors:
 | 3 | `InvalidInstanceId` | Instance ID invalid or does not respect rules |
 | 4 | `InvalidInstance` | Invalid instance provided |
 | 5 | `InvalidAdmin` | Invalid admin provided |
-| 6 | `TransferHookNotAllowed` | Transfer hook extension not allowed |
+| 6 | `TransferHookNotAllowed` | Retired. Transfer-hook mints are supported; the code is kept so the ones after it do not shift |
 | 7 | `InvalidOperatorPda` | Invalid operator PDA provided |
 | 8 | `InvalidTokenAccount` | Invalid token account provided |
 | 9 | `InvalidEscrowBalance` | Invalid escrow balance |
@@ -334,6 +363,9 @@ The program defines the following custom errors:
 | 12 | `NonceAlreadyUsed` | Withdrawal nonce has already been released |
 | 13 | `NonceOutsideCurrentGeneration` | Withdrawal nonce belongs to a different bitmap generation |
 | 14 | `UnexpectedGeneration` | Bitmap rotation pre-state mismatch; blocks replaying a landed rotation |
+| 15 | `DepositsBlockedForMint` | Deposits are blocked for this mint |
+| 16 | `WithdrawalsBlockedForMint` | Withdrawals are blocked for this mint |
+| 17 | `MintProfileChanged` | Mint no longer matches the profile recorded at AllowMint |
 
 ## Other Constants
 

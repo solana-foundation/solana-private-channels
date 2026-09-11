@@ -523,7 +523,9 @@ impl RpcClientWithRetry {
         let config = RpcTransactionConfig {
             encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
             commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
+            // A ceiling, not a request: below it a v1 transaction comes back as
+            // -32015 instead of being read. Matches the poller's.
+            max_supported_transaction_version: Some(1),
         };
 
         self.with_retry("get_transaction", RetryPolicy::Idempotent, || async {

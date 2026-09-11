@@ -5,24 +5,30 @@ use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
     compute_budget::ComputeBudgetInstruction,
-    instruction::Instruction,
+    instruction::{AccountMeta, Instruction},
     program_option::COption,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
 };
 use spl_pod::optional_keys::OptionalNonZeroPubkey;
+use spl_tlv_account_resolution::{account::ExtraAccountMeta, state::ExtraAccountMetaList};
 use spl_token::{
     state::{Account as TokenAccount, Mint},
     ID as TOKEN_PROGRAM_ID,
 };
 use spl_token_2022::{
     extension::{
-        pausable::PausableConfig, permanent_delegate::PermanentDelegate,
-        transfer_fee::instruction::initialize_transfer_fee_config, transfer_hook::TransferHook,
+        pausable::PausableConfig,
+        permanent_delegate::PermanentDelegate,
+        transfer_fee::instruction::initialize_transfer_fee_config,
+        transfer_hook::{TransferHook, TransferHookAccount},
         BaseStateWithExtensionsMut, ExtensionType,
     },
     state::Mint as Token2022Mint,
+};
+use spl_transfer_hook_interface::{
+    get_extra_account_metas_address, instruction::ExecuteInstruction,
 };
 
 use solana_program::clock::Clock;
@@ -30,7 +36,7 @@ use spl_associated_token_account::{
     get_associated_token_address, instruction::create_associated_token_account_idempotent,
 };
 use spl_token_2022::extension::PodStateWithExtensionsMut;
-use spl_token_2022::pod::PodMint;
+use spl_token_2022::pod::{PodAccount, PodCOption, PodMint};
 use spl_token_2022::state::{Account as Token2022Account, AccountState};
 
 const MIN_LAMPORTS: u64 = 500_000_000;
@@ -39,6 +45,9 @@ pub const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTN
 pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: Pubkey =
     pubkey!("9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU");
 pub const TOKEN_2022_PROGRAM_ID: Pubkey = spl_token_2022::ID;
+/// Transfer-hook program loaded into LiteSVM for hook-bearing Token-2022
+/// mints. Matches `declare_id!` in `tests/transfer-hook-fixture`.
+pub const HOOK_FIXTURE_PROGRAM_ID: Pubkey = pubkey!("hookEjHJAu757hfesyLchyGLxH6BeNuEbcztVEFT4K4");
 
 // PrivateChannel Escrow Program Error Codes (using generated error enum)
 pub const INVALID_EVENT_AUTHORITY_ERROR: u32 =
@@ -59,6 +68,12 @@ pub const NONCE_OUTSIDE_CURRENT_GENERATION_ERROR: u32 =
     PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration as u32;
 pub const UNEXPECTED_GENERATION_ERROR: u32 =
     PrivateChannelEscrowProgramError::UnexpectedGeneration as u32;
+pub const DEPOSITS_BLOCKED_FOR_MINT_ERROR: u32 =
+    PrivateChannelEscrowProgramError::DepositsBlockedForMint as u32;
+pub const WITHDRAWALS_BLOCKED_FOR_MINT_ERROR: u32 =
+    PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint as u32;
+pub const MINT_PROFILE_CHANGED_ERROR: u32 =
+    PrivateChannelEscrowProgramError::MintProfileChanged as u32;
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
 pub const NONCES_PER_GENERATION: u64 = 65_536;
@@ -104,6 +119,10 @@ impl TestContext {
         let program_data =
             include_bytes!("../../../../target/deploy/private_channel_escrow_program.so");
         let _ = svm.add_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, program_data);
+
+        let hook_fixture_data =
+            include_bytes!("../../../../target/deploy/transfer_hook_fixture.so");
+        let _ = svm.add_program(HOOK_FIXTURE_PROGRAM_ID, hook_fixture_data);
 
         let payer = Keypair::new();
 
@@ -388,8 +407,45 @@ pub fn set_token_balance_2022(
 }
 
 pub fn set_mint(context: &mut TestContext, mint: &Pubkey) {
+    set_mint_with_decimals(context, mint, 6);
+}
+
+/// Same as [`set_mint`] but carrying a freeze authority, for the one-directional
+/// profile check: gaining one means a recreate, losing one does not.
+pub fn set_mint_with_freeze_authority(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    freeze_authority: &Pubkey,
+) {
     let mint_account = Mint {
         decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::Some(*freeze_authority),
+        mint_authority: COption::None,
+        supply: 1_000_000,
+    };
+
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(mint_account, &mut data).expect("Failed to pack mint account");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set mint account");
+}
+
+pub fn set_mint_with_decimals(context: &mut TestContext, mint: &Pubkey, decimals: u8) {
+    let mint_account = Mint {
+        decimals,
         is_initialized: true,
         freeze_authority: COption::None,
         mint_authority: COption::None,
@@ -646,6 +702,160 @@ pub fn set_mint_2022_with_transfer_hook(
             },
         )
         .expect("Failed to set Token 2022 mint account with TransferHook");
+}
+
+/// Writes the `ExtraAccountMetaList` validation PDA the hook fixture reads.
+/// Token-2022 resolves the transfer's hook accounts from it.
+fn set_extra_account_meta_list(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    extras: &[ExtraAccountMeta],
+) {
+    let validation_pda = get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID);
+
+    let size = ExtraAccountMetaList::size_of(extras.len()).unwrap();
+    let mut data = vec![0u8; size];
+    ExtraAccountMetaList::init::<ExecuteInstruction>(&mut data, extras)
+        .expect("Failed to init ExtraAccountMetaList");
+
+    context
+        .svm
+        .set_account(
+            validation_pda,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: HOOK_FIXTURE_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set ExtraAccountMetaList account");
+}
+
+/// Token-2022 mint whose transfers run the hook fixture, with an
+/// `ExtraAccountMetaList` declaring one extra (the system program).
+///
+/// The fixture logs how many accounts it receives, so tests assert 6:
+/// source, mint, destination, authority, validation PDA, and that extra.
+pub fn setup_hook_mint(context: &mut TestContext, mint: &Pubkey) {
+    set_mint_2022_with_transfer_hook(context, mint, &HOOK_FIXTURE_PROGRAM_ID);
+
+    let extras =
+        [
+            ExtraAccountMeta::new_with_pubkey(&solana_program::system_program::ID, false, false)
+                .unwrap(),
+        ];
+    set_extra_account_meta_list(context, mint, &extras);
+}
+
+/// Trailing accounts to append when transferring a mint from
+/// [`setup_hook_mint`]. Order matches the offchain resolver: declared
+/// extras, hook program, validation PDA.
+pub fn hook_extras_for_mint(mint: &Pubkey) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(solana_program::system_program::ID, false),
+        AccountMeta::new_readonly(HOOK_FIXTURE_PROGRAM_ID, false),
+        AccountMeta::new_readonly(
+            get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID),
+            false,
+        ),
+    ]
+}
+
+/// Like [`setup_hook_mint`], but the `ExtraAccountMetaList` names `victim`
+/// as a signer-bearing extra and `attacker` as a writable one, arming the
+/// fixture's drain. A client resolver faithfully marks victim a signer; the
+/// escrow strips that bit before forwarding.
+pub fn setup_malicious_hook_mint(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    victim: &Pubkey,
+    attacker: &Pubkey,
+) {
+    set_mint_2022_with_transfer_hook(context, mint, &HOOK_FIXTURE_PROGRAM_ID);
+
+    // victim: signer + writable, since a System transfer's source needs
+    // both. attacker: the writable sink. system program: so the hook can
+    // CPI it.
+    let extras = [
+        ExtraAccountMeta::new_with_pubkey(victim, true, true).unwrap(),
+        ExtraAccountMeta::new_with_pubkey(attacker, false, true).unwrap(),
+        ExtraAccountMeta::new_with_pubkey(&solana_program::system_program::ID, false, false)
+            .unwrap(),
+    ];
+    set_extra_account_meta_list(context, mint, &extras);
+}
+
+/// Trailing accounts for a mint from [`setup_malicious_hook_mint`]. Victim
+/// is passed writable so the runtime carries its signer bit into the
+/// instruction, which is what the escrow has to strip.
+pub fn malicious_hook_extras(
+    mint: &Pubkey,
+    victim: &Pubkey,
+    attacker: &Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(*victim, false),
+        AccountMeta::new(*attacker, false),
+        AccountMeta::new_readonly(solana_program::system_program::ID, false),
+        AccountMeta::new_readonly(HOOK_FIXTURE_PROGRAM_ID, false),
+        AccountMeta::new_readonly(
+            get_extra_account_metas_address(mint, &HOOK_FIXTURE_PROGRAM_ID),
+            false,
+        ),
+    ]
+}
+
+/// Token-2022 account carrying the `TransferHookAccount` extension.
+///
+/// `process_transfer` flips `transferring` on both sides of a hook mint's
+/// transfer, so a bare 165-byte account fails with `InvalidAccountData`.
+/// ATAs the program creates after the mint has its hook get the extension
+/// automatically; this is for accounts written by hand.
+pub fn set_token_2022_with_hook_account(
+    context: &mut TestContext,
+    ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+) {
+    let space = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+        ExtensionType::TransferHookAccount,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state =
+        PodStateWithExtensionsMut::<PodAccount>::unpack_uninitialized(&mut data).unwrap();
+    state.init_extension::<TransferHookAccount>(true).unwrap();
+    *state.base = PodAccount {
+        mint: *mint,
+        owner: *owner,
+        amount: amount.into(),
+        delegate: PodCOption::none(),
+        state: AccountState::Initialized as u8,
+        is_native: PodCOption::none(),
+        delegated_amount: 0u64.into(),
+        close_authority: PodCOption::none(),
+    };
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *ata,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set Token2022 account with TransferHookAccount");
 }
 
 pub fn create_mint_2022_with_transfer_fee(

@@ -29,7 +29,9 @@ pub enum PrivateChannelEscrowProgramError {
     #[error("Invalid admin provided")]
     InvalidAdmin,
 
-    /// (6) Transfer hook extension not allowed
+    /// (6) Retired. Transfer-hook mints are supported: both transfer paths
+    /// forward the hook extras to the token program. Kept so the codes after
+    /// it do not shift.
     #[error("Transfer hook extension not allowed")]
     TransferHookNotAllowed,
 
@@ -64,6 +66,18 @@ pub enum PrivateChannelEscrowProgramError {
     /// (14) Bitmap rotation pre-state mismatch. Blocks replaying a landed rotation.
     #[error("Unexpected generation for bitmap rotation")]
     UnexpectedGeneration,
+
+    /// (15) Admin has blocked deposits for this mint
+    #[error("Deposits are blocked for this mint")]
+    DepositsBlockedForMint,
+
+    /// (16) Admin has blocked withdrawals for this mint
+    #[error("Withdrawals are blocked for this mint")]
+    WithdrawalsBlockedForMint,
+
+    /// (17) Mint no longer matches the profile recorded when it was allowed
+    #[error("Mint no longer matches the profile recorded at AllowMint")]
+    MintProfileChanged,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -100,6 +114,9 @@ mod tests {
             (NonceAlreadyUsed, 12),
             (NonceOutsideCurrentGeneration, 13),
             (UnexpectedGeneration, 14),
+            (DepositsBlockedForMint, 15),
+            (WithdrawalsBlockedForMint, 16),
+            (MintProfileChanged, 17),
         ];
 
         for (error, expected_code) in cases {

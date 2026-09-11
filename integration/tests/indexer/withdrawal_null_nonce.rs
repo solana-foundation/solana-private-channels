@@ -181,6 +181,7 @@ async fn null_withdrawal_nonce_is_quarantined_to_manual_review(
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: env.mint.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,

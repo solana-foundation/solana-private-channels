@@ -4,11 +4,11 @@ use crate::{
     error::PrivateChannelEscrowProgramError,
     events::DepositEvent,
     processor::{
-        get_mint_decimals, get_token_account_balance,
+        get_token_account_balance,
         shared::{
             account_check::{verify_signer, verify_system_program},
             event_utils::emit_event,
-            token_utils::{validate_ata, validate_token2022_extensions},
+            token_utils::{read_mint_profile, transfer_checked_cpi, validate_ata},
         },
         verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
@@ -18,9 +18,8 @@ use crate::{
 };
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
 
-use pinocchio_token_2022::{
-    instructions::TransferChecked as TransferChecked2022, ID as TOKEN_2022_PROGRAM_ID,
-};
+/// Fixed account prefix; anything past it is transfer-hook extras.
+const FIXED_ACCOUNTS_LEN: usize = 12;
 
 /// Processes the Deposit instruction.
 ///
@@ -38,6 +37,15 @@ use pinocchio_token_2022::{
 /// 10. `[]` event_authority - Event authority PDA for emitting events
 /// 11. `[]` private_channel_escrow_program - Current program for CPI
 ///
+/// Trailing accounts (variable): transfer-hook extras for the mint (hook
+/// program, validation PDA, and whatever its `ExtraAccountMetaList`
+/// resolves to), forwarded to the token program. Empty for mints without
+/// a hook. The client resolves them; the IDL cannot express them.
+///
+/// Unlike before, extra accounts no longer fail the instruction. On a
+/// hook-less mint they are inert: the token program reads trailing accounts
+/// only as multisig signers, which the signing user cannot be.
+///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to deposit
 /// * `recipient` (Option<Pubkey>) - Optional recipient for private_channel tracking
@@ -47,8 +55,12 @@ pub fn process_deposit(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+    if accounts.len() < FIXED_ACCOUNTS_LEN {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
     let [payer_info, user_info, instance_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
-        accounts
+        fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -82,6 +94,30 @@ pub fn process_deposit(
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
 
+    if allowed_mint.deposits_blocked {
+        return Err(PrivateChannelEscrowProgramError::DepositsBlockedForMint.into());
+    }
+
+    // A recreate at the same address can change any of these. Closing needs zero
+    // supply, so the window is while the escrow holds none of this mint, and the
+    // channel mint is initialized from the allow-time decimals on the first deposit.
+    // TransferChecked cannot catch it: the decimals it validates are read from the
+    // mint below. Runs before validate_ata, which only rejects a changed token
+    // program until someone creates the new escrow ATA.
+    //
+    // Freeze authority is compared in one direction only. It can be revoked but
+    // never re-added, so a mint that lost one is the same mint behaving more
+    // safely, while one that gained a freeze authority was recreated.
+    let mint_profile = read_mint_profile(mint_info)?;
+    let mint_decimals = mint_profile.decimals;
+    if allowed_mint.decimals != mint_decimals
+        || allowed_mint.token_program != *token_program_info.address()
+        || allowed_mint.extensions != mint_profile.extensions
+        || (mint_profile.has_freeze_authority && !allowed_mint.has_freeze_authority)
+    {
+        return Err(PrivateChannelEscrowProgramError::MintProfileChanged.into());
+    }
+
     validate_ata(
         user_ata_info,
         user_info.address(),
@@ -96,22 +132,19 @@ pub fn process_deposit(
         token_program_info,
     )?;
 
-    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
-        validate_token2022_extensions(mint_info)?;
-    }
-
     let escrow_token_balance_before = get_token_account_balance(instance_ata_info)?;
 
-    TransferChecked2022 {
-        from: user_ata_info,
-        to: instance_ata_info,
-        authority: user_info,
-        amount: args.amount,
-        token_program: token_program_info.address(),
-        mint: mint_info,
-        decimals: get_mint_decimals(mint_info)?,
-    }
-    .invoke_signed(&[])?;
+    transfer_checked_cpi(
+        user_ata_info,
+        mint_info,
+        instance_ata_info,
+        user_info,
+        args.amount,
+        mint_decimals,
+        token_program_info.address(),
+        hook_extras,
+        &[],
+    )?;
 
     let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
     let received = escrow_token_balance_after

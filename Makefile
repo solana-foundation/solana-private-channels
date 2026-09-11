@@ -185,6 +185,7 @@ ci-integration-test-prebuilt:
 	@cd integration && cargo test --test truncate_integration -- --nocapture
 	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
 	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
+	@cd integration && cargo test --test transfer_hook_mint_integration -- --nocapture
 	@cd integration && cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture
@@ -233,6 +234,7 @@ ci-integration-test-indexer:
 	@cd integration && cargo test --test truncate_integration -- --nocapture
 	@cd integration && cargo test --test pausable_mint_integration -- --nocapture
 	@cd integration && cargo test --test permanent_delegate_mint_integration -- --nocapture
+	@cd integration && cargo test --test transfer_hook_mint_integration -- --nocapture
 	@cd integration && cargo test --test resync_integration -- --nocapture --test-threads=1
 	@cd integration && cargo test --test reconciliation_e2e_test -- --nocapture
 	@cd integration && cargo test --test mock_rpc_retry -- --nocapture

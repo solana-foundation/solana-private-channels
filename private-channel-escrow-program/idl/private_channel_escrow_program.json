@@ -14,6 +14,67 @@
                 "format": "u8",
                 "kind": "numberTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "decimals",
+              "type": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "tokenProgram",
+              "type": {
+                "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "extensions",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "hasFreezeAuthority",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -208,6 +269,30 @@
               "name": "mint",
               "type": {
                 "kind": "publicKeyTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "depositsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawalsBlocked",
+              "type": {
+                "kind": "booleanTypeNode",
+                "size": {
+                  "endian": "le",
+                  "format": "u8",
+                  "kind": "numberTypeNode"
+                }
               }
             }
           ],
@@ -559,6 +644,24 @@
         "kind": "errorNode",
         "message": "Unexpected generation for bitmap rotation",
         "name": "unexpectedGeneration"
+      },
+      {
+        "code": 15,
+        "kind": "errorNode",
+        "message": "Deposits are blocked for this mint",
+        "name": "depositsBlockedForMint"
+      },
+      {
+        "code": 16,
+        "kind": "errorNode",
+        "message": "Withdrawals are blocked for this mint",
+        "name": "withdrawalsBlockedForMint"
+      },
+      {
+        "code": 17,
+        "kind": "errorNode",
+        "message": "Mint no longer matches the profile recorded at AllowMint",
+        "name": "mintProfileChanged"
       }
     ],
     "instructions": [
@@ -849,7 +952,7 @@
           },
           {
             "docs": [
-              "Token mint to be blocked"
+              "Token mint whose gates are being set"
             ],
             "isSigner": false,
             "isWritable": false,
@@ -864,15 +967,6 @@
             "isWritable": true,
             "kind": "instructionAccountNode",
             "name": "allowedMint"
-          },
-          {
-            "docs": [
-              "System program for account creation"
-            ],
-            "isSigner": false,
-            "isWritable": false,
-            "kind": "instructionAccountNode",
-            "name": "systemProgram"
           },
           {
             "docs": [
@@ -906,6 +1000,30 @@
               "endian": "le",
               "format": "u8",
               "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "blockDeposits",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "blockWithdrawals",
+            "type": {
+              "kind": "booleanTypeNode",
+              "size": {
+                "endian": "le",
+                "format": "u8",
+                "kind": "numberTypeNode"
+              }
             }
           }
         ],

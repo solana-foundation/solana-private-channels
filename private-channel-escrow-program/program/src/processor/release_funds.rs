@@ -8,7 +8,7 @@ use crate::{
         shared::{
             account_check::verify_signer,
             event_utils::emit_event,
-            token_utils::{validate_ata, validate_token2022_extensions},
+            token_utils::{transfer_checked_cpi, validate_ata},
         },
         verify_account_owner, verify_ata_program, verify_current_program, verify_mutability,
         verify_token_programs,
@@ -23,12 +23,11 @@ use pinocchio::{
     error::ProgramError,
     Address, ProgramResult,
 };
-use pinocchio_token_2022::{
-    instructions::TransferChecked as TransferChecked2022, ID as TOKEN_2022_PROGRAM_ID,
-};
-
 // amount (8) + user (32) + transaction_nonce (8)
 const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 8;
+
+/// Fixed account prefix; anything past it is transfer-hook extras.
+const FIXED_ACCOUNTS_LEN: usize = 13;
 
 /// Processes the ReleaseFunds instruction.
 ///
@@ -47,6 +46,15 @@ const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 8;
 /// 11. `[]` event_authority - Event authority PDA for emitting events
 /// 12. `[]` private_channel_escrow_program - Current program for CPI
 ///
+/// Trailing accounts (variable): transfer-hook extras for the mint (hook
+/// program, validation PDA, and whatever its `ExtraAccountMetaList`
+/// resolves to), forwarded to the token program. Empty for mints without
+/// a hook. The operator resolves them; the IDL cannot express them.
+///
+/// Unlike before, extra accounts no longer fail the instruction. On a
+/// hook-less mint they are inert: the token program reads trailing accounts
+/// only as multisig signers, which the escrow PDA is not.
+///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to release
 /// * `user` (Pubkey) - User receiving the funds
@@ -57,8 +65,12 @@ pub fn process_release_funds(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+    if accounts.len() < FIXED_ACCOUNTS_LEN {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
     let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
-        accounts
+        fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -103,6 +115,10 @@ pub fn process_release_funds(
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
 
+    if allowed_mint.withdrawals_blocked {
+        return Err(PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint.into());
+    }
+
     validate_ata(user_ata_info, &args.user, mint_info, token_program_info)?;
     validate_ata(
         instance_ata_info,
@@ -110,10 +126,6 @@ pub fn process_release_funds(
         mint_info,
         token_program_info,
     )?;
-
-    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
-        validate_token2022_extensions(mint_info)?;
-    }
 
     let mut bitmap_data = withdrawal_bitmap_info.try_borrow_mut()?;
     WithdrawalBitmap::validate(
@@ -137,16 +149,17 @@ pub fn process_release_funds(
 
     drop(instance_data);
 
-    TransferChecked2022 {
-        from: instance_ata_info,
-        to: user_ata_info,
-        authority: instance_info,
-        amount: args.amount,
-        token_program: token_program_info.address(),
-        mint: mint_info,
-        decimals: get_mint_decimals(mint_info)?,
-    }
-    .invoke_signed(&[signer])?;
+    transfer_checked_cpi(
+        instance_ata_info,
+        mint_info,
+        user_ata_info,
+        instance_info,
+        args.amount,
+        get_mint_decimals(mint_info)?,
+        token_program_info.address(),
+        hook_extras,
+        &[signer],
+    )?;
 
     let escrow_token_balance_after = get_token_account_balance(instance_ata_info)?;
     let released = escrow_token_balance_before

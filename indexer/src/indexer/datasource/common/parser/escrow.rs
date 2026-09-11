@@ -57,6 +57,7 @@ pub enum EscrowInstruction {
     },
     BlockMint {
         accounts: BlockMintAccounts,
+        data: BlockMintData,
     },
     Deposit {
         accounts: DepositAccounts,
@@ -106,7 +107,6 @@ pub struct BlockMintAccounts {
     pub instance: Pubkey,
     pub mint: Pubkey,
     pub allowed_mint: Pubkey,
-    pub system_program: Pubkey,
     pub event_authority: Pubkey,
     pub private_channel_escrow_program: Pubkey,
 }
@@ -166,6 +166,12 @@ pub struct CreateInstanceData {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
 pub struct AllowMintData {
     pub bump: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
+pub struct BlockMintData {
+    pub block_deposits: bool,
+    pub block_withdrawals: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -247,7 +253,7 @@ pub fn escrow_instance_of(ix: &EscrowInstruction) -> Pubkey {
     match ix {
         EscrowInstruction::CreateInstance { accounts, .. } => accounts.instance,
         EscrowInstruction::AllowMint { accounts, .. } => accounts.instance,
-        EscrowInstruction::BlockMint { accounts } => accounts.instance,
+        EscrowInstruction::BlockMint { accounts, .. } => accounts.instance,
         EscrowInstruction::Deposit { accounts, .. } => accounts.instance,
         EscrowInstruction::ReleaseFunds { accounts, .. } => accounts.instance,
         EscrowInstruction::RotateBitmap { accounts, .. } => accounts.instance,
@@ -274,7 +280,7 @@ pub fn parse_escrow_instruction(
     match discriminator {
         CREATE_INSTANCE => parse_create_instance(ix_data, instruction, account_keys),
         ALLOW_MINT => parse_allow_mint(ix_data, instruction, account_keys, inner_instructions),
-        BLOCK_MINT => parse_block_mint(instruction, account_keys),
+        BLOCK_MINT => parse_block_mint(ix_data, instruction, account_keys),
         DEPOSIT => parse_deposit(
             ix_data,
             instruction,
@@ -403,20 +409,22 @@ fn parse_allow_mint(
     })
 }
 
-/// Parse BlockMint instruction from its accounts.
+/// Parse BlockMint instruction.
 ///
-/// BlockMint carries no instruction arguments. The two fields the downstream
-/// status row needs — the instance and the mint — are both present in the
-/// instruction accounts, so there is no
-/// need to scan the inner BlockMintEvent.
+/// The gate flags are read from the instruction args. The inner BlockMintEvent
+/// carries them too, but the args need no CPI scan. Borsh rejects a bool byte
+/// outside 0/1, matching the on-chain parser.
 fn parse_block_mint(
+    data: &[u8],
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
 ) -> Result<Option<EscrowInstruction>, ParserError> {
-    // Expected 8 accounts
-    if instruction.accounts.len() < 8 {
+    let ix_data = <BlockMintData as borsh::BorshDeserialize>::deserialize(&mut &data[..])?;
+
+    // Expected 7 accounts
+    if instruction.accounts.len() < 7 {
         return Err(AccountError::InsufficientAccounts {
-            required: 8,
+            required: 7,
             actual: instruction.accounts.len(),
         }
         .into());
@@ -428,12 +436,14 @@ fn parse_block_mint(
         instance: account_keys[instruction.accounts[2] as usize],
         mint: account_keys[instruction.accounts[3] as usize],
         allowed_mint: account_keys[instruction.accounts[4] as usize],
-        system_program: account_keys[instruction.accounts[5] as usize],
-        event_authority: account_keys[instruction.accounts[6] as usize],
-        private_channel_escrow_program: account_keys[instruction.accounts[7] as usize],
+        event_authority: account_keys[instruction.accounts[5] as usize],
+        private_channel_escrow_program: account_keys[instruction.accounts[6] as usize],
     };
 
-    Ok(Some(EscrowInstruction::BlockMint { accounts }))
+    Ok(Some(EscrowInstruction::BlockMint {
+        accounts,
+        data: ix_data,
+    }))
 }
 
 /// Parse Deposit instruction
@@ -837,17 +847,20 @@ mod tests {
 
     #[test]
     fn test_block_mint_valid_accounts() {
-        let instruction = create_instruction_with_accounts(8, "dummy".to_string());
-        let account_keys = create_n_account_keys(8);
+        let instruction = create_instruction_with_accounts(7, "dummy".to_string());
+        let account_keys = create_n_account_keys(7);
 
-        let result = parse_block_mint(&instruction, &account_keys);
+        // Opposite gate values so a swapped byte would fail here.
+        let result = parse_block_mint(&[1, 0], &instruction, &account_keys);
 
         assert!(result.is_ok());
         let parsed = result.unwrap();
-        if let Some(EscrowInstruction::BlockMint { accounts }) = parsed {
+        if let Some(EscrowInstruction::BlockMint { accounts, data }) = parsed {
             // instance @ index 2, mint @ index 3 — read straight from accounts.
             assert_eq!(accounts.instance, account_keys[2]);
             assert_eq!(accounts.mint, account_keys[3]);
+            assert!(data.block_deposits);
+            assert!(!data.block_withdrawals);
         } else {
             panic!("Expected BlockMint instruction");
         }
@@ -855,19 +868,61 @@ mod tests {
 
     #[test]
     fn test_block_mint_insufficient_accounts() {
-        let instruction = create_instruction_with_accounts(7, "dummy".to_string()); // Only 7 accounts (need 8)
-        let account_keys = create_n_account_keys(7);
+        let instruction = create_instruction_with_accounts(6, "dummy".to_string()); // Only 6 accounts (need 7)
+        let account_keys = create_n_account_keys(6);
 
-        let result = parse_block_mint(&instruction, &account_keys);
+        let result = parse_block_mint(&[1, 1], &instruction, &account_keys);
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Insufficient accounts"), "Error: {}", err);
     }
 
+    // A gate byte outside 0/1 must be refused, matching the on-chain parser.
+    #[test]
+    fn test_block_mint_non_canonical_gate() {
+        let instruction = create_instruction_with_accounts(7, "dummy".to_string());
+        let account_keys = create_n_account_keys(7);
+
+        let result = parse_block_mint(&[2, 0], &instruction, &account_keys);
+
+        assert!(result.is_err());
+    }
+
     // ============================================================================
     // parse_deposit Tests
     // ============================================================================
+
+    // A deposit of a transfer-hook mint carries the hook's accounts after the
+    // fixed 12. Tightening the account check to an equality would stop indexing
+    // those deposits while the tokens still land in escrow, so pin that the
+    // trailing accounts are tolerated and the fixed slots still resolve.
+    #[test]
+    fn test_deposit_tolerates_trailing_hook_accounts() {
+        let borsh_data = create_deposit_borsh_data();
+        let instruction = create_instruction_with_accounts(15, "dummy".to_string());
+        let account_keys = create_n_account_keys(15);
+
+        let result = parse_deposit(
+            &borsh_data,
+            &instruction,
+            &account_keys,
+            &create_deposit_inner_instructions(990),
+            InstructionLocation::top_level(0),
+        );
+
+        let parsed = result.unwrap().expect("Some");
+        if let EscrowInstruction::Deposit {
+            accounts, event, ..
+        } = parsed
+        {
+            assert_eq!(event.amount, 990);
+            assert_eq!(accounts.mint, account_keys[3]);
+            assert_eq!(accounts.private_channel_escrow_program, account_keys[11]);
+        } else {
+            panic!("Expected Deposit instruction");
+        }
+    }
 
     #[test]
     fn test_deposit_valid_accounts() {

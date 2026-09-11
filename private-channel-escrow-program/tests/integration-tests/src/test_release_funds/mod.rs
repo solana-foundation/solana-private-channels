@@ -12,11 +12,13 @@ use crate::{
     },
     utils::{
         assert_program_error, create_mint_2022_with_transfer_fee,
-        get_or_create_associated_token_account_2022, get_token_balance, set_mint,
-        setup_test_balances, TestContext, ATA_PROGRAM_ID, INVALID_INSTRUCTION_DATA_ERROR,
-        INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR, NONCE_OUTSIDE_CURRENT_GENERATION_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        get_or_create_associated_token_account_2022, get_token_balance, hook_extras_for_mint,
+        malicious_hook_extras, set_mint, set_token_2022_with_hook_account, setup_hook_mint,
+        setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        INVALID_INSTRUCTION_DATA_ERROR, INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR,
+        MISSING_REQUIRED_SIGNATURE_ERROR, NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR,
+        NONCE_OUTSIDE_CURRENT_GENERATION_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
 
@@ -1459,4 +1461,238 @@ fn test_release_funds_rotation_frees_same_bit_position() {
         false,
     )
     .expect("Same bit position must be reusable after rotation");
+}
+
+// The fixture logs how many accounts Token-2022 handed it. With one extra
+// declared in the mint's ExtraAccountMetaList that is 6: source, mint,
+// destination, authority, validation PDA, and the extra.
+const HOOK_LOG: &str = "hook accounts: 6";
+
+// A release out of escrow forwards the mint's hook extras to the token
+// program, which resolves the ExtraAccountMetaList and runs the hook. The
+// escrow is funded directly here: the deposit leg has its own hook tests.
+#[test]
+fn test_release_funds_token_2022_transfer_hook_forwards_extras() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    setup_hook_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed for a transfer-hook mint");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    set_token_2022_with_hook_account(&mut context, &user_ata, &mint.pubkey(), &user.pubkey(), 0);
+    set_token_2022_with_hook_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        DEPOSIT_AMOUNT,
+    );
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .add_remaining_accounts(&hook_extras_for_mint(&mint.pubkey()))
+        .instruction();
+
+    let metadata = context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[&operator],
+            false,
+            None,
+        )
+        .expect("ReleaseFunds through a transfer-hook mint should succeed");
+
+    let hook_runs = metadata
+        .logs
+        .iter()
+        .filter(|log| log.contains(HOOK_LOG))
+        .count();
+    assert_eq!(hook_runs, 1, "the hook must run exactly once");
+
+    assert_eq!(get_token_balance(&mut context, &user_ata), RELEASE_AMOUNT);
+    assert_eq!(
+        get_token_balance(&mut context, &instance_ata),
+        DEPOSIT_AMOUNT - RELEASE_AMOUNT
+    );
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        true,
+    );
+}
+
+// The release leg is where a hostile hook has the most to gain: the escrow
+// signs it, and the operator's payer wallet is hot. The mint names that
+// payer as a signer-bearing extra and the fixture tries to drain it; only
+// the program stripping the signer bit stops it.
+#[test]
+fn test_release_funds_rejects_signer_bearing_hook_extra() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let attacker = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+    let victim = context.payer.pubkey();
+
+    setup_malicious_hook_mint(&mut context, &mint.pubkey(), &victim, &attacker.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed for a transfer-hook mint");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    set_token_2022_with_hook_account(&mut context, &user_ata, &mint.pubkey(), &user.pubkey(), 0);
+    set_token_2022_with_hook_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        DEPOSIT_AMOUNT,
+    );
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .add_remaining_accounts(&malicious_hook_extras(
+            &mint.pubkey(),
+            &victim,
+            &attacker.pubkey(),
+        ))
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert!(
+        result.is_err(),
+        "a hook abusing a forwarded signer must not settle"
+    );
+    assert_eq!(
+        context
+            .get_account(&attacker.pubkey())
+            .map(|account| account.lamports)
+            .unwrap_or(0),
+        0,
+        "the attacker must receive nothing"
+    );
+    // The release reverted, so the nonce is still spendable.
+    assert_nonce_consumed(
+        &mut context,
+        &withdrawal_bitmap_pda,
+        TRANSACTION_NONCE,
+        false,
+    );
 }

@@ -68,6 +68,7 @@ async fn seed_mint_status_allowed(
 ) -> Result<(), Box<dyn std::error::Error>> {
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_address.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
