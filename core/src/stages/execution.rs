@@ -19,7 +19,7 @@ use {
     },
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
     solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
+        account::{AccountSharedData, ReadableAccount, WritableAccount},
         hash::Hash,
         pubkey::Pubkey,
         transaction::{SanitizedTransaction, TransactionError},
@@ -373,6 +373,9 @@ pub(crate) const MAX_IN_FLIGHT_RESULT_BYTES: usize = 2 * MAX_SEND_CHUNK_BYTES;
 
 /// A chunk that could not fit the budget would wait for room that never comes.
 const _: () = assert!(MAX_SEND_CHUNK_BYTES <= MAX_IN_FLIGHT_RESULT_BYTES);
+
+/// A preload larger than the cache cap would evict everything but itself every time.
+const _: () = assert!(MAX_BATCH_PRELOAD_BYTES < crate::accounts::bob::DEFAULT_MAX_CACHE_BYTES);
 
 /// Outcome of a settler send. There is no shutdown variant: abandoning a send
 /// would discard a batch that has already executed and already mutated the
@@ -845,6 +848,33 @@ fn enforce_lamport_conservation(
     }
 }
 
+/// Later stages read only writable account data and every account's lamports, so
+/// readonly data is dropped here. Otherwise a result keeps an account alive after
+/// the cache evicts it, until the settler is done with the result.
+fn shed_readonly_account_data(
+    output: &mut LoadAndExecuteSanitizedTransactionsOutput,
+    transactions: &[SanitizedTransaction],
+) {
+    for (result, transaction) in output.processing_results.iter_mut().zip(transactions) {
+        let Ok(ProcessedTransaction::Executed(executed)) = result else {
+            continue;
+        };
+        for (index, (_, account)) in executed.loaded_transaction.accounts.iter_mut().enumerate() {
+            if account.data().is_empty() || transaction.is_writable(index) {
+                continue;
+            }
+            // A new account rather than an edit: the old buffer is still shared with the cache.
+            *account = AccountSharedData::create(
+                account.lamports(),
+                Vec::new(),
+                *account.owner(),
+                account.executable(),
+                account.rent_epoch(),
+            );
+        }
+    }
+}
+
 /// Returns `Err` when the accounts this batch needs could not be loaded. The
 /// abort happens before any SVM run or BOB write, so nothing has changed yet.
 pub async fn execute_batch(
@@ -1096,7 +1126,7 @@ pub async fn execute_batch(
     // Settle admin transactions immediately so regular transactions see the updates
     let admin_results = if !admin_transactions.is_empty() {
         let t_op = Instant::now();
-        let admin_results = execution_deps
+        let mut admin_results = execution_deps
             .admin_vm
             .load_and_execute_sanitized_transactions(
                 &execution_deps.bob,
@@ -1120,6 +1150,7 @@ pub async fn execute_batch(
         t_bob_admin = t_op.elapsed();
         debug!("bob_update_admin: {:?}", t_bob_admin);
         metrics.executor_bob_update_duration_ms("admin", t_bob_admin.as_secs_f64() * 1000.0);
+        shed_readonly_account_data(&mut admin_results, &admin_transactions);
 
         Some(admin_results)
     } else {
@@ -1211,6 +1242,7 @@ pub async fn execute_batch(
         t_bob_reg = t_op.elapsed();
         debug!("bob_update_regular: {:?}", t_bob_reg);
         metrics.executor_bob_update_duration_ms("regular", t_bob_reg.as_secs_f64() * 1000.0);
+        shed_readonly_account_data(&mut regular_results, &regular_transactions);
 
         Some(regular_results)
     } else {
@@ -4055,6 +4087,98 @@ mod tests {
         assert!(
             matches!(outcome, BatchOutcome::Stop),
             "a closed settler must stop the executor, not silently drop the remainder"
+        );
+    }
+
+    /// Results keep only what later stages read, so readonly account data must not
+    /// ride along, while its balance and the cache's shared copy stay intact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn results_do_not_carry_readonly_account_data() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 1, 1_500).await[0];
+        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &[readonly]);
+        let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+
+        let Ok(processed @ ProcessedTransaction::Executed(executed)) = regular_result(&result, 0)
+        else {
+            panic!("the transaction must be processed by the SVM");
+        };
+        let index = executed
+            .loaded_transaction
+            .accounts
+            .iter()
+            .position(|(key, _)| *key == readonly)
+            .expect("the SVM loads every message key");
+        let account = &executed.loaded_transaction.accounts[index].1;
+        assert!(
+            account.data().is_empty(),
+            "readonly data must not leave the executor"
+        );
+        assert_eq!(account.lamports(), 1);
+        assert_eq!(*account.owner(), solana_sdk_ids::system_program::ID);
+        assert_eq!(
+            deps.bob
+                .get_account_shared_data(&readonly)
+                .map(|a| a.data().len()),
+            Some(1_500),
+            "the buffer the cache shares must not be edited in place"
+        );
+
+        let stored = crate::accounts::utils::get_stored_transaction(
+            &result.regular_transactions[0],
+            0,
+            0,
+            processed,
+        );
+        assert_eq!(
+            stored.meta.pre_balances[index], 1,
+            "stored balances come from lamports"
+        );
+    }
+
+    /// Deferred pieces run back to back, so without a byte cap the cache keeps
+    /// every one of them; it must stay within its cap across the whole batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_batch_keeps_bob_within_its_byte_cap_across_sub_batches() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 6, 1_500).await;
+        let mut deps = deps_with_budget(accounts_db, 3_000).await;
+        deps.bob.set_max_cache_bytes(4_000);
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let heartbeat = crate::health::StageHeartbeat::new();
+
+        let batch = ConflictFreeBatch {
+            transactions: readonly
+                .iter()
+                .enumerate()
+                .map(|(index, key)| crate::scheduler::TransactionWithIndex {
+                    transaction: Arc::new(transfer_with_unused_readonly(&Keypair::new(), &[*key])),
+                    index,
+                })
+                .collect(),
+        };
+        let (results_tx, mut results_rx) = mpsc::channel::<ExecutedBatch>(8);
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let outcome =
+            process_batch(batch, &mut deps, &results_tx, &budget, &metrics, &heartbeat).await;
+        drop(results_tx);
+
+        assert!(matches!(outcome, BatchOutcome::Continue { executed: 6 }));
+        let mut messages = 0;
+        while results_rx.recv().await.is_some() {
+            messages += 1;
+        }
+        assert_eq!(
+            messages, 3,
+            "a 3000-byte budget splits six 1500-byte accounts into three pieces"
+        );
+        assert!(
+            deps.bob.cache_stats().bytes <= 4_000,
+            "resident bytes must stay within the cap, not accumulate every piece"
         );
     }
 }

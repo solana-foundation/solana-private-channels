@@ -102,6 +102,17 @@ gigabytes, and a small transaction can name a large amount of account data
 through readonly keys no instruction uses. A store that cannot answer the size
 query aborts the batch on the same terms as an unreadable preload.
 
+**Resident account memory**: the preload budget bounds one fetch, but the cache
+keeps what it loads, so BOB is also capped by bytes (1 GiB) as well as by entry
+count. After each preload lands, clean entries are evicted largest first until the
+cache is back under 90% of that cap. The accounts the preload was asked for are
+never evicted, and neither are unsettled writes, so resident account data stays
+within the cap plus one preload. Rows are decoded as they stream in, so a preload
+briefly costs about 1.07 times the bytes it fetches. Results leaving the executor
+keep writable account data and every account's lamports but drop readonly data,
+which nothing downstream reads; otherwise a result would keep an evicted account
+alive until the settler had finished with it.
+
 
 **Execution Modes**:
 

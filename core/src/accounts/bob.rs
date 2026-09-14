@@ -54,7 +54,7 @@ use {
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_transaction::svm_message::SVMMessage,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         time::{SystemTime, UNIX_EPOCH},
     },
     tokio::sync::mpsc,
@@ -67,8 +67,12 @@ const OLDEST_SYNCED_ACCOUNT_AGE: u64 = 60 * 60; // 1 hour
 /// Upper bound on resident cache entries. Once exceeded, the oldest clean
 /// entries are evicted down to a low watermark. Must stay well above the max
 /// distinct account keys a single batch can reference so a batch never evicts
-/// its own working set. At ~1 KiB/account this bounds the clean set near ~1 GiB.
+/// its own working set. Large accounts break any byte estimate, hence the byte cap.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 1_000_000;
+
+/// Upper bound on resident account-data bytes. Without it a stream of large
+/// accounts grows the cache without limit while staying far under the entry cap.
+pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Snapshot of BOB cache size, reported to metrics once per batch.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -122,6 +126,8 @@ pub struct BOB {
     batches_since_eviction: u64,
     /// Hard cap on resident entries; the cap evicts clean entries above it.
     max_cache_entries: usize,
+    /// Cap on resident account-data bytes; clean entries above it are evicted.
+    max_cache_bytes: usize,
     /// Entries evicted since the last cache_stats read; drained on read.
     evicted_delta: usize,
     /// Running count of dirty (ahead-of-DB) entries. Maintained incrementally so
@@ -152,6 +158,7 @@ impl BOB {
             accounts_db,
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             evicted_delta: 0,
             dirty_entries: 0,
             cache_bytes: 0,
@@ -272,34 +279,36 @@ impl BOB {
         // yet, so they are never eviction candidates here.
         self.garbage_collect();
 
-        // If everything is warm, skip the DB round-trip entirely.
-        if miss_keys.is_empty() {
-            return Ok((0, already_cached));
-        }
-
-        // Only fetch the cache-miss keys from the database.
-        let accounts = self.accounts_db.get_accounts(&miss_keys).await?;
         let mut fetched = 0usize;
-        for (index, account_opt) in accounts.iter().enumerate() {
-            if let Some(account) = account_opt {
-                // A DB-loaded account is byte-identical to the DB, so it is
-                // clean and belongs in the normally-evictable population.
-                // Reserve synced_since=None for execution-produced state.
-                // generation stays None for the same reason: the executor never
-                // wrote this, so no settlement acknowledgement can describe it.
-                let meta = AccountWithMeta {
-                    account: account.clone(),
-                    synced_since: Some(now),
-                    deleted: false,
-                    generation: None,
-                };
-                self.note_added(&meta);
-                if let Some(old) = self.accounts.insert(miss_keys[index], meta) {
-                    self.note_removed(&old);
+        // If everything is warm, skip the DB round-trip entirely.
+        if !miss_keys.is_empty() {
+            // Only fetch the cache-miss keys from the database.
+            let accounts = self.accounts_db.get_accounts(&miss_keys).await?;
+            for (index, account_opt) in accounts.iter().enumerate() {
+                if let Some(account) = account_opt {
+                    // A DB-loaded account is byte-identical to the DB, so it is
+                    // clean and belongs in the normally-evictable population.
+                    // Reserve synced_since=None for execution-produced state.
+                    // generation stays None for the same reason: the executor never
+                    // wrote this, so no settlement acknowledgement can describe it.
+                    let meta = AccountWithMeta {
+                        account: account.clone(),
+                        synced_since: Some(now),
+                        deleted: false,
+                        generation: None,
+                    };
+                    self.note_added(&meta);
+                    if let Some(old) = self.accounts.insert(miss_keys[index], meta) {
+                        self.note_removed(&old);
+                    }
+                    fetched += 1;
                 }
-                fetched += 1;
             }
         }
+
+        // Runs after the misses land so the cache is back within its cap before the
+        // batch executes. This preload's keys are spared, so none reaches the SVM as absent.
+        self.evict_to_byte_cap(pubkeys);
 
         Ok((fetched, already_cached))
     }
@@ -542,6 +551,41 @@ impl BOB {
         self.evicted_delta += remove_count;
     }
 
+    /// Evict clean entries, largest first, until resident bytes are back under a
+    /// 90% watermark. `protected` is never evicted, so the cache can exceed its
+    /// cap by at most that working set plus unsettled writes.
+    fn evict_to_byte_cap(&mut self, protected: &[Pubkey]) {
+        if self.cache_bytes <= self.max_cache_bytes {
+            return;
+        }
+        let target = self.max_cache_bytes * 9 / 10;
+        let protected: HashSet<&Pubkey> = protected.iter().collect();
+
+        // Largest first frees the bytes with the fewest evictions and spares the
+        // many small accounts the warm path relies on. Dirty entries are not candidates.
+        let mut candidates: Vec<(Pubkey, usize)> = self
+            .accounts
+            .iter()
+            .filter(|(pubkey, meta)| {
+                meta.synced_since.is_some()
+                    && !meta.account.data().is_empty()
+                    && !protected.contains(pubkey)
+            })
+            .map(|(pubkey, meta)| (*pubkey, meta.account.data().len()))
+            .collect();
+        candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+        for (pubkey, _) in candidates {
+            if self.cache_bytes <= target {
+                break;
+            }
+            if let Some(old) = self.accounts.remove(&pubkey) {
+                self.note_removed(&old);
+                self.evicted_delta += 1;
+            }
+        }
+    }
+
     /// Account the byte and dirty totals for an entry entering the cache.
     fn note_added(&mut self, meta: &AccountWithMeta) {
         self.cache_bytes += meta.account.data().len();
@@ -590,12 +634,18 @@ impl BOB {
             accounts_db,
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             evicted_delta: 0,
             dirty_entries: 0,
             cache_bytes: 0,
             settlement_divergences: 0,
             next_generation: 0,
         }
+    }
+
+    /// Lower the byte cap so a test can cross it with small accounts.
+    pub(crate) fn set_max_cache_bytes(&mut self, bytes: usize) {
+        self.max_cache_bytes = bytes;
     }
 
     /// Insert an account directly into BOB's cache (test-only).
@@ -1879,6 +1929,127 @@ mod tests {
             bob.accounts.contains_key(&referenced),
             "an account referenced this batch must not be cap-evicted"
         );
+    }
+
+    /// Insert a clean entry holding `len` bytes, keeping the byte total in step.
+    fn insert_clean(bob: &mut BOB, len: usize) -> Pubkey {
+        let pubkey = Pubkey::new_unique();
+        let meta = AccountWithMeta {
+            account: make_account(1, &vec![7u8; len], &Pubkey::default()),
+            synced_since: Some(now_secs()),
+            deleted: false,
+            generation: None,
+        };
+        bob.note_added(&meta);
+        bob.accounts.insert(pubkey, meta);
+        pubkey
+    }
+
+    /// Over the byte cap the largest clean entries go first, and only until the
+    /// total is back under the watermark.
+    #[tokio::test]
+    async fn byte_cap_evicts_largest_clean_entries_to_the_watermark() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let largest = insert_clean(&mut bob, 600);
+        let rest = [
+            insert_clean(&mut bob, 300),
+            insert_clean(&mut bob, 200),
+            insert_clean(&mut bob, 50),
+        ];
+
+        bob.evict_to_byte_cap(&[]);
+
+        assert!(!bob.accounts.contains_key(&largest));
+        assert!(rest.iter().all(|key| bob.accounts.contains_key(key)));
+        let stats = bob.cache_stats();
+        assert_eq!(stats.bytes, 550, "byte total must follow the eviction");
+        assert_eq!(stats.evicted, 1);
+    }
+
+    /// The keys a preload was asked for are never evicted, even when they alone
+    /// exceed the cap, because the batch is about to execute against them.
+    #[tokio::test]
+    async fn byte_cap_never_evicts_the_working_set() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let working_set = [insert_clean(&mut bob, 800), insert_clean(&mut bob, 700)];
+        let other = insert_clean(&mut bob, 100);
+
+        bob.evict_to_byte_cap(&working_set);
+
+        assert!(working_set.iter().all(|key| bob.accounts.contains_key(key)));
+        assert!(!bob.accounts.contains_key(&other));
+        assert_eq!(bob.cache_stats().bytes, 1500);
+    }
+
+    /// Unsettled writes and tombstones are ahead of the store, so evicting them
+    /// would lose state; the byte cap must leave them alone like the entry cap.
+    #[tokio::test]
+    async fn byte_cap_never_evicts_dirty_entries_or_tombstones() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let dirty = Pubkey::new_unique();
+        bob.insert_account_for_test(dirty, make_account(1, &[7u8; 1200], &Pubkey::default()));
+        let tombstone = Pubkey::new_unique();
+        let meta = AccountWithMeta {
+            account: AccountSharedData::default(),
+            synced_since: None,
+            deleted: true,
+            generation: Some(1),
+        };
+        bob.note_added(&meta);
+        bob.accounts.insert(tombstone, meta);
+
+        bob.evict_to_byte_cap(&[]);
+
+        assert!(bob.accounts.contains_key(&dirty));
+        assert!(bob.accounts.contains_key(&tombstone));
+    }
+
+    #[tokio::test]
+    async fn byte_cap_is_a_no_op_under_the_limit() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let key = insert_clean(&mut bob, 900);
+
+        bob.evict_to_byte_cap(&[]);
+
+        assert!(bob.accounts.contains_key(&key));
+        assert_eq!(bob.cache_stats().evicted, 0);
+    }
+
+    /// Through a real store: a preload that pushes the cache over its byte cap
+    /// evicts what earlier preloads left behind, never what it was asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_accounts_holds_the_cache_to_its_byte_cap() {
+        let (accounts_db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let (_settled_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new_test(rx, accounts_db);
+        bob.max_cache_bytes = 5000;
+        let mut keys = Vec::new();
+        for _ in 0..4 {
+            let key = Pubkey::new_unique();
+            bob.accounts_db
+                .set_account(key, make_account(1, &[7u8; 2000], &Pubkey::default()))
+                .await;
+            keys.push(key);
+        }
+        let (a, b, c, d) = (keys[0], keys[1], keys[2], keys[3]);
+
+        bob.preload_accounts(&[a, b]).await.unwrap();
+        bob.preload_accounts(&[c, d]).await.unwrap();
+        assert!(!bob.accounts.contains_key(&a) && !bob.accounts.contains_key(&b));
+        assert!(bob.accounts.contains_key(&c) && bob.accounts.contains_key(&d));
+        assert_eq!(bob.cache_stats().bytes, 4000);
+
+        bob.preload_accounts(&[a, b, c]).await.unwrap();
+        assert!(
+            [a, b, c].iter().all(|key| bob.accounts.contains_key(key)),
+            "a working set larger than the cap must still be fully resident"
+        );
+        assert!(!bob.accounts.contains_key(&d));
+        assert_eq!(bob.cache_stats().bytes, 6000);
     }
 
     #[tokio::test]

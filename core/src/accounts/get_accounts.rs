@@ -1,6 +1,7 @@
 use {
     super::traits::AccountsDB,
     crate::accounts::{PostgresAccountsDB, RedisAccountsDB},
+    futures::TryStreamExt,
     redis::{AsyncCommands, RedisResult},
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
@@ -284,37 +285,38 @@ async fn get_accounts_postgres(
     let pool = Arc::clone(&postgres_db.pool);
     let pubkey_bytes: Vec<Vec<u8>> = accounts.iter().map(|key| key.to_bytes().to_vec()).collect();
 
-    // Only the whole query is retried; a corrupt row below is fatal on sight.
-    let rows = with_retry(|| async {
-        sqlx::query("SELECT pubkey, data FROM accounts WHERE pubkey = ANY($1)")
+    // Rows are decoded from borrowed bytes as they arrive, so a large read never
+    // holds every raw row beside its decoded copy. A transient error restarts the
+    // whole read; a corrupt row is returned inside Ok so it is never retried.
+    with_retry(|| async {
+        let mut rows = sqlx::query("SELECT pubkey, data FROM accounts WHERE pubkey = ANY($1)")
             .bind(&pubkey_bytes)
-            .fetch_all(pool.as_ref())
-            .await
-    })
-    .await
-    .map_err(|e| AccountLoadError::Backend(e.to_string()))?;
+            .fetch(pool.as_ref());
 
-    // Keys with no row stay None; a row that will not deserialize is an error,
-    // never a silent skip, which the caller could not tell from absence.
-    let mut result = vec![None; accounts.len()];
-    for row in rows {
-        let row_pubkey: Vec<u8> = row.get("pubkey");
-        let data: Vec<u8> = row.get("data");
+        // Keys with no row stay None; a row that will not deserialize is an error,
+        // never a silent skip, which the caller could not tell from absence.
+        let mut result = vec![None; accounts.len()];
+        while let Some(row) = rows.try_next().await? {
+            let row_pubkey: &[u8] = row.get("pubkey");
+            let data: &[u8] = row.get("data");
 
-        if let Some(index) = accounts
-            .iter()
-            .position(|&key| key.to_bytes().as_slice() == row_pubkey)
-        {
-            match bincode::deserialize::<AccountSharedData>(&data) {
-                Ok(account) => result[index] = Some(account),
-                Err(e) => {
-                    tracing::error!("Failed to deserialize account {}: {}", accounts[index], e);
-                    return Err(AccountLoadError::Corrupt(accounts[index]));
+            if let Some(index) = accounts
+                .iter()
+                .position(|&key| key.to_bytes().as_slice() == row_pubkey)
+            {
+                match bincode::deserialize::<AccountSharedData>(data) {
+                    Ok(account) => result[index] = Some(account),
+                    Err(e) => {
+                        tracing::error!("Failed to deserialize account {}: {}", accounts[index], e);
+                        return Ok(Err(AccountLoadError::Corrupt(accounts[index])));
+                    }
                 }
             }
         }
-    }
-    Ok(result)
+        Ok(Ok(result))
+    })
+    .await
+    .map_err(|e| AccountLoadError::Backend(e.to_string()))?
 }
 
 /// The cache never mints an error of its own: an absent, unreadable, stale or
@@ -582,6 +584,44 @@ mod tests {
         let results = get_accounts(&db, &[absent, stored]).await.unwrap();
         assert!(results[0].is_none());
         assert_eq!(results[1].as_ref().unwrap().lamports(), 700);
+    }
+
+    /// Multi-megabyte rows arrive over several protocol reads, so each must still
+    /// decode byte for byte into the slot of the key that asked for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_accounts_decodes_multi_megabyte_rows_exactly() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let mut stored = Vec::new();
+        for fill in [3u8, 5, 9] {
+            let key = Pubkey::new_unique();
+            let data: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i as u8) ^ fill).collect();
+            db.set_account(
+                key,
+                AccountSharedData::from(solana_sdk::account::Account {
+                    lamports: fill as u64,
+                    data: data.clone(),
+                    owner: Pubkey::new_unique(),
+                    executable: false,
+                    rent_epoch: 0,
+                }),
+            )
+            .await;
+            stored.push((key, data));
+        }
+        let absent = Pubkey::new_unique();
+        let request = [stored[2].0, absent, stored[0].0, stored[1].0];
+
+        let results = get_accounts(&db, &request).await.unwrap();
+
+        assert!(results[1].is_none());
+        for (slot, source) in [(0, 2), (2, 0), (3, 1)] {
+            let account = results[slot].as_ref().expect("stored key must decode");
+            assert_eq!(
+                account.data(),
+                stored[source].1.as_slice(),
+                "slot {slot} bytes"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
