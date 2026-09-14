@@ -1,5 +1,6 @@
-//! Integration test for the withdrawal allowlist gate in the processor's
-//! withdrawal-dispatch path.
+//! Integration tests for the withdrawal gates in the processor's
+//! withdrawal-dispatch path: the allowlist gate, and the two `BlockMint` gates
+//! the admin moves independently.
 //!
 //! A withdrawal can name any mint that exists on the private channel, but only a
 //! mint the escrow allowlisted has funds behind it on the target chain. Before the
@@ -20,6 +21,12 @@
 //!
 //! Step 6 is the regression: a critical task exit is what ends `operator::run`,
 //! so a finished handle is exactly the symptom the gate removes.
+//!
+//! The other two tests allowlist the mint and then call `BlockMint` on it, once
+//! per gate. `withdrawals_blocked` must park the row, because `release_funds`
+//! rejects it on-chain and that rejection is permanent; `deposits_blocked` must
+//! not, because the gates are independent and a mint closed to new deposits still
+//! owes its depositors their balance.
 
 #[path = "helpers/mod.rs"]
 mod helpers;
@@ -30,6 +37,10 @@ mod setup;
 use {
     chrono::Utc,
     helpers::db,
+    helpers::tokens::{get_token_balance, mint_to_owner},
+    private_channel_escrow_program_client::{
+        instructions::BlockMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    },
     private_channel_indexer::{
         config::{OperatorConfig, PrivateChannelIndexerConfig, ProgramType, StorageType},
         operator,
@@ -38,12 +49,13 @@ use {
         storage::{PostgresDb, Storage, TransactionType},
         PostgresConfig,
     },
-    setup::{TestEnvironment, TEST_ADMIN_KEYPAIR},
+    setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR},
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
         commitment_config::CommitmentConfig,
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
+        transaction::Transaction,
     },
     std::{sync::Arc, time::Duration},
     test_utils::operator_helper::{same_host_fallback_url, OperatorHandle},
@@ -276,6 +288,278 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
         .await?
         .expect("row must still exist");
     assert_eq!(row.status, "manual_review");
+
+    operator_handle.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// BlockMint gates
+// ---------------------------------------------------------------------------
+
+const WITHDRAW_AMOUNT: u64 = 50_000;
+
+/// Everything the two gate scenarios share: validator, Postgres, escrow instance
+/// and operator, an allowlisted SPL mint with a funded escrow ATA, and a
+/// recipient whose ATA already exists, since `release_funds` rejects an
+/// uninitialized one. They differ only in how `BlockMint` is called afterwards.
+struct GateEnv {
+    test_validator: solana_test_validator::TestValidator,
+    client: RpcClient,
+    pool: sqlx::PgPool,
+    db_url: String,
+    storage: Storage,
+    instance: Pubkey,
+    mint: Pubkey,
+    recipient: Pubkey,
+    _pg_container: testcontainers::ContainerAsync<Postgres>,
+}
+
+async fn setup_gate_env(db_name: &str) -> Result<GateEnv, Box<dyn std::error::Error>> {
+    let (test_validator, faucet_keypair) = start_test_validator_no_geyser().await;
+    let client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+
+    let pg_container = Postgres::default()
+        .with_db_name(db_name)
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let pg_host = pg_container.get_host().await?;
+    let pg_port = pg_container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/{db_name}");
+
+    let pool = db::connect(&db_url).await?;
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 10,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    // One user, zero balance: the ATA is created either way, so the recipient's
+    // balance after a release is the released amount and nothing else.
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 0, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
+
+    // Fund the escrow ATA directly. Sidesteps the deposit path — only the escrow
+    // balance matters to release_funds, and the deposit gate is under test below.
+    mint_to_owner(
+        &client,
+        &admin,
+        env.mint,
+        env.instance,
+        &admin,
+        WITHDRAW_AMOUNT * 2,
+    )
+    .await?;
+
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            env.mint.to_string(),
+            6,
+            spl_token::id().to_string(),
+        )])
+        .await?;
+    storage
+        .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
+            mint_address: env.mint.to_string(),
+            status: "allowed".to_string(),
+            effective_slot: 0,
+            signature: format!("test-seed-{}", env.mint),
+            created_at: Utc::now(),
+        }])
+        .await?;
+
+    Ok(GateEnv {
+        test_validator,
+        client,
+        pool,
+        db_url,
+        storage,
+        instance: env.instance,
+        mint: env.mint,
+        recipient: env.users[0].pubkey(),
+        _pg_container: pg_container,
+    })
+}
+
+/// Set both gates on an allowlisted mint. The PDA stays open either way, so the
+/// operator reads the flags rather than an absent account, which is the whole
+/// difference between this and the unsupported-mint case above.
+async fn set_mint_gates(
+    client: &RpcClient,
+    admin: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    block_deposits: bool,
+    block_withdrawals: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance, &mint);
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let ix = BlockMintBuilder::new()
+        .payer(admin.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance)
+        .mint(mint)
+        .allowed_mint(allowed_mint_pda)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .block_deposits(block_deposits)
+        .block_withdrawals(block_withdrawals)
+        .instruction();
+
+    let recent_blockhash = client.get_latest_blockhash().await?;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        recent_blockhash,
+    );
+    client.send_and_confirm_transaction(&tx).await?;
+    Ok(())
+}
+
+fn make_withdrawal(
+    signature: String,
+    mint: Pubkey,
+    recipient: Pubkey,
+    amount: u64,
+) -> DbTransaction {
+    let now = Utc::now();
+    DbTransaction {
+        id: 0,
+        signature,
+        trace_id: Uuid::new_v4().to_string(),
+        slot: 1,
+        initiator: recipient.to_string(),
+        recipient: recipient.to_string(),
+        mint: mint.to_string(),
+        amount: TokenAmount(amount),
+        memo: None,
+        transaction_type: TransactionType::Withdrawal,
+        withdrawal_nonce: Some(0), // trigger overwrites with NEXTVAL
+        status: TransactionStatus::Pending,
+        created_at: now,
+        updated_at: now,
+        processed_at: None,
+        counterpart_signature: None,
+        remint_signatures: None,
+        remint_last_valid_block_heights: None,
+        pending_remint_deadline_at: None,
+        finality_check_attempts: 0,
+        recovery_requeue_attempts: 0,
+        instruction_index: 0,
+        inner_index: None,
+        landed_remint_signature: None,
+        release_refused_on_chain: false,
+    }
+}
+
+/// A withdrawal-blocked mint parks instead of broadcasting. `release_funds`
+/// rejects it on-chain, and that failure is permanent: letting it broadcast
+/// would terminalize the row through the remint path, where re-opening the gate
+/// could no longer rescue it.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_blocked_mint_is_parked() -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== BlockMint withdrawal gate -> ManualReview ===");
+
+    let env = setup_gate_env("withdrawals_blocked_gate").await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+
+    // Withdrawals shut, deposits left open: the row must park on the gate under
+    // test and not on the other one.
+    set_mint_gates(&env.client, &admin, env.instance, env.mint, false, true).await?;
+
+    let signature = Signature::new_unique().to_string();
+    env.storage
+        .insert_db_transaction(&make_withdrawal(
+            signature.clone(),
+            env.mint,
+            env.recipient,
+            WITHDRAW_AMOUNT,
+        ))
+        .await?;
+
+    let operator_handle = start_withdraw_operator(
+        env.test_validator.rpc_url(),
+        env.db_url.clone(),
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
+        env.instance,
+    )
+    .await?;
+
+    wait_for_status(&env.pool, &signature, "manual_review", 60)
+        .await
+        .expect("a withdrawal-blocked mint must park the row");
+
+    assert_eq!(
+        get_token_balance(&env.client, &env.recipient, &env.mint).await?,
+        0,
+        "nothing may be released while the withdrawal gate is shut",
+    );
+    assert!(
+        !operator_handle._handle.is_finished(),
+        "the operator must survive a blocked withdrawal mint"
+    );
+
+    operator_handle.shutdown().await;
+    Ok(())
+}
+
+/// The gates are independent: a mint closed to new deposits still owes its
+/// depositors their balance, so the withdrawal must release. Before the split,
+/// blocking deposits closed the `AllowedMint` PDA and stranded them.
+#[tokio::test(flavor = "multi_thread")]
+async fn deposit_blocked_mint_still_releases() -> Result<(), Box<dyn std::error::Error>> {
+    println!("=== BlockMint deposit gate -> withdrawal still releases ===");
+
+    let env = setup_gate_env("deposits_blocked_gate").await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+
+    set_mint_gates(&env.client, &admin, env.instance, env.mint, true, false).await?;
+
+    let signature = Signature::new_unique().to_string();
+    env.storage
+        .insert_db_transaction(&make_withdrawal(
+            signature.clone(),
+            env.mint,
+            env.recipient,
+            WITHDRAW_AMOUNT,
+        ))
+        .await?;
+
+    let operator_handle = start_withdraw_operator(
+        env.test_validator.rpc_url(),
+        env.db_url.clone(),
+        Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?,
+        env.instance,
+    )
+    .await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if get_token_balance(&env.client, &env.recipient, &env.mint).await? == WITHDRAW_AMOUNT {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let status = db::get_transaction(&env.pool, &signature)
+                .await?
+                .map(|row| row.status)
+                .unwrap_or_else(|| "missing".to_string());
+            return Err(format!(
+                "deposit-blocked mint did not release within 60s (row status: {status})"
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 
     operator_handle.shutdown().await;
     Ok(())
