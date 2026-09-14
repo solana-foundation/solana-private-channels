@@ -432,10 +432,14 @@ services:
       # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
       # distinct key without also fixing feepayer_monitor.rs, which watches
       # get_operator_pubkey() while the real fee payer is the admin key.
-      - ADMIN_SIGNER=memory
-      - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - OPERATOR_SIGNER=memory
-      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - ADMIN_SIGNER=${ADMIN_SIGNER:-memory}
+      - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY:-}
+      - ADMIN_GCP_KMS_KEY_NAME=${ADMIN_GCP_KMS_KEY_NAME:-}
+      - ADMIN_GCP_KMS_PUBLIC_KEY=${ADMIN_GCP_KMS_PUBLIC_KEY:-}
+      - OPERATOR_SIGNER=${ADMIN_SIGNER:-memory}
+      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY:-}
+      - OPERATOR_GCP_KMS_KEY_NAME=${ADMIN_GCP_KMS_KEY_NAME:-}
+      - OPERATOR_GCP_KMS_PUBLIC_KEY=${ADMIN_GCP_KMS_PUBLIC_KEY:-}
       - METRICS_PORT=9102
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
       # Required for the escrow operator: it refuses to start without a
@@ -490,10 +494,14 @@ services:
       # the same hot service identity. Do not point OPERATOR_PRIVATE_KEY at a
       # distinct key without also fixing feepayer_monitor.rs, which watches
       # get_operator_pubkey() while the real fee payer is the admin key.
-      - ADMIN_SIGNER=memory
-      - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
-      - OPERATOR_SIGNER=memory
-      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY}
+      - ADMIN_SIGNER=${ADMIN_SIGNER:-memory}
+      - ADMIN_PRIVATE_KEY=${ADMIN_PRIVATE_KEY:-}
+      - ADMIN_GCP_KMS_KEY_NAME=${ADMIN_GCP_KMS_KEY_NAME:-}
+      - ADMIN_GCP_KMS_PUBLIC_KEY=${ADMIN_GCP_KMS_PUBLIC_KEY:-}
+      - OPERATOR_SIGNER=${ADMIN_SIGNER:-memory}
+      - OPERATOR_PRIVATE_KEY=${ADMIN_PRIVATE_KEY:-}
+      - OPERATOR_GCP_KMS_KEY_NAME=${ADMIN_GCP_KMS_KEY_NAME:-}
+      - OPERATOR_GCP_KMS_PUBLIC_KEY=${ADMIN_GCP_KMS_PUBLIC_KEY:-}
       - METRICS_PORT=9103
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
     ports:

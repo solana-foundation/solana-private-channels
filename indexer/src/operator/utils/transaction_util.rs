@@ -88,7 +88,7 @@ pub async fn build_and_sign(
 
     for signer in ix_with_signers.signers.iter() {
         signer
-            .sign_partial_transaction(&mut transaction)
+            .sign_transaction(&mut transaction)
             .await
             .map_err(TransactionError::Signer)?;
     }

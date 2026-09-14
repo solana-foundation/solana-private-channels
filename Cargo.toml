@@ -97,6 +97,14 @@ solana-rpc-client-api = "2.3.10"
 solana-rpc-client-types = "2.3.10"
 solana-runtime-transaction = "2.3.10"
 solana-sdk = "2.3.0"
+solana-keychain = { version = "1.4.0", default-features = false, features = [
+    "sdk-v2",
+    "memory",
+    "vault",
+    "privy",
+    "turnkey",
+    "gcp_kms",
+] }
 solana-sdk-ids = "2.2.1"
 solana-svm = { version = "2.3.0", features = ["dev-context-only-utils"] }
 solana-svm-callback = "2.3.0"
