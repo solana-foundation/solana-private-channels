@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**55 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **84 integration tests** (end-to-end behavior).
+**62 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **96 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -88,7 +88,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (20 integration tests)
+### Deposit (21 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -110,6 +110,7 @@
 - `test_deposit_rejected_after_mint_gains_extension` — MintProfileChanged; decimals, token program and freeze authority all still match, so only the extension bitmask can catch the recreate
 - `test_deposit_rejected_after_mint_gains_freeze_authority` — MintProfileChanged; a freeze authority cannot be re-enabled once revoked, so gaining one means a recreate
 - `test_deposit_succeeds_after_freeze_authority_revoked` — the other direction; revoking leaves the mint strictly safer and must not strand deposits, so tightening the check into an equality breaks this
+- `test_deposit_succeeds_after_mint_gains_metadata` — an issuer writing metadata onto a live mint is routine, not a recreate; dropping the metadata and group bits from the exemption mask breaks this
 
 ### ReleaseFunds (21 integration tests)
 
@@ -166,7 +167,7 @@
 
 **State serialization and validation** (`state/`):
 
-- `allowed_mint`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
+- `allowed_mint`: 8 tests (constructor stores bump and gates, serialize→deserialize roundtrip, wrong discriminator rejected, non-canonical gate byte rejected, empty data rejected, data too short rejected, profile comparison detects drift, profile comparison ignores issuer-addable extensions and a revoked freeze authority)
 - `operator`: 5 tests (constructor stores bump, serialize→deserialize roundtrip, wrong discriminator rejected, empty data rejected, data too short rejected)
 - `instance`: 5 tests (constructor, serialization roundtrip with length check, validate_admin succeeds for correct key, validate_admin returns InvalidAdmin for wrong key, wrong discriminator rejected on deserialization)
 - `discriminator`: 2 tests (all 10 valid instruction discriminator bytes accepted, unmapped bytes rejected)

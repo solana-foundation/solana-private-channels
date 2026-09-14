@@ -18,7 +18,7 @@ use pinocchio_token_2022::{
     state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
     ID as TOKEN_2022_PROGRAM_ID,
 };
-use spl_token_2022::extension::{BaseStateWithExtensions, StateWithExtensions};
+use spl_token_2022::extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions};
 use spl_token_2022::state::Mint as Token2022MintState;
 
 use crate::error::PrivateChannelEscrowProgramError;
@@ -126,6 +126,12 @@ pub struct MintProfile {
     pub extensions: u64,
     pub has_freeze_authority: bool,
 }
+
+/// Extensions an issuer can write onto a live mint, so gaining or losing one is
+/// not a recreate. None has any power over transfers.
+pub const ISSUER_ADDABLE_EXTENSIONS: u64 = (1 << ExtensionType::TokenMetadata as u64)
+    | (1 << ExtensionType::TokenGroup as u64)
+    | (1 << ExtensionType::TokenGroupMember as u64);
 
 /// Reads a mint's pinned profile, and in doing so proves the account really is
 /// a mint: `get_mint_decimals` casts unchecked, this is what validates the

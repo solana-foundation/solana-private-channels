@@ -16334,6 +16334,7 @@ dependencies = [
  "spl-tlv-account-resolution 0.10.0",
  "spl-token 6.0.0",
  "spl-token-2022 9.0.0",
+ "spl-token-metadata-interface 0.7.0",
  "spl-transfer-hook-interface 0.10.0",
 ]
 

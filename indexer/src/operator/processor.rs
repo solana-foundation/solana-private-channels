@@ -665,9 +665,9 @@ async fn read_withdrawal_allowed_mint(
 /// `AllowedMint.extensions`: bit N is set when the mint carries type N. Only the
 /// ones a withdrawal has to act on are named here.
 ///
-/// These pin *presence*, which is fixed when a mint is created and can only change
-/// through a close and recreate that `Deposit` then rejects. The state behind each
-/// one is still read live, because it moves at any time: a pausable mint can be
+/// These three pin *presence*, which is fixed when a mint is created and can only
+/// change through a close and recreate that `Deposit` then rejects. The state behind
+/// each one is still read live, because it moves at any time: a pausable mint can be
 /// paused, a delegate can drain, a hook authority can swap the hook program.
 const EXTENSION_BIT_PERMANENT_DELEGATE: u8 = 12;
 const EXTENSION_BIT_TRANSFER_HOOK: u8 = 14;

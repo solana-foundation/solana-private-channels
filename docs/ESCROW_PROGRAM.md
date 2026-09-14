@@ -324,7 +324,7 @@ profile recorded when it was allowed.
 | `withdrawals_blocked` | bool | `ReleaseFunds` rejects this mint |
 | `decimals` | u8 | Mint decimals at `AllowMint`; `Deposit` rejects a mismatch |
 | `token_program` | Pubkey | Token program at `AllowMint`; `Deposit` rejects a mismatch |
-| `extensions` | u64 | Bitmask of the mint's Token-2022 `ExtensionType` discriminants (bit N = type N), 0 for a legacy mint; `Deposit` rejects a mismatch |
+| `extensions` | u64 | Bitmask of the mint's Token-2022 `ExtensionType` discriminants (bit N = type N), 0 for a legacy mint; `Deposit` rejects a mismatch outside the metadata and group bits |
 | `has_freeze_authority` | bool | Whether the mint had a freeze authority at `AllowMint`; `Deposit` rejects *gaining* one |
 
 A mint carrying `MintCloseAuthority` can be closed and recreated at the same address
@@ -341,6 +341,12 @@ re-added, so losing one is the same mint behaving more safely while gaining one
 means a recreate. The `extensions` mask pins *which* extensions exist, not their
 contents — a transfer fee raised, a hook program swapped or a permanent delegate
 rotated leaves it unchanged, and those stay issuer-trust decisions.
+
+The metadata, group and group-member bits are recorded but not compared. An issuer
+adds them to a live mint as a routine step, so comparing them would stop deposits on
+a mint that never changed. They carry no power over transfers, and a recreate that
+hides behind them still has to match decimals, token program, freeze authority and
+every other extension bit.
 
 ## Errors
 

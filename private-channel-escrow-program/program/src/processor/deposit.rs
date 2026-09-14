@@ -104,17 +104,9 @@ pub fn process_deposit(
     // TransferChecked cannot catch it: the decimals it validates are read from the
     // mint below. Runs before validate_ata, which only rejects a changed token
     // program until someone creates the new escrow ATA.
-    //
-    // Freeze authority is compared in one direction only. It can be revoked but
-    // never re-added, so a mint that lost one is the same mint behaving more
-    // safely, while one that gained a freeze authority was recreated.
     let mint_profile = read_mint_profile(mint_info)?;
     let mint_decimals = mint_profile.decimals;
-    if allowed_mint.decimals != mint_decimals
-        || allowed_mint.token_program != *token_program_info.address()
-        || allowed_mint.extensions != mint_profile.extensions
-        || (mint_profile.has_freeze_authority && !allowed_mint.has_freeze_authority)
-    {
+    if allowed_mint.profile_changed(&mint_profile, token_program_info.address()) {
         return Err(PrivateChannelEscrowProgramError::MintProfileChanged.into());
     }
 

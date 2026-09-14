@@ -5,7 +5,8 @@ use crate::{
         assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account, get_or_create_associated_token_account_2022,
         get_token_balance, hook_extras_for_mint, malicious_hook_extras, set_mint,
-        set_mint_2022_basic, set_mint_2022_with_permanent_delegate, set_mint_with_decimals,
+        set_mint_2022_basic, set_mint_2022_with_metadata, set_mint_2022_with_metadata_pointer,
+        set_mint_2022_with_permanent_delegate, set_mint_with_decimals,
         set_mint_with_freeze_authority, set_token_2022_with_hook_account, set_token_balance,
         setup_hook_mint, setup_malicious_hook_mint, setup_test_balances, TestContext,
         ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
@@ -1312,6 +1313,82 @@ fn test_deposit_rejected_after_mint_gains_extension() {
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
     assert_program_error(result, MINT_PROFILE_CHANGED_ERROR);
+}
+
+// An issuer writes metadata onto a live mint as a routine step, so the added
+// TokenMetadata bit must not read as a recreate and stop deposits.
+#[test]
+fn test_deposit_succeeds_after_mint_gains_metadata() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint_2022_with_metadata_pointer(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    // Same mint, now carrying the metadata its pointer already named.
+    set_mint_2022_with_metadata(&mut context, &mint.pubkey());
+
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&user])
+        .expect("Deposit should succeed after a mint gains metadata");
 }
 
 // A freeze authority cannot be re-enabled once revoked, so a mint carrying one

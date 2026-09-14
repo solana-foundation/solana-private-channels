@@ -3,6 +3,7 @@ use super::discriminator::{
     AccountSerialize, Discriminator, PrivateChannelEscrowAccountDiscriminators,
 };
 use crate::constants::ALLOWED_MINT_SEED;
+use crate::processor::shared::token_utils::{MintProfile, ISSUER_ADDABLE_EXTENSIONS};
 use crate::processor::validate_pda_account;
 use crate::require_len;
 use crate::validate_discriminator;
@@ -32,7 +33,8 @@ pub struct AllowedMint {
     /// Bit N is set when the mint carries the `ExtensionType` whose
     /// discriminant is N. Always 0 for a legacy SPL mint. Pins which
     /// extensions exist, not their contents: a fee raised or a hook program
-    /// swapped leaves this unchanged.
+    /// swapped leaves this unchanged. Records every bit; Deposit skips the
+    /// metadata and group ones, which an issuer can add to a live mint.
     pub extensions: u64,
     /// A freeze authority can be revoked but never re-added, so only gaining
     /// one implies a recreate. Deposit compares this in one direction.
@@ -146,6 +148,21 @@ impl AllowedMint {
         })
     }
 
+    /// Whether the mint has drifted from what the admin reviewed.
+    ///
+    /// The metadata and group bits are exempt because an issuer adds them to a
+    /// live mint as a routine step, which is not a recreate.
+    ///
+    /// Freeze authority is compared in one direction only. It can be revoked but
+    /// never re-added, so a mint that lost one is the same mint behaving more
+    /// safely, while one that gained a freeze authority was recreated.
+    pub fn profile_changed(&self, profile: &MintProfile, token_program: &Address) -> bool {
+        self.decimals != profile.decimals
+            || self.token_program != *token_program
+            || (self.extensions ^ profile.extensions) & !ISSUER_ADDABLE_EXTENSIONS != 0
+            || (profile.has_freeze_authority && !self.has_freeze_authority)
+    }
+
     pub fn validate_pda(
         &self,
         instance_pda: &Address,
@@ -180,6 +197,104 @@ mod tests {
         assert_eq!(allowed_mint.token_program, token_program);
         assert_eq!(allowed_mint.extensions, 0b1010);
         assert!(allowed_mint.has_freeze_authority);
+    }
+
+    // Each case flips exactly one property off the allowed mint, so dropping any
+    // clause of the comparison leaves one of them failing.
+    #[test]
+    fn test_profile_changed_detects_drift() {
+        let token_program = Address::new_from_array([7u8; 32]);
+        let permanent_delegate = 1u64 << 12;
+        let allowed_mint = AllowedMint::new(99, 6, token_program, permanent_delegate, false);
+
+        assert!(!allowed_mint.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: permanent_delegate,
+                has_freeze_authority: false,
+            },
+            &token_program
+        ));
+
+        assert!(allowed_mint.profile_changed(
+            &MintProfile {
+                decimals: 9,
+                extensions: permanent_delegate,
+                has_freeze_authority: false,
+            },
+            &token_program
+        ));
+
+        assert!(allowed_mint.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: permanent_delegate,
+                has_freeze_authority: false,
+            },
+            &Address::new_from_array([8u8; 32])
+        ));
+
+        assert!(allowed_mint.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: 0,
+                has_freeze_authority: false,
+            },
+            &token_program
+        ));
+
+        assert!(allowed_mint.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: permanent_delegate,
+                has_freeze_authority: true,
+            },
+            &token_program
+        ));
+    }
+
+    // Metadata and group bits move on a live mint, and a freeze authority can be
+    // revoked. Neither is a recreate, so neither may stop deposits.
+    #[test]
+    fn test_profile_changed_ignores_issuer_addable_extensions() {
+        let token_program = Address::new_from_array([7u8; 32]);
+        let permanent_delegate = 1u64 << 12;
+
+        let allowed_mint = AllowedMint::new(99, 6, token_program, permanent_delegate, false);
+        assert!(!allowed_mint.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: permanent_delegate | ISSUER_ADDABLE_EXTENSIONS,
+                has_freeze_authority: false,
+            },
+            &token_program
+        ));
+
+        let with_metadata = AllowedMint::new(
+            99,
+            6,
+            token_program,
+            permanent_delegate | ISSUER_ADDABLE_EXTENSIONS,
+            false,
+        );
+        assert!(!with_metadata.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: permanent_delegate,
+                has_freeze_authority: false,
+            },
+            &token_program
+        ));
+
+        let freezable = AllowedMint::new(99, 6, token_program, 0, true);
+        assert!(!freezable.profile_changed(
+            &MintProfile {
+                decimals: 6,
+                extensions: 0,
+                has_freeze_authority: false,
+            },
+            &token_program
+        ));
     }
 
     // The gates are adjacent bytes of the same type and decimals follows them, so

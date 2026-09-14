@@ -19,6 +19,7 @@ use spl_token::{
 };
 use spl_token_2022::{
     extension::{
+        metadata_pointer::MetadataPointer,
         pausable::PausableConfig,
         permanent_delegate::PermanentDelegate,
         transfer_fee::instruction::initialize_transfer_fee_config,
@@ -27,6 +28,7 @@ use spl_token_2022::{
     },
     state::Mint as Token2022Mint,
 };
+use spl_token_metadata_interface::state::TokenMetadata;
 use spl_transfer_hook_interface::{
     get_extra_account_metas_address, instruction::ExecuteInstruction,
 };
@@ -657,6 +659,106 @@ pub fn set_mint_2022_with_pausable(context: &mut TestContext, mint: &Pubkey, aut
             },
         )
         .expect("Failed to set Token 2022 mint account with Pausable");
+}
+
+/// A mint whose issuer has reserved the right to attach metadata later. The
+/// pointer is init-time; the metadata it names is not there yet.
+pub fn set_mint_2022_with_metadata_pointer(context: &mut TestContext, mint: &Pubkey) {
+    let extensions = [ExtensionType::MetadataPointer];
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
+
+    let metadata_pointer = state.init_extension::<MetadataPointer>(true).unwrap();
+    *metadata_pointer = MetadataPointer {
+        authority: OptionalNonZeroPubkey::try_from(Some(context.payer.pubkey())).unwrap(),
+        metadata_address: OptionalNonZeroPubkey::try_from(Some(*mint)).unwrap(),
+    };
+
+    let pod_mint = PodMint {
+        mint_authority: COption::Some(context.payer.pubkey()).into(),
+        supply: 1_000_000u64.into(),
+        decimals: 6,
+        is_initialized: true.into(),
+        freeze_authority: COption::None.into(),
+    };
+    *state.base = pod_mint;
+
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set Token 2022 mint account with MetadataPointer");
+}
+
+/// The same mint after the issuer wrote its metadata. Identical to
+/// [`set_mint_2022_with_metadata_pointer`] but for the added `TokenMetadata`.
+pub fn set_mint_2022_with_metadata(context: &mut TestContext, mint: &Pubkey) {
+    let metadata = TokenMetadata {
+        update_authority: OptionalNonZeroPubkey::try_from(Some(context.payer.pubkey())).unwrap(),
+        mint: *mint,
+        name: "Test Token".to_string(),
+        symbol: "TEST".to_string(),
+        uri: "https://example.com/test.json".to_string(),
+        additional_metadata: vec![],
+    };
+
+    let extensions = [ExtensionType::MetadataPointer];
+    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&extensions).unwrap()
+        + metadata.tlv_size_of().unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state = PodStateWithExtensionsMut::<PodMint>::unpack_uninitialized(&mut data).unwrap();
+
+    let metadata_pointer = state.init_extension::<MetadataPointer>(true).unwrap();
+    *metadata_pointer = MetadataPointer {
+        authority: OptionalNonZeroPubkey::try_from(Some(context.payer.pubkey())).unwrap(),
+        metadata_address: OptionalNonZeroPubkey::try_from(Some(*mint)).unwrap(),
+    };
+
+    let pod_mint = PodMint {
+        mint_authority: COption::Some(context.payer.pubkey()).into(),
+        supply: 1_000_000u64.into(),
+        decimals: 6,
+        is_initialized: true.into(),
+        freeze_authority: COption::None.into(),
+    };
+    *state.base = pod_mint;
+
+    state
+        .init_variable_len_extension::<TokenMetadata>(&metadata, false)
+        .expect("Failed to init TokenMetadata");
+
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *mint,
+            Account {
+                lamports: 1_000_000_000,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set Token 2022 mint account with TokenMetadata");
 }
 
 pub fn set_mint_2022_with_transfer_hook(
