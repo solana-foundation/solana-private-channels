@@ -91,9 +91,20 @@ supported path is a destructive resync, which drops the checkpoint and rebuilds 
 chosen genesis slot under fail-closed channel reconciliation:
 
 ```bash
-private-channel-indexer resync --genesis-slot <slot> --channel-rpc-url <url>
+# Stop every indexer and operator on this database first; resync refuses otherwise.
+private-channel-indexer resync \
+  --genesis-slot <slot> \
+  --channel-rpc-url <url> \
+  --destroy-existing-data
 ```
 
+Resync takes the live-state lock exclusively and holds it for the whole rebuild, so it
+refuses to start while any indexer or operator is running, and those refuse to start
+while it runs. Scale them to zero first. Note the guarantee only covers workers running
+a build that takes the lock, so during a rolling upgrade confirm by process, not by the
+refusal alone. Resync also refuses when the reconciliation halt flag is set: resolve and
+clear the halt first, since the rebuild would otherwise drop the table holding it. See
+[`live_state_lock_runbook.md`](live_state_lock_runbook.md).
 A withdraw resync additionally needs `common.escrow_instance_id` and `--escrow-rpc-url`
 (a Solana RPC), and refuses unless the escrow's withdrawal bitmap is at generation 0 with
 no set bits.

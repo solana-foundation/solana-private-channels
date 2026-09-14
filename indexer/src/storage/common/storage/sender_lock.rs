@@ -8,30 +8,35 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-/// Probe the lock on a fixed interval and cancel `operator_token` the first
-/// time ownership cannot be proven. Generic over the probe so every verdict is
-/// unit-testable without a database. An interval of zero disables probing but
+/// Probe the lock on a fixed interval and call `fail_closed` once ownership can no
+/// longer be proven. Generic over the probe so every verdict is unit-testable
+/// without a database, and over the loss report so both the sender lock and the
+/// live-state lock share this one loop. An interval of zero disables probing but
 /// keeps the task, and therefore the release path, in exactly one shape.
-async fn run_lock_heartbeat<P, Fut>(
+///
+/// `budget` is how long a probe may go unanswered before the role stops, and it
+/// applies to the timeout arm alone. The other two verdicts are already proof and
+/// get no tolerance: "not held" is the server answering about the lock, and a
+/// query error on a pinned connection means the session itself is gone, which is
+/// the same thing. Only a timeout is genuinely ambiguous, since a healthy server
+/// under load can miss the deadline. A budget of zero stops on the first timeout.
+pub(crate) async fn run_lock_heartbeat<P, Fut, L>(
     interval: Duration,
+    budget: Duration,
     stop: CancellationToken,
-    operator_token: CancellationToken,
-    program_type: &str,
+    mut fail_closed: L,
     mut probe: P,
 ) where
     P: FnMut() -> Fut,
     Fut: Future<Output = Result<ProbeOutcome, sqlx::Error>>,
+    L: FnMut(&str, &str),
 {
-    let fail_closed = |reason: &str, detail: &str| {
-        OPERATOR_SENDER_LOCK_LOST
-            .with_label_values(&[program_type, reason])
-            .inc();
-        error!(
-            reason,
-            "Sender advisory lock ownership could not be proven ({detail}); cancelling the operator"
-        );
-        operator_token.cancel();
-    };
+    let mut confirmed_at = tokio::time::Instant::now();
+    // Set only by an unanswered probe, and the only state in which the waits below are
+    // clamped. Clamping unconditionally would spin: a zero budget leaves nothing
+    // remaining even on a healthy loop, and a busy connection continues without
+    // refreshing `confirmed_at`, so either would drive the sleep to zero.
+    let mut unanswered = false;
 
     loop {
         if interval.is_zero() {
@@ -39,33 +44,89 @@ async fn run_lock_heartbeat<P, Fut>(
             return;
         }
 
+        // Never wait past the budget, so the deadline it names is an upper bound rather
+        // than an approximation of one. Clamped twice because the sleep spends budget
+        // too, so the probe's share is only known once the sleep has happened.
+        let clamped = unanswered && !budget.is_zero();
+        let remaining = || budget.saturating_sub(confirmed_at.elapsed());
+        let wait = if clamped {
+            interval.min(remaining())
+        } else {
+            interval
+        };
+
         // Not raced against the stop token: dropping a query mid-flight ruins the connection.
         tokio::select! {
             biased;
             _ = stop.cancelled() => return,
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(wait) => {}
         }
 
-        match tokio::time::timeout(PROBE_TIMEOUT, probe()).await {
-            Ok(Ok(ProbeOutcome::Held)) => {}
-            Ok(Ok(ProbeOutcome::Busy)) => debug!("Sender lock probe skipped; connection in use"),
+        const UNANSWERED: &str = "probe did not answer within the timeout";
+
+        let probe_cap = if clamped {
+            PROBE_TIMEOUT.min(remaining())
+        } else {
+            PROBE_TIMEOUT
+        };
+
+        match tokio::time::timeout(probe_cap, probe()).await {
+            Ok(Ok(ProbeOutcome::Held)) => {
+                confirmed_at = tokio::time::Instant::now();
+                unanswered = false;
+                continue;
+            }
+            // A synchronous check holds the connection, which proves the session is
+            // alive on its own, so the last real confirmation still stands.
+            Ok(Ok(ProbeOutcome::Busy)) => {
+                debug!("Lock probe skipped; connection in use");
+                unanswered = false;
+                continue;
+            }
             // A fenced write already reported and cancelled, so do not count it twice.
             Ok(Ok(ProbeOutcome::Gone)) => return,
+            // The server answered and it is not ours. Proof, so no tolerance.
             Ok(Ok(ProbeOutcome::NotHeld)) => {
                 fail_closed("not_held", "pg_locks reports the lock is not held");
                 return;
             }
+            // A checked-out connection never heals, so an error here means the session
+            // is gone, and with it the lock. Proof, so no tolerance.
             Ok(Err(e)) => {
-                // A checked-out connection never heals, so an error here means the session is gone.
                 fail_closed("probe_error", &format!("probe query failed: {e}"));
                 return;
             }
-            Err(_) => {
-                fail_closed("probe_timeout", "probe did not answer within the timeout");
-                return;
-            }
+            // Unanswered. Falls through to the budget below.
+            Err(_) => unanswered = true,
         }
+
+        // A timeout says the server is slow, not that the lock is gone. Retry while the
+        // budget lasts: our session is still open, so it still holds the lock, and
+        // nothing the lock protects is at risk meanwhile.
+        if confirmed_at.elapsed() < budget {
+            warn!("Lock probe inconclusive ({UNANSWERED}); retrying");
+            continue;
+        }
+        fail_closed("probe_timeout", UNANSWERED);
+        return;
     }
+}
+
+/// Report a sender lock we can no longer prove we own, and stop the operator.
+fn report_sender_lock_lost(
+    program_type: &str,
+    operator_token: &CancellationToken,
+    reason: &str,
+    detail: &str,
+) {
+    OPERATOR_SENDER_LOCK_LOST
+        .with_label_values(&[program_type, reason])
+        .inc();
+    error!(
+        reason,
+        "Sender advisory lock ownership could not be proven ({detail}); cancelling the operator"
+    );
+    operator_token.cancel();
 }
 
 /// Held for the sender's lifetime. Dropping it tells the heartbeat to unlock and let go.
@@ -148,9 +209,13 @@ fn spawn_heartbeat(
         let probe_lock = lock.clone();
         run_lock_heartbeat(
             heartbeat_interval,
+            // No tolerance for an unanswered probe, unchanged. The sender's fail-closed
+            // timing is the operator's to retune, not this change's.
+            Duration::ZERO,
             task_stop.clone(),
-            operator_token,
-            program_type,
+            move |reason, detail| {
+                report_sender_lock_lost(program_type, &operator_token, reason, detail)
+            },
             move || {
                 let lock = probe_lock.clone();
                 async move { lock.probe().await }
@@ -198,6 +263,15 @@ mod tests {
         crate::metrics::OPERATOR_SENDER_LOCK_LOST
             .with_label_values(&[program_type, reason])
             .get()
+    }
+
+    /// The sender's own loss report, so these tests still exercise the exact
+    /// metric and cancellation the production heartbeat performs.
+    fn sender_on_lost(
+        program_type: &'static str,
+        operator: CancellationToken,
+    ) -> impl FnMut(&str, &str) {
+        move |reason, detail| report_sender_lock_lost(program_type, &operator, reason, detail)
     }
 
     /// U1. Four `run_sender` call sites pass `Storage::Mock`. A `Noop` that
@@ -291,9 +365,9 @@ mod tests {
         let probe_calls = calls.clone();
         run_lock_heartbeat(
             Duration::from_secs(5),
+            Duration::ZERO,
             stop.clone(),
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             move || {
                 let calls = probe_calls.clone();
                 async move {
@@ -338,9 +412,9 @@ mod tests {
         let probe_stop = stop.clone();
         run_lock_heartbeat(
             Duration::from_secs(5),
+            Duration::ZERO,
             stop.clone(),
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             move || {
                 let calls = probe_calls.clone();
                 let stop = probe_stop.clone();
@@ -381,9 +455,9 @@ mod tests {
         let probe_calls = calls.clone();
         run_lock_heartbeat(
             Duration::from_secs(5),
+            Duration::ZERO,
             stop.clone(),
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             move || {
                 let calls = probe_calls.clone();
                 async move {
@@ -416,9 +490,9 @@ mod tests {
         let started = tokio::time::Instant::now();
         run_lock_heartbeat(
             interval,
+            Duration::ZERO,
             stop.clone(),
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             std::future::pending::<Result<ProbeOutcome, sqlx::Error>>,
         )
         .await;
@@ -444,9 +518,9 @@ mod tests {
         stop.cancel();
         run_lock_heartbeat(
             Duration::from_secs(5),
+            Duration::ZERO,
             stop,
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             || async { panic!("a cancelled stop token must not probe") },
         )
         .await;
@@ -475,9 +549,9 @@ mod tests {
 
         run_lock_heartbeat(
             Duration::ZERO,
+            Duration::ZERO,
             stop,
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             || async { panic!("a zero interval must never probe") },
         )
         .await;
@@ -502,9 +576,9 @@ mod tests {
         let probe_stop = stop.clone();
         run_lock_heartbeat(
             Duration::from_secs(5),
+            Duration::ZERO,
             stop.clone(),
-            operator.clone(),
-            program_type,
+            sender_on_lost(program_type, operator.clone()),
             move || {
                 let calls = probe_calls.clone();
                 let stop = probe_stop.clone();
@@ -523,5 +597,259 @@ mod tests {
         for (reason, was) in ALL_REASONS.iter().zip(before) {
             assert_eq!(lost_count(program_type, reason), was);
         }
+    }
+    /// U7. A probe that misses the deadline and then answers says the server was
+    /// slow, not that the lock is gone. Stopping the role on it would abort a rebuild
+    /// that has already dropped the tables, so retry it while the budget lasts.
+    #[tokio::test(start_paused = true)]
+    async fn inconclusive_probe_within_budget_keeps_probing() {
+        let program_type = "u7_within_budget";
+        let stop = CancellationToken::new();
+        let operator = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let before: Vec<f64> = ALL_REASONS
+            .iter()
+            .map(|r| lost_count(program_type, r))
+            .collect();
+
+        // Hangs past the deadline for the first two ticks, then answers for the rest.
+        let probe_calls = calls.clone();
+        let probe_stop = stop.clone();
+        run_lock_heartbeat(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            stop.clone(),
+            sender_on_lost(program_type, operator.clone()),
+            move || {
+                let calls = probe_calls.clone();
+                let stop = probe_stop.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if n >= 5 {
+                        stop.cancel();
+                    }
+                    if n < 2 {
+                        std::future::pending::<Result<ProbeOutcome, sqlx::Error>>().await
+                    } else {
+                        Ok(ProbeOutcome::Held)
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "a tolerated failure must not end the loop"
+        );
+        assert!(
+            !operator.is_cancelled(),
+            "a probe that failed and then answered must not stop the role"
+        );
+        for (reason, was) in ALL_REASONS.iter().zip(before) {
+            assert_eq!(
+                lost_count(program_type, reason),
+                was,
+                "a tolerated failure must not count as a loss under reason={reason}"
+            );
+        }
+    }
+
+    /// U8. Tolerance is bounded, or an unreachable database would never stop the
+    /// role at all. The verdict must land once the budget is spent and not before.
+    /// Every probe here misses the deadline, which is the only arm the budget covers.
+    #[tokio::test(start_paused = true)]
+    async fn inconclusive_probe_cancels_once_the_budget_is_spent() {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        const BUDGET: Duration = Duration::from_secs(30);
+
+        let program_type = "u8_budget_spent";
+        let stop = CancellationToken::new();
+        let operator = CancellationToken::new();
+
+        let before = lost_count(program_type, "probe_timeout");
+        let started = tokio::time::Instant::now();
+
+        run_lock_heartbeat(
+            INTERVAL,
+            BUDGET,
+            stop.clone(),
+            sender_on_lost(program_type, operator.clone()),
+            std::future::pending::<Result<ProbeOutcome, sqlx::Error>>,
+        )
+        .await;
+
+        assert!(operator.is_cancelled(), "a spent budget must stop the role");
+        assert_eq!(lost_count(program_type, "probe_timeout"), before + 1.0);
+        assert!(
+            started.elapsed() >= BUDGET,
+            "the role must not stop before the budget has passed, stopped after {:?}",
+            started.elapsed()
+        );
+        // The runbook quotes the budget as a deadline, so it has to be an upper bound
+        // too. Waiting a whole interval and then a whole probe timeout before testing
+        // it would overshoot by both.
+        assert!(
+            started.elapsed() <= BUDGET,
+            "the budget must be an upper bound, stopped after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The budget cap must never apply to a zero budget. That is what the sender lock
+    /// passes, and there the remaining budget is always zero, so a cap would drive the
+    /// sleep to zero and spin the loop against Postgres instead of pacing it.
+    #[tokio::test]
+    async fn zero_budget_paces_a_healthy_probe_at_the_interval() {
+        const INTERVAL: Duration = Duration::from_millis(20);
+        const WINDOW: Duration = Duration::from_millis(300);
+
+        let stop = CancellationToken::new();
+        let probes = Arc::new(AtomicU32::new(0));
+        let counted = probes.clone();
+
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WINDOW).await;
+            stopper.cancel();
+        });
+
+        run_lock_heartbeat(
+            INTERVAL,
+            Duration::ZERO,
+            stop,
+            |_, _| panic!("a healthy probe must never report a loss"),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(ProbeOutcome::Held))
+            },
+        )
+        .await;
+
+        // Interval pacing puts this near 15. A spin puts it in the thousands, so the
+        // bound is loose on purpose and still catches the failure by orders of magnitude.
+        let count = probes.load(Ordering::SeqCst);
+        assert!(
+            count <= 60,
+            "a zero budget must stay interval-paced, probed {count} times in {WINDOW:?}"
+        );
+    }
+
+    /// A busy connection continues without refreshing the last confirmation, so once it
+    /// has been busy longer than the budget the remaining budget is zero. Capping the
+    /// wait on that outcome would spin. Reachable in production: the fenced drop holds
+    /// the lock session for its whole duration.
+    #[tokio::test]
+    async fn a_busy_connection_past_the_budget_does_not_spin() {
+        const INTERVAL: Duration = Duration::from_millis(20);
+        const BUDGET: Duration = Duration::from_millis(40);
+        const WINDOW: Duration = Duration::from_millis(300);
+
+        let stop = CancellationToken::new();
+        let probes = Arc::new(AtomicU32::new(0));
+        let counted = probes.clone();
+
+        let stopper = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(WINDOW).await;
+            stopper.cancel();
+        });
+
+        run_lock_heartbeat(
+            INTERVAL,
+            BUDGET,
+            stop,
+            |_, _| panic!("a busy connection must never report a loss"),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(ProbeOutcome::Busy))
+            },
+        )
+        .await;
+
+        let count = probes.load(Ordering::SeqCst);
+        assert!(
+            count <= 60,
+            "a busy connection must stay interval-paced, probed {count} times in {WINDOW:?}"
+        );
+    }
+
+    /// U9. `NotHeld` is the server answering, not failing to answer. It is proof, so
+    /// the budget must not apply to it: the role stops on the first such probe.
+    #[tokio::test(start_paused = true)]
+    async fn not_held_ignores_the_budget() {
+        let program_type = "u9_not_held";
+        let stop = CancellationToken::new();
+        let operator = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let before = lost_count(program_type, "not_held");
+
+        let probe_calls = calls.clone();
+        run_lock_heartbeat(
+            Duration::from_secs(5),
+            Duration::from_secs(3600),
+            stop.clone(),
+            sender_on_lost(program_type, operator.clone()),
+            move || {
+                let calls = probe_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(ProbeOutcome::NotHeld)
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "proof of loss must exit on the first probe however large the budget"
+        );
+        assert!(operator.is_cancelled(), "proof of loss must stop the role");
+        assert_eq!(lost_count(program_type, "not_held"), before + 1.0);
+    }
+
+    /// U10. A terminated backend surfaces as a probe error, and it means the session
+    /// and the lock are already gone. Tolerating it would leave a worker writing
+    /// against a database another holder could now be rebuilding, so the budget must
+    /// never reach this arm however large it is.
+    #[tokio::test(start_paused = true)]
+    async fn probe_error_ignores_the_budget() {
+        let program_type = "u10_probe_error_budget";
+        let stop = CancellationToken::new();
+        let operator = CancellationToken::new();
+        let calls = Arc::new(AtomicU32::new(0));
+
+        let before = lost_count(program_type, "probe_error");
+
+        let probe_calls = calls.clone();
+        run_lock_heartbeat(
+            Duration::from_secs(5),
+            Duration::from_secs(3600),
+            stop.clone(),
+            sender_on_lost(program_type, operator.clone()),
+            move || {
+                let calls = probe_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(sqlx::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "backend terminated",
+                    )))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a dead session must exit on the first probe however large the budget"
+        );
+        assert!(operator.is_cancelled(), "a dead session must stop the role");
+        assert_eq!(lost_count(program_type, "probe_error"), before + 1.0);
     }
 }

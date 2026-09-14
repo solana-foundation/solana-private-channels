@@ -113,6 +113,20 @@ keep writable account data and every account's lamports but drop readonly data,
 which nothing downstream reads; otherwise a result would keep an evicted account
 alive until the settler had finished with it.
 
+**Blockhash expiry**: the live window keeps advancing while a batch waits on
+that account load, so validity is checked twice. The check on arrival only
+avoids loading accounts for a transaction that is already dead; the check after
+the load is the one that decides whether a transaction may run, and the run from
+it to both VM dispatches is synchronous, so what remains between the verdict and
+the dispatch is microseconds rather than a whole account load. Neither VM would
+catch a stale transaction later, since Core supplies successful transaction
+prechecks and a default processing blockhash. Without the second check a
+transaction could expire while its accounts loaded and still execute beside the
+replacement a client signs once `isBlockhashValid` reports the original hash
+dead, debiting the sender twice. A transaction dropped this way is never
+settled, so it stays absent from `getSignatureStatuses` exactly as one dropped
+on arrival does.
+
 
 **Execution Modes**:
 

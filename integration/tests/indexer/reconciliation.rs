@@ -28,6 +28,11 @@ mod pending_remint_storage;
 #[path = "sender_singleton_lock.rs"]
 mod sender_singleton_lock;
 
+// Live-state lock: an indexer and an operator both refuse to start while a
+// resync holds the database exclusively.
+#[path = "live_state_lock.rs"]
+mod live_state_lock;
+
 // End-to-end multi-instruction ledger integrity (SOLA2-13): same-signature
 // instructions must persist as distinct rows through the real processor.
 #[path = "multi_instruction_pipeline.rs"]

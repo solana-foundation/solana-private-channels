@@ -148,11 +148,7 @@ async fn start_mock_backend_with_body(body: impl Into<String> + Send + 'static) 
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf).await;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let resp = json_http_response(&body);
             let _ = stream.write_all(resp.as_bytes()).await;
         }
     });
@@ -163,6 +159,16 @@ async fn start_mock_backend_with_body(body: impl Into<String> + Send + 'static) 
 /// next body in `bodies` and repeats the last one after they run out. A
 /// User-role request takes two: the ownership account fetch, then the proxied
 /// call.
+/// A one-shot JSON reply. `Connection: close` stops the gateway's pooled client from
+/// reusing a socket these mocks drop after a single response.
+fn json_http_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
 async fn start_mock_backend_with_sequence(bodies: Vec<String>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -173,11 +179,7 @@ async fn start_mock_backend_with_sequence(bodies: Vec<String>) -> SocketAddr {
             let _ = stream.read(&mut buf).await;
             let body = &bodies[served.min(bodies.len() - 1)];
             served += 1;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let resp = json_http_response(body);
             let _ = stream.write_all(resp.as_bytes()).await;
         }
     });
@@ -1265,11 +1267,7 @@ async fn test_empty_jwt_secret_disables_auth() {
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf).await;
             let body = r#"{"jsonrpc":"2.0","id":1,"result":{"value":null}}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let resp = json_http_response(body);
             let _ = stream.write_all(resp.as_bytes()).await;
         }
     });
@@ -1329,11 +1327,7 @@ async fn test_whitespace_jwt_secret_disables_auth() {
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf).await;
             let body = r#"{"jsonrpc":"2.0","id":1,"result":{"value":null}}"#;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
+            let resp = json_http_response(body);
             let _ = stream.write_all(resp.as_bytes()).await;
         }
     });
