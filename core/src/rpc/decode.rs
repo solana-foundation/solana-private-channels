@@ -19,6 +19,14 @@ use {
 /// is a reliable discriminator. The wincode reader branches on the same byte.
 const V1_PREFIX: u8 = 0x81;
 
+/// Most memory one sequence may reserve before its elements are read.
+///
+/// wincode reserves from the declared count, so a few bytes claiming a huge count
+/// could reserve its 4 MiB default. No element decodes past 64 bytes per input byte.
+const PREALLOCATION_LIMIT: usize = MAX_TRANSACTION_V1_SIZE * 64;
+
+type DecodeConfig = wincode::config::Configuration<true, PREALLOCATION_LIMIT>;
+
 /// Largest submission this endpoint will read, decided by the leading byte.
 ///
 /// Only v1 earned the bigger ceiling; legacy and v0 stay at the packet size,
@@ -48,12 +56,14 @@ pub fn decode_transaction(tx_data: &[u8]) -> Result<VersionedTransaction, ErrorO
         ));
     }
 
-    wincode::deserialize::<VersionedTransaction>(tx_data).map_err(|e| {
-        custom_error(
-            INVALID_PARAMS_CODE,
-            format!("Failed to deserialize transaction: {}", e),
-        )
-    })
+    wincode::config::deserialize::<VersionedTransaction, _>(tx_data, DecodeConfig::new()).map_err(
+        |e| {
+            custom_error(
+                INVALID_PARAMS_CODE,
+                format!("Failed to deserialize transaction: {}", e),
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -265,7 +275,7 @@ mod tests {
                 num_readonly_signed_accounts: 0,
                 num_readonly_unsigned_accounts: 1,
             },
-            config.clone(),
+            config,
             Hash::default(),
             vec![Pubkey::new_unique(), Pubkey::new_unique()],
             vec![CompiledInstruction {
@@ -325,6 +335,97 @@ mod tests {
     fn empty_input_is_refused_without_panicking() {
         let err = decode_transaction(&[]).expect_err("empty input must be refused");
         assert_eq!(err.code(), INVALID_PARAMS_CODE);
+    }
+
+    /// A tiny legacy submission claiming 65,535 instructions, the largest short-vec count.
+    fn huge_instruction_count() -> Vec<u8> {
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&[0u8; 64]);
+        bytes.extend_from_slice(&[1, 0, 0]);
+        bytes.push(1);
+        bytes.extend_from_slice(&[0u8; 32 + 32]);
+        bytes.extend_from_slice(&[0xff, 0xff, 0x03]);
+        bytes
+    }
+
+    #[test]
+    fn a_huge_declared_count_is_refused_before_reserving_memory() {
+        let bytes = huge_instruction_count();
+
+        let err = decode_transaction(&bytes).expect_err("the claimed count cannot fit");
+        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert!(
+            err.message().contains("preallocation limit"),
+            "the cap, not the end of input, must stop it, got: {}",
+            err.message()
+        );
+
+        // The default config would have reserved it and only failed on the missing bytes.
+        let default = wincode::deserialize::<VersionedTransaction>(&bytes).expect_err("truncated");
+        assert!(!default.to_string().contains("preallocation limit"));
+    }
+
+    /// The cap must never refuse a real transaction, so pack each version to its ceiling
+    /// with the element that reserves the most per input byte.
+    #[test]
+    fn the_densest_valid_transactions_fit_under_the_cap() {
+        let empty = CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![],
+            data: vec![],
+        };
+
+        let with_instructions = |count: usize| {
+            let mut tx = legacy_tx(2, 0);
+            if let VersionedMessage::Legacy(message) = &mut tx.message {
+                message.instructions = vec![empty.clone(); count];
+            }
+            tx
+        };
+        let mut count = 1;
+        while bincode::serialize(&with_instructions(count + 1))
+            .unwrap()
+            .len()
+            <= PACKET_DATA_SIZE
+        {
+            count += 1;
+        }
+        let legacy = with_instructions(count);
+        let bytes = bincode::serialize(&legacy).unwrap();
+        assert_eq!(
+            decode_transaction(&bytes).expect("dense legacy decodes"),
+            legacy
+        );
+
+        let mut instructions = vec![];
+        let v1_tx = |instructions: Vec<CompiledInstruction>| VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V1(v1::Message::new(
+                MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                v1::TransactionConfig::empty(),
+                Hash::default(),
+                vec![Pubkey::new_unique(), Pubkey::new_unique()],
+                instructions,
+            )),
+        };
+        while instructions.len() < usize::from(u8::MAX) {
+            instructions.push(empty.clone());
+            if wincode::serialize(&v1_tx(instructions.clone()))
+                .unwrap()
+                .len()
+                > MAX_TRANSACTION_V1_SIZE
+            {
+                instructions.pop();
+                break;
+            }
+        }
+        let tx = v1_tx(instructions);
+        let bytes = wincode::serialize(&tx).unwrap();
+        assert_eq!(decode_transaction(&bytes).expect("dense v1 decodes"), tx);
     }
 
     #[test]
