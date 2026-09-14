@@ -347,13 +347,14 @@ Replay the indexer over the `AllowMint`'s slot (preferred — same code path
 as production), or insert directly. The gate (`assert_mint_allowed_at_slot`)
 reads **`mint_status_history`**, so backfilling only `mints` loops
 `pending` → `manual_review` forever — both rows are required. Values must
-match the on-chain mint and `AllowMint` flags:
+match the on-chain mint. `status` and `withdrawals_blocked` are left to their
+defaults (`allowed`, open), which is what an `AllowMint` sets:
 
 ```sql
 INSERT INTO mints
-  (mint_address, decimals, token_program, is_pausable, has_permanent_delegate, created_at)
+  (mint_address, decimals, token_program, created_at)
 VALUES
-  (:mint, :decimals, :token_program, :is_pausable, :has_permanent_delegate, NOW());
+  (:mint, :decimals, :token_program, NOW());
 
 -- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
 INSERT INTO mint_status_history

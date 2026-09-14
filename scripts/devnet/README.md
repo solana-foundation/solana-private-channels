@@ -76,8 +76,9 @@ cargo run --bin withdraw -- \
 ```
 
 ## Block Mint (set the deposit / withdrawal gates)
-Both flags are absolute, so passing `false` for one re-opens that gate. Blocking
-deposits leaves already-escrowed balances withdrawable.
+Both flags are absolute, so passing `false` for one re-opens that gate. The script
+prints the current gates before sending and warns when a flag re-opens one.
+Blocking deposits leaves already-escrowed balances withdrawable.
 ```bash
 cargo run --bin block_mint -- \
   https://api.devnet.solana.com \

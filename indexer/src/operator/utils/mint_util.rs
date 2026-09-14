@@ -197,14 +197,14 @@ impl MintCache {
                 }
             })?;
 
-        let cfg =
-            state
-                .get_extension::<PausableConfig>()
-                .map_err(|_| AccountError::InvalidMint {
-                    pubkey: *mint,
-                    reason: "mint is tagged is_pausable but PausableConfig extension is missing"
-                        .to_string(),
-                })?;
+        let cfg = state.get_extension::<PausableConfig>().map_err(|_| {
+            AccountError::MintProfileMismatch {
+                pubkey: *mint,
+                reason: "profile carries the Pausable bit but the mint has no PausableConfig \
+                         extension"
+                    .to_string(),
+            }
+        })?;
 
         Ok(bool::from(cfg.paused))
     }

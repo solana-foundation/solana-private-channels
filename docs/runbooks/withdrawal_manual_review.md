@@ -42,6 +42,7 @@ have prefixes.
 | `insufficient escrow balance:` | A.non-halting | no | pre-flight |
 | `unsupported withdrawal mint:` | A.non-halting | no | allowlist gate |
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
+| `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
@@ -229,6 +230,26 @@ to say explicitly what the user is owed.
      exists. Expect every withdrawal of that mint to park here. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook accounts exceed the per-transfer cap` - the mint's
+     `ExtraAccountMetaList` resolves to more accounts than a release transaction
+     can carry. The message gives the count and the cap. The escrow still holds
+     the funds and the row is intact, but no release of that mint can be sent
+     while the list is this long. Only the hook authority can shorten it, so
+     contact the mint issuer. Expect every withdrawal of that mint to park here,
+     and deposits to fail client-side for the same reason. The cap is the legacy
+     transaction's, not the program's: moving the sender to a versioned
+     transaction with a lookup table would raise it toward the program's 32.
+     [Escalate](_escalation.md) (Tier 2).
+   - `no longer matches its reviewed profile:` - the mint is missing an extension
+     the `AllowedMint` account pinned at allow time, which is what a close and
+     recreate at the same address looks like. The escrow still holds the funds and
+     the row is intact, but nothing on the operator side reconciles the two: only
+     a fresh `AllowMint` re-pins the profile. Confirm the recreate against the
+     mint on chain, review it as a new asset, then `AllowMint` and re-arm the row.
+     Deposits of the mint are already failing on-chain with `MintProfileChanged`
+     for the same reason. Expect every withdrawal of that mint to park here.
+     [Escalate](_escalation.md) (Tier 3): a mint changing underneath a live
+     allowlist entry means the original review no longer describes the asset.
    - `withdrawal mint absent on target chain:` - the mint was allowlisted, so its
      account existed then, and the node answered from a slot at or past that allow
      before reporting nothing. A lagging node cannot produce this message; it

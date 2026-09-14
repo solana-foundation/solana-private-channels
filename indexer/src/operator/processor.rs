@@ -23,6 +23,7 @@ use private_channel_escrow_program_client::AllowedMint;
 use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
+use spl_token_2022::extension::ExtensionType;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -669,9 +670,9 @@ async fn read_withdrawal_allowed_mint(
 /// change through a close and recreate that `Deposit` then rejects. The state behind
 /// each one is still read live, because it moves at any time: a pausable mint can be
 /// paused, a delegate can drain, a hook authority can swap the hook program.
-const EXTENSION_BIT_PERMANENT_DELEGATE: u8 = 12;
-const EXTENSION_BIT_TRANSFER_HOOK: u8 = 14;
-const EXTENSION_BIT_PAUSABLE: u8 = 26;
+const EXTENSION_BIT_PERMANENT_DELEGATE: u8 = ExtensionType::PermanentDelegate as u8;
+const EXTENSION_BIT_TRANSFER_HOOK: u8 = ExtensionType::TransferHook as u8;
+const EXTENSION_BIT_PAUSABLE: u8 = ExtensionType::Pausable as u8;
 
 fn has_extension(extensions: u64, bit: u8) -> bool {
     extensions & (1u64 << bit) != 0
@@ -696,12 +697,24 @@ async fn check_withdrawal_preflights(
 ) -> Result<Option<BailReason>, OperatorError> {
     // The reads below only report a mint absent once the node has passed the slot that
     // allowlisted it, so the account was closed rather than merely not yet visible.
-    // That is not fixed by retrying, so it parks the row instead of restarting us.
+    // Neither that nor a drifted profile is fixed by retrying, so both park the row
+    // instead of restarting us.
     match check_withdrawal_preflights_inner(processor_state, transaction, allowed_mint).await {
         Err(OperatorError::Account(AccountError::TargetMintMissing { pubkey })) => {
             Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_TARGET_MINT_MISSING,
                 format!("withdrawal mint absent on target chain: {pubkey}"),
+            )))
+        }
+        // A mint that dropped something the profile pinned was recreated. No
+        // release can be built for it, so park rather than raise a transient the
+        // task would restart on forever.
+        Err(OperatorError::Account(AccountError::MintProfileMismatch { pubkey, reason })) => {
+            Ok(Some(BailReason::new(
+                metrics::BAIL_REASON_MINT_PROFILE_MISMATCH,
+                format!(
+                    "withdrawal mint {pubkey} no longer matches its reviewed profile: {reason}"
+                ),
             )))
         }
         other => other,
@@ -795,9 +808,13 @@ async fn check_withdrawal_preflights_inner(
     Ok(None)
 }
 
-/// Mirrors `MAX_HOOK_REMAINING_ACCOUNTS` in the escrow's `token_utils`, which
-/// codama does not export. Past it the program rejects the transfer.
-const MAX_HOOK_REMAINING_ACCOUNTS: usize = 32;
+/// The program caps extras at 32 (`MAX_HOOK_REMAINING_ACCOUNTS` in its
+/// `token_utils`, which codama does not export), but the transport binds first:
+/// the sender builds a legacy message with no lookup tables, and the 1232-byte
+/// packet holds 699 bytes of release plus 33 per extra, so 16 fit and 17 does
+/// not. Raise it toward 32 if the sender ever moves to versioned transactions
+/// with a lookup table, or to v1 transactions with their larger limit.
+const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 16;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.
@@ -867,11 +884,11 @@ async fn attach_hook_extras(
         )));
     };
 
-    if hook_extras.len() > MAX_HOOK_REMAINING_ACCOUNTS {
+    if hook_extras.len() > MAX_HOOK_EXTRAS_LEGACY_TX {
         return Ok(Some(BailReason::new(
             metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
             format!(
-                "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {}",
+                "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {} > {MAX_HOOK_EXTRAS_LEGACY_TX}",
                 hook_extras.len()
             ),
         )));
@@ -1242,6 +1259,9 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use solana_client::rpc_request::RpcRequest;
+    use solana_sdk::program_option::COption;
+    use solana_sdk::program_pack::Pack;
+    use spl_token_2022::state::Mint as Token2022MintState;
 
     fn make_release_funds_state() -> ReleaseFundsState {
         let instance_pda = Pubkey::new_unique();
@@ -2006,6 +2026,76 @@ mod tests {
             .expect("error_message must be set");
         assert!(
             msg.contains("withdrawal mint absent on target chain")
+                && msg.contains(&mint.to_string()),
+            "unexpected error_message: {msg}"
+        );
+        assert!(builder.is_none(), "no builder may be dispatched");
+    }
+
+    /// The profile pins Pausable but the live mint no longer carries the
+    /// extension, which is what a recreate looks like. No release can be built
+    /// for it, so the row parks instead of raising a transient the supervisor
+    /// would restart on forever.
+    #[tokio::test]
+    async fn a_mint_that_lost_a_pinned_extension_parks_the_row() {
+        let mint = Pubkey::new_unique();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_token_2022_mint_row(&storage, &mint);
+
+        let (mut ps, mut server) = processor_state_for(
+            &storage,
+            &mint,
+            allowed_mint_bytes_token_2022(1 << EXTENSION_BIT_PAUSABLE),
+        )
+        .await;
+
+        // A base Token-2022 mint: parses fine, carries no extensions at all.
+        let mut mint_bytes = vec![0u8; Token2022MintState::LEN];
+        Token2022MintState::pack_into_slice(
+            &Token2022MintState {
+                mint_authority: COption::None,
+                supply: 1_000_000,
+                decimals: 6,
+                is_initialized: true,
+                freeze_authority: COption::None,
+            },
+            &mut mint_bytes,
+        );
+
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(mint.to_string()))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 500},
+                        "value": {
+                            "owner": spl_token_2022::id().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [STANDARD.encode(&mint_bytes), "base64"],
+                            "executable": false,
+                            "rentEpoch": 0
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        assume_mint_allowlisted(&mut ps, &mint);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "a drifted mint must not exit the task");
+        let msg = update
+            .expect("row must be parked")
+            .error_message
+            .expect("error_message must be set");
+        assert!(
+            msg.contains("no longer matches its reviewed profile")
                 && msg.contains(&mint.to_string()),
             "unexpected error_message: {msg}"
         );

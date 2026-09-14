@@ -1,4 +1,5 @@
 use private_channel_escrow_program_client::{
+    accounts::AllowedMint,
     instructions::{BlockMint, BlockMintInstructionArgs},
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
@@ -66,16 +67,32 @@ fn main() -> Result<()> {
 
     // BlockMint only updates the existing PDA, so a mint that was never allowed
     // has nothing to set. Fail here rather than on-chain.
-    if client.get_account(&allowed_mint_pda).is_err() {
+    let Ok(allowed_mint_account) = client.get_account(&allowed_mint_pda) else {
         return Err(format!(
             "No AllowedMint account at {} — allow the mint first",
             allowed_mint_pda
         )
         .into());
-    }
+    };
+
+    let current = AllowedMint::from_bytes(&allowed_mint_account.data)
+        .map_err(|e| format!("Failed to decode AllowedMint: {}", e))?;
 
     println!("\nSetting mint gates...");
     println!("Allowed Mint PDA: {}", allowed_mint_pda);
+    println!(
+        "Current on-chain: deposits_blocked={}, withdrawals_blocked={}",
+        current.deposits_blocked, current.withdrawals_blocked
+    );
+
+    // Both flags are absolute, so a gate the caller did not set is re-opened
+    // whether or not they knew it was closed.
+    if current.deposits_blocked && !block_deposits {
+        println!("WARNING: this re-opens the deposit gate.");
+    }
+    if current.withdrawals_blocked && !block_withdrawals {
+        println!("WARNING: this re-opens the withdrawal gate.");
+    }
 
     let instruction = BlockMint {
         payer: admin_keypair.pubkey(),
