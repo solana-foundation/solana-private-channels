@@ -53,17 +53,40 @@ enum SignerType {
 }
 
 impl SignerType {
-    fn from_str(s: &str) -> Result<Self, SignerError> {
+    fn from_str(s: &str) -> Result<Self, LoadError> {
         match s.to_lowercase().as_str() {
             "memory" => Ok(Self::Memory),
             "vault" => Ok(Self::Vault),
             "turnkey" => Ok(Self::Turnkey),
             "privy" => Ok(Self::Privy),
-            other => Err(SignerError::InvalidPrivateKey(format!(
+            other => Err(LoadError::Config(format!(
                 "Unsupported signer type: {}. Supported: memory, vault, turnkey, privy",
                 other
             ))),
         }
+    }
+}
+
+/// Why a signer failed to load. `Config` names only env vars, never their values, so it
+/// is safe to print; the keychain redacts its own errors, which would hide the var name.
+#[derive(Debug)]
+enum LoadError {
+    Config(String),
+    Keychain(SignerError),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(reason) => f.write_str(reason),
+            Self::Keychain(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<SignerError> for LoadError {
+    fn from(e: SignerError) -> Self {
+        Self::Keychain(e)
     }
 }
 
@@ -75,28 +98,32 @@ enum SignerRole {
 }
 
 /// Global admin signer (required for both programs)
-static ADMIN_SIGNER_INSTANCE: Lazy<Signer> =
-    Lazy::new(|| load_signer(SignerRole::Admin).expect("ADMIN_SIGNER must be configured"));
+static ADMIN_SIGNER_INSTANCE: Lazy<Signer> = Lazy::new(|| {
+    load_signer(SignerRole::Admin)
+        .unwrap_or_else(|e| panic!("ADMIN_SIGNER must be configured: {e}"))
+});
 
 /// Global operator signer (optional, only for release funds)
 static OPERATOR_SIGNER_INSTANCE: Lazy<Option<Signer>> =
     Lazy::new(|| match load_signer(SignerRole::Operator) {
         Ok(signer) => Some(signer),
-        Err(_) => {
-            warn!("OPERATOR_SIGNER not configured - release funds will use admin as operator");
+        Err(e) => {
+            warn!(
+                "OPERATOR_SIGNER not configured ({e}) - release funds will use admin as operator"
+            );
             None
         }
     });
 
 /// Load signer from environment variables
-fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
+fn load_signer(role: SignerRole) -> Result<Signer, LoadError> {
     let (role_name, type_var) = match role {
         SignerRole::Admin => ("admin", ADMIN_SIGNER),
         SignerRole::Operator => ("operator", OPERATOR_SIGNER),
     };
 
-    let signer_type_str = env::var(type_var)
-        .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", type_var)))?;
+    let signer_type_str =
+        env::var(type_var).map_err(|_| LoadError::Config(format!("{} not set", type_var)))?;
     let signer_type = SignerType::from_str(&signer_type_str)?;
 
     let signer = match signer_type {
@@ -105,12 +132,11 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 SignerRole::Admin => ADMIN_PRIVATE_KEY,
                 SignerRole::Operator => OPERATOR_PRIVATE_KEY,
             };
-            let private_key = env::var(private_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", private_key_var))
-            })?;
+            let private_key = env::var(private_key_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", private_key_var)))?;
             // Reject a set-but-empty value: env::var returns Ok("") for a blank var.
             if private_key.trim().is_empty() {
-                return Err(SignerError::InvalidPrivateKey(format!(
+                return Err(LoadError::Config(format!(
                     "{} is set but empty",
                     private_key_var
                 )));
@@ -133,17 +159,15 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                     OPERATOR_VAULT_PUBKEY,
                 ),
             };
-            let vault_addr = env::var(vault_addr_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", vault_addr_var))
-            })?;
-            let vault_token = env::var(vault_token_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", vault_token_var))
-            })?;
+            let vault_addr = env::var(vault_addr_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", vault_addr_var)))?;
+            let vault_token = env::var(vault_token_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", vault_token_var)))?;
 
             let key_name = env::var(key_name_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", key_name_var)))?;
+                .map_err(|_| LoadError::Config(format!("{} not set", key_name_var)))?;
             let pubkey = env::var(pubkey_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
+                .map_err(|_| LoadError::Config(format!("{} not set", pubkey_var)))?;
             Signer::from_vault(vault_addr, vault_token, key_name, pubkey, None)?
         }
         SignerType::Turnkey => {
@@ -169,20 +193,16 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                     OPERATOR_TURNKEY_PRIVATE_KEY_ID,
                 ),
             };
-            let api_public_key = env::var(api_public_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", api_public_key_var))
-            })?;
-            let api_private_key = env::var(api_private_key_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", api_private_key_var))
-            })?;
-            let organization_id = env::var(organization_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", organization_id_var))
-            })?;
+            let api_public_key = env::var(api_public_key_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", api_public_key_var)))?;
+            let api_private_key = env::var(api_private_key_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", api_private_key_var)))?;
+            let organization_id = env::var(organization_id_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", organization_id_var)))?;
             let public_key = env::var(pubkey_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", pubkey_var)))?;
-            let private_key_id = env::var(private_key_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", private_key_id_var))
-            })?;
+                .map_err(|_| LoadError::Config(format!("{} not set", pubkey_var)))?;
+            let private_key_id = env::var(private_key_id_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", private_key_id_var)))?;
             Signer::from_turnkey(
                 api_public_key,
                 api_private_key,
@@ -206,13 +226,11 @@ fn load_signer(role: SignerRole) -> Result<Signer, SignerError> {
                 ),
             };
             let app_id = env::var(app_id_var)
-                .map_err(|_| SignerError::InvalidPrivateKey(format!("{} not set", app_id_var)))?;
-            let app_secret = env::var(app_secret_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", app_secret_var))
-            })?;
-            let wallet_id = env::var(wallet_id_var).map_err(|_| {
-                SignerError::InvalidPrivateKey(format!("{} not set", wallet_id_var))
-            })?;
+                .map_err(|_| LoadError::Config(format!("{} not set", app_id_var)))?;
+            let app_secret = env::var(app_secret_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", app_secret_var)))?;
+            let wallet_id = env::var(wallet_id_var)
+                .map_err(|_| LoadError::Config(format!("{} not set", wallet_id_var)))?;
 
             // Block on async initialization
             tokio::runtime::Handle::current()
@@ -259,22 +277,12 @@ mod tests {
     // environment variables (set_var / remove_var).
     use serial_test::serial;
 
-    /// The message a signer error carries, which its Display no longer shows.
-    /// The keychain redacts every payload from Display and Debug so a secret
-    /// cannot reach a log, but matching on the variant still reads it.
-    fn detail(err: &SignerError) -> &str {
-        match err {
-            SignerError::InvalidPrivateKey(message) => message,
-            other => panic!("expected InvalidPrivateKey, got {other:?}"),
-        }
-    }
-
     /// Only "memory", "vault", "turnkey", and "privy" are valid signer types; any other
     /// string, including an empty one, must return an InvalidPrivateKey error.
     #[test]
     fn signer_type_from_str_unknown_errors() {
         let err = SignerType::from_str("unknown").unwrap_err();
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
             msg.contains("Unsupported signer type"),
             "unexpected error: {msg}"
@@ -293,9 +301,9 @@ mod tests {
         let err = load_signer(SignerRole::Admin)
             .err()
             .expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("ADMIN_SIGNER") || msg.contains("not set"),
+            msg.contains("ADMIN_SIGNER") && msg.contains("not set"),
             "error should name the missing var, got: {msg}"
         );
 
@@ -317,9 +325,9 @@ mod tests {
         let err = load_signer(SignerRole::Admin)
             .err()
             .expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("ADMIN_PRIVATE_KEY") || msg.contains("not set"),
+            msg.contains("ADMIN_PRIVATE_KEY") && msg.contains("not set"),
             "error should name the missing var, got: {msg}"
         );
 
@@ -346,7 +354,7 @@ mod tests {
             let err = load_signer(SignerRole::Admin)
                 .err()
                 .expect("set-but-empty private key must be rejected");
-            let msg = detail(&err);
+            let msg = err.to_string();
             assert!(
                 msg.contains("ADMIN_PRIVATE_KEY") && msg.contains("is set but empty"),
                 "error should flag the empty var, got: {msg}"
@@ -376,9 +384,9 @@ mod tests {
         let result = load_signer(SignerRole::Admin);
         assert!(result.is_err());
         let err = result.err().expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("ADMIN_VAULT_ADDR") || msg.contains("not set"),
+            msg.contains("ADMIN_VAULT_ADDR") && msg.contains("not set"),
             "Unexpected error: {}",
             msg
         );
@@ -406,9 +414,9 @@ mod tests {
         let result = load_signer(SignerRole::Admin);
         assert!(result.is_err());
         let err = result.err().expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("ADMIN_TURNKEY_API_PUBLIC_KEY") || msg.contains("not set"),
+            msg.contains("ADMIN_TURNKEY_API_PUBLIC_KEY") && msg.contains("not set"),
             "Unexpected error: {}",
             msg
         );
@@ -436,9 +444,9 @@ mod tests {
         let result = load_signer(SignerRole::Admin);
         assert!(result.is_err());
         let err = result.err().expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("ADMIN_PRIVY_APP_ID") || msg.contains("not set"),
+            msg.contains("ADMIN_PRIVY_APP_ID") && msg.contains("not set"),
             "Unexpected error: {}",
             msg
         );
@@ -464,9 +472,9 @@ mod tests {
         let err = load_signer(SignerRole::Operator)
             .err()
             .expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("OPERATOR_SIGNER") || msg.contains("not set"),
+            msg.contains("OPERATOR_SIGNER") && msg.contains("not set"),
             "error should name the missing var, got: {msg}"
         );
 
@@ -488,9 +496,9 @@ mod tests {
         let err = load_signer(SignerRole::Operator)
             .err()
             .expect("expected error");
-        let msg = detail(&err);
+        let msg = err.to_string();
         assert!(
-            msg.contains("OPERATOR_PRIVATE_KEY") || msg.contains("not set"),
+            msg.contains("OPERATOR_PRIVATE_KEY") && msg.contains("not set"),
             "error should name the missing var, got: {msg}"
         );
 

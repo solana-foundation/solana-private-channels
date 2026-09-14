@@ -140,12 +140,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 url = "2.5.7"
 wiremock = "0.6"
 uuid = { version = "1", features = ["v4"] }
-# YELLOWSTONE_TAG=v12.3.0+solana.3.1.13 is the geyser *binary* tag from the
-# upstream monorepo; the `+solana.3.1.13` is build metadata that pins the
-# Solana crates it was compiled against. The client/proto crates on crates.io
-# were not re-published for 12.3 (next published version is 13.0), so ~12.2
-# is the correct client pin against a 12.3 server — the proto surface is
-# unchanged between the two.
+# YELLOWSTONE_TAG in versions.env is the geyser plugin binary; the crates.io client and
+# proto are numbered separately. Client 13.5 requires proto 12.7, the line built on
+# Solana 4.x crates, and the geyser integration suites run both against that plugin.
 yellowstone-grpc-client = "13.5"
 yellowstone-grpc-proto = "12.7"
 private-channel-core = { path = "core" }
