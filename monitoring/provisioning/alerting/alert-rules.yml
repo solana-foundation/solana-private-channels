@@ -628,6 +628,40 @@ groups:
                     params: [0]
               refId: C
 
+      - uid: live-state-lock-lost
+        title: "Live-state lock ownership could not be proven"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Role {{ $labels.role }} ({{ $labels.job }}) could not prove it still owns the live-state lock (reason {{ $labels.reason }}) and stopped itself. This lock is what keeps live workers and a destructive resync off the same database, so while it is unheld that separation is not enforced. Runbook: docs/runbooks/live_state_lock_runbook.md. Confirm the process restarted and that the database-side cause (failover, idle reaper, pooler) is understood. A reason of not_held or probe_error fired on the first bad probe; probe_timeout means the database went unanswerable for a full 30s, so this alert trails that event by up to that long. Only indexer and operator can page here; resync is a one-shot command with no metrics server, so its own loss surfaces as a failed command instead."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_live_state_lock_lost_total[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
   - orgId: 1
     name: bitmap-rotation-alerts
     folder: Solana Private Channels Alerts

@@ -33,7 +33,7 @@ use private_channel_escrow_program_client::{
 };
 use private_channel_indexer::{
     config::{BackfillConfig, ProgramType, ReconciliationConfig},
-    error::{IndexerError, ReconciliationError},
+    error::{IndexerError, ReconciliationError, StorageError},
     indexer::{
         datasource::rpc_polling::rpc::RpcPoller,
         reconciliation::run_startup_reconciliation,
@@ -43,7 +43,10 @@ use private_channel_indexer::{
         utils::instruction_util::{mint_idempotency_memo, remint_idempotency_memo, SourceEventId},
         ConsumedMintKind, CONSUMED_SET_PAGE_SIZE,
     },
-    storage::{PostgresDb, Storage},
+    storage::{
+        common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
+        PostgresDb, Storage,
+    },
     PostgresConfig,
 };
 use serde_json::{json, Value};
@@ -67,8 +70,14 @@ use test_utils::{
 };
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+use tokio_util::sync::CancellationToken;
 
 // ── constants ───────────────────────────────────────────────────────────────
+
+/// Slots the mid-rebuild loss test backfills over, one round trip each. Wide enough
+/// that the fill is still running well after the lock is pulled, and recent enough
+/// that every block in the range is retrievable.
+const BACKFILL_SPAN_SLOTS: u64 = 300;
 
 /// Upper bound for a full resync (drop + schema + backfill + drain).
 const RESYNC_TIMEOUT_SECS: u64 = 180;
@@ -119,6 +128,39 @@ async fn start_postgres_for_resync(
         .await?,
     ));
     storage.init_schema().await?;
+
+    Ok((db_url, storage, container))
+}
+
+/// Same as above but leaves the database empty, so a test can prove resync builds
+/// its own schema rather than assuming one is already there.
+async fn start_bare_postgres_for_resync(
+    db_name: &str,
+) -> Result<
+    (
+        String,
+        Arc<Storage>,
+        testcontainers::ContainerAsync<Postgres>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let container = Postgres::default()
+        .with_db_name(db_name)
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{}:{}/{}", host, port, db_name);
+
+    let storage = Arc::new(Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 5,
+        })
+        .await?,
+    ));
 
     Ok((db_url, storage, container))
 }
@@ -1473,5 +1515,263 @@ async fn resync_aborts_on_legacy_scheme_memo_db_intact() -> Result<(), Box<dyn s
     );
 
     mock.shutdown().await;
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Live-state lock and halt refusal
+// ════════════════════════════════════════════════════════════════════════════
+
+/// I6. The finding itself: a resync must not destroy a database that live workers
+/// are still using. A worker's shared lock stands in for the running process, and
+/// the refusal has to land before the drop, not after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_refuses_while_a_worker_holds_the_live_lock(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (test_validator, _faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = test_validator.rpc_url();
+    let (db_url, storage, _container) = start_postgres_for_resync("resync_live_lock_test").await?;
+
+    seed_pending_deposit(&db_url, "resync_live_lock_seed").await;
+
+    // A separate pool, standing in for a live indexer or operator process.
+    let worker_storage = Arc::new(Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 5,
+        })
+        .await?,
+    ));
+    let worker_lock = worker_storage
+        .try_acquire_live_lock(
+            LiveLockMode::Shared,
+            "i6_worker",
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await?;
+
+    let service = make_resync_service(rpc_url.clone(), storage);
+    let refused = service.run(0).await;
+    assert!(
+        matches!(
+            refused,
+            Err(IndexerError::Storage(StorageError::LiveStateLockHeld {
+                requested: LiveLockMode::Exclusive
+            }))
+        ),
+        "resync must refuse while a worker holds the lock, got: {refused:?}"
+    );
+    assert_eq!(
+        row_count(&db_url).await,
+        1,
+        "the refusal must leave the live database untouched"
+    );
+
+    // With the worker stopped the same resync goes through, so the guard blocks the
+    // dangerous case without blocking the supported one.
+    worker_lock.stop_and_wait().await;
+    let storage = Arc::new(Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url.clone(),
+            max_connections: 5,
+        })
+        .await?,
+    ));
+    let current_slot = {
+        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
+        client.get_slot()?
+    };
+    let service = make_resync_service(rpc_url, storage);
+    run_resync(&service, current_slot)
+        .await
+        .expect("resync must succeed once no worker holds the lock");
+    assert_eq!(
+        row_count(&db_url).await,
+        0,
+        "the rebuild must have replaced the seeded row"
+    );
+    Ok(())
+}
+
+/// I7. A reconciliation halt is a solvency interlock living in a table the rebuild
+/// drops. Refuse rather than clear it silently, and leave the evidence in place.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_refuses_when_reconciliation_halt_is_set() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (test_validator, _faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = test_validator.rpc_url();
+    let (db_url, storage, _container) = start_postgres_for_resync("resync_halt_test").await?;
+
+    seed_pending_deposit(&db_url, "resync_halt_seed").await;
+    storage
+        .set_reconciliation_halt("supply above custody on mint X")
+        .await?;
+
+    let service = make_resync_service(rpc_url, storage.clone());
+    let refused = service.run(0).await;
+    assert!(
+        matches!(
+            refused,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::ReconciliationHalted { .. }
+            ))
+        ),
+        "a halted database must refuse to resync, got: {refused:?}"
+    );
+    assert_eq!(
+        row_count(&db_url).await,
+        1,
+        "the refusal must leave the live database untouched"
+    );
+    assert!(
+        storage.is_reconciliation_halted().await?.is_some(),
+        "the halt flag itself must survive the refusal"
+    );
+    Ok(())
+}
+
+/// I8. Resync also has to work on a database that has never been indexed, which is
+/// the case the halt read would otherwise fail on with a missing table.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_initializes_schema_on_a_fresh_database() -> Result<(), Box<dyn std::error::Error>> {
+    let (test_validator, _faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = test_validator.rpc_url();
+    let (db_url, storage, _container) = start_bare_postgres_for_resync("resync_fresh_db").await?;
+
+    let current_slot = {
+        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
+        client.get_slot()?
+    };
+    let service = make_resync_service(rpc_url, storage);
+    run_resync(&service, current_slot)
+        .await
+        .expect("resync must build its own schema on an empty database");
+
+    assert_eq!(
+        row_count(&db_url).await,
+        0,
+        "a rebuild on an empty database must leave a usable, empty schema"
+    );
+    Ok(())
+}
+
+/// Is the pre-resync seed still there? False once the rebuild has dropped and
+/// recreated the table, and also while the table is briefly missing, which is the
+/// moment this is polled across.
+async fn seeded_rows_remain(pool: &sqlx::PgPool) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM transactions")
+        .fetch_one(pool)
+        .await
+        .is_ok_and(|n| n > 0)
+}
+
+/// Kill the backend holding the live-state key, standing in for a failover or an
+/// idle-session reap pulling the lock out from under a running rebuild.
+async fn terminate_live_lock_holder(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_locks
+         WHERE locktype = 'advisory' AND objsubid = 1 AND granted
+           AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(LIVE_STATE_LOCK_KEY)
+    .execute(pool)
+    .await
+    .expect("terminate the live-state lock holder");
+}
+
+/// I12. Losing the lock mid-rebuild means a worker can start against a database
+/// that is only half rebuilt. The rebuild must stop rather than race it, and stop
+/// both writers outright: letting the checkpoint writer flush would commit a
+/// durable frontier over a half-rebuilt database and leave no gap to detect later.
+///
+/// The kill is gated on the drop having already happened, so this can only be the
+/// mid-rebuild arm. The synchronous check that guards the drop runs strictly
+/// earlier, and nothing after it re-checks, so no other path returns this error.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (test_validator, _faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = test_validator.rpc_url();
+    let (db_url, storage, _container) = start_postgres_for_resync("resync_lock_lost_mid").await?;
+
+    seed_pending_deposit(&db_url, "resync_lock_lost_seed").await;
+
+    let current_slot = {
+        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
+        client.get_slot()?
+    };
+    // Recent slots only, so every block is retrievable, and one round trip per slot
+    // so the fill is long enough to still be running when the lock goes.
+    let genesis_slot = current_slot.saturating_sub(BACKFILL_SPAN_SLOTS);
+
+    let rpc_poller = Arc::new(RpcPoller::new(
+        rpc_url.clone(),
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Finalized,
+    ));
+    let service = ResyncService::new(
+        storage,
+        rpc_poller,
+        ProgramType::Escrow,
+        BackfillConfig {
+            enabled: true,
+            exit_after_backfill: true,
+            rpc_url,
+            batch_size: 1,
+            max_gap_slots: u64::MAX,
+            start_slot: None,
+        },
+        Some(Pubkey::new_unique()),
+    )
+    .with_lock_heartbeat_interval(Duration::from_millis(5));
+
+    // Pull the lock the moment the seeded row is gone, which is the drop landing. One
+    // pool for the whole task, since opening a fresh one per poll would cost more than
+    // the window being aimed at.
+    let killer_url = db_url.clone();
+    let killer = tokio::spawn(async move {
+        let pool = fresh_pool(&killer_url).await;
+        // Bounded, so a resync that failed before the drop fails this test instead of
+        // hanging it: nothing would ever clear the seed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while seeded_rows_remain(&pool).await {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        terminate_live_lock_holder(&pool).await;
+        true
+    });
+
+    let result = service.run(genesis_slot).await;
+    assert!(
+        killer.await.expect("killer task"),
+        "the rebuild never reached the drop, so the lock was never pulled mid-rebuild"
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "a lock lost mid-rebuild must abort the rebuild, got: {result:?}"
+    );
+
+    // The frontier is what makes a half-rebuilt database look complete, so it is the one
+    // thing that must never survive a lost lock. Every phase of the rebuild is watched
+    // for exactly this reason, including the flush that runs after the fill returns.
+    let pool = fresh_pool(&db_url).await;
+    let committed: Option<i64> =
+        sqlx::query_scalar("SELECT last_committed_slot FROM indexer_state LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+    assert!(
+        committed.is_none_or(|slot| slot <= genesis_slot as i64),
+        "a lost lock must not leave a durable frontier over a half-rebuilt database, got {committed:?}"
+    );
     Ok(())
 }

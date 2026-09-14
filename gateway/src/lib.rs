@@ -1526,8 +1526,9 @@ mod tests {
             {
                 let mut buf = vec![0u8; 4096];
                 let _ = stream.read(&mut buf).await;
+                // Close after one reply so the pooled client never reuses a socket this mock drops.
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 );

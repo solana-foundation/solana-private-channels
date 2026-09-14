@@ -2,13 +2,14 @@ use {
     super::{postgres::PostgresAccountsDB, traits::BlockInfo},
     crate::accounts::address_index_watermark::ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
     anyhow::{anyhow, Context, Result},
-    sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row},
+    sqlx::{Connection, Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row},
     std::{
         collections::HashSet,
         fs,
         path::{Path, PathBuf},
         time::{Duration, SystemTime},
     },
+    tracing::error,
 };
 
 const FIRST_AVAILABLE_BLOCK_KEY: &str = "first_available_block";
@@ -81,9 +82,20 @@ pub async fn truncate_slots(
 
     let pool = db.pool.clone();
 
+    // The lock belongs to one session, so acquire and release have to run on the
+    // same connection. Unlocking from a different one is a silent no-op that
+    // strands the lock until that connection is recycled.
+    //
+    // The session is opened outside the pool, not reserved from it: the work below
+    // needs the pool, and a one-connection pool is a legal setting. sqlx also does
+    // not reset a returned connection, so a stranded lock would never free.
+    let mut lock_conn = PgConnection::connect_with(&pool.connect_options())
+        .await
+        .context("Failed to open the truncation lock session")?;
+
     let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .fetch_one(pool.as_ref())
+        .fetch_one(&mut lock_conn)
         .await
         .context("Failed to acquire advisory lock")?;
     if !acquired {
@@ -94,11 +106,30 @@ pub async fn truncate_slots(
 
     let result = truncate_slots_inner(pool.as_ref(), options).await;
 
-    sqlx::query("SELECT pg_advisory_unlock($1)")
+    // Read the answer rather than discarding it: false means this session did not
+    // hold the lock, which is the bug above and must not pass unnoticed.
+    let released = match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
         .bind(TRUNCATE_ADVISORY_LOCK_ID)
-        .execute(pool.as_ref())
+        .fetch_one(&mut lock_conn)
         .await
-        .context("Failed to release advisory lock")?;
+    {
+        Ok(released) => released,
+        Err(e) => {
+            // Returning drops the session, and closing its socket frees the lock.
+            if let Err(run_err) = result {
+                error!("Truncation failed before its lock could be released: {run_err:#}");
+            }
+            return Err(anyhow!(e).context("Failed to release advisory lock"));
+        }
+    };
+    if !released {
+        if let Err(run_err) = result {
+            error!("Truncation failed, and its lock was not held by this session: {run_err:#}");
+        }
+        return Err(anyhow!(
+            "Truncation advisory lock was not held by the releasing session"
+        ));
+    }
 
     result
 }
@@ -584,6 +615,7 @@ fn is_noop_archive_command(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn compute_cutoff_slot_keeps_recent_window() {
@@ -801,17 +833,13 @@ mod tests {
         assert_eq!(updated, 1, "expected to corrupt exactly one block");
     }
 
-    /// Run one truncation against a pool of its own, close it, and wait until the
-    /// server has actually dropped the truncation advisory lock.
+    /// Run one truncation against a pool of its own and prove the lock is gone
+    /// before the pool is torn down.
     ///
-    /// `truncate_slots` takes that lock on whichever pooled connection serves the
-    /// acquire statement and releases it on whichever connection serves the
-    /// release statement. Those are not guaranteed to be the same connection, so
-    /// a second run against a still-open pool can find the lock held by an idle
-    /// one. Closing the pool ends those sessions, but the backends exit
-    /// asynchronously, so the wait below is what makes multi-run tests
-    /// deterministic. This is test scaffolding only; the lock's connection
-    /// affinity is not part of this change.
+    /// The check runs while the pool is still open on purpose. `truncate_slots`
+    /// holds the lock on one reserved connection and releases it there, so the
+    /// lock must be gone the moment it returns. Closing the pool first would free
+    /// the lock as a side effect and hide a release that never happened.
     async fn truncate_on_fresh_pool(
         url: &str,
         options: &TruncateOptions,
@@ -821,27 +849,126 @@ mod tests {
             .await
             .expect("test pool connects");
         let report = truncate_slots(&db, options).await;
+        assert_advisory_locks_released(observer).await;
         db.pool.close().await;
-        await_advisory_locks_released(observer).await;
         report
     }
 
-    /// Block until no advisory lock is held anywhere on the test database. Each
-    /// test owns its container, so the truncation lock is the only one possible.
-    async fn await_advisory_locks_released(pool: &PgPool) {
-        for _ in 0..600 {
-            let held = sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
-            )
+    /// No advisory lock may be held once a truncation has returned. Asserted once
+    /// rather than polled: the release is synchronous, so a retry loop here would
+    /// only turn a stranded lock into a slow test that passes.
+    async fn assert_advisory_locks_released(pool: &PgPool) {
+        let held = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_locks is readable");
+        assert_eq!(
+            held, 0,
+            "truncate_slots must release its advisory lock before returning"
+        );
+    }
+
+    /// A one-connection pool is a legal setting, so the lock session must not come
+    /// out of the pool: taking it from there leaves nothing for the truncation
+    /// itself, which then waits out the acquire timeout and fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncate_runs_on_a_single_connection_pool() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        // A short timeout so a regression fails in seconds rather than the 30s default.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("single-connection pool connects");
+        let starved = PostgresAccountsDB {
+            pool: Arc::new(pool),
+            read_only: false,
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let report = truncate_slots(&starved, &apply_opts(5, 100, tmp.path()))
+            .await
+            .expect("truncation must not starve itself of connections");
+        assert_eq!(report.blocks_deleted, 15);
+    }
+
+    /// A pool whose sessions resolve `pg_advisory_unlock` to a function that raises.
+    ///
+    /// The acquire still takes the real lock, so this reproduces the one case that
+    /// actually strands a key: the release fails while the session stays alive and goes on
+    /// holding it. Terminating the backend would not do, since that frees the lock itself
+    /// and the bug would vanish with it.
+    async fn pool_whose_release_fails(url: &str) -> PgPool {
+        let mut setup = sqlx::postgres::PgConnection::connect(url)
+            .await
+            .expect("setup connects");
+        for sql in [
+            "CREATE SCHEMA IF NOT EXISTS shadow",
+            "CREATE OR REPLACE FUNCTION shadow.pg_advisory_unlock(bigint) RETURNS boolean
+             AS $$ BEGIN RAISE EXCEPTION 'release refused'; END; $$ LANGUAGE plpgsql",
+        ] {
+            sqlx::query(sql)
+                .execute(&mut setup)
+                .await
+                .expect("shadow function is created");
+        }
+        setup.close().await.expect("setup closes");
+
+        // Set at connect time rather than in a hook, so the lock session opened from the
+        // pool's options is shadowed too. pg_catalog is named second so the shadow wins.
+        let options = url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("test url parses")
+            .options([("search_path", "shadow,pg_catalog,public")]);
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .expect("shadowed pool connects")
+    }
+
+    /// Advisory locks still held anywhere on the database.
+    async fn advisory_locks_held(pool: &PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
             .fetch_one(pool)
             .await
-            .expect("pg_locks is readable");
-            if held == 0 {
+            .expect("pg_locks is readable")
+    }
+
+    /// A release that fails leaves this session still holding the key, so the connection
+    /// must not go back to the pool. Pooled, it would strand the lock and refuse every
+    /// later truncation until that connection happened to be recycled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_release_does_not_return_a_locked_connection_to_the_pool() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+
+        let shadowed = PostgresAccountsDB {
+            pool: Arc::new(pool_whose_release_fails(&url).await),
+            read_only: false,
+        };
+        let outcome = truncate_slots(&shadowed, &apply_opts(10, 3, tmp.path())).await;
+        assert!(
+            outcome.is_err(),
+            "a release that raises must fail the run, got {outcome:?}"
+        );
+
+        // Bounded poll, not tolerance: a detached socket frees the key a moment after the
+        // close, while a pooled one holds it for as long as the pool lives, so this cannot
+        // pass by waiting.
+        for _ in 0..50 {
+            if advisory_locks_held(db.pool.as_ref()).await == 0 {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        panic!("truncation advisory lock still held after its pool was closed");
+        panic!("a connection that could not release its lock must not be pooled still holding it");
     }
 
     fn apply_opts(keep_slots: u64, batch_size: usize, backup: &Path) -> TruncateOptions {
