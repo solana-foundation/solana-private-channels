@@ -164,6 +164,13 @@ impl AccountsDB {
         super::get_accounts::get_accounts(self, accounts).await
     }
 
+    pub async fn get_account_data_sizes(
+        &self,
+        accounts: &[Pubkey],
+    ) -> Result<Vec<usize>, AccountLoadError> {
+        super::get_accounts::get_account_data_sizes(self, accounts).await
+    }
+
     pub async fn store_performance_sample(
         &mut self,
         sample: solana_rpc_client_types::response::RpcPerfSample,

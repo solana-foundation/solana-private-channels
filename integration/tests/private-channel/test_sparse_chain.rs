@@ -702,8 +702,8 @@ async fn get_slot_does_not_regress_across_a_restart() -> Result<()> {
     Ok(())
 }
 
-/// Hold an ACCESS EXCLUSIVE lock on `accounts` so the executor's preload SELECT
-/// parks until the returned transaction is committed. A heartbeat block writes
+/// Hold an ACCESS EXCLUSIVE lock on `accounts` so the executor's account reads
+/// park until the returned transaction is committed. A heartbeat block writes
 /// no accounts, so the chain keeps producing blocks and the blockhash window
 /// keeps advancing while the executor is stuck.
 async fn hold_accounts_lock(pg_url: &str) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
@@ -718,14 +718,15 @@ async fn hold_accounts_lock(pg_url: &str) -> Result<sqlx::Transaction<'static, s
     Ok(tx)
 }
 
-/// Wait until the preload is parked, so the window moves mid-await.
+/// Wait until the account load is parked, so the window moves mid-await. The
+/// size read reaches the table before the data read, so either may be the waiter.
 async fn wait_for_preload_waiter(probe: &sqlx::PgPool, within: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
              WHERE wait_event_type = 'Lock' \
-               AND query LIKE 'SELECT pubkey, data FROM accounts%'",
+               AND query LIKE 'SELECT pubkey, % FROM accounts%'",
         )
         .fetch_one(probe)
         .await?;
@@ -734,7 +735,7 @@ async fn wait_for_preload_waiter(probe: &sqlx::PgPool, within: Duration) -> Resu
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the executor's preload never parked on the accounts lock"
+            "the executor's account load never parked on the accounts lock"
         );
         sleep(Duration::from_millis(10)).await;
     }

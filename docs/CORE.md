@@ -85,6 +85,34 @@ change on a second ask. The same split reaches RPC: `getAccountInfo` returns a
 null account only when the account is genuinely absent, and a server error when
 the store could not be read.
 
+**Account size gating**: before any of those bytes are fetched, the executor asks
+the store for the *lengths* of the accounts a batch references. Resident accounts
+answer from memory and only genuine misses reach the database, where
+`octet_length` reads a row's TOAST pointer without pulling the blob, so a warm
+batch pays nothing and a cold one pays a metadata read. Two limits are then
+applied to those lengths. A transaction referencing more than 64 MiB of account
+data fails with `MaxLoadedAccountsDataSizeExceeded` without its accounts being
+loaded at all; the SVM enforces the same ceiling, but only while loading, which
+is after the store has already been read. A batch is then packed against a
+256 MiB preload budget, counting each account once however many transactions
+name it, and whatever does not fit runs as a follow-on sub-batch once the current
+one has been handed to the settler. Per-transaction limits alone would not bound
+anything here: a batch of individually legal transactions still adds up to
+gigabytes, and a small transaction can name a large amount of account data
+through readonly keys no instruction uses. A store that cannot answer the size
+query aborts the batch on the same terms as an unreadable preload.
+
+**Resident account memory**: the preload budget bounds one fetch, but the cache
+keeps what it loads, so BOB is also capped by bytes (1 GiB) as well as by entry
+count. After each preload lands, clean entries are evicted largest first until the
+cache is back under 90% of that cap. The accounts the preload was asked for are
+never evicted, and neither are unsettled writes, so resident account data stays
+within the cap plus one preload. Rows are decoded as they stream in, so a preload
+briefly costs about 1.07 times the bytes it fetches. Results leaving the executor
+keep writable account data and every account's lamports but drop readonly data,
+which nothing downstream reads; otherwise a result would keep an evicted account
+alive until the settler had finished with it.
+
 **Blockhash expiry**: the live window keeps advancing while a batch waits on
 that account load, so validity is checked twice. The check on arrival only
 avoids loading accounts for a transaction that is already dead; the check after
