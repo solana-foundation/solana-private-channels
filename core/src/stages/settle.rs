@@ -1837,21 +1837,27 @@ mod tests {
     /// Make every slot above the current tip fail to commit, the way a
     /// storage-side error would, and return that tip.
     ///
-    /// A constraint aimed at one slot races the settler, which mints an empty
-    /// block every tick and may already have passed it. Capping the whole table
-    /// cannot race: whatever slot comes next is above the cap and fails.
+    /// Slots advance every tick but blocks do not, so the next block's slot is
+    /// unknown. Capping the whole table under a lock is exact: nothing lands between
+    /// reading the tip and the cap, and whatever comes next fails.
     async fn block_slots_above_tip(pool: &sqlx::PgPool) -> u64 {
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE blocks IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("lock blocks");
         let tip: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             .expect("read tip");
         let tip = tip.unwrap_or(0) as u64;
         sqlx::query(&format!(
             "ALTER TABLE blocks ADD CONSTRAINT test_slot_ceiling CHECK (slot <= {tip}) NOT VALID"
         ))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("add blocking constraint");
+        tx.commit().await.expect("commit cap");
         tip
     }
 
@@ -1886,6 +1892,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         false
+    }
+
+    /// Wait for the first block above `tip`, returning its slot. Idle ticks skip
+    /// slots, so the block after a stall is rarely `tip + 1`.
+    async fn await_block_above(pool: &sqlx::PgPool, tip: u64, within: Duration) -> Option<u64> {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            let found: Option<i64> =
+                sqlx::query_scalar("SELECT MIN(slot) FROM blocks WHERE slot > $1")
+                    .bind(tip as i64)
+                    .fetch_one(pool)
+                    .await
+                    .expect("query blocks");
+            if let Some(slot) = found {
+                return Some(slot as u64);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
     }
 
     /// The premise the in-flight budget rests on: the settler never holds a
@@ -2247,7 +2272,6 @@ mod tests {
         let (exec_tx, _rx, handle, _sinks, _hb) =
             settler_under_test(url, 100, 4, Arc::new(NoopMetrics), shutdown.clone()).await;
 
-        // Genesis is slot 0, so the first block carrying our batch is slot 1.
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
         let tip = block_slots_above_tip(&pool).await;
 
@@ -2258,7 +2282,9 @@ mod tests {
         unblock_slots(&pool).await;
 
         assert!(
-            await_block(&pool, tip + 1, Duration::from_secs(20)).await,
+            await_block_above(&pool, tip, Duration::from_secs(20))
+                .await
+                .is_some(),
             "the batch must land once the failure clears"
         );
         shutdown.cancel();
@@ -2291,9 +2317,11 @@ mod tests {
         let unblocked_at = unix_secs();
         unblock_slots(&pool).await;
 
-        assert!(await_block(&pool, tip + 1, Duration::from_secs(20)).await);
+        let slot = await_block_above(&pool, tip, Duration::from_secs(20))
+            .await
+            .expect("the blocked block must land");
         let raw: Vec<u8> = sqlx::query_scalar("SELECT data FROM blocks WHERE slot = $1")
-            .bind((tip + 1) as i64)
+            .bind(slot as i64)
             .fetch_one(pool.as_ref())
             .await
             .expect("read the blocked block");
@@ -2490,7 +2518,9 @@ mod tests {
         let exited = tokio::time::timeout(Duration::from_secs(20), handle.handle).await;
         assert!(exited.is_ok(), "the settler must finish its drain");
         assert!(
-            await_block(&pool, tip + 1, Duration::from_secs(5)).await,
+            await_block_above(&pool, tip, Duration::from_secs(5))
+                .await
+                .is_some(),
             "a cancelled settler must retry a failure that clears inside its budget"
         );
         let discarded =
@@ -2653,7 +2683,9 @@ mod tests {
             "both the buffered and the queued transaction must be recorded"
         );
         assert!(
-            !await_block(&pool, tip + 1, Duration::from_millis(200)).await,
+            await_block_above(&pool, tip, Duration::from_millis(200))
+                .await
+                .is_none(),
             "no block may exist for a batch that was discarded"
         );
         shutdown.cancel();
