@@ -16,6 +16,7 @@ spl-token-2022 = { workspace = true }
 # Token 2022 extension fields hold their optional keys as MaybeNull now.
 solana-nullable = "1.3"
 spl-associated-token-account = { workspace = true }
+spl-memo = { workspace = true }
 solana-program-pack = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
 solana-sdk-ids = { workspace = true }

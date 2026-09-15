@@ -18,6 +18,10 @@ import { AccountRole, assertIsAddress, type Address } from '@solana/kit';
 import { TOKEN_PROGRAM_ADDRESS, ASSOCIATED_TOKEN_PROGRAM_ADDRESS, findAssociatedTokenPda } from '@solana-program/token';
 import { TOKEN_2022_PROGRAM_ADDRESS } from '@solana-program/token-2022';
 
+// Declared here rather than imported: there is no @solana-program/memo dependency,
+// and the account is a fixed default in the generated client, not a caller argument.
+const MEMO_PROGRAM_ADDRESS = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' as Address;
+
 // Token program addresses
 describe('releaseFunds', () => {
     describe('Instruction data validation', () => {
@@ -191,7 +195,7 @@ describe('releaseFunds', () => {
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram', async () => {
+        it('should include all required accounts: payer, operator, instance, operatorPda, mint, allowedMint, userAta, instanceAta, tokenProgram, associatedTokenProgram, eventAuthority, privateChannelEscrowProgram, memoProgram', async () => {
             const payer = mockTransactionSigner(TEST_ADDRESSES.PAYER);
             const operator = mockTransactionSigner(TEST_ADDRESSES.OPERATOR);
             const testAmount = BigInt(1000000);
@@ -208,8 +212,8 @@ describe('releaseFunds', () => {
                 transactionNonce: TEST_TRANSACTION_NONCE,
             });
 
-            // Based on program instruction definition, ReleaseFunds should have 12 accounts
-            expect(instruction.accounts).toHaveLength(13);
+            // Based on program instruction definition, ReleaseFunds should have 14 accounts
+            expect(instruction.accounts).toHaveLength(14);
 
             // Account 0: payer (WritableSigner)
             const payerAccount = instruction.accounts[0];
@@ -264,6 +268,10 @@ describe('releaseFunds', () => {
             // Account 12: privateChannelEscrowProgram (Readonly)
             const privateChannelEscrowProgramAccount = instruction.accounts[12];
             expect(privateChannelEscrowProgramAccount.address).toBe(PRIVATE_CHANNEL_ESCROW_PROGRAM_PROGRAM_ADDRESS);
+
+            // Account 13: memoProgram (Readonly, defaulted by the client)
+            const memoProgramAccount = instruction.accounts[13];
+            expect(memoProgramAccount.address).toBe(MEMO_PROGRAM_ADDRESS);
         });
 
         it('should set correct account permissions (writable/readable/signer)', async () => {
@@ -333,6 +341,10 @@ describe('releaseFunds', () => {
             // Account 11: privateChannelEscrowProgram - should be Readonly
             const privateChannelEscrowProgramAccount = instruction.accounts[12];
             expect(privateChannelEscrowProgramAccount.role).toBe(AccountRole.READONLY);
+
+            // Account 13: memoProgram - should be Readonly
+            const memoProgramAccount = instruction.accounts[13];
+            expect(memoProgramAccount.role).toBe(AccountRole.READONLY);
         });
 
         it('should use correct program addresses', async () => {

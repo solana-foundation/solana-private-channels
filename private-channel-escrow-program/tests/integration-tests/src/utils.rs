@@ -19,6 +19,7 @@ use spl_token::{
 };
 use spl_token_2022::{
     extension::{
+        memo_transfer::MemoTransfer,
         metadata_pointer::MetadataPointer,
         pausable::PausableConfig,
         permanent_delegate::PermanentDelegate,
@@ -958,6 +959,70 @@ pub fn set_token_2022_with_hook_account(
             },
         )
         .expect("Failed to set Token2022 account with TransferHookAccount");
+}
+
+/// Token-2022 account with `MemoTransfer` enabled, so Token-2022 rejects an
+/// incoming transfer unless a Memo instruction is its preceding sibling. Only
+/// the account owner can turn this on, which is why it reaches user ATAs and
+/// never the escrow's.
+///
+/// `with_transfer_hook` adds `TransferHookAccount`, which a hook mint's
+/// transfer requires on both sides regardless of the memo.
+pub fn set_token_2022_with_memo_account(
+    context: &mut TestContext,
+    ata: &Pubkey,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    amount: u64,
+    with_transfer_hook: bool,
+) {
+    let extensions: &[ExtensionType] = if with_transfer_hook {
+        &[
+            ExtensionType::MemoTransfer,
+            ExtensionType::TransferHookAccount,
+        ]
+    } else {
+        &[ExtensionType::MemoTransfer]
+    };
+    let space = ExtensionType::try_calculate_account_len::<Token2022Account>(extensions).unwrap();
+    let mut data = vec![0u8; space];
+
+    let mut state =
+        PodStateWithExtensionsMut::<PodAccount>::unpack_uninitialized(&mut data).unwrap();
+    state
+        .init_extension::<MemoTransfer>(true)
+        .unwrap()
+        .require_incoming_transfer_memos = true.into();
+    if with_transfer_hook {
+        state.init_extension::<TransferHookAccount>(true).unwrap();
+    }
+    *state.base = PodAccount {
+        mint: *mint,
+        owner: *owner,
+        amount: amount.into(),
+        delegate: PodCOption::none(),
+        state: AccountState::Initialized as u8,
+        is_native: PodCOption::none(),
+        delegated_amount: 0u64.into(),
+        close_authority: PodCOption::none(),
+    };
+    state
+        .init_account_type()
+        .expect("Failed to init account type");
+
+    context
+        .svm
+        .set_account(
+            *ata,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: TOKEN_2022_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("Failed to set Token2022 account with MemoTransfer");
 }
 
 pub fn create_mint_2022_with_transfer_fee(

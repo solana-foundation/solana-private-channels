@@ -13,8 +13,9 @@ use crate::{
     utils::{
         assert_program_error, create_mint_2022_with_transfer_fee,
         get_or_create_associated_token_account_2022, get_token_balance, hook_extras_for_mint,
-        malicious_hook_extras, set_mint, set_token_2022_with_hook_account, setup_hook_mint,
-        setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        malicious_hook_extras, set_mint, set_mint_2022_basic, set_token_2022_with_hook_account,
+        set_token_2022_with_memo_account, setup_hook_mint, setup_malicious_hook_mint,
+        setup_test_balances, TestContext, ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR,
         INVALID_INSTRUCTION_DATA_ERROR, INVALID_OPERATOR_ERROR, INVALID_WITHDRAWAL_BITMAP_ERROR,
         MISSING_REQUIRED_SIGNATURE_ERROR, NONCES_PER_GENERATION, NONCE_ALREADY_USED_ERROR,
         NONCE_OUTSIDE_CURRENT_GENERATION_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
@@ -387,7 +388,7 @@ fn test_release_funds_operator_not_signer() {
         &TOKEN_PROGRAM_ID,
     );
 
-    // Create instruction where operator is NOT marked as signer (13 accounts)
+    // Create instruction where operator is NOT marked as signer (14 accounts)
     let accounts = vec![
         AccountMeta::new(context.payer.pubkey(), true), // payer (signer, writable)
         AccountMeta::new_readonly(operator.pubkey(), false), // operator (NOT signer)
@@ -402,6 +403,7 @@ fn test_release_funds_operator_not_signer() {
         AccountMeta::new_readonly(ATA_PROGRAM_ID, false), // associated_token_program
         AccountMeta::new_readonly(event_authority_pda, false), // event_authority
         AccountMeta::new_readonly(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, false), // private_channel_escrow_program
+        AccountMeta::new_readonly(spl_memo::id(), false),                    // memo_program
     ];
 
     let mut data = vec![7]; // discriminator for ReleaseFunds
@@ -1695,4 +1697,315 @@ fn test_release_funds_rejects_signer_bearing_hook_extra() {
         TRANSACTION_NONCE,
         false,
     );
+}
+
+// Proves the Memo CPI fired. Token-2022 accepts the memo only as the transfer's
+// immediately preceding sibling, so a client-side top-level memo would not do.
+const MEMO_LOG: &str = "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr invoke";
+
+// A user can enable required memos on their own ATA. Before this the release was
+// unrecoverable for them; now the program emits the memo itself and it lands.
+#[test]
+fn test_release_funds_token_2022_memo_required_destination() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint_2022_basic(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+    // Swap the plain user ATA for one demanding a memo on every incoming transfer.
+    set_token_2022_with_memo_account(
+        &mut context,
+        &user_ata,
+        &mint.pubkey(),
+        &user.pubkey(),
+        0,
+        false,
+    );
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .instruction();
+
+    let metadata = context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[&operator],
+            false,
+            None,
+        )
+        .expect("ReleaseFunds to a memo-required ATA should succeed");
+
+    assert!(
+        metadata.logs.iter().any(|log| log.contains(MEMO_LOG)),
+        "the program must CPI the Memo program before the transfer"
+    );
+    assert_eq!(get_token_balance(&mut context, &user_ata), RELEASE_AMOUNT);
+}
+
+// The memo slot is validated only on the path that uses it, so a memo-required
+// destination with the wrong program there must revert instead of transferring.
+#[test]
+fn test_release_funds_memo_required_wrong_memo_program_rejected() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    set_mint_2022_basic(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+        0,
+        DEPOSIT_AMOUNT,
+    );
+    set_token_2022_with_memo_account(
+        &mut context,
+        &user_ata,
+        &mint.pubkey(),
+        &user.pubkey(),
+        0,
+        false,
+    );
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        // Anything but the Memo program in the slot the memo path reaches for.
+        .memo_program(ATA_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&operator]);
+
+    assert_program_error(result, INCORRECT_PROGRAM_ID_ERROR);
+    assert_eq!(
+        get_token_balance(&mut context, &user_ata),
+        0,
+        "nothing may move when the memo cannot be emitted"
+    );
+}
+
+// Memo and transfer hook on the same release: the memo CPI must not disturb the
+// hook extras trailing the fixed accounts, and both must run.
+#[test]
+fn test_release_funds_token_2022_memo_with_transfer_hook() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let operator = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+
+    setup_hook_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed for a transfer-hook mint");
+
+    let (operator_pda, _) = assert_get_or_add_operator(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &operator.pubkey(),
+        false,
+        false,
+    )
+    .expect("AddOperator should succeed");
+
+    let user_ata = get_associated_token_address_with_program_id(
+        &user.pubkey(),
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    let instance_ata = get_associated_token_address_with_program_id(
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+    );
+    // The destination carries both extensions; the escrow side only the hook.
+    set_token_2022_with_memo_account(
+        &mut context,
+        &user_ata,
+        &mint.pubkey(),
+        &user.pubkey(),
+        0,
+        true,
+    );
+    set_token_2022_with_hook_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        DEPOSIT_AMOUNT,
+    );
+
+    context
+        .airdrop_if_required(&operator.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let (withdrawal_bitmap_pda, _) = find_withdrawal_bitmap_pda(&instance_pda);
+
+    let instruction = ReleaseFundsBuilder::new()
+        .payer(context.payer.pubkey())
+        .operator(operator.pubkey())
+        .instance(instance_pda)
+        .withdrawal_bitmap(withdrawal_bitmap_pda)
+        .operator_pda(operator_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(RELEASE_AMOUNT)
+        .user(user.pubkey())
+        .transaction_nonce(TRANSACTION_NONCE)
+        .add_remaining_accounts(&hook_extras_for_mint(&mint.pubkey()))
+        .instruction();
+
+    let metadata = context
+        .send_transaction_with_signers_with_transaction_result(
+            instruction,
+            &[&operator],
+            false,
+            None,
+        )
+        .expect("ReleaseFunds through a memo-required hook mint should succeed");
+
+    assert!(
+        metadata.logs.iter().any(|log| log.contains(MEMO_LOG)),
+        "the memo must still be emitted on a hook mint"
+    );
+    let hook_runs = metadata
+        .logs
+        .iter()
+        .filter(|log| log.contains(HOOK_LOG))
+        .count();
+    assert_eq!(hook_runs, 1, "the hook must run exactly once");
+    assert_eq!(get_token_balance(&mut context, &user_ata), RELEASE_AMOUNT);
 }
