@@ -20,3 +20,6 @@ solana-program-pack = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-system-interface = { workspace = true }
+spl-token-metadata-interface = "1.0.1"
+spl-tlv-account-resolution = "0.11.1"
+spl-transfer-hook-interface = { workspace = true }

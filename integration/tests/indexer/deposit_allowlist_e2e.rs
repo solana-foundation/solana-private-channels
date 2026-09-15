@@ -83,6 +83,7 @@ async fn insert_mint_row_at_slot(
     storage
         .insert_mint_statuses_batch(&[
             private_channel_indexer::storage::common::models::DbMintStatus {
+                withdrawals_blocked: false,
                 mint_address: mint.to_string(),
                 status: "allowed".to_string(),
                 effective_slot,
@@ -106,6 +107,7 @@ async fn insert_block_row_at_slot(
     storage
         .insert_mint_statuses_batch(&[
             private_channel_indexer::storage::common::models::DbMintStatus {
+                withdrawals_blocked: false,
                 mint_address: mint.to_string(),
                 status: "blocked".to_string(),
                 effective_slot,

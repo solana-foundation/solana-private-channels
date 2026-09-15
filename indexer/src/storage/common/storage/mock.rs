@@ -327,16 +327,11 @@ impl MockStorage {
         self.check_should_fail("upsert_mints_batch")?;
         let mut store = self.mints.lock().unwrap();
         for mint in mints {
-            // Must mirror the Postgres `ON CONFLICT DO UPDATE SET decimals,
-            // token_program` semantics: the indexer upserts a `DbMint::new`
-            // (flags = None) every time it sees AllowMint, but the operator
-            // lazily fills `is_pausable` / `has_permanent_delegate` via
-            // `set_mint_extension_flags`. A re-upsert (reorg, indexer
-            // restart, retry) must preserve those flags, otherwise the next
-            // withdrawal wastes an RPC round-trip re-resolving them. A
-            // blanket `insert` here would silently disagree with prod and
-            // let tests lock in the wrong behavior. `status` is NOT touched on
-            // conflict — `sync_mint_status` is the sole writer of the mirror.
+            // Must mirror the Postgres `ON CONFLICT DO UPDATE`: refresh decimals
+            // and token_program only. A blanket `insert` here would silently
+            // disagree with prod and let tests lock in the wrong behavior. Neither
+            // gate is touched on conflict — `sync_mint_status` is the sole writer
+            // of both mirrors.
             match store.get_mut(&mint.mint_address) {
                 Some(existing) => {
                     existing.decimals = mint.decimals;
@@ -354,24 +349,31 @@ impl MockStorage {
     /// latest `mint_status_history` transition; a missing row is a no-op.
     pub async fn sync_mint_status(&self, mint_addresses: &[String]) -> Result<(), StorageError> {
         self.check_should_fail("sync_mint_status")?;
-        // Resolve the latest status per address without holding both locks.
-        let latest: std::collections::HashMap<String, String> = {
+        // Resolve the latest transition per address without holding both locks.
+        // Both gates come from the same winning row, as in the Postgres query.
+        let latest: std::collections::HashMap<String, (String, bool)> = {
             let history = self.mint_status_history.lock().unwrap();
             mint_addresses
                 .iter()
                 .filter_map(|addr| {
                     history
                         .iter()
-                        .filter(|r| &r.mint_address == addr)
-                        .max_by_key(|r| r.effective_slot)
-                        .map(|r| (addr.clone(), r.status.clone()))
+                        .filter(|record| &record.mint_address == addr)
+                        .max_by_key(|record| record.effective_slot)
+                        .map(|record| {
+                            (
+                                addr.clone(),
+                                (record.status.clone(), record.withdrawals_blocked),
+                            )
+                        })
                 })
                 .collect()
         };
         let mut store = self.mints.lock().unwrap();
-        for (addr, status) in latest {
+        for (addr, (status, withdrawals_blocked)) in latest {
             if let Some(existing) = store.get_mut(&addr) {
                 existing.status = status;
+                existing.withdrawals_blocked = withdrawals_blocked;
             }
         }
         Ok(())
@@ -417,26 +419,6 @@ impl MockStorage {
             // Mirror the postgres path: an unrecognized status fails closed to Blocked.
             Some(_) => Ok(MintStatusAtSlot::Blocked),
             None => Ok(MintStatusAtSlot::NeverAllowed),
-        }
-    }
-
-    pub async fn set_mint_extension_flags(
-        &self,
-        mint_address: &str,
-        is_pausable: bool,
-        has_permanent_delegate: bool,
-    ) -> Result<(), StorageError> {
-        self.check_should_fail("set_mint_extension_flags")?;
-        let mut mints = self.mints.lock().unwrap();
-        match mints.get_mut(mint_address) {
-            Some(mint) => {
-                mint.is_pausable = Some(is_pausable);
-                mint.has_permanent_delegate = Some(has_permanent_delegate);
-                Ok(())
-            }
-            None => Err(StorageError::DatabaseError {
-                message: format!("set_mint_extension_flags: no mints row for {mint_address}"),
-            }),
         }
     }
 
