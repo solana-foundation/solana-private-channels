@@ -224,6 +224,10 @@ released. `expected_generation` must match the bitmap's current generation, whic
 makes the instruction non-idempotent: a replayed rotation cannot skip a whole
 generation of nonces.
 
+The program does not require the current window to be full. When to rotate is
+the operator's responsibility and is gated in the indexer, see
+[Trust model](#trust-model).
+
 Discriminator: `8`
 
 **Parameters:**
@@ -253,6 +257,34 @@ Discriminator: `228`
 | Account | Name | Signer | Writable | Description |
 |---------|------|--------|----------|-------------|
 | 0 | `event_authority` | ✓ | | Event authority PDA for emitting events |
+
+## Trust model
+
+The program trusts each kind of signer for a fixed set of decisions.
+
+| Principal | Trusted for | Instructions |
+|-----------|-------------|--------------|
+| Admin | Instance configuration: the mint allowlist, the operator set, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `SetNewAdmin` |
+| Operator | Every release parameter (amount, recipient, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
+| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens | `CreateInstance`, `Deposit` |
+
+Beyond the mint allowlist, the program constrains an operator in two ways only.
+Each nonce is released at most once, and only while the bitmap covers its
+generation. A rotation must name the current generation, so a replayed one
+cannot skip a generation.
+
+The program does not check a release's amount, recipient or mint against the
+burn on the channel, and it does not check that a generation is finished before
+it is rotated. The operator in the indexer makes those decisions from its
+database, see [Rotation](WITHDRAWING_GUIDE.md#rotation) and the operator
+invariants in [INVARIANTS.md](INVARIANTS.md#operator). A rotation that lands
+early makes every unreleased nonce in the closed generation unreleasable. The
+indexer then routes those withdrawals to its remint path. A row with earlier
+broadcast signatures enters the automatic remint flow, which remints only once
+it proves no release landed and otherwise sends the row to manual review. A row
+with no signatures goes straight to manual review for an out-of-band remint.
+
+The admin's control over an operator key is `RemoveOperator`.
 
 ## Accounts
 
@@ -290,7 +322,10 @@ cost regardless of withdrawal volume.
 
 `ReleaseFunds` rejects a nonce whose bit is already set, and rejects any nonce
 outside the current generation. `RotateBitmap` clears the bits and advances the
-generation, which is what keeps the account a fixed size as volume grows. Only
+generation, which is what keeps the account a fixed size as volume grows. It does
+not check that the window is full, so a nonce still unreleased when its
+generation is rotated past can never be released; rotation timing is the
+operator's responsibility and is gated in the indexer. Only
 `bump` and `generation` appear in the IDL: the bits are read by slicing at
 offset 10, since a fixed 8192-byte field does not fit on the BPF stack and its
 length varies with the `test-tree` feature.
