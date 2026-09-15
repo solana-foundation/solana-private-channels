@@ -65,12 +65,16 @@ pub async fn set_current_slot(db: &PostgresAccountsDB, slot: u64) -> Result<bool
         return Ok(true);
     }
 
-    // `false` means a newer writer epoch refused it. No row lock, so the hot idle
-    // path stays cheap: a tick racing a bump costs one value the new writer rewrites.
+    // `false` means a newer writer epoch refused it. The shared lock makes the
+    // check wait for a bump in flight and then read its value, so a superseded
+    // writer cannot slip a slot past it. Batches lock the same row first.
     let written = sqlx::query(
-        "INSERT INTO metadata (key, value) SELECT $1, $2
+        "WITH fence AS (
+             SELECT 1 FROM metadata WHERE key = $4 AND value = $3 FOR SHARE
+         )
+         INSERT INTO metadata (key, value) SELECT $1, $2
          WHERE $3::bytea IS NULL
-            OR EXISTS (SELECT 1 FROM metadata WHERE key = $4 AND value = $3)
+            OR EXISTS (SELECT 1 FROM fence)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
     .bind(CURRENT_SLOT_KEY)
@@ -206,6 +210,57 @@ mod tests {
 
         assert!(set_current_slot(&postgres_of(&db), 7).await.unwrap());
         assert_eq!(db.get_current_slot().await.unwrap(), Some(7));
+    }
+
+    /// A tick that checks the epoch while a bump is still open must wait for it,
+    /// or it would pass on the old value and land after the new writer took over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_racing_a_bump_is_refused() {
+        use crate::{
+            accounts::writer_epoch::{bump, read_locked, WRITER_EPOCH_KEY},
+            test_helpers::start_test_postgres_with_url,
+        };
+        use sqlx::Connection;
+
+        let (mut fenced, _pg, url) = start_test_postgres_with_url().await;
+        fenced.writer_epoch = Some(bump(&fenced).await.unwrap());
+        assert!(set_current_slot(&fenced, 5).await.unwrap());
+
+        // A bump by the replacement, held open between its update and its commit.
+        let mut bumper = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::query("BEGIN").execute(&mut bumper).await.unwrap();
+        assert_eq!(read_locked(&mut bumper).await.unwrap(), Some(1));
+        sqlx::query("UPDATE metadata SET value = $2 WHERE key = $1")
+            .bind(WRITER_EPOCH_KEY)
+            .bind(&crate::accounts::counter::encode(2)[..])
+            .execute(&mut bumper)
+            .await
+            .unwrap();
+
+        let ticker = fenced.clone();
+        let tick = tokio::spawn(async move { set_current_slot(&ticker, 6).await });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !tick.is_finished() {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(fenced.pool.as_ref())
+            .await
+            .unwrap();
+            if waiting > 0 || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        sqlx::query("COMMIT").execute(&mut bumper).await.unwrap();
+        assert!(
+            !tick.await.unwrap().unwrap(),
+            "a tick racing a bump must be refused"
+        );
+        let db = AccountsDB::Postgres(fenced);
+        assert_eq!(db.get_current_slot().await.unwrap(), Some(5));
     }
 
     /// A replica reads the slot through the cache, so the mirror has to carry it
