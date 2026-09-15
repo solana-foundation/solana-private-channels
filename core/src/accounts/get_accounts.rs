@@ -373,6 +373,12 @@ async fn get_accounts_redis(
     keys.extend(accounts.iter().map(|key| format!("account:{}", key)));
     let data: RedisResult<Vec<Option<Vec<u8>>>> = conn.mget(keys).await;
 
+    // Hits and fallback rows share the caller's limit, since either store can
+    // serve a larger version of an account than the size was read from.
+    let limit_exceeded = AccountLoadError::LimitExceeded {
+        limit: max_data_bytes,
+    };
+    let mut hit_bytes = 0usize;
     let mut results: Vec<Option<AccountSharedData>> = match data {
         // MGET answers one entry per key, so the split always succeeds; a short
         // reply is treated as an untrusted cache rather than indexed into, since
@@ -380,13 +386,21 @@ async fn get_accounts_redis(
         Ok(cached) if cached.len() == accounts.len() + 1 => {
             let (stamp, values) = cached.split_first().expect("checked non-empty above");
             if redis_db.stamp_is_current(stamp.as_ref()) {
-                values
-                    .iter()
-                    .map(|opt| {
-                        opt.as_ref()
-                            .and_then(|bytes| bincode::deserialize(bytes).ok())
-                    })
-                    .collect()
+                // Hits are counted as they decode, so nothing past the crossing entry is decoded.
+                let mut decoded = Vec::with_capacity(values.len());
+                for bytes in values {
+                    let account: Option<AccountSharedData> = bytes
+                        .as_ref()
+                        .and_then(|bytes| bincode::deserialize(bytes).ok());
+                    if let Some(account) = &account {
+                        hit_bytes = hit_bytes.saturating_add(account.data().len());
+                        if hit_bytes > max_data_bytes {
+                            return Err(limit_exceeded);
+                        }
+                    }
+                    decoded.push(account);
+                }
+                decoded
             } else {
                 // Condemned or foreign cache: every position is a miss.
                 vec![None; accounts.len()]
@@ -405,18 +419,6 @@ async fn get_accounts_redis(
             vec![None; accounts.len()]
         }
     };
-
-    // Hits and fallback rows share the caller's limit, since either store can
-    // serve a larger version of an account than the size was read from.
-    let hit_bytes = results.iter().flatten().fold(0usize, |total, account| {
-        total.saturating_add(account.data().len())
-    });
-    let limit_exceeded = AccountLoadError::LimitExceeded {
-        limit: max_data_bytes,
-    };
-    if hit_bytes > max_data_bytes {
-        return Err(limit_exceeded);
-    }
 
     // Every position the cache could not answer is a miss. Resolve just those
     // against the source of truth, keeping the result aligned with `accounts`.
@@ -767,6 +769,15 @@ mod tests {
             .set_account(cached, AccountSharedData::new(1, 4_000, &owner))
             .await;
         let db = AccountsDB::Redis(redis_db);
+
+        let result = get_accounts_within(&db, &[cached], 3_999).await;
+        assert!(
+            matches!(
+                result,
+                Err(AccountLoadError::LimitExceeded { limit: 3_999 })
+            ),
+            "cache hits alone past the limit must fail: {result:?}"
+        );
 
         let result = get_accounts_within(&db, &[cached, uncached], 5_999).await;
         assert!(
