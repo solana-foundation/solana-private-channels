@@ -48,6 +48,8 @@ This document defines the safety and correctness invariants that Solana Private 
 | O1 | Withdrawals from escrow MUST NOT withdraw more than once | MUST | Done | #29, #9 |
 | O2 | Issuances on Solana Private Channels MUST NOT issue more than once | MUST | Done | #26 |
 | O3 | Failed withdrawals/issuances MUST fire an alert | MUST | Done | #40 |
+| O4 | Operator MUST NOT arm a withdrawal bitmap rotation while any nonce in the current generation still owes a release, and MUST NOT send it while a release is in flight | MUST | Done | #256, #277, #111 |
+| O5 | A withdrawal the operator finds in a generation the bitmap has rotated past MUST be routed to remint or manual review, not retried as a release | MUST | Done | #256, #111 |
 
 ## Global
 

@@ -51,10 +51,10 @@ The core payment channel processes transactions through a five-stage pipeline op
 - `ReleaseFunds`: Withdraw funds, consuming the nonce's bit in the withdrawal bitmap
 
 **Security**:
-- Isolation for each Solana Private Channels instance (with unique admin, operators, mints, and Merkle tree roots)
+- Isolation for each Solana Private Channels instance (with unique admin, operators, mints, and withdrawal bitmap)
 - An on-chain withdrawal bitmap, one bit per nonce, to prevent double spending of withdrawals
 - Admin-only mint whitelisting
-- Operator-based withdrawal processing
+- Operator-based withdrawal processing: operators are trusted for release parameters and bitmap rotation timing (see the [trust model](ESCROW_PROGRAM.md#trust-model))
 
 #### Withdrawal Program (Channel)
 
