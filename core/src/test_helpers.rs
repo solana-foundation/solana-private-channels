@@ -1,8 +1,7 @@
 use crate::accounts::traits::BlockInfo;
 use solana_sdk::{
     hash::Hash,
-    instruction::CompiledInstruction,
-    message::{Message, MessageHeader},
+    message::{compiled_instruction::CompiledInstruction, Message, MessageHeader},
     signature::{Keypair, Signer},
     transaction::{SanitizedTransaction, Transaction},
 };
@@ -293,4 +292,15 @@ pub(crate) async fn create_test_bob_with_postgres() -> (
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let bob = crate::accounts::bob::BOB::new_test(rx, db);
     (bob, tx, container)
+}
+
+/// Zero account-size deltas, for building an executed result in a test.
+///
+/// The upstream type carries no `Default`, and every test here executes
+/// transactions that resize nothing, so they all want the same zeroed value.
+pub fn no_accounts_deltas() -> solana_svm::transaction_execution_result::AccountsDeltas {
+    solana_svm::transaction_execution_result::AccountsDeltas {
+        accounts_resize_delta: 0,
+        accounts_uninitialized_size: 0,
+    }
 }

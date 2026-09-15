@@ -11,6 +11,7 @@
 //! sender that stays pending has acquired the lock; one that resolves to `Err`
 //! was refused.
 
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         config::{
@@ -23,7 +24,6 @@ use {
         storage::{PostgresDb, Storage},
     },
     private_channel_metrics::MetricLabel,
-    solana_sdk::commitment_config::CommitmentLevel,
     std::{sync::Arc, time::Duration},
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,

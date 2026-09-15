@@ -23,7 +23,7 @@ use {
         },
         DatasourceType,
     },
-    solana_sdk::commitment_config::CommitmentLevel,
+    solana_commitment_config::CommitmentLevel,
     std::{sync::Arc, time::Duration},
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,

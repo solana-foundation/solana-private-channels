@@ -12,7 +12,7 @@ use private_channel_indexer::indexer::datasource::common::parser::withdraw::PRIV
 use private_channel_indexer::indexer::datasource::common::types::ProcessorMessage;
 use private_channel_indexer::indexer::datasource::rpc_polling::RpcPollingSource;
 use serde_json::json;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::UiTransactionEncoding;
 use std::time::Duration;

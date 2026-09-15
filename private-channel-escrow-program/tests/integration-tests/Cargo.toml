@@ -5,15 +5,18 @@ edition = { workspace = true }
 
 [dependencies]
 const-crypto = { workspace = true }
-litesvm = "=0.7.0"
+litesvm = "0.16"
 private-channel-escrow-program-client = { workspace = true, features = ["fetch"] }
-# Use LiteSVM compatible versions instead of workspace versions
-solana-sdk = "2.3.1"
-solana-program = "2.3.0"
-spl-token = "6.0.0"
-spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
-spl-pod = "0.5.1"
-spl-associated-token-account = { version = "4.0.0", features = [
-    "no-entrypoint",
-] }
-solana-program-pack = "2.2.1"
+# These follow the generated client, which core also links, so the address type
+# is the same one everywhere. LiteSVM 0.16 targets the same runtime release.
+solana-sdk = { workspace = true }
+solana-program = { workspace = true }
+spl-token = { workspace = true }
+spl-token-2022 = { workspace = true }
+# Token 2022 extension fields hold their optional keys as MaybeNull now.
+solana-nullable = "1.3"
+spl-associated-token-account = { workspace = true }
+solana-program-pack = { workspace = true }
+solana-compute-budget-interface = { workspace = true }
+solana-sdk-ids = { workspace = true }
+solana-system-interface = { workspace = true }

@@ -6,8 +6,8 @@ use private_channel_escrow_program_client::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
-    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::{Keypair, Signature, Signer},
 };

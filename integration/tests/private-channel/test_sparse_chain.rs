@@ -9,7 +9,7 @@ use private_channel_indexer::indexer::datasource::rpc_polling::rpc::RpcPoller;
 use private_channel_indexer::indexer::datasource::rpc_polling::types::BlockFetch;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSendTransactionConfig;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_sdk::{
     hash::Hash, pubkey::Pubkey, signature::Keypair, signature::Signature, signer::Signer,
     transaction::Transaction,

@@ -23,10 +23,9 @@ use crate::{
 };
 use chrono::Utc;
 use private_channel_metrics::MetricLabel;
+use solana_commitment_config::CommitmentConfig;
 use solana_keychain::SolanaSigner;
-use solana_sdk::{
-    clock::MAX_PROCESSING_AGE, commitment_config::CommitmentConfig, signature::Signature,
-};
+use solana_sdk::{clock::MAX_PROCESSING_AGE, signature::Signature};
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -1242,7 +1241,7 @@ mod tests {
     use crate::storage::common::models::{DbObservedRelease, StoredSig};
     use crate::storage::common::storage::mock::MockStorage;
     use crate::storage::Storage;
-    use solana_sdk::commitment_config::CommitmentConfig;
+
     use solana_sdk::pubkey::Pubkey;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -1265,7 +1264,7 @@ mod tests {
         let rpc = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
             "http://localhost:8899".to_string(),
             crate::operator::RetryConfig::default(),
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         ));
         let state = SenderState {
             fallback_rpc_client: None,
@@ -1405,7 +1404,7 @@ mod tests {
                 base_delay: std::time::Duration::from_millis(1),
                 max_delay: std::time::Duration::from_millis(1),
             },
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         ));
         let state = SenderState {
             fallback_rpc_client: None,
@@ -1467,12 +1466,12 @@ mod tests {
         let rpc_client = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
             dest_url.to_string(),
             fast.clone(),
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         ));
         let source_rpc_client = Arc::new(crate::operator::RpcClientWithRetry::with_retry_config(
             source_url.to_string(),
             fast,
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         ));
         let state = SenderState {
             rpc_client,

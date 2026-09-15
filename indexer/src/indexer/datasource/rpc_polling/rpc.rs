@@ -2,7 +2,7 @@ use crate::error::DataSourceRpcError;
 use crate::indexer::datasource::rpc_polling::types::{BlockFetch, RpcBlock};
 use futures::future::join_all;
 use serde_json::json;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::collections::HashMap;
 use tracing::{debug, warn};

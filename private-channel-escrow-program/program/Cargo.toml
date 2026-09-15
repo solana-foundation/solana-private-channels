@@ -29,7 +29,7 @@ pinocchio-system = { workspace = true }
 pinocchio-token = { workspace = true }
 pinocchio-token-2022 = { workspace = true }
 codama = { workspace = true }
-spl-token-2022 = { workspace = true }
+spl-token-2022 = { version = "9.0.0", features = ["no-entrypoint"] }
 thiserror = { workspace = true }
 
 [build-dependencies]

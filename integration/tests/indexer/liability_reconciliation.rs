@@ -30,7 +30,7 @@ use private_channel_indexer::{DatasourceType, YellowstoneConfig};
 use private_channel_metrics::{HealthConfig, HealthState};
 use serde_json::json;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_transaction_status::UiTransactionEncoding;

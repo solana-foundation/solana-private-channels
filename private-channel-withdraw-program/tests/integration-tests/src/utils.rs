@@ -1,10 +1,10 @@
 use litesvm::{types::TransactionMetadata, LiteSVM};
 use private_channel_withdraw_program_client::PrivateChannelWithdrawProgramError;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey;
 use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     program_option::COption,
     pubkey::Pubkey,

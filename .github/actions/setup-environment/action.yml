@@ -45,7 +45,7 @@ runs:
     - name: Set tool versions
       shell: bash
       run: |
-        echo "RUST_VERSION=1.91.0" >> $GITHUB_ENV
+        echo "RUST_VERSION=1.96.1" >> $GITHUB_ENV
         echo "LLVM_COV_VERSION=0.8.4" >> $GITHUB_ENV
 
     - name: Install system dependencies

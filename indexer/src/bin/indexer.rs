@@ -12,7 +12,8 @@ use private_channel_indexer::{
     YellowstoneConfig,
 };
 use serde::Deserialize;
-use solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey};
+use solana_commitment_config::CommitmentLevel;
+use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::UiTransactionEncoding;
 use std::path::PathBuf;
 use std::str::FromStr;

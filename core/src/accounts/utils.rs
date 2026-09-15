@@ -6,9 +6,7 @@ use {
         transaction::SanitizedTransaction,
     },
     solana_svm::transaction_processing_result::ProcessedTransaction,
-    solana_transaction_status::{
-        TransactionStatusMeta, UiTransactionEncoding, UiTransactionStatusMeta,
-    },
+    solana_transaction_status::{TransactionStatusMeta, UiTransactionEncoding},
     solana_transaction_status_client_types::InnerInstructions,
     tracing::debug,
 };
@@ -89,7 +87,7 @@ pub fn get_stored_transaction(
         slot,
         block_time,
         transaction: transaction.to_versioned_transaction(),
-        meta: UiTransactionStatusMeta::from(meta),
+        meta: meta.into(),
     }
 }
 
@@ -172,7 +170,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: std::collections::HashMap::new(),
         }))
@@ -296,7 +294,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         };

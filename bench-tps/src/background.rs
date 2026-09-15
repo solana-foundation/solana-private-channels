@@ -16,6 +16,7 @@
 //! `(start_count, final_count)` so the caller can compute the total
 //! transactions landed over the full duration.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     crate::{
         bench_metrics::BENCH_LANDED_TOTAL,
@@ -24,7 +25,6 @@ use {
         },
     },
     solana_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::commitment_config::CommitmentConfig,
     std::{sync::Arc, time::Instant},
     tokio_util::sync::CancellationToken,
     tracing::{info, warn},

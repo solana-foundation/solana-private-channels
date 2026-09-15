@@ -22,6 +22,7 @@
 //! so the integration crate boundary stays honest — the same public API
 //! a future external tool would use to drive recovery.
 
+use solana_commitment_config::CommitmentLevel;
 use {
     chrono::{DateTime, Utc},
     private_channel_indexer::{
@@ -36,7 +37,7 @@ use {
             Storage,
         },
     },
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
     std::sync::Arc,
     tokio::sync::mpsc,
 };

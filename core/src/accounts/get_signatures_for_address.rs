@@ -182,7 +182,7 @@ async fn get_signatures_for_address_postgres(
             }
         };
 
-        let stored_tx = match bincode::deserialize::<StoredTransaction>(&tx_data) {
+        let stored_tx = match StoredTransaction::from_bytes(&tx_data) {
             Ok(tx) => tx,
             Err(e) => {
                 return Err(anyhow::anyhow!(
@@ -202,10 +202,13 @@ async fn get_signatures_for_address_postgres(
         results.push(RpcConfirmedTransactionStatusWithSignature {
             signature: signature.to_string(),
             slot: slot as u64,
-            err,
+            err: err.map(Into::into),
             memo,
             block_time: Some(stored_tx.block_time),
             confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+            // A row is keyed by signature and records no position in its block,
+            // so the field is omitted rather than guessed.
+            transaction_index: None,
         });
     }
 

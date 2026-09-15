@@ -114,6 +114,6 @@ mod tests {
         let (read_accounts, write_accounts) = extract_accounts(&sanitized);
 
         assert_eq!(write_accounts, vec![from.pubkey(), to]);
-        assert_eq!(read_accounts, vec![solana_sdk::system_program::id()]);
+        assert_eq!(read_accounts, vec![solana_sdk_ids::system_program::id()]);
     }
 }

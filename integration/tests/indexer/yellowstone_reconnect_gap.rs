@@ -10,7 +10,7 @@ use private_channel_indexer::indexer::datasource::yellowstone::YellowstoneSource
 use private_channel_indexer::storage::common::storage::mock::MockStorage;
 use private_channel_indexer::storage::Storage;
 use serde_json::json;
-use solana_sdk::commitment_config::CommitmentLevel;
+use solana_commitment_config::CommitmentLevel;
 use solana_transaction_status::UiTransactionEncoding;
 use std::collections::HashSet;
 use std::sync::Arc;

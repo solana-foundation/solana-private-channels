@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+solana-commitment-config = { workspace = true }
 bs58.workspace = true
 chrono.workspace = true
 private-channel-escrow-program-client.workspace = true
@@ -12,10 +13,10 @@ private-channel-indexer = { path = "../indexer" }
 serde_json.workspace = true
 solana-address.workspace = true
 solana-client.workspace = true
-solana-net-utils = "3.0"
+solana-net-utils = "4.2"
 solana-rpc.workspace = true
 solana-sdk.workspace = true
-solana-sdk-ids = "3.0"
+solana-sdk-ids = { workspace = true }
 solana-test-validator.workspace = true
 solana-transaction-status.workspace = true
 tempfile.workspace = true

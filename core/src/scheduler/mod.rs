@@ -302,8 +302,8 @@ mod tests {
             let (read, write) = extract_accounts(tx);
             println!("Tx {}: {} reads, {} writes", i + 1, read.len(), write.len());
             // Check for system program
-            if read.contains(&solana_sdk::system_program::id())
-                || write.contains(&solana_sdk::system_program::id())
+            if read.contains(&solana_sdk_ids::system_program::id())
+                || write.contains(&solana_sdk_ids::system_program::id())
             {
                 println!("  Contains system program!");
             }

@@ -191,7 +191,7 @@ async fn derive_rows_for_block(
     for row in rows {
         let sig_bytes: Vec<u8> = row.get("signature");
         let data: Vec<u8> = row.get("data");
-        let stored: StoredTransaction = match bincode::deserialize(&data) {
+        let stored = match StoredTransaction::from_bytes(&data) {
             Ok(t) => t,
             Err(e) => {
                 let sig = Signature::try_from(sig_bytes.as_slice())
@@ -333,7 +333,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }))

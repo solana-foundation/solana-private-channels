@@ -14,8 +14,8 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    system_program::ID as SYSTEM_PROGRAM_ID,
 };
+use solana_sdk_ids::system_program::ID as SYSTEM_PROGRAM_ID;
 use spl_associated_token_account::ID as ATA_PROGRAM_ID;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 

@@ -14,7 +14,7 @@ use crate::storage::common::storage::mock::MockStorage;
 use crate::storage::Storage;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use std::collections::{HashMap, HashSet};
