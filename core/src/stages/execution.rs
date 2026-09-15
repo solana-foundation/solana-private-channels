@@ -8,7 +8,7 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::{retained_bytes_of, AccountSettlements, ExecutedBatch, WeightBudget},
+        stages::{retained_bytes_of, ExecutedBatch, SettledInbox, WeightBudget},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
@@ -54,7 +54,7 @@ const MIN_PARALLEL_BATCH_FACTOR: usize = 4;
 
 pub struct ExecutionArgs {
     pub batch_rx: mpsc::Receiver<ConflictFreeBatch>,
-    pub settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    pub settled_accounts: SettledInbox,
     pub execution_results_tx: mpsc::Sender<ExecutedBatch>,
     pub accountsdb_connection_url: String,
     pub metrics: SharedMetrics,
@@ -113,7 +113,7 @@ pub struct ExecutionResult {
 pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
     let ExecutionArgs {
         mut batch_rx,
-        settled_accounts_rx,
+        settled_accounts,
         execution_results_tx,
         accountsdb_connection_url,
         metrics,
@@ -132,7 +132,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
             .unwrap();
         let mut execution_deps = get_execution_deps(
             accounts_db,
-            settled_accounts_rx,
+            settled_accounts,
             max_svm_workers,
             live_blockhashes,
         )
@@ -192,11 +192,11 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
 
 pub async fn get_execution_deps(
     accounts_db: AccountsDB,
-    settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    settled_accounts: SettledInbox,
     max_svm_workers: usize,
     live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 ) -> ExecutionDeps {
-    let bob = BOB::new(accounts_db, settled_accounts_rx).await;
+    let bob = BOB::new(accounts_db, settled_accounts).await;
     let feature_set = SVMFeatureSet::all_enabled();
     let compute_budget = SVMTransactionExecutionBudget::default();
     let batch_processor =
@@ -1459,8 +1459,8 @@ mod tests {
         accounts_db: crate::accounts::AccountsDB,
         budget: usize,
     ) -> ExecutionDeps {
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         deps.preload_budget_bytes = budget;
         deps
     }
@@ -1471,8 +1471,8 @@ mod tests {
         accounts_db: crate::accounts::AccountsDB,
         per_tx_limit: usize,
     ) -> ExecutionDeps {
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         deps.max_tx_loaded_accounts_bytes = per_tx_limit;
         deps
     }
@@ -2423,8 +2423,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_exploit_is_rejected() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2447,8 +2447,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_spend_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2464,8 +2464,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn two_step_setup_does_not_graduate_payer() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2498,8 +2498,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn synthetic_fee_payer_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2519,8 +2519,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn gasless_sponsor_succeeds_and_is_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let b = Keypair::new();
@@ -2549,8 +2549,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn real_transfer_persists_both_sides() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let b = Keypair::new();
@@ -2570,8 +2570,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ata_creation_under_fabricated_payer_succeeds() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let (admin_tx, mint) = create_admin_initialize_mint_tx();
@@ -2618,8 +2618,8 @@ mod tests {
         };
 
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let payer = Keypair::new();
@@ -2678,8 +2678,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_failure_through_svm_is_executed_err_and_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let payer = Keypair::new();
@@ -2731,10 +2731,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn conservation_parallel_path_parity() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         // Above the parallel threshold so SnapshotCallback fabricates the payers.
@@ -2777,10 +2777,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_parallel_path() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so each worker gets 2× MIN_PARALLEL_BATCH_FACTOR
         // transactions — comfortably inside the parallel regime.
@@ -2810,10 +2810,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_parallel_threshold_boundary() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         let n = workers * MIN_PARALLEL_BATCH_FACTOR;
         let transactions: Vec<_> = (0..n)
@@ -2891,8 +2891,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_empty_batch() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let empty_batch = ConflictFreeBatch {
             transactions: vec![],
@@ -2909,8 +2909,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_single_normal_transaction() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx = create_test_transaction();
         let batch = ConflictFreeBatch {
@@ -2937,8 +2937,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_multiple_normal_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx1 = create_test_transaction();
         let tx2 = create_test_transaction();
@@ -2969,11 +2969,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_drops_expired_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
 
         let known = Hash::new_unique();
         let live = Arc::new(RwLock::new(LinkedList::from([known])));
-        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
 
         // Two txs using the known (live) hash + one tx using an expired hash.
         let payer = Keypair::new();
@@ -3029,11 +3029,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_reads_live_window_each_call() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
 
         let bh = Hash::new_unique();
         let live = Arc::new(RwLock::new(LinkedList::from([bh])));
-        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let batch_with = |payer: &Keypair| ConflictFreeBatch {
@@ -3080,13 +3080,13 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, _execution_results_rx) =
             mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3120,10 +3120,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_parallel_path_preserves_transaction_order() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so the batch is comfortably in the
         // parallel regime and splits into multiple chunks.
@@ -3171,10 +3171,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_parallel_path_uneven_chunking() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 17 is intentional: > threshold (16), not divisible by 4, last
         // chunk is much smaller than the others.
@@ -3226,8 +3226,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_max_svm_workers_one_forces_sequential() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
 
         // Deliberately well above any reasonable parallel threshold — with
         // workers=2 this size would split; with workers=1 the gate keeps
@@ -3404,14 +3404,14 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, _execution_results_rx) =
             mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
         let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3437,8 +3437,8 @@ mod tests {
     async fn test_execute_batch_routes_pure_admin_tx_to_admin_vm() {
         // A tx whose only instruction is an admin instruction routes to the Admin VM.
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let (tx, _mint) = create_admin_initialize_mint_tx();
         let batch = ConflictFreeBatch {
@@ -3463,8 +3463,8 @@ mod tests {
         // Admin VM. The router sends it to the regular SVM path; the admin
         // path stays strictly single-purpose.
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx = create_mixed_admin_and_regular_tx();
         let batch = ConflictFreeBatch {
@@ -3490,8 +3490,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_partitions_admin_and_regular_separately() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let (admin_tx, _mint) = create_admin_initialize_mint_tx();
         let regular_tx = create_test_transaction();
@@ -3536,13 +3536,13 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let shutdown = CancellationToken::new();
 
         let _handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3585,13 +3585,13 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3637,10 +3637,10 @@ mod tests {
         use crate::accounts::get_accounts::{reset_test_retry, set_test_retry};
 
         set_test_retry(2, 1);
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let mut deps = get_execution_deps(
             crate::test_helpers::dead_postgres_db(),
-            rx,
+            inbox,
             1,
             default_live_blockhashes(),
         )
@@ -3686,8 +3686,8 @@ mod tests {
         let corrupt = Pubkey::new_unique();
         insert_corrupt_pg(&accounts_db, corrupt).await;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let batch = ConflictFreeBatch {
@@ -3712,8 +3712,8 @@ mod tests {
         let unref = Pubkey::new_unique();
         insert_corrupt_pg(&accounts_db, unref).await;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let result = run_batch(
@@ -3856,8 +3856,8 @@ mod tests {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let big = seed_sized_accounts(&mut accounts_db, 7, BIG_ACCOUNT_BYTES).await;
 
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let oversized_payer = Keypair::new();
@@ -3978,10 +3978,10 @@ mod tests {
     /// sizing cannot have introduced a round-trip on the warm path.
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_batch_runs_a_warm_batch_without_the_store() {
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let mut deps = get_execution_deps(
             crate::test_helpers::dead_postgres_db(),
-            rx,
+            inbox,
             1,
             default_live_blockhashes(),
         )
@@ -4168,8 +4168,8 @@ mod tests {
     async fn results_do_not_carry_readonly_account_data() {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let readonly = seed_sized_accounts(&mut accounts_db, 1, 1_500).await[0];
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let tx = transfer_with_unused_readonly(&Keypair::new(), &[readonly]);
@@ -4209,6 +4209,42 @@ mod tests {
         assert_eq!(
             stored.meta.pre_balances[index], 1,
             "stored balances come from lamports"
+        );
+    }
+
+    /// The queue weight counts writable data only. That is exact only because
+    /// readonly data is shed before the result is queued, so tie the two together.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queue_weight_equals_what_a_shed_result_retains() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 2, 4096).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &readonly);
+        let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+        let output = result
+            .regular_results
+            .as_ref()
+            .expect("the transfer runs on the regular path");
+
+        let mut retained = 0;
+        for processed in &output.processing_results {
+            let Ok(ProcessedTransaction::Executed(executed)) = processed else {
+                panic!("the transaction must be processed by the SVM");
+            };
+            for (key, account) in &executed.loaded_transaction.accounts {
+                if readonly.contains(key) {
+                    assert!(account.data().is_empty(), "readonly data must be shed");
+                }
+                retained += account.data().len();
+            }
+        }
+        assert_eq!(
+            retained_account_bytes(&output.processing_results, &result.regular_transactions),
+            retained,
+            "the queue weight must equal every data byte the result holds"
         );
     }
 
@@ -4338,10 +4374,10 @@ mod tests {
         {
             let (accounts_db, pg) = start_test_postgres().await;
             let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
-            let (_settled_tx, rx) = mpsc::unbounded_channel();
+            let inbox = SettledInbox::new();
 
             let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
-            let mut deps = get_execution_deps(accounts_db, rx, 1, Arc::clone(&live)).await;
+            let mut deps = get_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
             let noop: SharedMetrics = Arc::new(NoopMetrics);
 
             let (admin_tx, _mint) = create_admin_initialize_mint_tx();
@@ -4403,10 +4439,10 @@ mod tests {
             let (mut accounts_db, pg) = start_test_postgres().await;
             let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
             let readonly = seed_sized_accounts(&mut accounts_db, 1, 1_500).await;
-            let (_settled_tx, rx) = mpsc::unbounded_channel();
+            let inbox = SettledInbox::new();
 
             let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
-            let mut deps = get_execution_deps(accounts_db, rx, 1, Arc::clone(&live)).await;
+            let mut deps = get_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
             deps.max_tx_loaded_accounts_bytes = 1_000;
             let noop: SharedMetrics = Arc::new(NoopMetrics);
 

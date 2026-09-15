@@ -6,14 +6,18 @@
 //! pipeline stays healthy past the heartbeat margin; a slow settler never
 //! deadlocks). `bounded_memory_under_burst` stays `#[ignore]` — its RSS-plateau
 //! assertion is resource-sensitive and belongs in a staging load run.
+//! `bob_dirty_set_drains_through_the_inbox` guards the settler and the executor's
+//! cache sharing one settled inbox.
 
 use {
     private_channel_core::{
+        accounts::AccountsDB,
         nodes::node::{run_node, NodeConfig, NodeHandles, NodeMode},
         stage_metrics::PrometheusMetrics,
     },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
+        account::AccountSharedData,
         instruction::Instruction,
         signature::{Keypair, Signer},
         transaction::Transaction,
@@ -98,13 +102,17 @@ async fn start_node(config: NodeConfig) -> (NodeHandles, String) {
 
 /// A unique, allowlisted, signature-valid memo tx against `blockhash`.
 fn memo_tx(blockhash: solana_sdk::hash::Hash, nonce: u64) -> Transaction {
-    let payer = Keypair::new();
+    memo_from(&Keypair::new(), blockhash, nonce)
+}
+
+/// The same memo paid for by `payer`, so every one rewrites the payer's account.
+fn memo_from(payer: &Keypair, blockhash: solana_sdk::hash::Hash, nonce: u64) -> Transaction {
     let memo = Instruction {
         program_id: spl_memo::id(),
         accounts: vec![],
         data: format!("backpressure:{nonce}").into_bytes(),
     };
-    Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[&payer], blockhash)
+    Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[payer], blockhash)
 }
 
 fn rss_kb() -> u64 {
@@ -116,6 +124,26 @@ fn rss_kb() -> u64 {
         .and_then(|v| v.split_whitespace().next())
         .and_then(|kb| kb.parse().ok())
         .unwrap_or(0)
+}
+
+/// Current value of one unlabelled gauge, zero if it was never set.
+fn gauge_value(name: &str) -> f64 {
+    private_channel_metrics::prometheus::gather()
+        .into_iter()
+        .filter(|mf| mf.name() == name)
+        .flat_map(|mf| mf.get_metric().to_vec())
+        .map(|m| m.get_gauge().value())
+        .sum()
+}
+
+/// Current value of one counter family, zero if it never moved.
+fn counter_value(name: &str) -> f64 {
+    private_channel_metrics::prometheus::gather()
+        .into_iter()
+        .filter(|mf| mf.name() == name)
+        .flat_map(|mf| mf.get_metric().to_vec())
+        .map(|m| m.get_counter().value())
+        .sum()
 }
 
 fn shed_total() -> f64 {
@@ -176,6 +204,85 @@ async fn no_deadlock_under_slow_settler() {
     assert!(
         slot_end > slot_start,
         "settler must keep advancing slots under load (no deadlock): {slot_start} -> {slot_end}"
+    );
+    handles.shutdown().await;
+}
+
+/// Two inboxes would compile and strand every settlement where the executor's
+/// cache never reads. Many writes of one funded account, plus fresh payers the
+/// executor closes, must all settle back to clean through the running node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bob_dirty_set_drains_through_the_inbox() {
+    private_channel_core::stage_metrics::init_prometheus_metrics();
+    let (_pg, db_url) = start_postgres().await;
+
+    // Funded before the node starts, so one writable key recurs in every batch.
+    let payer = Keypair::new();
+    let mut db = AccountsDB::new(&db_url, false)
+        .await
+        .expect("accounts db must open");
+    db.set_account(
+        payer.pubkey(),
+        AccountSharedData::new(1_000_000_000, 0, &solana_sdk_ids::system_program::ID),
+    )
+    .await;
+    drop(db);
+
+    let (handles, url) = start_node(load_config(db_url, free_port(), true)).await;
+    let client = RpcClient::new(url);
+    let slot_start = client.get_slot().await.unwrap_or(0);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut nonce = 0u64;
+    while std::time::Instant::now() < deadline {
+        let bh = client.get_latest_blockhash().await.expect("blockhash");
+        for _ in 0..32 {
+            // Shed errors are fine: only what executed has to settle.
+            let _ = client.send_transaction(&memo_from(&payer, bh, nonce)).await;
+            let _ = client.send_transaction(&memo_tx(bh, nonce)).await;
+            nonce += 1;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    // Five blocktimes, so every block the flood produced has committed and published.
+    sleep(Duration::from_millis(500)).await;
+
+    // The probe's preload drains the inbox, and the gauges are reported right after it.
+    let bh = client.get_latest_blockhash().await.expect("blockhash");
+    let probe = client
+        .send_transaction(&memo_tx(bh, nonce))
+        .await
+        .expect("the probe must be admitted");
+    let mut landed = false;
+    for _ in 0..100 {
+        if client
+            .get_signature_statuses(&[probe])
+            .await
+            .expect("status query")
+            .value[0]
+            .is_some()
+        {
+            landed = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(landed, "probe {probe} never landed");
+
+    let slot_end = client.get_slot().await.expect("slot still served");
+    assert!(
+        slot_end > slot_start,
+        "slots must advance: {slot_start} -> {slot_end}"
+    );
+    assert_eq!(
+        gauge_value("private_channel_bob_cache_dirty_entries"),
+        0.0,
+        "every settled write must reach the executor's cache through the shared inbox"
+    );
+    assert_eq!(
+        counter_value("private_channel_bob_settlement_divergences_total"),
+        0.0,
+        "merged settlements must match what the cache holds"
     );
     handles.shutdown().await;
 }
