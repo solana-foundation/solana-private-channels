@@ -263,6 +263,7 @@ pub(crate) fn dead_postgres_db() -> crate::accounts::AccountsDB {
     AccountsDB::Postgres(PostgresAccountsDB {
         pool: Arc::new(pool),
         read_only: true,
+        writer_epoch: None,
     })
 }
 
