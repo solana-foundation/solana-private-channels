@@ -134,6 +134,11 @@ pub fn process_deposit(
         args.amount,
         mint_decimals,
         token_program_info.address(),
+        // No memo slot: the destination is the instance's own ATA, and required
+        // memos are only ever set by an owner-signed EnableRequiredMemoTransfers,
+        // which this program never issues, or derived from a mint extension,
+        // which never yields MemoTransfer.
+        None,
         hook_extras,
         &[],
     )?;

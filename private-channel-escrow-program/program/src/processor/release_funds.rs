@@ -27,7 +27,7 @@ use pinocchio::{
 const INSTRUCTION_DATA_LENGTH: usize = 8 + 32 + 8;
 
 /// Fixed account prefix; anything past it is transfer-hook extras.
-const FIXED_ACCOUNTS_LEN: usize = 13;
+const FIXED_ACCOUNTS_LEN: usize = 14;
 
 /// Processes the ReleaseFunds instruction.
 ///
@@ -45,6 +45,7 @@ const FIXED_ACCOUNTS_LEN: usize = 13;
 /// 10. `[]` associated_token_program - Associated Token program
 /// 11. `[]` event_authority - Event authority PDA for emitting events
 /// 12. `[]` private_channel_escrow_program - Current program for CPI
+/// 13. `[]` memo_program - SPL Memo program, used only when user_ata requires a memo
 ///
 /// Trailing accounts (variable): transfer-hook extras for the mint (hook
 /// program, validation PDA, and whatever its `ExtraAccountMetaList`
@@ -69,7 +70,7 @@ pub fn process_release_funds(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let (fixed_accounts, hook_extras) = accounts.split_at(FIXED_ACCOUNTS_LEN);
-    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
+    let [payer_info, operator_info, instance_info, withdrawal_bitmap_info, operator_pda_info, mint_info, allowed_mint_info, user_ata_info, instance_ata_info, token_program_info, associated_token_program_info, event_authority_info, program_info, memo_program_info] =
         fixed_accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -157,6 +158,7 @@ pub fn process_release_funds(
         args.amount,
         get_mint_decimals(mint_info)?,
         token_program_info.address(),
+        Some(memo_program_info),
         hook_extras,
         &[signer],
     )?;

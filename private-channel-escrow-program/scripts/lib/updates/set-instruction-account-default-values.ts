@@ -16,6 +16,7 @@ const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const EVENT_AUTHORITY_PDA = 'FngERuuhrF13VUpEVuTgVrBH9TM861Wwzr9d6qMSVjMd';
+const MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 
 function createAtaPdaValueNode(ownerAccount: string, mintAccount: string, tokenProgram: string) {
     return pdaValueNode(
@@ -59,6 +60,10 @@ export function setInstructionAccountDefaultValues(privateChannelEscrowCodama: C
             {
                 account: 'eventAuthority',
                 defaultValue: publicKeyValueNode(EVENT_AUTHORITY_PDA),
+            },
+            {
+                account: 'memoProgram',
+                defaultValue: publicKeyValueNode(MEMO_PROGRAM_ID),
             },
             {
                 account: 'instanceAta',

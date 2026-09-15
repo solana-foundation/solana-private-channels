@@ -811,10 +811,13 @@ async fn check_withdrawal_preflights_inner(
 /// The program caps extras at 32 (`MAX_HOOK_REMAINING_ACCOUNTS` in its
 /// `token_utils`, which codama does not export), but the transport binds first:
 /// the sender builds a legacy message with no lookup tables, and the 1232-byte
-/// packet holds 699 bytes of release plus 33 per extra, so 16 fit and 17 does
+/// packet holds 732 bytes of release plus 33 per extra, so 15 fit and 16 does
 /// not. Raise it toward 32 if the sender ever moves to versioned transactions
 /// with a lookup table, or to v1 transactions with their larger limit.
-const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 16;
+///
+/// The release grew by one account key plus its index byte, the same 33 bytes
+/// an extra costs, when ReleaseFunds gained its memo_program slot.
+const MAX_HOOK_EXTRAS_LEGACY_TX: usize = 15;
 
 /// Append the mint's transfer-hook accounts to a built release, so Token-2022
 /// can resolve the hook. A no-op for mints without one.

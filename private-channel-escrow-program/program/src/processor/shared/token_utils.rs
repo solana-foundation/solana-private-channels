@@ -18,8 +18,10 @@ use pinocchio_token_2022::{
     state::Mint as Token2022Mint, state::TokenAccount as Token2022Account,
     ID as TOKEN_2022_PROGRAM_ID,
 };
-use spl_token_2022::extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions};
-use spl_token_2022::state::Mint as Token2022MintState;
+use spl_token_2022::extension::{
+    memo_transfer::memo_required, BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+};
+use spl_token_2022::state::{Account as Token2022AccountState, Mint as Token2022MintState};
 
 use crate::error::PrivateChannelEscrowProgramError;
 
@@ -198,6 +200,49 @@ const MAX_TRANSFER_CHECKED_ACCOUNTS: usize = 4 + MAX_HOOK_REMAINING_ACCOUNTS;
 /// SPL Token / Token-2022 `TransferChecked` discriminator.
 const TRANSFER_CHECKED_DISCRIMINATOR: u8 = 12;
 
+/// SPL Memo program.
+const MEMO_PROGRAM_ID: Address =
+    Address::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
+/// Payload of the memo emitted before a memo-required transfer. Token-2022 only
+/// checks that the preceding sibling is the Memo program, so the text is free.
+const MEMO_TEXT: &[u8] = b"escrow release";
+
+/// True when `to` carries Token-2022's `MemoTransfer` extension, so an incoming
+/// transfer has to be preceded by a memo.
+#[inline(always)]
+fn requires_memo(to: &AccountView) -> Result<bool, ProgramError> {
+    if !to.owned_by(&TOKEN_2022_PROGRAM_ID) {
+        return Ok(false);
+    }
+    let data = to.try_borrow()?;
+    let account = StateWithExtensions::<Token2022AccountState>::unpack(&data)
+        .map_err(|_| PrivateChannelEscrowProgramError::InvalidTokenAccount)?;
+    Ok(memo_required(&account))
+}
+
+/// CPI the Memo program so it lands as the immediately preceding sibling of the
+/// transfer that follows. A memo the client puts at the top level sits one stack
+/// frame above our `TransferChecked` CPI and so is not a sibling, which is why
+/// this has to be emitted here. The address is checked only on this path, so a
+/// destination needing no memo is unaffected by whatever occupies the slot.
+///
+/// Memo handling ported from <https://github.com/solana-foundation/dvp>.
+#[inline(always)]
+fn invoke_memo(memo_program: &AccountView) -> ProgramResult {
+    if memo_program.address() != &MEMO_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let instruction = InstructionView {
+        program_id: &MEMO_PROGRAM_ID,
+        accounts: &[],
+        data: MEMO_TEXT,
+    };
+
+    invoke_signed_with_bounds::<0>(&instruction, &[], &[])
+}
+
 /// `TransferChecked` CPI carrying a trailing slice of transfer-hook extras.
 /// Hand-built because the pinocchio builder's account list is fixed at 4;
 /// an empty slice behaves like a plain `TransferChecked`.
@@ -224,9 +269,18 @@ pub fn transfer_checked_cpi(
     amount: u64,
     decimals: u8,
     token_program: &Address,
+    memo_program: Option<&AccountView>,
     hook_extras: &[AccountView],
     signers: &[Signer],
 ) -> ProgramResult {
+    // A memo-required destination needs the Memo CPI as its immediately
+    // preceding sibling, so emit it here where nothing can come between.
+    // `None` is for callers whose destination provably cannot require one; if
+    // that ever stops holding, this errors instead of skipping the memo.
+    if requires_memo(to)? {
+        invoke_memo(memo_program.ok_or(ProgramError::NotEnoughAccountKeys)?)?;
+    }
+
     if hook_extras.len() > MAX_HOOK_REMAINING_ACCOUNTS {
         return Err(ProgramError::InvalidArgument);
     }

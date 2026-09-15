@@ -229,6 +229,10 @@ pub enum PrivateChannelEscrowProgramInstruction {
         name = "private_channel_escrow_program",
         docs = "Current program for CPI"
     ))]
+    #[codama(account(
+        name = "memo_program",
+        docs = "SPL Memo program; only used when user_ata requires a memo"
+    ))]
     ReleaseFunds {
         /// Amount of tokens to release
         amount: u64,
