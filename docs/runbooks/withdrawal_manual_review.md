@@ -575,15 +575,17 @@ keys.
 2. **Rule out a release.** A release for this nonce could only land before that
    rotation. The escrow indexer records every release of this instance, from
    any operator key, before its checkpoint moves past the release's slot. This
-   is the same record the sender's own refund gate reads.
+   is the same record the sender's own refund gate reads. Run the queries in
+   this order. A release recorded between them would otherwise pair a stale
+   empty lookup with a checkpoint that has already moved past it.
    ```sql
-   SELECT signature, slot FROM observed_releases WHERE withdrawal_nonce = :withdrawal_nonce;
    SELECT last_committed_slot FROM indexer_state WHERE program_type = 'escrow';
+   SELECT signature, slot FROM observed_releases WHERE withdrawal_nonce = :withdrawal_nonce;
    ```
    - A row is returned: confirm it with `solana confirm -v <signature>`, then
      mark the row completed as in Path C Step 2. Done.
-   - No row, and `last_committed_slot` is at or past the rotation's slot:
-     no release landed. Continue.
+   - No row, and the `last_committed_slot` read first is at or past the
+     rotation's slot: no release landed. Continue.
    - No row, and the checkpoint is behind the rotation's slot: `AMBIGUOUS`.
 3. **Rule out an earlier refund.** A row re-armed from `failed_reminted` was
    already compensated, and "burned, no release" is still true for it.
