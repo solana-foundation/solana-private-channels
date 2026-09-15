@@ -20,6 +20,9 @@ pub enum AccountLoadError {
     /// A stored row is present but will not deserialize. Retrying cannot change
     /// the bytes, so this is an integrity fault and is fatal on the first read.
     Corrupt(Pubkey),
+    /// The read returned more account data than the caller's limit. Retrying
+    /// reads the same rows, so this is never retried.
+    LimitExceeded { limit: usize },
 }
 
 impl Display for AccountLoadError {
@@ -30,6 +33,9 @@ impl Display for AccountLoadError {
             }
             AccountLoadError::Corrupt(pubkey) => {
                 write!(f, "stored account {} could not be deserialized", pubkey)
+            }
+            AccountLoadError::LimitExceeded { limit } => {
+                write!(f, "account read exceeded its {} byte data limit", limit)
             }
         }
     }
@@ -205,9 +211,23 @@ pub async fn get_accounts(
     db: &AccountsDB,
     accounts: &[Pubkey],
 ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
+    get_accounts_within(db, accounts, usize::MAX).await
+}
+
+/// `get_accounts`, but fails with `LimitExceeded` once the account data read
+/// passes `max_data_bytes`. Nothing partial is returned.
+pub async fn get_accounts_within(
+    db: &AccountsDB,
+    accounts: &[Pubkey],
+    max_data_bytes: usize,
+) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
     let mut results = match db {
-        AccountsDB::Postgres(postgres_db) => get_accounts_postgres(postgres_db, accounts).await?,
-        AccountsDB::Redis(redis_db) => get_accounts_redis(redis_db, accounts).await?,
+        AccountsDB::Postgres(postgres_db) => {
+            get_accounts_postgres(postgres_db, accounts, max_data_bytes).await?
+        }
+        AccountsDB::Redis(redis_db) => {
+            get_accounts_redis(redis_db, accounts, max_data_bytes).await?
+        }
     };
     // A stored row with no lamports describes an account that no longer exists.
     // Cleared in place so the result stays positionally aligned with `accounts`.
@@ -281,13 +301,14 @@ async fn get_account_data_sizes_postgres(
 async fn get_accounts_postgres(
     postgres_db: &PostgresAccountsDB,
     accounts: &[Pubkey],
+    max_data_bytes: usize,
 ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
     let pool = Arc::clone(&postgres_db.pool);
     let pubkey_bytes: Vec<Vec<u8>> = accounts.iter().map(|key| key.to_bytes().to_vec()).collect();
 
     // Rows are decoded from borrowed bytes as they arrive, so a large read never
     // holds every raw row beside its decoded copy. A transient error restarts the
-    // whole read; a corrupt row is returned inside Ok so it is never retried.
+    // whole read; a corrupt row or a breached limit is returned inside Ok, so neither is retried.
     with_retry(|| async {
         let mut rows = sqlx::query("SELECT pubkey, data FROM accounts WHERE pubkey = ANY($1)")
             .bind(&pubkey_bytes)
@@ -296,9 +317,20 @@ async fn get_accounts_postgres(
         // Keys with no row stay None; a row that will not deserialize is an error,
         // never a silent skip, which the caller could not tell from absence.
         let mut result = vec![None; accounts.len()];
+        let mut data_bytes = 0usize;
         while let Some(row) = rows.try_next().await? {
             let row_pubkey: &[u8] = row.get("pubkey");
             let data: &[u8] = row.get("data");
+
+            // Counted the way the size query measures a row, and checked before
+            // decoding, so the row that crosses the limit is never decoded.
+            data_bytes = data_bytes
+                .saturating_add(data.len().saturating_sub(ACCOUNT_SERIALIZED_HEADER_BYTES));
+            if data_bytes > max_data_bytes {
+                return Ok(Err(AccountLoadError::LimitExceeded {
+                    limit: max_data_bytes,
+                }));
+            }
 
             if let Some(index) = accounts
                 .iter()
@@ -321,10 +353,12 @@ async fn get_accounts_postgres(
 
 /// The cache never mints an error of its own: an absent, unreadable, stale or
 /// undecodable entry is a miss that Postgres resolves, so an entry written by an
-/// older build cannot halt the node. Only the fallback can fail.
+/// older build cannot halt the node. Only the fallback can fail, or the caller's
+/// data limit, which counts what the cache served too.
 async fn get_accounts_redis(
     redis_db: &RedisAccountsDB,
     accounts: &[Pubkey],
+    max_data_bytes: usize,
 ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
     // MGET with no keys is a Redis error, and there is nothing to resolve.
     if accounts.is_empty() {
@@ -372,6 +406,18 @@ async fn get_accounts_redis(
         }
     };
 
+    // Hits and fallback rows share the caller's limit, since either store can
+    // serve a larger version of an account than the size was read from.
+    let hit_bytes = results.iter().flatten().fold(0usize, |total, account| {
+        total.saturating_add(account.data().len())
+    });
+    let limit_exceeded = AccountLoadError::LimitExceeded {
+        limit: max_data_bytes,
+    };
+    if hit_bytes > max_data_bytes {
+        return Err(limit_exceeded);
+    }
+
     // Every position the cache could not answer is a miss. Resolve just those
     // against the source of truth, keeping the result aligned with `accounts`.
     let missing: Vec<usize> = results
@@ -385,7 +431,17 @@ async fn get_accounts_redis(
     }
 
     let missing_pubkeys: Vec<Pubkey> = missing.iter().map(|&position| accounts[position]).collect();
-    let resolved = get_accounts_postgres(&redis_db.fallback, &missing_pubkeys).await?;
+    let resolved = match get_accounts_postgres(
+        &redis_db.fallback,
+        &missing_pubkeys,
+        max_data_bytes - hit_bytes,
+    )
+    .await
+    {
+        // Name the caller's limit, not the remainder the fallback was given.
+        Err(AccountLoadError::LimitExceeded { .. }) => return Err(limit_exceeded),
+        other => other?,
+    };
     for (position, account) in missing.into_iter().zip(resolved) {
         results[position] = account;
     }
@@ -659,6 +715,73 @@ mod tests {
             matches!(result, Err(AccountLoadError::Corrupt(key)) if key == corrupt),
             "a corrupt row must be reported directly, not retried: {result:?}"
         );
+    }
+
+    /// The limit counts account data, not stored row bytes. Rows whose data totals
+    /// the limit load, and a limit one byte lower refuses the whole read.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn get_accounts_within_stops_past_its_byte_limit() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let owner = Pubkey::new_unique();
+        let mut keys = Vec::new();
+        for _ in 0..3 {
+            let pubkey = Pubkey::new_unique();
+            db.set_account(pubkey, AccountSharedData::new(1, 2_000, &owner))
+                .await;
+            keys.push(pubkey);
+        }
+
+        let loaded = get_accounts_within(&db, &keys, 6_000)
+            .await
+            .expect("data exactly at the limit must load");
+        assert!(loaded.iter().all(|slot| slot.is_some()));
+
+        let result = get_accounts_within(&db, &keys, 5_999).await;
+        assert!(
+            matches!(
+                result,
+                Err(AccountLoadError::LimitExceeded { limit: 5_999 })
+            ),
+            "a read past its limit must fail with the caller's limit: {result:?}"
+        );
+    }
+
+    /// Cache hits and fallback rows share one limit, and a hit counts at the size
+    /// Redis served, which can be larger than the Postgres row.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn get_accounts_within_counts_cache_hits_and_fallback_rows_together() {
+        let (postgres_db, _pg) = start_test_postgres_raw().await;
+        let (mut redis_db, _redis) =
+            crate::test_helpers::start_stamped_redis(postgres_db.clone()).await;
+        let mut fallback = AccountsDB::Postgres(postgres_db);
+        let owner = Pubkey::new_unique();
+        let (cached, uncached) = (Pubkey::new_unique(), Pubkey::new_unique());
+        for key in [cached, uncached] {
+            fallback
+                .set_account(key, AccountSharedData::new(1, 2_000, &owner))
+                .await;
+        }
+        redis_db
+            .set_account(cached, AccountSharedData::new(1, 4_000, &owner))
+            .await;
+        let db = AccountsDB::Redis(redis_db);
+
+        let result = get_accounts_within(&db, &[cached, uncached], 5_999).await;
+        assert!(
+            matches!(
+                result,
+                Err(AccountLoadError::LimitExceeded { limit: 5_999 })
+            ),
+            "the fallback must only get what the cache hits left over: {result:?}"
+        );
+
+        let loaded = get_accounts_within(&db, &[cached, uncached], 6_000)
+            .await
+            .expect("hits and fallback rows exactly at the limit must load");
+        assert_eq!(loaded[0].as_ref().unwrap().data().len(), 4_000);
+        assert_eq!(loaded[1].as_ref().unwrap().data().len(), 2_000);
     }
 
     /// The header the size query subtracts must match what bincode actually

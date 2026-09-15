@@ -14,6 +14,10 @@ pub const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// Half the response ceiling, leaving room for logs and inner instructions beside it.
 pub const MAX_SIMULATION_ACCOUNTS_BYTES: usize = MAX_RESPONSE_SIZE / 2;
 
+/// `simulateTransaction` calls that may run at once. Each loads at most the
+/// per-transaction account data cap, so this bounds their total memory.
+pub const MAX_CONCURRENT_SIMULATIONS: usize = 8;
+
 /// Encoded-byte budget for the account in a `getAccountInfo` reply.
 /// Sized off what the endpoint actually serves: the largest account is the
 /// 134 KB SPL Token precompile, encoding to ~175 KB. The reply holds nothing

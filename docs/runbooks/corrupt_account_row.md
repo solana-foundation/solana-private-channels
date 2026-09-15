@@ -77,6 +77,12 @@ failing on a **Backend** error, not corruption. That is a database availability
 problem: check that Postgres is reachable and healthy, and expect the node to
 recover by itself once it is. Do not run any step below.
 
+If instead the log line reads `account read exceeded its <N> byte data limit`, the
+accounts table returned more data than the executor sized a moment earlier. With a
+single writer that cannot happen, so something else wrote to `accounts` while the
+node was live: a second write node that got past the writer lease, or SQL run by
+hand. Find and stop that writer. Do not run any step below.
+
 Take the pubkey from the log line. Every step that follows needs it.
 
 ## Confirm before touching anything

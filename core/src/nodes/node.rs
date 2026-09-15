@@ -501,6 +501,9 @@ async fn start_services(
                 accounts_db,
                 live_blockhashes: live_blockhashes_arc,
                 max_blockhashes,
+                simulation_permits: tokio::sync::Semaphore::new(
+                    crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
+                ),
             })
         }
         NodeMode::Write => None,
