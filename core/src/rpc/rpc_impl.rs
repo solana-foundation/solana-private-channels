@@ -63,6 +63,8 @@ pub struct ReadDeps {
     pub admin_keys: Vec<Pubkey>,
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
     pub max_blockhashes: u64,
+    /// One permit per running `simulateTransaction`; a call finding none is refused.
+    pub simulation_permits: tokio::sync::Semaphore,
 }
 
 pub struct WriteDeps {

@@ -3435,14 +3435,14 @@ mod tests {
 
         // Drains the acknowledgement and drops the tombstone, then proves the
         // now-absent key is not refilled from the database.
-        let (fetched, cached) = bob.preload_accounts(&[closed]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[closed], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
             "the tombstone is still resident when the hit/miss split runs"
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[closed]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[closed], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 0),

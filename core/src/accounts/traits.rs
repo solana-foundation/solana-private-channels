@@ -164,6 +164,14 @@ impl AccountsDB {
         super::get_accounts::get_accounts(self, accounts).await
     }
 
+    pub async fn get_accounts_within(
+        &self,
+        accounts: &[Pubkey],
+        max_data_bytes: usize,
+    ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
+        super::get_accounts::get_accounts_within(self, accounts, max_data_bytes).await
+    }
+
     pub async fn get_account_data_sizes(
         &self,
         accounts: &[Pubkey],

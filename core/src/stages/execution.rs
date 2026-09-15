@@ -941,8 +941,9 @@ fn retain_live(
     transactions
 }
 
-/// Returns `Err` when the accounts this batch needs could not be loaded. The
-/// abort happens before any SVM run or BOB write, so nothing has changed yet.
+/// Returns `Err` when the accounts this batch needs could not be loaded, or came
+/// back larger than they were sized. The abort happens before any SVM run or BOB
+/// write, so nothing has changed yet.
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
@@ -1043,11 +1044,16 @@ pub async fn execute_batch(
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
     let t_op = Instant::now();
+    // Admitted accounts never exceed the larger limit, so a bigger fetch means the store
+    // changed after sizing. With a single writer that is a fault, so the batch aborts.
+    let max_fetch_bytes = execution_deps
+        .preload_budget_bytes
+        .max(execution_deps.max_tx_loaded_accounts_bytes);
     // Executing against accounts BOB could not load would settle state derived
     // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
     let (preload_fetched, preload_cached) = match execution_deps
         .bob
-        .preload_accounts(&accounts_to_preload)
+        .preload_accounts(&accounts_to_preload, max_fetch_bytes)
         .await
     {
         Ok(counts) => counts,
@@ -3664,6 +3670,44 @@ mod tests {
         );
     }
 
+    /// Fetched data larger than its sizes aborts the batch before anything is
+    /// cached. Redis serving a bigger copy than Postgres sized makes the skew exact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_aborts_when_the_fetch_outgrows_its_sizes() {
+        let (postgres_db, _pg) = crate::test_helpers::start_test_postgres_raw().await;
+        let (mut redis_db, _redis) =
+            crate::test_helpers::start_stamped_redis(postgres_db.clone()).await;
+        let mut fallback = AccountsDB::Postgres(postgres_db);
+        let grown = seed_sized_accounts(&mut fallback, 1, 100).await[0];
+        redis_db
+            .set_account(
+                grown,
+                AccountSharedData::new(1, 5_000, &solana_sdk_ids::system_program::ID),
+            )
+            .await;
+        let mut deps = deps_with_budget(AccountsDB::Redis(redis_db), 1_000).await;
+        deps.max_tx_loaded_accounts_bytes = 1_000;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let transactions = vec![crate::scheduler::TransactionWithIndex {
+            transaction: Arc::new(transfer_with_unused_readonly(&Keypair::new(), &[grown])),
+            index: 0,
+        }];
+        let result = execute_batch(ConflictFreeBatch { transactions }, &mut deps, &noop).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AccountLoadError::LimitExceeded { limit: 1_000 })
+            ),
+            "a fetch past its limit must abort the batch"
+        );
+        assert!(
+            deps.bob.get_account_shared_data(&grown).is_none(),
+            "nothing may be cached from a read that breached its limit"
+        );
+    }
+
     async fn insert_corrupt_pg(db: &AccountsDB, pubkey: Pubkey) {
         if let AccountsDB::Postgres(pg) = db {
             sqlx::query(
@@ -3971,6 +4015,26 @@ mod tests {
         assert!(
             result.deferred.is_empty(),
             "4000 bytes of transactions are 2000 bytes of accounts"
+        );
+    }
+
+    /// A first transaction larger than the budget but under the per-transaction
+    /// cap is admitted on purpose, so the fetch limit must not trip on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_transaction_over_the_budget_still_loads() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let big = seed_sized_accounts(&mut accounts_db, 1, 1_500).await[0];
+        let mut deps = deps_with_budget(accounts_db, 1_000).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &[big]);
+        let result = run_batch(&mut deps, &noop, vec![tx]).await;
+
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(result.deferred.is_empty());
+        assert!(
+            deps.bob.get_account_shared_data(&big).is_some(),
+            "the admitted transaction's account must be loaded"
         );
     }
 

@@ -246,6 +246,25 @@ pub(crate) async fn start_test_redis(
     (db, container)
 }
 
+/// `start_test_redis` stamped with the fallback's deployment id, so keys seeded
+/// straight into Redis are served as cache hits.
+#[cfg(test)]
+pub(crate) async fn start_stamped_redis(
+    fallback: crate::accounts::PostgresAccountsDB,
+) -> (
+    crate::accounts::RedisAccountsDB,
+    testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
+) {
+    let deployment_id = crate::accounts::redis_coherence::read_deployment_id(&fallback)
+        .await
+        .unwrap();
+    let (redis_db, container) = start_test_redis(fallback).await;
+    crate::accounts::redis_coherence::stamp_deployment_id(&redis_db, &deployment_id)
+        .await
+        .unwrap();
+    (redis_db, container)
+}
+
 /// An AccountsDB whose pool points at a bogus URL, so every query fails with a
 /// connection error. Use it to exercise the unreadable-store path.
 #[cfg(test)]

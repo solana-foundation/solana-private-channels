@@ -88,6 +88,7 @@ mod tests {
             admin_keys: vec![],
             live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
             max_blockhashes: TEST_MAX_BLOCKHASHES,
+            simulation_permits: tokio::sync::Semaphore::new(constants::MAX_CONCURRENT_SIMULATIONS),
         }
     }
 

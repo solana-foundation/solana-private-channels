@@ -100,7 +100,16 @@ one has been handed to the settler. Per-transaction limits alone would not bound
 anything here: a batch of individually legal transactions still adds up to
 gigabytes, and a small transaction can name a large amount of account data
 through readonly keys no instruction uses. A store that cannot answer the size
-query aborts the batch on the same terms as an unreadable preload.
+query aborts the batch on the same terms as an unreadable preload. The fetch then
+counts the account data it actually reads against the larger of the two limits
+and stops as soon as it passes it, before anything reaches the cache. On the write
+node the settler is the only writer, so the fetch always matches its sizes; more
+bytes than that mean the accounts table changed under the writer, and the batch
+aborts like an unreadable store. A simulation's fetch is limited to 64 MiB, and at
+most 8 simulations run at once, so they hold at most about 512 MiB of account data
+between them. On a read node with a Redis cache the reply for the cached accounts
+arrives whole before it can be counted, so that bound covers what a fetch returns,
+not that brief reply.
 
 **Resident account memory**: the preload budget bounds one fetch, but the cache
 keeps what it loads, so BOB is also capped by bytes (1 GiB) as well as by entry
@@ -254,6 +263,7 @@ Solana precompile programs (Ed25519, Secp256k1, Secp256r1) are not available. Tr
 | Max slot range for `getBlocks`, max limit for `getBlocksWithLimit` | 500,000 | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max addresses per `simulateTransaction` | the transaction's own account count (matches Agave) | [`core/src/rpc/simulate_transaction_impl.rs`](../core/src/rpc/simulate_transaction_impl.rs) |
 | Max encoded bytes for `simulateTransaction` accounts | 5 MB | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
+| Max concurrent `simulateTransaction` calls | 8, the excess returns `-32003` | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Max RPC response size | 10 MB, **declared but not enforced** (see below) | [`core/src/rpc/constants.rs`](../core/src/rpc/constants.rs) |
 | Gateway max request body | 64 KB | [`gateway/src/lib.rs`](../gateway/src/lib.rs) |
 
