@@ -5,16 +5,17 @@
 //! instance's Associated Token Accounts (ATAs).
 //!
 //! The DB-side formula mirrors exactly what is on-chain:
-//!   `db_expected = all_indexed_deposits − completed_withdrawals`
+//!   `db_expected = all_indexed_deposits - released_withdrawals`
 //!
 //! Deposits increase the ATA balance on-chain the moment they are observed, regardless of
 //! the operator's private_channel minting status (`pending`/`processing`/`completed`/`failed`).
-//! Only completed withdrawals (`release_funds`) reduce the ATA balance.
+//! Only released withdrawals (a `release_funds` the indexer observed at or below the slot)
+//! reduce the ATA balance.
 //!
 //! Flow:
 //! 1. Sweep the escrow instance's on-chain token accounts, summed per mint, noting the
 //!    slot the reading is valid as of.
-//! 2. Query the DB for per-mint aggregate balances (all deposits − completed
+//! 2. Query the DB for per-mint aggregate balances (all deposits - released
 //!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.
 //! 4. If any mint's channel supply exceeds its custody by more than the threshold, log
@@ -23,12 +24,14 @@
 //!    indexing more slots. A supply that cannot be read at all aborts too, since an
 //!    unreadable channel and a solvent one look the same from here.
 //! 5. A mint whose shortfall (db_expected minus on-chain) exceeds the threshold means the escrow may not cover its liabilities: log an error, emit an alert, and abort startup.
+//!    Skipped with a warning when the escrow checkpoint is below the snapshot slot, since that ledger lacks recent releases.
 //! 6. A surplus (on-chain minus db_expected) is benign and attacker-inducible, so it only logs a warning and never blocks; a shortfall within the threshold also just warns.
 //! 7. If all mints balance (or both sides are empty), log info and continue.
 
 use crate::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
+    indexer::checkpoint::program_key,
     operator::{
         escrow_sweep::{
             fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot, SweepFailure,
@@ -49,7 +52,7 @@ use tracing::{error, info, warn};
 #[derive(Debug, Clone)]
 pub struct MintReconciliation {
     pub mint: String,
-    /// Expected balance according to DB: all indexed deposits − completed withdrawals.
+    /// Expected balance according to DB: all indexed deposits - released withdrawals.
     /// Unsigned because it mirrors the escrow ATA balance, itself a u64; a negative
     /// net is clamped to 0 at the call site so this value stays lossless across the
     /// full u64 range instead of truncating at i64::MAX.
@@ -222,6 +225,21 @@ pub async fn reconcile_against_snapshot(
     // would send startup back for another catch-up that cannot change this answer.
     check_channel_supply_invariant(channel_rpc_url, rpc_url, instance_pda, config, &results)
         .await?;
+
+    // A ledger checkpointed below the snapshot lacks releases that already left custody, so its
+    // shortfall proves nothing; runtime reconciliation compares once the indexer catches up.
+    let committed = storage
+        .get_committed_checkpoint(&program_key(program_type))
+        .await
+        .map_err(ReconciliationError::Storage)?;
+    if let Some(committed) = committed.filter(|&c| c < snapshot.slot) {
+        warn!(
+            committed,
+            snapshot_slot = snapshot.slot,
+            "Ledger is behind the custody snapshot; ledger comparison deferred to runtime reconciliation"
+        );
+        return Ok(());
+    }
 
     classify_and_report(config, &results)?;
 
@@ -1221,6 +1239,70 @@ mod tests {
             }
             other => panic!("Expected MismatchExceedsThreshold, got: {:?}", other),
         }
+    }
+
+    /// Run startup reconciliation with custody 980 (slot 100), ledger 1000 and the escrow
+    /// checkpoint at `checkpoint`; supply matches custody unless `supply` says otherwise.
+    async fn shortfall_with_checkpoint(checkpoint: u64, supply: u64) -> Result<(), IndexerError> {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
+        mock_channel_supply(&mut server, supply).await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        mock_storage.set_checkpoint("escrow", checkpoint);
+        let storage = Storage::Mock(mock_storage);
+
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 10,
+        };
+        let url = server.url();
+        run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &Pubkey::new_unique(),
+        )
+        .await
+    }
+
+    /// A ledger behind the snapshot is missing the releases that already left custody, so
+    /// its shortfall must not stop startup; runtime reconciliation compares once caught up.
+    #[tokio::test]
+    async fn shortfall_from_a_ledger_behind_the_snapshot_does_not_block() {
+        let result = shortfall_with_checkpoint(99, 980).await;
+        assert!(result.is_ok(), "lagging ledger must defer: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn shortfall_from_a_ledger_covering_the_snapshot_still_blocks() {
+        let result = shortfall_with_checkpoint(100, 980).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "a covering ledger must still block: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_behind_the_snapshot_still_enforces_the_supply_invariant() {
+        let result = shortfall_with_checkpoint(99, 1_200).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::SupplyExceedsCustody { .. }
+                ))
+            ),
+            "supply over custody must block whatever the ledger: {result:?}"
+        );
     }
 
     #[tokio::test]

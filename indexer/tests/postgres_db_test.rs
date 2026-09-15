@@ -13,7 +13,7 @@ use private_channel_indexer::{
     operator::sender_lock_key,
     storage::{
         common::amount::TokenAmount,
-        common::models::{DbMint, DbMintStatus, MintStatusAtSlot, StoredSig},
+        common::models::{DbMint, DbMintStatus, DbObservedRelease, MintStatusAtSlot, StoredSig},
         common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
         common::storage::sender_lock::SenderLockGuard,
         postgres::db::{
@@ -726,17 +726,26 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
         .execute(&pool)
         .await?;
 
-    // Completed withdrawal (only completed withdrawals count)
+    // Released withdrawal: only a release the indexer observed counts
     let mut w1 = make_db_transaction("recon_w1", TransactionType::Withdrawal);
     w1.mint = mint.to_string();
     w1.amount = TokenAmount(100);
     let w1_id = storage.insert_db_transaction(&w1).await?;
-    sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
-        .bind(w1_id)
-        .execute(&pool)
+    let w1_nonce: i64 = sqlx::query_scalar(
+        "UPDATE transactions SET status = 'completed' WHERE id = $1 RETURNING withdrawal_nonce",
+    )
+    .bind(w1_id)
+    .fetch_one(&pool)
+    .await?;
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: w1_nonce,
+            signature: "recon_w1_release".to_string(),
+            slot: 100,
+        }])
         .await?;
 
-    // Pending withdrawal (should NOT count)
+    // Pending withdrawal with no release (should NOT count)
     let mut w2 = make_db_transaction("recon_w2", TransactionType::Withdrawal);
     w2.mint = mint.to_string();
     w2.amount = TokenAmount(9999);
@@ -755,10 +764,10 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     assert_eq!(balances.len(), 1);
     // Deposits: 500 (pending) + 300 (completed) + 700 (later slot) = 1500 (all statuses)
     assert_eq!(balances[0].total_deposits, BigDecimal::from(1500u64));
-    // Withdrawals: only completed = 100
+    // Withdrawals: only the released one = 100
     assert_eq!(balances[0].total_withdrawals, BigDecimal::from(100u64));
 
-    // Bounded at the earlier rows' slot: the later deposit is excluded.
+    // Bounded at the earlier rows' slot: the later deposit is excluded, the release at 100 counts.
     let at_100 = storage.get_mint_balances_for_reconciliation(100).await?;
     assert_eq!(at_100[0].total_deposits, BigDecimal::from(800u64));
     assert_eq!(at_100[0].total_withdrawals, BigDecimal::from(100u64));

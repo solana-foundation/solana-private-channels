@@ -30,8 +30,9 @@ mod setup;
 
 use chrono::Utc;
 use helpers::db;
-use private_channel_escrow_program_client::{
-    instructions::AllowMintBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+use helpers::{
+    drain_via_permanent_delegate, generate_permanent_delegate_mint_2022, get_token_2022_balance,
+    mint_2022_to_owner,
 };
 use private_channel_indexer::storage::common::amount::TokenAmount;
 use private_channel_indexer::storage::common::models::{
@@ -39,19 +40,12 @@ use private_channel_indexer::storage::common::models::{
 };
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
-use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
+use setup::{allow_mint_for_program, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
-use solana_system_interface::{instruction::create_account, program::ID as SYSTEM_PROGRAM_ID};
-use spl_associated_token_account::{
-    get_associated_token_address_with_program_id,
-    instruction::create_associated_token_account_idempotent,
-};
-use spl_token_2022::extension::ExtensionType;
-use spl_token_2022::state::Mint as Token2022Mint;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 use std::time::Duration;
 use test_utils::operator_helper::start_private_channel_to_solana_operator;
@@ -61,188 +55,6 @@ use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
 const MINT_DECIMALS: u8 = 6;
-
-// ---------------------------------------------------------------------------
-// Local helpers — Token-2022 mint with PermanentDelegate + delegate-driven drain
-// ---------------------------------------------------------------------------
-
-/// Create a Token-2022 mint on-chain with the PermanentDelegate extension.
-/// The returned mint has `delegate` as its permanent delegate; the delegate
-/// can transfer out of any ATA for this mint without the owner's consent.
-async fn generate_permanent_delegate_mint_2022(
-    client: &RpcClient,
-    payer: &Keypair,
-    authority: &Keypair,
-    delegate: &Pubkey,
-    mint: &Keypair,
-) -> Result<Pubkey, Box<dyn std::error::Error>> {
-    let space = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
-        ExtensionType::PermanentDelegate,
-    ])?;
-    let rent = client.get_minimum_balance_for_rent_exemption(space).await?;
-
-    // Three-instruction sequence: allocate, init extension, init mint.
-    // Extensions must be initialized BEFORE the mint itself.
-    let ixs = vec![
-        create_account(
-            &payer.pubkey(),
-            &mint.pubkey(),
-            rent,
-            space as u64,
-            &TOKEN_2022_PROGRAM_ID,
-        ),
-        spl_token_2022::instruction::initialize_permanent_delegate(
-            &TOKEN_2022_PROGRAM_ID,
-            &mint.pubkey(),
-            delegate,
-        )?,
-        spl_token_2022::instruction::initialize_mint2(
-            &TOKEN_2022_PROGRAM_ID,
-            &mint.pubkey(),
-            &authority.pubkey(),
-            Some(&authority.pubkey()),
-            MINT_DECIMALS,
-        )?,
-    ];
-
-    let recent_blockhash = client.get_latest_blockhash().await?;
-    let tx = Transaction::new_signed_with_payer(
-        &ixs,
-        Some(&payer.pubkey()),
-        &[payer, mint],
-        recent_blockhash,
-    );
-    client.send_and_confirm_transaction(&tx).await?;
-
-    Ok(mint.pubkey())
-}
-
-/// Mint Token-2022 tokens to `owner`, creating their ATA if needed.
-async fn mint_2022_to_owner(
-    client: &RpcClient,
-    payer: &Keypair,
-    mint: Pubkey,
-    owner: Pubkey,
-    authority: &Keypair,
-    amount: u64,
-) -> Result<Pubkey, Box<dyn std::error::Error>> {
-    let ata = get_associated_token_address_with_program_id(&owner, &mint, &TOKEN_2022_PROGRAM_ID);
-
-    let ixs = vec![
-        create_associated_token_account_idempotent(
-            &payer.pubkey(),
-            &owner,
-            &mint,
-            &TOKEN_2022_PROGRAM_ID,
-        ),
-        spl_token_2022::instruction::mint_to(
-            &TOKEN_2022_PROGRAM_ID,
-            &mint,
-            &ata,
-            &authority.pubkey(),
-            &[],
-            amount,
-        )?,
-    ];
-
-    let recent_blockhash = client.get_latest_blockhash().await?;
-    let tx = Transaction::new_signed_with_payer(
-        &ixs,
-        Some(&payer.pubkey()),
-        &[payer, authority],
-        recent_blockhash,
-    );
-    client.send_and_confirm_transaction(&tx).await?;
-
-    Ok(ata)
-}
-
-/// Use the permanent delegate to move tokens out of `source_ata` into a
-/// fresh ATA owned by `drain_owner`. Simulates the attack the pre-flight
-/// is designed to catch: the escrow program is never invoked, so no
-/// PrivateChannel-side event ever reaches the indexer.
-async fn drain_via_permanent_delegate(
-    client: &RpcClient,
-    payer: &Keypair,
-    mint: Pubkey,
-    source_ata: Pubkey,
-    delegate: &Keypair,
-    drain_owner: Pubkey,
-    amount: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let drain_ata =
-        get_associated_token_address_with_program_id(&drain_owner, &mint, &TOKEN_2022_PROGRAM_ID);
-
-    let ixs = vec![
-        create_associated_token_account_idempotent(
-            &payer.pubkey(),
-            &drain_owner,
-            &mint,
-            &TOKEN_2022_PROGRAM_ID,
-        ),
-        spl_token_2022::instruction::transfer_checked(
-            &TOKEN_2022_PROGRAM_ID,
-            &source_ata,
-            &mint,
-            &drain_ata,
-            &delegate.pubkey(),
-            &[],
-            amount,
-            MINT_DECIMALS,
-        )?,
-    ];
-
-    let recent_blockhash = client.get_latest_blockhash().await?;
-    let tx = Transaction::new_signed_with_payer(
-        &ixs,
-        Some(&payer.pubkey()),
-        &[payer, delegate],
-        recent_blockhash,
-    );
-    client.send_and_confirm_transaction(&tx).await?;
-    Ok(())
-}
-
-/// Allow a mint on the escrow instance, binding it to `token_program`. The
-/// shared `TestEnvironment::setup` hardcodes SPL Token, so we replicate the
-/// AllowMint call here against Token-2022.
-async fn allow_mint_for_program(
-    client: &RpcClient,
-    admin: &Keypair,
-    instance: Pubkey,
-    mint: Pubkey,
-    token_program: Pubkey,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance, &mint);
-    let (event_authority_pda, _) = find_event_authority_pda();
-    let instance_ata =
-        get_associated_token_address_with_program_id(&instance, &mint, &token_program);
-
-    let ix = AllowMintBuilder::new()
-        .payer(admin.pubkey())
-        .admin(admin.pubkey())
-        .instance(instance)
-        .mint(mint)
-        .allowed_mint(allowed_mint_pda)
-        .instance_ata(instance_ata)
-        .system_program(SYSTEM_PROGRAM_ID)
-        .token_program(token_program)
-        .associated_token_program(spl_associated_token_account::ID)
-        .event_authority(event_authority_pda)
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .bump(bump)
-        .instruction();
-
-    let recent_blockhash = client.get_latest_blockhash().await?;
-    let tx = Transaction::new_signed_with_payer(
-        &[ix],
-        Some(&admin.pubkey()),
-        &[admin],
-        recent_blockhash,
-    );
-    client.send_and_confirm_transaction(&tx).await?;
-    Ok(())
-}
 
 fn make_withdrawal_transaction(
     signature: String,
@@ -278,19 +90,6 @@ fn make_withdrawal_transaction(
         inner_index: None,
         landed_remint_signature: None,
         release_refused_on_chain: false,
-    }
-}
-
-async fn get_token_2022_balance(
-    client: &RpcClient,
-    owner: &Pubkey,
-    mint: &Pubkey,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let ata = get_associated_token_address_with_program_id(owner, mint, &TOKEN_2022_PROGRAM_ID);
-    match client.get_token_account_balance(&ata).await {
-        Ok(bal) => Ok(bal.amount.parse::<u64>()?),
-        // ATA may not exist yet before release-funds fires it into existence.
-        Err(_) => Ok(0),
     }
 }
 
@@ -365,6 +164,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         &admin,
         &delegate.pubkey(),
         &mint_keypair,
+        MINT_DECIMALS,
     )
     .await?;
     println!("Created permanent-delegate Token-2022 mint {}", mint_pubkey);
@@ -410,6 +210,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         &delegate,
         drainer.pubkey(),
         drain_amount,
+        MINT_DECIMALS,
     )
     .await?;
     println!(
@@ -575,6 +376,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
         &admin,
         &delegate.pubkey(),
         &mint_keypair,
+        MINT_DECIMALS,
     )
     .await?;
 

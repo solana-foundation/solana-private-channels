@@ -1,21 +1,18 @@
 //! Escrow balance reconciliation module
 //!
-//! Guards a single on-chain invariant: per mint, channel `supply` must not
-//! exceed escrow `custody` by more than the in-flight envelope plus tolerance.
-//! A persistent breach (`HALT_CONFIRM_TICKS` consecutive finalized ticks)
-//! freezes the pipelines and fires one webhook alert.
-//!
-//! The database is read only to enumerate the mint universe (so a blocked or
-//! zero-custody mint with outstanding supply is still checked) and to size the
-//! transient in-flight envelope. Its ledger net is never compared against
-//! custody. This check is fundamental to solvency: supply beyond custody with no
-//! backing means channel tokens exist that the escrow cannot honor.
+//! Per mint, freezes the pipelines after `HALT_CONFIRM_TICKS` finalized breaches of either invariant:
+//! channel supply within custody plus the in-flight envelope (over-issuance), or ledger liabilities
+//! at the custody slot within custody (a drain that unminted deposits hide from the supply check).
 
-use crate::config::OperatorConfig;
+use crate::config::{OperatorConfig, ProgramType};
 use crate::error::OperatorError;
-use crate::operator::escrow_sweep::{fetch_channel_supply, fetch_escrow_balances_by_mint};
+use crate::indexer::checkpoint::program_key;
+use crate::operator::escrow_sweep::{
+    fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot,
+};
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
+use crate::storage::common::models::MintDbBalance;
 use crate::storage::Storage;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
 use private_channel_metrics::HealthState;
@@ -36,13 +33,31 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// corrupt RPC read cannot halt while a persistent shortfall always will.
 const HALT_CONFIRM_TICKS: u32 = 3;
 
+/// Longest a tick waits for the escrow indexer's checkpoint to reach the custody slot.
+#[cfg(not(test))]
+const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Checkpoint poll interval while waiting for the ledger to cover the custody slot.
+#[cfg(not(test))]
+const LEDGER_CATCHUP_POLL_MS: u64 = 500;
+#[cfg(test)]
+const LEDGER_CATCHUP_POLL_MS: u64 = 5;
+
+/// Per-mint consecutive breach counts, one map per invariant.
+/// Two maps so an unknown or clean reading of one invariant never resets the other's evidence.
+#[derive(Debug, Default)]
+struct BreachCounters {
+    supply: HashMap<Pubkey, u32>,
+    liability: HashMap<Pubkey, u32>,
+}
+
 /// Runs periodic escrow balance reconciliation checks
 ///
-/// Each tick reads escrow custody on-chain and channel supply per mint, then
-/// halts (durable flag + quarantine + forced-unhealthy + webhook) when supply
-/// exceeds custody beyond the in-flight envelope for `HALT_CONFIRM_TICKS`
-/// consecutive ticks. Reads are lock-free since reconciliation never mutates
-/// transaction state outside the halt path.
+/// Each tick reads escrow custody, channel supply and the ledger per mint, then halts
+/// (durable flag + quarantine + forced-unhealthy + webhook) when either invariant breaches
+/// for `HALT_CONFIRM_TICKS` consecutive ticks. Reads never mutate state outside the halt path.
 pub async fn run_reconciliation(
     storage: Arc<Storage>,
     config: OperatorConfig,
@@ -71,9 +86,8 @@ pub async fn run_reconciliation(
     // Orphan-mint dedup state
     let mut previously_alerted_orphans: Option<HashSet<i64>> = None;
 
-    // Per-mint consecutive beyond-envelope breach counters. A read-erroring tick
-    // returns early and leaves these untouched, so they hold rather than reset.
-    let mut breach_counters: HashMap<Pubkey, u32> = HashMap::new();
+    // A read-erroring tick returns early and leaves these untouched, so they hold rather than reset.
+    let mut breach_counters = BreachCounters::default();
 
     // Seed the set-once guard from the durable flag so a restart into an active
     // halt does not re-quarantine or re-webhook; it stays frozen until cleared.
@@ -103,6 +117,7 @@ pub async fn run_reconciliation(
             &mut previously_alerted_orphans,
             &mut breach_counters,
             &mut halted,
+            &cancellation_token,
         )
         .await
         {
@@ -161,6 +176,46 @@ fn evaluate_insolvency(
     }
 }
 
+/// A per-mint custody shortfall: ledger liabilities exceed custody by more than tolerance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiabilityBreach {
+    pub gap: u64,
+    pub liabilities: u64,
+    pub tolerance: u64,
+}
+
+/// Decide whether custody falls short of ledger liabilities beyond tolerance.
+/// No envelope: a pending deposit is already in custody, so nothing in flight explains a shortfall.
+fn evaluate_liability_shortfall(
+    custody: u64,
+    liabilities: u64,
+    tolerance: u64,
+) -> Option<LiabilityBreach> {
+    let gap = liabilities.saturating_sub(custody);
+    (gap > tolerance).then_some(LiabilityBreach {
+        gap,
+        liabilities,
+        tolerance,
+    })
+}
+
+/// A ledger row's liabilities (deposits minus released withdrawals) as u64.
+/// Negative means missing deposit history and reads as 0 (surplus); above u64::MAX fails closed.
+fn ledger_liability(row: &MintDbBalance) -> u64 {
+    let net = &row.total_deposits - &row.total_withdrawals;
+    match net_to_u64(&net) {
+        NetBalance::Exact(v) => v,
+        NetBalance::Negative => {
+            warn!(mint = %row.mint_address, net = %net, "Ledger withdrawals exceed deposits; liabilities read as 0");
+            0
+        }
+        NetBalance::Overflow => {
+            error!(mint = %row.mint_address, net = %net, "Ledger net exceeds u64::MAX; liabilities read as u64::MAX");
+            u64::MAX
+        }
+    }
+}
+
 /// Convert an in-flight envelope BigDecimal into u64. The sum is non-negative by
 /// construction; an over-u64 sum reports u64::MAX, which only ever enlarges the
 /// envelope (delays a halt), never fabricates one.
@@ -194,13 +249,9 @@ fn insolvency_delta_bps(custody: u64, gap: u64) -> u64 {
 
 /// Performs a single reconciliation check.
 ///
-/// One invariant over finalized reads: per mint, freeze when channel supply
-/// exceeds escrow custody beyond the in-flight envelope for `HALT_CONFIRM_TICKS`
-/// consecutive ticks. Custody comes from Solana, supply from the channel RPC,
-/// and the DB supplies only the mint universe (enumeration) and the transient
-/// envelope. If loading the halt inputs fails, `warn!` and return Ok with the
-/// breach counters held, so a transient RPC glitch keeps the evidence rather
-/// than resetting it.
+/// Per mint, over finalized reads: supply against custody plus envelope, and ledger
+/// liabilities at the custody slot against custody. A failed halt-input load warns and
+/// returns Ok with the counters held, so a transient glitch keeps the evidence.
 #[allow(clippy::too_many_arguments)]
 async fn perform_reconciliation_check(
     storage: &Arc<Storage>,
@@ -211,8 +262,9 @@ async fn perform_reconciliation_check(
     webhook_client: &WebhookClient,
     health: &Option<Arc<HealthState>>,
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
-    breach_counters: &mut HashMap<Pubkey, u32>,
+    breach_counters: &mut BreachCounters,
     halted: &mut bool,
+    cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
     check_orphan_deposit_rows(
         storage,
@@ -229,12 +281,18 @@ async fn perform_reconciliation_check(
         *halted = flag.is_some();
     }
 
-    // Custody (Solana) plus the DB mint set enumerate the mints to check; the DB
-    // set keeps a zero-custody mint with outstanding supply in scope. The union is
-    // built once here and shared with both the supply fetch and the evaluation.
     let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
-    let mut mints: HashSet<Pubkey> = custody.keys().copied().collect();
-    mints.extend(fetch_db_mint_set(storage).await?);
+    let covered = match wait_for_ledger(storage, custody.slot, cancellation_token).await {
+        LedgerWait::Covered => true,
+        LedgerWait::Unknown => false,
+        LedgerWait::Cancelled => return Ok(()),
+    };
+
+    // Rows are read whatever the wait outcome: they enumerate the mints even when
+    // liabilities are unknown, keeping a zero-custody mint with supply in scope.
+    let (ledger_mints, liabilities) = fetch_ledger(storage, custody.slot).await?;
+    let mut mints: HashSet<Pubkey> = custody.balances.keys().copied().collect();
+    mints.extend(ledger_mints);
 
     // Envelope (DB) and channel supply (PrivateChannel RPC) are the remaining
     // halt inputs. A failure of either holds the breach counters and skips the
@@ -246,10 +304,12 @@ async fn perform_reconciliation_check(
                 config,
                 health,
                 webhook_client,
-                &custody,
+                &custody.balances,
+                custody.slot,
                 &mints,
                 &supply,
                 &envelope,
+                covered.then_some(&liabilities),
                 breach_counters,
                 halted,
             )
@@ -261,18 +321,72 @@ async fn perform_reconciliation_check(
     Ok(())
 }
 
-/// Enumerate the DB mint universe so a blocked or zero-custody mint with
-/// outstanding supply stays in scope.
-async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<HashSet<Pubkey>, OperatorError> {
-    let addresses = storage
-        .get_mint_addresses()
+/// Whether the ledger can be compared at the custody slot this tick.
+#[derive(Debug, PartialEq, Eq)]
+enum LedgerWait {
+    Covered,
+    Unknown,
+    Cancelled,
+}
+
+/// Wait, bounded, for the escrow indexer's checkpoint to reach `slot`.
+///
+/// A checkpoint at or past `slot` means every deposit and release up to it is in the DB,
+/// so the ledger is exact there. Giving up returns Unknown, which holds the liability counter.
+async fn wait_for_ledger(
+    storage: &Arc<Storage>,
+    slot: u64,
+    cancellation_token: &CancellationToken,
+) -> LedgerWait {
+    let key = program_key(ProgramType::Escrow);
+    let started = tokio::time::Instant::now();
+    let mut last: Option<u64> = None;
+    loop {
+        match storage.get_committed_checkpoint(&key).await {
+            Ok(Some(committed)) if committed >= slot => return LedgerWait::Covered,
+            Ok(Some(committed)) => last = Some(committed),
+            // No escrow indexer has ever committed, so waiting cannot help.
+            Ok(None) => {
+                warn!(
+                    slot,
+                    "No escrow indexer checkpoint; ledger liabilities unknown this tick"
+                );
+                return LedgerWait::Unknown;
+            }
+            Err(e) => warn!("Checkpoint read failed while waiting for the ledger: {}", e),
+        }
+        if started.elapsed() >= LEDGER_CATCHUP_TIMEOUT {
+            warn!(
+                checkpoint = ?last,
+                slot,
+                "Escrow indexer checkpoint did not reach the custody slot in time; ledger liabilities unknown this tick"
+            );
+            return LedgerWait::Unknown;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(LEDGER_CATCHUP_POLL_MS)) => {}
+            _ = cancellation_token.cancelled() => return LedgerWait::Cancelled,
+        }
+    }
+}
+
+/// Read the ledger at `slot`: every DB mint, plus its liabilities.
+async fn fetch_ledger(
+    storage: &Arc<Storage>,
+    slot: u64,
+) -> Result<(HashSet<Pubkey>, HashMap<Pubkey, u64>), OperatorError> {
+    let rows = storage
+        .get_mint_balances_for_reconciliation(slot)
         .await
         .map_err(OperatorError::Storage)?;
-    let mut out = HashSet::new();
-    for address in addresses {
-        out.insert(parse_mint(&address)?);
+    let mut mints = HashSet::new();
+    let mut liabilities = HashMap::new();
+    for row in rows {
+        let mint = parse_mint(&row.mint_address)?;
+        mints.insert(mint);
+        liabilities.insert(mint, ledger_liability(&row));
     }
-    Ok(out)
+    Ok((mints, liabilities))
 }
 
 /// Query the per-mint in-flight envelope (unsettled amount) as u64.
@@ -327,12 +441,9 @@ fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
         })
 }
 
-/// Halt path: per mint, decide insolvency, advance/reset the breach counter, and
-/// on the `HALT_CONFIRM_TICKS`-th consecutive breach freeze the pipelines once
-/// (durable flag + quarantine + forced-unhealthy + webhook). Every action is
-/// best-effort and logged, so one failing action never skips the others.
-/// `mints` is the shared custody-plus-DB enumeration set; the DB net is never
-/// compared, only the addresses widen the set.
+/// Halt path: per mint, advance each invariant's own counter and freeze the pipelines once
+/// (durable flag + quarantine + forced-unhealthy + webhook) on the `HALT_CONFIRM_TICKS`-th breach of either.
+/// `liabilities` is `None` when the ledger could not be pinned to `slot`; that arm then holds.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_and_maybe_halt(
     storage: &Arc<Storage>,
@@ -340,23 +451,25 @@ async fn evaluate_and_maybe_halt(
     health: &Option<Arc<HealthState>>,
     webhook_client: &WebhookClient,
     custody: &HashMap<Pubkey, u64>,
+    slot: u64,
     mints: &HashSet<Pubkey>,
     supply: &HashMap<Pubkey, u64>,
     envelope: &HashMap<Pubkey, u64>,
-    breach_counters: &mut HashMap<Pubkey, u32>,
+    liabilities: Option<&HashMap<Pubkey, u64>>,
+    breach_counters: &mut BreachCounters,
     halted: &mut bool,
 ) {
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
-    let mut next_counters: HashMap<Pubkey, u32> = HashMap::new();
+    let mut next_counters = BreachCounters::default();
     for &mint in mints {
         // A mint absent from `supply` had its read fail this tick (an absent
         // account reads as Ok(0), not a miss). Hold its counter rather than
         // resetting, so a transient per-mint glitch neither halts it nor erases
         // its evidence, and never blocks the other mints.
         let Some(&s) = supply.get(&mint) else {
-            if let Some(&held) = breach_counters.get(&mint) {
-                next_counters.insert(mint, held);
+            if let Some(&held) = breach_counters.supply.get(&mint) {
+                next_counters.supply.insert(mint, held);
             }
             continue;
         };
@@ -368,8 +481,8 @@ async fn evaluate_and_maybe_halt(
             continue;
         };
 
-        let count = breach_counters.get(&mint).copied().unwrap_or(0) + 1;
-        next_counters.insert(mint, count);
+        let count = breach_counters.supply.get(&mint).copied().unwrap_or(0) + 1;
+        next_counters.supply.insert(mint, count);
 
         if count < HALT_CONFIRM_TICKS || *halted {
             warn!(
@@ -398,7 +511,61 @@ async fn evaluate_and_maybe_halt(
             config,
             &mint,
             c,
-            &breach,
+            breach.supply_gap,
+            c.saturating_add(breach.supply_gap),
+            &reason,
+        )
+        .await;
+    }
+
+    for &mint in mints {
+        // Unknown liabilities hold the counter: this tick is no evidence either way.
+        let Some(liabilities) = liabilities else {
+            if let Some(&held) = breach_counters.liability.get(&mint) {
+                next_counters.liability.insert(mint, held);
+            }
+            continue;
+        };
+        let c = *custody.get(&mint).unwrap_or(&0);
+        let owed = *liabilities.get(&mint).unwrap_or(&0);
+        let tolerance = insolvency_tolerance_raw(c, config.reconciliation_tolerance_bps);
+
+        let Some(breach) = evaluate_liability_shortfall(c, owed, tolerance) else {
+            continue;
+        };
+
+        let count = breach_counters.liability.get(&mint).copied().unwrap_or(0) + 1;
+        next_counters.liability.insert(mint, count);
+
+        if count < HALT_CONFIRM_TICKS || *halted {
+            warn!(
+                mint = %mint,
+                gap = breach.gap,
+                liabilities = breach.liabilities,
+                tolerance = breach.tolerance,
+                slot,
+                consecutive_ticks = count,
+                "Custody short of ledger liabilities; halt pending confirmation"
+            );
+            continue;
+        }
+
+        *halted = true;
+        let reason = format!(
+            "reconciliation halt: mint {} custody {} short of ledger liabilities {} by {}, \
+             tolerance {} at slot {} over {} consecutive finalized ticks",
+            mint, c, breach.liabilities, breach.gap, breach.tolerance, slot, count
+        );
+        error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
+        trip_halt(
+            storage,
+            health,
+            webhook_client,
+            config,
+            &mint,
+            c,
+            breach.gap,
+            breach.liabilities,
             &reason,
         )
         .await;
@@ -419,7 +586,8 @@ async fn trip_halt(
     config: &OperatorConfig,
     mint: &Pubkey,
     custody: u64,
-    breach: &InsolvencyBreach,
+    gap: u64,
+    db_balance: u64,
     reason: &str,
 ) {
     if let Err(e) = storage.set_reconciliation_halt(reason).await {
@@ -433,15 +601,12 @@ async fn trip_halt(
     if let Some(h) = health {
         h.force_unhealthy(reason.to_string());
     }
-    // Payload carries real custody and the supply the escrow could not honor;
-    // delta_bps stays in basis points to match every other reconciliation alert
-    // (u64::MAX when custody is 0).
-    let gap = breach.supply_gap;
-    let expected = custody.saturating_add(gap);
+    // Payload carries real custody and the amount the escrow should hold (supply it
+    // could not honor, or ledger liabilities); delta_bps is u64::MAX when custody is 0.
     let alert = BalanceMismatch {
         mint: *mint,
         on_chain_balance: custody,
-        db_balance: expected,
+        db_balance,
         delta_bps: insolvency_delta_bps(custody, gap),
     };
     if let Err(e) =
@@ -556,19 +721,16 @@ pub struct BalanceMismatch {
 /// * `escrow_instance_id` - Public key of the escrow account that owns the token accounts
 ///
 /// # Returns
-/// * `HashMap<Pubkey, u64>` - Map of mint pubkey to total balance (in smallest token units)
+/// * `CustodySnapshot` - Per-mint balances (smallest token units) and the slot they are valid at
 ///
 /// # Errors
 /// Returns `OperatorError::RpcError` if the RPC call fails after retries or if token account data cannot be parsed
 async fn fetch_on_chain_balances(
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
-) -> Result<HashMap<Pubkey, u64>, OperatorError> {
-    // Runtime reconciliation compares against live DB totals, so it wants the balances
-    // only; the snapshot slot matters to startup, which bounds its ledger read by it.
+) -> Result<CustodySnapshot, OperatorError> {
     fetch_escrow_balances_by_mint(rpc_client, escrow_instance_id)
         .await
-        .map(|snapshot| snapshot.balances)
         .map_err(|e| OperatorError::RpcError(e.to_string()))
 }
 
@@ -715,6 +877,7 @@ pub async fn send_orphan_deposit_alert(
 mod tests {
     use super::*;
     use crate::storage::common::amount::TokenAmount;
+    use crate::storage::common::models::MintDbBalance;
     use crate::storage::common::storage::{mock::MockStorage, Storage};
     use solana_sdk::pubkey::Pubkey;
 
@@ -847,6 +1010,50 @@ mod tests {
         assert_eq!(envelope_to_u64(&over), u64::MAX);
     }
 
+    // -- evaluate_liability_shortfall and ledger mapping (pure) --
+
+    #[test]
+    fn evaluate_liability_shortfall_table() {
+        let gap = |c, l, t| evaluate_liability_shortfall(c, l, t).map(|b| b.gap);
+        assert_eq!(gap(100, 100, 0), None);
+        assert_eq!(gap(200, 100, 0), None, "custody richer is benign");
+        assert_eq!(gap(100, 110, 10), None, "gap equal to tolerance is within");
+        assert_eq!(gap(100, 111, 10), Some(11));
+        assert_eq!(gap(0, 1, 0), Some(1), "zero custody with liabilities flags");
+        assert_eq!(gap(0, u64::MAX, u64::MAX), None);
+        let b = evaluate_liability_shortfall(100, 111, 10).unwrap();
+        assert_eq!((b.liabilities, b.tolerance), (111, 10));
+    }
+
+    #[test]
+    fn ledger_net_maps_negative_and_overflow() {
+        use bigdecimal::BigDecimal;
+        assert_eq!(ledger_liability(&ledger_row("m", 500, 200)), 300);
+        assert_eq!(ledger_liability(&ledger_row("m", 100, 200)), 0);
+        let over = MintDbBalance {
+            total_deposits: BigDecimal::from(u64::MAX) + BigDecimal::from(1u64),
+            ..ledger_row("m", 0, 0)
+        };
+        assert_eq!(ledger_liability(&over), u64::MAX);
+    }
+
+    #[test]
+    fn negative_net_never_breaches_overflow_net_always_breaches() {
+        use bigdecimal::BigDecimal;
+        let negative = ledger_liability(&ledger_row("m", 100, 200));
+        assert!(evaluate_liability_shortfall(0, negative, 0).is_none());
+
+        let over = MintDbBalance {
+            total_deposits: BigDecimal::from(u64::MAX) * BigDecimal::from(2u64),
+            ..ledger_row("m", 0, 0)
+        };
+        let custody = 1_000_000;
+        let tolerance = insolvency_tolerance_raw(custody, 10);
+        assert!(
+            evaluate_liability_shortfall(custody, ledger_liability(&over), tolerance).is_some()
+        );
+    }
+
     // ── halt layer (persistence + actions), driven directly ───────────
 
     fn recon_config_zero_tolerance() -> OperatorConfig {
@@ -916,7 +1123,7 @@ mod tests {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
         let (custody, db_mints, supply, envelope, _mint) = breach_maps();
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
 
         evaluate_and_maybe_halt(
@@ -925,9 +1132,11 @@ mod tests {
             &None,
             &test_webhook_client(),
             &custody,
+            1,
             &db_mints,
             &supply,
             &envelope,
+            None,
             &mut counters,
             &mut halted,
         )
@@ -946,7 +1155,7 @@ mod tests {
         let health_state = HealthState::new(HealthConfig::operator());
         let health = Some(health_state.clone());
         let (custody, db_mints, supply, envelope, _mint) = breach_maps();
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
         let config = recon_config_zero_tolerance();
 
@@ -957,9 +1166,11 @@ mod tests {
                 &health,
                 &test_webhook_client(),
                 &custody,
+                1,
                 &db_mints,
                 &supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -986,7 +1197,7 @@ mod tests {
         let (custody, db_mints, supply, envelope, mint) = breach_maps();
         // A clean map: supply matches custody, no gap.
         let clean_supply = HashMap::from([(mint, 900u64)]);
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
         let webhook = test_webhook_client();
 
@@ -998,9 +1209,11 @@ mod tests {
                 &None,
                 &webhook,
                 &custody,
+                1,
                 &db_mints,
                 supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -1022,7 +1235,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock));
         let config = recon_config_zero_tolerance();
         let (custody, db_mints, supply, envelope, _mint) = breach_maps();
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
 
         for _ in 0..2 {
@@ -1032,9 +1245,11 @@ mod tests {
                 &None,
                 &test_webhook_client(),
                 &custody,
+                1,
                 &db_mints,
                 &supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -1048,9 +1263,11 @@ mod tests {
             &None,
             &test_webhook_client(),
             &custody,
+            1,
             &db_mints,
             &supply,
             &envelope,
+            None,
             &mut counters,
             &mut halted,
         )
@@ -1064,7 +1281,7 @@ mod tests {
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let config = recon_config_zero_tolerance();
         let (custody, db_mints, supply, envelope, _mint) = breach_maps();
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
 
         for _ in 0..3 {
@@ -1074,9 +1291,11 @@ mod tests {
                 &None,
                 &test_webhook_client(),
                 &custody,
+                1,
                 &db_mints,
                 &supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -1093,9 +1312,11 @@ mod tests {
             &None,
             &test_webhook_client(),
             &custody,
+            1,
             &db_mints,
             &supply,
             &envelope,
+            None,
             &mut counters,
             &mut halted,
         )
@@ -1122,7 +1343,7 @@ mod tests {
         let db_mints = HashSet::from([mint]);
         let supply = HashMap::from([(mint, 500u64)]);
         let envelope = HashMap::from([(mint, 100u64)]);
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
         let config = recon_config_zero_tolerance();
 
@@ -1133,9 +1354,11 @@ mod tests {
                 &None,
                 &test_webhook_client(),
                 &custody,
+                1,
                 &db_mints,
                 &supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -1162,7 +1385,7 @@ mod tests {
         let custody = HashMap::from([(a, 900u64), (b, 900u64)]);
         let db_mints = HashSet::from([a, b]);
         let envelope = HashMap::from([(a, 100u64), (b, 100u64)]);
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
         let webhook = test_webhook_client();
 
@@ -1176,9 +1399,11 @@ mod tests {
                 &None,
                 &webhook,
                 &custody,
+                1,
                 &db_mints,
                 supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -1186,8 +1411,12 @@ mod tests {
         }
 
         assert!(!halted, "per-mint counters must not aggregate across mints");
-        assert_eq!(counters.get(&b).copied(), Some(1));
-        assert_eq!(counters.get(&a).copied(), None, "A reset on its clean tick");
+        assert_eq!(counters.supply.get(&b).copied(), Some(1));
+        assert_eq!(
+            counters.supply.get(&a).copied(),
+            None,
+            "A reset on its clean tick"
+        );
     }
 
     #[tokio::test]
@@ -1203,7 +1432,7 @@ mod tests {
         let db_mints = HashSet::from([a, b]);
         let envelope = HashMap::from([(a, 100u64), (b, 100u64)]);
         let supply = HashMap::from([(b, 1200u64)]); // A absent: read failed
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
         let mut halted = false;
         let webhook = test_webhook_client();
 
@@ -1214,9 +1443,11 @@ mod tests {
                 &None,
                 &webhook,
                 &custody,
+                1,
                 &db_mints,
                 &supply,
                 &envelope,
+                None,
                 &mut counters,
                 &mut halted,
             )
@@ -1227,7 +1458,520 @@ mod tests {
             halted,
             "a failed supply read on one mint must not block another"
         );
-        assert_eq!(counters.get(&b).copied(), Some(3));
+        assert_eq!(counters.supply.get(&b).copied(), Some(3));
+    }
+
+    // -- liability arm at the halt layer --
+
+    // (custody, mints, supply, envelope, liabilities, mint) for the liability tests.
+    type LiabilityMaps = (
+        HashMap<Pubkey, u64>,
+        HashSet<Pubkey>,
+        HashMap<Pubkey, u64>,
+        HashMap<Pubkey, u64>,
+        HashMap<Pubkey, u64>,
+        Pubkey,
+    );
+
+    /// custody 100, supply 100, envelope 100, liabilities 200: supply clean, custody short.
+    fn liability_maps() -> LiabilityMaps {
+        let mint = Pubkey::new_unique();
+        (
+            HashMap::from([(mint, 100u64)]),
+            HashSet::from([mint]),
+            HashMap::from([(mint, 100u64)]),
+            HashMap::from([(mint, 100u64)]),
+            HashMap::from([(mint, 200u64)]),
+            mint,
+        )
+    }
+
+    /// One halt-layer tick at custody slot 1 with no health state.
+    #[allow(clippy::too_many_arguments)]
+    async fn halt_tick(
+        storage: &Arc<Storage>,
+        config: &OperatorConfig,
+        custody: &HashMap<Pubkey, u64>,
+        mints: &HashSet<Pubkey>,
+        supply: &HashMap<Pubkey, u64>,
+        envelope: &HashMap<Pubkey, u64>,
+        liabilities: Option<&HashMap<Pubkey, u64>>,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+    ) {
+        evaluate_and_maybe_halt(
+            storage,
+            config,
+            &None,
+            &test_webhook_client(),
+            custody,
+            1,
+            mints,
+            supply,
+            envelope,
+            liabilities,
+            counters,
+            halted,
+        )
+        .await;
+    }
+
+    async fn halt_reason(storage: &Arc<Storage>) -> String {
+        storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halt set")
+            .reason
+    }
+
+    #[tokio::test]
+    async fn pending_deposit_masked_drain_halts_on_liability_arm() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = recon_config_zero_tolerance();
+        let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for _ in 0..3 {
+            assert!(!halted);
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &mints,
+                &supply,
+                &envelope,
+                Some(&liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+            assert!(counters.supply.is_empty(), "supply arm stays clean");
+        }
+
+        assert!(halted);
+        let reason = halt_reason(&storage).await;
+        assert!(reason.contains("short of ledger liabilities"), "{reason}");
+        assert!(!reason.contains("supply by"), "{reason}");
+        assert!(reason.contains(&mint.to_string()), "{reason}");
+        assert_eq!(counters.liability.get(&mint).copied(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn unknown_liabilities_hold_liability_counter() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = recon_config_zero_tolerance();
+        let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for known in [Some(&liabilities), Some(&liabilities), None] {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &mints,
+                &supply,
+                &envelope,
+                known,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+        assert!(!halted);
+        assert_eq!(
+            counters.liability.get(&mint).copied(),
+            Some(2),
+            "held, not reset"
+        );
+
+        halt_tick(
+            &storage,
+            &config,
+            &custody,
+            &mints,
+            &supply,
+            &envelope,
+            Some(&liabilities),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+        assert!(halted, "the held count reaches 3 on the next breach");
+        assert!(counters.supply.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clean_liability_tick_resets_only_its_counter() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = recon_config_zero_tolerance();
+        let (custody, db_mints, supply, envelope, mint) = breach_maps();
+        let short = HashMap::from([(mint, 2000u64)]);
+        let covered = HashMap::from([(mint, 900u64)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for liabilities in [&short, &short, &covered] {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &db_mints,
+                &supply,
+                &envelope,
+                Some(liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(halted, "the supply arm reaches 3 on its own");
+        assert!(halt_reason(&storage).await.contains("supply by"));
+        assert_eq!(counters.supply.get(&mint).copied(), Some(3));
+        assert_eq!(
+            counters.liability.get(&mint).copied(),
+            None,
+            "reset by the clean tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn liability_halt_webhook_reports_liabilities() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "on_chain_balance": 100,
+                "db_balance": 200,
+                "delta_bps": 10_000,
+            })))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(server.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, mints, supply, envelope, liabilities, _mint) = liability_maps();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for _ in 0..3 {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &mints,
+                &supply,
+                &envelope,
+                Some(&liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(halted);
+        hook.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn liability_tolerance_boundary_with_nonzero_bps() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = OperatorConfig {
+            reconciliation_tolerance_bps: 100,
+            ..make_operator_config()
+        };
+        let mint = Pubkey::new_unique();
+        let custody = HashMap::from([(mint, 10_000u64)]);
+        let mints = HashSet::from([mint]);
+        let supply = HashMap::from([(mint, 10_000u64)]);
+        let envelope = HashMap::new();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        let at_tolerance = HashMap::from([(mint, 10_100u64)]);
+        halt_tick(
+            &storage,
+            &config,
+            &custody,
+            &mints,
+            &supply,
+            &envelope,
+            Some(&at_tolerance),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+        assert!(
+            counters.liability.is_empty(),
+            "gap equal to tolerance never counts"
+        );
+
+        let past_tolerance = HashMap::from([(mint, 10_101u64)]);
+        halt_tick(
+            &storage,
+            &config,
+            &custody,
+            &mints,
+            &supply,
+            &envelope,
+            Some(&past_tolerance),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+        assert_eq!(counters.liability.get(&mint).copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn liability_breach_on_one_mint_never_touches_another() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = recon_config_zero_tolerance();
+        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let custody = HashMap::from([(a, 100u64), (b, 100u64)]);
+        let mints = HashSet::from([a, b]);
+        let supply = HashMap::from([(a, 100u64)]); // B's supply read failed
+        let envelope = HashMap::new();
+        let liabilities = HashMap::from([(a, 200u64), (b, 100u64)]);
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(b, 2)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+
+        for _ in 0..3 {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &mints,
+                &supply,
+                &envelope,
+                Some(&liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(halted);
+        let reason = halt_reason(&storage).await;
+        assert!(
+            reason.contains(&a.to_string()) && !reason.contains(&b.to_string()),
+            "{reason}"
+        );
+        assert_eq!(counters.liability, HashMap::from([(a, 3)]));
+        assert_eq!(
+            counters.supply,
+            HashMap::from([(b, 2)]),
+            "B's held supply count is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_arms_breaching_one_mint_halt_once_with_supply_reason() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock, 1, 1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(server.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, db_mints, supply, envelope, mint) = breach_maps();
+        let liabilities = HashMap::from([(mint, 2000u64)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for _ in 0..4 {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &db_mints,
+                &supply,
+                &envelope,
+                Some(&liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(halted);
+        assert_eq!(mock.calls("set_reconciliation_halt"), 1, "one flag write");
+        assert_eq!(
+            mock.calls("quarantine_active_withdrawals"),
+            1,
+            "one quarantine"
+        );
+        assert!(
+            halt_reason(&storage).await.contains("supply by"),
+            "supply arm is checked first"
+        );
+        assert_eq!(counters.supply.get(&mint).copied(), Some(4));
+        assert_eq!(counters.liability.get(&mint).copied(), Some(4));
+        hook.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn durable_halt_suppresses_liability_trip() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock, 1, 1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        storage.set_reconciliation_halt("prior halt").await.unwrap();
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(server.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
+        let mut counters = BreachCounters::default();
+        let mut halted = true;
+
+        for _ in 0..3 {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &mints,
+                &supply,
+                &envelope,
+                Some(&liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert_eq!(halt_reason(&storage).await, "prior halt");
+        assert_eq!(
+            mock.calls("set_reconciliation_halt"),
+            1,
+            "only the seed wrote the flag"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            crate::storage::common::models::TransactionStatus::Pending
+        );
+        assert_eq!(
+            counters.liability.get(&mint).copied(),
+            Some(3),
+            "evidence still counted"
+        );
+        hook.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn custody_only_mint_has_zero_liabilities() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mint = Pubkey::new_unique();
+        let custody = HashMap::from([(mint, 500u64)]);
+        let mints = HashSet::from([mint]);
+        let supply = HashMap::from([(mint, 500u64)]);
+        let known = HashMap::new();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        halt_tick(
+            &storage,
+            &recon_config_zero_tolerance(),
+            &custody,
+            &mints,
+            &supply,
+            &HashMap::new(),
+            Some(&known),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        assert!(counters.liability.is_empty());
+        assert!(counters.supply.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ledger_only_mint_with_zero_custody_breaches() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = recon_config_zero_tolerance();
+        let mint = Pubkey::new_unique();
+        let custody = HashMap::new();
+        let mints = HashSet::from([mint]);
+        let supply = HashMap::from([(mint, 0u64)]);
+        let liabilities = HashMap::from([(mint, 1u64)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for tick in 1..=3 {
+            halt_tick(
+                &storage,
+                &config,
+                &custody,
+                &mints,
+                &supply,
+                &HashMap::new(),
+                Some(&liabilities),
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+            assert_eq!(counters.liability.get(&mint).copied(), Some(tick));
+        }
+
+        assert!(halted);
+        assert!(halt_reason(&storage)
+            .await
+            .contains("short of ledger liabilities"));
+    }
+
+    #[tokio::test]
+    async fn liability_tolerance_is_taken_from_custody() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let config = OperatorConfig {
+            reconciliation_tolerance_bps: 10_000,
+            ..make_operator_config()
+        };
+        let mint = Pubkey::new_unique();
+        let custody = HashMap::from([(mint, 1000u64)]);
+        let mints = HashSet::from([mint]);
+        let supply = HashMap::from([(mint, 1000u64)]);
+        // Tolerance from custody is 1000 (gap 2000 breaches); from liabilities it would be 3000.
+        let liabilities = HashMap::from([(mint, 3000u64)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        halt_tick(
+            &storage,
+            &config,
+            &custody,
+            &mints,
+            &supply,
+            &HashMap::new(),
+            Some(&liabilities),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        assert_eq!(counters.liability.get(&mint).copied(), Some(1));
     }
 
     /// Mock the escrow custody sweep on a mockito server: the SPL Token program
@@ -1258,40 +2002,115 @@ mod tests {
             .await;
     }
 
-    /// Put one allowed mint in the mock's mints table, the runtime enumeration source.
-    fn seed_db_mint(mock: &MockStorage, mint: Pubkey) {
-        seed_db_mint_address(mock, &mint.to_string());
+    /// One ledger aggregate row as the balance query returns it.
+    fn ledger_row(mint: &str, deposits: u64, withdrawals: u64) -> MintDbBalance {
+        MintDbBalance {
+            mint_address: mint.to_string(),
+            token_program: spl_token::id().to_string(),
+            total_deposits: bigdecimal::BigDecimal::from(deposits),
+            total_withdrawals: bigdecimal::BigDecimal::from(withdrawals),
+        }
     }
 
-    /// Same as `seed_db_mint` but takes the raw address, so a test can seed an unparseable one.
-    fn seed_db_mint_address(mock: &MockStorage, mint_address: &str) {
-        use crate::storage::common::models::DbMint;
-        mock.mints.lock().unwrap().insert(
-            mint_address.to_string(),
-            DbMint::new(mint_address.to_string(), 6, spl_token::id().to_string()),
-        );
+    /// Commit the escrow indexer's checkpoint under the key it really writes.
+    fn seed_checkpoint(mock: &MockStorage, slot: u64) {
+        mock.set_checkpoint(&program_key(ProgramType::Escrow), slot);
+    }
+
+    /// Answer every channel `getAccountInfo` with an SPL mint at `supply`.
+    async fn mock_channel_supply(server: &mut mockito::Server, supply: u64) {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        let mint = spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut buf = vec![0u8; spl_token::state::Mint::LEN];
+        mint.pack_into_slice(&mut buf);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                prog = spl_token::id(),
+            ))
+            .create_async()
+            .await;
+    }
+
+    /// One-attempt RPC client so a failing read ends the tick quickly.
+    fn fast_rpc(url: String) -> Arc<RpcClientWithRetry> {
+        use crate::operator::utils::rpc_util::RetryConfig;
+        use solana_commitment_config::CommitmentConfig;
+        Arc::new(RpcClientWithRetry::with_retry_config(
+            url,
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(1),
+            },
+            CommitmentConfig::finalized(),
+        ))
+    }
+
+    /// Mocked custody (one mint at slot 1), channel supply and storage for one tick.
+    struct TickEnv {
+        custody: mockito::ServerGuard,
+        channel: mockito::ServerGuard,
+        mock: MockStorage,
+        storage: Arc<Storage>,
+    }
+
+    async fn tick_env(mint: Pubkey, custody: u64, supply: u64) -> TickEnv {
+        let mut custody_server = mockito::Server::new_async().await;
+        mock_custody_sweep(&mut custody_server, mint, custody).await;
+        let mut channel = mockito::Server::new_async().await;
+        mock_channel_supply(&mut channel, supply).await;
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        TickEnv {
+            custody: custody_server,
+            channel,
+            mock,
+            storage,
+        }
+    }
+
+    async fn run_tick(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        token: &CancellationToken,
+    ) -> Result<(), OperatorError> {
+        perform_reconciliation_check(
+            &env.storage,
+            config,
+            &fast_rpc(env.custody.url()),
+            &fast_rpc(env.channel.url()),
+            Pubkey::new_unique(),
+            &test_webhook_client(),
+            &None,
+            &mut None,
+            counters,
+            halted,
+            token,
+        )
+        .await
     }
 
     #[tokio::test]
-    async fn db_mint_set_enumerates_upserted_mints() {
+    async fn ledger_rejects_unparseable_address() {
         let mock = MockStorage::new();
-        let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
-        seed_db_mint(&mock, a);
-        seed_db_mint(&mock, b);
+        mock.set_mint_balances(vec![ledger_row("not-a-pubkey", 0, 0)]);
         let storage = Arc::new(Storage::Mock(mock));
 
-        let set = fetch_db_mint_set(&storage).await.unwrap();
-
-        assert_eq!(set, HashSet::from([a, b]));
-    }
-
-    #[tokio::test]
-    async fn db_mint_set_rejects_unparseable_address() {
-        let mock = MockStorage::new();
-        seed_db_mint_address(&mock, "not-a-pubkey");
-        let storage = Arc::new(Storage::Mock(mock));
-
-        let err = fetch_db_mint_set(&storage).await.unwrap_err();
+        let err = fetch_ledger(&storage, 1).await.unwrap_err();
 
         match err {
             OperatorError::InvalidPubkey { pubkey, .. } => assert_eq!(pubkey, "not-a-pubkey"),
@@ -1299,66 +2118,365 @@ mod tests {
         }
     }
 
-    /// A failed mint enumeration must skip the tick without halting or erasing a
+    /// A failed ledger read must skip the tick without halting or erasing either
     /// building breach counter, the same way a failed supply read does.
     #[tokio::test]
-    async fn db_mint_set_read_failure_returns_err_and_holds_counters() {
-        use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
-        use solana_commitment_config::CommitmentConfig;
-
-        let fast = || RetryConfig {
-            max_attempts: 1,
-            base_delay: Duration::from_millis(1),
-            max_delay: Duration::from_millis(1),
-        };
-
+    async fn ledger_read_failure_returns_err_and_holds_counters() {
         let mint = Pubkey::new_unique();
-        let mut custody_server = mockito::Server::new_async().await;
-        mock_custody_sweep(&mut custody_server, mint, 900).await;
-
-        let mock = MockStorage::new();
-        seed_db_mint(&mock, mint);
-        mock.set_should_fail("get_mint_addresses", true);
-        let storage = Arc::new(Storage::Mock(mock));
-
-        let custody_rpc = Arc::new(RpcClientWithRetry::with_retry_config(
-            custody_server.url(),
-            fast(),
-            CommitmentConfig::finalized(),
-        ));
-        let channel_rpc = Arc::new(RpcClientWithRetry::with_retry_config(
-            custody_server.url(),
-            fast(),
-            CommitmentConfig::finalized(),
-        ));
-
-        let config = recon_config_zero_tolerance();
-        let mut orphans = None;
-        let mut counters: HashMap<Pubkey, u32> = HashMap::from([(mint, 2)]);
+        let env = tick_env(mint, 900, 1200).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 2000, 0)]);
+        env.mock
+            .set_should_fail("get_mint_balances_for_reconciliation", true);
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(mint, 2)]),
+            liability: HashMap::from([(mint, 2)]),
+        };
         let mut halted = false;
 
-        let res = perform_reconciliation_check(
-            &storage,
-            &config,
-            &custody_rpc,
-            &channel_rpc,
-            Pubkey::new_unique(),
-            &test_webhook_client(),
-            &None,
-            &mut orphans,
+        let res = run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
+            &CancellationToken::new(),
         )
         .await;
 
-        assert!(res.is_err(), "an enumeration failure must fail the tick");
+        assert!(res.is_err(), "a ledger read failure must fail the tick");
+        assert_eq!(counters.supply, HashMap::from([(mint, 2)]));
+        assert_eq!(counters.liability, HashMap::from([(mint, 2)]));
+        assert!(!halted, "a failed ledger read must not halt");
+        assert!(env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_is_read_at_the_custody_slot_when_checkpoint_covers_it() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(env.mock.last_reconciliation_slot(), Some(1));
+        assert_eq!(counters.liability.get(&mint).copied(), Some(1));
+        assert!(counters.supply.is_empty());
+    }
+
+    #[tokio::test]
+    async fn absent_checkpoint_skips_wait_and_leaves_liabilities_unknown() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 1000).await;
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        // The wait alone, timed without the mocked RPC round trips around it.
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ledger(&env.storage, 1, &CancellationToken::new()).await;
+        assert_eq!(outcome, LedgerWait::Unknown);
+        assert!(started.elapsed() < LEDGER_CATCHUP_TIMEOUT / 2, "no wait");
+        env.mock.call_counts.lock().unwrap().clear();
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
         assert_eq!(
-            counters.get(&mint).copied(),
-            Some(2),
-            "a failed enumeration must hold the breach counter"
+            env.mock.calls("get_committed_checkpoint"),
+            1,
+            "one read, no poll"
         );
-        assert!(!halted, "a failed enumeration must not halt");
-        assert!(storage.is_reconciliation_halted().await.unwrap().is_none());
+        assert!(counters.liability.is_empty());
+        assert_eq!(env.mock.last_reconciliation_slot(), Some(1));
+        assert_eq!(counters.supply.get(&mint).copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn lagging_checkpoint_times_out_to_unknown() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 1000).await;
+        seed_checkpoint(&env.mock, 0);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, 2)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counters.liability.get(&mint).copied(), Some(2), "held");
+        assert!(!halted);
+        assert_eq!(counters.supply.get(&mint).copied(), Some(1));
+        assert!(env.mock.calls("get_committed_checkpoint") > 1, "it polled");
+    }
+
+    #[tokio::test]
+    async fn cancelled_token_ends_wait_immediately() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 1000).await;
+        seed_checkpoint(&env.mock, 0);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, 2)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+        let token = CancellationToken::new();
+        token.cancel();
+
+        // The wait alone, timed without the mocked RPC round trips around it.
+        let started = std::time::Instant::now();
+        let outcome = wait_for_ledger(&env.storage, 1, &token).await;
+        assert_eq!(outcome, LedgerWait::Cancelled);
+        assert!(started.elapsed() < LEDGER_CATCHUP_TIMEOUT / 2);
+        env.mock.call_counts.lock().unwrap().clear();
+
+        let res = run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &token,
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "a cancelled wait ends the tick cleanly: {res:?}"
+        );
+        assert_eq!(
+            env.mock.calls("get_committed_checkpoint"),
+            1,
+            "one poll, no wait"
+        );
+        assert_eq!(counters.liability, HashMap::from([(mint, 2)]));
+        assert!(counters.supply.is_empty(), "nothing evaluated");
+        assert_eq!(env.mock.last_reconciliation_slot(), None, "ledger not read");
+        assert!(!halted);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_advanced_during_wait_is_covered() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 0);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        // The indexer commits the custody slot only after the tick's first poll.
+        let writer = env.mock.clone();
+        tokio::spawn(async move {
+            while writer.calls("get_committed_checkpoint") == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            seed_checkpoint(&writer, 1);
+        });
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counters.liability.get(&mint).copied(), Some(1));
+        assert!(env.mock.calls("get_committed_checkpoint") >= 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_read_failing_every_poll_leaves_liabilities_unknown() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 1000).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_should_fail("get_committed_checkpoint", true);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, 2)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+
+        let res = run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(counters.liability.get(&mint).copied(), Some(2), "held");
+        assert_eq!(counters.supply.get(&mint).copied(), Some(1));
+        assert!(!halted);
+    }
+
+    #[tokio::test]
+    async fn transient_checkpoint_read_failure_then_covered() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_fail_times("get_committed_checkpoint", 2);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counters.liability.get(&mint).copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn withdraw_checkpoint_does_not_cover_the_escrow_ledger() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        env.mock
+            .set_checkpoint(&program_key(ProgramType::Withdraw), 1);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(counters.liability.is_empty());
+        assert_eq!(env.mock.calls("get_committed_checkpoint"), 1);
+    }
+
+    /// Supply matches custody while a pending deposit pads the envelope, yet the
+    /// escrow holds half of what it owes: three ticks halt on the liability arm.
+    #[tokio::test]
+    async fn reviewer_scenario_halts_over_three_ticks() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        let id = seed_orphan_deposit(&env.mock, &mint.to_string());
+        env.mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t.id == id)
+            .unwrap()
+            .amount = TokenAmount(100);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+        let config = recon_config_zero_tolerance();
+
+        for _ in 0..3 {
+            assert!(!halted);
+            run_tick(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(halted);
+        let reason = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halt set")
+            .reason;
+        assert!(reason.contains("short of ledger liabilities"), "{reason}");
+        assert!(counters.supply.is_empty(), "supply arm stayed clean");
+    }
+
+    #[tokio::test]
+    async fn ledger_rows_enumerate_zero_and_withdrawal_rows() {
+        let (a, b, c) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let env = tick_env(c, 100, 50).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_mint_balances(vec![
+            ledger_row(&a.to_string(), 0, 0),
+            ledger_row(&b.to_string(), 300, 300),
+        ]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counters.supply, HashMap::from([(a, 1), (b, 1)]));
+        assert!(counters.liability.is_empty());
     }
 
     /// A tick whose halt-input load fails (channel supply RPC down) must not
@@ -1377,12 +2495,12 @@ mod tests {
         };
 
         let mint = Pubkey::new_unique();
-        // Custody holds 900 on-chain; the DB set only enumerates the mint.
+        // Custody holds 900 on-chain; the ledger row only enumerates the mint.
         let mut custody_server = mockito::Server::new_async().await;
         mock_custody_sweep(&mut custody_server, mint, 900).await;
 
         let mock = MockStorage::new();
-        seed_db_mint(&mock, mint);
+        mock.set_mint_balances(vec![ledger_row(&mint.to_string(), 0, 0)]);
         let storage = Arc::new(Storage::Mock(mock));
 
         let custody_rpc = Arc::new(RpcClientWithRetry::with_retry_config(
@@ -1411,7 +2529,10 @@ mod tests {
         let webhook_client = test_webhook_client();
         let mut orphans = None;
         // A breach counter already building; a failed load must hold it intact.
-        let mut counters: HashMap<Pubkey, u32> = HashMap::from([(mint, 2)]);
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(mint, 2)]),
+            ..Default::default()
+        };
         let mut halted = false;
 
         let res = perform_reconciliation_check(
@@ -1425,6 +2546,7 @@ mod tests {
             &mut orphans,
             &mut counters,
             &mut halted,
+            &CancellationToken::new(),
         )
         .await;
         assert!(res.is_ok(), "tick should complete: {res:?}");
@@ -1432,7 +2554,7 @@ mod tests {
         // Load failed: no halt, flag unset, and the counter is HELD (not reset).
         assert!(!halted);
         assert_eq!(
-            counters.get(&mint).copied(),
+            counters.supply.get(&mint).copied(),
             Some(2),
             "a read failure must hold the breach counter, not reset it"
         );
@@ -1461,7 +2583,7 @@ mod tests {
         let config = recon_config_zero_tolerance();
         let webhook = test_webhook_client();
         let mut orphans = None;
-        let mut counters = HashMap::new();
+        let mut counters = BreachCounters::default();
 
         // Flag set: the guard is raised even though it started false.
         storage.set_reconciliation_halt("prior halt").await.unwrap();
@@ -1477,6 +2599,7 @@ mod tests {
             &mut orphans,
             &mut counters,
             &mut halted,
+            &CancellationToken::new(),
         )
         .await;
         assert!(halted, "a set durable flag must raise the in-memory guard");
@@ -1495,6 +2618,7 @@ mod tests {
             &mut orphans,
             &mut counters,
             &mut halted,
+            &CancellationToken::new(),
         )
         .await;
         assert!(

@@ -123,8 +123,8 @@ pub struct MintDbBalance {
     /// Held as `BigDecimal` because the gross sum of many near-`u64::MAX` amounts can
     /// exceed `u64::MAX` even though the net (deposits - withdrawals) cannot.
     pub total_deposits: BigDecimal,
-    /// Sum of amounts for completed withdrawals only.
-    /// Only a completed `release_funds` call actually reduces the on-chain ATA balance.
+    /// Sum of amounts for withdrawals whose release the indexer observed at or below the slot.
+    /// Only a landed `release_funds` call actually reduces the on-chain ATA balance.
     pub total_withdrawals: BigDecimal,
 }
 

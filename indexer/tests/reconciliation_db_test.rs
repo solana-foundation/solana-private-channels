@@ -1,13 +1,16 @@
 //! Integration tests for the reconciliation storage queries.
 //!
-//! Covers the runtime mint enumeration, the startup balance aggregate, the
-//! durable halt flag and the in-flight envelope.
+//! Covers the ledger balance aggregate shared by startup and runtime
+//! reconciliation, the durable halt flag and the in-flight envelope.
 //!
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 
 use bigdecimal::BigDecimal;
 use private_channel_indexer::{
-    storage::{common::amount::TokenAmount, PostgresDb, Storage},
+    storage::{
+        common::{amount::TokenAmount, models::DbObservedRelease},
+        PostgresDb, Storage,
+    },
     PostgresConfig,
 };
 use solana_sdk::pubkey::Pubkey;
@@ -98,70 +101,302 @@ async fn insert_transaction(
     Ok(())
 }
 
+/// Insert a withdrawal row and return the nonce the trigger assigned to it.
+async fn insert_withdrawal(
+    pool: &PgPool,
+    signature: &str,
+    mint: &str,
+    amount: u64,
+    status: &str,
+    slot: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO transactions
+         (signature, slot, initiator, recipient, mint, amount,
+          transaction_type, status, created_at, updated_at)
+         VALUES ($1, $2, 'test_initiator', 'test_recipient', $3, $4, 'withdrawal', $5::transaction_status, NOW(), NOW())
+         RETURNING withdrawal_nonce",
+    )
+    .bind(signature)
+    .bind(slot)
+    .bind(mint)
+    .bind(TokenAmount(amount))
+    .bind(status)
+    .fetch_one(pool)
+    .await
+}
+
+/// Record that the escrow indexer saw the release for `nonce` land at `slot`.
+async fn observe_release(
+    storage: &Storage,
+    nonce: i64,
+    slot: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: nonce,
+            signature: format!("release_{nonce}"),
+            slot,
+        }])
+        .await?;
+    Ok(())
+}
+
+/// Total withdrawals the aggregate reports for `mint` at `slot`.
+async fn withdrawals_at(
+    storage: &Storage,
+    mint: &str,
+    slot: u64,
+) -> Result<BigDecimal, Box<dyn std::error::Error>> {
+    let rows = storage.get_mint_balances_for_reconciliation(slot).await?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.mint_address == mint)
+        .ok_or("mint missing from the aggregate")?;
+    Ok(row.total_withdrawals)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Runtime enumeration is driven by the `mints` table alone: one row per mint,
-/// whatever transactions exist, and nothing for an address that only ever
-/// appears in `transactions`.
+/// Deposits of every status count, bounded at the slot.
 #[tokio::test(flavor = "multi_thread")]
-async fn mint_addresses_enumerates_mints_table_only() -> Result<(), Box<dyn std::error::Error>> {
+async fn deposits_of_every_status_count_up_to_the_bound() -> Result<(), Box<dyn std::error::Error>>
+{
     let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
 
-    assert!(
-        storage.get_mint_addresses().await?.is_empty(),
-        "a fresh schema has no mints to enumerate"
-    );
-
-    let allowed_no_txns = Pubkey::new_unique().to_string();
-    let allowed_with_txns = Pubkey::new_unique().to_string();
-    let orphan_only = Pubkey::new_unique().to_string();
-    let token_program = spl_token::id().to_string();
-
-    insert_mint(&pool, &allowed_no_txns, 6, &token_program).await?;
-    insert_mint(&pool, &allowed_with_txns, 9, &token_program).await?;
-
-    // Two rows on one mint, neither status completed, plus a mint that has no `mints` row.
-    insert_transaction(
-        &pool,
-        "pending_deposit",
-        &allowed_with_txns,
-        1_000,
-        "deposit",
+    let statuses = [
         "pending",
-        100,
-    )
-    .await?;
+        "processing",
+        "completed",
+        "failed",
+        "manual_review",
+    ];
+    for (i, status) in statuses.iter().enumerate() {
+        insert_transaction(
+            &pool,
+            &format!("d_{status}"),
+            &mint,
+            1 << i,
+            "deposit",
+            status,
+            100,
+        )
+        .await?;
+    }
+    insert_transaction(&pool, "d_late", &mint, 1_000, "deposit", "completed", 201).await?;
+
+    let at_200 = storage.get_mint_balances_for_reconciliation(200).await?;
+    assert_eq!(
+        at_200[0].total_deposits,
+        BigDecimal::from(31u64),
+        "every status counts"
+    );
+    let at_max = storage
+        .get_mint_balances_for_reconciliation(u64::MAX)
+        .await?;
+    assert_eq!(
+        at_max[0].total_deposits,
+        BigDecimal::from(1_031u64),
+        "the later deposit counts once in range"
+    );
+    Ok(())
+}
+
+/// One row per `mints` row: a mint with nothing in range still reports zero, withdrawal
+/// rows never duplicate it, and an address with no `mints` row never appears.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_mint_row_appears_once_even_without_qualifying_rows(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let token_program = spl_token::id().to_string();
+    let empty = Pubkey::new_unique().to_string();
+    let busy = Pubkey::new_unique().to_string();
+    let orphan = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &empty, 6, &token_program).await?;
+    insert_mint(&pool, &busy, 6, &token_program).await?;
+
     insert_transaction(
         &pool,
-        "completed_withdrawal",
-        &allowed_with_txns,
-        400,
-        "withdrawal",
+        "busy_late_deposit",
+        &busy,
+        500,
+        "deposit",
         "completed",
-        101,
+        300,
     )
     .await?;
+    insert_withdrawal(&pool, "busy_w1", &busy, 40, "processing", 10).await?;
+    insert_withdrawal(&pool, "busy_w2", &busy, 60, "pending", 20).await?;
     insert_transaction(
         &pool,
         "orphan_deposit",
-        &orphan_only,
+        &orphan,
         700,
         "deposit",
         "completed",
-        102,
+        5,
     )
     .await?;
 
-    let mut addresses = storage.get_mint_addresses().await?;
-    addresses.sort();
-    let mut expected = vec![allowed_no_txns, allowed_with_txns];
+    let mut rows = storage.get_mint_balances_for_reconciliation(200).await?;
+    rows.sort_by(|a, b| a.mint_address.cmp(&b.mint_address));
+    let mut expected = vec![empty, busy];
     expected.sort();
-
+    let addresses: Vec<String> = rows.iter().map(|r| r.mint_address.clone()).collect();
     assert_eq!(
         addresses, expected,
-        "one row per mints row; transaction count and status are irrelevant and an orphan mint is excluded"
+        "exactly one row per mints row, orphan excluded"
     );
+    for row in &rows {
+        assert_eq!(row.total_deposits, BigDecimal::from(0u64));
+        assert_eq!(row.total_withdrawals, BigDecimal::from(0u64));
+    }
+    Ok(())
+}
 
+/// Status never subtracts a withdrawal: without an observed release nothing is released.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreleased_withdrawals_are_never_subtracted() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    let statuses = [
+        "pending",
+        "processing",
+        "parked",
+        "pending_remint",
+        "failed_reminted",
+        "manual_review",
+        "failed",
+        "completed",
+    ];
+    for status in statuses {
+        insert_withdrawal(&pool, &format!("w_{status}"), &mint, 100, status, 100).await?;
+    }
+    insert_withdrawal(&pool, "w_refused", &mint, 100, "failed_reminted", 100).await?;
+    sqlx::query(
+        "UPDATE transactions SET release_refused_on_chain = true WHERE signature = 'w_refused'",
+    )
+    .execute(&pool)
+    .await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(0u64)
+    );
+    Ok(())
+}
+
+/// A release whose nonce names no transaction row subtracts nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn observed_release_without_matching_row_changes_nothing(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+    insert_transaction(&pool, "d", &mint, 1_000, "deposit", "completed", 100).await?;
+    let nonce = insert_withdrawal(&pool, "w", &mint, 300, "processing", 100).await?;
+    observe_release(&storage, nonce + 1_000, 100).await?;
+
+    let rows = storage
+        .get_mint_balances_for_reconciliation(u64::MAX)
+        .await?;
+    assert_eq!(rows[0].total_deposits, BigDecimal::from(1_000u64));
+    assert_eq!(rows[0].total_withdrawals, BigDecimal::from(0u64));
+    Ok(())
+}
+
+/// A release subtracts only under the mint of the row that carries its nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn observed_release_subtracts_only_under_its_rows_mint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let token_program = spl_token::id().to_string();
+    let a = Pubkey::new_unique().to_string();
+    let b = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &a, 6, &token_program).await?;
+    insert_mint(&pool, &b, 6, &token_program).await?;
+    let nonce_a = insert_withdrawal(&pool, "w_a", &a, 300, "processing", 100).await?;
+    insert_withdrawal(&pool, "w_b", &b, 500, "processing", 100).await?;
+    observe_release(&storage, nonce_a, 100).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &a, u64::MAX).await?,
+        BigDecimal::from(300u64)
+    );
+    assert_eq!(
+        withdrawals_at(&storage, &b, u64::MAX).await?,
+        BigDecimal::from(0u64)
+    );
+    Ok(())
+}
+
+/// A release counts from its own slot on, whatever the row's status.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_counts_at_the_bound_not_above() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+    insert_transaction(&pool, "d", &mint, 1_000, "deposit", "completed", 100).await?;
+    let nonce = insert_withdrawal(&pool, "w", &mint, 300, "processing", 100).await?;
+    observe_release(&storage, nonce, 150).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, 149).await?,
+        BigDecimal::from(0u64)
+    );
+    assert_eq!(
+        withdrawals_at(&storage, &mint, 150).await?,
+        BigDecimal::from(300u64)
+    );
+    assert_eq!(
+        withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(300u64)
+    );
+    let at_150 = storage.get_mint_balances_for_reconciliation(150).await?;
+    assert_eq!(at_150[0].total_deposits, BigDecimal::from(1_000u64));
+    Ok(())
+}
+
+/// Withdrawal rows carry a channel slot, so a row far above the Solana bound still
+/// subtracts once its release is observed below it.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_channel_slot_above_bound_still_subtracts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+    let nonce = insert_withdrawal(&pool, "w", &mint, 70, "completed", 10_000).await?;
+    observe_release(&storage, nonce, 120).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, 150).await?,
+        BigDecimal::from(70u64)
+    );
+    Ok(())
+}
+
+/// A release that lands after the bound is not subtracted, even once the row reads completed.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_withdrawal_released_above_bound_is_not_subtracted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+    let nonce = insert_withdrawal(&pool, "w", &mint, 200, "completed", 100).await?;
+    observe_release(&storage, nonce, 160).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, 150).await?,
+        BigDecimal::from(0u64)
+    );
+    assert_eq!(
+        withdrawals_at(&storage, &mint, 160).await?,
+        BigDecimal::from(200u64)
+    );
     Ok(())
 }
 
@@ -198,16 +433,16 @@ async fn startup_balances_sum_past_i64_max_exactly() -> Result<(), Box<dyn std::
         101,
     )
     .await?;
-    insert_transaction(
+    let nonce = insert_withdrawal(
         &pool,
         "large_withdrawal",
         &mint,
         large_amount / 2,
-        "withdrawal",
         "completed",
         102,
     )
     .await?;
+    observe_release(&storage, nonce, 102).await?;
 
     let balances = storage
         .get_mint_balances_for_reconciliation(u64::MAX)
@@ -223,7 +458,7 @@ async fn startup_balances_sum_past_i64_max_exactly() -> Result<(), Box<dyn std::
     assert_eq!(
         balances[0].total_withdrawals,
         BigDecimal::from(large_amount / 2),
-        "completed withdrawal counted exactly"
+        "released withdrawal counted exactly"
     );
 
     Ok(())

@@ -2750,26 +2750,15 @@ impl PostgresDb {
         )
     }
 
-    /// Return per-mint aggregate balances for startup reconciliation.
-    ///
-    /// For each mint known to the DB, sums:
-    /// - `total_deposits`  : ALL indexed deposits (any status), because a deposit increases
-    ///   the escrow ATA balance on-chain the moment it is observed — the operator's private_channel minting
-    ///   status (`pending`/`processing`/`completed`/`failed`) does not change what is on-chain.
-    /// - `total_withdrawals`: only `completed` withdrawals, because only a completed
-    ///   `release_funds` call actually moves tokens out of the ATA.
-    ///
-    /// Mints with no transactions still appear (with totals = 0) because of the LEFT JOIN.
-    ///
-    /// `as_of_slot` bounds the totals to what was indexed at or below that slot, so the
-    /// answer describes the ledger at one point rather than at whatever moment the query
-    /// happened to run. The bound sits in the JOIN, not a WHERE clause, because moving it
-    /// to WHERE would discard the NULL rows the LEFT JOIN produces for a mint with no
-    /// qualifying transactions and silently drop that mint from the comparison.
+    /// Per-mint ledger for startup and runtime reconciliation: every deposit at or below
+    /// `as_of_slot` in any status, minus withdrawals whose release was observed at or below it.
+    /// The bound sits in the JOIN, not WHERE, so a mint with no qualifying rows still reports 0.
     pub async fn get_mint_balances_for_reconciliation_internal(
         &self,
         as_of_slot: i64,
     ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
+        // Withdrawal rows carry a channel slot, not a Solana one, so the bound limits deposits only.
+        // Status is not trusted for withdrawals: it turns completed after the payout and has no Solana slot.
         sqlx::query_as::<_, MintDbBalance>(
             r#"
             SELECT
@@ -2780,27 +2769,23 @@ impl PostgresDb {
                     0
                 )::NUMERIC AS total_deposits,
                 COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'withdrawal' AND t.status = 'completed' THEN t.amount ELSE 0 END),
+                    SUM(CASE WHEN t.transaction_type = 'withdrawal'
+                              AND EXISTS (SELECT 1 FROM observed_releases r
+                                          WHERE r.withdrawal_nonce = t.withdrawal_nonce
+                                            AND r.slot <= $1)
+                             THEN t.amount ELSE 0 END),
                     0
                 )::NUMERIC AS total_withdrawals
             FROM mints m
-            LEFT JOIN transactions t ON t.mint = m.mint_address AND t.slot <= $1
+            LEFT JOIN transactions t
+              ON t.mint = m.mint_address
+             AND (t.transaction_type = 'withdrawal' OR t.slot <= $1)
             GROUP BY m.mint_address, m.token_program
             "#,
         )
         .bind(as_of_slot)
         .fetch_all(&self.pool)
         .await
-    }
-
-    /// Every mint address the DB knows: the mint universe that runtime reconciliation checks.
-    ///
-    /// Addresses only: runtime compares on-chain custody against on-chain channel
-    /// supply, so no ledger amount is read here and none is aggregated.
-    pub async fn get_mint_addresses_internal(&self) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT mint_address FROM mints")
-            .fetch_all(&self.pool)
-            .await
     }
 
     /// Per-mint sum of every unsettled transaction amount (the in-flight
