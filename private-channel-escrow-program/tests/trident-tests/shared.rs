@@ -3,7 +3,12 @@
 use private_channel_escrow_program_client::instructions::{
     AddOperatorBuilder, AllowMintBuilder, CreateInstanceBuilder,
 };
-use solana_sdk::{pubkey, pubkey::Pubkey, system_program::ID as SYSTEM_PROGRAM_ID};
+use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey,
+    pubkey::Pubkey,
+    system_program::ID as SYSTEM_PROGRAM_ID,
+};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use trident_fuzz::fuzzing::*;
 
@@ -14,6 +19,47 @@ pub const SPL_TOKEN_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623
 /// Clamp raw fuzz amounts to [1, 999_999].
 pub fn clamp_amount(raw: u64) -> u64 {
     (raw % 1_000_000).max(1)
+}
+
+// ── Type conversions ──────────────────────────────────────────────────────────
+//
+// Trident is pinned to solana-sdk 2.x while the generated client is on
+// solana-pubkey 4 / solana-instruction 3, so `Pubkey` and `Instruction` are
+// distinct types on each side. Every builder call crosses the boundary twice:
+// addresses in, a built instruction out.
+
+/// Convert a trident address into the client's `Pubkey`.
+pub trait ToClient {
+    fn client(&self) -> solana_pubkey::Pubkey;
+}
+
+impl ToClient for Pubkey {
+    fn client(&self) -> solana_pubkey::Pubkey {
+        solana_pubkey::Pubkey::new_from_array(self.to_bytes())
+    }
+}
+
+/// Convert a client-built instruction into the one trident executes.
+pub trait ToTrident {
+    fn to_trident(self) -> Instruction;
+}
+
+impl ToTrident for solana_instruction::Instruction {
+    fn to_trident(self) -> Instruction {
+        Instruction {
+            program_id: Pubkey::new_from_array(self.program_id.to_bytes()),
+            accounts: self
+                .accounts
+                .into_iter()
+                .map(|meta| AccountMeta {
+                    pubkey: Pubkey::new_from_array(meta.pubkey.to_bytes()),
+                    is_signer: meta.is_signer,
+                    is_writable: meta.is_writable,
+                })
+                .collect(),
+            data: self.data,
+        }
+    }
 }
 
 // ── Account addresses ─────────────────────────────────────────────────────────
@@ -78,17 +124,18 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
 
     let res = trident.process_transaction(
         &[CreateInstanceBuilder::new()
-            .payer(payer)
-            .admin(admin)
-            .instance_seed(instance_seed)
-            .instance(instance_pda)
-            .withdrawal_bitmap(withdrawal_bitmap_pda)
-            .system_program(SYSTEM_PROGRAM_ID)
-            .event_authority(event_authority_pda)
-            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .payer(payer.client())
+            .admin(admin.client())
+            .instance_seed(instance_seed.client())
+            .instance(instance_pda.client())
+            .withdrawal_bitmap(withdrawal_bitmap_pda.client())
+            .system_program(SYSTEM_PROGRAM_ID.client())
+            .event_authority(event_authority_pda.client())
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.client())
             .bump(instance_bump)
             .bitmap_bump(bitmap_bump)
-            .instruction()],
+            .instruction()
+            .to_trident()],
         Some("create_instance"),
     );
     assert!(res.is_success(), "create_instance failed: {}", res.logs());
@@ -112,14 +159,15 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
 
     let res = trident.process_transaction(
         &[AllowMintBuilder::new()
-            .payer(payer)
-            .admin(admin)
-            .instance(instance_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint_pda)
-            .instance_ata(instance_ata)
+            .payer(payer.client())
+            .admin(admin.client())
+            .instance(instance_pda.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint_pda.client())
+            .instance_ata(instance_ata.client())
             .bump(allowed_mint_bump)
-            .instruction()],
+            .instruction()
+            .to_trident()],
         Some("allow_mint"),
     );
     assert!(res.is_success(), "allow_mint failed: {}", res.logs());
@@ -134,13 +182,14 @@ pub fn setup_escrow(trident: &mut Trident, accounts: &mut AccountAddresses) -> u
 
     let res = trident.process_transaction(
         &[AddOperatorBuilder::new()
-            .payer(payer)
-            .admin(admin)
-            .instance(instance_pda)
-            .operator(operator)
-            .operator_pda(operator_pda)
+            .payer(payer.client())
+            .admin(admin.client())
+            .instance(instance_pda.client())
+            .operator(operator.client())
+            .operator_pda(operator_pda.client())
             .bump(operator_bump)
-            .instruction()],
+            .instruction()
+            .to_trident()],
         Some("add_operator"),
     );
     assert!(res.is_success(), "add_operator failed: {}", res.logs());

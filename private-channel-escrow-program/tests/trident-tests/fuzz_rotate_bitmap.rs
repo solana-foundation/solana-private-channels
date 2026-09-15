@@ -18,7 +18,8 @@ use std::collections::HashSet;
 use trident_fuzz::fuzzing::*;
 
 use shared::{
-    clamp_amount, setup_escrow, token_amount, AccountAddresses, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    clamp_amount, setup_escrow, token_amount, AccountAddresses, ToClient, ToTrident,
+    PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
@@ -92,15 +93,16 @@ impl FuzzTest {
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
         let ix = DepositBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .user(user)
-            .instance(instance)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .user(user.client())
+            .instance(instance.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(amount)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self.trident.process_transaction(&[ix], Some("deposit"));
         if res.is_success() {
@@ -159,19 +161,20 @@ impl FuzzTest {
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .operator(operator)
-            .instance(instance)
-            .withdrawal_bitmap(withdrawal_bitmap)
-            .operator_pda(operator_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .operator(operator.client())
+            .instance(instance.client())
+            .withdrawal_bitmap(withdrawal_bitmap.client())
+            .operator_pda(operator_pda.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(amount)
-            .user(user)
+            .user(user.client())
             .transaction_nonce(nonce)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self
             .trident
@@ -236,19 +239,20 @@ impl FuzzTest {
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .operator(operator)
-            .instance(instance)
-            .withdrawal_bitmap(withdrawal_bitmap)
-            .operator_pda(operator_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .operator(operator.client())
+            .instance(instance.client())
+            .withdrawal_bitmap(withdrawal_bitmap.client())
+            .operator_pda(operator_pda.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(1)
-            .user(user)
+            .user(user.client())
             .transaction_nonce(nonce)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self
             .trident
@@ -302,15 +306,16 @@ impl FuzzTest {
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
         let ix = RotateBitmapBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .operator(operator)
-            .instance(instance)
-            .withdrawal_bitmap(withdrawal_bitmap)
-            .operator_pda(operator_pda)
-            .event_authority(event_authority)
-            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+            .payer(self.trident.payer().pubkey().client())
+            .operator(operator.client())
+            .instance(instance.client())
+            .withdrawal_bitmap(withdrawal_bitmap.client())
+            .operator_pda(operator_pda.client())
+            .event_authority(event_authority.client())
+            .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.client())
             .expected_generation(self.current_generation)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self.trident.process_transaction(&[ix], Some("rotate"));
         assert!(res.is_success(), "RotateBitmap failed: {}", res.logs());
@@ -372,19 +377,20 @@ impl FuzzTest {
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .operator(operator)
-            .instance(instance)
-            .withdrawal_bitmap(withdrawal_bitmap)
-            .operator_pda(operator_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .operator(operator.client())
+            .instance(instance.client())
+            .withdrawal_bitmap(withdrawal_bitmap.client())
+            .operator_pda(operator_pda.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(1)
-            .user(user)
+            .user(user.client())
             .transaction_nonce(stale_nonce)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self
             .trident
