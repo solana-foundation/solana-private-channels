@@ -40,10 +40,12 @@
 use {
     crate::{
         accounts::{precompiles::PRECOMPILES, AccountsDB},
+        processor::CHANNEL_SLOT,
         stages::AccountSettlements,
     },
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
+        clock::Slot,
         pubkey::Pubkey,
         transaction::SanitizedTransaction,
     },
@@ -54,7 +56,7 @@ use {
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_transaction::svm_message::SVMMessage,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         time::{SystemTime, UNIX_EPOCH},
     },
     tokio::sync::mpsc,
@@ -67,8 +69,12 @@ const OLDEST_SYNCED_ACCOUNT_AGE: u64 = 60 * 60; // 1 hour
 /// Upper bound on resident cache entries. Once exceeded, the oldest clean
 /// entries are evicted down to a low watermark. Must stay well above the max
 /// distinct account keys a single batch can reference so a batch never evicts
-/// its own working set. At ~1 KiB/account this bounds the clean set near ~1 GiB.
+/// its own working set. Large accounts break any byte estimate, hence the byte cap.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 1_000_000;
+
+/// Upper bound on resident account-data bytes. Without it a stream of large
+/// accounts grows the cache without limit while staying far under the entry cap.
+pub(crate) const DEFAULT_MAX_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Snapshot of BOB cache size, reported to metrics once per batch.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -122,6 +128,8 @@ pub struct BOB {
     batches_since_eviction: u64,
     /// Hard cap on resident entries; the cap evicts clean entries above it.
     max_cache_entries: usize,
+    /// Cap on resident account-data bytes; clean entries above it are evicted.
+    max_cache_bytes: usize,
     /// Entries evicted since the last cache_stats read; drained on read.
     evicted_delta: usize,
     /// Running count of dirty (ahead-of-DB) entries. Maintained incrementally so
@@ -152,6 +160,7 @@ impl BOB {
             accounts_db,
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             evicted_delta: 0,
             dirty_entries: 0,
             cache_bytes: 0,
@@ -176,6 +185,46 @@ impl BOB {
             .get(pubkey)
             .filter(|entry| !entry.deleted)
             .map(|entry| entry.account.lamports())
+    }
+
+    /// Data length per account, so a caller can size a working set before
+    /// loading it. Resident entries answer from memory and only misses reach the
+    /// store. Precompiles and tombstones are left out; neither costs anything.
+    pub async fn account_data_sizes(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<HashMap<Pubkey, usize>, crate::accounts::get_accounts::AccountLoadError> {
+        let mut sizes = HashMap::with_capacity(pubkeys.len());
+        let mut miss_keys: Vec<Pubkey> = Vec::new();
+
+        for pubkey in pubkeys {
+            if self.precompiles.contains_key(pubkey) || sizes.contains_key(pubkey) {
+                continue;
+            }
+            match self.accounts.get(pubkey) {
+                Some(entry) if entry.deleted => {
+                    sizes.insert(*pubkey, 0);
+                }
+                Some(entry) => {
+                    sizes.insert(*pubkey, entry.account.data().len());
+                }
+                None => {
+                    if !miss_keys.contains(pubkey) {
+                        miss_keys.push(*pubkey);
+                    }
+                }
+            }
+        }
+
+        if miss_keys.is_empty() {
+            return Ok(sizes);
+        }
+
+        let fetched = self.accounts_db.get_account_data_sizes(&miss_keys).await?;
+        for (pubkey, size) in miss_keys.into_iter().zip(fetched) {
+            sizes.insert(pubkey, size);
+        }
+        Ok(sizes)
     }
 
     /// Preloads accounts into BOB from the database.
@@ -232,34 +281,36 @@ impl BOB {
         // yet, so they are never eviction candidates here.
         self.garbage_collect();
 
-        // If everything is warm, skip the DB round-trip entirely.
-        if miss_keys.is_empty() {
-            return Ok((0, already_cached));
-        }
-
-        // Only fetch the cache-miss keys from the database.
-        let accounts = self.accounts_db.get_accounts(&miss_keys).await?;
         let mut fetched = 0usize;
-        for (index, account_opt) in accounts.iter().enumerate() {
-            if let Some(account) = account_opt {
-                // A DB-loaded account is byte-identical to the DB, so it is
-                // clean and belongs in the normally-evictable population.
-                // Reserve synced_since=None for execution-produced state.
-                // generation stays None for the same reason: the executor never
-                // wrote this, so no settlement acknowledgement can describe it.
-                let meta = AccountWithMeta {
-                    account: account.clone(),
-                    synced_since: Some(now),
-                    deleted: false,
-                    generation: None,
-                };
-                self.note_added(&meta);
-                if let Some(old) = self.accounts.insert(miss_keys[index], meta) {
-                    self.note_removed(&old);
+        // If everything is warm, skip the DB round-trip entirely.
+        if !miss_keys.is_empty() {
+            // Only fetch the cache-miss keys from the database.
+            let accounts = self.accounts_db.get_accounts(&miss_keys).await?;
+            for (index, account_opt) in accounts.iter().enumerate() {
+                if let Some(account) = account_opt {
+                    // A DB-loaded account is byte-identical to the DB, so it is
+                    // clean and belongs in the normally-evictable population.
+                    // Reserve synced_since=None for execution-produced state.
+                    // generation stays None for the same reason: the executor never
+                    // wrote this, so no settlement acknowledgement can describe it.
+                    let meta = AccountWithMeta {
+                        account: account.clone(),
+                        synced_since: Some(now),
+                        deleted: false,
+                        generation: None,
+                    };
+                    self.note_added(&meta);
+                    if let Some(old) = self.accounts.insert(miss_keys[index], meta) {
+                        self.note_removed(&old);
+                    }
+                    fetched += 1;
                 }
-                fetched += 1;
             }
         }
+
+        // Runs after the misses land so the cache is back within its cap before the
+        // batch executes. This preload's keys are spared, so none reaches the SVM as absent.
+        self.evict_to_byte_cap(pubkeys);
 
         Ok((fetched, already_cached))
     }
@@ -502,6 +553,41 @@ impl BOB {
         self.evicted_delta += remove_count;
     }
 
+    /// Evict clean entries, largest first, until resident bytes are back under a
+    /// 90% watermark. `protected` is never evicted, so the cache can exceed its
+    /// cap by at most that working set plus unsettled writes.
+    fn evict_to_byte_cap(&mut self, protected: &[Pubkey]) {
+        if self.cache_bytes <= self.max_cache_bytes {
+            return;
+        }
+        let target = self.max_cache_bytes * 9 / 10;
+        let protected: HashSet<&Pubkey> = protected.iter().collect();
+
+        // Largest first frees the bytes with the fewest evictions and spares the
+        // many small accounts the warm path relies on. Dirty entries are not candidates.
+        let mut candidates: Vec<(Pubkey, usize)> = self
+            .accounts
+            .iter()
+            .filter(|(pubkey, meta)| {
+                meta.synced_since.is_some()
+                    && !meta.account.data().is_empty()
+                    && !protected.contains(pubkey)
+            })
+            .map(|(pubkey, meta)| (*pubkey, meta.account.data().len()))
+            .collect();
+        candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.1));
+
+        for (pubkey, _) in candidates {
+            if self.cache_bytes <= target {
+                break;
+            }
+            if let Some(old) = self.accounts.remove(&pubkey) {
+                self.note_removed(&old);
+                self.evicted_delta += 1;
+            }
+        }
+    }
+
     /// Account the byte and dirty totals for an entry entering the cache.
     fn note_added(&mut self, meta: &AccountWithMeta) {
         self.cache_bytes += meta.account.data().len();
@@ -550,12 +636,18 @@ impl BOB {
             accounts_db,
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             evicted_delta: 0,
             dirty_entries: 0,
             cache_bytes: 0,
             settlement_divergences: 0,
             next_generation: 0,
         }
+    }
+
+    /// Lower the byte cap so a test can cross it with small accounts.
+    pub(crate) fn set_max_cache_bytes(&mut self, bytes: usize) {
+        self.max_cache_bytes = bytes;
     }
 
     /// Insert an account directly into BOB's cache (test-only).
@@ -577,10 +669,12 @@ impl BOB {
     }
 }
 
-impl InvokeContextCallback for BOB {}
-
-impl TransactionProcessingCallback for BOB {
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+impl BOB {
+    /// Reads an account without the slot the SVM callback wants alongside it.
+    ///
+    /// Kept inherent so callers inside this crate keep the plain option, and so
+    /// the trait below is only the shape the SVM asks for.
+    pub fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         // First check precompiles (always in memory)
         if let Some(precompile) = self.precompiles.get(pubkey) {
             return Some(precompile.clone());
@@ -596,10 +690,13 @@ impl TransactionProcessingCallback for BOB {
 
         None
     }
+}
 
-    fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
-        self.get_account_shared_data(account)
-            .and_then(|account| owners.iter().position(|key| account.owner().eq(key)))
+impl InvokeContextCallback for BOB {}
+
+impl TransactionProcessingCallback for BOB {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+        BOB::get_account_shared_data(self, pubkey).map(|account| (account, CHANNEL_SLOT))
     }
 }
 
@@ -619,7 +716,7 @@ mod tests {
             ExecutedTransaction, TransactionExecutionDetails,
         },
         solana_svm_callback::TransactionProcessingCallback,
-        solana_timings::ExecuteTimings,
+        solana_svm_timings::ExecuteTimings,
     };
 
     fn create_test_bob() -> (BOB, mpsc::UnboundedSender<AccountSettlements>) {
@@ -662,7 +759,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }))
@@ -830,7 +927,7 @@ mod tests {
                         inner_instructions: None,
                         return_data: None,
                         executed_units: 0,
-                        accounts_data_len_delta: 0,
+                        accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                     },
                     programs_modified_by_tx: HashMap::new(),
                 },
@@ -1673,8 +1770,8 @@ mod tests {
         let result = TransactionProcessingCallback::get_account_shared_data(&bob, &pubkey);
         assert_eq!(
             result.unwrap(),
-            account,
-            "Live account must be returned to SVM"
+            (account, CHANNEL_SLOT),
+            "Live account must be returned to SVM at the channel slot"
         );
     }
 
@@ -1839,6 +1936,127 @@ mod tests {
             bob.accounts.contains_key(&referenced),
             "an account referenced this batch must not be cap-evicted"
         );
+    }
+
+    /// Insert a clean entry holding `len` bytes, keeping the byte total in step.
+    fn insert_clean(bob: &mut BOB, len: usize) -> Pubkey {
+        let pubkey = Pubkey::new_unique();
+        let meta = AccountWithMeta {
+            account: make_account(1, &vec![7u8; len], &Pubkey::default()),
+            synced_since: Some(now_secs()),
+            deleted: false,
+            generation: None,
+        };
+        bob.note_added(&meta);
+        bob.accounts.insert(pubkey, meta);
+        pubkey
+    }
+
+    /// Over the byte cap the largest clean entries go first, and only until the
+    /// total is back under the watermark.
+    #[tokio::test]
+    async fn byte_cap_evicts_largest_clean_entries_to_the_watermark() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let largest = insert_clean(&mut bob, 600);
+        let rest = [
+            insert_clean(&mut bob, 300),
+            insert_clean(&mut bob, 200),
+            insert_clean(&mut bob, 50),
+        ];
+
+        bob.evict_to_byte_cap(&[]);
+
+        assert!(!bob.accounts.contains_key(&largest));
+        assert!(rest.iter().all(|key| bob.accounts.contains_key(key)));
+        let stats = bob.cache_stats();
+        assert_eq!(stats.bytes, 550, "byte total must follow the eviction");
+        assert_eq!(stats.evicted, 1);
+    }
+
+    /// The keys a preload was asked for are never evicted, even when they alone
+    /// exceed the cap, because the batch is about to execute against them.
+    #[tokio::test]
+    async fn byte_cap_never_evicts_the_working_set() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let working_set = [insert_clean(&mut bob, 800), insert_clean(&mut bob, 700)];
+        let other = insert_clean(&mut bob, 100);
+
+        bob.evict_to_byte_cap(&working_set);
+
+        assert!(working_set.iter().all(|key| bob.accounts.contains_key(key)));
+        assert!(!bob.accounts.contains_key(&other));
+        assert_eq!(bob.cache_stats().bytes, 1500);
+    }
+
+    /// Unsettled writes and tombstones are ahead of the store, so evicting them
+    /// would lose state; the byte cap must leave them alone like the entry cap.
+    #[tokio::test]
+    async fn byte_cap_never_evicts_dirty_entries_or_tombstones() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let dirty = Pubkey::new_unique();
+        bob.insert_account_for_test(dirty, make_account(1, &[7u8; 1200], &Pubkey::default()));
+        let tombstone = Pubkey::new_unique();
+        let meta = AccountWithMeta {
+            account: AccountSharedData::default(),
+            synced_since: None,
+            deleted: true,
+            generation: Some(1),
+        };
+        bob.note_added(&meta);
+        bob.accounts.insert(tombstone, meta);
+
+        bob.evict_to_byte_cap(&[]);
+
+        assert!(bob.accounts.contains_key(&dirty));
+        assert!(bob.accounts.contains_key(&tombstone));
+    }
+
+    #[tokio::test]
+    async fn byte_cap_is_a_no_op_under_the_limit() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        bob.max_cache_bytes = 1000;
+        let key = insert_clean(&mut bob, 900);
+
+        bob.evict_to_byte_cap(&[]);
+
+        assert!(bob.accounts.contains_key(&key));
+        assert_eq!(bob.cache_stats().evicted, 0);
+    }
+
+    /// Through a real store: a preload that pushes the cache over its byte cap
+    /// evicts what earlier preloads left behind, never what it was asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preload_accounts_holds_the_cache_to_its_byte_cap() {
+        let (accounts_db, _pg) = crate::test_helpers::start_test_postgres().await;
+        let (_settled_tx, rx) = mpsc::unbounded_channel();
+        let mut bob = BOB::new_test(rx, accounts_db);
+        bob.max_cache_bytes = 5000;
+        let mut keys = Vec::new();
+        for _ in 0..4 {
+            let key = Pubkey::new_unique();
+            bob.accounts_db
+                .set_account(key, make_account(1, &[7u8; 2000], &Pubkey::default()))
+                .await;
+            keys.push(key);
+        }
+        let (a, b, c, d) = (keys[0], keys[1], keys[2], keys[3]);
+
+        bob.preload_accounts(&[a, b]).await.unwrap();
+        bob.preload_accounts(&[c, d]).await.unwrap();
+        assert!(!bob.accounts.contains_key(&a) && !bob.accounts.contains_key(&b));
+        assert!(bob.accounts.contains_key(&c) && bob.accounts.contains_key(&d));
+        assert_eq!(bob.cache_stats().bytes, 4000);
+
+        bob.preload_accounts(&[a, b, c]).await.unwrap();
+        assert!(
+            [a, b, c].iter().all(|key| bob.accounts.contains_key(key)),
+            "a working set larger than the cap must still be fully resident"
+        );
+        assert!(!bob.accounts.contains_key(&d));
+        assert_eq!(bob.cache_stats().bytes, 6000);
     }
 
     #[tokio::test]
@@ -2407,7 +2625,7 @@ mod tests {
                 transaction_error_metrics::TransactionErrorMetrics,
                 transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
             },
-            solana_timings::ExecuteTimings,
+            solana_svm_timings::ExecuteTimings,
         };
         let executed = ExecutedTransaction {
             loaded_transaction: LoadedTransaction {
@@ -2420,7 +2638,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         };
@@ -2464,6 +2682,74 @@ mod tests {
         assert!(
             !bob.accounts.contains_key(&spl_token::id()),
             "read-only spl_token program slot must be skipped"
+        );
+    }
+
+    /// A batch whose accounts are all resident must be sized without touching
+    /// the store, which is what keeps a warm batch free of DB round-trips.
+    #[tokio::test]
+    async fn account_data_sizes_answers_a_warm_batch_without_the_store() {
+        // Backed by a dead Postgres, so any query at all would fail the test.
+        let (mut bob, _settled_tx) = create_test_bob();
+        let small = Pubkey::new_unique();
+        let large = Pubkey::new_unique();
+        bob.insert_account_for_test(small, make_account(1, &[7u8; 10], &Pubkey::default()));
+        bob.insert_account_for_test(large, make_account(1, &[7u8; 5_000], &Pubkey::default()));
+        let precompile = Pubkey::new_unique();
+        bob.precompiles
+            .insert(precompile, make_account(1, &[9u8; 200], &Pubkey::default()));
+
+        let sizes = bob
+            .account_data_sizes(&[small, large, precompile])
+            .await
+            .expect("a fully warm batch must not need the store");
+
+        assert_eq!(sizes.get(&small).copied(), Some(10));
+        assert_eq!(sizes.get(&large).copied(), Some(5_000));
+        assert!(
+            !sizes.contains_key(&precompile),
+            "a precompile is always in memory and costs no preload budget"
+        );
+    }
+
+    /// A deleted entry is absent as far as the SVM is concerned, so it must not
+    /// be sized from the tombstone it still occupies in the map.
+    #[tokio::test]
+    async fn account_data_sizes_treats_a_tombstone_as_absent() {
+        let (mut bob, _settled_tx) = create_test_bob();
+        let closed = Pubkey::new_unique();
+        bob.accounts.insert(
+            closed,
+            AccountWithMeta {
+                account: make_account(0, &[1u8; 100], &Pubkey::default()),
+                synced_since: None,
+                deleted: true,
+                generation: None,
+            },
+        );
+
+        let sizes = bob
+            .account_data_sizes(&[closed])
+            .await
+            .expect("a tombstone is resident, so no query is needed");
+        assert_eq!(sizes.get(&closed).copied(), Some(0));
+    }
+
+    /// A store that cannot answer the size query must stop the caller, exactly
+    /// as an unreadable preload does; zeroes would admit an oversized batch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn account_data_sizes_surfaces_an_unreadable_store() {
+        use crate::accounts::get_accounts::{reset_test_retry, set_test_retry, AccountLoadError};
+
+        set_test_retry(2, 1);
+        let (bob, _settled_tx) = create_test_bob();
+        let result = bob.account_data_sizes(&[Pubkey::new_unique()]).await;
+        reset_test_retry();
+
+        assert!(
+            matches!(result, Err(AccountLoadError::Backend(_))),
+            "an unreadable store must not be read as zero-sized accounts: {result:?}"
         );
     }
 }

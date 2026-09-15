@@ -19,6 +19,7 @@
 
 #![allow(dead_code)]
 
+use solana_commitment_config::CommitmentLevel;
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
     private_channel_indexer::{
@@ -38,7 +39,7 @@ use {
     },
     serde_json::{json, Value},
     solana_keychain::SolanaSigner,
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Keypair},
+    solana_sdk::{pubkey::Pubkey, signature::Keypair},
     spl_associated_token_account::get_associated_token_address_with_program_id,
     spl_token::{
         solana_program::{program_option::COption, program_pack::Pack},

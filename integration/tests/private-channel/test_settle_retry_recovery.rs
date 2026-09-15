@@ -8,6 +8,7 @@
 //! Commits are made to fail deterministically with a CHECK constraint on the
 //! `blocks` table, the same fault-injection the batch-atomicity tests use.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     private_channel_core::{
         nodes::node::{run_node, NodeConfig, NodeHandles, NodeMode},
@@ -15,7 +16,6 @@ use {
     },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
-        commitment_config::CommitmentConfig,
         instruction::Instruction,
         signature::{Keypair, Signature, Signer},
         transaction::Transaction,

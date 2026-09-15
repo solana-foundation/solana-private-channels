@@ -14,8 +14,8 @@ use private_channel_escrow_program_client::instructions::{AllowMintBuilder, SetN
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     signature::{Keypair, Signer},
-    system_program::ID as SYSTEM_PROGRAM_ID,
 };
+use solana_sdk_ids::system_program::ID as SYSTEM_PROGRAM_ID;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
 #[test]

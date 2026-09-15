@@ -15,7 +15,9 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::Keypair,
 };
-use solana_svm::transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails};
+use solana_svm::transaction_execution_result::{
+    AccountsDeltas, ExecutedTransaction, TransactionExecutionDetails,
+};
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use std::collections::HashMap;
 use testcontainers::runners::AsyncRunner;
@@ -62,7 +64,10 @@ fn make_executed_tx(accounts: Vec<(Pubkey, AccountSharedData)>) -> ProcessedTran
             inner_instructions: None,
             return_data: None,
             executed_units: 0,
-            accounts_data_len_delta: 0,
+            accounts_deltas: Some(AccountsDeltas {
+                accounts_resize_delta: 0,
+                accounts_uninitialized_size: 0,
+            }),
         },
         programs_modified_by_tx: HashMap::new(),
     }))
@@ -117,28 +122,6 @@ async fn test_get_multiple_accounts() {
     assert!(results[1].is_some());
     assert_eq!(results[1].as_ref().unwrap().lamports(), 200);
     assert!(results[2].is_none());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_account_matches_owners() {
-    let (mut db, _pg) = start_postgres().await;
-
-    let owner_a = Pubkey::new_unique();
-    let owner_b = Pubkey::new_unique();
-    let owner_c = Pubkey::new_unique();
-    let pubkey = Pubkey::new_unique();
-
-    db.set_account(pubkey, make_account(100, &owner_b)).await;
-
-    // Wrap in AccountsDB::Postgres to call account_matches_owners via the trait
-    // The trait impl is on PostgresAccountsDB which delegates to get_account + owner check
-    use solana_svm_callback::TransactionProcessingCallback;
-    if let AccountsDB::Postgres(ref pg) = db {
-        let result = pg.account_matches_owners(&pubkey, &[owner_a, owner_b, owner_c]);
-        assert_eq!(result, Some(1)); // owner_b is at index 1
-    } else {
-        panic!("Expected Postgres variant");
-    }
 }
 
 // ── Block Operations ──────────────────────────────────────────────────────────

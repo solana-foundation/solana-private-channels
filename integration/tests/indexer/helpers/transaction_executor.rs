@@ -2,13 +2,14 @@
 
 use super::send_and_confirm_instructions;
 use super::test_types::{TransactionType, UserTransaction, BASE_AMOUNT, DEPOSITS_PER_USER};
+use solana_commitment_config::CommitmentConfig;
 
 use private_channel_escrow_program_client::instructions::DepositBuilder;
 use private_channel_withdraw_program_client::instructions::{
     WithdrawFunds, WithdrawFundsInstructionArgs,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signer};
+use solana_sdk::{pubkey::Pubkey, signature::Signer};
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;

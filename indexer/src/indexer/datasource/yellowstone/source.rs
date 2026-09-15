@@ -629,6 +629,8 @@ async fn connect_and_stream(
         "private_channel_blocks".to_string(),
         SubscribeRequestFilterBlocks {
             account_include: vec![program_id.to_string()],
+            // The cuckoo form of the same filter, which this stream does not use.
+            cuckoo_account_include: None,
             include_transactions: Some(true),
             include_accounts: Some(false),
             include_entries: Some(false),
@@ -826,7 +828,7 @@ mod tests {
     use crate::test_utils::rpc_mocks::mock_get_blocks;
     use mockito::Server;
     use serde_json::json;
-    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
     use tokio::sync::mpsc;
 
@@ -1724,6 +1726,8 @@ mod tests {
             .collect();
 
         let message = proto::Message {
+            // A v1 message would carry its compute budget here; these fixtures are v0.
+            config: None,
             header: Some(proto::MessageHeader {
                 num_required_signatures: 1,
                 num_readonly_signed_accounts: 0,
@@ -1887,6 +1891,8 @@ mod tests {
     ) -> yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
         use yellowstone_grpc_proto::prelude as proto;
         let message = proto::Message {
+            // A v1 message would carry its compute budget here; these fixtures are v0.
+            config: None,
             header: Some(proto::MessageHeader {
                 num_required_signatures: 1,
                 num_readonly_signed_accounts: 0,
@@ -2642,6 +2648,9 @@ async fn handle_transaction_info(
     ) = match &versioned_message {
         VersionedMessage::Legacy(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
         VersionedMessage::V0(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
+        // A v1 message carries the same static keys and instructions; only the
+        // compute budget moved into the message, and nothing here reads it.
+        VersionedMessage::V1(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
     };
 
     // Full account list (static message keys, then loaded writable, then readonly) that inner and v0 top-level account indices reference.

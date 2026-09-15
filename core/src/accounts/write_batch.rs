@@ -163,7 +163,8 @@ async fn write_batch_postgres(
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         sig_bytes_vec.push(signature.as_ref().to_vec());
-        let data = bincode::serialize(&stored_tx)
+        let data = stored_tx
+            .to_bytes()
             .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
         tx_data_vec.push(data);
         // Index every account key the transaction touches, not just the fee
@@ -399,7 +400,9 @@ pub(crate) async fn write_batch_redis(
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         let key = format!("tx:{}", signature);
-        let serialized = bincode::serialize(&stored_tx).unwrap();
+        let serialized = stored_tx
+            .to_bytes()
+            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
         pipe.set(key, serialized);
     }
 

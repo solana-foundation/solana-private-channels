@@ -12,11 +12,10 @@ use {
     clap::Parser,
     private_channel_core::accounts::{
         traits::{AccountsDB, BlockInfo},
-        types::StoredTransaction,
+        types::{StoredTokenBalance, StoredTransaction},
     },
     serde::Serialize,
     solana_sdk::{message::VersionedMessage, pubkey::Pubkey, signature::Signature},
-    solana_transaction_status_client_types::option_serializer::OptionSerializer,
     sqlx::{postgres::PgPoolOptions, FromRow, PgPool},
     std::{
         net::SocketAddr,
@@ -239,9 +238,7 @@ fn parse_spl_token_instruction(
     data: &[u8],
     account_keys: &[Pubkey],
     ix_accounts: &[u8],
-    pre_token_balances: &Option<
-        Vec<solana_transaction_status_client_types::UiTransactionTokenBalance>,
-    >,
+    pre_token_balances: &Option<Vec<StoredTokenBalance>>,
 ) -> Option<ParsedInstruction> {
     if data.is_empty() {
         return None;
@@ -349,12 +346,13 @@ fn parse_stored_transaction(
     let instructions = match &stored_tx.transaction.message {
         VersionedMessage::Legacy(msg) => &msg.instructions,
         VersionedMessage::V0(msg) => &msg.instructions,
+        VersionedMessage::V1(msg) => &msg.instructions,
     };
 
     let escrow_program_id: Pubkey = ESCROW_PROGRAM_ID.parse().unwrap();
     let spl_token_program_id: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().unwrap();
 
-    let failed = stored_tx.meta.status.is_err();
+    let failed = stored_tx.meta.err.is_some();
 
     let mut result = ParsedInstruction {
         tx_type: "unknown".into(),
@@ -368,10 +366,7 @@ fn parse_stored_transaction(
     };
 
     // Extract pre_token_balances for SPL Token parsing
-    let pre_token_balances = match &stored_tx.meta.pre_token_balances {
-        OptionSerializer::Some(b) => Some(b.clone()),
-        _ => None,
-    };
+    let pre_token_balances = stored_tx.meta.pre_token_balances.clone();
 
     for ix in instructions {
         let prog_id = account_keys.get(ix.program_id_index as usize);

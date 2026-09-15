@@ -1,5 +1,6 @@
 //! E2E tests for the stuck-`Processing` recovery worker.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
@@ -14,7 +15,7 @@ use {
         PostgresConfig,
     },
     serde_json::json,
-    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
     std::{sync::Arc, time::Duration},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,

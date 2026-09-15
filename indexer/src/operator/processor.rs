@@ -1376,7 +1376,7 @@ mod tests {
                 base_delay: std::time::Duration::from_millis(1),
                 max_delay: std::time::Duration::from_millis(1),
             },
-            solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            solana_commitment_config::CommitmentConfig::confirmed(),
         )
     }
 
@@ -1568,7 +1568,7 @@ mod tests {
                 Arc::new(RpcClientWithRetry::with_retry_config(
                     server.url(),
                     Default::default(),
-                    solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                    solana_commitment_config::CommitmentConfig::confirmed(),
                 )),
             ),
         };
@@ -1935,7 +1935,7 @@ mod tests {
                 Arc::new(RpcClientWithRetry::with_retry_config(
                     server.url(),
                     Default::default(),
-                    solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                    solana_commitment_config::CommitmentConfig::confirmed(),
                 )),
             ),
         };

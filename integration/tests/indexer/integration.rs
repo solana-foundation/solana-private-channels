@@ -21,9 +21,10 @@ use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::PostgresConfig;
 use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::signature::Keypair;
+use solana_sdk::signature::Signer;
 use solana_sdk::signer::SeedDerivable;
-use solana_sdk::{commitment_config::CommitmentConfig, signature::Signer};
 use std::sync::{Arc, Once};
 use test_utils::indexer_helper::{start_private_channel_indexer, start_solana_indexer};
 use test_utils::operator_helper::{

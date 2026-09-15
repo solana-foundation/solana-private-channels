@@ -14,6 +14,7 @@
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
 
+use solana_commitment_config::CommitmentLevel;
 use {
     base64::{engine::general_purpose::STANDARD, Engine as _},
     private_channel_indexer::{
@@ -34,7 +35,7 @@ use {
     },
     serde_json::json,
     solana_keychain::SolanaSigner,
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey},
+    solana_sdk::pubkey::Pubkey,
     spl_token::{
         solana_program::{program_option::COption, program_pack::Pack},
         state::Mint,

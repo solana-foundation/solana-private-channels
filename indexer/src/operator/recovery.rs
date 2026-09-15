@@ -1115,7 +1115,7 @@ mod tests {
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
-    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_commitment_config::CommitmentConfig;
 
     fn make_deposit_row(id: i64) -> DbTransaction {
         let now = Utc::now();

@@ -42,6 +42,7 @@
 #[path = "sender_fixtures.rs"]
 mod sender_fixtures;
 
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         config::ProgramType,
@@ -62,7 +63,7 @@ use {
         make_remint_info, send_transaction_echo_reply, withdrawal_ctx,
     },
     serde_json::json,
-    solana_sdk::{commitment_config::CommitmentLevel, pubkey::Pubkey, signature::Signature},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
     std::{str::FromStr, sync::Arc},
     test_utils::mock_rpc::{MockRpcServer, Reply},
     tokio::sync::mpsc,

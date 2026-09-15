@@ -12,7 +12,7 @@ use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
 use solana_account_decoder_client_types::UiAccountData;
 use solana_client::rpc_request::TokenAccountsFilter;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
@@ -227,22 +227,10 @@ pub async fn fetch_channel_supply(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
 ) -> Result<u64, EscrowSweepError> {
-    // get_account_with_commitment cleanly separates a truly-absent account
-    // (Ok(value = None)) from a transport/node error (Err). The plain get_account
-    // convenience formats BOTH as an "AccountNotFound" error, which would let an
-    // RPC outage masquerade as zero supply and blind the supply invariant.
-    let commitment = CommitmentConfig::finalized();
+    // Only a truly absent account is Ok(None); a node error or data that will not
+    // decode is Err, so neither can masquerade as zero supply.
     let response = channel_rpc
-        .with_retry(
-            "get_channel_mint_account",
-            RetryPolicy::Idempotent,
-            || async {
-                channel_rpc
-                    .rpc_client
-                    .get_account_with_commitment(mint, commitment)
-                    .await
-            },
-        )
+        .get_account_with_context(mint, CommitmentConfig::finalized())
         .await
         .map_err(|e| EscrowSweepError {
             reason: format!("Failed to fetch channel mint account {mint}: {e}"),
@@ -266,7 +254,7 @@ mod tests {
     use super::*;
     use crate::operator::RetryConfig;
     use base64::Engine as _;
-    use solana_sdk::commitment_config::CommitmentConfig;
+    use solana_commitment_config::CommitmentConfig;
     use spl_token::solana_program::program_option::COption;
     use spl_token::state::AccountState;
 
@@ -607,6 +595,33 @@ mod tests {
         );
         let result = fetch_channel_supply(&fast, &Pubkey::new_unique()).await;
         assert!(result.is_err(), "an RPC outage must be Err, not Ok(0)");
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_supply_undecodable_mint_is_err() {
+        // Data the operator cannot decode must never read as an absent mint, which is 0 supply.
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["not base64!","base64"],"executable":false,"rentEpoch":0}}}"#)
+            .create_async()
+            .await;
+
+        let fast = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::finalized(),
+        );
+        let result = fetch_channel_supply(&fast, &Pubkey::new_unique()).await;
+        assert!(
+            result.is_err(),
+            "undecodable mint must be Err, got {result:?}"
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@
 //! owns the processor channel inside `operator::run` and can't expose a
 //! closed-sender state.
 
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         config::{
@@ -29,7 +30,6 @@ use {
         operator::run_sender,
         storage::{common::storage::mock::MockStorage, Storage},
     },
-    solana_sdk::commitment_config::CommitmentLevel,
     std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,

@@ -22,6 +22,7 @@
 //! RPC traffic or storage fixtures, complementing the `OperatorMockHarness`
 //! tests which exit via handle drop rather than cooperative cancellation.
 
+use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         config::{
@@ -31,7 +32,6 @@ use {
         operator::run_sender,
         storage::{common::storage::mock::MockStorage, Storage},
     },
-    solana_sdk::commitment_config::CommitmentLevel,
     std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
     tokio_util::sync::CancellationToken,

@@ -19,6 +19,12 @@ pub const BLOCK_NOT_AVAILABLE_CODE: i32 = -32004;
 /// Retryable: the write pipeline ingress queue is full; the tx was not accepted.
 pub const NODE_AT_CAPACITY_CODE: i32 = -32003;
 
+/// Solana's UnsupportedTransactionVersion: the caller asked for a transaction
+/// whose version is above the ceiling it passed, or passed no ceiling at all.
+/// Numbered to match Agave so a client library recognises it and retries with a
+/// higher `maxSupportedTransactionVersion` instead of treating it as fatal.
+pub const UNSUPPORTED_TRANSACTION_VERSION_CODE: i32 = -32015;
+
 pub fn custom_error(code: i32, message: impl ToString) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(code, message.to_string(), None::<()>)
 }
@@ -46,5 +52,22 @@ pub fn block_not_available(slot: u64) -> ErrorObjectOwned {
     custom_error(
         BLOCK_NOT_AVAILABLE_CODE,
         format!("Block not available for slot {slot}"),
+    )
+}
+
+/// Refuse to encode a transaction the caller's version ceiling excludes.
+///
+/// Encoding is the only place this can be detected, because the ceiling is a
+/// per-request parameter while the stored row's version is fixed. Returning the
+/// error rather than unwrapping keeps one oversized row from killing the
+/// connection and taking every other in-flight request with it.
+pub fn unsupported_transaction_version(version: impl std::fmt::Display) -> ErrorObjectOwned {
+    custom_error(
+        UNSUPPORTED_TRANSACTION_VERSION_CODE,
+        format!(
+            "Transaction version ({version}) is not supported by the requesting client. \
+             Please try the request again with the following configuration parameter: \
+             \"maxSupportedTransactionVersion\": {version}"
+        ),
     )
 }

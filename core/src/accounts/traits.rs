@@ -164,6 +164,13 @@ impl AccountsDB {
         super::get_accounts::get_accounts(self, accounts).await
     }
 
+    pub async fn get_account_data_sizes(
+        &self,
+        accounts: &[Pubkey],
+    ) -> Result<Vec<usize>, AccountLoadError> {
+        super::get_accounts::get_account_data_sizes(self, accounts).await
+    }
+
     pub async fn store_performance_sample(
         &mut self,
         sample: solana_rpc_client_types::response::RpcPerfSample,
@@ -522,7 +529,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -783,7 +790,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1109,7 +1116,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1173,7 +1180,7 @@ mod tests {
                     inner_instructions: None,
                     return_data: None,
                     executed_units: 0,
-                    accounts_data_len_delta: 0,
+                    accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                 },
                 programs_modified_by_tx: HashMap::new(),
             }))
@@ -1241,7 +1248,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1387,7 +1394,7 @@ mod tests {
                         inner_instructions: None,
                         return_data: None,
                         executed_units: 0,
-                        accounts_data_len_delta: 0,
+                        accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                     },
                     programs_modified_by_tx: HashMap::new(),
                 }));
@@ -1446,7 +1453,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
