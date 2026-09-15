@@ -24,7 +24,7 @@ use solana_sdk::pubkey::Pubkey;
 use trident_fuzz::fuzzing::*;
 
 use shared::{
-    clamp_amount, setup_escrow, token_amount, AccountAddresses,
+    clamp_amount, setup_escrow, token_amount, AccountAddresses, ToClient, ToTrident,
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 
@@ -108,15 +108,16 @@ impl FuzzTest {
         let user_bal_before = token_amount(&mut self.trident, &user_ata);
 
         let ix = DepositBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .user(user)
-            .instance(instance)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .user(user.client())
+            .instance(instance.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(amount)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self.trident.process_transaction(&[ix], Some("deposit"));
 
@@ -207,19 +208,20 @@ impl FuzzTest {
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .operator(operator)
-            .instance(instance)
-            .withdrawal_bitmap(bitmap_account)
-            .operator_pda(operator_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .operator(operator.client())
+            .instance(instance.client())
+            .withdrawal_bitmap(bitmap_account.client())
+            .operator_pda(operator_pda.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(amount)
-            .user(user)
+            .user(user.client())
             .transaction_nonce(nonce)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self
             .trident
@@ -288,14 +290,15 @@ impl FuzzTest {
         let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
 
         let ix = BlockMintBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .admin(admin)
-            .instance(instance)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
+            .payer(self.trident.payer().pubkey().client())
+            .admin(admin.client())
+            .instance(instance.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
             .block_deposits(block_deposits)
             .block_withdrawals(block_withdrawals)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self
             .trident
@@ -342,14 +345,15 @@ impl FuzzTest {
         let instance_bal_before = token_amount(&mut self.trident, &instance_ata);
 
         let ix = AllowMintBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .admin(admin)
-            .instance(instance)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .admin(admin.client())
+            .instance(instance.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .instance_ata(instance_ata.client())
             .bump(allowed_mint_bump)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self.trident.process_transaction(&[ix], Some("re_allow"));
         assert!(
@@ -409,19 +413,20 @@ impl FuzzTest {
 
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_200_000);
         let ix = ReleaseFundsBuilder::new()
-            .payer(self.trident.payer().pubkey())
-            .operator(operator)
-            .instance(instance)
-            .withdrawal_bitmap(withdrawal_bitmap)
-            .operator_pda(operator_pda)
-            .mint(mint)
-            .allowed_mint(allowed_mint)
-            .user_ata(user_ata)
-            .instance_ata(instance_ata)
+            .payer(self.trident.payer().pubkey().client())
+            .operator(operator.client())
+            .instance(instance.client())
+            .withdrawal_bitmap(withdrawal_bitmap.client())
+            .operator_pda(operator_pda.client())
+            .mint(mint.client())
+            .allowed_mint(allowed_mint.client())
+            .user_ata(user_ata.client())
+            .instance_ata(instance_ata.client())
             .amount(prev.amount)
-            .user(user)
+            .user(user.client())
             .transaction_nonce(nonce)
-            .instruction();
+            .instruction()
+            .to_trident();
 
         let res = self
             .trident

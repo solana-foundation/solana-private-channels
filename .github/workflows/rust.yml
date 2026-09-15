@@ -86,6 +86,7 @@ jobs:
       rust_checks: ${{ steps.filter.outputs.rust_checks }}
       integration: ${{ steps.filter.outputs.integration }}
       core_indexer: ${{ steps.filter.outputs.core_indexer }}
+      trident: ${{ steps.filter.outputs.trident }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,6 +137,10 @@ jobs:
               - 'auth/**'
               # Re-vendoring the DvP client runs its tests via ci-unit-coverage.
               - 'dvp-swap-program/**'
+            trident:
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - 'private-channel-escrow-program/**'
 
   build-artifacts:
     name: Build Shared Artifacts
@@ -439,3 +444,34 @@ jobs:
           lcov-file: coverage/coverage-auth-unit.lcov
           artifact-name: rust-unit-coverage-reports
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  fuzz-tests:
+    name: Escrow Fuzz (Trident)
+    needs: [changes, build-artifacts]
+    if: needs.changes.outputs.trident == 'true'
+    runs-on: private-channel-runner-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "false"
+          setup-pnpm: "false"
+          install-dependencies: "false"
+          install-base-cargo-tools: "false"
+          setup-solana: "false"
+          build-programs: "false"
+
+      # The harnesses load the .so named in Trident.toml and link the generated
+      # Rust client, both of which the tarball already carries.
+      - name: Download shared artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-build-artifacts
+
+      - name: Restore shared artifacts
+        run: tar -xzf ci-build-artifacts.tgz
+
+      - name: Run fuzz harnesses
+        run: make -C private-channel-escrow-program fuzz
