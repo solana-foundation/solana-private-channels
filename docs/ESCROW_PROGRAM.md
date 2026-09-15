@@ -266,7 +266,7 @@ The program trusts each kind of signer for a fixed set of decisions.
 |-----------|-------------|--------------|
 | Admin | Instance configuration: the mint allowlist, the operator set, and handing over the admin role | `AllowMint`, `BlockMint`, `AddOperator`, `RemoveOperator`, `SetNewAdmin` |
 | Operator | Every release parameter (amount, recipient, allowlisted mint, nonce) and when to rotate the withdrawal bitmap | `ReleaseFunds`, `RotateBitmap` |
-| Anyone | Creating an instance, which makes the signer its admin, and depositing their own tokens | `CreateInstance`, `Deposit` |
+| Anyone | Creating an instance with a specified admin, who must also sign, and depositing their own tokens | `CreateInstance`, `Deposit` |
 
 Beyond the mint allowlist, the program constrains an operator in two ways only.
 Each nonce is released at most once, and only while the bitmap covers its
@@ -279,9 +279,10 @@ it is rotated. The operator in the indexer makes those decisions from its
 database, see [Rotation](WITHDRAWING_GUIDE.md#rotation) and the operator
 invariants in [INVARIANTS.md](INVARIANTS.md#operator). A rotation that lands
 early makes every unreleased nonce in the closed generation unreleasable. The
-indexer then routes those withdrawals to its remint path: a row with earlier
-broadcast signatures is reminted automatically, and a row with none goes to
-manual review for an out-of-band remint.
+indexer then routes those withdrawals to its remint path. A row with earlier
+broadcast signatures enters the automatic remint flow, which remints only once
+it proves no release landed and otherwise sends the row to manual review. A row
+with no signatures goes straight to manual review for an out-of-band remint.
 
 The admin's control over an operator key is `RemoveOperator`.
 

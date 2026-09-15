@@ -122,10 +122,11 @@ it:
 
 A nonce whose generation has been rotated past can never be released. The
 sender does not retry it as a release. It routes the withdrawal to the
-compensating remint instead: a row with earlier broadcast signatures is
-classified and reminted on the channel if none of them landed, and a row with no
-signatures goes to `manual_review`, where a human confirms nothing landed and
-restores the user's tokens (see Path H in
+compensating remint instead. A row with earlier broadcast signatures enters the
+remint flow, which remints on the channel only once it proves none of them
+landed; if the evidence stays inconclusive the row goes to `manual_review`. A
+row with no signatures goes to `manual_review` directly, where a human confirms
+nothing landed and restores the user's tokens (see Path H in
 [`withdrawal_manual_review.md`](runbooks/withdrawal_manual_review.md)).
 
 ### Visual example
