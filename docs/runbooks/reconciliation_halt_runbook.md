@@ -6,10 +6,9 @@ closed: it sets a durable DB flag that freezes **both** operators' fetchers
 (deposits and withdrawals), quarantines active withdrawals, forces the escrow
 operator's `/health` to 503, and posts a webhook.
 
-A halt is deliberate: it trades liveness for integrity. It only fires when the
-on-chain channel-token supply exceeds on-chain escrow custody by more than the
-DB-computed in-flight envelope for three consecutive finalized-read ticks, so a
-transient (in-flight activity, a one-off bad RPC read) cannot trip it. Recovery
+A halt is deliberate: it trades liveness for integrity. It only fires when one of
+two per-mint invariants (below) breaches for three consecutive finalized-read
+ticks, so a transient (in-flight activity, a one-off bad RPC read) cannot trip it. Recovery
 is **manual** - a human must confirm real backing before clearing the flag.
 
 As with every runbook here, the recovery `UPDATE` statements are
@@ -21,20 +20,35 @@ human-in-the-loop".
 
 ## What the operator does automatically
 
-Runtime reconciliation checks a single on-chain invariant against **finalized**
-reads, per mint:
+Runtime reconciliation checks two invariants against **finalized** reads, per
+mint, each with its own consecutive-tick counter:
 
-> **channel `Mint.supply` (PrivateChannel) must not exceed escrow custody (Solana).**
+> **Supply: channel `Mint.supply` (PrivateChannel) must not exceed escrow custody
+> (Solana) beyond the in-flight envelope.**
+>
+> **Liability: escrow custody must cover the DB ledger's liabilities at the custody
+> slot.**
 
 On-chain supply is already net of burns (the program burns channel tokens at
-withdrawal initiation, not at release), so `supply <= custody` is a pure
-economic-backing check that does **not** trust the DB ledger. The DB is read only
-to (a) enumerate the mint universe (the `mints` table, so a blocked or not-held
-mint with outstanding supply is still checked) and (b) compute the per-mint
-in-flight envelope; neither is compared against custody.
+withdrawal initiation, not at release), so the supply check does **not** trust
+the DB ledger; it catches over-issuance. Its halt reason reads
+`... custody <C> short of supply by <GAP>, envelope <E> tolerance <T> ...`.
 
-When a mint shows `supply - custody` greater than its in-flight envelope (plus a
-small bps cushion) for three consecutive ticks, the operator **halts**:
+The liability check catches a custody drain that the supply check cannot see
+while unminted (`pending`, `failed`, `manual_review`) deposits pad the gap.
+Liabilities are every deposit indexed at or below the custody slot, in any
+status, minus every withdrawal whose `release_funds` the escrow indexer recorded
+in `observed_releases` at or below that slot. Before comparing, the operator
+waits (up to 30 s) for the escrow indexer's committed checkpoint to reach the
+custody slot; if it does not, liabilities are unknown for that tick, the
+counter holds, and a `warn!` names the checkpoint and slot. Its halt reason reads
+`... custody <C> short of ledger liabilities <L> by <GAP>, tolerance <T> at slot <S> ...`.
+
+The DB also supplies the mint universe (every `mints` row, so a blocked or
+not-held mint is still checked) and the in-flight envelope. Both checks use the
+same small bps cushion of custody.
+
+When either check breaches for three consecutive ticks, the operator **halts**:
 
 1. Sets the durable `reconciliation_halt` flag (reason recorded).
 2. Quarantines every active (`pending`/`processing`/`parked`) withdrawal to
@@ -52,7 +66,8 @@ re-read it at first poll and stay frozen until it is cleared.
 - Deposits stop minting and withdrawals stop releasing across both operators.
 - The escrow operator's `/health` returns 503 with `"reason":"forced"`.
 - Logs carry `RECONCILIATION HALT tripped; freezing both pipelines` with the
-  mint, the supply gap, envelope, tolerance, and tick count.
+  reason: `short of supply by` (supply check) or `short of ledger liabilities`
+  (liability check), plus the mint, gap, tolerance and tick count.
 - Active withdrawals are in `manual_review`.
 
 ## Detection
@@ -63,8 +78,9 @@ Inspect the flag directly:
 SELECT halted, reason, halted_at FROM reconciliation_halt WHERE id = TRUE;
 ```
 
-A `halted = TRUE` row is an active halt. `reason` carries the offending mint and
-the exact custody / supply-gap / envelope / tolerance numbers.
+A `halted = TRUE` row is an active halt. `reason` carries the offending mint,
+which check tripped, and the exact custody / gap / envelope or liabilities /
+tolerance numbers.
 
 ## Investigate before clearing
 
@@ -87,18 +103,28 @@ the halt reason:
    GROUP BY mint;
    ```
 
-4. **DB ledger (context only, not the halt basis).** The recorded deposits and
-   completed withdrawals help explain *why* the supply may be unbacked (e.g. no
-   deposits justify the minted amount), but the halt does not compare them:
+4. **DB ledger liabilities.** The basis of a liability halt, and context for a
+   supply halt (e.g. no deposits justify the minted amount). Use the slot from
+   the halt reason for `<SLOT>`:
 
    ```sql
-   SELECT mint,
-          SUM(CASE WHEN transaction_type='deposit' AND status='completed'
-                   THEN amount ELSE 0 END)   AS deposits_completed,
-          SUM(CASE WHEN transaction_type='withdrawal' AND status='completed'
-                   THEN amount ELSE 0 END)   AS withdrawals_completed
-   FROM transactions WHERE mint = '<MINT>' GROUP BY mint;
+   SELECT
+     SUM(CASE WHEN t.transaction_type='deposit' AND t.slot <= <SLOT>
+              THEN t.amount ELSE 0 END) AS deposits,
+     SUM(CASE WHEN t.transaction_type='withdrawal' AND EXISTS (
+              SELECT 1 FROM observed_releases r
+              WHERE r.withdrawal_nonce = t.withdrawal_nonce AND r.slot <= <SLOT>)
+              THEN t.amount ELSE 0 END) AS released
+   FROM transactions t WHERE t.mint = '<MINT>';
    ```
+
+   For a liability halt, custody below `deposits - released` means tokens left
+   escrow without a recorded release. Only `ReleaseFunds` is indexed as an
+   outflow, so check the escrow token accounts' history for other movements: a
+   permanent-delegate transfer (`mints.has_permanent_delegate`) or a Token-2022
+   fee effect is a real custody loss to the escrow even if the issuer calls it
+   legitimate, and must be resolved before clearing. A liability gap that
+   disappears once the escrow indexer catches up was lag, not a drain.
 
 If `supply > custody` persists beyond the in-flight envelope once the in-flight
 work settles, this is a **real** solvency incident (operator-key over-issuance or

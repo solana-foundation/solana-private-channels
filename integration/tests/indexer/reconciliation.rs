@@ -15,6 +15,10 @@
 #[path = "helpers/mod.rs"]
 mod helpers;
 
+#[path = "setup.rs"]
+#[allow(dead_code)]
+mod setup;
+
 // DB migration idempotency + insert-race safety on PostgresDb.
 #[path = "db_migration_race.rs"]
 mod db_migration_race;
@@ -37,6 +41,11 @@ mod live_state_lock;
 // instructions must persist as distinct rows through the real processor.
 #[path = "multi_instruction_pipeline.rs"]
 mod multi_instruction_pipeline;
+
+// Ledger-liability reconciliation, runtime and startup, against a real drain and a real
+// payout with a real escrow indexer beside them.
+#[path = "liability_reconciliation.rs"]
+mod liability_reconciliation;
 
 use helpers::{generate_mint, mint_to_owner, setup_wallets};
 use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;

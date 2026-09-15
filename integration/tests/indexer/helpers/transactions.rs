@@ -1,4 +1,11 @@
+use private_channel_escrow_program_client::{
+    instructions::ReleaseFundsBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+};
+use private_channel_indexer::operator::{
+    find_allowed_mint_pda, find_event_authority_pda, find_operator_pda, find_withdrawal_bitmap_pda,
+};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
@@ -7,6 +14,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solana_system_interface::instruction as system_instruction;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 
 const COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const COMPUTE_UNIT_PRICE: u64 = 1;
@@ -79,4 +87,49 @@ pub async fn setup_wallets(
     }
 
     Ok(())
+}
+
+/// Consume a withdrawal nonce on-chain directly, without an operator. Sending the release
+/// from the test sidesteps operator lifecycle: a shut-down operator keeps the sender's
+/// advisory lock, so a second one against the same database exits immediately.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub async fn release_funds_on_chain(
+    client: &RpcClient,
+    admin: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    user: Pubkey,
+    amount: u64,
+    nonce: u64,
+) -> Result<Signature, Box<dyn std::error::Error>> {
+    let token_program = spl_token::id();
+    let release_ix = ReleaseFundsBuilder::new()
+        .payer(admin.pubkey())
+        .operator(admin.pubkey())
+        .instance(instance)
+        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&instance))
+        .operator_pda(find_operator_pda(&instance, &admin.pubkey()))
+        .mint(mint)
+        .allowed_mint(find_allowed_mint_pda(&instance, &mint))
+        .user_ata(get_associated_token_address_with_program_id(
+            &user,
+            &mint,
+            &token_program,
+        ))
+        .instance_ata(get_associated_token_address_with_program_id(
+            &instance,
+            &mint,
+            &token_program,
+        ))
+        .token_program(token_program)
+        .associated_token_program(spl_associated_token_account::id())
+        .event_authority(find_event_authority_pda())
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(amount)
+        .user(user)
+        .transaction_nonce(nonce)
+        .instruction();
+
+    send_and_confirm_instructions(client, &[release_ix], admin, &[admin], "Release Funds").await
 }

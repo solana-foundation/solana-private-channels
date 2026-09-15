@@ -448,6 +448,7 @@ impl MockStorage {
         &self,
         as_of_slot: u64,
     ) -> Result<Vec<MintDbBalance>, StorageError> {
+        self.check_should_fail("get_mint_balances_for_reconciliation")?;
         *self.last_reconciliation_slot.lock().unwrap() = Some(as_of_slot);
         Ok(self.mint_balances.lock().unwrap().clone())
     }
@@ -455,12 +456,6 @@ impl MockStorage {
     /// Slot the last reconciliation balance read was bounded by.
     pub fn last_reconciliation_slot(&self) -> Option<u64> {
         *self.last_reconciliation_slot.lock().unwrap()
-    }
-
-    /// Reads the mints map, mirroring the Postgres query's `mints` table source.
-    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
-        self.check_should_fail("get_mint_addresses")?;
-        Ok(self.mints.lock().unwrap().keys().cloned().collect())
     }
 
     pub async fn get_in_flight_amounts_by_mint(

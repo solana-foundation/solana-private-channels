@@ -259,71 +259,6 @@ async fn wait_for_release_signature_journaled(
     .into())
 }
 
-/// Consume a withdrawal nonce on-chain directly, without going through the
-/// operator.
-///
-/// Staging a boot-time divergence needs a bit that is genuinely set while the
-/// database knows nothing about it. Letting an operator do it and then deleting
-/// the row does not work: `OperatorHandle::shutdown` only detaches the task, so
-/// the first operator keeps running and keeps the sender's advisory lock, and a
-/// second one started against the same database exits immediately. Sending the
-/// release from the test sidesteps operator lifecycle entirely.
-async fn release_nonce_on_chain(
-    client: &RpcClient,
-    admin: &Keypair,
-    instance: Pubkey,
-    mint: Pubkey,
-    user: Pubkey,
-    amount: u64,
-    nonce: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use private_channel_escrow_program_client::instructions::ReleaseFundsBuilder;
-    use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
-    use private_channel_indexer::operator::{
-        find_allowed_mint_pda, find_event_authority_pda, find_operator_pda,
-        find_withdrawal_bitmap_pda,
-    };
-    use spl_associated_token_account::get_associated_token_address_with_program_id;
-
-    let token_program = spl_token::id();
-    let release_ix = ReleaseFundsBuilder::new()
-        .payer(admin.pubkey())
-        .operator(admin.pubkey())
-        .instance(instance)
-        .withdrawal_bitmap(find_withdrawal_bitmap_pda(&instance))
-        .operator_pda(find_operator_pda(&instance, &admin.pubkey()))
-        .mint(mint)
-        .allowed_mint(find_allowed_mint_pda(&instance, &mint))
-        .user_ata(get_associated_token_address_with_program_id(
-            &user,
-            &mint,
-            &token_program,
-        ))
-        .instance_ata(get_associated_token_address_with_program_id(
-            &instance,
-            &mint,
-            &token_program,
-        ))
-        .token_program(token_program)
-        .associated_token_program(spl_associated_token_account::id())
-        .event_authority(find_event_authority_pda())
-        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
-        .amount(amount)
-        .user(user)
-        .transaction_nonce(nonce)
-        .instruction();
-
-    helpers::send_and_confirm_instructions(
-        client,
-        &[release_ix],
-        admin,
-        &[admin],
-        "Release Funds (direct)",
-    )
-    .await?;
-    Ok(())
-}
-
 fn make_withdrawal_transaction(
     signature: String,
     mint: String,
@@ -1349,7 +1284,7 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
     let user_pubkey = env.users[0].pubkey();
 
     // Consume nonce 0 on-chain with no row to match: a release whose write was lost.
-    release_nonce_on_chain(
+    helpers::release_funds_on_chain(
         &client,
         &admin,
         env.instance,
@@ -1708,7 +1643,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
     let user_pubkey = env.users[0].pubkey();
 
     // The release really happens, so nonce 0's bit is genuinely set on-chain.
-    release_nonce_on_chain(
+    helpers::release_funds_on_chain(
         &client,
         &admin,
         env.instance,

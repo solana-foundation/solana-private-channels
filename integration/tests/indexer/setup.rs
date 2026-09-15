@@ -282,3 +282,38 @@ impl TestEnvironment {
         .await
     }
 }
+
+/// Allow `mint` on `instance` for a specific token program. [`TestEnvironment::setup`]
+/// hardcodes SPL Token, and a Token-2022 mint has to be allowed against its own program or
+/// the escrow rejects every later instruction for it.
+#[allow(dead_code)]
+pub async fn allow_mint_for_program(
+    client: &RpcClient,
+    admin: &Keypair,
+    instance: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (allowed_mint_pda, bump) = find_allowed_mint_pda(&instance, &mint);
+    let (event_authority_pda, _) = find_event_authority_pda();
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance, &mint, &token_program);
+
+    let allow_ix = AllowMintBuilder::new()
+        .payer(admin.pubkey())
+        .admin(admin.pubkey())
+        .instance(instance)
+        .mint(mint)
+        .allowed_mint(allowed_mint_pda)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(token_program)
+        .associated_token_program(spl_associated_token_account::ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .bump(bump)
+        .instruction();
+
+    send_and_confirm_instructions(client, &[allow_ix], admin, &[admin], "Allow Mint").await?;
+    Ok(())
+}
