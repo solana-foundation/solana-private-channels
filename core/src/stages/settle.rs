@@ -1758,9 +1758,10 @@ mod tests {
             .collect()
     }
 
-    /// Account keys per `row_heavy_batch` transaction. Wide, so a row-capped block
-    /// commits a few thousand transactions and stays inside the commit timeout.
-    const ROW_HEAVY_KEYS: usize = 64;
+    /// Account keys per `row_heavy_batch` transaction. As wide as a message allows,
+    /// so a row-capped block reaches the cap on few transactions and its commit
+    /// stays well inside the timeout.
+    const ROW_HEAVY_KEYS: usize = 192;
 
     /// `txs` transfers of `ROW_HEAVY_KEYS` keys with dataless executed results, so
     /// they weigh rows and no bytes. `unique` gives each its own keys and signature
@@ -2472,7 +2473,7 @@ mod tests {
         // Genesis is the first tick; the next is ten minutes away.
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
 
-        let batches: Vec<_> = (0..8).map(|_| row_heavy_batch(768, false)).collect();
+        let batches: Vec<_> = (0..8).map(|_| row_heavy_batch(256, false)).collect();
         let (output, transactions) = &batches[0];
         assert_eq!(
             retained_account_bytes(&output.processing_results, transactions),
@@ -2523,7 +2524,7 @@ mod tests {
         assert!(await_block(&pool, 0, Duration::from_secs(10)).await);
         let height_before = db.get_block_height().await.unwrap().unwrap_or(0);
 
-        let batches: Vec<_> = (0..8).map(|_| row_heavy_batch(768, true)).collect();
+        let batches: Vec<_> = (0..8).map(|_| row_heavy_batch(256, true)).collect();
         tokio::time::timeout(Duration::from_secs(20), async {
             for (output, transactions) in batches {
                 exec_tx

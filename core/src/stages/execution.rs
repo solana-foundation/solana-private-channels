@@ -389,6 +389,18 @@ pub(crate) const MAX_SEND_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 /// A chunk must never exceed the settler budget it is measured against.
 const _: () = assert!(MAX_SEND_CHUNK_BYTES <= crate::stages::MAX_BUFFERED_SETTLE_BYTES);
 
+/// Cap on address rows in one message to the settler. Bytes alone do not bound
+/// them: a large batch of dataless transactions naming many accounts weighs
+/// nothing and would still push one block past the settler's row cap.
+pub(crate) const MAX_SEND_CHUNK_ROWS: usize = crate::stages::MAX_BUFFERED_SETTLE_ROWS / 4;
+
+/// The settler takes one message past its row cap, so the two together must
+/// still fit the address-index writer's budget.
+const _: () = assert!(
+    crate::stages::MAX_BUFFERED_SETTLE_ROWS + MAX_SEND_CHUNK_ROWS
+        <= crate::stages::MAX_QUEUED_ADDRESS_ROWS
+);
+
 /// Cap on retained account bytes sent to the settler but not yet received.
 /// Two whole chunks, so the executor can hand one over while the settler still
 /// holds the previous one and ordinary traffic never waits on the budget.
@@ -532,12 +544,13 @@ struct ChunkRange {
 }
 
 /// Where to split a batch, as end-exclusive index ranges over its transactions.
-/// A chunk closes just before the transaction that would exceed the cap, so an
+/// A chunk closes just before the transaction that would exceed either cap, so an
 /// oversized one travels alone and no transaction is ever split across messages.
-fn chunk_ranges_by_bytes(
+fn chunk_ranges(
     results: &[TransactionProcessingResult],
     transactions: &[SanitizedTransaction],
-    cap: usize,
+    byte_cap: usize,
+    row_cap: usize,
 ) -> Vec<ChunkRange> {
     // A length mismatch is the settler's error to report, so send the batch whole.
     if results.len() != transactions.len() {
@@ -546,17 +559,22 @@ fn chunk_ranges_by_bytes(
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut buffered = 0usize;
+    let mut buffered_rows = 0usize;
     for (index, (result, transaction)) in results.iter().zip(transactions.iter()).enumerate() {
         let bytes = retained_bytes_of(result, transaction);
-        if index > start && buffered + bytes > cap {
+        // One row per account key, the same count the block writes to the index.
+        let rows = transaction.message().account_keys().len();
+        if index > start && (buffered + bytes > byte_cap || buffered_rows + rows > row_cap) {
             ranges.push(ChunkRange {
                 range: start..index,
                 bytes: buffered,
             });
             start = index;
             buffered = 0;
+            buffered_rows = 0;
         }
         buffered += bytes;
+        buffered_rows += rows;
     }
     if start < results.len() {
         ranges.push(ChunkRange {
@@ -595,7 +613,7 @@ fn record_unsent(
     crate::stages::record_discarded("executor", "settler queue closed", &signatures, metrics);
 }
 
-/// Send results to the settler in byte-bounded messages.
+/// Send results to the settler in byte-bounded and row-bounded messages.
 /// A batch under the cap is sent untouched, so ordinary traffic only pays the byte
 /// sum. When split, the real generation rides the last chunk and earlier ones get zero.
 async fn send_results_chunked(
@@ -607,7 +625,12 @@ async fn send_results_chunked(
     budget: &WeightBudget,
     metrics: &SharedMetrics,
 ) -> SendOutcome {
-    let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
+    let ranges = chunk_ranges(
+        &output.processing_results,
+        &transactions,
+        cap,
+        MAX_SEND_CHUNK_ROWS,
+    );
     if ranges.len() <= 1 {
         // Empty only when the batch is empty or its lengths disagree, and the
         // settler rejects the latter on arrival, so nothing is left unweighed.
@@ -1631,6 +1654,8 @@ mod tests {
     #[test]
     fn chunk_ranges_by_bytes_respects_cap_and_preserves_order() {
         let cap = 1000usize;
+        // High enough that only the byte cap can split these batches.
+        let row_cap = usize::MAX;
         let cases: Vec<(&str, Vec<usize>, usize)> = vec![
             ("all small stays unsplit", vec![10, 10, 10, 10], 1),
             ("exact fit stays unsplit", vec![500, 500], 1),
@@ -1642,7 +1667,7 @@ mod tests {
 
         for (name, sizes, expected_chunks) in cases {
             let (results, txs) = sized_batch(&sizes);
-            let ranges = chunk_ranges_by_bytes(&results, &txs, cap);
+            let ranges = chunk_ranges(&results, &txs, cap, row_cap);
             assert_eq!(ranges.len(), expected_chunks, "chunk count for {}", name);
 
             let mut next = 0usize;
@@ -1672,6 +1697,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Rows are the other way a message grows: a batch of dataless transactions
+    /// naming many accounts weighs no bytes, so without a row cap one message
+    /// could carry a whole block past the settler's row budget.
+    #[test]
+    fn chunk_ranges_split_on_rows_as_well_as_bytes() {
+        // Each transaction names 3 keys of its own plus the extra readonly ones.
+        let keys_per_tx = 3 + 7;
+        let row_cap = 25usize;
+        let txs: Vec<SanitizedTransaction> = (0..6)
+            .map(|_| {
+                let extra: Vec<Pubkey> = (0..7).map(|_| Pubkey::new_unique()).collect();
+                transfer_with_unused_readonly(&Keypair::new(), &extra)
+            })
+            .collect();
+        // Dataless, so the byte cap can never be what splits them.
+        let results: Vec<TransactionProcessingResult> = txs
+            .iter()
+            .map(|_| executed_with(vec![(Pubkey::new_unique(), AccountSharedData::default())]))
+            .collect();
+
+        let ranges = chunk_ranges(&results, &txs, MAX_SEND_CHUNK_BYTES, row_cap);
+
+        assert_eq!(ranges.len(), 3, "two transactions fit under a 25-row cap");
+        let mut next = 0usize;
+        for chunk in &ranges {
+            assert_eq!(chunk.range.start, next, "gap or overlap between chunks");
+            let rows = (chunk.range.end - chunk.range.start) * keys_per_tx;
+            assert!(rows <= row_cap, "chunk over the row cap: {rows}");
+            next = chunk.range.end;
+        }
+        assert_eq!(next, txs.len(), "chunks must cover every transaction");
     }
 
     /// The one assertion standing between the split and a data-loss bug. If a
