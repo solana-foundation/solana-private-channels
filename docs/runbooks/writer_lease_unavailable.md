@@ -33,8 +33,23 @@ database is refused. That is the mechanism that stops two writers producing
 mixed ledger state.
 
 A session advisory lock lives exactly as long as its Postgres backend, and that
-backend lives as long as its TCP connection. There is no lease expiry, no TTL and
-no fencing token to revoke. **The connection is the lease.**
+backend lives as long as its TCP connection. There is no lease expiry and no TTL.
+**The connection is the lease.**
+
+## The writer epoch
+
+Beside the lock, each write node claims a writer epoch at startup: the
+`writer_epoch` row in `metadata`, an 8-byte little-endian counter it raises by
+one. Every batch locks that row and commits only if it still holds the value its
+node claimed, and every idle slot write checks it too. So a node that lost its
+lock without noticing is stopped by its next commit once a replacement starts,
+not only by the ownership probe.
+
+Raising that row by one stops the live writer on its next batch or idle tick,
+with `Refusing to commit: this node holds writer epoch N` in its log. Do not do
+it by hand unless you mean to stop the writer; a restarted node claims a new
+epoch on its own. **Never delete the row**: the next node would count again from
+1, an epoch an old writer may still hold.
 
 ## Why it is usually not stuck
 
@@ -103,8 +118,9 @@ Two counters describe this from the outside:
   `probe_error`, `probe_timeout`. A rising `probe_error` or `probe_timeout` with
   no `not_held` is a slow or unreachable database, not a lost lease.
 - `private_channel_writer_lease_lost_total{reason}` - `not_held` (proof: another
-  session holds it, or the backend is gone) or `probe_unavailable` (the 30s
-  budget ran out).
+  session holds it, or the backend is gone), `probe_unavailable` (the 30s
+  budget ran out) or `fenced` (a newer writer epoch refused a commit, so another
+  node took over).
 
 > **Do not set `idle_session_timeout` on the node's database role.** The lease
 > session is idle for the node's whole life by design, since ownership is read

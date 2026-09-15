@@ -60,21 +60,30 @@ async fn get_current_slot_redis(db: &RedisAccountsDB) -> Result<Option<u64>> {
 /// Publish a tick that produced no block. One metadata row and no block row: the
 /// growth this change exists to stop is block rows, and an eight-byte counter is
 /// a different shape entirely.
-pub async fn set_current_slot(db: &PostgresAccountsDB, slot: u64) -> Result<()> {
+pub async fn set_current_slot(db: &PostgresAccountsDB, slot: u64) -> Result<bool> {
     if db.read_only {
-        return Ok(());
+        return Ok(true);
     }
 
-    sqlx::query(
-        "INSERT INTO metadata (key, value) VALUES ($1, $2)
+    // `false` means a newer writer epoch refused it. No row lock, so the hot idle
+    // path stays cheap: a tick racing a bump costs one value the new writer rewrites.
+    let written = sqlx::query(
+        "INSERT INTO metadata (key, value) SELECT $1, $2
+         WHERE $3::bytea IS NULL
+            OR EXISTS (SELECT 1 FROM metadata WHERE key = $4 AND value = $3)
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
     .bind(CURRENT_SLOT_KEY)
     .bind(&super::counter::encode(slot)[..])
+    .bind(
+        db.writer_epoch
+            .map(|epoch| super::counter::encode(epoch).to_vec()),
+    )
+    .bind(super::writer_epoch::WRITER_EPOCH_KEY)
     .execute(db.pool.as_ref())
     .await
-    .context("Failed to publish the current slot")
-    .map(|_| ())
+    .context("Failed to publish the current slot")?;
+    Ok(written.rows_affected() == 1)
 }
 
 /// Mirror the live slot so a replica reading through the cache sees it move.
@@ -175,6 +184,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(db.get_current_slot().await.unwrap(), Some(12));
+    }
+
+    /// An idle tick moves `getSlot` and the slot a restart resumes from, so a
+    /// superseded writer must not publish one. An unfenced handle still does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idle_tick_from_a_superseded_epoch_is_refused() {
+        use crate::accounts::writer_epoch::bump;
+
+        let (db, _pg) = start_test_postgres().await;
+        let mut fenced = postgres_of(&db);
+        fenced.writer_epoch = Some(bump(&fenced).await.unwrap());
+        assert!(set_current_slot(&fenced, 5).await.unwrap());
+
+        bump(&fenced).await.unwrap();
+        assert!(
+            !set_current_slot(&fenced, 6).await.unwrap(),
+            "a superseded epoch must be refused"
+        );
+        assert_eq!(db.get_current_slot().await.unwrap(), Some(5));
+
+        assert!(set_current_slot(&postgres_of(&db), 7).await.unwrap());
+        assert_eq!(db.get_current_slot().await.unwrap(), Some(7));
     }
 
     /// A replica reads the slot through the cache, so the mirror has to carry it

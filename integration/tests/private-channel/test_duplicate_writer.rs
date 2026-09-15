@@ -1,11 +1,12 @@
-//! Real-node guards for the single-writer model, driving full in-process nodes
-//! against a Postgres testcontainer: the startup lease refusing a second
-//! write-capable node, the heartbeat stopping a node whose lease was pulled, the
+//! Real-node guards for the single-writer model on a Postgres testcontainer: the
+//! startup lease, the heartbeat, the writer epoch fencing a superseded node, the
 //! database stopping a passed-by writer, and read nodes staying ungated.
 
 use {
     private_channel_core::{
-        accounts::writer_lease::WriterLease,
+        accounts::{
+            traits::BlockInfo, writer_epoch, writer_lease::WriterLease, PostgresAccountsDB,
+        },
         nodes::node::{run_node, NodeConfig, NodeHandles, NodeMode},
         stage_metrics::NoopMetrics,
     },
@@ -261,6 +262,111 @@ async fn a_node_that_loses_its_lease_stops_and_a_replacement_takes_over() {
         .expect("a replacement must start once the stopped node has gone");
     await_slot_above(&mut killer, tip_at_handover).await;
     replacement.shutdown().await;
+}
+
+/// A node that lost its lease keeps committing until its probe notices, so a
+/// replacement starting inside that window must stop it at the database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_fences_a_writer_that_has_not_noticed_its_lost_lease() {
+    let (_pg, url) = start_postgres().await;
+
+    let stale_port = get_free_port();
+    let mut stale = run_node(write_node_config(url.clone(), stale_port))
+        .await
+        .expect("the first write node must start");
+    await_first_block(stale_port).await;
+
+    let mut probe = PgConnection::connect(&url)
+        .await
+        .expect("failed to open the probe connection");
+    let terminated = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM (
+           SELECT pg_terminate_backend(pid) FROM pg_locks
+           WHERE locktype = 'advisory' AND granted
+         ) AS killed",
+    )
+    .fetch_one(&mut probe)
+    .await
+    .expect("failed to terminate the lease session");
+    assert_eq!(terminated, 1, "exactly one lease holder was expected");
+
+    // Started at once, while the first node still believes it is the writer.
+    let tip_at_handover = latest_slot(&mut probe).await;
+    let replacement_port = get_free_port();
+    let replacement = run_node(write_node_config(url.clone(), replacement_port))
+        .await
+        .expect("a replacement must start once the lease is free");
+    await_slot_above(&mut probe, tip_at_handover).await;
+
+    // Either the fence or the probe may stop it first; both are a stop.
+    timeout(Duration::from_secs(60), stale.wait_for_any_worker_quit())
+        .await
+        .expect("the stale node must stop");
+    stale.shutdown().await;
+
+    // The replacement, not the stale node, must be the one left producing.
+    let tip_after_stop = latest_slot(&mut probe).await;
+    await_slot_above(&mut probe, tip_after_stop).await;
+
+    // Two writers on one database show up as a block that skips its predecessor.
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as("SELECT slot, data FROM blocks ORDER BY slot")
+        .fetch_all(&mut probe)
+        .await
+        .expect("failed to read the stored blocks");
+    for pair in rows.windows(2) {
+        let block: BlockInfo = bincode::deserialize(&pair[1].1).expect("block must decode");
+        assert_eq!(
+            block.parent_slot as i64, pair[0].0,
+            "block {} must build on the block stored before it",
+            pair[1].0
+        );
+    }
+
+    replacement.shutdown().await;
+}
+
+/// Claiming a newer writer epoch is how a replacement fences the old writer, so
+/// doing it by hand must stop a live node at once rather than after retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_bump_stops_the_live_writer() {
+    let (_pg, url) = start_postgres().await;
+
+    let port = get_free_port();
+    let mut handles = run_node(write_node_config(url.clone(), port))
+        .await
+        .expect("the write node must start");
+    await_first_block(port).await;
+
+    let operator = PostgresAccountsDB::new(&url, false)
+        .await
+        .expect("failed to open the operator handle");
+    writer_epoch::bump(&operator)
+        .await
+        .expect("the operator bump must succeed");
+    // A batch in flight finishes before the bump returns, so this tip is final.
+    let mut probe = PgConnection::connect(&url)
+        .await
+        .expect("failed to open the probe connection");
+    let tip_after_bump = latest_slot(&mut probe).await;
+
+    // Well inside the 15s retry budget, so this is not a retried failure giving up.
+    let quit = timeout(Duration::from_secs(5), handles.wait_for_any_worker_quit())
+        .await
+        .expect("a fenced node must stop straight away");
+    assert!(
+        quit == "Settle" || quit == "Dedup",
+        "a write-pipeline worker must be the one that stopped, got: {quit}"
+    );
+    assert_eq!(
+        latest_slot(&mut probe).await,
+        tip_after_bump,
+        "no block may commit after the bump"
+    );
+
+    handles.shutdown().await;
+    WriterLease::acquire(&url, CancellationToken::new(), Arc::new(NoopMetrics))
+        .await
+        .expect("the lease must be free once the fenced node has shut down");
 }
 
 /// The heartbeat only catches a lease this node can no longer prove it holds, so

@@ -10,6 +10,7 @@ use {
         traits::{AccountsDB, BlockInfo},
         transaction_count::TransactionCount,
         utils::get_stored_transaction,
+        writer_epoch,
     },
     crate::stages::AccountSettlement,
     solana_sdk::{
@@ -32,16 +33,45 @@ pub struct AddressSignatureRow {
     pub signature: Vec<u8>,
 }
 
-/// Refusal message for a batch whose block does not extend the stored ledger.
-/// Names both causes: a second write-capable node, or this node retrying a slot
-/// whose commit it never saw land. The log line is what an operator sees first.
-fn stale_tip_error(slot: u64) -> String {
-    format!(
-        "Refusing to commit slot {}: a block at or above it is already stored. \
-         Either a second write-capable node is running against this database, or \
-         this batch retries a slot that already committed.",
-        slot
-    )
+/// Why a batch did not commit. The two refusals mean this node is not the
+/// writer any more, so the settler stops on them instead of retrying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteBatchError {
+    /// A newer write node claimed the database after this one started.
+    Fenced { held: u64, current: Option<u64> },
+    /// The block does not build on the stored tip.
+    StaleTip { slot: u64 },
+    /// Storage failed; retrying may succeed.
+    Other(String),
+}
+
+impl std::fmt::Display for WriteBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fenced { held, current } => write!(
+                f,
+                "Refusing to commit: this node holds writer epoch {held} but the database is \
+                 at {}. A newer write node has taken over this database.",
+                current.map_or("no epoch".to_string(), |c| c.to_string())
+            ),
+            // Names both causes, since the log line is what an operator sees first.
+            Self::StaleTip { slot } => write!(
+                f,
+                "Refusing to commit slot {slot}: it does not extend the stored tip. \
+                 Either a second write-capable node is running against this database, or \
+                 this batch retries a slot that already committed."
+            ),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for WriteBatchError {}
+
+impl From<String> for WriteBatchError {
+    fn from(msg: String) -> Self {
+        Self::Other(msg)
+    }
 }
 
 /// Bulk-insert into address_signatures inside an active PG tx.
@@ -79,7 +109,7 @@ pub async fn write_batch(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-) -> Result<Vec<AddressSignatureRow>, String> {
+) -> Result<Vec<AddressSignatureRow>, WriteBatchError> {
     match db {
         AccountsDB::Postgres(postgres_db) => {
             write_batch_postgres(postgres_db, account_settlements, transactions, block_info).await
@@ -88,6 +118,7 @@ pub async fn write_batch(
             write_batch_redis(redis_db, account_settlements, transactions, block_info)
                 .await
                 .map(|()| Vec::new())
+                .map_err(WriteBatchError::Other)
         }
     }
 }
@@ -110,7 +141,7 @@ async fn write_batch_postgres(
         &ProcessedTransaction,
     )>,
     block_info: Option<BlockInfo>,
-) -> Result<Vec<AddressSignatureRow>, String> {
+) -> Result<Vec<AddressSignatureRow>, WriteBatchError> {
     if db.read_only {
         warn!("Attempted to write batch in read-only mode");
         return Ok(Vec::new());
@@ -194,6 +225,18 @@ async fn write_batch_postgres(
         .await
         .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
+    // First statement, so a superseded writer is refused before it takes any
+    // other lock. FOR UPDATE makes a new writer's bump wait for this batch and
+    // runs batches one at a time, which the parent check below relies on.
+    if let Some(held) = db.writer_epoch {
+        let current = writer_epoch::read_locked(&mut tx)
+            .await
+            .map_err(|e| format!("Failed to read the writer epoch: {}", e))?;
+        if current != Some(held) {
+            return Err(WriteBatchError::Fenced { held, current });
+        }
+    }
+
     // ── Accounts: bulk DELETE pre-serialized buffers ──
     if !delete_pubkeys.is_empty() {
         sqlx::query("DELETE FROM accounts WHERE pubkey = ANY($1::bytea[])")
@@ -238,30 +281,31 @@ async fn write_batch_postgres(
     // Runs before the counter because whether this slot is new is what decides
     // whether the counter may advance.
     let slot_is_new = if let (Some(block_info), Some(block_data)) = (&block_info, &block_data) {
-        // A block may only extend the stored ledger, and a slot already stored may
-        // only be rewritten with the same bytes: that admits the settler's own
-        // retry after a lost acknowledgement and rejects every other writer.
-        //
-        // `xmax = 0` then separates a real insert from such a replay, so the
-        // counter below advances once per slot however often the commit retries.
+        // The block must build on the stored tip (none means genesis), and a stored
+        // slot only takes identical bytes, which admits a lost-ack retry. Stored bytes
+        // never change, so a matching parent slot is a matching parent hash.
         let inserted: Option<bool> = sqlx::query_scalar(
             "INSERT INTO blocks (slot, data)
                  SELECT $1, $2
                  WHERE NOT EXISTS (SELECT 1 FROM blocks WHERE slot > $1)
+                   AND COALESCE((SELECT MAX(slot) FROM blocks) IN ($1, $3), true)
                  ON CONFLICT (slot) DO UPDATE SET data = EXCLUDED.data
                    WHERE blocks.data = EXCLUDED.data
                  RETURNING (xmax = 0)",
         )
         .bind(block_info.slot as i64)
         .bind(block_data)
+        .bind(block_info.parent_slot as i64)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| format!("Failed to store block: {}", e))?;
 
-        // No row means a newer block is already stored, or this slot holds a
-        // different one. Either way another writer has passed this batch.
+        // No row means the tip is not this block's parent, or this slot holds a
+        // different block. Either way another writer has passed this batch.
         let Some(inserted) = inserted else {
-            return Err(stale_tip_error(block_info.slot));
+            return Err(WriteBatchError::StaleTip {
+                slot: block_info.slot,
+            });
         };
 
         // The tip blockhash and the chain counters go in one UNNEST upsert, so
@@ -290,6 +334,7 @@ async fn write_batch_postgres(
         .await
         .map_err(|e| format!("Failed to update the chain tip metadata: {}", e))?;
 
+        // `xmax = 0` is false on a replay, so the counter counts a slot once.
         inserted
     } else {
         // No slot to key on, so there is nothing to suppress.

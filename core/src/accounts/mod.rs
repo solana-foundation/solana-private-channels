@@ -36,6 +36,7 @@ pub mod truncate;
 pub mod types;
 pub mod utils;
 pub mod write_batch;
+pub mod writer_epoch;
 pub mod writer_lease;
 
 use {

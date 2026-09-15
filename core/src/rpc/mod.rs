@@ -968,9 +968,11 @@ mod tests {
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        db.write_batch(&[], vec![], Some(make_block_info(99, Hash::new_unique())))
-            .await
-            .unwrap();
+        let block = BlockInfo {
+            parent_slot: 10,
+            ..make_block_info(99, Hash::new_unique())
+        };
+        db.write_batch(&[], vec![], Some(block)).await.unwrap();
         assert!(
             !query.is_finished(),
             "the lookup must still be parked, else the interleaving was not exercised"
@@ -1203,7 +1205,7 @@ mod tests {
         let from = Keypair::new();
         let processed = make_executed_tx(vec![]);
 
-        for slot in [10u64, 20, 30] {
+        for (slot, parent_slot) in [(10u64, 9u64), (20, 10), (30, 20)] {
             let to = Pubkey::new_unique();
             let tx = create_test_sanitized_transaction(&from, &to, slot);
             let sig = *tx.signature();
@@ -1211,7 +1213,10 @@ mod tests {
                 .write_batch(
                     &[],
                     vec![(sig, &tx, slot, 1_700_000_000, &processed)],
-                    Some(make_block_info(slot, Hash::new_unique())),
+                    Some(BlockInfo {
+                        parent_slot,
+                        ..make_block_info(slot, Hash::new_unique())
+                    }),
                 )
                 .await
                 .unwrap();
