@@ -90,6 +90,7 @@ solana-keychain = { version = "1.4.0", default-features = false, features = [
 
 [dev-dependencies]
 bigdecimal = "0.4"
+bincode = { workspace = true }
 figment = { workspace = true, features = ["test"] }
 tokio = { workspace = true, features = ["test-util"] }
 spl-associated-token-account = { workspace = true }
