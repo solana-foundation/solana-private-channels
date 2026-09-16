@@ -6,6 +6,7 @@ use {
                 ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
             },
             get_latest_slot::get_latest_slot,
+            owner_change::{rows_from_stored, upsert_owner_change_rows, OwnerChangeRow},
             traits::{AccountsDB, BlockInfo},
             types::StoredTransaction,
             write_batch::{upsert_address_signature_rows, AddressSignatureRow},
@@ -120,17 +121,22 @@ pub async fn repair_address_signatures(db: &AccountsDB, _metrics: SharedMetrics)
             let block: BlockInfo = bincode::deserialize(&data)
                 .with_context(|| format!("Failed to deserialize block at slot {}", slot))?;
 
-            let derived = derive_rows_for_block(pool.as_ref(), slot, &block).await?;
-            let n = derived.len();
+            let (address_rows, owner_change_rows) =
+                derive_rows_for_block(pool.as_ref(), slot, &block).await?;
+            let n = address_rows.len();
 
             let mut pg_tx = pool
                 .begin()
                 .await
                 .context("Failed to begin repair transaction")?;
 
-            upsert_address_signature_rows(&mut pg_tx, &derived)
+            upsert_address_signature_rows(&mut pg_tx, &address_rows)
                 .await
                 .with_context(|| format!("Repair insert failed for slot {}", slot))?;
+
+            upsert_owner_change_rows(&mut pg_tx, &owner_change_rows)
+                .await
+                .with_context(|| format!("Repair owner-change insert failed for slot {}", slot))?;
 
             upsert_address_signatures_flushed_slot_in_tx(&mut pg_tx, slot)
                 .await
@@ -166,9 +172,9 @@ async fn derive_rows_for_block(
     pool: &PgPool,
     slot: i64,
     block: &BlockInfo,
-) -> Result<Vec<AddressSignatureRow>> {
+) -> Result<(Vec<AddressSignatureRow>, Vec<OwnerChangeRow>)> {
     if block.transaction_signatures.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let sig_bytes: Vec<Vec<u8>> = block
@@ -188,6 +194,7 @@ async fn derive_rows_for_block(
     .with_context(|| format!("Failed to fetch transactions for slot {}", slot))?;
 
     let mut out: Vec<AddressSignatureRow> = Vec::with_capacity(rows.len() * 7);
+    let mut owner_changes: Vec<OwnerChangeRow> = Vec::new();
     for row in rows {
         let sig_bytes: Vec<u8> = row.get("signature");
         let data: Vec<u8> = row.get("data");
@@ -205,6 +212,12 @@ async fn derive_rows_for_block(
                 ));
             }
         };
+
+        // Re-derived from the same stored bytes the address rows come from, so a
+        // database restored behind the live table recovers both together.
+        if let Ok(signature) = Signature::try_from(sig_bytes.as_slice()) {
+            owner_changes.extend(rows_from_stored(&stored, slot, &signature));
+        }
 
         let tx_with_meta = stored.transaction_with_status_meta();
         let solana_transaction_status::TransactionWithStatusMeta::Complete(versioned) =
@@ -232,7 +245,7 @@ async fn derive_rows_for_block(
         );
     }
 
-    Ok(out)
+    Ok((out, owner_changes))
 }
 
 #[cfg(test)]

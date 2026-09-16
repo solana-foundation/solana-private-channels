@@ -1546,6 +1546,135 @@ mod tests {
         assert_eq!(db.get_transaction_count().await.unwrap(), 2);
     }
 
+    /// A landed `SetAuthority { AccountOwner }` handing `token_account` from
+    /// `owner` to `new_owner`. `status` decides whether it executed.
+    fn handoff_tx(
+        owner: &Keypair,
+        token_account: &Pubkey,
+        new_owner: &Pubkey,
+        status: Result<(), solana_sdk::transaction::TransactionError>,
+    ) -> (SanitizedTransaction, ProcessedTransaction) {
+        let instruction = spl_token::instruction::set_authority(
+            &spl_token::id(),
+            token_account,
+            Some(new_owner),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            &owner.pubkey(),
+            &[],
+        )
+        .expect("set_authority builds");
+        let message = solana_sdk::message::Message::new(&[instruction], Some(&owner.pubkey()));
+        let transaction =
+            solana_sdk::transaction::Transaction::new(&[owner], message, Hash::default());
+        let sanitized = SanitizedTransaction::try_from_legacy_transaction(
+            transaction,
+            &std::collections::HashSet::new(),
+        )
+        .expect("sanitizes");
+
+        let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+            loaded_transaction: LoadedTransaction {
+                accounts: vec![],
+                ..Default::default()
+            },
+            execution_details: TransactionExecutionDetails {
+                accounts_deltas: status.is_ok().then(crate::test_helpers::no_accounts_deltas),
+                status,
+                log_messages: None,
+                inner_instructions: None,
+                return_data: None,
+                executed_units: 0,
+            },
+            programs_modified_by_tx: HashMap::new(),
+        }));
+
+        (sanitized, processed)
+    }
+
+    /// The row gates what a later owner may read, so it has to be visible to
+    /// anything that can already see the block it arrived in — it commits with
+    /// the batch rather than after it, unlike the address index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_owner_handoff_is_recorded_with_its_block() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let owner = Keypair::new();
+        let token_account = Pubkey::new_unique();
+        let new_owner = Pubkey::new_unique();
+        let slot = 9u64;
+
+        let txs = [handoff_tx(&owner, &token_account, &new_owner, Ok(()))];
+        let refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+            .collect();
+        db.write_batch(
+            &[],
+            refs,
+            Some(create_test_block_info(slot, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        let (address, recorded_slot, prev_owner, recorded_new_owner): (
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+        ) = sqlx::query_as(
+            "SELECT address, slot, prev_owner, new_owner FROM token_account_owner_change",
+        )
+        .fetch_one(postgres_db.pool.as_ref())
+        .await
+        .unwrap();
+
+        assert_eq!(address, token_account.to_bytes().to_vec());
+        assert_eq!(recorded_slot, slot as i64);
+        assert_eq!(prev_owner, owner.pubkey().to_bytes().to_vec());
+        assert_eq!(recorded_new_owner, new_owner.to_bytes().to_vec());
+    }
+
+    /// A handoff that failed never moved the account. Recording one anyway would
+    /// cut the owner off from their own history on someone else's failed attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_handoff_records_nothing() {
+        let (mut db, _pg) = start_test_postgres().await;
+        let slot = 9u64;
+
+        let txs = [handoff_tx(
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            Err(solana_sdk::transaction::TransactionError::InstructionError(
+                0,
+                solana_sdk::instruction::InstructionError::Custom(1),
+            )),
+        )];
+        let refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, slot, 1_700_000_000i64, p))
+            .collect();
+        db.write_batch(
+            &[],
+            refs,
+            Some(create_test_block_info(slot, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM token_account_owner_change")
+            .fetch_one(postgres_db.pool.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(recorded, 0);
+    }
+
     /// A handle on this database carrying a freshly claimed writer epoch.
     async fn claim_epoch(db: &AccountsDB) -> AccountsDB {
         let AccountsDB::Postgres(ref pg) = db else {

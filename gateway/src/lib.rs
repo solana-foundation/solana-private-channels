@@ -3,9 +3,9 @@ pub mod db;
 pub mod metrics;
 
 use crate::auth::{
-    auth_unavailable_body, check_account_data_ownership, check_request_auth, decode_account_data,
-    forbidden_body, is_gated, redacts_transaction_errors_for, role_check_error_body, verify_bearer,
-    AuthDecision, Role,
+    auth_unavailable_body, check_account_data_ownership, check_request_auth, db_error_body,
+    decode_account_data, forbidden_body, is_gated, is_owner_only, redacts_transaction_errors_for,
+    resolve_owned_slot_ranges, role_check_error_body, verify_bearer, AuthDecision, Role,
 };
 use crate::db::get_user_role;
 use clap::Parser;
@@ -301,6 +301,33 @@ enum AccountFetch {
     Unavailable,
 }
 
+/// How a proxied response must be reshaped before it reaches this caller.
+///
+/// Both axes are independent of whether the request was authorized: a caller may
+/// be entitled to a history page and still not to every field of it.
+struct ResponsePolicy {
+    /// Collapse every transaction error to the generic marker.
+    redact_errors: bool,
+    /// Keep only history entries whose slot falls inside one of these ranges.
+    /// `None` leaves the page untouched.
+    slot_ranges: Option<Vec<(i64, i64)>>,
+}
+
+impl ResponsePolicy {
+    /// Nothing to reshape, the shape every ungated and internal request takes.
+    fn passthrough() -> Self {
+        Self {
+            redact_errors: false,
+            slot_ranges: None,
+        }
+    }
+
+    /// Whether the response has to be buffered and rewritten at all.
+    fn rewrites_response(&self) -> bool {
+        self.redact_errors || self.slot_ranges.is_some()
+    }
+}
+
 /// Tracks how many connections each client IP currently holds. Entries are
 /// removed when an IP's count reaches zero, so the map only holds IPs with a
 /// live connection and stays bounded by the global connection cap.
@@ -432,6 +459,63 @@ fn redact_transaction_errors(body: Bytes) -> Bytes {
         }
     }
     Bytes::from(json.to_string())
+}
+
+/// Report at boot when the ledger table that scopes history is missing.
+///
+/// The core node creates it at startup and the gateway only reads it, so on a
+/// cold start of the whole stack the gateway can easily win the race. That is
+/// why this warns rather than refusing to start: refusing would crash-loop until
+/// the node caught up, and the requests that need the table already fail closed
+/// with a 500 meanwhile. What they don't do is say why, which is this log line's
+/// job.
+async fn warn_if_owner_change_table_missing(pool: &PgPool) {
+    let present: Result<Option<String>, _> =
+        sqlx::query_scalar("SELECT to_regclass('public.token_account_owner_change')::text")
+            .fetch_one(pool)
+            .await;
+
+    match present {
+        Ok(Some(_)) => {}
+        Ok(None) => error!(
+            "token_account_owner_change is missing from the ledger database. \
+             getSignaturesForAddress will answer 500 for every User-role caller \
+             until the core node starts and creates it."
+        ),
+        Err(e) => error!("Could not check for token_account_owner_change: {}", e),
+    }
+}
+
+/// Drop history entries outside the slot ranges the caller owned the address
+/// for. Returns `None` when the body is not a JSON-RPC page, which the caller
+/// must treat as a failure rather than forward.
+///
+/// Entries carrying no slot are dropped: every real one has a slot, and an entry
+/// that cannot be placed in time cannot be shown to be the caller's.
+///
+/// A page filtered this way can come back shorter than the caller's `limit`, or
+/// empty while older entries of theirs remain, because `limit` is applied
+/// upstream over every owner's entries. Clients must page on `before` until the
+/// upstream page itself comes back short.
+fn restrict_to_slot_ranges(body: Bytes, ranges: &[(i64, i64)]) -> Option<Bytes> {
+    let mut json = serde_json::from_slice::<Value>(&body).ok()?;
+    let Some(Value::Array(entries)) = json.get_mut("result") else {
+        // An error response, or a shape with no page in it. Nothing to scope.
+        return Some(body);
+    };
+
+    entries.retain(|entry| {
+        entry
+            .get("slot")
+            .and_then(|slot| slot.as_i64())
+            .is_some_and(|slot| {
+                ranges
+                    .iter()
+                    .any(|(first, last)| slot >= *first && slot <= *last)
+            })
+    });
+
+    Some(Bytes::from(json.to_string()))
 }
 
 /// The single error every collapsed transaction reports.
@@ -745,15 +829,17 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Result<bool, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
-    {
+    ) -> Result<
+        ResponsePolicy,
+        Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
+    > {
         // Auth off, so nothing is redacted either. Every method is ungated in this
         // mode, so a caller reads the balance straight from getTokenAccountBalance
         // instead of inferring it from error codes. Redacting would also hit the
         // operator services, since with no key we cannot tell who is an Operator.
         let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
             (Some(k), Some(db)) => (k, db),
-            _ => return Ok(false),
+            _ => return Ok(ResponsePolicy::passthrough()),
         };
 
         let mut claims = verify_bearer(auth_header, decoding_key);
@@ -786,7 +872,10 @@ impl Gateway {
         // separate axis: getSignatureStatuses is ungated and still error-bearing.
         // A public method stays available when the auth DB is down; it just redacts.
         if !is_gated(method) {
-            return Ok(redacts_transaction_errors_for(claims.as_ref(), method));
+            return Ok(ResponsePolicy {
+                redact_errors: redacts_transaction_errors_for(claims.as_ref(), method),
+                slot_ranges: None,
+            });
         }
 
         if role_check_failed {
@@ -804,17 +893,24 @@ impl Gateway {
         let redact = redacts_transaction_errors_for(claims.as_ref(), method);
 
         let (status, body) = match decision {
-            AuthDecision::Proceed => return Ok(redact),
+            // An Operator, whose reads are not scoped to any wallet.
+            AuthDecision::Proceed => {
+                return Ok(ResponsePolicy {
+                    redact_errors: redact,
+                    slot_ranges: None,
+                })
+            }
             AuthDecision::Reject(status, body) => (status, body),
             AuthDecision::NeedsAccountFetch { user_id, pubkey } => {
-                let result = match self.fetch_account_for_auth(&pubkey).await {
+                let fetched = self.fetch_account_for_auth(&pubkey).await;
+                let result = match &fetched {
                     AccountFetch::Found {
                         data,
                         program_owner,
                     } => {
                         check_account_data_ownership(
-                            &data,
-                            &program_owner,
+                            data,
+                            program_owner,
                             &pubkey,
                             method,
                             user_id,
@@ -831,7 +927,43 @@ impl Gateway {
                     ),
                 };
                 match result {
-                    AuthDecision::Proceed => return Ok(redact),
+                    AuthDecision::Proceed => {
+                        // Owning the account now says nothing about who owned it
+                        // when its older transactions landed, so a history page
+                        // is scoped to the windows this caller held it for.
+                        let slot_ranges = match (&fetched, is_owner_only(method)) {
+                            (
+                                AccountFetch::Found {
+                                    data,
+                                    program_owner,
+                                },
+                                true,
+                            ) => match resolve_owned_slot_ranges(
+                                data,
+                                program_owner,
+                                &pubkey,
+                                user_id,
+                                auth_db,
+                            )
+                            .await
+                            {
+                                Ok(ranges) => ranges,
+                                Err(_) => {
+                                    return Err(self.reject_with_metrics(
+                                        method_label,
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        db_error_body(),
+                                        start,
+                                    ))
+                                }
+                            },
+                            _ => None,
+                        };
+                        return Ok(ResponsePolicy {
+                            redact_errors: redact,
+                            slot_ranges,
+                        });
+                    }
                     AuthDecision::Reject(status, body) => (status, body),
                     AuthDecision::NeedsAccountFetch { .. } => unreachable!(),
                 }
@@ -1115,13 +1247,13 @@ impl Gateway {
         // Skipped on the internal listener: the operator services carry no JWT,
         // and they need the raw errors their confirmation handling routes on.
         let params = json.get("params").cloned().unwrap_or(Value::Null);
-        let redact_tx_errors = match access {
-            Access::Internal => false,
+        let response_policy = match access {
+            Access::Internal => ResponsePolicy::passthrough(),
             Access::Public => match self
                 .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
                 .await
             {
-                Ok(redact) => redact,
+                Ok(policy) => policy,
                 Err(rejection) => return Ok(rejection),
             },
         };
@@ -1200,7 +1332,7 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                if !redact_tx_errors {
+                if !response_policy.rewrites_response() {
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
@@ -1212,12 +1344,31 @@ impl Gateway {
                         return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
                     }
                 };
-                // Redaction changes the length, so let hyper re-frame the body.
+                let rewritten = match &response_policy.slot_ranges {
+                    Some(ranges) => match restrict_to_slot_ranges(collected, ranges) {
+                        Some(body) => body,
+                        None => {
+                            // Unparseable with a scope to apply. Redaction alone
+                            // forwards such a body untouched, but a page that
+                            // cannot be scoped must not be served at all.
+                            error!("History response from {} was not JSON", target_url);
+                            return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
+                        }
+                    },
+                    None => collected,
+                };
+                let rewritten = if response_policy.redact_errors {
+                    redact_transaction_errors(rewritten)
+                } else {
+                    rewritten
+                };
+
+                // Rewriting changes the length, so let hyper re-frame the body.
                 parts.headers.remove(hyper::header::CONTENT_LENGTH);
                 parts.headers.remove(hyper::header::TRANSFER_ENCODING);
                 Ok(Response::from_parts(
                     parts,
-                    Full::new(redact_transaction_errors(collected))
+                    Full::new(rewritten)
                         .map_err(|never| match never {})
                         .boxed_unsync(),
                 ))
@@ -1415,6 +1566,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 "  Auth DB: connected (max_connections={})",
                 args.auth_database_max_connections
             );
+            warn_if_owner_change_table_missing(&pool).await;
             Some(pool)
         }
         None => {
@@ -2115,6 +2267,81 @@ mod tests {
         // IPv4 is keyed by the full address.
         let v4 = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         assert_eq!(rate_limit_key(v4), v4);
+    }
+
+    /// A three-entry history page spanning slots 1, 2 and 3.
+    fn history_page() -> Bytes {
+        Bytes::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [
+                    {"signature": "sig3", "slot": 3, "err": null},
+                    {"signature": "sig2", "slot": 2, "err": null},
+                    {"signature": "sig1", "slot": 1, "err": null}
+                ]
+            })
+            .to_string(),
+        )
+    }
+
+    fn signatures_in(page: Bytes) -> Vec<String> {
+        let json: Value = serde_json::from_slice(&page).unwrap();
+        json["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["signature"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Entries from a window the caller did not own the address for are dropped,
+    /// including ones between two windows they did own.
+    #[test]
+    fn slot_ranges_keep_only_the_callers_windows() {
+        let kept = restrict_to_slot_ranges(history_page(), &[(1, 1), (3, i64::MAX)]).unwrap();
+
+        assert_eq!(signatures_in(kept), vec!["sig3", "sig1"]);
+    }
+
+    /// Owning no window of an address hides the page rather than emptying it of
+    /// meaning: the caller gets a valid, empty result.
+    #[test]
+    fn no_owned_range_yields_an_empty_page() {
+        let kept = restrict_to_slot_ranges(history_page(), &[]).unwrap();
+
+        assert!(signatures_in(kept).is_empty());
+    }
+
+    /// An entry with no slot cannot be placed in time, so it cannot be shown to
+    /// belong to the caller.
+    #[test]
+    fn entries_without_a_slot_are_dropped() {
+        let body = Bytes::from(
+            json!({"jsonrpc": "2.0", "id": 1, "result": [{"signature": "sig1"}]}).to_string(),
+        );
+
+        let kept = restrict_to_slot_ranges(body, &[(0, i64::MAX)]).unwrap();
+
+        assert!(signatures_in(kept).is_empty());
+    }
+
+    /// Redaction forwards a body it cannot parse. A page that needs scoping must
+    /// not be forwarded on those terms.
+    #[test]
+    fn an_unparseable_page_is_refused_rather_than_forwarded() {
+        assert!(restrict_to_slot_ranges(Bytes::from("not json"), &[(0, 10)]).is_none());
+    }
+
+    /// An error response carries no entries to scope and passes through.
+    #[test]
+    fn an_error_response_passes_through_scoping() {
+        let body =
+            Bytes::from(json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32004}}).to_string());
+
+        let forwarded = restrict_to_slot_ranges(body.clone(), &[(0, 10)]).unwrap();
+
+        assert_eq!(forwarded, body);
     }
 
     /// Both legs of the balance probe (InsufficientFunds above the source

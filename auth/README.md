@@ -212,7 +212,7 @@ Wallets are not trusted on assertion — the user must cryptographically prove t
    ← { pubkey, created_at }
 ```
 
-Once verified, the gateway allows that user to query accounts owned or delegated by that wallet (ATAs, token accounts, etc.). Transaction history is the exception: `getSignaturesForAddress` requires the wallet to be the token account's owner, not its delegate.
+Once verified, the gateway allows that user to query accounts owned or delegated by that wallet (ATAs, token accounts, etc.). Transaction history is the exception: `getSignaturesForAddress` requires the wallet to be the token account's owner, not its delegate, and returns only the slots that wallet owned the address for.
 
 ## JWT format
 

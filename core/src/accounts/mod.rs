@@ -23,6 +23,7 @@ pub mod get_signatures_for_address;
 pub mod get_tip;
 pub mod get_transaction;
 pub mod get_transaction_count;
+pub mod owner_change;
 pub mod postgres;
 pub mod precompiles;
 pub mod redis;

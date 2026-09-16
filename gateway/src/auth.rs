@@ -6,12 +6,13 @@ use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use uuid::Uuid;
 
 use dvp_swap_program_client::{accounts::SwapDvp, DVP_SWAP_PROGRAM_ID};
 
-use crate::db::is_wallet_owned_by_user;
+use crate::db::{is_wallet_owned_by_user, owner_changes, OwnerChange};
 
 // ---------------------------------------------------------------------------
 // Auth types — local minimal copies of auth service types.
@@ -93,6 +94,12 @@ pub const GET_SIGNATURES_FOR_ADDRESS: &str = "getSignaturesForAddress";
 /// the balance it can spend. It says nothing about who controlled the address
 /// when past transactions landed, so it cannot open a history page.
 const OWNER_ONLY_METHODS: &[&str] = &[GET_SIGNATURES_FOR_ADDRESS];
+
+/// Whether `method` reads history rather than current state, and so must be
+/// scoped to the slots its caller owned the address for.
+pub fn is_owner_only(method: &str) -> bool {
+    OWNER_ONLY_METHODS.contains(&method)
+}
 
 /// Signature status lookup. Ungated, since any caller may poll a signature it
 /// already holds, but its response carries the same execution errors as a
@@ -302,6 +309,115 @@ pub async fn check_account_data_ownership(
     }
 }
 
+/// The slot ranges `user_id` may read `pubkey`'s history for.
+///
+/// `None` means no filtering: the address never changed hands, so all of it is
+/// theirs. `Some(ranges)` keeps only entries whose slot falls inside one of
+/// them, and an empty `Some` hides the page entirely.
+///
+/// Only a token account can change hands; a wallet address is its own identity
+/// for as long as it exists, so it never needs a range.
+pub async fn resolve_owned_slot_ranges(
+    data: &[u8],
+    program_owner: &str,
+    pubkey: &str,
+    user_id: Uuid,
+    auth_db: &PgPool,
+) -> Result<Option<Vec<(i64, i64)>>, sqlx::Error> {
+    if !matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
+        || data.len() < TOKEN_ACCOUNT_SIZE
+    {
+        return Ok(None);
+    }
+
+    let Ok(address) = bs58::decode(pubkey).into_vec() else {
+        // The fetch resolved this pubkey, so it decodes. Hide the page rather
+        // than serve it unscoped if that ever stops being true.
+        return Ok(Some(Vec::new()));
+    };
+
+    let changes = owner_changes(auth_db, &address).await?;
+    if changes.is_empty() {
+        return Ok(None);
+    }
+
+    // One lookup per distinct wallet in the chain, not per interval. A chain is
+    // almost always a single entry.
+    let mut owned: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for candidate in changes
+        .iter()
+        .flat_map(|change| [change.prev_owner.as_str(), change.new_owner.as_str()])
+    {
+        if !seen.insert(candidate) {
+            continue;
+        }
+        if is_wallet_owned_by_user(auth_db, user_id, candidate).await? {
+            owned.insert(candidate.to_owned());
+        }
+    }
+
+    let current_owner = bs58::encode(&data[OWNER_OFFSET..OWNER_END]).into_string();
+    Ok(Some(slot_ranges_for_owner(
+        &changes,
+        &current_owner,
+        &owned,
+    )))
+}
+
+/// Rebuild an address's ownership timeline from its handoffs and keep the
+/// windows belonging to the caller.
+///
+/// A handoff at slot `s` gives everything below `s` to the previous owner and
+/// everything above it to the new one. Slot `s` itself goes to neither: history
+/// is ordered by `(slot, signature)`, so the order transactions ran inside a
+/// slot is not recoverable, and the whole slot is cheaper to drop than to
+/// reason about.
+///
+/// The rows form a chain — each handoff's new owner is the next one's previous
+/// owner, and the last one's new owner is whoever holds the account now. A link
+/// that doesn't join means a handoff went unrecorded, so the timeline before the
+/// last known one cannot be trusted and only what follows it is served.
+fn slot_ranges_for_owner(
+    changes: &[OwnerChange],
+    current_owner: &str,
+    owned: &HashSet<String>,
+) -> Vec<(i64, i64)> {
+    let Some(last) = changes.last() else {
+        return Vec::new();
+    };
+
+    let chain_links = changes
+        .windows(2)
+        .all(|pair| pair[0].new_owner == pair[1].prev_owner)
+        && last.new_owner == current_owner;
+    if !chain_links {
+        return vec![(last.slot.saturating_add(1), i64::MAX)];
+    }
+
+    let mut ranges: Vec<(i64, i64)> = Vec::new();
+
+    // Before the first handoff the account belonged to whoever signed it away.
+    let head_end = changes[0].slot.saturating_sub(1);
+    if owned.contains(&changes[0].prev_owner) && head_end >= 0 {
+        ranges.push((0, head_end));
+    }
+
+    for (index, change) in changes.iter().enumerate() {
+        let start = change.slot.saturating_add(1);
+        let end = changes
+            .get(index + 1)
+            .map(|next| next.slot.saturating_sub(1))
+            .unwrap_or(i64::MAX);
+        // Two handoffs in the same slot leave no window between them.
+        if start <= end && owned.contains(&change.new_owner) {
+            ranges.push((start, end));
+        }
+    }
+
+    ranges
+}
+
 /// Ownership check for SPL Token and Token-2022 accounts. Both programs share
 /// the same base layout, so this checks the `owner` field (bytes 32-63) and,
 /// if it doesn't match, the `delegate` field (bytes 76-107) when present. The
@@ -453,7 +569,7 @@ fn missing_pubkey_body() -> Bytes {
     )
 }
 
-fn db_error_body() -> Bytes {
+pub fn db_error_body() -> Bytes {
     Bytes::from(
         serde_json::json!({
             "error": { "code": -32603, "message": "Internal error: could not verify account ownership" }
@@ -728,6 +844,104 @@ mod tests {
                 "{method} is owner-only but not account-gated"
             );
         }
+    }
+
+    // ── slot_ranges_for_owner ─────────────────────────────────────────────────
+
+    fn handoff(slot: i64, prev_owner: &str, new_owner: &str) -> OwnerChange {
+        OwnerChange {
+            slot,
+            prev_owner: prev_owner.to_owned(),
+            new_owner: new_owner.to_owned(),
+        }
+    }
+
+    fn wallets(pubkeys: &[&str]) -> HashSet<String> {
+        pubkeys.iter().map(|pubkey| (*pubkey).to_string()).collect()
+    }
+
+    /// The new owner gets everything after the handoff and nothing before it,
+    /// and the handoff's own slot belongs to neither side.
+    #[test]
+    fn a_new_owner_reads_only_what_followed_the_handoff() {
+        let handoff_slot = 500;
+        let ranges = slot_ranges_for_owner(
+            &[handoff(handoff_slot, "alice", "bob")],
+            "bob",
+            &wallets(&["bob"]),
+        );
+
+        assert_eq!(ranges, vec![(handoff_slot + 1, i64::MAX)]);
+    }
+
+    /// An account handed away and taken back leaves its owner both of their own
+    /// windows, and none of the one in between.
+    #[test]
+    fn a_returning_owner_reads_both_of_their_windows_but_not_the_middle() {
+        let away = 100;
+        let back = 200;
+        let ranges = slot_ranges_for_owner(
+            &[handoff(away, "alice", "bob"), handoff(back, "bob", "alice")],
+            "alice",
+            &wallets(&["alice"]),
+        );
+
+        assert_eq!(ranges, vec![(0, away - 1), (back + 1, i64::MAX)]);
+    }
+
+    /// The caller holds the account now, so the last recorded handoff must name
+    /// them. It naming someone else means a later handoff went unrecorded, and
+    /// nothing before the last known one can be trusted.
+    #[test]
+    fn a_tail_that_disagrees_with_the_current_owner_serves_only_what_follows_it() {
+        let handoff_slot = 500;
+        let ranges = slot_ranges_for_owner(
+            &[handoff(handoff_slot, "alice", "bob")],
+            "carol",
+            &wallets(&["carol", "alice"]),
+        );
+
+        assert_eq!(ranges, vec![(handoff_slot + 1, i64::MAX)]);
+    }
+
+    /// Same rule for a gap in the middle: bob handed it on, but the next row
+    /// claims it came from someone else.
+    #[test]
+    fn a_broken_link_serves_only_what_follows_the_last_handoff() {
+        let last = 200;
+        let ranges = slot_ranges_for_owner(
+            &[handoff(100, "alice", "bob"), handoff(last, "carol", "dave")],
+            "dave",
+            &wallets(&["alice", "dave"]),
+        );
+
+        assert_eq!(ranges, vec![(last + 1, i64::MAX)]);
+    }
+
+    /// Two handoffs in one slot leave no window between them to hand out.
+    #[test]
+    fn handoffs_in_the_same_slot_leave_no_window_between_them() {
+        let slot = 100;
+        let ranges = slot_ranges_for_owner(
+            &[handoff(slot, "alice", "bob"), handoff(slot, "bob", "carol")],
+            "carol",
+            &wallets(&["alice", "bob", "carol"]),
+        );
+
+        assert_eq!(ranges, vec![(0, slot - 1), (slot + 1, i64::MAX)]);
+    }
+
+    /// Windows belonging to other wallets are not served, even to the account's
+    /// current owner.
+    #[test]
+    fn windows_owned_by_other_wallets_are_left_out() {
+        let ranges = slot_ranges_for_owner(
+            &[handoff(100, "alice", "bob"), handoff(200, "bob", "carol")],
+            "carol",
+            &wallets(&["carol"]),
+        );
+
+        assert_eq!(ranges, vec![(201, i64::MAX)]);
     }
 
     // ── redacts_transaction_errors ────────────────────────────────────────────

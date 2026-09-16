@@ -3,6 +3,45 @@ use uuid::Uuid;
 
 use crate::auth::Role;
 
+/// One recorded handoff of a token account between wallets, as the core node
+/// wrote it. Owners come back base58-encoded to match `verified_wallets.pubkey`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerChange {
+    pub slot: i64,
+    pub prev_owner: String,
+    pub new_owner: String,
+}
+
+/// Every recorded owner handoff for `address`, oldest first.
+///
+/// This is the gateway's one read outside the `private_channel_auth` schema.
+/// The auth service keeps its objects in their own schema to stay clear of the
+/// ledger's (see `auth/src/db.rs`), and both live in the same database, so the
+/// pool already in hand can serve this. Qualified explicitly rather than left to
+/// `search_path`, and read-only: the node owns these rows.
+pub async fn owner_changes(pool: &PgPool, address: &[u8]) -> Result<Vec<OwnerChange>, sqlx::Error> {
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT slot, prev_owner, new_owner
+        FROM public.token_account_owner_change
+        WHERE address = $1
+        ORDER BY slot ASC, signature ASC
+        "#,
+    )
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(slot, prev_owner, new_owner)| OwnerChange {
+            slot,
+            prev_owner: bs58::encode(prev_owner).into_string(),
+            new_owner: bs58::encode(new_owner).into_string(),
+        })
+        .collect())
+}
+
 /// Returns the role currently stored for `user_id`, or `None` if the user no
 /// longer exists. The gateway uses this to confirm that a JWT's Operator claim
 /// still matches the DB, since a token can outlive a demotion by up to 24h.

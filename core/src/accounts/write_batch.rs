@@ -5,6 +5,7 @@ use {
         get_block_height::BLOCK_HEIGHT_KEY,
         get_latest_blockhash::LATEST_BLOCKHASH_KEY,
         get_latest_slot::LATEST_SLOT_KEY,
+        owner_change::{rows_from_processed, upsert_owner_change_rows, OwnerChangeRow},
         postgres::PostgresAccountsDB,
         redis::RedisAccountsDB,
         traits::{AccountsDB, BlockInfo},
@@ -191,6 +192,11 @@ async fn write_batch_postgres(
     // they are no longer part of the atomic transaction. ~5–7 rows per tx is
     // typical, so use that as the initial capacity hint.
     let mut addr_sig_rows: Vec<AddressSignatureRow> = Vec::with_capacity(transactions.len() * 7);
+    // Ownership handoffs, on the other hand, commit with the block below. They
+    // gate what a later owner may read, so one may never be visible later than
+    // the signatures it covers. Handing an account on is rare enough that the
+    // vector almost always stays empty.
+    let mut owner_change_rows: Vec<OwnerChangeRow> = Vec::new();
     for (signature, transaction, tx_slot, block_time, processed) in transactions {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         sig_bytes_vec.push(signature.as_ref().to_vec());
@@ -209,6 +215,12 @@ async fn write_batch_postgres(
                 signature: sig_bytes.clone(),
             });
         }
+        owner_change_rows.extend(rows_from_processed(
+            transaction,
+            processed,
+            tx_slot,
+            &signature,
+        ));
     }
 
     // Block info: serialize the row payload up front.
@@ -276,6 +288,12 @@ async fn write_batch_postgres(
         .await
         .map_err(|e| format!("Failed to bulk upsert transactions: {}", e))?;
     }
+
+    // Inside the commit on purpose: a handoff that landed but went unrecorded
+    // would let the new owner read the previous owner's history.
+    upsert_owner_change_rows(&mut tx, &owner_change_rows)
+        .await
+        .map_err(|e| format!("Failed to bulk upsert owner changes: {}", e))?;
 
     // ── Block info: at most 2 queries (block row + chain tip metadata) ──
     // Runs before the counter because whether this slot is new is what decides

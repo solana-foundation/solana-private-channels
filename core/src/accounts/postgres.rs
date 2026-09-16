@@ -214,6 +214,27 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .execute(pool)
     .await?;
 
+    // Every SPL Token `SetAuthority { AccountOwner }` that landed, recording both
+    // sides of the handoff. The gateway reads these to scope a user's history to
+    // the slots they actually owned the address for.
+    //
+    // Never prune these rows, not even once the transaction that produced one is
+    // gone: a missing row silently widens what a later owner may read.
+    sqlx::query(
+        r#"
+            CREATE TABLE IF NOT EXISTS token_account_owner_change (
+                address    BYTEA  NOT NULL,
+                slot       BIGINT NOT NULL,
+                signature  BYTEA  NOT NULL,
+                prev_owner BYTEA  NOT NULL,
+                new_owner  BYTEA  NOT NULL,
+                PRIMARY KEY (address, slot, signature)
+            )
+            "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("PostgreSQL tables initialized");
     Ok(())
 }

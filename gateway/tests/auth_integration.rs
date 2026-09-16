@@ -360,6 +360,84 @@ fn history_response() -> String {
     .to_string()
 }
 
+/// Create the ledger table the gateway reads ownership handoffs from.
+///
+/// The core node owns this schema (`core/src/accounts/postgres.rs`) and creates
+/// it at startup. It is copied rather than imported so the gateway's tests don't
+/// build the node; keep the two in step.
+async fn init_owner_change_table(pool: &PgPool) {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS token_account_owner_change (
+            address    BYTEA  NOT NULL,
+            slot       BIGINT NOT NULL,
+            signature  BYTEA  NOT NULL,
+            prev_owner BYTEA  NOT NULL,
+            new_owner  BYTEA  NOT NULL,
+            PRIMARY KEY (address, slot, signature)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Record `address` passing from `prev_owner` to `new_owner` at `slot`.
+async fn insert_owner_change(
+    pool: &PgPool,
+    address: &[u8; 32],
+    slot: i64,
+    prev_owner: &[u8; 32],
+    new_owner: &[u8; 32],
+) {
+    sqlx::query(
+        "INSERT INTO token_account_owner_change
+             (address, slot, signature, prev_owner, new_owner)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(address.as_slice())
+    .bind(slot)
+    // Only its uniqueness matters here; the gateway never reads it.
+    .bind(vec![slot as u8; 64])
+    .bind(prev_owner.as_slice())
+    .bind(new_owner.as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A landed history page with one entry per slot, newest first as the node
+/// orders them.
+fn history_page_for_slots(slots: &[i64]) -> String {
+    let entries: Vec<serde_json::Value> = slots
+        .iter()
+        .rev()
+        .map(|slot| {
+            json!({
+                "signature": format!("sig{slot}"),
+                "slot": slot,
+                "err": null,
+                "memo": null,
+                "blockTime": null,
+                "confirmationStatus": "finalized"
+            })
+        })
+        .collect();
+
+    json!({"jsonrpc": "2.0", "id": 1, "result": entries}).to_string()
+}
+
+/// The signatures a history response came back with, in order.
+fn returned_signatures(body: &serde_json::Value) -> Vec<String> {
+    body["result"]
+        .as_array()
+        .expect("history page")
+        .iter()
+        .map(|entry| entry["signature"].as_str().unwrap().to_string())
+        .collect()
+}
+
 /// A getSignatureStatuses response carrying the same two probe errors, in the
 /// nested shape with the error repeated in the legacy `status` field.
 fn signature_status_response() -> String {
@@ -1519,6 +1597,7 @@ async fn test_get_signatures_for_address_delegate_returns_403() {
 async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
 
     let owner_bytes = [50u8; 32];
     let owner_pubkey = bs58::encode(owner_bytes).into_string();
@@ -1558,6 +1637,7 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
 async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
 
     let owner_bytes = [52u8; 32];
     let owner_pubkey = bs58::encode(owner_bytes).into_string();
@@ -1680,6 +1760,164 @@ async fn test_get_signatures_for_address_user_gets_uniform_errors() {
         entries[2]["err"].is_null(),
         "a landed transaction keeps err: null"
     );
+}
+
+/// Taking ownership of a token account must not hand over the history the
+/// previous owner made with it. The handoff's own slot goes to neither party.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_excludes_slots_before_a_handoff() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let previous_owner = [1u8; 32];
+    let new_owner = [2u8; 32];
+    let token_account = [8u8; 32];
+    let handoff_slot = 2;
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(new_owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+    insert_owner_change(
+        &pool,
+        &token_account,
+        handoff_slot,
+        &previous_owner,
+        &new_owner,
+    )
+    .await;
+
+    // Ownership fetch shows the account is theirs now, then the proxied page
+    // spans both sides of the handoff.
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&new_owner, None),
+        history_page_for_slots(&[1, 2, 3]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        returned_signatures(&body),
+        vec!["sig3"],
+        "the new owner may read only what landed after the handoff"
+    );
+}
+
+/// An account handed away and taken back leaves its owner both of their own
+/// windows, and none of the window in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_returns_both_windows_of_a_returning_owner() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let original_owner = [1u8; 32];
+    let interim_owner = [2u8; 32];
+    let token_account = [8u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(original_owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+    insert_owner_change(&pool, &token_account, 2, &original_owner, &interim_owner).await;
+    insert_owner_change(&pool, &token_account, 4, &interim_owner, &original_owner).await;
+
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&original_owner, None),
+        history_page_for_slots(&[1, 2, 3, 4, 5]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(
+        returned_signatures(&body),
+        vec!["sig5", "sig1"],
+        "slot 3 belonged to the interim owner, and slots 2 and 4 are handoffs"
+    );
+}
+
+/// An address that never changed hands is not scoped at all, so an ordinary
+/// user's history comes back whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_unhandled_account_is_not_scoped() {
+    let (pool, _url, _container) = start_postgres().await;
+    db::init_schema(&pool).await.unwrap();
+    init_owner_change_table(&pool).await;
+
+    let owner = [1u8; 32];
+    let token_account = [8u8; 32];
+
+    let user_id = insert_user(&pool, "user").await;
+    insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
+    let token = generate_token(user_id, "user");
+
+    let backend = start_mock_backend_with_sequence(vec![
+        token_account_response(&owner, None),
+        history_page_for_slots(&[1, 2, 3]),
+    ])
+    .await;
+    let addr = start_gateway(
+        pool,
+        "http://127.0.0.1:1".to_string(),
+        format!("http://{}", backend),
+    )
+    .await;
+
+    let res = Client::new()
+        .post(format!("http://{}", addr))
+        .bearer_auth(token)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [bs58::encode(token_account).into_string()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(returned_signatures(&body), vec!["sig3", "sig2", "sig1"]);
 }
 
 /// An Operator keeps the raw errors, so diagnostics survive the redaction.
