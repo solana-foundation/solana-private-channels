@@ -191,7 +191,9 @@ const RELEASED_BY_OBSERVATION: &str = "EXISTS (SELECT 1 FROM observed_releases r
                          WHERE r.withdrawal_nonce = t.withdrawal_nonce
                            AND r.slot <= $1)";
 
-/// The same, plus the operator's own record of a confirmed payout.
+/// The same, plus the operator's own record of a confirmed payout. `completed` carries no
+/// slot, so it can only misjudge a payout finalized after the custody reading: the window
+/// between that reading and this query, not the indexer's lag.
 const RELEASED_BY_OBSERVATION_OR_STATUS: &str = "(t.status = 'completed' OR EXISTS (
                          SELECT 1 FROM observed_releases r
                          WHERE r.withdrawal_nonce = t.withdrawal_nonce

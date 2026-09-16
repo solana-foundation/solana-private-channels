@@ -231,6 +231,10 @@ pub async fn reconcile_against_snapshot(
     // and reading those as a shortfall would fail an otherwise healthy boot. Re-read it with
     // the operator's own completions standing in for the releases the indexer has yet to
     // record, so a drain nothing accounts for still stops the boot.
+    //
+    // A row reaches `completed` only once its release is finalized, so the only payout this
+    // can subtract early is one finalized between the custody reading and this query. That
+    // window is seconds wide and independent of how far the indexer trails.
     let committed = storage
         .get_committed_checkpoint(&program_key(program_type))
         .await
