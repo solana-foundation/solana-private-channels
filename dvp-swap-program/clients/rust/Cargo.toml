@@ -8,21 +8,21 @@ repository = "https://github.com/solana-foundation/dvp"
 
 [dependencies]
 borsh = { workspace = true, features = ["derive"] }
-solana-account-info = "2.2.1"
+solana-account-info = "3"
 # `curve25519` enables the host-side PDA derivation (`find_program_address`)
 # used by the handwritten `verify` module; `borsh` provides the Borsh impls
 # the generated account/instruction structs derive against. Host-only client
 # crate, so neither reaches the on-chain program build.
-solana-pubkey = { version = "2.2.1", features = ["curve25519", "borsh"] }
-solana-instruction = "2.2.1"
-solana-cpi = "2.2.1"
+solana-pubkey = { version = "4", features = ["curve25519", "borsh"] }
+solana-instruction = "3"
+solana-cpi = "3"
 num-derive = { workspace = true }
 
-solana-client = { version = "2.2.1", optional = true }
-solana-account = { version = "2.2.1", optional = true }
+solana-client = { version = "4.2", optional = true }
+solana-account = { version = "4", optional = true }
 num-traits = { workspace = true }
 
-solana-program-error = "2.2.1"
+solana-program-error = "3"
 thiserror = { workspace = true }
 
 [features]

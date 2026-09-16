@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 private-channel-escrow-program-client.workspace = true
 private-channel-withdraw-program-client.workspace = true
-solana-client = "2.3.10"
+solana-client = { workspace = true }
 solana-sdk.workspace = true
 solana-system-interface.workspace = true
 spl-associated-token-account.workspace = true

@@ -249,6 +249,7 @@ impl TransactionProcessor {
                     mint_statuses.push(DbMintStatus {
                         mint_address: change.mint_address,
                         status: change.status.as_str().to_string(),
+                        withdrawals_blocked: change.withdrawals_blocked,
                         effective_slot: slot as i64,
                         signature: sig,
                         created_at: chrono::Utc::now(),
@@ -497,13 +498,17 @@ impl MintStatus {
 /// A mint allow/block transition to record in `mint_status_history`.
 struct MintStatusChange {
     mint_address: String,
+    /// The deposit gate.
     status: MintStatus,
+    /// The withdrawal gate, carried separately because the two are independent
+    /// on chain.
+    withdrawals_blocked: bool,
 }
 
 /// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction,
 /// DbObservedRelease)` tuple, each element independently optional:
 /// - `AllowMint` → mints-row upsert + `"allowed"` transition.
-/// - `BlockMint` → `"blocked"` transition only (mints row already exists).
+/// - `BlockMint` → deposit-gate transition only (mints row already exists).
 /// - `Deposit` / `WithdrawFunds` → transaction row only.
 /// - `ReleaseFunds` yields an observed-release row only.
 ///
@@ -580,16 +585,28 @@ fn convert_to_db_models(
                         Some(MintStatusChange {
                             mint_address,
                             status: MintStatus::Allowed,
+                            // AllowMint re-opens both gates on chain, so a
+                            // re-allow must clear the withdrawal gate too.
+                            withdrawals_blocked: false,
                         }),
                         None,
                         None,
                     )
                 }
-                EscrowInstruction::BlockMint { accounts } => (
+                // Both gates are recorded. `status` feeds the deposit-slot check;
+                // `withdrawals_blocked` is mirrored onto the mints row and read by
+                // the withdrawal pre-flight, so a mint blocked mid-run stops
+                // releasing without an operator restart.
+                EscrowInstruction::BlockMint { accounts, data } => (
                     None,
                     Some(MintStatusChange {
                         mint_address: accounts.mint.to_string(),
-                        status: MintStatus::Blocked,
+                        status: if data.block_deposits {
+                            MintStatus::Blocked
+                        } else {
+                            MintStatus::Allowed
+                        },
+                        withdrawals_blocked: data.block_withdrawals,
                     }),
                     None,
                     None,
@@ -645,9 +662,9 @@ mod tests {
     use super::*;
     use crate::indexer::checkpoint::CheckpointWriter;
     use crate::indexer::datasource::common::parser::{
-        AllowMintAccounts, AllowMintData, AllowMintEvent, BlockMintAccounts, DepositAccounts,
-        DepositData, DepositEvent, ReleaseFundsAccounts, ReleaseFundsData, RotateBitmapAccounts,
-        WithdrawFundsAccounts, WithdrawFundsData,
+        AllowMintAccounts, AllowMintData, AllowMintEvent, BlockMintAccounts, BlockMintData,
+        DepositAccounts, DepositData, DepositEvent, ReleaseFundsAccounts, ReleaseFundsData,
+        RotateBitmapAccounts, WithdrawFundsAccounts, WithdrawFundsData,
     };
     use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::storage::mock::MockStorage;
@@ -754,7 +771,12 @@ mod tests {
 
     /// BlockMint scoped to `allow_mint_instance()` so it follows an AllowMint on
     /// the same watched instance, mirroring the on-chain allow-then-block order.
-    fn make_block_mint_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
+    fn make_block_mint_instruction(
+        slot: u64,
+        sig: Option<String>,
+        block_deposits: bool,
+        block_withdrawals: bool,
+    ) -> InstructionWithMetadata {
         InstructionWithMetadata {
             instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::BlockMint {
                 accounts: BlockMintAccounts {
@@ -763,9 +785,12 @@ mod tests {
                     instance: allow_mint_instance(),
                     mint: make_pubkey(2),
                     allowed_mint: make_pubkey(13),
-                    system_program: make_pubkey(15),
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
+                },
+                data: BlockMintData {
+                    block_deposits,
+                    block_withdrawals,
                 },
             })),
             slot,
@@ -912,19 +937,18 @@ mod tests {
         let status = status.expect("AllowMint must emit a status change");
         assert_eq!(status.status, MintStatus::Allowed);
         assert_eq!(status.mint_address, make_pubkey(2).to_string());
+        // AllowMint re-opens both gates on chain, so a re-allow must clear a
+        // withdrawal block the mirror is still carrying.
+        assert!(!status.withdrawals_blocked);
         let mint = mint.unwrap();
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
-        // The indexer leaves Token-2022 extension resolution to the operator —
-        // both flags must stay None at AllowMint time.
-        assert_eq!(mint.is_pausable, None);
-        assert_eq!(mint.has_permanent_delegate, None);
     }
 
     #[test]
     fn convert_block_mint_returns_blocked_status_no_mint_no_txn() {
-        let ix = make_block_mint_instruction(210, Some("sig-block-1".to_string()));
+        let ix = make_block_mint_instruction(210, Some("sig-block-1".to_string()), true, false);
         let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         // Block never upserts a mints row and never produces a transaction —
         // only a "blocked" status transition for the already-allowed mint.
@@ -933,6 +957,25 @@ mod tests {
         let status = status.expect("BlockMint must emit a status change");
         assert_eq!(status.status, MintStatus::Blocked);
         assert_eq!(status.mint_address, make_pubkey(2).to_string());
+        // Deposits only: the withdrawal gate must not be dragged along with it.
+        assert!(!status.withdrawals_blocked);
+    }
+
+    // The status column tracks the deposit gate, so a withdrawals-only block
+    // leaves deposits recorded as allowed.
+    #[test]
+    fn convert_block_mint_withdrawals_only_keeps_deposits_allowed() {
+        let ix = make_block_mint_instruction(
+            211,
+            Some("sig-block-withdrawals".to_string()),
+            false,
+            true,
+        );
+        let (_, status, _, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
+        let status = status.expect("BlockMint must emit a status change");
+        assert_eq!(status.status, MintStatus::Allowed);
+        // This is the flag the withdrawal pre-flight reads once it is mirrored.
+        assert!(status.withdrawals_blocked);
     }
 
     #[test]
@@ -1219,6 +1262,8 @@ mod tests {
         processor.buffer(make_block_mint_instruction(
             250,
             Some("sig-block-2".to_string()),
+            true,
+            false,
         ));
         processor
             .finalize_and_checkpoint(250, ProgramType::Escrow)

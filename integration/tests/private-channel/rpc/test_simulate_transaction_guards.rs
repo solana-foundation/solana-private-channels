@@ -20,12 +20,12 @@ use {
     jsonrpsee::server::RpcModule,
     private_channel_core::{
         accounts::AccountsDB,
-        rpc::{create_rpc_module, ReadDeps},
+        rpc::{constants::MAX_CONCURRENT_SIMULATIONS, create_rpc_module, ReadDeps},
     },
     serde_json::{json, Value},
     solana_sdk::{
         hash::Hash,
-        instruction::CompiledInstruction,
+        message::compiled_instruction::CompiledInstruction,
         message::{Message, MessageHeader},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
@@ -64,6 +64,7 @@ async fn build_module(admin_keys: Vec<Pubkey>) -> (RpcModule<()>, ContainerAsync
         admin_keys,
         live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
         max_blockhashes: 150,
+        simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
     };
     let module = create_rpc_module(Some(read_deps), None).await;
     (module, pg)
@@ -100,7 +101,11 @@ fn tx_with_account_keys(total_keys: usize) -> Transaction {
     );
     let payer = Keypair::new();
     let recipient = Pubkey::new_unique();
-    let mut account_keys = vec![payer.pubkey(), recipient, solana_sdk::system_program::ID];
+    let mut account_keys = vec![
+        payer.pubkey(),
+        recipient,
+        solana_sdk_ids::system_program::ID,
+    ];
     while account_keys.len() < total_keys {
         account_keys.push(Pubkey::new_unique());
     }

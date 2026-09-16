@@ -91,6 +91,8 @@ pub fn escrow_deposit_tx_info() -> SubscribeUpdateTransactionInfo {
     };
 
     let message = ProtoMessage {
+        // A v1 message would carry its compute budget here; these fixtures are v0.
+        config: None,
         header: Some(MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,
@@ -148,6 +150,8 @@ pub fn unknown_discriminator_tx_info() -> SubscribeUpdateTransactionInfo {
         data: vec![0xFEu8],
     };
     let message = ProtoMessage {
+        // A v1 message would carry its compute budget here; these fixtures are v0.
+        config: None,
         header: Some(MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,
@@ -189,6 +193,8 @@ pub fn bad_program_index_tx_info() -> SubscribeUpdateTransactionInfo {
         data: vec![0x00],
     };
     let message = ProtoMessage {
+        // A v1 message would carry its compute budget here; these fixtures are v0.
+        config: None,
         header: Some(MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,
@@ -252,6 +258,8 @@ pub fn wrong_program_tx_info(
         data: ix_data,
     };
     let message = ProtoMessage {
+        // A v1 message would carry its compute budget here; these fixtures are v0.
+        config: None,
         header: Some(MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,

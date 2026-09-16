@@ -1,4 +1,3 @@
-pub mod account_matches_owners;
 pub mod address_index_repair;
 pub mod address_index_watermark;
 pub mod bob;
@@ -37,6 +36,7 @@ pub mod truncate;
 pub mod types;
 pub mod utils;
 pub mod write_batch;
+pub mod writer_epoch;
 pub mod writer_lease;
 
 use {

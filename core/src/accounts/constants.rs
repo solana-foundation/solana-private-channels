@@ -12,7 +12,7 @@ pub const CF_METADATA: &str = "metadata";
 
 /// Column family for storing transaction history
 /// Key: Signature (64 bytes)
-/// Value: Serialized StoredTransaction (includes transaction, metadata, and execution results)
+/// Value: `StoredTransaction::to_bytes`, a versioned row holding the signed wire bytes and metadata
 pub const CF_TRANSACTIONS: &str = "transactions";
 
 /// Column family for storing block metadata

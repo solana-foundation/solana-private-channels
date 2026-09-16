@@ -1,12 +1,17 @@
 use crate::rpc::{
-    error::{block_not_available, custom_error, slot_skipped, JSON_RPC_SERVER_ERROR},
+    error::{
+        block_not_available, custom_error, slot_skipped, unsupported_transaction_version,
+        JSON_RPC_SERVER_ERROR,
+    },
     ReadDeps,
 };
 use jsonrpsee::core::RpcResult;
 use serde_json::{json, Value};
 use solana_rpc_client_types::config::{RpcBlockConfig, RpcEncodingConfigWrapper};
 use solana_transaction_status::{BlockEncodingOptions, ConfirmedBlock, TransactionWithStatusMeta};
-use solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding};
+use solana_transaction_status_client_types::{
+    EncodeError, TransactionDetails, UiTransactionEncoding,
+};
 
 pub async fn get_block_impl(
     read_deps: &ReadDeps,
@@ -83,7 +88,11 @@ pub async fn get_block_impl(
                 max_supported_transaction_version: config.max_supported_transaction_version,
             },
         )
-        .unwrap();
+        // One transaction above the caller's ceiling fails the whole block, the
+        // same way Agave answers, rather than faulting the connection.
+        .map_err(|EncodeError::UnsupportedTransactionVersion(version)| {
+            unsupported_transaction_version(version)
+        })?;
 
     Ok(Some(json!(encoded_block)))
 }

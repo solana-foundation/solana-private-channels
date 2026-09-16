@@ -85,6 +85,17 @@ const WITHDRAW_PROGRAM_PATH: &str = concat!(
     "/programs/private_channel_withdraw_program.so"
 );
 
+/// Transfer-hook program the hook-mint tests point their mints at. Loaded for
+/// every validator so no test has to opt in. Matches `declare_id!` in
+/// `private-channel-escrow-program/tests/transfer-hook-fixture`.
+pub const HOOK_FIXTURE_PROGRAM_ID: solana_sdk::pubkey::Pubkey =
+    solana_sdk::pubkey!("hookEjHJAu757hfesyLchyGLxH6BeNuEbcztVEFT4K4");
+
+const HOOK_FIXTURE_PROGRAM_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/programs/transfer_hook_fixture.so"
+);
+
 #[cfg(target_os = "macos")]
 const GEYSER_PLUGIN_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -273,6 +284,10 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
             PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
             WITHDRAW_PROGRAM_PATH,
         );
+        let hook_fixture_program = make_program_info(
+            HOOK_FIXTURE_PROGRAM_ID.to_bytes(),
+            HOOK_FIXTURE_PROGRAM_PATH,
+        );
 
         let geyser_config = serde_json::json!({
             "libpath": GEYSER_PLUGIN_PATH,
@@ -297,7 +312,11 @@ pub async fn start_test_validator() -> (TestValidator, Keypair, u16) {
             .rpc_config(rpc_config)
             .rpc_port(rpc_port)
             .gossip_port(gossip_port)
-            .add_upgradeable_programs_with_path(&[escrow_program, withdraw_program])
+            .add_upgradeable_programs_with_path(&[
+                escrow_program,
+                withdraw_program,
+                hook_fixture_program,
+            ])
             .start();
         (validator, mint, geyser_port)
     })
@@ -357,6 +376,10 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
             PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_bytes(),
             WITHDRAW_PROGRAM_PATH,
         );
+        let hook_fixture_program = make_program_info(
+            HOOK_FIXTURE_PROGRAM_ID.to_bytes(),
+            HOOK_FIXTURE_PROGRAM_PATH,
+        );
 
         let mut genesis = TestValidatorGenesis::default();
 
@@ -364,7 +387,11 @@ pub async fn start_test_validator_no_geyser() -> (TestValidator, Keypair) {
             .rpc_config(rpc_config)
             .rpc_port(rpc_port)
             .gossip_port(gossip_port)
-            .add_upgradeable_programs_with_path(&[escrow_program, withdraw_program])
+            .add_upgradeable_programs_with_path(&[
+                escrow_program,
+                withdraw_program,
+                hook_fixture_program,
+            ])
             .start()
     })
     .await;

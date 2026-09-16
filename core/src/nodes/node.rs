@@ -2,7 +2,7 @@ use {
     crate::{
         accounts::{
             address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
-            redis::RedisAccountsDB, writer_lease::WriterLease, AccountsDB,
+            redis::RedisAccountsDB, writer_epoch, writer_lease::WriterLease, AccountsDB,
         },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
@@ -17,7 +17,7 @@ use {
             sequencer::start_sequence_worker,
             settle::start_settle_worker,
             sigverify::start_sigverify_workerpool,
-            AccountSettlements, ExecutedBatch,
+            ExecutedBatch, SettledInbox,
         },
     },
     futures::future::FutureExt,
@@ -323,13 +323,14 @@ async fn start_services(
             let (execution_results_tx, execution_results_rx) =
                 mpsc::channel::<ExecutedBatch>(config.execution_results_capacity);
 
-            // Create settled accounts channel between settler and executor
-            let (settled_accounts_tx, settled_accounts_rx) =
-                mpsc::unbounded_channel::<AccountSettlements>();
+            // Settled accounts from settler to the executor's BOB. Exactly one inbox,
+            // cloned to both: a second would compile and strand every dirty entry.
+            let settled_inbox = SettledInbox::new();
 
-            // Create settled blockhashes channel between settler and dedup
+            // Settled blockhashes from settler to dedup, as deep as dedup's window so
+            // a full queue holds only hashes a caught-up dedup would still keep.
             let (settled_blockhashes_tx, settled_blockhashes_rx) =
-                mpsc::unbounded_channel::<Hash>();
+                mpsc::channel::<Hash>(config.max_blockhashes);
 
             // Load persisted dedup state from DB before starting the stage.
             // Failure here is fatal: starting with an empty cache could allow
@@ -342,6 +343,14 @@ async fn start_services(
             // The read-only node opens its own read_only=true handle below, where
             // the repair is skipped.
             let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
+            // Claimed under the lease and before anything reads the chain: the bump
+            // waits out the old writer's last batch and fences every later one, so
+            // the dedup state and tip loaded below are final.
+            let AccountsDB::Postgres(ref postgres_db) = db else {
+                return Err("the write pipeline requires a Postgres accounts database".into());
+            };
+            let writer_epoch = writer_epoch::bump(postgres_db).await?;
+            info!("Claimed writer epoch {writer_epoch}");
             repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
             let (initial_live_blockhashes, initial_dedup_cache) =
                 load_dedup_state(&db, config.max_blockhashes).await?;
@@ -402,7 +411,7 @@ async fn start_services(
             // Start executor (executes and settles batches)
             let execution = start_execution_worker(crate::stages::ExecutionArgs {
                 batch_rx,
-                settled_accounts_rx,
+                settled_accounts: settled_inbox.clone(),
                 execution_results_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
                 metrics: Arc::clone(&config.metrics),
@@ -423,7 +432,7 @@ async fn start_services(
 
             let settle = start_settle_worker(crate::stages::SettleArgs {
                 execution_results_rx,
-                settled_accounts_tx,
+                settled_accounts_tx: settled_inbox,
                 settled_blockhashes_tx,
                 address_signatures_tx: addr_sig_tx,
                 accountsdb_connection_url: config.accountsdb_connection_url.clone(),
@@ -435,6 +444,7 @@ async fn start_services(
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: settler_hb,
+                writer_epoch: Some(writer_epoch),
             })
             .await;
             workers.push(settle);
@@ -501,6 +511,9 @@ async fn start_services(
                 accounts_db,
                 live_blockhashes: live_blockhashes_arc,
                 max_blockhashes,
+                simulation_permits: tokio::sync::Semaphore::new(
+                    crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
+                ),
             })
         }
         NodeMode::Write => None,

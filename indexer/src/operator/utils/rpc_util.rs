@@ -2,12 +2,12 @@ use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_response::{Response, RpcBlockhash};
+use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::client_error;
 use solana_rpc_client_api::client_error::ErrorKind;
 use solana_rpc_client_api::config::{RpcAccountInfoConfig, RpcTransactionConfig};
 use solana_rpc_client_api::request::{RpcError, RpcRequest};
 use solana_sdk::account::Account;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -295,23 +295,22 @@ impl RpcClientWithRetry {
         .await
     }
 
-    /// Get account with retry
+    /// Get account data with retry
     pub async fn get_account_data(
         &self,
         pubkey: &Pubkey,
     ) -> Result<Vec<u8>, Box<client_error::Error>> {
-        self.with_retry("get_account_info", RetryPolicy::Idempotent, || async {
-            self.rpc_client.get_account_data(pubkey).await
-        })
-        .await
+        Ok(self.get_account(pubkey).await?.data)
     }
 
-    /// Get account with retry
+    /// Get account with retry. An absent account is the client's `AccountNotFound` error.
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<Account, Box<client_error::Error>> {
-        self.with_retry("get_account", RetryPolicy::Idempotent, || async {
-            self.rpc_client.get_account(pubkey).await
-        })
-        .await
+        self.get_account_with_context(pubkey, self.rpc_client.commitment())
+            .await?
+            .value
+            .ok_or_else(|| {
+                Box::new(RpcError::ForUser(format!("AccountNotFound: pubkey={pubkey}")).into())
+            })
     }
 
     /// Read an account at the given commitment, returning the response context
@@ -322,16 +321,8 @@ impl RpcClientWithRetry {
         pubkey: &Pubkey,
         commitment: CommitmentConfig,
     ) -> Result<Response<Option<Account>>, Box<client_error::Error>> {
-        self.with_retry(
-            "get_account_with_context",
-            RetryPolicy::Idempotent,
-            || async {
-                self.rpc_client
-                    .get_account_with_commitment(pubkey, commitment)
-                    .await
-            },
-        )
-        .await
+        self.get_account_with_context_min_slot(pubkey, commitment, None)
+            .await
     }
 
     /// Like `get_account_with_context`, but requires the node to answer from a
@@ -355,9 +346,24 @@ impl RpcClientWithRetry {
                     commitment: Some(commitment),
                     min_context_slot,
                 };
-                self.rpc_client
-                    .get_account_with_config(pubkey, config)
-                    .await
+                // Decoded here, not by the client, whose own decode panics on bad data.
+                // Data that will not decode is an error: absent would read as "no account".
+                let response = self
+                    .rpc_client
+                    .get_ui_account_with_config(pubkey, config)
+                    .await?;
+                let value = match response.value {
+                    None => None,
+                    Some(account) => Some(account.to_account().ok_or_else(|| {
+                        client_error::Error::from(ErrorKind::Custom(format!(
+                            "account {pubkey} returned data that does not decode"
+                        )))
+                    })?),
+                };
+                Ok::<_, client_error::Error>(Response {
+                    context: response.context,
+                    value,
+                })
             },
         )
         .await
@@ -523,7 +529,9 @@ impl RpcClientWithRetry {
         let config = RpcTransactionConfig {
             encoding: Some(solana_transaction_status::UiTransactionEncoding::JsonParsed),
             commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
+            // A ceiling, not a request: below it a v1 transaction comes back as
+            // -32015 instead of being read. Matches the poller's.
+            max_supported_transaction_version: Some(1),
         };
 
         self.with_retry("get_transaction", RetryPolicy::Idempotent, || async {
@@ -938,6 +946,71 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.value.is_none());
+    }
+
+    /// A getAccountInfo body whose account data is not valid base64.
+    async fn mock_undecodable_account(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getAccountInfo""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":9},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["not base64!","base64"],"executable":false,"rentEpoch":0}},"id":0}"#,
+            )
+            .create_async()
+            .await
+    }
+
+    /// Data that will not decode is a read failure, never an absent account or a panic.
+    #[tokio::test]
+    async fn undecodable_account_is_err_not_absent() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = mock_undecodable_account(&mut server).await;
+        let client = make_client_at(&server.url());
+
+        let err = client
+            .get_account_with_context(&Pubkey::default(), CommitmentConfig::finalized())
+            .await
+            .expect_err("undecodable data must not read as None");
+        assert!(err.to_string().contains("does not decode"), "{err}");
+
+        let err = client
+            .get_account_with_context_min_slot(
+                &Pubkey::default(),
+                CommitmentConfig::finalized(),
+                Some(1),
+            )
+            .await
+            .expect_err("undecodable data must not read as None");
+        assert!(err.to_string().contains("does not decode"), "{err}");
+
+        let err = client
+            .get_account_data(&Pubkey::default())
+            .await
+            .expect_err("undecodable data must not read as data");
+        assert!(!err.to_string().contains("AccountNotFound"), "{err}");
+    }
+
+    /// `get_account_data` keeps the client's contract: absence is `AccountNotFound`.
+    #[tokio::test]
+    async fn get_account_data_absent_is_account_not_found() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":7},"value":null},"id":0}"#)
+            .create_async()
+            .await;
+        let client = make_client_at(&server.url());
+        let err = client
+            .get_account_data(&Pubkey::default())
+            .await
+            .expect_err("absent account");
+        assert!(is_permanent_rpc_error(&err), "{err}");
     }
 
     #[tokio::test]

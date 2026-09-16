@@ -1,10 +1,10 @@
 use litesvm::{types::TransactionMetadata, LiteSVM};
 use private_channel_withdraw_program_client::PrivateChannelWithdrawProgramError;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey;
 use solana_program_pack::Pack;
 use solana_sdk::{
     account::Account,
-    compute_budget::ComputeBudgetInstruction,
     instruction::Instruction,
     program_option::COption,
     pubkey::Pubkey,
@@ -222,15 +222,12 @@ impl Default for TestContext {
 pub fn get_token_balance(context: &mut TestContext, ata: &Pubkey) -> u64 {
     let account = context.get_account(ata);
     match account {
-        Some(account) => {
-            if account.owner == TOKEN_PROGRAM_ID {
-                let token_account =
-                    TokenAccount::unpack(&account.data).expect("Should deserialize token account");
-                token_account.amount
-            } else {
-                0
-            }
+        Some(account) if account.owner == TOKEN_PROGRAM_ID => {
+            let token_account =
+                TokenAccount::unpack(&account.data).expect("Should deserialize token account");
+            token_account.amount
         }
+        Some(_) => 0,
         None => 0,
     }
 }

@@ -11,9 +11,9 @@ use {
         nodes::node::{run_node, NodeConfig, NodeHandles, NodeMode},
     },
     solana_client::nonblocking::rpc_client::RpcClient,
+    solana_commitment_config::CommitmentConfig,
     solana_sdk::{
         account::AccountSharedData,
-        commitment_config::CommitmentConfig,
         instruction::Instruction,
         message::Message,
         pubkey::Pubkey,

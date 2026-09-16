@@ -3,7 +3,7 @@
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 //! Requires Docker to be running.
 
-use private_channel_core::accounts::AccountsDB;
+use private_channel_core::accounts::{traits::BlockInfo, AccountsDB};
 use private_channel_core::stages::AccountSettlement;
 use private_channel_core::test_helpers::{
     create_test_block_info, create_test_sanitized_transaction,
@@ -15,7 +15,9 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::Keypair,
 };
-use solana_svm::transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails};
+use solana_svm::transaction_execution_result::{
+    AccountsDeltas, ExecutedTransaction, TransactionExecutionDetails,
+};
 use solana_svm::transaction_processing_result::ProcessedTransaction;
 use std::collections::HashMap;
 use testcontainers::runners::AsyncRunner;
@@ -62,7 +64,10 @@ fn make_executed_tx(accounts: Vec<(Pubkey, AccountSharedData)>) -> ProcessedTran
             inner_instructions: None,
             return_data: None,
             executed_units: 0,
-            accounts_data_len_delta: 0,
+            accounts_deltas: Some(AccountsDeltas {
+                accounts_resize_delta: 0,
+                accounts_uninitialized_size: 0,
+            }),
         },
         programs_modified_by_tx: HashMap::new(),
     }))
@@ -117,28 +122,6 @@ async fn test_get_multiple_accounts() {
     assert!(results[1].is_some());
     assert_eq!(results[1].as_ref().unwrap().lamports(), 200);
     assert!(results[2].is_none());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_account_matches_owners() {
-    let (mut db, _pg) = start_postgres().await;
-
-    let owner_a = Pubkey::new_unique();
-    let owner_b = Pubkey::new_unique();
-    let owner_c = Pubkey::new_unique();
-    let pubkey = Pubkey::new_unique();
-
-    db.set_account(pubkey, make_account(100, &owner_b)).await;
-
-    // Wrap in AccountsDB::Postgres to call account_matches_owners via the trait
-    // The trait impl is on PostgresAccountsDB which delegates to get_account + owner check
-    use solana_svm_callback::TransactionProcessingCallback;
-    if let AccountsDB::Postgres(ref pg) = db {
-        let result = pg.account_matches_owners(&pubkey, &[owner_a, owner_b, owner_c]);
-        assert_eq!(result, Some(1)); // owner_b is at index 1
-    } else {
-        panic!("Expected Postgres variant");
-    }
 }
 
 // ── Block Operations ──────────────────────────────────────────────────────────
@@ -388,7 +371,7 @@ async fn write_batch_rejects_a_block_at_or_below_the_stored_tip() {
 
         let err = result.expect_err("a block at or below the tip must be rejected");
         assert!(
-            err.contains(&slot.to_string()),
+            err.to_string().contains(&slot.to_string()),
             "the error must name the rejected slot, got: {err}"
         );
 
@@ -448,9 +431,9 @@ async fn write_batch_accepts_an_identical_replay_of_the_stored_tip() {
     assert_eq!(db.get_block(5).await.unwrap().unwrap().blockhash, blockhash);
 }
 
-/// The guard rejects rewinds and overwrites, not gaps. The settler only ever
-/// extends by one slot, so gaps cost nothing to allow and keep write_batch
-/// usable for building arbitrary ledger fixtures.
+/// The guard rejects rewinds, overwrites and wrong parents, not gaps. Idle ticks
+/// leave slots without blocks, so a block may skip slots as long as it names the
+/// stored tip as its parent.
 #[tokio::test(flavor = "multi_thread")]
 async fn write_batch_accepts_a_block_above_the_stored_tip() {
     let (mut db, _pg) = start_postgres().await;
@@ -463,9 +446,13 @@ async fn write_batch_accepts_a_block_above_the_stored_tip() {
     .await
     .unwrap();
 
-    for slot in [6u64, 20] {
+    for (slot, parent_slot) in [(6u64, 5u64), (20, 6)] {
         let blockhash = Hash::new_unique();
-        db.write_batch(&[], vec![], Some(create_test_block_info(slot, blockhash)))
+        let block = BlockInfo {
+            parent_slot,
+            ..create_test_block_info(slot, blockhash)
+        };
+        db.write_batch(&[], vec![], Some(block))
             .await
             .unwrap_or_else(|e| panic!("slot {slot} must commit above the tip: {e}"));
 

@@ -74,7 +74,7 @@ async fn sponsor_cannot_replay_spl_transfer_under_varied_first_signature() {
     let (ingress_tx, ingress_rx) = create_ingress_channel(64);
     let (dedup_tx, dedup_rx) = mpsc::channel::<SanitizedTransaction>(64);
     let (output_tx, mut output_rx) = mpsc::channel::<SanitizedTransaction>(64);
-    let (blockhash_tx, blockhash_rx) = mpsc::unbounded_channel::<Hash>();
+    let (blockhash_tx, blockhash_rx) = mpsc::channel::<Hash>(8);
     let shutdown = CancellationToken::new();
 
     let _sigverify_workers = start_sigverify_workerpool(SigverifyArgs {
@@ -101,7 +101,9 @@ async fn sponsor_cannot_replay_spl_transfer_under_varied_first_signature() {
 
     // Make the transfer's blockhash live so dedup does not reject it as unknown.
     let blockhash = Hash::new_unique();
-    blockhash_tx.send(blockhash).expect("seed live blockhash");
+    blockhash_tx
+        .try_send(blockhash)
+        .expect("seed live blockhash");
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Sponsor pays fees (first signer); victim owner authorizes the transfer

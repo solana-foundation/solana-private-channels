@@ -6,17 +6,19 @@
 //! the store cannot answer, and still sees a null for an account that is simply
 //! not there.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     private_channel_core::{
         accounts::AccountsDB,
         health::HeartbeatRegistry,
         rpc::{
+            constants::MAX_CONCURRENT_SIMULATIONS,
             server::{start_rpc_service, RpcServiceConfig},
             ReadDeps,
         },
     },
     solana_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::{account::AccountSharedData, commitment_config::CommitmentConfig, pubkey::Pubkey},
+    solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
     std::{
         collections::LinkedList,
         sync::{Arc, RwLock},
@@ -65,6 +67,7 @@ async fn start_read_only_rpc() -> (
             admin_keys: vec![],
             live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
             max_blockhashes: 150,
+            simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
         }),
         write_deps: None,
         heartbeats: HeartbeatRegistry::new(),

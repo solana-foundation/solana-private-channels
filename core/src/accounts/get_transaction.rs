@@ -41,7 +41,7 @@ async fn get_transaction_postgres(
     };
 
     let data: Vec<u8> = row.get("data");
-    let tx = bincode::deserialize(&data)
+    let tx = StoredTransaction::from_bytes(&data)
         .with_context(|| format!("Failed to deserialize transaction {}", sig_str))?;
     debug!("Retrieved transaction {}", sig_str);
     Ok(Some(tx))
@@ -61,10 +61,10 @@ async fn get_transaction_redis(
     };
 
     if let Some(bytes) = cached {
-        match bincode::deserialize(&bytes) {
+        match StoredTransaction::from_bytes(&bytes) {
             Ok(tx) => return Ok(Some(tx)),
-            // Written by an older build whose StoredTransaction had a different
-            // layout. Falling through keeps the signature readable.
+            // Written by an older build whose row format differs. Falling
+            // through lets Postgres answer instead.
             Err(e) => warn!(
                 "Failed to deserialize cached transaction {}: {}",
                 signature, e

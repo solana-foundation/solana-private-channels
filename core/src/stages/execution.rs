@@ -8,20 +8,21 @@ use {
         },
         scheduler::ConflictFreeBatch,
         stage_metrics::SharedMetrics,
-        stages::{retained_bytes_of, AccountSettlements, ExecutedBatch, WeightBudget},
+        stages::{retained_bytes_of, ExecutedBatch, SettledInbox, WeightBudget},
         transactions::is_admin_instruction,
         vm::{
             admin::AdminVm,
             clock::set_clock_now,
             gasless_callback::{GaslessCallback, SnapshotCallback, DEFAULT_FEE_PAYER_LAMPORTS},
-            gasless_rent_collector::GaslessRentCollector,
         },
     },
     solana_compute_budget::compute_budget::SVMTransactionExecutionBudget,
+    solana_program_runtime::loaded_programs::ProgramRuntimeEnvironments,
     solana_sdk::{
-        account::{AccountSharedData, ReadableAccount, WritableAccount},
+        account::{AccountSharedData, ReadableAccount},
         hash::Hash,
         pubkey::Pubkey,
+        rent::Rent,
         transaction::{SanitizedTransaction, TransactionError},
     },
     solana_svm::{
@@ -33,8 +34,8 @@ use {
         },
     },
     solana_svm_feature_set::SVMFeatureSet,
-    solana_svm_transaction::svm_message::SVMMessage,
-    solana_timings::ExecuteTimings,
+    solana_svm_timings::ExecuteTimings,
+    solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage},
     std::{
         collections::{HashMap, HashSet, LinkedList},
         sync::{Arc, RwLock},
@@ -53,7 +54,7 @@ const MIN_PARALLEL_BATCH_FACTOR: usize = 4;
 
 pub struct ExecutionArgs {
     pub batch_rx: mpsc::Receiver<ConflictFreeBatch>,
-    pub settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    pub settled_accounts: SettledInbox,
     pub execution_results_tx: mpsc::Sender<ExecutedBatch>,
     pub accountsdb_connection_url: String,
     pub metrics: SharedMetrics,
@@ -76,6 +77,12 @@ pub struct ExecutionDeps {
     pub max_svm_workers: usize,
     /// Shared live-blockhash window
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    /// The environments the program cache entries were compiled against.
+    ///
+    /// The cache matches an entry to an environment by pointer, so framing a
+    /// batch with anything else silently recompiles every program on every
+    /// batch. Cloning this is a refcount bump.
+    pub program_runtime_environments: ProgramRuntimeEnvironments,
     /// Account bytes one transaction may reference before it is refused.
     pub max_tx_loaded_accounts_bytes: usize,
     /// Account bytes one preload may pull in before the batch is split.
@@ -106,7 +113,7 @@ pub struct ExecutionResult {
 pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
     let ExecutionArgs {
         mut batch_rx,
-        settled_accounts_rx,
+        settled_accounts,
         execution_results_tx,
         accountsdb_connection_url,
         metrics,
@@ -125,7 +132,7 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
             .unwrap();
         let mut execution_deps = get_execution_deps(
             accounts_db,
-            settled_accounts_rx,
+            settled_accounts,
             max_svm_workers,
             live_blockhashes,
         )
@@ -185,52 +192,68 @@ pub async fn start_execution_worker(args: ExecutionArgs) -> WorkerHandle {
 
 pub async fn get_execution_deps(
     accounts_db: AccountsDB,
-    settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    settled_accounts: SettledInbox,
     max_svm_workers: usize,
     live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
 ) -> ExecutionDeps {
-    let bob = BOB::new(accounts_db, settled_accounts_rx).await;
+    let bob = BOB::new(accounts_db, settled_accounts).await;
     let feature_set = SVMFeatureSet::all_enabled();
     let compute_budget = SVMTransactionExecutionBudget::default();
-    let (vm, _fork_graph) =
+    let batch_processor =
         create_transaction_batch_processor(&bob, &feature_set, &compute_budget).unwrap();
     let admin_vm = AdminVm::default();
     ExecutionDeps {
         bob,
-        vm,
+        vm: batch_processor.processor,
         admin_vm,
         max_svm_workers,
         live_blockhashes,
+        program_runtime_environments: batch_processor.environments,
         max_tx_loaded_accounts_bytes: MAX_TX_LOADED_ACCOUNTS_BYTES,
         preload_budget_bytes: MAX_BATCH_PRELOAD_BYTES,
-        _fork_graph,
+        _fork_graph: batch_processor.fork_graph,
     }
 }
 
-/// Execute a chunk of transactions on the shared SVM with a dedicated
-/// per-thread processing environment.
+/// Build the frame one batch executes under.
 ///
-/// Each thread creates its own `TransactionProcessingEnvironment` because it
-/// contains `Option<&dyn SVMRentCollector>` and that trait has no `Sync`
-/// supertrait — so the environment can't be shared across threads. The
-/// environment is trivially cheap to construct, so per-thread construction has
-/// negligible cost compared to the SVM call it frames.
+/// Rent is expressed as a rate of zero rather than a hook, which is the only
+/// shape the SVM accepts now. Every rent check runs through the minimum balance,
+/// which is the byte count times the rate, so at a zero rate nothing is ever
+/// charged and every funded account is exempt whatever its size.
+fn processing_environment(
+    environments: &ProgramRuntimeEnvironments,
+) -> TransactionProcessingEnvironment {
+    TransactionProcessingEnvironment {
+        // TODO: Replace with proper blockhash for replay protection
+        blockhash: Hash::default(),
+        // Gasless - no lamports per signature
+        blockhash_lamports_per_signature: 0,
+        alpenglow_migration_succeeded: false,
+        epoch_total_stake: 0,
+        feature_set: SVMFeatureSet::all_enabled(),
+        // The pair is rebuilt from the same two handles rather than compiled
+        // again, so this costs two refcount bumps and the cache still matches
+        // every program it already holds.
+        program_runtime_environments: ProgramRuntimeEnvironments::new(
+            environments.get_env_for_execution().clone(),
+            environments.get_env_for_deployment().clone(),
+        ),
+        rent: Rent::free(),
+    }
+}
+
+/// Execute a chunk of transactions on the shared SVM.
+///
+/// Each worker frames its own batch, which costs one refcount bump on the shared
+/// environments and nothing else.
 fn execute_chunk(
     vm: &TransactionBatchProcessor<PrivateChannelForkGraph>,
     callback: &SnapshotCallback,
     transactions: &[SanitizedTransaction],
+    environments: &ProgramRuntimeEnvironments,
 ) -> LoadAndExecuteSanitizedTransactionsOutput {
-    let gasless_rent_collector = GaslessRentCollector::new();
-    let processing_environment = TransactionProcessingEnvironment {
-        blockhash: Hash::default(),
-        blockhash_lamports_per_signature: 0,
-        feature_set: SVMFeatureSet::all_enabled(),
-        rent_collector: Some(
-            &gasless_rent_collector
-                as &dyn solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
-        ),
-        ..Default::default()
-    };
+    let processing_environment = processing_environment(environments);
     let processing_config = TransactionProcessingConfig::default();
     let check_results = get_transaction_check_results(transactions.len());
 
@@ -366,6 +389,18 @@ pub(crate) const MAX_SEND_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 /// A chunk must never exceed the settler budget it is measured against.
 const _: () = assert!(MAX_SEND_CHUNK_BYTES <= crate::stages::MAX_BUFFERED_SETTLE_BYTES);
 
+/// Cap on address rows in one message to the settler. Bytes alone do not bound
+/// them: a large batch of dataless transactions naming many accounts weighs
+/// nothing and would still push one block past the settler's row cap.
+pub(crate) const MAX_SEND_CHUNK_ROWS: usize = crate::stages::MAX_BUFFERED_SETTLE_ROWS / 4;
+
+/// The settler takes one message past its row cap, so the two together must
+/// still fit the address-index writer's budget.
+const _: () = assert!(
+    crate::stages::MAX_BUFFERED_SETTLE_ROWS + MAX_SEND_CHUNK_ROWS
+        <= crate::stages::MAX_QUEUED_ADDRESS_ROWS
+);
+
 /// Cap on retained account bytes sent to the settler but not yet received.
 /// Two whole chunks, so the executor can hand one over while the settler still
 /// holds the previous one and ordinary traffic never waits on the budget.
@@ -437,6 +472,7 @@ pub(crate) async fn process_batch(
                 execution_result.admin_transactions,
                 execution_result.admin_generation,
                 MAX_SEND_CHUNK_BYTES,
+                MAX_SEND_CHUNK_ROWS,
                 results_budget,
                 metrics,
             )
@@ -465,6 +501,7 @@ pub(crate) async fn process_batch(
                 execution_result.regular_transactions,
                 execution_result.regular_generation,
                 MAX_SEND_CHUNK_BYTES,
+                MAX_SEND_CHUNK_ROWS,
                 results_budget,
                 metrics,
             )
@@ -509,12 +546,13 @@ struct ChunkRange {
 }
 
 /// Where to split a batch, as end-exclusive index ranges over its transactions.
-/// A chunk closes just before the transaction that would exceed the cap, so an
+/// A chunk closes just before the transaction that would exceed either cap, so an
 /// oversized one travels alone and no transaction is ever split across messages.
-fn chunk_ranges_by_bytes(
+fn chunk_ranges(
     results: &[TransactionProcessingResult],
     transactions: &[SanitizedTransaction],
-    cap: usize,
+    byte_cap: usize,
+    row_cap: usize,
 ) -> Vec<ChunkRange> {
     // A length mismatch is the settler's error to report, so send the batch whole.
     if results.len() != transactions.len() {
@@ -523,17 +561,22 @@ fn chunk_ranges_by_bytes(
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut buffered = 0usize;
+    let mut buffered_rows = 0usize;
     for (index, (result, transaction)) in results.iter().zip(transactions.iter()).enumerate() {
         let bytes = retained_bytes_of(result, transaction);
-        if index > start && buffered + bytes > cap {
+        // One row per account key, the same count the block writes to the index.
+        let rows = transaction.message().account_keys().len();
+        if index > start && (buffered + bytes > byte_cap || buffered_rows + rows > row_cap) {
             ranges.push(ChunkRange {
                 range: start..index,
                 bytes: buffered,
             });
             start = index;
             buffered = 0;
+            buffered_rows = 0;
         }
         buffered += bytes;
+        buffered_rows += rows;
     }
     if start < results.len() {
         ranges.push(ChunkRange {
@@ -572,19 +615,21 @@ fn record_unsent(
     crate::stages::record_discarded("executor", "settler queue closed", &signatures, metrics);
 }
 
-/// Send results to the settler in byte-bounded messages.
-/// A batch under the cap is sent untouched, so ordinary traffic only pays the byte
-/// sum. When split, the real generation rides the last chunk and earlier ones get zero.
-async fn send_results_chunked(
+/// Send results to the settler in byte-bounded and row-bounded messages. A batch
+/// under both caps goes untouched. Every chunk carries the batch's generation: the
+/// settler acknowledges each account at the write it committed, never a whole block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_results_chunked(
     results_tx: &mpsc::Sender<ExecutedBatch>,
     output: LoadAndExecuteSanitizedTransactionsOutput,
     transactions: Vec<SanitizedTransaction>,
     generation: u64,
     cap: usize,
+    row_cap: usize,
     budget: &WeightBudget,
     metrics: &SharedMetrics,
 ) -> SendOutcome {
-    let ranges = chunk_ranges_by_bytes(&output.processing_results, &transactions, cap);
+    let ranges = chunk_ranges(&output.processing_results, &transactions, cap, row_cap);
     if ranges.len() <= 1 {
         // Empty only when the batch is empty or its lengths disagree, and the
         // settler rejects the latter on arrival, so nothing is left unweighed.
@@ -624,9 +669,8 @@ async fn send_results_chunked(
     // Batch-wide telemetry has no per-chunk meaning, so it rides the first message.
     let mut head = Some((error_metrics, execute_timings, balance_collector));
 
-    let last = ranges.len() - 1;
     let mut sent = 0usize;
-    for (position, chunk_range) in ranges.iter().enumerate() {
+    for chunk_range in ranges.iter() {
         let take = chunk_range.range.end - chunk_range.range.start;
         let (error_metrics, execute_timings, balance_collector) =
             head.take().unwrap_or_else(|| {
@@ -643,8 +687,6 @@ async fn send_results_chunked(
             balance_collector,
         };
         let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
-        // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
-        let chunk_generation = if position == last { generation } else { 0 };
         let Some(permit) = budget.acquire(chunk_range.bytes, results_tx).await else {
             if sent > 0 {
                 metrics.executor_results_sent(sent);
@@ -657,7 +699,7 @@ async fn send_results_chunked(
             ExecutedBatch {
                 output: chunk,
                 transactions: chunk_transactions,
-                generation: chunk_generation,
+                generation,
                 permit,
             },
         )
@@ -702,6 +744,7 @@ fn execute_parallel(
     snapshot: &SnapshotCallback,
     transactions: &[SanitizedTransaction],
     max_svm_workers: usize,
+    environments: &ProgramRuntimeEnvironments,
 ) -> LoadAndExecuteSanitizedTransactionsOutput {
     debug_assert!(
         max_svm_workers >= 2,
@@ -731,13 +774,13 @@ fn execute_parallel(
         let mut handles = Vec::with_capacity(chunks.len().saturating_sub(1));
         for chunk in &chunks[1..] {
             let chunk: &[SanitizedTransaction] = chunk;
-            handles.push(s.spawn(move || execute_chunk(vm, snapshot, chunk)));
+            handles.push(s.spawn(move || execute_chunk(vm, snapshot, chunk, environments)));
         }
 
         // Do chunks[0] inline on this thread while workers run.
         let mut outputs: Vec<LoadAndExecuteSanitizedTransactionsOutput> =
             Vec::with_capacity(chunks.len());
-        outputs.push(execute_chunk(vm, snapshot, chunks[0]));
+        outputs.push(execute_chunk(vm, snapshot, chunks[0], environments));
 
         // Join in spawn order to preserve original transaction ordering.
         // A panic in any worker propagates to the executor — we want the
@@ -864,9 +907,9 @@ fn shed_readonly_account_data(
                 continue;
             }
             // A new account rather than an edit: the old buffer is still shared with the cache.
-            *account = AccountSharedData::create(
+            *account = AccountSharedData::create_from_existing_shared_data(
                 account.lamports(),
-                Vec::new(),
+                Arc::new(Vec::new()),
                 *account.owner(),
                 account.executable(),
                 account.rent_epoch(),
@@ -917,8 +960,9 @@ fn retain_live(
     transactions
 }
 
-/// Returns `Err` when the accounts this batch needs could not be loaded. The
-/// abort happens before any SVM run or BOB write, so nothing has changed yet.
+/// Returns `Err` when the accounts this batch needs could not be loaded, or came
+/// back larger than they were sized. The abort happens before any SVM run or BOB
+/// write, so nothing has changed yet.
 pub async fn execute_batch(
     batch: ConflictFreeBatch,
     execution_deps: &mut ExecutionDeps,
@@ -1019,11 +1063,16 @@ pub async fn execute_batch(
     // Preload accounts
     let accounts_to_preload = accounts_to_preload.into_iter().collect::<Vec<_>>();
     let t_op = Instant::now();
+    // Admitted accounts never exceed the larger limit, so a bigger fetch means the store
+    // changed after sizing. With a single writer that is a fault, so the batch aborts.
+    let max_fetch_bytes = execution_deps
+        .preload_budget_bytes
+        .max(execution_deps.max_tx_loaded_accounts_bytes);
     // Executing against accounts BOB could not load would settle state derived
     // from accounts the SVM wrongly saw as nonexistent, so the batch stops here.
     let (preload_fetched, preload_cached) = match execution_deps
         .bob
-        .preload_accounts(&accounts_to_preload)
+        .preload_accounts(&accounts_to_preload, max_fetch_bytes)
         .await
     {
         Ok(counts) => counts,
@@ -1145,26 +1194,11 @@ pub async fn execute_batch(
     // the sysvar cache during syscalls, so a mid-batch write would deadlock.
     set_clock_now(&execution_deps.vm);
 
-    // Create processing environment and config
-    let feature_set: SVMFeatureSet = SVMFeatureSet::all_enabled();
     // TODO: Use non-default blockhash for TransactionProcessingEnvironment
     // This would add replay attack prevention by ensuring each batch has a unique blockhash
     // Could use a combination of slot number, batch index, or timestamp to generate unique hashes
-
-    // For gasless operation, use our custom gasless rent collector
-    let gasless_rent_collector = GaslessRentCollector::new();
-    let rent_collector = Some(
-        &gasless_rent_collector
-            as &dyn solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
-    );
-
-    let processing_environment = TransactionProcessingEnvironment {
-        blockhash: Hash::default(), // TODO: Replace with proper blockhash for replay protection
-        blockhash_lamports_per_signature: 0, // Gasless - no lamports per signature
-        feature_set,
-        rent_collector,
-        ..Default::default()
-    };
+    let processing_environment =
+        processing_environment(&execution_deps.program_runtime_environments);
 
     let processing_config = TransactionProcessingConfig {
         ..Default::default()
@@ -1176,9 +1210,8 @@ pub async fn execute_batch(
     let mut t_svm_reg = Duration::ZERO;
     let mut t_bob_reg = Duration::ZERO;
 
-    // Generations stamped by each path's BOB update. They stay 0 when that path
-    // is skipped, which the settler's max() fold and BOB's high-water comparison
-    // both treat as "acknowledges nothing".
+    // Generations stamped by each path's BOB update. A path that wrote nothing to
+    // BOB stays 0, and its message then carries only rejected results, which write no account.
     let mut admin_generation = 0u64;
     let mut regular_generation = 0u64;
 
@@ -1255,6 +1288,7 @@ pub async fn execute_batch(
                     &snapshot,
                     &regular_transactions,
                     execution_deps.max_svm_workers,
+                    &execution_deps.program_runtime_environments,
                 )
             })
         } else {
@@ -1376,7 +1410,6 @@ mod tests {
         transaction::Transaction,
     };
     use solana_svm::transaction_processor::LoadAndExecuteSanitizedTransactionsOutput;
-    use solana_svm_callback::TransactionProcessingCallback;
     use std::collections::{HashMap, HashSet, LinkedList};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -1450,8 +1483,8 @@ mod tests {
         accounts_db: crate::accounts::AccountsDB,
         budget: usize,
     ) -> ExecutionDeps {
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         deps.preload_budget_bytes = budget;
         deps
     }
@@ -1462,8 +1495,8 @@ mod tests {
         accounts_db: crate::accounts::AccountsDB,
         per_tx_limit: usize,
     ) -> ExecutionDeps {
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         deps.max_tx_loaded_accounts_bytes = per_tx_limit;
         deps
     }
@@ -1564,12 +1597,14 @@ mod tests {
                     ..Default::default()
                 },
                 execution_details: TransactionExecutionDetails {
+                    // Deltas exist only for a transaction that succeeded, so a
+                    // caller asking for a failure gets the shape the SVM emits.
+                    accounts_deltas: status.is_ok().then(crate::test_helpers::no_accounts_deltas),
                     status,
                     log_messages: None,
                     inner_instructions: None,
                     return_data: None,
                     executed_units: 0,
-                    accounts_data_len_delta: 0,
                 },
                 programs_modified_by_tx: std::collections::HashMap::new(),
             },
@@ -1620,6 +1655,8 @@ mod tests {
     #[test]
     fn chunk_ranges_by_bytes_respects_cap_and_preserves_order() {
         let cap = 1000usize;
+        // High enough that only the byte cap can split these batches.
+        let row_cap = usize::MAX;
         let cases: Vec<(&str, Vec<usize>, usize)> = vec![
             ("all small stays unsplit", vec![10, 10, 10, 10], 1),
             ("exact fit stays unsplit", vec![500, 500], 1),
@@ -1631,7 +1668,7 @@ mod tests {
 
         for (name, sizes, expected_chunks) in cases {
             let (results, txs) = sized_batch(&sizes);
-            let ranges = chunk_ranges_by_bytes(&results, &txs, cap);
+            let ranges = chunk_ranges(&results, &txs, cap, row_cap);
             assert_eq!(ranges.len(), expected_chunks, "chunk count for {}", name);
 
             let mut next = 0usize;
@@ -1663,54 +1700,117 @@ mod tests {
         }
     }
 
-    /// The one assertion standing between the split and a data-loss bug. If a
-    /// non-final chunk carried the real generation, BOB would treat undrained writes
-    /// as durable and drop them, so only the last chunk may advance the watermark.
-    #[tokio::test]
-    async fn chunked_send_stamps_generation_on_final_chunk_only() {
-        let cap = 1000usize;
-        let _shutdown = CancellationToken::new();
-        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+    /// Rows are the other way a message grows: a batch of dataless transactions
+    /// naming many accounts weighs no bytes, so without a row cap one message
+    /// could carry a whole block past the settler's row budget.
+    #[test]
+    fn chunk_ranges_split_on_rows_as_well_as_bytes() {
+        // Each transaction names 3 keys of its own plus the extra readonly ones.
+        let keys_per_tx = 3 + 7;
+        let row_cap = 25usize;
+        let txs: Vec<SanitizedTransaction> = (0..6)
+            .map(|_| {
+                let extra: Vec<Pubkey> = (0..7).map(|_| Pubkey::new_unique()).collect();
+                transfer_with_unused_readonly(&Keypair::new(), &extra)
+            })
+            .collect();
+        // Dataless, so the byte cap can never be what splits them.
+        let results: Vec<TransactionProcessingResult> = txs
+            .iter()
+            .map(|_| executed_with(vec![(Pubkey::new_unique(), AccountSharedData::default())]))
+            .collect();
 
-        // Each transaction alone exceeds the cap, so this splits into three.
+        let ranges = chunk_ranges(&results, &txs, MAX_SEND_CHUNK_BYTES, row_cap);
+
+        assert_eq!(ranges.len(), 3, "two transactions fit under a 25-row cap");
+        let mut next = 0usize;
+        for chunk in &ranges {
+            assert_eq!(chunk.range.start, next, "gap or overlap between chunks");
+            let rows = (chunk.range.end - chunk.range.start) * keys_per_tx;
+            assert!(rows <= row_cap, "chunk over the row cap: {rows}");
+            next = chunk.range.end;
+        }
+        assert_eq!(next, txs.len(), "chunks must cover every transaction");
+    }
+
+    /// A chunk stamped below its batch's generation can never be acknowledged:
+    /// BOB compares each settled account against the write that produced it, so
+    /// every chunk of a split batch must carry the real generation.
+    #[tokio::test]
+    async fn every_chunk_carries_the_batch_generation() {
+        let cap = 1000usize;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let generations = |rx: &mut mpsc::Receiver<ExecutedBatch>| {
+            let mut gens = Vec::new();
+            while let Ok(batch) = rx.try_recv() {
+                gens.push(batch.generation);
+            }
+            gens
+        };
+
+        // Each transaction alone exceeds the byte cap, so this splits into three.
         let (results, txs) = sized_batch(&[5000, 5000, 5000]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
         let outcome = send_results_chunked(
             &chan_tx,
             output_of(results),
             txs,
             42,
             cap,
+            MAX_SEND_CHUNK_ROWS,
             &budget,
             &metrics,
         )
         .await;
         assert!(matches!(outcome, SendOutcome::Sent));
-
-        let mut gens = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
-            gens.push(batch.generation);
-        }
         assert_eq!(
-            gens,
-            vec![0, 0, 42],
-            "only the final chunk may carry the generation"
+            generations(&mut rx),
+            vec![42, 42, 42],
+            "every byte-split chunk must carry the batch's generation"
         );
 
-        // Under the cap the batch goes as one message, still stamped.
+        // Weightless transfers of three keys each, so a row cap of three splits per transaction.
+        let (results, txs) = sized_batch(&[0, 0, 0]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            43,
+            cap,
+            3,
+            &budget,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+        assert_eq!(
+            generations(&mut rx),
+            vec![43, 43, 43],
+            "every row-split chunk must carry the batch's generation"
+        );
+
+        // Under both caps the batch goes as one message, still stamped.
         let (results, txs) = sized_batch(&[10, 10]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let outcome =
-            send_results_chunked(&chan_tx, output_of(results), txs, 7, cap, &budget, &metrics)
-                .await;
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            7,
+            cap,
+            MAX_SEND_CHUNK_ROWS,
+            &budget,
+            &metrics,
+        )
+        .await;
         assert!(matches!(outcome, SendOutcome::Sent));
-
-        let mut gens = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
-            gens.push(batch.generation);
-        }
-        assert_eq!(gens, vec![7], "an unsplit batch stays one message");
+        assert_eq!(
+            generations(&mut rx),
+            vec![7],
+            "an unsplit batch stays one message"
+        );
     }
 
     use crate::stage_metrics::PrometheusMetrics;
@@ -1747,6 +1847,7 @@ mod tests {
             txs,
             1,
             MAX_SEND_CHUNK_BYTES,
+            MAX_SEND_CHUNK_ROWS,
             &WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES),
             &metrics,
         )
@@ -1791,6 +1892,7 @@ mod tests {
                 txs,
                 9,
                 1000,
+                MAX_SEND_CHUNK_ROWS,
                 &budget,
                 &metrics,
             )
@@ -1826,6 +1928,7 @@ mod tests {
                     txs,
                     3,
                     1000,
+                    MAX_SEND_CHUNK_ROWS,
                     &budget,
                     &metrics,
                 )
@@ -1870,6 +1973,7 @@ mod tests {
             txs,
             1,
             1000,
+            MAX_SEND_CHUNK_ROWS,
             &budget,
             &metrics,
         )
@@ -1909,7 +2013,8 @@ mod tests {
     /// sanitization counts them, nothing here verifies them.
     fn tx_over(keys: &[Pubkey], writable: usize) -> SanitizedTransaction {
         use solana_sdk::{
-            instruction::CompiledInstruction, message::MessageHeader, signature::Signature,
+            message::{compiled_instruction::CompiledInstruction, MessageHeader},
+            signature::Signature,
         };
         let mut account_keys = keys.to_vec();
         account_keys.push(solana_sdk_ids::system_program::ID);
@@ -2411,8 +2516,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_exploit_is_rejected() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2435,8 +2540,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_spend_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2452,8 +2557,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn two_step_setup_does_not_graduate_payer() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2486,8 +2591,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn synthetic_fee_payer_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let a = Keypair::new();
@@ -2507,8 +2612,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn gasless_sponsor_succeeds_and_is_dropped() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let b = Keypair::new();
@@ -2537,8 +2642,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn real_transfer_persists_both_sides() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let b = Keypair::new();
@@ -2558,8 +2663,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ata_creation_under_fabricated_payer_succeeds() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let (admin_tx, mint) = create_admin_initialize_mint_tx();
@@ -2601,12 +2706,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unrelated_writable_account_is_untouched() {
         use solana_sdk::{
-            account::WritableAccount, instruction::CompiledInstruction, message::MessageHeader,
+            account::WritableAccount,
+            message::{compiled_instruction::CompiledInstruction, MessageHeader},
         };
 
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let payer = Keypair::new();
@@ -2665,8 +2771,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_failure_through_svm_is_executed_err_and_persists_nothing() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let payer = Keypair::new();
@@ -2718,10 +2824,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn conservation_parallel_path_parity() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         // Above the parallel threshold so SnapshotCallback fabricates the payers.
@@ -2764,10 +2870,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_parallel_path() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so each worker gets 2× MIN_PARALLEL_BATCH_FACTOR
         // transactions — comfortably inside the parallel regime.
@@ -2797,10 +2903,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_parallel_threshold_boundary() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         let n = workers * MIN_PARALLEL_BATCH_FACTOR;
         let transactions: Vec<_> = (0..n)
@@ -2878,8 +2984,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_empty_batch() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let empty_batch = ConflictFreeBatch {
             transactions: vec![],
@@ -2896,8 +3002,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_single_normal_transaction() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx = create_test_transaction();
         let batch = ConflictFreeBatch {
@@ -2924,8 +3030,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_multiple_normal_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx1 = create_test_transaction();
         let tx2 = create_test_transaction();
@@ -2956,11 +3062,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_drops_expired_transactions() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
 
         let known = Hash::new_unique();
         let live = Arc::new(RwLock::new(LinkedList::from([known])));
-        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
 
         // Two txs using the known (live) hash + one tx using an expired hash.
         let payer = Keypair::new();
@@ -3016,11 +3122,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_reads_live_window_each_call() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
 
         let bh = Hash::new_unique();
         let live = Arc::new(RwLock::new(LinkedList::from([bh])));
-        let mut deps = get_execution_deps(accounts_db, rx, 4, Arc::clone(&live)).await;
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, Arc::clone(&live)).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let batch_with = |payer: &Keypair| ConflictFreeBatch {
@@ -3067,13 +3173,13 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, _execution_results_rx) =
             mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3107,10 +3213,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_parallel_path_preserves_transaction_order() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 2× the parallel threshold so the batch is comfortably in the
         // parallel regime and splits into multiple chunks.
@@ -3158,10 +3264,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_parallel_path_uneven_chunking() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let workers = 4;
         let mut deps =
-            get_execution_deps(accounts_db, rx, workers, default_live_blockhashes()).await;
+            get_execution_deps(accounts_db, inbox, workers, default_live_blockhashes()).await;
 
         // 17 is intentional: > threshold (16), not divisible by 4, last
         // chunk is much smaller than the others.
@@ -3213,8 +3319,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_max_svm_workers_one_forces_sequential() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
 
         // Deliberately well above any reasonable parallel threshold — with
         // workers=2 this size would split; with workers=1 the gate keeps
@@ -3355,7 +3461,7 @@ mod tests {
 
     #[test]
     fn test_merge_svm_outputs_accumulates_execute_timings() {
-        use solana_timings::ExecuteTimingType;
+        use solana_svm_timings::ExecuteTimingType;
         use std::num::Saturating;
 
         let mut chunk_a = fabricate_output(vec![]);
@@ -3391,14 +3497,14 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, _execution_results_rx) =
             mpsc::channel::<ExecutedBatch>(RESULTS_CAP);
         let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3424,8 +3530,8 @@ mod tests {
     async fn test_execute_batch_routes_pure_admin_tx_to_admin_vm() {
         // A tx whose only instruction is an admin instruction routes to the Admin VM.
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let (tx, _mint) = create_admin_initialize_mint_tx();
         let batch = ConflictFreeBatch {
@@ -3450,8 +3556,8 @@ mod tests {
         // Admin VM. The router sends it to the regular SVM path; the admin
         // path stays strictly single-purpose.
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let tx = create_mixed_admin_and_regular_tx();
         let batch = ConflictFreeBatch {
@@ -3477,8 +3583,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_execute_batch_partitions_admin_and_regular_separately() {
         let (accounts_db, _pg) = start_test_postgres().await;
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 4, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 4, default_live_blockhashes()).await;
 
         let (admin_tx, _mint) = create_admin_initialize_mint_tx();
         let regular_tx = create_test_transaction();
@@ -3523,13 +3629,13 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, mut execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let shutdown = CancellationToken::new();
 
         let _handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3572,13 +3678,13 @@ mod tests {
         let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
 
         let (batch_tx, batch_rx) = mpsc::channel::<ConflictFreeBatch>(16);
-        let (_settled_tx, settled_rx) = mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let (execution_results_tx, execution_results_rx) = mpsc::channel::<ExecutedBatch>(1);
         let _shutdown = CancellationToken::new();
 
         let handle = start_execution_worker(ExecutionArgs {
             batch_rx,
-            settled_accounts_rx: settled_rx,
+            settled_accounts: inbox,
             execution_results_tx,
             accountsdb_connection_url: url,
             metrics: Arc::new(NoopMetrics),
@@ -3624,10 +3730,10 @@ mod tests {
         use crate::accounts::get_accounts::{reset_test_retry, set_test_retry};
 
         set_test_retry(2, 1);
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let mut deps = get_execution_deps(
             crate::test_helpers::dead_postgres_db(),
-            rx,
+            inbox,
             1,
             default_live_blockhashes(),
         )
@@ -3648,6 +3754,44 @@ mod tests {
         assert!(
             deps.bob.get_account_shared_data(&payer.pubkey()).is_none(),
             "nothing may be cached from a read that failed"
+        );
+    }
+
+    /// Fetched data larger than its sizes aborts the batch before anything is
+    /// cached. Redis serving a bigger copy than Postgres sized makes the skew exact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_batch_aborts_when_the_fetch_outgrows_its_sizes() {
+        let (postgres_db, _pg) = crate::test_helpers::start_test_postgres_raw().await;
+        let (mut redis_db, _redis) =
+            crate::test_helpers::start_stamped_redis(postgres_db.clone()).await;
+        let mut fallback = AccountsDB::Postgres(postgres_db);
+        let grown = seed_sized_accounts(&mut fallback, 1, 100).await[0];
+        redis_db
+            .set_account(
+                grown,
+                AccountSharedData::new(1, 5_000, &solana_sdk_ids::system_program::ID),
+            )
+            .await;
+        let mut deps = deps_with_budget(AccountsDB::Redis(redis_db), 1_000).await;
+        deps.max_tx_loaded_accounts_bytes = 1_000;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let transactions = vec![crate::scheduler::TransactionWithIndex {
+            transaction: Arc::new(transfer_with_unused_readonly(&Keypair::new(), &[grown])),
+            index: 0,
+        }];
+        let result = execute_batch(ConflictFreeBatch { transactions }, &mut deps, &noop).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AccountLoadError::LimitExceeded { limit: 1_000 })
+            ),
+            "a fetch past its limit must abort the batch"
+        );
+        assert!(
+            deps.bob.get_account_shared_data(&grown).is_none(),
+            "nothing may be cached from a read that breached its limit"
         );
     }
 
@@ -3673,8 +3817,8 @@ mod tests {
         let corrupt = Pubkey::new_unique();
         insert_corrupt_pg(&accounts_db, corrupt).await;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let batch = ConflictFreeBatch {
@@ -3699,8 +3843,8 @@ mod tests {
         let unref = Pubkey::new_unique();
         insert_corrupt_pg(&accounts_db, unref).await;
 
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let result = run_batch(
@@ -3843,8 +3987,8 @@ mod tests {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let big = seed_sized_accounts(&mut accounts_db, 7, BIG_ACCOUNT_BYTES).await;
 
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let noop: SharedMetrics = Arc::new(NoopMetrics);
 
         let oversized_payer = Keypair::new();
@@ -3961,14 +4105,34 @@ mod tests {
         );
     }
 
+    /// A first transaction larger than the budget but under the per-transaction
+    /// cap is admitted on purpose, so the fetch limit must not trip on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_transaction_over_the_budget_still_loads() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let big = seed_sized_accounts(&mut accounts_db, 1, 1_500).await[0];
+        let mut deps = deps_with_budget(accounts_db, 1_000).await;
+        let noop: SharedMetrics = Arc::new(NoopMetrics);
+
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &[big]);
+        let result = run_batch(&mut deps, &noop, vec![tx]).await;
+
+        assert_eq!(result.regular_transactions.len(), 1);
+        assert!(result.deferred.is_empty());
+        assert!(
+            deps.bob.get_account_shared_data(&big).is_some(),
+            "the admitted transaction's account must be loaded"
+        );
+    }
+
     /// A batch whose accounts are already resident must not need the store, so
     /// sizing cannot have introduced a round-trip on the warm path.
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_batch_runs_a_warm_batch_without_the_store() {
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let inbox = SettledInbox::new();
         let mut deps = get_execution_deps(
             crate::test_helpers::dead_postgres_db(),
-            rx,
+            inbox,
             1,
             default_live_blockhashes(),
         )
@@ -4155,8 +4319,8 @@ mod tests {
     async fn results_do_not_carry_readonly_account_data() {
         let (mut accounts_db, _pg) = start_test_postgres().await;
         let readonly = seed_sized_accounts(&mut accounts_db, 1, 1_500).await[0];
-        let (_settled_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut deps = get_execution_deps(accounts_db, rx, 1, default_live_blockhashes()).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
 
         let tx = transfer_with_unused_readonly(&Keypair::new(), &[readonly]);
@@ -4196,6 +4360,42 @@ mod tests {
         assert_eq!(
             stored.meta.pre_balances[index], 1,
             "stored balances come from lamports"
+        );
+    }
+
+    /// The queue weight counts writable data only. That is exact only because
+    /// readonly data is shed before the result is queued, so tie the two together.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queue_weight_equals_what_a_shed_result_retains() {
+        let (mut accounts_db, _pg) = start_test_postgres().await;
+        let readonly = seed_sized_accounts(&mut accounts_db, 2, 4096).await;
+        let inbox = SettledInbox::new();
+        let mut deps = get_execution_deps(accounts_db, inbox, 1, default_live_blockhashes()).await;
+        let metrics: SharedMetrics = Arc::new(NoopMetrics);
+
+        let tx = transfer_with_unused_readonly(&Keypair::new(), &readonly);
+        let result = run_batch(&mut deps, &metrics, vec![tx]).await;
+        let output = result
+            .regular_results
+            .as_ref()
+            .expect("the transfer runs on the regular path");
+
+        let mut retained = 0;
+        for processed in &output.processing_results {
+            let Ok(ProcessedTransaction::Executed(executed)) = processed else {
+                panic!("the transaction must be processed by the SVM");
+            };
+            for (key, account) in &executed.loaded_transaction.accounts {
+                if readonly.contains(key) {
+                    assert!(account.data().is_empty(), "readonly data must be shed");
+                }
+                retained += account.data().len();
+            }
+        }
+        assert_eq!(
+            retained_account_bytes(&output.processing_results, &result.regular_transactions),
+            retained,
+            "the queue weight must equal every data byte the result holds"
         );
     }
 
@@ -4325,10 +4525,10 @@ mod tests {
         {
             let (accounts_db, pg) = start_test_postgres().await;
             let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
-            let (_settled_tx, rx) = mpsc::unbounded_channel();
+            let inbox = SettledInbox::new();
 
             let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
-            let mut deps = get_execution_deps(accounts_db, rx, 1, Arc::clone(&live)).await;
+            let mut deps = get_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
             let noop: SharedMetrics = Arc::new(NoopMetrics);
 
             let (admin_tx, _mint) = create_admin_initialize_mint_tx();
@@ -4390,10 +4590,10 @@ mod tests {
             let (mut accounts_db, pg) = start_test_postgres().await;
             let url = crate::test_helpers::postgres_container_url(&pg, "test_db").await;
             let readonly = seed_sized_accounts(&mut accounts_db, 1, 1_500).await;
-            let (_settled_tx, rx) = mpsc::unbounded_channel();
+            let inbox = SettledInbox::new();
 
             let live = Arc::new(RwLock::new(LinkedList::from([Hash::default()])));
-            let mut deps = get_execution_deps(accounts_db, rx, 1, Arc::clone(&live)).await;
+            let mut deps = get_execution_deps(accounts_db, inbox, 1, Arc::clone(&live)).await;
             deps.max_tx_loaded_accounts_bytes = 1_000;
             let noop: SharedMetrics = Arc::new(NoopMetrics);
 

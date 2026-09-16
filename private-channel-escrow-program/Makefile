@@ -6,7 +6,7 @@ PROGRAM_SO := ../target/deploy/private_channel_escrow_program.so
 PROGRAM_KEYPAIR := ../target/deploy/private_channel_escrow_program-keypair.json
 PROGRAM_ENV_KEY := ESCROW_PROGRAM_ID
 
-.PHONY: install build build-test build-no-clients fmt generate-idl generate-clients
+.PHONY: install build build-test build-no-clients build-hook-fixture fmt generate-idl generate-clients
 .PHONY: unit-test integration-test integration-test-no-build all-test
 .PHONY: unit-coverage coverage-html all-coverage
 .PHONY: build-localnet build-devnet deploy-devnet
@@ -22,10 +22,18 @@ install:
 build:
 	$(MAKE) generate-clients
 	cd program && cargo-build-sbf
+	$(MAKE) build-hook-fixture
 
 # Build the program with test-tree feature for integration tests
 build-test:
 	cd program && cargo-build-sbf --features test-tree
+	$(MAKE) build-hook-fixture
+
+# Transfer-hook program used only by the tests. LiteSVM and the integration
+# validator load it so hook-bearing Token-2022 mints run a real hook. The .so
+# lands in target/deploy/ next to the escrow program's.
+build-hook-fixture:
+	cd tests/transfer-hook-fixture && cargo-build-sbf
 
 # Build the prod program WITHOUT regenerating IDL / clients. Use after
 # `make build` (or after restoring a CI artifact that already contains

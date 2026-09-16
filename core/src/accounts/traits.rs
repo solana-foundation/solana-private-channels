@@ -153,7 +153,8 @@ impl AccountsDB {
             &ProcessedTransaction,
         )>,
         block_info: Option<BlockInfo>,
-    ) -> Result<Vec<super::write_batch::AddressSignatureRow>, String> {
+    ) -> Result<Vec<super::write_batch::AddressSignatureRow>, super::write_batch::WriteBatchError>
+    {
         super::write_batch::write_batch(self, account_settlements, transactions, block_info).await
     }
 
@@ -162,6 +163,14 @@ impl AccountsDB {
         accounts: &[Pubkey],
     ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
         super::get_accounts::get_accounts(self, accounts).await
+    }
+
+    pub async fn get_accounts_within(
+        &self,
+        accounts: &[Pubkey],
+        max_data_bytes: usize,
+    ) -> Result<Vec<Option<AccountSharedData>>, AccountLoadError> {
+        super::get_accounts::get_accounts_within(self, accounts, max_data_bytes).await
     }
 
     pub async fn get_account_data_sizes(
@@ -529,7 +538,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -790,7 +799,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1116,7 +1125,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1180,7 +1189,7 @@ mod tests {
                     inner_instructions: None,
                     return_data: None,
                     executed_units: 0,
-                    accounts_data_len_delta: 0,
+                    accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                 },
                 programs_modified_by_tx: HashMap::new(),
             }))
@@ -1248,7 +1257,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1256,7 +1265,10 @@ mod tests {
             .write_batch(
                 &[],
                 vec![(sig, &tx, slot, 1_700_000_000, &processed)],
-                Some(create_test_block_info(slot, Hash::new_unique())),
+                Some(BlockInfo {
+                    parent_slot: db.get_latest_slot().await.unwrap().unwrap_or(slot),
+                    ..create_test_block_info(slot, Hash::new_unique())
+                }),
             )
             .await
             .unwrap();
@@ -1394,7 +1406,7 @@ mod tests {
                         inner_instructions: None,
                         return_data: None,
                         executed_units: 0,
-                        accounts_data_len_delta: 0,
+                        accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
                     },
                     programs_modified_by_tx: HashMap::new(),
                 }));
@@ -1453,7 +1465,7 @@ mod tests {
                 inner_instructions: None,
                 return_data: None,
                 executed_units: 0,
-                accounts_data_len_delta: 0,
+                accounts_deltas: Some(crate::test_helpers::no_accounts_deltas()),
             },
             programs_modified_by_tx: HashMap::new(),
         }));
@@ -1532,6 +1544,134 @@ mod tests {
         }
 
         assert_eq!(db.get_transaction_count().await.unwrap(), 2);
+    }
+
+    /// A handle on this database carrying a freshly claimed writer epoch.
+    async fn claim_epoch(db: &AccountsDB) -> AccountsDB {
+        let AccountsDB::Postgres(ref pg) = db else {
+            panic!("expected Postgres variant")
+        };
+        let mut handle = pg.clone();
+        handle.writer_epoch = Some(super::super::writer_epoch::bump(pg).await.unwrap());
+        AccountsDB::Postgres(handle)
+    }
+
+    /// A writer whose epoch was superseded is refused before it writes anything.
+    /// The parent is right on purpose, so only the epoch can refuse it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_from_a_superseded_epoch_is_refused() {
+        let (db, _pg) = start_test_postgres().await;
+        let mut superseded = claim_epoch(&db).await;
+        superseded
+            .write_batch(
+                &[],
+                vec![],
+                Some(create_test_block_info(1, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+        let mut current = claim_epoch(&db).await;
+        current
+            .write_batch(
+                &[],
+                vec![],
+                Some(create_test_block_info(2, Hash::new_unique())),
+            )
+            .await
+            .unwrap();
+
+        let account = Pubkey::new_unique();
+        let txs = [counted_tx(&account)];
+        let refs: Vec<_> = txs
+            .iter()
+            .map(|(tx, p)| (*tx.signature(), tx, 3u64, 1_700_000_000i64, p))
+            .collect();
+        let settlement = AccountSettlement {
+            account: AccountSharedData::new(1, 0, &Pubkey::default()),
+            deleted: false,
+        };
+        let result = superseded
+            .write_batch(
+                &[(account, settlement)],
+                refs,
+                Some(create_test_block_info(3, Hash::new_unique())),
+            )
+            .await;
+
+        assert_eq!(
+            result.err(),
+            Some(super::super::write_batch::WriteBatchError::Fenced {
+                held: 1,
+                current: Some(2)
+            })
+        );
+        assert!(db.get_block(3).await.unwrap().is_none());
+        assert!(db.get_accounts(&[account]).await.unwrap()[0].is_none());
+        assert_eq!(db.get_transaction_count().await.unwrap(), 0);
+    }
+
+    /// A block must build on the stored tip. Only a byte-identical replay of the
+    /// tip itself is let through, and a ledger with no blocks accepts any genesis.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_block_that_does_not_extend_the_tip_is_refused() {
+        use super::super::write_batch::WriteBatchError;
+
+        let (mut db, pg) = start_test_postgres().await;
+        let block_on = |slot: u64, parent_slot: u64| BlockInfo {
+            parent_slot,
+            ..create_test_block_info(slot, Hash::new_unique())
+        };
+        for slot in 1..=2 {
+            db.write_batch(&[], vec![], Some(block_on(slot, slot - 1)))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.write_batch(&[], vec![], Some(block_on(3, 1)))
+                .await
+                .err(),
+            Some(WriteBatchError::StaleTip { slot: 3 }),
+            "a block on an older parent must be refused"
+        );
+
+        let to = Pubkey::new_unique();
+        let txs = [counted_tx(&to)];
+        let refs = || -> Vec<_> {
+            txs.iter()
+                .map(|(tx, p)| (*tx.signature(), tx, 3u64, 1_700_000_000i64, p))
+                .collect()
+        };
+        let block = block_on(3, 2);
+        db.write_batch(&[], refs(), Some(block.clone()))
+            .await
+            .expect("a block on the tip must commit");
+        db.write_batch(&[], refs(), Some(block))
+            .await
+            .expect("a byte-identical replay must commit");
+        assert_eq!(db.get_transaction_count().await.unwrap(), 1);
+
+        assert_eq!(
+            db.write_batch(&[], vec![], Some(block_on(3, 2)))
+                .await
+                .err(),
+            Some(WriteBatchError::StaleTip { slot: 3 }),
+            "a different block at a stored slot must be refused"
+        );
+
+        let AccountsDB::Postgres(ref pg_db) = db else {
+            panic!("expected Postgres variant")
+        };
+        sqlx::query("CREATE DATABASE empty_ledger")
+            .execute(pg_db.pool.as_ref())
+            .await
+            .unwrap();
+        let url = crate::test_helpers::postgres_container_url(&pg, "empty_ledger").await;
+        let mut empty = AccountsDB::new(&url, false).await.unwrap();
+        empty
+            .write_batch(&[], vec![], Some(block_on(7, 7)))
+            .await
+            .expect("a ledger with no blocks must accept a genesis block");
     }
 
     #[tokio::test(flavor = "multi_thread")]

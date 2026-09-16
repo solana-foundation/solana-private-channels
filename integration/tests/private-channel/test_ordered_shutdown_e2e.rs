@@ -7,6 +7,7 @@
 //! and check every one of them is queryable after a restart against the same
 //! database.
 
+use solana_commitment_config::CommitmentConfig;
 use {
     private_channel_core::{
         nodes::node::{run_node, NodeConfig, NodeHandles, NodeMode},
@@ -14,7 +15,6 @@ use {
     },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{
-        commitment_config::CommitmentConfig,
         instruction::Instruction,
         signature::{Keypair, Signature, Signer},
         transaction::Transaction,
@@ -185,9 +185,28 @@ fn in_flight() -> f64 {
         - metric_total("private_channel_settler_txs_settled_total")
 }
 
-/// Slots must be contiguous: a gap would mean a block was skipped rather than
-/// drained, which the ordered shutdown is supposed to make impossible.
-async fn assert_chain_contiguous(client: &RpcClient) {
+/// Waits for work to be in flight, so the shutdown that follows has something to drain.
+///
+/// A single sample at a fixed time can land just after the settler caught up,
+/// which reads as an empty pipeline even under steady load.
+async fn wait_for_in_flight(baseline: f64) -> f64 {
+    let mut carried = in_flight() - baseline;
+    for _ in 0..1_500 {
+        if carried > 0.0 {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+        carried = in_flight() - baseline;
+    }
+    carried
+}
+
+/// The chain must hold a block for every slot an accepted transaction settled in.
+///
+/// Idle ticks advance the slot without producing a block, so gaps between blocks
+/// are expected. What the drain must prevent is a settled transaction whose slot
+/// has no block, which would mean its block was dropped on the way down.
+async fn assert_blocks_cover(client: &RpcClient, settled_slots: &[u64]) {
     let tip = client.get_slot().await.expect("slot after restart");
     let blocks = client
         .get_blocks(0, Some(tip))
@@ -195,28 +214,40 @@ async fn assert_chain_contiguous(client: &RpcClient) {
         .expect("blocks after restart");
     assert!(!blocks.is_empty(), "restarted node has no blocks");
     for pair in blocks.windows(2) {
-        assert_eq!(
-            pair[1],
-            pair[0] + 1,
-            "slot gap between {} and {} after restart",
+        assert!(
+            pair[1] > pair[0],
+            "blocks out of order or repeated: {} then {}",
             pair[0],
             pair[1]
         );
     }
+    let blocks: std::collections::HashSet<u64> = blocks.into_iter().collect();
+    let orphaned: Vec<u64> = settled_slots
+        .iter()
+        .copied()
+        .filter(|slot| !blocks.contains(slot))
+        .collect();
+    assert!(
+        orphaned.is_empty(),
+        "accepted transactions settled in slots with no block: {:?}",
+        orphaned.iter().take(5).collect::<Vec<_>>()
+    );
 }
 
 /// Every accepted signature must be queryable, allowing time for the restarted
-/// node to come up rather than assuming it is instantly ready.
-async fn assert_all_queryable(client: &RpcClient, accepted: &[Signature]) {
+/// node to come up rather than assuming it is instantly ready. Returns the slot
+/// each one settled in.
+async fn assert_all_queryable(client: &RpcClient, accepted: &[Signature]) -> Vec<u64> {
     let mut missing = Vec::new();
+    let mut settled_slots = Vec::with_capacity(accepted.len());
     for sig in accepted {
         let mut found = false;
         for _ in 0..40 {
-            if client
+            if let Ok(tx) = client
                 .get_transaction(sig, UiTransactionEncoding::Base64)
                 .await
-                .is_ok()
             {
+                settled_slots.push(tx.slot);
                 found = true;
                 break;
             }
@@ -254,6 +285,7 @@ async fn assert_all_queryable(client: &RpcClient, accepted: &[Signature]) {
         accepted.len(),
         missing.iter().take(5).collect::<Vec<_>>()
     );
+    settled_slots
 }
 
 /// The drain end to end. Shutdown fires mid-burst with work in every stage, and
@@ -278,7 +310,7 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
     // Guards against a vacuous pass: if the pipeline had already settled
     // everything, the drain would never be exercised and this test would prove
     // nothing. Sampled immediately before the shutdown it is about to survive.
-    let carried = in_flight() - in_flight_before;
+    let carried = wait_for_in_flight(in_flight_before).await;
     assert!(
         carried > 0.0,
         "shutdown landed on an empty pipeline, so the drain was never exercised"
@@ -320,8 +352,8 @@ async fn accepted_transactions_survive_an_ordered_shutdown() {
     sleep(Duration::from_millis(300)).await;
     let (restarted, url) = start_node(load_config(db_url, free_port())).await;
     let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
-    assert_all_queryable(&client, &accepted).await;
-    assert_chain_contiguous(&client).await;
+    let settled_slots = assert_all_queryable(&client, &accepted).await;
+    assert_blocks_cover(&client, &settled_slots).await;
 
     restarted.shutdown().await;
 }
@@ -342,7 +374,7 @@ async fn a_saturated_pipeline_still_drains_within_the_deadline() {
     let loader = Loader::spawn(&url, 8).await;
     sleep(Duration::from_secs(3)).await;
 
-    let carried = in_flight() - in_flight_before;
+    let carried = wait_for_in_flight(in_flight_before).await;
     assert!(
         carried > 0.0,
         "pipeline was not saturated, so the deadline was never tested"
@@ -375,8 +407,8 @@ async fn a_saturated_pipeline_still_drains_within_the_deadline() {
     sleep(Duration::from_millis(300)).await;
     let (restarted, url) = start_node(load_config(db_url, free_port())).await;
     let client = RpcClient::new_with_commitment(url, CommitmentConfig::processed());
-    assert_all_queryable(&client, &accepted).await;
-    assert_chain_contiguous(&client).await;
+    let settled_slots = assert_all_queryable(&client, &accepted).await;
+    assert_blocks_cover(&client, &settled_slots).await;
 
     restarted.shutdown().await;
 }

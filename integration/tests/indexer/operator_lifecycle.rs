@@ -47,7 +47,7 @@ use private_channel_indexer::PostgresConfig;
 use private_channel_metrics::{HealthConfig, HealthState};
 use setup::{TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use std::sync::Arc;
@@ -68,6 +68,7 @@ async fn seed_mint_status_allowed(
 ) -> Result<(), Box<dyn std::error::Error>> {
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_address.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
@@ -85,7 +86,7 @@ fn default_operator_config(alert_url: Option<String>) -> OperatorConfig {
         retry_max_attempts: 15,
         retry_base_delay: Duration::from_millis(500),
         channel_buffer_size: 100,
-        rpc_commitment: solana_sdk::commitment_config::CommitmentLevel::Confirmed,
+        rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
         alert_webhook_url: alert_url,
         reconciliation_interval: Duration::from_secs(5 * 60),
         reconciliation_tolerance_bps: 10,
@@ -1665,7 +1666,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         TransactionContext, TransactionStatusUpdate,
     };
     use private_channel_indexer::operator::{SourceEventId, TransactionKind, WithdrawalRemintInfo};
-    use solana_sdk::commitment_config::CommitmentLevel;
+    use solana_commitment_config::CommitmentLevel;
 
     println!("=== Operator Lifecycle: Landed Release With Dead Signatures ===");
 

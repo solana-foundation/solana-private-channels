@@ -28,12 +28,9 @@ pub fn get(pubkey: &Pubkey) -> Option<AccountSharedData> {
 fn build_precompiles() -> HashMap<Pubkey, AccountSharedData> {
     let mut precompiles = HashMap::new();
 
-    // Zero rent for gasless operation.
-    let rent = Rent {
-        lamports_per_byte_year: 0,
-        exemption_threshold: 0.0,
-        burn_percent: 0,
-    };
+    // Zero rent for gasless operation. A zero rate makes every minimum balance
+    // zero, so every account is exempt whatever its size.
+    let rent = Rent::free();
 
     // System program. lamports=1 (not 0): the SVM's AccountLoader caches
     // loaded accounts across transactions within a batch, and a cached entry

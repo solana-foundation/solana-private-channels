@@ -1,8 +1,7 @@
 use crate::accounts::traits::BlockInfo;
 use solana_sdk::{
     hash::Hash,
-    instruction::CompiledInstruction,
-    message::{Message, MessageHeader},
+    message::{compiled_instruction::CompiledInstruction, Message, MessageHeader},
     signature::{Keypair, Signer},
     transaction::{SanitizedTransaction, Transaction},
 };
@@ -247,6 +246,25 @@ pub(crate) async fn start_test_redis(
     (db, container)
 }
 
+/// `start_test_redis` stamped with the fallback's deployment id, so keys seeded
+/// straight into Redis are served as cache hits.
+#[cfg(test)]
+pub(crate) async fn start_stamped_redis(
+    fallback: crate::accounts::PostgresAccountsDB,
+) -> (
+    crate::accounts::RedisAccountsDB,
+    testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
+) {
+    let deployment_id = crate::accounts::redis_coherence::read_deployment_id(&fallback)
+        .await
+        .unwrap();
+    let (redis_db, container) = start_test_redis(fallback).await;
+    crate::accounts::redis_coherence::stamp_deployment_id(&redis_db, &deployment_id)
+        .await
+        .unwrap();
+    (redis_db, container)
+}
+
 /// An AccountsDB whose pool points at a bogus URL, so every query fails with a
 /// connection error. Use it to exercise the unreadable-store path.
 #[cfg(test)]
@@ -264,6 +282,7 @@ pub(crate) fn dead_postgres_db() -> crate::accounts::AccountsDB {
     AccountsDB::Postgres(PostgresAccountsDB {
         pool: Arc::new(pool),
         read_only: true,
+        writer_epoch: None,
     })
 }
 
@@ -271,13 +290,10 @@ pub(crate) fn dead_postgres_db() -> crate::accounts::AccountsDB {
 /// The pool uses a bogus URL — any accidental DB call will fail with a
 /// connection timeout. Only for unit tests that stay in-memory.
 #[cfg(test)]
-pub(crate) fn create_test_bob() -> (
-    crate::accounts::bob::BOB,
-    tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
-) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let bob = crate::accounts::bob::BOB::new_test(rx, dead_postgres_db());
-    (bob, tx)
+pub(crate) fn create_test_bob() -> (crate::accounts::bob::BOB, crate::stages::SettledInbox) {
+    let inbox = crate::stages::SettledInbox::new();
+    let bob = crate::accounts::bob::BOB::new_test(inbox.clone(), dead_postgres_db());
+    (bob, inbox)
 }
 
 /// Same as `create_test_bob` but backed by a real throwaway Postgres container,
@@ -286,11 +302,22 @@ pub(crate) fn create_test_bob() -> (
 #[cfg(test)]
 pub(crate) async fn create_test_bob_with_postgres() -> (
     crate::accounts::bob::BOB,
-    tokio::sync::mpsc::UnboundedSender<crate::stages::AccountSettlements>,
+    crate::stages::SettledInbox,
     testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
 ) {
     let (db, container) = start_test_postgres().await;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let bob = crate::accounts::bob::BOB::new_test(rx, db);
-    (bob, tx, container)
+    let inbox = crate::stages::SettledInbox::new();
+    let bob = crate::accounts::bob::BOB::new_test(inbox.clone(), db);
+    (bob, inbox, container)
+}
+
+/// Zero account-size deltas, for building an executed result in a test.
+///
+/// The upstream type carries no `Default`, and every test here executes
+/// transactions that resize nothing, so they all want the same zeroed value.
+pub fn no_accounts_deltas() -> solana_svm::transaction_execution_result::AccountsDeltas {
+    solana_svm::transaction_execution_result::AccountsDeltas {
+        accounts_resize_delta: 0,
+        accounts_uninitialized_size: 0,
+    }
 }

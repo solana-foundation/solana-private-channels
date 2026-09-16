@@ -47,8 +47,9 @@ use yellowstone_grpc_proto::geyser::{
     GetBlockHeightRequest, GetBlockHeightResponse, GetLatestBlockhashRequest,
     GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse, GetVersionRequest,
     GetVersionResponse, IsBlockhashValidRequest, IsBlockhashValidResponse, PingRequest,
-    PongResponse, SubscribeDeshredRequest, SubscribeReplayInfoRequest, SubscribeReplayInfoResponse,
-    SubscribeRequest, SubscribeUpdate, SubscribeUpdateDeshred,
+    PongResponse, SubscribeDeshredRequest, SubscribeGossipRequest, SubscribeReplayInfoRequest,
+    SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate, SubscribeUpdateDeshred,
+    SubscribeUpdateGossip,
 };
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -326,10 +327,15 @@ type SubscribeStream =
 type SubscribeDeshredStream =
     Pin<Box<dyn Stream<Item = Result<SubscribeUpdateDeshred, Status>> + Send + 'static>>;
 
+// `subscribe_gossip` arrived alongside it and is stubbed for the same reason.
+type SubscribeGossipStream =
+    Pin<Box<dyn Stream<Item = Result<SubscribeUpdateGossip, Status>> + Send + 'static>>;
+
 #[tonic::async_trait]
 impl Geyser for MockGeyserService {
     type SubscribeStream = SubscribeStream;
     type SubscribeDeshredStream = SubscribeDeshredStream;
+    type SubscribeGossipStream = SubscribeGossipStream;
 
     async fn subscribe_deshred(
         &self,
@@ -337,6 +343,15 @@ impl Geyser for MockGeyserService {
     ) -> Result<Response<Self::SubscribeDeshredStream>, Status> {
         Err(Status::unimplemented(
             "subscribe_deshred is not implemented by the mock",
+        ))
+    }
+
+    async fn subscribe_gossip(
+        &self,
+        _request: Request<SubscribeGossipRequest>,
+    ) -> Result<Response<Self::SubscribeGossipStream>, Status> {
+        Err(Status::unimplemented(
+            "subscribe_gossip is not implemented by the mock",
         ))
     }
 

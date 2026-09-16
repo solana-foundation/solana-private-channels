@@ -888,6 +888,7 @@ mod tests {
         let starved = PostgresAccountsDB {
             pool: Arc::new(pool),
             read_only: false,
+            writer_epoch: None,
         };
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -952,6 +953,7 @@ mod tests {
         let shadowed = PostgresAccountsDB {
             pool: Arc::new(pool_whose_release_fails(&url).await),
             read_only: false,
+            writer_epoch: None,
         };
         let outcome = truncate_slots(&shadowed, &apply_opts(10, 3, tmp.path())).await;
         assert!(
