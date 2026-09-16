@@ -114,9 +114,9 @@ it:
   release belongs to a later generation than the bitmap is on. Rows that are
   `completed`, `failed` or `failed_reminted` do not count; `manual_review` does.
 - It holds an armed rotation while any release is in flight, or while a pending
-  remint still depends on a bit in the current generation. The database is not
-  read again before sending, so a terminal row re-armed to `pending` after the
-  rotation is armed is not waited for.
+  remint still depends on a bit in the current generation. It also reads the
+  owed rows again before sending, and drops a fresh armed rotation if the answer
+  changed.
 - If a lower nonce keeps a rotation withheld for five minutes, it reports
   `rotation_blocked_by_lower_nonce`.
 

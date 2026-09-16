@@ -172,6 +172,8 @@ const blockMintIx = await getBlockMintInstructionAsync({
 
 Authorizes an operator to sign withdrawal transactions. At least one operator is required for a functional instance.
 
+An operator key can release any allowed mint to any recipient and can rotate the withdrawal bitmap, so register one key per instance and keep it distinct from the admin key. Rotation should only ever come from the indexer's sender, which withholds it while a withdrawal still owes a release. A rotation sent by hand or from a second operator key can strand every unreleased nonce in the generation it closes. See the trust model in [ESCROW_PROGRAM.md](ESCROW_PROGRAM.md#trust-model).
+
 ### TypeScript Example
 
 ```typescript

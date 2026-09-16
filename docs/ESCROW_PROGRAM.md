@@ -291,7 +291,12 @@ broadcast signatures enters the automatic remint flow, which remints only once
 it proves no release landed and otherwise sends the row to manual review. A row
 with no signatures goes straight to manual review for an out-of-band remint.
 
-The admin's control over an operator key is `RemoveOperator`.
+The admin's control over an operator key is `RemoveOperator`. That separation is
+on chain only. The indexer's operator process always loads the admin signer, uses
+it to pay for rotations, and falls back to it as the operator when
+`OPERATOR_SIGNER` is unset, so whoever holds that process holds both roles and
+there is no one left to revoke anything. Containment requires an operator key
+that is distinct from the admin key and kept outside that process.
 
 ## Accounts
 

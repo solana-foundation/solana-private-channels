@@ -191,7 +191,11 @@ async fn rotation_happens_with_no_boundary_row_present() {
 async fn a_manual_review_row_blocks_rotation_until_resolved() {
     let (storage, pool, _pg) = start_pg("rotation_blocked_by_manual_review").await;
     let rpc = MockRpcServer::start().await;
-    rpc.enqueue_sequence("getAccountInfo", vec![bitmap_reply(0), bitmap_reply(0)]);
+    // The withheld pass, the arming pass, and the send gate each read the chain.
+    rpc.enqueue_sequence(
+        "getAccountInfo",
+        vec![bitmap_reply(0), bitmap_reply(0), bitmap_reply(0)],
+    );
 
     let blocking = seed_withdrawal(&storage, &pool, "stuck", 2, "manual_review").await;
     seed_withdrawal(
@@ -229,6 +233,75 @@ async fn a_manual_review_row_blocks_rotation_until_resolved() {
             .await
             .is_some(),
         "resolving the blocking nonce must let the rotation through"
+    );
+}
+
+/// The reviewer's scenario: a rotation is armed while nothing in the current
+/// generation is owed, and then a terminal row in that generation is re-armed
+/// by hand before the send tick. The arming pass never looks again, so the send
+/// has to, and a rotation sent past that row would strand it for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_re_armed_after_arming_is_seen_before_the_send() {
+    let (storage, pool, _pg) = start_pg("rotation_disarmed_by_rearmed_row").await;
+    let rpc = MockRpcServer::start().await;
+    rpc.enqueue_sequence(
+        "getAccountInfo",
+        std::iter::repeat_with(|| bitmap_reply(0)).take(4),
+    );
+
+    let settled = seed_withdrawal(&storage, &pool, "settled", 2, "completed").await;
+    seed_withdrawal(
+        &storage,
+        &pool,
+        "waiting",
+        next_generation_nonce(1),
+        "pending",
+    )
+    .await;
+
+    let mut state = build_sender(storage.clone(), rpc.url());
+    test_hooks::originate_rotation_if_needed(&mut state).await;
+    assert!(
+        state.pending_rotation.is_some(),
+        "nothing owed on the current generation, so the rotation arms"
+    );
+
+    // On-call re-arms the settled row into the generation the rotation would close.
+    sqlx::query("UPDATE transactions SET status = 'pending' WHERE id = $1")
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(
+        test_hooks::take_pending_rotation_if_ready(&mut state)
+            .await
+            .is_none(),
+        "the send must see the row that returned to owing a release"
+    );
+    assert!(
+        state.pending_rotation.is_none(),
+        "a fresh rotation is disarmed so the arming pass decides again"
+    );
+    assert_eq!(
+        rpc.call_count("sendTransaction"),
+        0,
+        "no rotation may be broadcast past the re-armed row"
+    );
+
+    // The row settles, and the rotation follows it.
+    sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    test_hooks::originate_rotation_if_needed(&mut state).await;
+    assert!(
+        test_hooks::take_pending_rotation_if_ready(&mut state)
+            .await
+            .is_some(),
+        "once the row has settled the rotation is armed and sent"
     );
 }
 

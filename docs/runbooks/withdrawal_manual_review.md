@@ -418,7 +418,7 @@ committing the row to manual review. Sub-triggers below; same recovery.
    did land. The operator enforces both before calling a signature dead by
    absence, the top via the blockhash-expiry check that produces
    `DeadByAbsence` and the bottom via the ledger floor in
-   `sender/remint.rs::coverage_verdict`. Honor both here.
+   `sender/remint.rs::ledger_coverage_verdict`. Honor both here.
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
    - Not burned, proven absent → **do not re-arm.** Nothing backs the
@@ -474,7 +474,18 @@ SELECT id, signature, slot, withdrawal_nonce, mint, amount, recipient,
 ```
 
 If `withdrawal_nonce IS NOT NULL`, the row was repaired between
-quarantine and triage. Re-arm to `pending`:
+quarantine and triage. Check first that the bitmap still covers it. A row with a
+NULL nonce contributes no bound to the rotation gate, so the window can close
+while the row is corrupt, and a re-arm would then send the release into a
+generation the program refuses.
+
+```bash
+solana account <BITMAP_PDA> --output json --url <rpc-url>
+```
+
+The generation is the u64 at offset 2. If it is above
+`withdrawal_nonce / 65536`, do not re-arm: the row belongs to
+[Path H](#path-h---rotated-past-generation). If it matches, re-arm to `pending`:
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
@@ -601,9 +612,8 @@ is already closed.
 This means a rotation landed while the withdrawal still owed a release. The
 sender withholds that rotation, so the cause is one of:
 
-- the row was terminal (`failed`, `failed_reminted` or `completed`) when the
-  sender armed the rotation, and was re-armed to `pending` before or after it
-  landed. The sender checks owed rows when it arms, not again when it sends.
+- the row owed a release with no nonce, so the sender could not count it before
+  the bitmap moved, and Path F Step 1 re-armed it afterwards.
 - a `RotateBitmap` sent outside the sender, by hand or from another operator key.
 
 **Do not re-arm.** The operator will not release a nonce from a closed
@@ -682,4 +692,3 @@ Capture in the incident record:
 - RPC endpoint used for verification.
 
 These feed the audit trail for any user-facing reconciliation.
-
