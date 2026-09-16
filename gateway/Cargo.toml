@@ -10,6 +10,10 @@ path = "src/lib.rs"
 clap = { workspace = true }
 private-channel-metrics = { path = "../metrics" }
 dvp-swap-program-client = { path = "../dvp-swap-program/clients/rust" }
+# Deriving a user's ATA is how the gateway tells "never changed hands" apart
+# from "changed hands without leaving a row".
+spl-associated-token-account = { workspace = true }
+solana-pubkey = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 jsonrpsee = { workspace = true }

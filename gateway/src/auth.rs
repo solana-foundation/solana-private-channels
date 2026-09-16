@@ -11,6 +11,9 @@ use std::sync::LazyLock;
 use uuid::Uuid;
 
 use dvp_swap_program_client::{accounts::SwapDvp, DVP_SWAP_PROGRAM_ID};
+use solana_pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use std::str::FromStr;
 
 use tracing::warn;
 
@@ -171,6 +174,10 @@ const SPL_TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuE
 /// is not a token account and is denied for User-role callers.
 const TOKEN_ACCOUNT_SIZE: usize = 165;
 
+/// Byte range of the `mint` field, the first thing in a token account.
+const MINT_OFFSET: usize = 0;
+const MINT_END: usize = 32;
+
 /// Byte range of the `owner` field: the wallet pubkey that controls the account.
 const OWNER_OFFSET: usize = 32;
 const OWNER_END: usize = 64;
@@ -313,6 +320,31 @@ pub async fn check_account_data_ownership(
     }
 }
 
+/// Whether `pubkey` is still the associated token account its own `owner` field
+/// derives to.
+///
+/// A user's token accounts are all ATAs: the ingress allowlist limits System to
+/// `Transfer`, so `CreateAccount` is unreachable and only the ATA program can
+/// make them. An ATA's address is derived from the wallet that owned it at
+/// creation, and nothing rewrites the address afterwards. So an owner the
+/// address no longer derives to is proof the owner field was moved, whatever
+/// moved it, including a CPI this gateway never sees.
+///
+/// Only meaningful for an account with no recorded handoff. After a recorded
+/// one the address is expected not to derive.
+fn derives_as_own_ata(data: &[u8], program_owner: &str, pubkey: &str) -> bool {
+    let (Ok(mint), Ok(owner), Ok(token_program), Ok(address)) = (
+        Pubkey::try_from(&data[MINT_OFFSET..MINT_END]),
+        Pubkey::try_from(&data[OWNER_OFFSET..OWNER_END]),
+        Pubkey::from_str(program_owner),
+        Pubkey::from_str(pubkey),
+    ) else {
+        return false;
+    };
+
+    get_associated_token_address_with_program_id(&owner, &mint, &token_program) == address
+}
+
 /// Count how a history request's scoping resolved. An empty scope is served as
 /// an empty page, which is indistinguishable from an address with no history
 /// unless something counts it.
@@ -366,6 +398,15 @@ pub async fn resolve_owned_slot_ranges(
     // One past the cap, so a full page is how an over-long chain announces itself.
     let changes = owner_changes(auth_db, &address, MAX_OWNER_CHANGES + 1).await?;
     if changes.is_empty() {
+        // No row is only evidence of no handoff while the address still derives
+        // from its owner. An owner it does not derive to was moved without one
+        // being recorded, which the detector cannot see if it happened through
+        // a CPI, so there is nothing here to vouch for the earlier history.
+        if !derives_as_own_ata(data, program_owner, pubkey) {
+            warn!("{pubkey} does not derive from its owner and has no recorded handoff");
+            record_scope_outcome("unrecorded_handoff");
+            return Ok(Some(Vec::new()));
+        }
         // A ledger recorded from genesis can vouch for the whole history.
         if indexed_from == 0 {
             record_scope_outcome("never_handed_on");
@@ -893,6 +934,52 @@ mod tests {
                 "{method} is owner-only but not account-gated"
             );
         }
+    }
+
+    // ── derives_as_own_ata ────────────────────────────────────────────────────
+
+    /// Token account bytes: mint at 0..32, owner at 32..64.
+    fn token_account_bytes(mint: &Pubkey, owner: &Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; TOKEN_ACCOUNT_SIZE];
+        data[MINT_OFFSET..MINT_END].copy_from_slice(mint.as_ref());
+        data[OWNER_OFFSET..OWNER_END].copy_from_slice(owner.as_ref());
+        data
+    }
+
+    /// An account still sitting at its own derived address has never had its
+    /// owner moved, so an absent handoff row really does mean none happened.
+    #[test]
+    fn an_untouched_ata_derives_from_its_owner() {
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
+        let address = get_associated_token_address_with_program_id(&owner, &mint, &token_program);
+
+        assert!(derives_as_own_ata(
+            &token_account_bytes(&mint, &owner),
+            SPL_TOKEN_PROGRAM,
+            &address.to_string(),
+        ));
+    }
+
+    /// An owner the address does not derive to was moved there, and a handoff
+    /// through a CPI leaves no row behind to say so. The derivation is what
+    /// catches it, whatever moved the owner.
+    #[test]
+    fn an_owner_the_address_does_not_derive_to_is_rejected() {
+        let mint = Pubkey::new_unique();
+        let original_owner = Pubkey::new_unique();
+        let new_owner = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(SPL_TOKEN_PROGRAM).unwrap();
+        // The address stays put; only the owner field moved.
+        let address =
+            get_associated_token_address_with_program_id(&original_owner, &mint, &token_program);
+
+        assert!(!derives_as_own_ata(
+            &token_account_bytes(&mint, &new_owner),
+            SPL_TOKEN_PROGRAM,
+            &address.to_string(),
+        ));
     }
 
     // ── slot_ranges_for_owner ─────────────────────────────────────────────────

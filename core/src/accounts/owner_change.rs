@@ -172,8 +172,10 @@ pub fn rows_from_stored(
 /// no pre-state lookup needed.
 ///
 /// Inner instructions are not scanned: CPI recording is off, so they are not
-/// available here. No admitted program CPIs `SetAuthority`, and a handoff that
-/// did slip through a CPI breaks the recorded chain rather than widening it.
+/// available here, and no admitted program CPIs `SetAuthority` today. A handoff
+/// that did slip through one would leave no row, so the gateway does not take an
+/// absent row as proof on its own: it checks the address still derives from its
+/// owner, which no CPI can fake.
 fn detect_owner_changes<'a, I>(
     account_keys: &[Pubkey],
     instructions: I,

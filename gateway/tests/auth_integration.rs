@@ -348,6 +348,23 @@ fn token_account_response(owner_bytes: &[u8; 32], delegate_bytes: Option<&[u8; 3
     .to_string()
 }
 
+/// Where an untouched ATA of `owner` actually sits, for the all-zero mint
+/// `token_account_response` builds.
+///
+/// A test covering the no-handoff path has to use this rather than an arbitrary
+/// address: the gateway treats an address that does not derive from its own
+/// owner as one whose owner was moved without a row being recorded.
+fn untouched_ata_of(owner: &[u8; 32]) -> [u8; 32] {
+    let token_program =
+        solana_pubkey::Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    spl_associated_token_account::get_associated_token_address_with_program_id(
+        &solana_pubkey::Pubkey::new_from_array(*owner),
+        &solana_pubkey::Pubkey::default(),
+        &token_program,
+    )
+    .to_bytes()
+}
+
 /// Build a getAccountInfo JSON-RPC response for a mint account (82 bytes, SPL
 /// Token program). Used to verify the gateway rejects mint queries for users.
 fn mint_account_response() -> String {
@@ -1978,7 +1995,7 @@ async fn test_get_signatures_for_address_withholds_history_below_the_watermark()
     init_owner_change_table(&pool).await;
 
     let owner = [1u8; 32];
-    let token_account = [8u8; 32];
+    let token_account = untouched_ata_of(&owner);
     let recording_began = 500;
     set_owner_change_watermark(&pool, recording_began).await;
 
@@ -2139,7 +2156,8 @@ async fn test_get_signatures_for_address_unhandled_account_is_not_scoped() {
     init_owner_change_table(&pool).await;
 
     let owner = [1u8; 32];
-    let token_account = [8u8; 32];
+    // Its own derived address, so the gateway can tell it was never moved.
+    let token_account = untouched_ata_of(&owner);
 
     let user_id = insert_user(&pool, "user").await;
     insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
