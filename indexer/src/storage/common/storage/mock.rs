@@ -29,6 +29,8 @@ pub struct MockStorage {
     pub fail_times: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     /// Per-op call counts (bumped in `check_should_fail`); tests assert loop convergence.
     pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
+    /// Storage operation names in call order, for tests that pin read ordering.
+    pub call_order: std::sync::Arc<Mutex<Vec<String>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
     /// Rows the unpinned reconciliation read answers with; `None` mirrors `mint_balances`.
@@ -76,6 +78,7 @@ impl MockStorage {
     }
 
     fn check_should_fail(&self, operation: &str) -> Result<(), StorageError> {
+        self.call_order.lock().unwrap().push(operation.to_string());
         *self
             .call_counts
             .lock()

@@ -33,7 +33,6 @@ use solana_transaction_status::{
     UiTransactionEncoding, UiTransactionReturnData,
 };
 use std::{collections::HashSet, str::FromStr, sync::Arc};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 /// Rejects an unusable `accounts` request before the transaction is executed.
@@ -217,12 +216,12 @@ pub async fn simulate_transaction(
         transaction: Arc::new(sanitized_tx),
         index: 0,
     });
-    let (_settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
     // Simulation runs a single transaction; intra-batch parallelism is
     // unnecessary, so disable it (max_svm_workers=1 forces sequential path).
     let mut execution_deps = get_execution_deps(
         read_deps.accounts_db.clone(),
-        settled_accounts_rx,
+        // A throwaway BOB that nothing settles into.
+        crate::stages::SettledInbox::new(),
         1,
         sim_live_blockhashes,
     )

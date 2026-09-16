@@ -411,7 +411,7 @@ counter_vec!(
 counter_vec!(
     SETTLER_BACKPRESSURE_ENGAGED,
     "private_channel_settler_backpressure_engaged_total",
-    "Ticks that flushed a settle buffer already at or over its byte budget",
+    "Ticks that flushed a settle buffer already at or over its byte or row budget",
     &[]
 );
 counter_vec!(

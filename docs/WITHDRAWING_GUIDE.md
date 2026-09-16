@@ -46,7 +46,8 @@ Setting a bit costs one byte write; checking one costs one byte read.
 ### Generations
 
 To stay bounded, the bitmap covers a **generation** of nonces at a time and is
-rotated when that window fills. `generation` is stored in the account:
+rotated once no withdrawal in that window still owes a release. `generation` is
+stored in the account:
 
 ```rust
 let nonce_generation = transaction_nonce / NONCES_PER_GENERATION; // 65_536
@@ -97,17 +98,51 @@ nonces.
 - **Constant verification cost**: one bit read and one bit write per release,
   independent of how many nonces have already been consumed.
 
+### What gates a rotation
+
+The program checks two things before it rotates: the signer is a registered
+operator for the instance, and `expected_generation` equals the stored
+generation. It does not check that the window is full or that every withdrawal
+in it was released. A window is not guaranteed to fill: a withdrawal that ends
+`failed` or `failed_reminted` never sets its bit.
+
+When to rotate is the operator's responsibility (see the
+[trust model](ESCROW_PROGRAM.md#trust-model)), and the indexer's sender enforces
+it:
+
+- It arms a rotation only when the lowest withdrawal nonce that still owes a
+  release belongs to a later generation than the bitmap is on. Rows that are
+  `completed`, `failed` or `failed_reminted` do not count; `manual_review` does.
+- It holds an armed rotation while any release is in flight, or while a pending
+  remint still depends on a bit in the current generation. It also reads the
+  owed rows again before sending, and drops a fresh armed rotation if the answer
+  changed.
+- If a lower nonce keeps a rotation withheld for five minutes, it reports
+  `rotation_blocked_by_lower_nonce`.
+
+A nonce whose generation has been rotated past can never be released. The
+sender does not retry it as a release. It routes the withdrawal to the
+compensating remint instead. A row with earlier broadcast signatures enters the
+remint flow, which remints on the channel only once it proves none of them
+landed; if the evidence stays inconclusive the row goes to `manual_review`. A
+row with no signatures goes to `manual_review` directly, where a human confirms
+nothing landed and restores the user's tokens (see Path H in
+[`withdrawal_manual_review.md`](runbooks/withdrawal_manual_review.md)).
+
 ### Visual example
 
 ```
 Generation 0 (nonces 0-65,535)              Generation 1 (nonces 65,536-131,071)
 +----------------------------+             +----------------------------+
 | generation: 0              |             | generation: 1              |
-| Nonces used: 65,536/65,536 |   Rotate    | Nonces used: 0/65,536      |
-| Status: FULL               |   ------>   | Status: ACTIVE             |
+| Nonces used: 61,204/65,536 |   Rotate    | Nonces used: 0/65,536      |
+| Still owed: 0              |   ------>   | Status: ACTIVE             |
 +----------------------------+             +----------------------------+
-      (window exhausted)                          (all bits cleared)
+ (no nonce still owes a release)                  (all bits cleared)
 ```
+
+Bits can stay clear in a rotated window. When the sender rotates, those nonces
+belong to withdrawals that ended without a release, so nothing is waiting on them.
 
 ### Rejections you may see
 

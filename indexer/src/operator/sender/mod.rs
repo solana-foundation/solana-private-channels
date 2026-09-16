@@ -214,6 +214,9 @@ const WITHDRAW_SENDER_LOCK_KEY: i64 = 0x53_4E_44_5F_57_44_52_57; // "SND_WDRW"
 /// parked, and the cost of a fast one is a database read on every tick forever.
 const ROTATION_ORIGINATION_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often an armed rotation is re-checked and sent.
+const ROTATION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// How often the sender re-proves it owns its advisory lock.
 ///
 /// Well under the 32s finality delay and the 60s recovery tick, so a sender that
@@ -297,8 +300,7 @@ pub async fn run_sender(
     // next tick
     state.recover_pending_remints(&storage_tx).await?;
 
-    // Periodic check for pending rotation (every 500ms)
-    let mut rotation_check_interval = interval(Duration::from_millis(500));
+    let mut rotation_check_interval = interval(ROTATION_CHECK_INTERVAL);
 
     // Rotation is needed once per generation of nonces, so the check that starts
     // one runs far more slowly than the one that submits it. The slower cadence

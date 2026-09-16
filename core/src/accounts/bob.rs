@@ -30,10 +30,10 @@
 ///
 /// What decides whether `synced_since` may be set at all is `generation`. Every
 /// account BOB writes is stamped with the ordinal of that
-/// write, and settlement feedback carries a high-water generation meaning
-/// "everything up to here is durable". An entry is only ever marked
+/// write, and settlement feedback carries, per account, the generation of the
+/// write the settler made durable. An entry is only ever marked
 /// synchronized, or dropped if it is a tombstone, when its own generation is
-/// covered by that mark. Account bytes are never the deciding test: closed
+/// covered by that acknowledgement. Account bytes are never the deciding test: closed
 /// accounts are all byte-identical, and a live account can return to a value it
 /// held before, so bytes cannot tell an acknowledgement of this write apart from
 /// an acknowledgement of an older one.
@@ -41,7 +41,7 @@ use {
     crate::{
         accounts::{precompiles::PRECOMPILES, AccountsDB},
         processor::CHANNEL_SLOT,
-        stages::AccountSettlements,
+        stages::{SettledEntry, SettledInbox},
     },
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
@@ -59,7 +59,6 @@ use {
         collections::{HashMap, HashSet},
         time::{SystemTime, UNIX_EPOCH},
     },
-    tokio::sync::mpsc,
     tracing::{debug, warn},
 };
 
@@ -111,7 +110,7 @@ struct AccountWithMeta {
 }
 
 /// How often (in batches) to run the expensive eviction sweep in garbage_collect.
-/// The settled_accounts channel is still drained on every preload to keep
+/// The settled accounts inbox is still drained on every preload to keep
 /// dirty/clean tracking current; only the O(N) `retain()` scan is deferred.
 const GC_EVICTION_INTERVAL: u64 = 100;
 
@@ -121,7 +120,7 @@ pub struct BOB {
     /// Precompiles that are always kept in memory (never garbage collected)
     precompiles: HashMap<Pubkey, AccountSharedData>,
     /// Accounts that are coming from settlement
-    settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
+    settled_accounts: SettledInbox,
     /// AccountsDB account state
     pub accounts_db: AccountsDB,
     /// Counts preload calls since last eviction sweep
@@ -146,17 +145,14 @@ pub struct BOB {
 }
 
 impl BOB {
-    pub async fn new(
-        accounts_db: AccountsDB,
-        settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
-    ) -> Self {
+    pub async fn new(accounts_db: AccountsDB, settled_accounts: SettledInbox) -> Self {
         // Precompile ELFs are parsed once process-wide; see
         // `crate::accounts::precompiles`. Cloning the map is cheap, the
         // heavy work of parsing BPF bytes happens at first LazyLock access.
         Self {
             accounts: HashMap::new(),
             precompiles: PRECOMPILES.clone(),
-            settled_accounts_rx,
+            settled_accounts,
             accounts_db,
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
@@ -278,7 +274,7 @@ impl BOB {
             }
         }
 
-        // Drain settled_accounts to keep dirty/clean tracking current, enforce
+        // Drain the settled inbox to keep dirty/clean tracking current, enforce
         // the hard cap, and run the periodic age sweep. Misses are not resident
         // yet, so they are never eviction candidates here.
         self.garbage_collect();
@@ -392,92 +388,91 @@ impl BOB {
         generation
     }
 
-    /// Drain the settled accounts channel and periodically evict stale entries.
+    /// Drain the settled accounts inbox and periodically evict stale entries.
     ///
     /// Split into two phases:
-    /// 1. **Channel drain** (every call): process settled_accounts messages to
-    ///    update `synced_since` and remove deleted tombstones. This is lightweight
-    ///    — just a `try_recv` loop over whatever messages are pending.
+    /// 1. **Inbox drain** (every call): apply the pending settlements to
+    ///    update `synced_since` and remove deleted tombstones. This is lightweight:
+    ///    one take of whatever the settler merged since the last call.
     /// 2. **Eviction sweep** (every `GC_EVICTION_INTERVAL` batches): scan the
     ///    entire HashMap to evict entries that have been synced for longer than
     ///    `OLDEST_SYNCED_ACCOUNT_AGE`. This is O(N) so we avoid it on every batch.
     ///
-    /// An entry is reconciled only when its generation is covered by the
-    /// acknowledgement's high-water mark, which is what makes the drain safe:
-    /// `entry.generation <= generation` means the database holds exactly the
-    /// value BOB holds, and a greater generation means the executor is ahead so
-    /// the entry must stay dirty. `<=` and not `==` because a tick acknowledges
-    /// every write up to its mark, and equality would strand any account whose
-    /// write was not the tick's last.
+    /// The settler acknowledges each account at the generation of the write it
+    /// committed, so `entry.generation <= generation` means the database holds what
+    /// BOB holds, and a newer entry means the executor is ahead and it stays dirty.
     fn garbage_collect(&mut self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        // Phase 1: always drain the channel to keep dirty/clean state current.
-        while let Ok(AccountSettlements {
-            generation,
-            accounts,
-        }) = self.settled_accounts_rx.try_recv()
+        // Phase 1: always drain the inbox to keep dirty/clean state current. The
+        // inbox keeps only the newest settlement per account; an older one it
+        // replaced could not have reconciled anything, since BOB's entry is newer.
+        for (
+            pubkey,
+            SettledEntry {
+                generation,
+                settlement: account_settlement,
+            },
+        ) in self.settled_accounts.take()
         {
-            for (pubkey, account_settlement) in accounts {
-                if account_settlement.deleted {
-                    // We expect the account to exist in-memory because we only
-                    // tombstone deleted accounts
-                    match self
-                        .accounts
-                        .get(&pubkey)
-                        .map(|account| (account.deleted, account.generation))
+            if account_settlement.deleted {
+                // We expect the account to exist in-memory because we only
+                // tombstone deleted accounts
+                match self
+                    .accounts
+                    .get(&pubkey)
+                    .map(|account| (account.deleted, account.generation))
+                {
+                    // Drop only a tombstone, and only the exact one now durable.
+                    // Closed accounts are byte-identical, so bytes cannot tell
+                    // one close apart from the next.
+                    Some((true, entry_generation))
+                        if entry_generation.is_some_and(|g| g <= generation) =>
                     {
-                        // Drop only a tombstone, and only the exact one now durable.
-                        // Closed accounts are byte-identical, so bytes cannot tell
-                        // one close apart from the next.
-                        Some((true, entry_generation))
-                            if entry_generation.is_some_and(|g| g <= generation) =>
-                        {
-                            if let Some(old) = self.accounts.remove(&pubkey) {
-                                self.note_removed(&old);
-                            }
-                        }
-                        // A live entry, or a tombstone newer than this acknowledgement.
-                        Some(_) => {}
-                        None => {
-                            warn!("Account {} was deleted from in-memory, but we expected it to be tombstoned", pubkey);
+                        if let Some(old) = self.accounts.remove(&pubkey) {
+                            self.note_removed(&old);
                         }
                     }
-                } else if let Some(account) = self.accounts.get_mut(&pubkey) {
-                    // A tombstone must never be marked clean: that would make it
-                    // evictable and let a later preload reload the stale row.
-                    if !account.deleted && account.generation.is_some_and(|g| g <= generation) {
-                        if account.account == account_settlement.account {
-                            // The settled bytes match, so this dirty entry is now clean.
-                            let was_dirty = account.synced_since.is_none();
-                            account.synced_since = Some(now);
-                            if was_dirty {
-                                self.dirty_entries = self.dirty_entries.saturating_sub(1);
-                            }
-                        } else {
-                            // A covered generation must imply matching bytes, so a
-                            // mismatch is a bug: BOB's and the settler's independent
-                            // derivations of account state have diverged. Leave the
-                            // entry dirty, which cannot be evicted or reloaded.
-                            let entry_generation = account.generation;
-                            warn!(
-                                "Account {} settled under high-water generation {} but its bytes differ from in-memory (entry generation {:?}); leaving it dirty",
-                                pubkey, generation, entry_generation
-                            );
-                            // Counted as well as logged so the divergence is
-                            // alertable, since a log line alone is not.
-                            self.settlement_divergences += 1;
-                        }
+                    // A live entry, or a tombstone newer than this acknowledgement.
+                    Some(_) => {}
+                    None => {
+                        warn!("Account {} was deleted from in-memory, but we expected it to be tombstoned", pubkey);
                     }
-                } else {
-                    warn!(
-                        "Account {} was deleted from in-memory, but we expected it to be there",
-                        pubkey
-                    );
                 }
+            } else if let Some(account) = self.accounts.get_mut(&pubkey) {
+                // A tombstone must never be marked clean: that would make it
+                // evictable and let a later preload reload the stale row.
+                if !account.deleted && account.generation.is_some_and(|g| g <= generation) {
+                    if account.account == account_settlement.account {
+                        // The settled bytes match, so this dirty entry is now clean.
+                        let was_dirty = account.synced_since.is_none();
+                        account.synced_since = Some(now);
+                        if was_dirty {
+                            self.dirty_entries = self.dirty_entries.saturating_sub(1);
+                        }
+                    } else {
+                        // A covered generation must imply matching bytes, so a
+                        // mismatch is a bug: BOB's and the settler's independent
+                        // derivations of account state have diverged. Leave the
+                        // entry dirty, which cannot be evicted or reloaded.
+                        let entry_generation = account.generation;
+                        warn!(
+                            "Account {} settled at generation {} but its bytes differ from in-memory (entry generation {:?}); leaving it dirty",
+                            pubkey, generation, entry_generation
+                        );
+                        // Counted as well as logged so the divergence is
+                        // alertable, since a log line alone is not.
+                        self.settlement_divergences += 1;
+                    }
+                }
+            } else {
+                warn!(
+                    "Account {} was deleted from in-memory, but we expected it to be there",
+                    pubkey
+                );
             }
         }
 
@@ -630,14 +625,11 @@ impl BOB {
 impl BOB {
     /// Test-only constructor — needs private field access so it lives on the type.
     /// The actual test helper that sets up the dummy DB pool is in test_helpers.rs.
-    pub(crate) fn new_test(
-        settled_accounts_rx: mpsc::UnboundedReceiver<AccountSettlements>,
-        accounts_db: AccountsDB,
-    ) -> Self {
+    pub(crate) fn new_test(settled_accounts: SettledInbox, accounts_db: AccountsDB) -> Self {
         Self {
             accounts: HashMap::new(),
             precompiles: HashMap::new(),
-            settled_accounts_rx,
+            settled_accounts,
             accounts_db,
             batches_since_eviction: 0,
             max_cache_entries: DEFAULT_MAX_CACHE_ENTRIES,
@@ -724,7 +716,7 @@ mod tests {
         solana_svm_timings::ExecuteTimings,
     };
 
-    fn create_test_bob() -> (BOB, mpsc::UnboundedSender<AccountSettlements>) {
+    fn create_test_bob() -> (BOB, SettledInbox) {
         crate::test_helpers::create_test_bob()
     }
 
@@ -783,7 +775,7 @@ mod tests {
     /// A failed executed tx must not overwrite a preloaded data account X=10 with its intermediate X=6, nor create dest.
     #[tokio::test]
     async fn failed_executed_does_not_overwrite_existing() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let from = Keypair::new();
         let x = from.pubkey();
         let dest = Pubkey::new_unique();
@@ -817,7 +809,7 @@ mod tests {
     /// Success path is unchanged: a successful executed tx still commits X=6 and dest=4 (guards against an inverted guard).
     #[tokio::test]
     async fn successful_executed_still_writes() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let from = Keypair::new();
         let x = from.pubkey();
         let dest = Pubkey::new_unique();
@@ -846,7 +838,7 @@ mod tests {
     /// Admin-trap regression: a failed executed result with empty loaded accounts must leave a pre-existing fee payer untouched.
     #[tokio::test]
     async fn failed_executed_does_not_tombstone_fee_payer() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let from = Keypair::new();
         let fee_payer = from.pubkey();
         bob.insert_account_for_test(fee_payer, token_like(10));
@@ -878,7 +870,7 @@ mod tests {
     /// gone. Classifying on the data too leaves a dead account readable.
     #[tokio::test]
     async fn update_accounts_tombstones_zero_lamport_data_account() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let from = Keypair::new();
         let closed = from.pubkey();
         bob.insert_account_for_test(closed, token_like(10));
@@ -949,7 +941,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_marks_matching_account_as_synced() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let account = make_account(1000, &[1, 2, 3], &Pubkey::default());
 
@@ -963,18 +955,16 @@ mod tests {
             },
         );
 
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: account.clone(),
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: account.clone(),
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -987,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_preserves_ahead_state_when_data_differs() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let newer = make_account(2000, &[9, 9, 9], &Pubkey::default());
         let older = make_account(1000, &[1, 2, 3], &Pubkey::default());
@@ -1004,18 +994,16 @@ mod tests {
         );
 
         // Settler sends older (now-stale) feedback
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: older,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: older,
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1032,7 +1020,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_preserves_deleted_tombstone_against_non_deleted_settlement() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let account = make_account(1000, &[1], &Pubkey::default());
 
@@ -1048,18 +1036,16 @@ mod tests {
         );
 
         // Settler sends non-deleted settlement (from before the delete)
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account,
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1073,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_removes_tombstone_on_deleted_settlement() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let account = make_account(0, &[], &Pubkey::default());
 
@@ -1088,18 +1074,16 @@ mod tests {
         );
 
         // Settler confirms deletion was persisted to DB
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account,
-                        deleted: true,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account,
+                    deleted: true,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1118,7 +1102,7 @@ mod tests {
     /// only the generation can tell one close apart from the next.
     #[tokio::test]
     async fn gc_stale_delete_ack_does_not_remove_newer_tombstone() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         // The tombstone from the second close of this account.
@@ -1133,18 +1117,16 @@ mod tests {
         );
 
         // Acknowledgement for the first close: durable only up to generation 1.
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: make_account(0, &[], &Pubkey::default()),
-                        deleted: true,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: make_account(0, &[], &Pubkey::default()),
+                    deleted: true,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1164,7 +1146,7 @@ mod tests {
     /// makes an entry that is newer than the database evictable.
     #[tokio::test]
     async fn gc_stale_ack_with_identical_bytes_does_not_mark_synced() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let bytes_a = make_account(1000, &[1, 2, 3], &Pubkey::default());
 
@@ -1178,18 +1160,16 @@ mod tests {
             },
         );
 
-        settled_tx
-            .send(AccountSettlements {
-                generation: 3,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: bytes_a,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            3,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: bytes_a,
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1204,7 +1184,7 @@ mod tests {
     /// the entry dirty so it can be neither evicted nor reloaded.
     #[tokio::test]
     async fn gc_current_generation_with_divergent_bytes_leaves_entry_dirty() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         bob.accounts.insert(
@@ -1217,18 +1197,16 @@ mod tests {
             },
         );
 
-        settled_tx
-            .send(AccountSettlements {
-                generation: 2,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: make_account(1000, &[2], &Pubkey::default()),
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            2,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: make_account(1000, &[2], &Pubkey::default()),
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1255,7 +1233,7 @@ mod tests {
     /// the next preload would reload the stale database row.
     #[tokio::test]
     async fn gc_current_live_ack_does_not_mark_tombstone_synced() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let tombstone = make_account(0, &[], &Pubkey::default());
 
@@ -1269,18 +1247,16 @@ mod tests {
             },
         );
 
-        settled_tx
-            .send(AccountSettlements {
-                generation: 4,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: tombstone,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            4,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: tombstone,
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1296,7 +1272,7 @@ mod tests {
     /// feedback must never remove a live entry, even when the mark has caught up.
     #[tokio::test]
     async fn gc_current_delete_ack_does_not_remove_live_entry() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let live = make_account(1000, &[1, 2, 3], &Pubkey::default());
 
@@ -1310,18 +1286,16 @@ mod tests {
             },
         );
 
-        settled_tx
-            .send(AccountSettlements {
-                generation: 4,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: make_account(0, &[], &Pubkey::default()),
-                        deleted: true,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            4,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: make_account(0, &[], &Pubkey::default()),
+                    deleted: true,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1338,7 +1312,7 @@ mod tests {
     /// reconcile. Both halves of this test fail if the comparison narrows.
     #[tokio::test]
     async fn gc_reconciles_entry_older_than_high_water_mark() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let live_key = Pubkey::new_unique();
         let tombstone_key = Pubkey::new_unique();
         let live = make_account(1000, &[1, 2, 3], &Pubkey::default());
@@ -1363,27 +1337,25 @@ mod tests {
         );
 
         // One tick made every generation up to 5 durable, so both entries are covered.
-        settled_tx
-            .send(AccountSettlements {
-                generation: 5,
-                accounts: vec![
-                    (
-                        live_key,
-                        AccountSettlement {
-                            account: live,
-                            deleted: false,
-                        },
-                    ),
-                    (
-                        tombstone_key,
-                        AccountSettlement {
-                            account: make_account(0, &[], &Pubkey::default()),
-                            deleted: true,
-                        },
-                    ),
-                ],
-            })
-            .unwrap();
+        inbox.publish_at(
+            5,
+            vec![
+                (
+                    live_key,
+                    AccountSettlement {
+                        account: live,
+                        deleted: false,
+                    },
+                ),
+                (
+                    tombstone_key,
+                    AccountSettlement {
+                        account: make_account(0, &[], &Pubkey::default()),
+                        deleted: true,
+                    },
+                ),
+            ],
+        );
 
         bob.garbage_collect();
 
@@ -1401,7 +1373,7 @@ mod tests {
     /// and every account written in a call carries the returned generation.
     #[tokio::test]
     async fn update_accounts_returns_monotonic_generations_starting_at_one() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
         // A system transfer has writable accounts at indices 0 and 1.
@@ -1441,7 +1413,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_never_removes_unsynced_accounts() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         bob.accounts.insert(
@@ -1464,7 +1436,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_removes_old_synced_accounts() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         bob.accounts.insert(
@@ -1489,7 +1461,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_keeps_recently_synced_accounts() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         bob.accounts.insert(
@@ -1514,7 +1486,7 @@ mod tests {
     async fn concurrent_preload_and_settle_preserves_newer_state() {
         // Simulates the race condition: executor writes v2 after settler
         // sends v1 feedback but before GC runs.
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         let v1 = make_account(1000, &[1], &Pubkey::default());
@@ -1532,18 +1504,16 @@ mod tests {
         );
 
         // Step 2: Settler settles v1 and sends feedback
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: v1,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: v1,
+                    deleted: false,
+                },
+            )],
+        );
 
         // Step 3: Before GC runs, executor updates BOB to v2
         bob.accounts.insert(
@@ -1572,7 +1542,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_multi_batch_settlement_applies_all_in_order() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         let v1 = make_account(1000, &[1], &Pubkey::default());
@@ -1591,30 +1561,26 @@ mod tests {
         );
 
         // Two settlement batches queue up before GC runs
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: v1,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
-        settled_tx
-            .send(AccountSettlements {
-                generation: 2,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: v2,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: v1,
+                    deleted: false,
+                },
+            )],
+        );
+        inbox.publish_at(
+            2,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: v2,
+                    deleted: false,
+                },
+            )],
+        );
 
         bob.garbage_collect();
 
@@ -1629,24 +1595,222 @@ mod tests {
         );
     }
 
+    /// An older settlement for an account the executor has since rewritten must
+    /// not be judged against the newer bytes, even when a later block settles
+    /// something else before BOB reads the inbox.
+    #[tokio::test]
+    async fn gc_older_ack_for_rewritten_entry_does_not_alert() {
+        let (mut bob, inbox) = create_test_bob();
+        let (x, y) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let b6 = make_account(1000, &[6], &Pubkey::default());
+        seed_entry(&mut bob, x, b6.clone(), 6);
+        seed_entry(&mut bob, y, make_account(1000, &[7], &Pubkey::default()), 7);
+
+        inbox.publish_at(
+            5,
+            vec![(x, settlement(make_account(1000, &[5], &Pubkey::default())))],
+        );
+        inbox.publish_at(
+            7,
+            vec![(y, settlement(make_account(1000, &[7], &Pubkey::default())))],
+        );
+        bob.garbage_collect();
+
+        let meta = bob.accounts.get(&x).unwrap();
+        assert_eq!(meta.account, b6, "the newer write stays");
+        assert!(meta.synced_since.is_none(), "and stays dirty");
+        assert_eq!(
+            bob.cache_stats().settlement_divergences,
+            0,
+            "an older settlement is not a divergence"
+        );
+    }
+
+    fn settlement(account: AccountSharedData) -> AccountSettlement {
+        AccountSettlement {
+            deleted: account.lamports() == 0,
+            account: if account.lamports() == 0 {
+                AccountSharedData::default()
+            } else {
+                account
+            },
+        }
+    }
+
+    /// Seed a dirty entry the way `update_accounts` writes one, counters included.
+    fn seed_entry(bob: &mut BOB, pubkey: Pubkey, account: AccountSharedData, generation: u64) {
+        let deleted = account.lamports() == 0;
+        let meta = AccountWithMeta {
+            account: if deleted {
+                AccountSharedData::default()
+            } else {
+                account
+            },
+            synced_since: None,
+            deleted,
+            generation: Some(generation),
+        };
+        bob.note_added(&meta);
+        if let Some(old) = bob.accounts.insert(pubkey, meta) {
+            bob.note_removed(&old);
+        }
+    }
+
+    type Snapshot = (
+        std::collections::BTreeMap<Pubkey, (AccountSharedData, bool, Option<u64>, bool)>,
+        BobCacheStats,
+    );
+
+    /// Everything a settlement can change: each entry's bytes, tombstone flag,
+    /// generation and cleanliness, plus the counters.
+    fn snapshot(bob: &mut BOB) -> Snapshot {
+        let entries = bob
+            .accounts
+            .iter()
+            .map(|(key, meta)| {
+                (
+                    *key,
+                    (
+                        meta.account.clone(),
+                        meta.deleted,
+                        meta.generation,
+                        meta.synced_since.is_some(),
+                    ),
+                )
+            })
+            .collect();
+        (entries, bob.cache_stats())
+    }
+
+    /// Settlements merged in the inbox and applied at once must leave BOB exactly
+    /// as applying them one at a time would. Every script is reachable: BOB's entry
+    /// is at least as new as every settlement for it, and settlements are in order.
+    #[tokio::test]
+    async fn merged_application_equals_in_order_application() {
+        struct Script {
+            name: &'static str,
+            /// BOB's entries when the settlements are read: key index, account, generation.
+            entries: Vec<(usize, AccountSharedData, u64)>,
+            /// Settlements in publish order: generation, then key index and account.
+            acks: Vec<(u64, Vec<(usize, AccountSharedData)>)>,
+            /// Expected end state per key index: `Some(clean)` if resident, `None` if removed.
+            expect: Vec<(usize, Option<bool>)>,
+            divergences: usize,
+        }
+        let live = |byte: u8| make_account(1000, &[byte], &Pubkey::default());
+        let closed = || make_account(0, &[], &Pubkey::default());
+        let scripts = vec![
+            Script {
+                name: "rewritten twice, entry at the last write",
+                entries: vec![(0, live(2), 2)],
+                acks: vec![(1, vec![(0, live(1))]), (2, vec![(0, live(2))])],
+                expect: vec![(0, Some(true))],
+                divergences: 0,
+            },
+            Script {
+                name: "rewritten twice, entry one write ahead",
+                entries: vec![(0, live(3), 3)],
+                acks: vec![(1, vec![(0, live(1))]), (2, vec![(0, live(2))])],
+                expect: vec![(0, Some(false))],
+                divergences: 0,
+            },
+            Script {
+                name: "closed then recreated",
+                entries: vec![(0, live(2), 2)],
+                acks: vec![(1, vec![(0, closed())]), (2, vec![(0, live(2))])],
+                expect: vec![(0, Some(true))],
+                divergences: 0,
+            },
+            Script {
+                name: "recreated then closed",
+                entries: vec![(0, closed(), 2)],
+                acks: vec![(1, vec![(0, live(1))]), (2, vec![(0, closed())])],
+                expect: vec![(0, None)],
+                divergences: 0,
+            },
+            Script {
+                name: "closed twice",
+                entries: vec![(0, closed(), 2)],
+                acks: vec![(1, vec![(0, closed())]), (2, vec![(0, closed())])],
+                expect: vec![(0, None)],
+                divergences: 0,
+            },
+            Script {
+                name: "disjoint keys across three blocks",
+                entries: vec![(0, live(1), 1), (1, live(2), 2), (2, closed(), 3)],
+                acks: vec![
+                    (1, vec![(0, live(1))]),
+                    (2, vec![(1, live(2))]),
+                    (3, vec![(2, closed())]),
+                ],
+                expect: vec![(0, Some(true)), (1, Some(true)), (2, None)],
+                divergences: 0,
+            },
+            Script {
+                name: "the last settlement covers a divergent entry",
+                entries: vec![(0, live(2), 2)],
+                acks: vec![(1, vec![(0, live(1))]), (2, vec![(0, live(9))])],
+                expect: vec![(0, Some(false))],
+                divergences: 1,
+            },
+            Script {
+                name: "a key BOB never held",
+                entries: vec![],
+                acks: vec![(1, vec![(0, live(1))])],
+                expect: vec![(0, None)],
+                divergences: 0,
+            },
+        ];
+
+        for script in scripts {
+            let keys: Vec<Pubkey> = (0..3).map(|_| Pubkey::new_unique()).collect();
+            let (mut in_order, in_order_inbox) = create_test_bob();
+            let (mut merged, merged_inbox) = create_test_bob();
+            for (key, account, generation) in &script.entries {
+                seed_entry(&mut in_order, keys[*key], account.clone(), *generation);
+                seed_entry(&mut merged, keys[*key], account.clone(), *generation);
+            }
+            for (generation, accounts) in &script.acks {
+                let accounts: Vec<_> = accounts
+                    .iter()
+                    .map(|(key, account)| (keys[*key], settlement(account.clone())))
+                    .collect();
+                in_order_inbox.publish_at(*generation, accounts.clone());
+                in_order.garbage_collect();
+                merged_inbox.publish_at(*generation, accounts);
+            }
+            merged.garbage_collect();
+
+            let merged_state = snapshot(&mut merged);
+            assert_eq!(snapshot(&mut in_order), merged_state, "{}", script.name);
+            for (key, expected) in &script.expect {
+                let actual = merged_state.0.get(&keys[*key]).map(|entry| entry.3);
+                assert_eq!(actual, *expected, "{}: key {key}", script.name);
+            }
+            assert_eq!(
+                merged_state.1.settlement_divergences, script.divergences,
+                "{}",
+                script.name
+            );
+        }
+    }
+
     #[tokio::test]
     async fn gc_settlement_for_missing_account_does_not_panic() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let missing_pubkey = Pubkey::new_unique();
 
         // Settler sends feedback for an account that was never in BOB
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    missing_pubkey,
-                    AccountSettlement {
-                        account: make_account(1000, &[1], &Pubkey::default()),
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                missing_pubkey,
+                AccountSettlement {
+                    account: make_account(1000, &[1], &Pubkey::default()),
+                    deleted: false,
+                },
+            )],
+        );
 
         // Should not panic; just logs a warning
         bob.garbage_collect();
@@ -1659,7 +1823,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_mixed_population() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let now = now_secs();
 
         let old_synced = Pubkey::new_unique();
@@ -1714,7 +1878,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_boundary_exact_age_is_kept() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         // synced_since + OLDEST_SYNCED_ACCOUNT_AGE == now, so it should be kept (>= check)
@@ -1786,7 +1950,7 @@ mod tests {
 
     #[tokio::test]
     async fn preload_hit_refreshes_clean_recency() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let now = now_secs();
 
@@ -1812,7 +1976,7 @@ mod tests {
 
     #[tokio::test]
     async fn preload_hit_does_not_sync_dirty() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
 
         bob.accounts.insert(
@@ -1836,7 +2000,7 @@ mod tests {
 
     #[tokio::test]
     async fn cap_evicts_oldest_clean_over_limit() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_entries = 10;
         let now = now_secs();
 
@@ -1878,7 +2042,7 @@ mod tests {
 
     #[tokio::test]
     async fn cap_never_evicts_dirty() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_entries = 2;
 
         for _ in 0..3 {
@@ -1906,7 +2070,7 @@ mod tests {
     /// if it was cold, because preload restamps hits before eviction runs.
     #[tokio::test]
     async fn cap_keeps_account_referenced_this_batch() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_entries = 2;
         let stale = now_secs() - 10_000;
 
@@ -1963,7 +2127,7 @@ mod tests {
     /// total is back under the watermark.
     #[tokio::test]
     async fn byte_cap_evicts_largest_clean_entries_to_the_watermark() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_bytes = 1000;
         let largest = insert_clean(&mut bob, 600);
         let rest = [
@@ -1985,7 +2149,7 @@ mod tests {
     /// exceed the cap, because the batch is about to execute against them.
     #[tokio::test]
     async fn byte_cap_never_evicts_the_working_set() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_bytes = 1000;
         let working_set = [insert_clean(&mut bob, 800), insert_clean(&mut bob, 700)];
         let other = insert_clean(&mut bob, 100);
@@ -2001,7 +2165,7 @@ mod tests {
     /// would lose state; the byte cap must leave them alone like the entry cap.
     #[tokio::test]
     async fn byte_cap_never_evicts_dirty_entries_or_tombstones() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_bytes = 1000;
         let dirty = Pubkey::new_unique();
         bob.insert_account_for_test(dirty, make_account(1, &[7u8; 1200], &Pubkey::default()));
@@ -2023,7 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn byte_cap_is_a_no_op_under_the_limit() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         bob.max_cache_bytes = 1000;
         let key = insert_clean(&mut bob, 900);
 
@@ -2038,8 +2202,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_accounts_holds_the_cache_to_its_byte_cap() {
         let (accounts_db, _pg) = crate::test_helpers::start_test_postgres().await;
-        let (_settled_tx, rx) = mpsc::unbounded_channel();
-        let mut bob = BOB::new_test(rx, accounts_db);
+        let mut bob = BOB::new_test(SettledInbox::new(), accounts_db);
         bob.max_cache_bytes = 5000;
         let mut keys = Vec::new();
         for _ in 0..4 {
@@ -2068,7 +2231,7 @@ mod tests {
 
     #[tokio::test]
     async fn cache_stats_reports_and_drains() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let now = now_secs();
 
         // One old clean entry that the sweep will evict.
@@ -2133,7 +2296,7 @@ mod tests {
     /// between eviction sweeps, not only right after one.
     #[tokio::test]
     async fn cache_stats_maintained_without_sweep() {
-        let (mut bob, settled_tx) = create_test_bob();
+        let (mut bob, inbox) = create_test_bob();
         let a = Pubkey::new_unique();
         let account_a = make_account(1, &[0u8; 5], &Pubkey::default());
         // Given a generation so settlement feedback can reconcile it;
@@ -2158,18 +2321,16 @@ mod tests {
         assert_eq!(stats.bytes, 5 + 3);
 
         // Settling `a` matches its in-memory bytes, flipping it clean with no sweep.
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    a,
-                    AccountSettlement {
-                        account: account_a,
-                        deleted: false,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                a,
+                AccountSettlement {
+                    account: account_a,
+                    deleted: false,
+                },
+            )],
+        );
         bob.garbage_collect();
 
         let stats = bob.cache_stats();
@@ -2201,8 +2362,7 @@ mod tests {
         redis_raw.set_account(pubkey, account.clone()).await;
 
         let db = crate::accounts::AccountsDB::Redis(redis_raw);
-        let (_settled_tx, rx) = mpsc::unbounded_channel();
-        let mut bob = BOB::new_test(rx, db);
+        let mut bob = BOB::new_test(SettledInbox::new(), db);
 
         let now = now_secs();
         let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
@@ -2245,7 +2405,7 @@ mod tests {
     /// path is covered rather than only its first half.
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_does_not_resurrect_account_after_stale_delete_ack() {
-        let (mut bob, settled_tx, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
+        let (mut bob, inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
         let pubkey = Pubkey::new_unique();
         let funded = make_account(1_000, &[7, 7, 7], &Pubkey::default());
 
@@ -2272,18 +2432,16 @@ mod tests {
         );
 
         // Acknowledgement for the first close, durable only up to generation 1.
-        settled_tx
-            .send(AccountSettlements {
-                generation: 1,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: make_account(0, &[], &Pubkey::default()),
-                        deleted: true,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            1,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: make_account(0, &[], &Pubkey::default()),
+                    deleted: true,
+                },
+            )],
+        );
 
         let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
         assert_eq!(
@@ -2320,7 +2478,7 @@ mod tests {
     /// counts as a hit here and the database is not read.
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_removes_tombstone_when_ack_is_current() {
-        let (mut bob, settled_tx, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
+        let (mut bob, inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
         let pubkey = Pubkey::new_unique();
 
         bob.accounts.insert(
@@ -2333,18 +2491,16 @@ mod tests {
             },
         );
 
-        settled_tx
-            .send(AccountSettlements {
-                generation: 3,
-                accounts: vec![(
-                    pubkey,
-                    AccountSettlement {
-                        account: make_account(0, &[], &Pubkey::default()),
-                        deleted: true,
-                    },
-                )],
-            })
-            .unwrap();
+        inbox.publish_at(
+            3,
+            vec![(
+                pubkey,
+                AccountSettlement {
+                    account: make_account(0, &[], &Pubkey::default()),
+                    deleted: true,
+                },
+            )],
+        );
 
         let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
 
@@ -2368,8 +2524,7 @@ mod tests {
     /// settlement comparison.
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_stamps_fetched_accounts_with_no_generation() {
-        let (mut bob, _settled_tx, _pg) =
-            crate::test_helpers::create_test_bob_with_postgres().await;
+        let (mut bob, _inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
         let pubkey = Pubkey::new_unique();
         let stored = make_account(1_000, &[4, 5, 6], &Pubkey::default());
 
@@ -2399,8 +2554,7 @@ mod tests {
     /// would carry no generation, so no acknowledgement could ever correct it.
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_does_not_clobber_a_warm_entry_with_a_stale_row() {
-        let (mut bob, _settled_tx, _pg) =
-            crate::test_helpers::create_test_bob_with_postgres().await;
+        let (mut bob, _inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
         let pubkey = Pubkey::new_unique();
         let older = make_account(1_000, &[1], &Pubkey::default());
         let newer = make_account(2_000, &[9], &Pubkey::default());
@@ -2439,8 +2593,7 @@ mod tests {
     /// 1-lamport control proves the seed landed, so the miss is the filter.
     #[tokio::test(flavor = "multi_thread")]
     async fn preload_skips_zero_lamport_row() {
-        let (mut bob, _settled_tx, _pg) =
-            crate::test_helpers::create_test_bob_with_postgres().await;
+        let (mut bob, _inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
         let zero = Pubkey::new_unique();
         let floor = Pubkey::new_unique();
 
@@ -2486,7 +2639,7 @@ mod tests {
     /// or misjudge whether a balance grew.
     #[tokio::test]
     async fn bob_account_lamports_matches_loader_semantics() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
 
         let precompile = Pubkey::new_unique();
         bob.precompiles
@@ -2551,7 +2704,7 @@ mod tests {
         use crate::accounts::get_accounts::{reset_test_retry, set_test_retry, AccountLoadError};
 
         set_test_retry(2, 1);
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
         let result = bob.preload_accounts(&[pubkey], usize::MAX).await;
         reset_test_retry();
@@ -2567,8 +2720,7 @@ mod tests {
     async fn preload_corrupt_row_errors_and_caches_nothing() {
         use crate::accounts::get_accounts::AccountLoadError;
 
-        let (mut bob, _settled_tx, _pg) =
-            crate::test_helpers::create_test_bob_with_postgres().await;
+        let (mut bob, _inbox, _pg) = crate::test_helpers::create_test_bob_with_postgres().await;
         let corrupt = Pubkey::new_unique();
         let pool = match &bob.accounts_db {
             crate::accounts::AccountsDB::Postgres(pg) => std::sync::Arc::clone(&pg.pool),
@@ -2662,7 +2814,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_accounts_mirror_persists_writable_skips_readonly() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let (tx, mint) = build_admin_shaped_tx();
 
         // Hand-build a mirror aligned to account_keys with a read-only spl_token slot.
@@ -2700,7 +2852,7 @@ mod tests {
     #[tokio::test]
     async fn account_data_sizes_answers_a_warm_batch_without_the_store() {
         // Backed by a dead Postgres, so any query at all would fail the test.
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let small = Pubkey::new_unique();
         let large = Pubkey::new_unique();
         bob.insert_account_for_test(small, make_account(1, &[7u8; 10], &Pubkey::default()));
@@ -2726,7 +2878,7 @@ mod tests {
     /// be sized from the tombstone it still occupies in the map.
     #[tokio::test]
     async fn account_data_sizes_treats_a_tombstone_as_absent() {
-        let (mut bob, _settled_tx) = create_test_bob();
+        let (mut bob, _inbox) = create_test_bob();
         let closed = Pubkey::new_unique();
         bob.accounts.insert(
             closed,
@@ -2753,7 +2905,7 @@ mod tests {
         use crate::accounts::get_accounts::{reset_test_retry, set_test_retry, AccountLoadError};
 
         set_test_retry(2, 1);
-        let (bob, _settled_tx) = create_test_bob();
+        let (bob, _inbox) = create_test_bob();
         let result = bob.account_data_sizes(&[Pubkey::new_unique()]).await;
         reset_test_retry();
 

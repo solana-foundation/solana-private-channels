@@ -966,6 +966,11 @@ enum ReleaseRecord {
     Unproven(String),
 }
 
+enum ReleaseCoverage {
+    Covered,
+    Unproven(String),
+}
+
 /// Ask the indexer's record whether this nonce already paid out.
 ///
 /// This is the last gate, and past a rotation it is the only one, because the
@@ -978,6 +983,8 @@ async fn release_record(state: &SenderState, entry: &mut PendingRemint) -> Relea
     let Some(nonce) = entry.ctx.withdrawal_nonce else {
         return ReleaseRecord::ProvenAbsent;
     };
+
+    let coverage = release_coverage(state, entry, nonce).await;
 
     match state.storage.get_observed_release(nonce).await {
         Ok(Some(release)) => {
@@ -997,16 +1004,18 @@ async fn release_record(state: &SenderState, entry: &mut PendingRemint) -> Relea
         }
     }
 
-    coverage_verdict(state, entry, nonce).await
+    match coverage {
+        ReleaseCoverage::Covered => ReleaseRecord::ProvenAbsent,
+        ReleaseCoverage::Unproven(reason) => ReleaseRecord::Unproven(reason),
+    }
 }
 
-/// Whether the indexer has walked far enough for the empty lookup above to mean
-/// anything.
-async fn coverage_verdict(
+/// Whether the indexer has walked far enough for an empty lookup to mean anything.
+async fn release_coverage(
     state: &SenderState,
     entry: &mut PendingRemint,
     nonce: u64,
-) -> ReleaseRecord {
+) -> ReleaseCoverage {
     let bound = match entry.coverage_slot {
         Some(slot) => slot,
         None => match state.rpc_client.get_slot().await {
@@ -1017,7 +1026,7 @@ async fn coverage_verdict(
                 slot
             }
             Err(e) => {
-                return ReleaseRecord::Unproven(format!(
+                return ReleaseCoverage::Unproven(format!(
                     "could not read the current slot to bound the release window for nonce \
                      {nonce} ({e})"
                 ))
@@ -1030,16 +1039,16 @@ async fn coverage_verdict(
         .get_committed_checkpoint(ProgramType::Escrow.as_label())
         .await
     {
-        Ok(Some(checkpoint)) if checkpoint >= bound => ReleaseRecord::ProvenAbsent,
-        Ok(Some(checkpoint)) => ReleaseRecord::Unproven(format!(
+        Ok(Some(checkpoint)) if checkpoint >= bound => ReleaseCoverage::Covered,
+        Ok(Some(checkpoint)) => ReleaseCoverage::Unproven(format!(
             "no release is on record for nonce {nonce}, but the indexer has only reached slot \
              {checkpoint} of {bound}, so a release could still be unindexed"
         )),
-        Ok(None) => ReleaseRecord::Unproven(format!(
+        Ok(None) => ReleaseCoverage::Unproven(format!(
             "no release is on record for nonce {nonce} and the indexer has committed no \
              checkpoint, so nothing says the record covers slot {bound}"
         )),
-        Err(e) => ReleaseRecord::Unproven(format!(
+        Err(e) => ReleaseCoverage::Unproven(format!(
             "no release is on record for nonce {nonce} and the indexer checkpoint could not be \
              read ({e}), so its coverage is unknown"
         )),
@@ -2423,6 +2432,36 @@ mod tests {
             state.pending_remints.len(),
             1,
             "an unreadable checkpoint must hold the refund, not wave it through"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_record_reads_the_checkpoint_before_the_lookup() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let (_slot, _calls) = mock_get_slot(&mut server, 9_000);
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        mock.update_committed_checkpoint("escrow", 9_000)
+            .await
+            .unwrap();
+
+        queue_dead_remint(&mut state, 3);
+        let mut entry = state.pending_remints.pop().unwrap();
+        let _record = release_record(&state, &mut entry).await;
+
+        let order = mock.call_order.lock().unwrap().clone();
+        let checkpoint = order
+            .iter()
+            .position(|op| op == "get_committed_checkpoint")
+            .expect("checkpoint must be read");
+        let lookup = order
+            .iter()
+            .position(|op| op == "get_observed_release")
+            .expect("release lookup must be read");
+        assert!(
+            checkpoint < lookup,
+            "coverage must be established before checking release absence"
         );
     }
 

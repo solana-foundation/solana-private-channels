@@ -49,6 +49,7 @@ have prefixes.
 | `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
 | `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
+| `but the bitmap is on generation` together with `no signatures to verify` | H - rotated past generation (use this, not C) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
 | `released on-chain with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
@@ -81,8 +82,10 @@ A rising count means the operator wants to rotate and has been held back for
 more than five minutes. It stays flat while a boundary is merely being crossed,
 so a count that moves is a row someone has to resolve, not ordinary traffic. The
 accompanying WARN log names the blocking nonce, which is the row to resolve
-first. Resolving it is what releases the block; no rotation command exists and
-none is needed.
+first. Resolving it is what releases the block. The operator does not expose a
+manual rotation, and hand-sending `RotateBitmap` is unsafe: it makes every
+unreleased withdrawal in the current generation unreleasable, see the
+[trust model](../ESCROW_PROGRAM.md#trust-model).
 
 ## Path A.halting - build error that halted the pipeline
 
@@ -197,10 +200,9 @@ to say explicitly what the user is owed.
        build knows, so the deployed program and the operator are out of step. Do not
        re-arm until they match. [Escalate](_escalation.md) (Tier 2).
 
-     Either way, if the parked row's `withdrawal_nonce` is a multiple of the tree
-     size, marking it `failed` releases later withdrawals onto a tree generation
-     that was never rotated, so rotate before you terminalize it. This applies to
-     any terminalized boundary row, not just this one.
+     Either way, marking the row `failed` needs no manual rotation, even on a
+     generation boundary. A terminal row no longer holds the rotation, and the
+     operator arms it on its own.
    - `escrow ATA frozen for mint:` - the mint's `freeze_authority` holder froze the
      pooled escrow ATA, so no release for that mint can settle. The escrow still
      holds the funds and the row is intact. Nothing on our side can thaw it: contact
@@ -416,7 +418,7 @@ committing the row to manual review. Sub-triggers below; same recovery.
    did land. The operator enforces both before calling a signature dead by
    absence, the top via the blockhash-expiry check that produces
    `DeadByAbsence` and the bottom via the ledger floor in
-   `sender/remint.rs::coverage_verdict`. Honor both here.
+   `sender/remint.rs::ledger_coverage_verdict`. Honor both here.
    - Burned, no release → re-arm to `pending` and restart operator. The
      withdrawal will be re-attempted; the channel-side burn is idempotent.
    - Not burned, proven absent → **do not re-arm.** Nothing backs the
@@ -472,7 +474,18 @@ SELECT id, signature, slot, withdrawal_nonce, mint, amount, recipient,
 ```
 
 If `withdrawal_nonce IS NOT NULL`, the row was repaired between
-quarantine and triage. Re-arm to `pending`:
+quarantine and triage. Check first that the bitmap still covers it. A row with a
+NULL nonce contributes no bound to the rotation gate, so the window can close
+while the row is corrupt, and a re-arm would then send the release into a
+generation the program refuses.
+
+```bash
+solana account <BITMAP_PDA> --output json --url <rpc-url>
+```
+
+The generation is the u64 at offset 2. If it is above
+`withdrawal_nonce / 65536`, do not re-arm: the row belongs to
+[Path H](#path-h---rotated-past-generation). If it matches, re-arm to `pending`:
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
@@ -587,6 +600,85 @@ UPDATE transactions SET status = 'failed', updated_at = NOW()
  WHERE id = :transaction_id;
 ```
 
+## Path H - rotated past generation
+
+`error_message` contains `but the bitmap is on generation` and `no signatures to
+verify`. The row's nonce belongs to a generation the bitmap has already rotated
+past, so the escrow program will never release it. The operator never sent a
+release for it, or kept no signature from one, so it cannot prove nothing landed
+and will not remint on its own. The row does not hold the rotation: its window
+is already closed.
+
+This means a rotation landed while the withdrawal still owed a release. The
+sender withholds that rotation, so the cause is one of:
+
+- the row owed a release with no nonce, so the sender could not count it before
+  the bitmap moved, and Path F Step 1 re-armed it afterwards.
+- a `RotateBitmap` sent outside the sender, by hand or from another operator key.
+
+**Do not re-arm.** The operator will not release a nonce from a closed
+generation, so a re-armed row comes straight back here.
+
+Every step below must reach a clear answer before the next. Any query that
+fails, or any evidence that does not fully cover the window it has to cover, is
+`AMBIGUOUS`: stop and [escalate](_escalation.md) (Tier 2). Do not use the
+operator-key scan in [`_verify_onchain_release.md`](_verify_onchain_release.md)
+here. It stops at a fixed window and misses releases signed by other operator
+keys.
+
+1. **Find the rotation.** Page back through the bitmap PDA's history until you
+   reach the `RotateBitmap` that moved the bitmap to generation
+   `withdrawal_nonce / 65536 + 1`:
+   ```bash
+   solana transaction-history <BITMAP_PDA> --limit 1000 --url <rpc-url>
+   solana transaction-history <BITMAP_PDA> --limit 1000 --before <oldest-sig-so-far> --url <rpc-url>
+   ```
+   Record its signature, slot and signing operator. If the RPC's history ends
+   before you reach it, stop: `AMBIGUOUS`.
+2. **Rule out a release.** A release for this nonce could only land before that
+   rotation. The escrow indexer records every release of this instance, from
+   any operator key, before its checkpoint moves past the release's slot. This
+   is the same record the sender's own refund gate reads. Run the queries in
+   this order. A release recorded between them would otherwise pair a stale
+   empty lookup with a checkpoint that has already moved past it.
+   ```sql
+   SELECT last_committed_slot FROM indexer_state WHERE program_type = 'escrow';
+   SELECT signature, slot FROM observed_releases WHERE withdrawal_nonce = :withdrawal_nonce;
+   ```
+   - A row is returned: confirm it with `solana confirm -v <signature>`, then
+     mark the row completed as in Path C Step 2. Done.
+   - No row, and the `last_committed_slot` read first is at or past the
+     rotation's slot: no release landed. Continue.
+   - No row, and the checkpoint is behind the rotation's slot: `AMBIGUOUS`.
+3. **Rule out an earlier refund.** A row re-armed from `failed_reminted` was
+   already compensated, and "burned, no release" is still true for it.
+   ```sql
+   SELECT landed_remint_signature FROM transactions WHERE id = :transaction_id;
+   SELECT signature FROM pending_remint_signatures WHERE transaction_id = :transaction_id;
+   ```
+   Confirm each signature against the private channel read node. Also search
+   the alert history for an earlier `failed_reminted` webhook for this
+   `transaction_id`, and the user's channel token account history for a remint
+   after the burn.
+   - Any remint landed: set the row back to `failed_reminted`, record that
+     signature in the incident record, and skip to Step 6. Do not remint again.
+   - None landed, and every signature was confirmed failed or not found:
+     continue.
+   - A signature cannot be confirmed either way: `AMBIGUOUS`.
+4. **Confirm the burn** with both coverage bounds, as in Path C Step 3. If the
+   burn is unproven, stop and [escalate](_escalation.md) (Tier 2). If it is
+   proven absent, follow Path C Step 3's `Not burned` branch.
+5. **Burned, no release, no earlier refund.** The release can never happen, so
+   the user is owed their channel tokens. [Escalate](_escalation.md) (Tier 1)
+   for an out-of-band remint of the burned tokens, as in Path B Step 3. Include
+   the evidence from Steps 1 to 3 in the escalation. Once the remint is
+   confirmed, mark the row `failed_reminted` and record the remint signature in
+   the incident record.
+6. **Attribute the rotation.** If the signer from Step 1 is this operator's key
+   and the row was re-armed from a terminal status around then, it is the first
+   cause above. Otherwise [escalate](_escalation.md) (Tier 2): the admin can
+   revoke an unaccounted operator key with `RemoveOperator`.
+
 ## Post-incident artifacts (required)
 
 Capture in the incident record:
@@ -600,4 +692,3 @@ Capture in the incident record:
 - RPC endpoint used for verification.
 
 These feed the audit trail for any user-facing reconciliation.
-

@@ -16,7 +16,7 @@ use {
 pub struct DedupArgs {
     pub max_blockhashes: usize,
     pub input_rx: mpsc::Receiver<SanitizedTransaction>,
-    pub settled_blockhashes_rx: mpsc::UnboundedReceiver<Hash>,
+    pub settled_blockhashes_rx: mpsc::Receiver<Hash>,
     pub output_tx: mpsc::Sender<SanitizedTransaction>,
     /// Pre-populated from DB on startup; empty on a fresh node.
     pub initial_live_blockhashes: LinkedList<Hash>,
@@ -112,7 +112,7 @@ fn dedup_window_is_short(
 /// by stale state under load.
 fn ingest_blockhashes(
     first: Option<Hash>,
-    settled_blockhashes_rx: &mut mpsc::UnboundedReceiver<Hash>,
+    settled_blockhashes_rx: &mut mpsc::Receiver<Hash>,
     live_blockhashes: &RwLock<LinkedList<Hash>>,
     dedup_cache: &mut HashMap<Hash, HashSet<Hash>>,
     max_blockhashes: usize,
@@ -441,17 +441,22 @@ mod tests {
 
     const TEST_INGRESS_CAP: usize = 64;
 
-    /// Spin up the dedup stage and return the handles needed for driving it.
-    fn start_test_dedup() -> (
+    /// Spin up the dedup stage and return the handles needed for driving it,
+    /// including the live window it advances.
+    async fn start_test_dedup(
+        output_capacity: usize,
+        blockhash_capacity: usize,
+    ) -> (
         mpsc::Sender<SanitizedTransaction>,
-        mpsc::UnboundedSender<Hash>,
+        mpsc::Sender<Hash>,
         mpsc::Receiver<SanitizedTransaction>,
+        Arc<RwLock<LinkedList<Hash>>>,
     ) {
         let (input_tx, input_rx) = mpsc::channel(TEST_INGRESS_CAP);
-        let (bh_tx, bh_rx) = mpsc::unbounded_channel();
-        let (output_tx, output_rx) = mpsc::channel(64);
+        let (bh_tx, bh_rx) = mpsc::channel(blockhash_capacity);
+        let (output_tx, output_rx) = mpsc::channel(output_capacity);
 
-        let args = DedupArgs {
+        let (_dedup, live) = start_dedup(DedupArgs {
             max_blockhashes: 8,
             input_rx,
             settled_blockhashes_rx: bh_rx,
@@ -460,22 +465,20 @@ mod tests {
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
-        };
-        tokio::spawn(async move {
-            start_dedup(args).await;
-        });
+        })
+        .await;
 
-        (input_tx, bh_tx, output_rx)
+        (input_tx, bh_tx, output_rx, live)
     }
 
     // --- live dedup stage tests ---
 
     #[tokio::test]
     async fn unknown_blockhash_rejected() {
-        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx, _live) = start_test_dedup(64, 64).await;
 
         let live_bh = Hash::new_unique();
-        bh_tx.send(live_bh).unwrap();
+        bh_tx.try_send(live_bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -496,10 +499,10 @@ mod tests {
     // the re-key does not regress the original duplicate-drop behavior.
     #[tokio::test]
     async fn identical_resubmit_rejected() {
-        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx, _live) = start_test_dedup(64, 64).await;
 
         let bh = Hash::new_unique();
-        bh_tx.send(bh).unwrap();
+        bh_tx.try_send(bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -521,10 +524,10 @@ mod tests {
     // against false-positive dedup of legitimate distinct transactions.
     #[tokio::test]
     async fn distinct_messages_both_forwarded() {
-        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx, _live) = start_test_dedup(64, 64).await;
 
         let bh = Hash::new_unique();
-        bh_tx.send(bh).unwrap();
+        bh_tx.try_send(bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -557,10 +560,10 @@ mod tests {
     // dropped as a duplicate. Fails on signature-keyed dedup, which forwards it.
     #[tokio::test]
     async fn varied_signature_same_message_rejected() {
-        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx, _live) = start_test_dedup(64, 64).await;
 
         let bh = Hash::new_unique();
-        bh_tx.send(bh).unwrap();
+        bh_tx.try_send(bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -592,10 +595,10 @@ mod tests {
 
     #[tokio::test]
     async fn valid_transaction_forwarded() {
-        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx, _live) = start_test_dedup(64, 64).await;
 
         let bh = Hash::new_unique();
-        bh_tx.send(bh).unwrap();
+        bh_tx.try_send(bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -617,13 +620,13 @@ mod tests {
 
     #[tokio::test]
     async fn expired_blockhash_evicted() {
-        let (input_tx, bh_tx, mut output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, mut output_rx, _live) = start_test_dedup(64, 64).await;
 
         let mut hashes = Vec::new();
         for _ in 0..9 {
             let h = Hash::new_unique();
             hashes.push(h);
-            bh_tx.send(h).unwrap();
+            bh_tx.try_send(h).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -661,7 +664,7 @@ mod tests {
         let hashes: Vec<Hash> = (0..5).map(|_| Hash::new_unique()).collect();
         for hash in &hashes {
             cache.insert(*hash, HashSet::from([Hash::new_unique()]));
-            let (_tx, mut rx) = mpsc::unbounded_channel();
+            let (_tx, mut rx) = mpsc::channel(1);
             rx.close();
             ingest_blockhashes(Some(*hash), &mut rx, &live, &mut cache, max_blockhashes);
         }
@@ -698,10 +701,10 @@ mod tests {
             let mut cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
 
             for chunk in hashes.chunks(burst) {
-                let (tx, mut rx) = mpsc::unbounded_channel();
+                let (tx, mut rx) = mpsc::channel(chunk.len());
                 for hash in chunk {
                     cache.insert(*hash, (0..per_block).map(|_| Hash::new_unique()).collect());
-                    tx.send(*hash).expect("queue the settled blockhash");
+                    tx.try_send(*hash).expect("queue the settled blockhash");
                 }
                 drop(tx);
                 ingest_blockhashes(None, &mut rx, &live, &mut cache, max_blockhashes);
@@ -844,7 +847,7 @@ mod tests {
     /// receiver, and the shutdown token.
     async fn start_test_pipeline() -> (
         async_channel::Sender<SanitizedTransaction>,
-        mpsc::UnboundedSender<Hash>,
+        mpsc::Sender<Hash>,
         mpsc::Receiver<SanitizedTransaction>,
         tokio_util::sync::CancellationToken,
     ) {
@@ -853,7 +856,7 @@ mod tests {
         let (ingress_tx, ingress_rx) = async_channel::bounded(64);
         let (dedup_tx, dedup_rx) = mpsc::channel(64);
         let (sequencer_tx, sequencer_rx) = mpsc::channel(64);
-        let (bh_tx, bh_rx) = mpsc::unbounded_channel();
+        let (bh_tx, bh_rx) = mpsc::channel(8);
         let shutdown = tokio_util::sync::CancellationToken::new();
 
         start_sigverify_workerpool(SigverifyArgs {
@@ -892,7 +895,7 @@ mod tests {
         let (ingress_tx, bh_tx, mut sequencer_rx, _shutdown) = start_test_pipeline().await;
 
         let bh = Hash::new_unique();
-        bh_tx.send(bh).unwrap();
+        bh_tx.try_send(bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -927,7 +930,7 @@ mod tests {
         let (ingress_tx, bh_tx, mut sequencer_rx, _shutdown) = start_test_pipeline().await;
 
         let bh = Hash::new_unique();
-        bh_tx.send(bh).unwrap();
+        bh_tx.try_send(bh).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let payer = Keypair::new();
@@ -1185,11 +1188,11 @@ mod tests {
     /// drained into the sequencer, and dedup would be waiting on the settler.
     #[tokio::test(flavor = "multi_thread")]
     async fn dedup_exits_on_input_close_without_waiting_on_blockhashes() {
-        let (input_tx, bh_tx, _output_rx) = start_test_dedup();
+        let (input_tx, bh_tx, _output_rx, _live) = start_test_dedup(64, 64).await;
 
         // Held open for the whole test, standing in for a settler still running.
         let live = Hash::new_unique();
-        bh_tx.send(live).unwrap();
+        bh_tx.try_send(live).unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let (probe_tx, mut probe_rx) = mpsc::channel::<()>(1);
@@ -1208,6 +1211,41 @@ mod tests {
         );
         drop(bh_tx);
         let _ = watcher.await;
+    }
+
+    /// The settler may wait on this channel only because dedup keeps draining it
+    /// while its own forward to the sequencer is parked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_forward_still_drains_blockhashes() {
+        let (input_tx, bh_tx, output_rx, live) = start_test_dedup(1, 2).await;
+
+        let bh = Hash::new_unique();
+        bh_tx.try_send(bh).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The first fills the output slot, the second parks the forward.
+        let payer = Keypair::new();
+        input_tx.send(make_tx(&payer, bh)).await.unwrap();
+        input_tx.send(make_tx(&payer, bh)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let later: Vec<Hash> = (0..3).map(|_| Hash::new_unique()).collect();
+        // One more than the queue holds, so the last send only lands if dedup drains.
+        for hash in &later {
+            tokio::time::timeout(Duration::from_secs(2), bh_tx.send(*hash))
+                .await
+                .expect("a parked forward must not stop dedup draining blockhashes")
+                .expect("dedup is running");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !later.iter().all(|hash| live.read().unwrap().contains(hash)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a parked forward must not stop the window advancing"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(output_rx.len(), 1, "the second forward is still parked");
     }
 
     /// A window short of `max_blockhashes` is only a truncation problem when the

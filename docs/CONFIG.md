@@ -24,7 +24,7 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--max-tx-per-batch` | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
 | `--max-connections` | `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
 | `--blocktime-ms` | `PRIVATE_CHANNEL_BLOCKTIME_MS` | `100` | Tick interval (ms). A block is produced only when the tick carried transactions or the 1s idle heartbeat came due, and the slot it lands on counts every tick since the last block |
-| `--max-blockhashes` | `PRIVATE_CHANNEL_MAX_BLOCKHASHES` | `150` | How many **blocks** a blockhash stays valid for. Matches Solana's `MAX_PROCESSING_AGE` |
+| `--max-blockhashes` | `PRIVATE_CHANNEL_MAX_BLOCKHASHES` | `150` | How many **blocks** a blockhash stays valid for. Matches Solana's `MAX_PROCESSING_AGE`. Also the depth of the settled-blockhash queue from the settler to dedup |
 | `--transaction-expiration-ms` | `PRIVATE_CHANNEL_TRANSACTION_EXPIRATION_MS` | none | **Deprecated.** Expiry as a duration. When set it overrides `--max-blockhashes` with `transaction_expiration_ms / blocktime_ms` and logs a warning. Removed after the next release |
 | `--admin-keys` | `PRIVATE_CHANNEL_ADMIN_KEYS` | — | Comma-separated base58 channel admin pubkeys, gating SPL `InitializeMint`. Not the escrow `Instance.admin`, which is a separate offline key |
 | `--accountsdb-connection-url` | `PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL` | — | PostgreSQL connection string. Must be PostgreSQL: Redis is a cache, never the accounts database |

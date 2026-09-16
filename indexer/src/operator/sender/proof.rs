@@ -157,6 +157,12 @@ const ROTATION_BLOCKED_ALERT_PASSES: u32 = (ROTATION_BLOCKED_ALERT_AFTER.as_mill
     / super::ROTATION_ORIGINATION_INTERVAL.as_millis())
     as u32;
 
+/// The same threshold on the send tick, which runs ten times faster than the
+/// arming pass. Counting its passes against the arming figure would report a
+/// held rotation after thirty seconds, not the five minutes the runbooks name.
+const ROTATION_HELD_ALERT_PASSES: u32 =
+    (ROTATION_BLOCKED_ALERT_AFTER.as_millis() / super::ROTATION_CHECK_INTERVAL.as_millis()) as u32;
+
 /// Arm a rotation when the chain's generation is behind the work waiting on it.
 ///
 /// The only thing that starts a rotation. Driven by state, not by a particular
@@ -170,10 +176,12 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     };
 
     // One already armed or sent owns this window; a second would pay twice and
-    // race the re-arm path holding the first. A rotation on its way is also the
-    // end of any block, since the block is precisely the absence of one.
+    // race the re-arm path holding the first. Only an in-flight send proves the
+    // block has cleared; a pending send still has to pass the send gate.
     if state.pending_rotation.is_some() || state.rotation_in_flight.is_some() {
-        state.rotation_blocked_passes = 0;
+        if state.rotation_in_flight.is_some() && state.pending_rotation.is_none() {
+            state.rotation_blocked_passes = 0;
+        }
         return;
     }
 
@@ -245,14 +253,27 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
     }
 
     // Withholding is correct here, but only a human clears it, so report it.
-    // Once per threshold, not once per block: a counter that stops ticking lets
-    // the alert resolve while the stall is still running. Every pass that
-    // establishes no block clears the streak, so this counts consecutive ones.
+    report_rotation_blocked(
+        state,
+        chain_generation,
+        lowest,
+        highest,
+        "arming",
+        ROTATION_BLOCKED_ALERT_PASSES,
+    );
+}
+
+/// Count a rotation withheld by an owed lower nonce and report it on schedule.
+fn report_rotation_blocked(
+    state: &mut SenderState,
+    chain_generation: u64,
+    lowest: u64,
+    highest: u64,
+    gate: &'static str,
+    alert_passes: u32,
+) {
     state.rotation_blocked_passes = state.rotation_blocked_passes.saturating_add(1);
-    if !state
-        .rotation_blocked_passes
-        .is_multiple_of(ROTATION_BLOCKED_ALERT_PASSES)
-    {
+    if !state.rotation_blocked_passes.is_multiple_of(alert_passes) {
         return;
     }
 
@@ -266,6 +287,7 @@ pub(super) async fn originate_rotation_if_needed(state: &mut SenderState) {
         chain_generation,
         blocking_nonce = lowest,
         highest_waiting_nonce = highest,
+        gate,
         "Rotation withheld: a lower nonce still owes a release on the current generation"
     );
 }
@@ -286,7 +308,7 @@ async fn read_unreleased_bounds(
         report_read_failure(state);
         error!(
             min_nonce,
-            "Not arming a rotation: the nonce floor does not fit"
+            "Not rotating bitmap: the nonce floor does not fit"
         );
         return Err(BoundsUnavailable);
     };
@@ -300,7 +322,7 @@ async fn read_unreleased_bounds(
         Ok(None) => return Ok(None),
         Err(e) => {
             report_read_failure(state);
-            warn!("Not arming a rotation: could not read the unreleased nonces: {e}");
+            warn!("Not rotating bitmap: could not read the unreleased nonces: {e}");
             return Err(BoundsUnavailable);
         }
     };
@@ -312,7 +334,7 @@ async fn read_unreleased_bounds(
             error!(
                 lowest = bounds.0,
                 highest = bounds.1,
-                "Not arming a rotation: an unreleased nonce is negative"
+                "Not rotating bitmap: an unreleased nonce is negative"
             );
             Err(BoundsUnavailable)
         }
@@ -369,8 +391,68 @@ pub async fn take_pending_rotation_if_ready(
         return None;
     }
 
+    if !owed_nonce_gate_allows_send(state).await {
+        return None;
+    }
+
     info!("All in-flight transactions settled, rotation ready to execute");
     state.pending_rotation.take()
+}
+
+/// Re-read owed withdrawal bounds just before a rotation can erase the bits.
+async fn owed_nonce_gate_allows_send(state: &mut SenderState) -> bool {
+    let cached_floor = state
+        .cached_generation
+        .map(|cached| cached.saturating_mul(NONCES_PER_GENERATION))
+        .unwrap_or(0);
+
+    match read_unreleased_bounds(state, cached_floor).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return true,
+        Err(BoundsUnavailable) => return false,
+    }
+
+    let chain_generation = match state.refresh_generation().await {
+        Ok(generation) => generation,
+        Err(e) => {
+            report_read_failure(state);
+            warn!("Holding the rotation: could not read the current generation: {e}");
+            return false;
+        }
+    };
+
+    if state
+        .rotation_bound_generation
+        .is_some_and(|bound| bound != chain_generation)
+    {
+        return true;
+    }
+
+    let window_floor = chain_generation.saturating_mul(NONCES_PER_GENERATION);
+    let (lowest, highest) = match read_unreleased_bounds(state, window_floor).await {
+        Ok(Some(bounds)) => bounds,
+        Ok(None) => return true,
+        Err(BoundsUnavailable) => return false,
+    };
+
+    if lowest / NONCES_PER_GENERATION > chain_generation {
+        return true;
+    }
+
+    if state.rotation_in_flight.is_some() {
+        report_rotation_blocked(
+            state,
+            chain_generation,
+            lowest,
+            highest,
+            "send",
+            ROTATION_HELD_ALERT_PASSES,
+        );
+    } else {
+        state.pending_rotation = None;
+    }
+
+    false
 }
 
 /// True when no deferred remint still depends on a bit this rotation would clear.
@@ -496,6 +578,12 @@ mod tests {
         Box::new(b)
     }
 
+    fn send_gate_state(url: &str, rows: &[(i64, i64, TransactionStatus)]) -> SenderState {
+        let mut state = originator_state(url, rows);
+        state.pending_rotation = Some(rotation_builder());
+        state
+    }
+
     /// Queue a matured deferred remint for `nonce`.
     fn queue_pending_remint(state: &mut SenderState, nonce: u64) {
         state.pending_remints.push(PendingRemint {
@@ -553,6 +641,155 @@ mod tests {
         state.in_flight_withdrawals.remove(&0);
 
         assert!(take_pending_rotation_if_ready(&mut state).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn send_gate_disarms_when_a_nonce_owes_a_release_in_the_current_generation() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(
+                1,
+                NONCES_PER_GENERATION as i64 + 1,
+                TransactionStatus::Pending,
+            )],
+        );
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        assert!(
+            state.pending_rotation.is_none(),
+            "a fresh stale arm must be dropped for the arming pass to re-check it"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_gate_sends_when_only_later_generations_owe_a_release() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(
+                1,
+                2 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_some());
+        assert!(state.pending_rotation.is_none(), "the builder was taken");
+    }
+
+    #[tokio::test]
+    async fn send_gate_holds_the_rotation_when_the_bounds_read_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(
+                1,
+                2 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+        match state.storage.as_ref() {
+            crate::storage::Storage::Mock(mock) => {
+                mock.set_should_fail("unreleased_withdrawal_nonce_bounds", true)
+            }
+            _ => unreachable!("the send-gate harness is built on the mock"),
+        }
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        assert!(
+            state.pending_rotation.is_some(),
+            "an unread owed gate must hold the armed rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_gate_holds_the_rotation_when_the_generation_read_fails() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_read_failure(&mut server);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        assert!(
+            state.pending_rotation.is_some(),
+            "an unread chain generation must hold the armed rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_gate_ignores_a_nonce_stranded_below_the_current_generation() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[
+                (1, 1, TransactionStatus::ManualReview),
+                (
+                    2,
+                    2 * NONCES_PER_GENERATION as i64,
+                    TransactionStatus::Pending,
+                ),
+            ],
+        );
+        state.cached_generation = None;
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn send_gate_skips_the_chain_read_when_nothing_is_owed() {
+        let mut state = send_gate_state("http://localhost:8899", &[]);
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn send_gate_holds_a_rearmed_rotation_instead_of_disarming_it() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        state.rotation_in_flight = Some(rotation_builder());
+        state.rotation_bound_generation = Some(1);
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        assert!(state.pending_rotation.is_some());
+        assert!(state.rotation_in_flight.is_some());
+        assert_eq!(state.rotation_bound_generation, Some(1));
+    }
+
+    #[tokio::test]
+    async fn send_gate_releases_a_rearmed_rotation_whose_bound_is_stale() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 2, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(
+                1,
+                2 * NONCES_PER_GENERATION as i64,
+                TransactionStatus::Pending,
+            )],
+        );
+        state.rotation_in_flight = Some(rotation_builder());
+        state.rotation_bound_generation = Some(1);
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_some());
+        assert!(state.pending_rotation.is_none());
     }
 
     /// A deferred remint has left the in-flight set but its outcome still turns
@@ -651,6 +888,11 @@ mod tests {
             ROTATION_BLOCKED_ALERT_AFTER,
             "the interval must divide the threshold exactly"
         );
+        assert_eq!(
+            super::super::ROTATION_CHECK_INTERVAL * ROTATION_HELD_ALERT_PASSES,
+            ROTATION_BLOCKED_ALERT_AFTER,
+            "the send tick must reach the same five minutes"
+        );
     }
 
     /// The whole point of the driver: work waiting in the next generation with
@@ -716,7 +958,7 @@ mod tests {
         // is being withheld, short of the two that already clear it.
         for case in [
             "nothing live at all",
-            "a rotation already armed",
+            "a rotation in flight",
             "everything waiting inside the cached window",
         ] {
             let mut server = mockito::Server::new_async().await;
@@ -728,7 +970,7 @@ mod tests {
             };
             let mut state = originator_state(&server.url(), rows);
             match case {
-                "a rotation already armed" => state.pending_rotation = Some(rotation_builder()),
+                "a rotation in flight" => state.rotation_in_flight = Some(rotation_builder()),
                 "everything waiting inside the cached window" => state.cached_generation = Some(0),
                 _ => {}
             }
@@ -741,6 +983,58 @@ mod tests {
                 "{case}: a pass that saw no block must not leave the next one primed to report"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn arming_pass_keeps_the_streak_while_a_rotation_is_pending() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = originator_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        state.pending_rotation = Some(rotation_builder());
+        state.rotation_blocked_passes = 3;
+
+        originate_rotation_if_needed(&mut state).await;
+
+        assert_eq!(
+            state.rotation_blocked_passes, 3,
+            "a merely pending rotation still has to pass the send gate"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn send_gate_hold_reports_on_the_shared_threshold() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 1, &[]);
+
+        let mut state = send_gate_state(
+            &server.url(),
+            &[(1, NONCES_PER_GENERATION as i64, TransactionStatus::Pending)],
+        );
+        state.rotation_in_flight = Some(rotation_builder());
+        state.rotation_bound_generation = Some(1);
+
+        let before = blocked_count();
+        for _ in 0..ROTATION_BLOCKED_ALERT_PASSES {
+            assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+            originate_rotation_if_needed(&mut state).await;
+        }
+        assert_eq!(
+            blocked_count(),
+            before,
+            "the arming figure counts send ticks ten times too fast"
+        );
+
+        for _ in ROTATION_BLOCKED_ALERT_PASSES..ROTATION_HELD_ALERT_PASSES {
+            assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+        }
+
+        assert_eq!(blocked_count(), before + 1.0);
+        assert_eq!(state.rotation_blocked_passes, ROTATION_HELD_ALERT_PASSES);
     }
 
     /// A read that failed establishes nothing, so it must not be mistaken for a
