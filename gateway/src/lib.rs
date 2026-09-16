@@ -301,31 +301,47 @@ enum AccountFetch {
     Unavailable,
 }
 
-/// How a proxied response must be reshaped before it reaches this caller.
+/// How a proxied call must be shaped for this caller: what the request may ask
+/// for, and what the response may carry back.
 ///
-/// Both axes are independent of whether the request was authorized: a caller may
-/// be entitled to a history page and still not to every field of it.
-struct ResponsePolicy {
-    /// Collapse every transaction error to the generic marker.
+/// Both are independent of whether the request was authorized. A caller may be
+/// entitled to a history page and still not to all of it, nor to every field.
+struct CallPolicy {
+    /// Collapse every transaction error in the response to the generic marker.
     redact_errors: bool,
-    /// Keep only history entries whose slot falls inside one of these ranges.
-    /// `None` leaves the page untouched.
+    /// Inclusive slot windows this caller owned the address for, passed to the
+    /// node so `limit` counts rows they may see. `None` asks for everything.
     slot_ranges: Option<Vec<(i64, i64)>>,
 }
 
-impl ResponsePolicy {
-    /// Nothing to reshape, the shape every ungated and internal request takes.
+impl CallPolicy {
+    /// Nothing to shape, the shape every ungated and internal request takes.
     fn passthrough() -> Self {
         Self {
             redact_errors: false,
             slot_ranges: None,
         }
     }
+}
 
-    /// Whether the response has to be buffered and rewritten at all.
-    fn rewrites_response(&self) -> bool {
-        self.redact_errors || self.slot_ranges.is_some()
+/// Add the caller's slot scope to an outgoing `getSignaturesForAddress`.
+///
+/// The scope rides in the config object, so params keep Solana's
+/// `[address, config]` shape. It is set, never merged: a caller cannot widen
+/// what the gateway decided, and supplying it themselves gains them nothing
+/// since it can only narrow a page.
+fn apply_slot_ranges(request: &mut Value, ranges: &[(i64, i64)]) {
+    let Some(params) = request.get_mut("params").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    // params[0] is the address; the config is optional and may be absent.
+    if params.len() < 2 {
+        params.resize(2, Value::Null);
     }
+    if !params[1].is_object() {
+        params[1] = serde_json::json!({});
+    }
+    params[1]["privateChannelSlotRanges"] = serde_json::json!(ranges);
 }
 
 /// Tracks how many connections each client IP currently holds. Entries are
@@ -484,38 +500,6 @@ async fn warn_if_owner_change_table_missing(pool: &PgPool) {
         ),
         Err(e) => error!("Could not check for token_account_owner_change: {}", e),
     }
-}
-
-/// Drop history entries outside the slot ranges the caller owned the address
-/// for. Returns `None` when the body is not a JSON-RPC page, which the caller
-/// must treat as a failure rather than forward.
-///
-/// Entries carrying no slot are dropped: every real one has a slot, and an entry
-/// that cannot be placed in time cannot be shown to be the caller's.
-///
-/// A page filtered this way can come back shorter than the caller's `limit`, or
-/// empty while older entries of theirs remain, because `limit` is applied
-/// upstream over every owner's entries. Clients must page on `before` until the
-/// upstream page itself comes back short.
-fn restrict_to_slot_ranges(body: Bytes, ranges: &[(i64, i64)]) -> Option<Bytes> {
-    let mut json = serde_json::from_slice::<Value>(&body).ok()?;
-    let Some(Value::Array(entries)) = json.get_mut("result") else {
-        // An error response, or a shape with no page in it. Nothing to scope.
-        return Some(body);
-    };
-
-    entries.retain(|entry| {
-        entry
-            .get("slot")
-            .and_then(|slot| slot.as_i64())
-            .is_some_and(|slot| {
-                ranges
-                    .iter()
-                    .any(|(first, last)| slot >= *first && slot <= *last)
-            })
-    });
-
-    Some(Bytes::from(json.to_string()))
 }
 
 /// The single error every collapsed transaction reports.
@@ -829,17 +813,15 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Result<
-        ResponsePolicy,
-        Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
-    > {
+    ) -> Result<CallPolicy, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
+    {
         // Auth off, so nothing is redacted either. Every method is ungated in this
         // mode, so a caller reads the balance straight from getTokenAccountBalance
         // instead of inferring it from error codes. Redacting would also hit the
         // operator services, since with no key we cannot tell who is an Operator.
         let (decoding_key, auth_db) = match (&self.jwt_secret, &self.auth_db) {
             (Some(k), Some(db)) => (k, db),
-            _ => return Ok(ResponsePolicy::passthrough()),
+            _ => return Ok(CallPolicy::passthrough()),
         };
 
         let mut claims = verify_bearer(auth_header, decoding_key);
@@ -872,7 +854,7 @@ impl Gateway {
         // separate axis: getSignatureStatuses is ungated and still error-bearing.
         // A public method stays available when the auth DB is down; it just redacts.
         if !is_gated(method) {
-            return Ok(ResponsePolicy {
+            return Ok(CallPolicy {
                 redact_errors: redacts_transaction_errors_for(claims.as_ref(), method),
                 slot_ranges: None,
             });
@@ -895,7 +877,7 @@ impl Gateway {
         let (status, body) = match decision {
             // An Operator, whose reads are not scoped to any wallet.
             AuthDecision::Proceed => {
-                return Ok(ResponsePolicy {
+                return Ok(CallPolicy {
                     redact_errors: redact,
                     slot_ranges: None,
                 })
@@ -959,7 +941,7 @@ impl Gateway {
                             },
                             _ => None,
                         };
-                        return Ok(ResponsePolicy {
+                        return Ok(CallPolicy {
                             redact_errors: redact,
                             slot_ranges,
                         });
@@ -1247,8 +1229,8 @@ impl Gateway {
         // Skipped on the internal listener: the operator services carry no JWT,
         // and they need the raw errors their confirmation handling routes on.
         let params = json.get("params").cloned().unwrap_or(Value::Null);
-        let response_policy = match access {
-            Access::Internal => ResponsePolicy::passthrough(),
+        let call_policy = match access {
+            Access::Internal => CallPolicy::passthrough(),
             Access::Public => match self
                 .enforce_auth(auth_header.as_deref(), method, method_label, &params, start)
                 .await
@@ -1279,6 +1261,18 @@ impl Gateway {
                 );
                 return Ok(self.error_response(StatusCode::INTERNAL_SERVER_ERROR, None));
             }
+        };
+
+        // Scoping goes to the node rather than being applied to the page here,
+        // so `limit` counts rows this caller may see and every entry they are
+        // served is one they can page from.
+        let body_bytes = match &call_policy.slot_ranges {
+            Some(ranges) => {
+                let mut scoped = json.clone();
+                apply_slot_ranges(&mut scoped, ranges);
+                Bytes::from(scoped.to_string())
+            }
+            None => body_bytes,
         };
 
         let forwarded_req = match Request::builder()
@@ -1332,7 +1326,7 @@ impl Gateway {
                         "Content-Type, Authorization, solana-client",
                     ),
                 );
-                if !response_policy.rewrites_response() {
+                if !call_policy.redact_errors {
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
@@ -1344,24 +1338,7 @@ impl Gateway {
                         return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
                     }
                 };
-                let rewritten = match &response_policy.slot_ranges {
-                    Some(ranges) => match restrict_to_slot_ranges(collected, ranges) {
-                        Some(body) => body,
-                        None => {
-                            // Unparseable with a scope to apply. Redaction alone
-                            // forwards such a body untouched, but a page that
-                            // cannot be scoped must not be served at all.
-                            error!("History response from {} was not JSON", target_url);
-                            return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
-                        }
-                    },
-                    None => collected,
-                };
-                let rewritten = if response_policy.redact_errors {
-                    redact_transaction_errors(rewritten)
-                } else {
-                    rewritten
-                };
+                let rewritten = redact_transaction_errors(collected);
 
                 // Rewriting changes the length, so let hyper re-frame the body.
                 parts.headers.remove(hyper::header::CONTENT_LENGTH);
@@ -2269,79 +2246,59 @@ mod tests {
         assert_eq!(rate_limit_key(v4), v4);
     }
 
-    /// A three-entry history page spanning slots 1, 2 and 3.
-    fn history_page() -> Bytes {
-        Bytes::from(
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": [
-                    {"signature": "sig3", "slot": 3, "err": null},
-                    {"signature": "sig2", "slot": 2, "err": null},
-                    {"signature": "sig1", "slot": 1, "err": null}
-                ]
-            })
-            .to_string(),
-        )
-    }
-
-    fn signatures_in(page: Bytes) -> Vec<String> {
-        let json: Value = serde_json::from_slice(&page).unwrap();
-        json["result"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["signature"].as_str().unwrap().to_string())
-            .collect()
-    }
-
-    /// Entries from a window the caller did not own the address for are dropped,
-    /// including ones between two windows they did own.
+    /// The config object is optional in the wire format, so scoping a request
+    /// that carries only an address has to create one.
     #[test]
-    fn slot_ranges_keep_only_the_callers_windows() {
-        let kept = restrict_to_slot_ranges(history_page(), &[(1, 1), (3, i64::MAX)]).unwrap();
+    fn scoping_a_request_without_a_config_adds_one() {
+        let mut request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["SomePubkey"]
+        });
 
-        assert_eq!(signatures_in(kept), vec!["sig3", "sig1"]);
-    }
+        apply_slot_ranges(&mut request, &[(0, 99), (201, i64::MAX)]);
 
-    /// Owning no window of an address hides the page rather than emptying it of
-    /// meaning: the caller gets a valid, empty result.
-    #[test]
-    fn no_owned_range_yields_an_empty_page() {
-        let kept = restrict_to_slot_ranges(history_page(), &[]).unwrap();
-
-        assert!(signatures_in(kept).is_empty());
-    }
-
-    /// An entry with no slot cannot be placed in time, so it cannot be shown to
-    /// belong to the caller.
-    #[test]
-    fn entries_without_a_slot_are_dropped() {
-        let body = Bytes::from(
-            json!({"jsonrpc": "2.0", "id": 1, "result": [{"signature": "sig1"}]}).to_string(),
+        assert_eq!(
+            request["params"][1]["privateChannelSlotRanges"],
+            json!([[0, 99], [201, i64::MAX]])
         );
-
-        let kept = restrict_to_slot_ranges(body, &[(0, i64::MAX)]).unwrap();
-
-        assert!(signatures_in(kept).is_empty());
     }
 
-    /// Redaction forwards a body it cannot parse. A page that needs scoping must
-    /// not be forwarded on those terms.
+    /// The caller's own config options survive being scoped.
     #[test]
-    fn an_unparseable_page_is_refused_rather_than_forwarded() {
-        assert!(restrict_to_slot_ranges(Bytes::from("not json"), &[(0, 10)]).is_none());
+    fn scoping_a_request_keeps_the_callers_config() {
+        let mut request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["SomePubkey", {"limit": 10, "before": "sig1"}]
+        });
+
+        apply_slot_ranges(&mut request, &[(5, 10)]);
+
+        assert_eq!(request["params"][1]["limit"], json!(10));
+        assert_eq!(request["params"][1]["before"], json!("sig1"));
+        assert_eq!(
+            request["params"][1]["privateChannelSlotRanges"],
+            json!([[5, 10]])
+        );
     }
 
-    /// An error response carries no entries to scope and passes through.
+    /// A caller cannot widen what the gateway decided by sending a scope of
+    /// their own: theirs is replaced, not merged.
     #[test]
-    fn an_error_response_passes_through_scoping() {
-        let body =
-            Bytes::from(json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32004}}).to_string());
+    fn a_caller_supplied_scope_is_overwritten() {
+        let mut request = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": ["SomePubkey", {"privateChannelSlotRanges": [[0, i64::MAX]]}]
+        });
 
-        let forwarded = restrict_to_slot_ranges(body.clone(), &[(0, 10)]).unwrap();
+        apply_slot_ranges(&mut request, &[(5, 10)]);
 
-        assert_eq!(forwarded, body);
+        assert_eq!(
+            request["params"][1]["privateChannelSlotRanges"],
+            json!([[5, 10]])
+        );
     }
 
     /// Both legs of the balance probe (InsufficientFunds above the source

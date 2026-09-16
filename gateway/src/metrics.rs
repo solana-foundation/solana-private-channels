@@ -28,11 +28,19 @@ counter_vec!(
     &["reason"]
 );
 
+counter_vec!(
+    GATEWAY_HISTORY_SCOPED_TOTAL,
+    "private_channel_gateway_history_scoped_total",
+    "History requests by how their caller's ownership of the address resolved",
+    &["outcome"]
+);
+
 pub fn init() {
     private_channel_metrics::init_metrics!(
         GATEWAY_REQUESTS_TOTAL,
         GATEWAY_REQUEST_DURATION,
         GATEWAY_ERRORS_TOTAL,
         GATEWAY_REJECTED_TOTAL,
+        GATEWAY_HISTORY_SCOPED_TOTAL,
     );
 }

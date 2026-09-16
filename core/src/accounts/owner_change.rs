@@ -13,10 +13,30 @@ use {
 pub struct OwnerChangeRow {
     pub address: Vec<u8>,
     pub slot: i64,
+    /// Position of the transaction in its block. Signature order is not
+    /// execution order, so this is what puts two handoffs in one slot in the
+    /// order they actually ran.
+    pub tx_index: i32,
     pub signature: Vec<u8>,
     pub prev_owner: Vec<u8>,
     pub new_owner: Vec<u8>,
 }
+
+/// Metadata key holding the first slot `token_account_owner_change` is known to
+/// cover. Readers must not scope history below it: the rows simply were not
+/// being written yet, which is indistinguishable from an account that never
+/// changed hands.
+pub const OWNER_CHANGE_INDEXED_FROM_KEY: &str = "owner_change_indexed_from_slot";
+
+/// Token-2022, which shares SPL Token's `SetAuthority` encoding for the four
+/// authority types they have in common.
+///
+/// Recorded even though the ingress allowlist does not admit it yet: the
+/// gateway already scopes history for both token programs, and a detector that
+/// covered fewer would hand a later owner the whole history the moment the
+/// allowlist gained one line. See `every_admitted_token_program_is_detected`.
+const SPL_TOKEN_2022_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
 /// SPL Token `SetAuthority` discriminator.
 const SET_AUTHORITY_DISCRIMINATOR: u8 = 6;
@@ -43,17 +63,20 @@ pub(crate) async fn upsert_owner_change_rows(
     }
     let addresses: Vec<&[u8]> = rows.iter().map(|row| row.address.as_slice()).collect();
     let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
+    let tx_indexes: Vec<i32> = rows.iter().map(|row| row.tx_index).collect();
     let signatures: Vec<&[u8]> = rows.iter().map(|row| row.signature.as_slice()).collect();
     let prev_owners: Vec<&[u8]> = rows.iter().map(|row| row.prev_owner.as_slice()).collect();
     let new_owners: Vec<&[u8]> = rows.iter().map(|row| row.new_owner.as_slice()).collect();
     sqlx::query(
         "INSERT INTO token_account_owner_change
-             (address, slot, signature, prev_owner, new_owner)
-         SELECT * FROM UNNEST($1::bytea[], $2::int8[], $3::bytea[], $4::bytea[], $5::bytea[])
+             (address, slot, tx_index, signature, prev_owner, new_owner)
+         SELECT * FROM UNNEST(
+             $1::bytea[], $2::int8[], $3::int4[], $4::bytea[], $5::bytea[], $6::bytea[])
          ON CONFLICT DO NOTHING",
     )
     .bind(&addresses)
     .bind(&slots)
+    .bind(&tx_indexes)
     .bind(&signatures)
     .bind(&prev_owners)
     .bind(&new_owners)
@@ -69,6 +92,7 @@ pub fn rows_from_processed(
     transaction: &SanitizedTransaction,
     processed: &ProcessedTransaction,
     slot: u64,
+    tx_index: i32,
     signature: &Signature,
 ) -> Vec<OwnerChangeRow> {
     let executed = match processed {
@@ -95,6 +119,7 @@ pub fn rows_from_processed(
             }),
         // A slot is never negative, and the column it lands in is a BIGINT.
         slot as i64,
+        tx_index,
         signature,
     )
 }
@@ -105,6 +130,7 @@ pub fn rows_from_processed(
 pub fn rows_from_stored(
     stored: &StoredTransaction,
     slot: i64,
+    tx_index: i32,
     signature: &Signature,
 ) -> Vec<OwnerChangeRow> {
     if stored.meta.err.is_some() {
@@ -124,6 +150,7 @@ pub fn rows_from_stored(
             ))
         }),
         slot,
+        tx_index,
         signature,
     )
 }
@@ -151,6 +178,7 @@ fn detect_owner_changes<'a, I>(
     account_keys: &[Pubkey],
     instructions: I,
     slot: i64,
+    tx_index: i32,
     signature: &Signature,
 ) -> Vec<OwnerChangeRow>
 where
@@ -159,7 +187,7 @@ where
     let mut rows: Vec<OwnerChangeRow> = Vec::new();
 
     for (program_id, instruction_accounts, data) in instructions {
-        if *program_id != spl_token::id() {
+        if *program_id != spl_token::id() && *program_id != SPL_TOKEN_2022_PROGRAM_ID {
             continue;
         }
         if data.len() < SET_AUTHORITY_WITH_PUBKEY_LEN
@@ -197,6 +225,7 @@ where
             None => rows.push(OwnerChangeRow {
                 address: address.to_bytes().to_vec(),
                 slot,
+                tx_index,
                 signature: signature.as_ref().to_vec(),
                 prev_owner: prev_owner.to_bytes().to_vec(),
                 new_owner: new_owner.to_bytes().to_vec(),
@@ -251,6 +280,7 @@ mod tests {
                 instruction.data.as_slice(),
             )),
             slot,
+            0,
             &signature,
         )
     }
@@ -277,6 +307,7 @@ mod tests {
             vec![OwnerChangeRow {
                 address: address.to_bytes().to_vec(),
                 slot,
+                tx_index: 0,
                 signature: Signature::default().as_ref().to_vec(),
                 prev_owner: current_owner.to_bytes().to_vec(),
                 new_owner: new_owner.to_bytes().to_vec(),
@@ -303,6 +334,43 @@ mod tests {
                 1,
             );
             assert!(rows.is_empty(), "{authority_type:?} must not record a row");
+        }
+    }
+
+    /// The gateway scopes a token account's history to the slots its caller
+    /// owned it for, and can only do that from what this detector records. So
+    /// every token program the ingress allowlist admits has to be one the
+    /// detector reads: admitting one it does not would let a handoff go
+    /// unrecorded, and the next owner would read the whole history unscoped.
+    #[test]
+    fn every_admitted_token_program_is_detected() {
+        let address = Pubkey::new_unique();
+        let current_owner = Pubkey::new_unique();
+        let new_owner = Pubkey::new_unique();
+        let handoff = set_authority_instruction(
+            &address,
+            &current_owner,
+            Some(&new_owner),
+            spl_token::instruction::AuthorityType::AccountOwner,
+        );
+
+        for program_id in [spl_token::id(), SPL_TOKEN_2022_PROGRAM_ID] {
+            if !crate::transactions::is_allowed_program_instruction(&program_id, &handoff.data) {
+                continue;
+            }
+
+            let rows = detect_owner_changes(
+                &[address, current_owner],
+                std::iter::once((&program_id, [0u8, 1].as_slice(), handoff.data.as_slice())),
+                1,
+                0,
+                &Signature::default(),
+            );
+            assert_eq!(
+                rows.len(),
+                1,
+                "{program_id} is admitted at ingress but its handoffs are not recorded"
+            );
         }
     }
 
@@ -351,6 +419,7 @@ mod tests {
             ]
             .into_iter(),
             7,
+            0,
             &Signature::default(),
         );
 
@@ -378,6 +447,7 @@ mod tests {
                     &instruction.data[..truncate_to],
                 )),
                 1,
+                0,
                 &Signature::default(),
             );
             assert!(

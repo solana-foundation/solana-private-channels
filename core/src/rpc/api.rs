@@ -1,4 +1,5 @@
 use {
+    crate::rpc::get_signatures_for_address_impl::SignaturesForAddressConfig,
     jsonrpsee::{core::RpcResult, proc_macros::rpc},
     serde_json::Value,
     solana_account_decoder_client_types::{token::UiTokenAmount, UiAccount},
@@ -7,8 +8,8 @@ use {
         config::{
             RpcAccountInfoConfig, RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
             RpcEpochConfig, RpcGetVoteAccountsConfig, RpcSendTransactionConfig,
-            RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcSimulateTransactionConfig,
-            RpcSupplyConfig, RpcTransactionConfig,
+            RpcSignatureStatusConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
+            RpcTransactionConfig,
         },
         response::{
             Response, RpcBlockhash, RpcBlockhashFeeCalculator, RpcPerfSample,
@@ -165,7 +166,7 @@ pub trait PrivateChannelRpc {
     async fn get_signatures_for_address(
         &self,
         address: String,
-        config: Option<RpcSignaturesForAddressConfig>,
+        config: Option<SignaturesForAddressConfig>,
     ) -> RpcResult<Vec<RpcConfirmedTransactionStatusWithSignature>>;
 
     /// Simulate a transaction

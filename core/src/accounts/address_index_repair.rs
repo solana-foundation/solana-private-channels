@@ -214,9 +214,16 @@ async fn derive_rows_for_block(
         };
 
         // Re-derived from the same stored bytes the address rows come from, so a
-        // database restored behind the live table recovers both together.
+        // database restored behind the live table recovers both together. The
+        // fetch returns rows in no particular order, so the position comes from
+        // the block, which lists its signatures in the order they ran.
         if let Ok(signature) = Signature::try_from(sig_bytes.as_slice()) {
-            owner_changes.extend(rows_from_stored(&stored, slot, &signature));
+            let tx_index = block
+                .transaction_signatures
+                .iter()
+                .position(|candidate| *candidate == signature)
+                .unwrap_or(0) as i32;
+            owner_changes.extend(rows_from_stored(&stored, slot, tx_index, &signature));
         }
 
         let tx_with_meta = stored.transaction_with_status_meta();

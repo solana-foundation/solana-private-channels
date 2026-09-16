@@ -197,7 +197,9 @@ async fn write_batch_postgres(
     // the signatures it covers. Handing an account on is rare enough that the
     // vector almost always stays empty.
     let mut owner_change_rows: Vec<OwnerChangeRow> = Vec::new();
-    for (signature, transaction, tx_slot, block_time, processed) in transactions {
+    for (tx_index, (signature, transaction, tx_slot, block_time, processed)) in
+        transactions.into_iter().enumerate()
+    {
         let stored_tx = get_stored_transaction(transaction, tx_slot, block_time, processed);
         sig_bytes_vec.push(signature.as_ref().to_vec());
         let data = stored_tx
@@ -219,6 +221,8 @@ async fn write_batch_postgres(
             transaction,
             processed,
             tx_slot,
+            // Position in the block, so two handoffs in one slot stay ordered.
+            tx_index as i32,
             &signature,
         ));
     }

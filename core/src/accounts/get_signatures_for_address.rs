@@ -16,18 +16,34 @@ pub async fn get_signatures_for_address(
     limit: usize,
     before: Option<&Signature>,
     until: Option<&Signature>,
+    slot_ranges: Option<&[(i64, i64)]>,
 ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
     match db {
         AccountsDB::Postgres(postgres_db) => {
-            get_signatures_for_address_postgres(postgres_db, address, limit, before, until).await
+            get_signatures_for_address_postgres(
+                postgres_db,
+                address,
+                limit,
+                before,
+                until,
+                slot_ranges,
+            )
+            .await
         }
         // Served from the source of truth, and no address index is cached. One
         // would hold only signatures written since the cache attached, so a
         // short history would read as a complete one. The cached form also
         // never supported before/until cursors.
         AccountsDB::Redis(redis_db) => {
-            get_signatures_for_address_postgres(&redis_db.fallback, address, limit, before, until)
-                .await
+            get_signatures_for_address_postgres(
+                &redis_db.fallback,
+                address,
+                limit,
+                before,
+                until,
+                slot_ranges,
+            )
+            .await
         }
     }
 }
@@ -79,9 +95,21 @@ async fn get_signatures_for_address_postgres(
     limit: usize,
     before: Option<&Signature>,
     until: Option<&Signature>,
+    slot_ranges: Option<&[(i64, i64)]>,
 ) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>> {
     let pool = Arc::clone(&db.pool);
     let addr_bytes = address.to_bytes();
+
+    // Applied in the query so `limit` counts rows the caller may actually see.
+    // Filtering afterwards would return short pages whose dropped entries the
+    // caller then has no cursor to page past.
+    let (range_starts, range_ends): (Option<Vec<i64>>, Option<Vec<i64>>) = match slot_ranges {
+        Some(ranges) => (
+            Some(ranges.iter().map(|(start, _)| *start).collect()),
+            Some(ranges.iter().map(|(_, end)| *end).collect()),
+        ),
+        None => (None, None),
+    };
 
     // ── Resolve pagination cursors ─────────────────────────────────────────
     //
@@ -124,7 +152,9 @@ async fn get_signatures_for_address_postgres(
     //     Returns transactions as old as — and including — the until cursor.
     //
     // When a cursor was not supplied its slot parameter ($2 or $4) is NULL,
-    // which short-circuits the OR to FALSE and skips that filter entirely.
+    // which short-circuits the OR to FALSE and skips that filter entirely. The
+    // scope arrays ($7, $8) work the same way: NULL means unscoped, while an
+    // empty pair of arrays matches nothing and hides the whole page.
     //
     // LEFT JOIN: a missing transactions row surfaces as NULL data rather than
     // silently dropping the row. We treat a NULL as data corruption below.
@@ -139,6 +169,10 @@ async fn get_signatures_for_address_postgres(
                 OR (address_signatures.slot, address_signatures.signature) < ($2, $3::bytea))
            AND ($4::bigint IS NULL
                 OR (address_signatures.slot, address_signatures.signature) >= ($4, $5::bytea))
+           AND ($7::int8[] IS NULL
+                OR EXISTS (
+                    SELECT 1 FROM UNNEST($7::int8[], $8::int8[]) AS scope(first_slot, last_slot)
+                    WHERE address_signatures.slot BETWEEN scope.first_slot AND scope.last_slot))
          ORDER BY address_signatures.slot DESC, address_signatures.signature DESC
          LIMIT $6",
     )
@@ -148,6 +182,8 @@ async fn get_signatures_for_address_postgres(
     .bind(until_slot)
     .bind(until_sig)
     .bind(limit as i64)
+    .bind(range_starts)
+    .bind(range_ends)
     .fetch_all(pool.as_ref())
     .await
     .map_err(|e| anyhow::anyhow!("Failed to query signatures for {}: {}", address, e))?;

@@ -1,5 +1,5 @@
 use {
-    crate::processor::CHANNEL_SLOT,
+    crate::{accounts::owner_change::OWNER_CHANGE_INDEXED_FROM_KEY, processor::CHANNEL_SLOT},
     anyhow::Result,
     solana_sdk::{account::AccountSharedData, clock::Slot, pubkey::Pubkey},
     solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
@@ -218,6 +218,10 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     // sides of the handoff. The gateway reads these to scope a user's history to
     // the slots they actually owned the address for.
     //
+    // `tx_index` is the transaction's position in its block. Two handoffs can
+    // land in one slot, and signature order is not execution order, so without
+    // it a reader cannot tell which came first.
+    //
     // Never prune these rows, not even once the transaction that produced one is
     // gone: a missing row silently widens what a later owner may read.
     sqlx::query(
@@ -225,6 +229,7 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
             CREATE TABLE IF NOT EXISTS token_account_owner_change (
                 address    BYTEA  NOT NULL,
                 slot       BIGINT NOT NULL,
+                tx_index   INT    NOT NULL,
                 signature  BYTEA  NOT NULL,
                 prev_owner BYTEA  NOT NULL,
                 new_owner  BYTEA  NOT NULL,
@@ -232,6 +237,23 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
             )
             "#,
     )
+    .execute(pool)
+    .await?;
+
+    // The first slot whose handoffs the table above is known to hold. Written
+    // once, so it captures the chain's height the moment recording began: on a
+    // database that already had blocks, nothing below it can be vouched for,
+    // and a reader must not mistake an empty table for an account that never
+    // changed hands.
+    let tip: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+        .fetch_one(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO metadata (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .bind(OWNER_CHANGE_INDEXED_FROM_KEY)
+    .bind(tip.map_or(0, |slot| slot + 1).to_be_bytes().to_vec())
     .execute(pool)
     .await?;
 

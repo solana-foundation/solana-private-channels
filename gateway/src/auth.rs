@@ -12,7 +12,11 @@ use uuid::Uuid;
 
 use dvp_swap_program_client::{accounts::SwapDvp, DVP_SWAP_PROGRAM_ID};
 
-use crate::db::{is_wallet_owned_by_user, owner_changes, OwnerChange};
+use tracing::warn;
+
+use crate::db::{
+    is_wallet_owned_by_user, owned_wallets, owner_change_indexed_from, owner_changes, OwnerChange,
+};
 
 // ---------------------------------------------------------------------------
 // Auth types — local minimal copies of auth service types.
@@ -309,6 +313,19 @@ pub async fn check_account_data_ownership(
     }
 }
 
+/// Count how a history request's scoping resolved. An empty scope is served as
+/// an empty page, which is indistinguishable from an address with no history
+/// unless something counts it.
+fn record_scope_outcome(outcome: &str) {
+    crate::metrics::GATEWAY_HISTORY_SCOPED_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How long an ownership chain the gateway will read for one address. Real
+/// accounts change hands rarely; a chain near this length is manufactured.
+const MAX_OWNER_CHANGES: i64 = 64;
+
 /// The slot ranges `user_id` may read `pubkey`'s history for.
 ///
 /// `None` means no filtering: the address never changed hands, so all of it is
@@ -327,42 +344,74 @@ pub async fn resolve_owned_slot_ranges(
     if !matches!(program_owner, SPL_TOKEN_PROGRAM | SPL_TOKEN_2022_PROGRAM)
         || data.len() < TOKEN_ACCOUNT_SIZE
     {
+        record_scope_outcome("not_a_token_account");
         return Ok(None);
     }
 
     let Ok(address) = bs58::decode(pubkey).into_vec() else {
         // The fetch resolved this pubkey, so it decodes. Hide the page rather
         // than serve it unscoped if that ever stops being true.
+        record_scope_outcome("undecodable_address");
         return Ok(Some(Vec::new()));
     };
 
-    let changes = owner_changes(auth_db, &address).await?;
+    // Handoffs are only recorded from this slot on. Below it an empty table
+    // means the rows were not being written yet, not that nothing happened.
+    let Some(indexed_from) = owner_change_indexed_from(auth_db).await? else {
+        warn!("Ledger records no owner-change watermark; serving no history for {pubkey}");
+        record_scope_outcome("no_watermark");
+        return Ok(Some(Vec::new()));
+    };
+
+    // One past the cap, so a full page is how an over-long chain announces itself.
+    let changes = owner_changes(auth_db, &address, MAX_OWNER_CHANGES + 1).await?;
     if changes.is_empty() {
-        return Ok(None);
+        // A ledger recorded from genesis can vouch for the whole history.
+        if indexed_from == 0 {
+            record_scope_outcome("never_handed_on");
+            return Ok(None);
+        }
+        record_scope_outcome("watermarked");
+        return Ok(Some(vec![(indexed_from, i64::MAX)]));
+    }
+    if changes.len() as i64 > MAX_OWNER_CHANGES {
+        // The timeline is longer than we will read, so it cannot be accounted
+        // for end to end. Handing an account on is free, which makes this shape
+        // cheap to manufacture; serving nothing is the only safe answer.
+        warn!("Owner-change chain for {pubkey} exceeds {MAX_OWNER_CHANGES}; serving no history");
+        record_scope_outcome("chain_too_long");
+        return Ok(Some(Vec::new()));
     }
 
-    // One lookup per distinct wallet in the chain, not per interval. A chain is
-    // almost always a single entry.
-    let mut owned: HashSet<String> = HashSet::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for candidate in changes
+    // Every distinct wallet in the chain in one round trip, rather than a query
+    // apiece against the pool the auth service shares.
+    let candidates: Vec<String> = changes
         .iter()
-        .flat_map(|change| [change.prev_owner.as_str(), change.new_owner.as_str()])
-    {
-        if !seen.insert(candidate) {
-            continue;
-        }
-        if is_wallet_owned_by_user(auth_db, user_id, candidate).await? {
-            owned.insert(candidate.to_owned());
-        }
-    }
+        .flat_map(|change| [change.prev_owner.clone(), change.new_owner.clone()])
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect();
+    let owned = owned_wallets(auth_db, user_id, &candidates).await?;
 
     let current_owner = bs58::encode(&data[OWNER_OFFSET..OWNER_END]).into_string();
-    Ok(Some(slot_ranges_for_owner(
-        &changes,
-        &current_owner,
-        &owned,
-    )))
+    let ranges = slot_ranges_for_owner(&changes, &current_owner, &owned)
+        .into_iter()
+        .filter_map(|(first, last)| {
+            (last >= indexed_from).then_some((first.max(indexed_from), last))
+        })
+        .collect::<Vec<_>>();
+
+    if ranges.is_empty() {
+        // Either the chain did not account for the current owner, or none of
+        // its windows are this caller's. Both leave them nothing to read, and
+        // both are worth seeing before the support ticket arrives.
+        warn!("Owner-change chain for {pubkey} leaves this caller no readable window");
+        record_scope_outcome("no_window");
+    } else {
+        record_scope_outcome("scoped");
+    }
+
+    Ok(Some(ranges))
 }
 
 /// Rebuild an address's ownership timeline from its handoffs and keep the
@@ -374,10 +423,10 @@ pub async fn resolve_owned_slot_ranges(
 /// slot is not recoverable, and the whole slot is cheaper to drop than to
 /// reason about.
 ///
-/// The rows form a chain — each handoff's new owner is the next one's previous
-/// owner, and the last one's new owner is whoever holds the account now. A link
-/// that doesn't join means a handoff went unrecorded, so the timeline before the
-/// last known one cannot be trusted and only what follows it is served.
+/// The rows chain: each handoff's new owner is the next one's previous owner,
+/// and the last one's new owner holds the account now. A link that doesn't join
+/// means a handoff went unrecorded, so no slot after it can be placed and the
+/// caller gets nothing.
 fn slot_ranges_for_owner(
     changes: &[OwnerChange],
     current_owner: &str,
@@ -392,7 +441,7 @@ fn slot_ranges_for_owner(
         .all(|pair| pair[0].new_owner == pair[1].prev_owner)
         && last.new_owner == current_owner;
     if !chain_links {
-        return vec![(last.slot.saturating_add(1), i64::MAX)];
+        return Vec::new();
     }
 
     let mut ranges: Vec<(i64, i64)> = Vec::new();
@@ -890,32 +939,45 @@ mod tests {
     }
 
     /// The caller holds the account now, so the last recorded handoff must name
-    /// them. It naming someone else means a later handoff went unrecorded, and
-    /// nothing before the last known one can be trusted.
+    /// them. It naming someone else means a later handoff went unrecorded, so
+    /// the account reached the caller at an unknown slot and the window after
+    /// the last recorded handoff is the missing owner's, not theirs.
     #[test]
-    fn a_tail_that_disagrees_with_the_current_owner_serves_only_what_follows_it() {
-        let handoff_slot = 500;
+    fn a_tail_that_disagrees_with_the_current_owner_serves_nothing() {
         let ranges = slot_ranges_for_owner(
-            &[handoff(handoff_slot, "alice", "bob")],
+            &[handoff(500, "alice", "bob")],
             "carol",
             &wallets(&["carol", "alice"]),
         );
 
-        assert_eq!(ranges, vec![(handoff_slot + 1, i64::MAX)]);
+        assert!(ranges.is_empty());
     }
 
     /// Same rule for a gap in the middle: bob handed it on, but the next row
     /// claims it came from someone else.
     #[test]
-    fn a_broken_link_serves_only_what_follows_the_last_handoff() {
-        let last = 200;
+    fn a_broken_link_serves_nothing() {
         let ranges = slot_ranges_for_owner(
-            &[handoff(100, "alice", "bob"), handoff(last, "carol", "dave")],
+            &[handoff(100, "alice", "bob"), handoff(200, "carol", "dave")],
             "dave",
             &wallets(&["alice", "dave"]),
         );
 
-        assert_eq!(ranges, vec![(last + 1, i64::MAX)]);
+        assert!(ranges.is_empty());
+    }
+
+    /// A closed account re-created at the same address returns to its derived
+    /// owner with no handoff recorded, so the chain ends at someone else. The
+    /// slots the interim owner produced are not the re-creator's to read.
+    #[test]
+    fn an_account_recreated_after_a_handoff_serves_nothing() {
+        let ranges = slot_ranges_for_owner(
+            &[handoff(100, "alice", "bob")],
+            "alice",
+            &wallets(&["alice"]),
+        );
+
+        assert!(ranges.is_empty());
     }
 
     /// Two handoffs in one slot leave no window between them to hand out.

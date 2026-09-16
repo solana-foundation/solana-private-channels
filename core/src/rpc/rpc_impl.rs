@@ -17,7 +17,9 @@ use {
             get_recent_blockhash_impl::get_recent_blockhash_impl,
             get_recent_performance_samples_impl::get_recent_performance_samples_impl,
             get_signature_statuses_impl::get_signature_statuses_impl,
-            get_signatures_for_address_impl::get_signatures_for_address_impl,
+            get_signatures_for_address_impl::{
+                get_signatures_for_address_impl, SignaturesForAddressConfig,
+            },
             get_slot_impl::get_slot_impl,
             get_slot_leaders_impl::get_slot_leaders_impl,
             get_supply_impl::get_supply_impl,
@@ -41,8 +43,8 @@ use {
         config::{
             RpcAccountInfoConfig, RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
             RpcEpochConfig, RpcGetVoteAccountsConfig, RpcSendTransactionConfig,
-            RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcSimulateTransactionConfig,
-            RpcSupplyConfig, RpcTransactionConfig,
+            RpcSignatureStatusConfig, RpcSimulateTransactionConfig, RpcSupplyConfig,
+            RpcTransactionConfig,
         },
         response::{
             Response, RpcBlockhash, RpcBlockhashFeeCalculator, RpcPerfSample,
@@ -250,7 +252,7 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
     async fn get_signatures_for_address(
         &self,
         address: String,
-        config: Option<RpcSignaturesForAddressConfig>,
+        config: Option<SignaturesForAddressConfig>,
     ) -> RpcResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
         let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
         get_signatures_for_address_impl(read_deps, address, config).await

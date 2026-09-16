@@ -78,7 +78,7 @@ async fn malformed_signature_bytes_surface_as_deserialize_error() {
         .expect("insert malformed sig row");
 
     let db = AccountsDB::Postgres(accounts.clone());
-    let err = get_signatures_for_address(&db, &addr, 10, None, None)
+    let err = get_signatures_for_address(&db, &addr, 10, None, None, None)
         .await
         .expect_err("malformed signature bytes must surface as Err");
     let msg = format!("{err}");
@@ -113,7 +113,7 @@ async fn missing_transaction_row_surfaces_as_corruption_error() {
     // LEFT JOIN surfaces NULL data.
 
     let db = AccountsDB::Postgres(accounts.clone());
-    let err = get_signatures_for_address(&db, &addr, 10, None, None)
+    let err = get_signatures_for_address(&db, &addr, 10, None, None, None)
         .await
         .expect_err("missing transaction row must surface as Err");
     let msg = format!("{err}");
@@ -156,7 +156,7 @@ async fn garbage_transaction_blob_surfaces_as_bincode_error() {
         .expect("insert garbage transactions row");
 
     let db = AccountsDB::Postgres(accounts.clone());
-    let err = get_signatures_for_address(&db, &addr, 10, None, None)
+    let err = get_signatures_for_address(&db, &addr, 10, None, None, None)
         .await
         .expect_err("garbage transaction blob must surface as Err");
     let msg = format!("{err}");
