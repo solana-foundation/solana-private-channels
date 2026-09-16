@@ -453,8 +453,14 @@ jobs:
 
   fuzz-tests:
     name: Escrow Fuzz (Trident)
-    needs: [changes, build-artifacts]
-    if: needs.changes.outputs.trident == 'true'
+    # Depends on integration-tests for ordering, not for its result: fuzzing
+    # saturates the runner, and the indexer chaos test confirms releases within
+    # a ~2s window, so the two must not share a box. `!cancelled()` keeps fuzz
+    # running when integration-tests fails or is skipped.
+    needs: [changes, build-artifacts, integration-tests]
+    if: >-
+      !cancelled() && needs.changes.outputs.trident == 'true' &&
+      needs.build-artifacts.result == 'success'
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
