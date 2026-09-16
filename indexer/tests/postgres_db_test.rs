@@ -742,6 +742,7 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
             withdrawal_nonce: w1_nonce,
             signature: "recon_w1_release".to_string(),
             slot: 100,
+            amount: None,
         }])
         .await?;
 

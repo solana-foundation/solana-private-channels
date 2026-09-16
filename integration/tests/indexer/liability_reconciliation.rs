@@ -46,10 +46,17 @@ use testcontainers_modules::postgres::Postgres;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// One test validator at a time. Each loads a geyser plugin that opens its own file
+/// watcher, and three live at once exhausts the host's inotify instances.
+static VALIDATOR_SLOT: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 const MINT_DECIMALS: u8 = 6;
 const DEPOSIT_AMOUNT: u64 = 200_000;
 const DRAIN_AMOUNT: u64 = 60_000;
 const WITHDRAWAL_AMOUNT: u64 = 40_000;
+/// A payout far below what its row owes, leaving the rest of the row as headroom.
+const PARTIAL_RELEASE: u64 = 4_000;
 const USER_BALANCE: u64 = 1_000_000;
 
 /// Ticks are one second apart, so a halt that needs three of them lands in seconds.
@@ -164,6 +171,7 @@ impl EscrowIndexer {
             },
             reconciliation: ReconciliationConfig {
                 mismatch_threshold_raw: u64::MAX,
+                ..Default::default()
             },
         };
 
@@ -466,6 +474,7 @@ async fn startup_comparison_at_threshold_zero(
     reconcile_against_snapshot(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
         ProgramType::Escrow,
         storage,
@@ -491,6 +500,7 @@ async fn startup_comparison_over_a_lagging_ledger(
     reconcile_against_snapshot(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
         ProgramType::Escrow,
         storage,
@@ -608,6 +618,23 @@ async fn assert_stays_unhalted(storage: &Storage, secs: u64, context: &str) {
     }
 }
 
+/// Wait until the escrow indexer has written the release for `nonce`, which is what makes
+/// the ledger subtract it at all.
+async fn wait_for_observed_release(pool: &PgPool, indexer: &mut EscrowIndexer, nonce: i64) {
+    let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    while observed_release_count(pool, nonce).await == 0 {
+        assert!(
+            !indexer.task.is_finished(),
+            "the indexer exited before recording the release for nonce {nonce}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the release for nonce {nonce} was never observed"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
 async fn observed_release_count(pool: &PgPool, nonce: i64) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM observed_releases WHERE withdrawal_nonce = $1")
         .bind(nonce)
@@ -634,6 +661,8 @@ async fn transaction_status(pool: &PgPool, signature: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_drain_halts_the_runtime_refuses_the_next_startup_and_holds_while_unpinnable() {
     println!("=== Liability Reconciliation: Real Drain ===");
+
+    let _slot = VALIDATOR_SLOT.lock().await;
 
     let (validator, faucet, geyser_port) = start_test_validator().await;
     let geyser_endpoint = format!("http://127.0.0.1:{geyser_port}");
@@ -857,6 +886,8 @@ async fn a_real_drain_halts_the_runtime_refuses_the_next_startup_and_holds_while
 async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
     println!("=== Liability Reconciliation: Real Release ===");
 
+    let _slot = VALIDATOR_SLOT.lock().await;
+
     const NONCE: u64 = 0;
 
     let (validator, faucet, geyser_port) = start_test_validator().await;
@@ -946,6 +977,7 @@ async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
         user.pubkey(),
         WITHDRAWAL_AMOUNT,
         NONCE,
+        spl_token::id(),
     )
     .await
     .expect("release funds");
@@ -992,6 +1024,166 @@ async fn a_real_release_neither_halts_the_runtime_nor_the_next_startup() {
     .await
     .expect("a released withdrawal must not stop startup");
     println!("  Startup comparison accepted the released withdrawal");
+
+    indexer.stop();
+    channel.shutdown().await;
+}
+
+/// A payout smaller than the row it discharges must free only what it moved. The rest of
+/// the row is headroom a drain would otherwise hide in: the ledger would call the whole row
+/// paid out, custody would fall by the drained amount, and the two would net out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partial_release_does_not_discharge_the_whole_row() {
+    println!("=== Liability Reconciliation: Partial Release ===");
+
+    let _slot = VALIDATOR_SLOT.lock().await;
+
+    const NONCE: u64 = 0;
+    const HEADROOM: u64 = WITHDRAWAL_AMOUNT - PARTIAL_RELEASE;
+
+    let (validator, faucet, geyser_port) = start_test_validator().await;
+    let geyser_endpoint = format!("http://127.0.0.1:{geyser_port}");
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let (_pg, pool, db_url, storage) = start_postgres("liability_partial").await;
+
+    let channel = MockRpcServer::start().await;
+    mock_absent_channel_mint(&channel);
+
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).expect("admin keypair");
+    let (_, instance) = TestEnvironment::setup_instance(&client, &faucet, None)
+        .await
+        .expect("instance");
+    TestEnvironment::setup_operator(&client, &faucet, instance)
+        .await
+        .expect("operator");
+    let mut indexer = EscrowIndexer::start(
+        &db_url,
+        &geyser_endpoint,
+        &rpc_url,
+        &channel.url(),
+        instance,
+    );
+    wait_for_live_indexer(&pool, &mut indexer).await;
+
+    // The same permanent-delegate mint the drain test uses, so the headroom can be taken
+    // without any escrow instruction accounting for it.
+    let delegate = Keypair::new();
+    let drainer = Keypair::new();
+    let user = Keypair::new();
+    helpers::setup_wallets(&client, &faucet, &[&admin, &delegate, &user])
+        .await
+        .expect("fund wallets");
+    let mint = generate_permanent_delegate_mint_2022(
+        &client,
+        &admin,
+        &admin,
+        &delegate.pubkey(),
+        &Keypair::new(),
+        MINT_DECIMALS,
+    )
+    .await
+    .expect("permanent-delegate mint");
+    allow_mint_for_program(&client, &admin, instance, mint, TOKEN_2022_PROGRAM_ID)
+        .await
+        .expect("allow mint");
+
+    mint_2022_to_owner(&client, &admin, mint, user.pubkey(), &admin, USER_BALANCE)
+        .await
+        .expect("fund user");
+    let deposit_sig = deposit(
+        &client,
+        &user,
+        instance,
+        mint,
+        TOKEN_2022_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+    )
+    .await
+    .expect("deposit")
+    .to_string();
+    wait_for_indexed_and_checkpointed(&pool, &mut indexer, &deposit_sig).await;
+    assert_mint_registered_and_allowed(&pool, mint).await;
+    println!("  Deposit {DEPOSIT_AMOUNT} indexed and checkpointed");
+
+    // The row says WITHDRAWAL_AMOUNT is owed; the payout below moves a tenth of it.
+    seed_pending_withdrawal(&storage, mint, WITHDRAWAL_AMOUNT, NONCE as i64).await;
+    helpers::release_funds_on_chain(
+        &client,
+        &admin,
+        instance,
+        mint,
+        user.pubkey(),
+        PARTIAL_RELEASE,
+        NONCE,
+        TOKEN_2022_PROGRAM_ID,
+    )
+    .await
+    .expect("release funds");
+    wait_for_observed_release(&pool, &mut indexer, NONCE as i64).await;
+    println!("  Released {PARTIAL_RELEASE} against a row owing {WITHDRAWAL_AMOUNT}");
+
+    // Take exactly the headroom the row would have covered. A ledger that credited the
+    // whole row as paid out would see custody and liabilities fall by the same amount.
+    let escrow_ata =
+        get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_2022_PROGRAM_ID);
+    drain_via_permanent_delegate(
+        &client,
+        &admin,
+        mint,
+        escrow_ata,
+        &delegate,
+        drainer.pubkey(),
+        HEADROOM,
+        MINT_DECIMALS,
+    )
+    .await
+    .expect("drain");
+    wait_for_finalized_custody(
+        &rpc_url,
+        instance,
+        mint,
+        TOKEN_2022_PROGRAM_ID,
+        DEPOSIT_AMOUNT - PARTIAL_RELEASE - HEADROOM,
+    )
+    .await;
+    println!("  Drained the remaining {HEADROOM} of the row");
+
+    let mut webhook = mockito::Server::new_async().await;
+    let halt_alert = webhook
+        .mock("POST", "/")
+        .with_status(200)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let health = HealthState::new(HealthConfig::operator());
+    let cancel = CancellationToken::new();
+    let ticks = spawn_reconciliation(
+        &db_url,
+        &rpc_url,
+        &channel.url(),
+        instance,
+        tick_config(webhook.url()),
+        health.clone(),
+        cancel.clone(),
+    );
+    let reason = wait_for_halt(
+        &storage,
+        &mut indexer,
+        Duration::from_secs(STARTUP_TIMEOUT_SECS),
+    )
+    .await;
+    cancel.cancel();
+    let _ = ticks.await;
+
+    assert!(
+        reason.contains("short of ledger liabilities"),
+        "the liability arm must be the one that tripped: {reason}"
+    );
+    halt_alert.assert_async().await;
+    assert!(!health.is_healthy(), "a confirmed drain must page");
+    println!("  Halted on the headroom the partial release left owed");
 
     indexer.stop();
     channel.shutdown().await;

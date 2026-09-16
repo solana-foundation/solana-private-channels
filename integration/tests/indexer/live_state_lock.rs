@@ -161,6 +161,7 @@ async fn indexer_refuses_to_start_during_a_resync() {
         },
         reconciliation: ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
     };
 

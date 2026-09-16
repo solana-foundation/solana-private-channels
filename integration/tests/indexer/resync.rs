@@ -1204,6 +1204,7 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
     let recon = run_startup_reconciliation(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
         ProgramType::Escrow,
         &recon_storage,

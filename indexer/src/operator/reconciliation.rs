@@ -7,6 +7,10 @@
 use crate::config::{OperatorConfig, ProgramType};
 use crate::error::OperatorError;
 use crate::indexer::checkpoint::program_key;
+use crate::metrics::{
+    OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS, OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
+    OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
+};
 use crate::operator::escrow_sweep::{
     fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot,
 };
@@ -15,7 +19,7 @@ use crate::storage::common::amount::{net_to_u64, NetBalance};
 use crate::storage::common::models::MintDbBalance;
 use crate::storage::Storage;
 use private_channel_core::webhook::{WebhookClient, WebhookRetryConfig};
-use private_channel_metrics::HealthState;
+use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,6 +42,11 @@ const HALT_CONFIRM_TICKS: u32 = 3;
 const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Consecutive unpinnable ticks before the dark liability arm is alerted on, and the
+/// cadence it re-alerts at afterwards. A frozen checkpoint keeps the arm off indefinitely,
+/// so this has to keep firing rather than notify once.
+const LIABILITY_DARK_ALERT_TICKS: u32 = 3;
 
 /// Checkpoint poll interval while waiting for the ledger to cover the custody slot.
 #[cfg(not(test))]
@@ -89,6 +98,10 @@ pub async fn run_reconciliation(
     // A read-erroring tick returns early and leaves these untouched, so they hold rather than reset.
     let mut breach_counters = BreachCounters::default();
 
+    // Consecutive ticks the liability arm could not be pinned for. Held across ticks so a
+    // silently dark arm is alertable rather than just repeatedly warned about.
+    let mut liability_dark_ticks: u32 = 0;
+
     // Seed the set-once guard from the durable flag so a restart into an active
     // halt does not re-quarantine or re-webhook; it stays frozen until cleared.
     let mut halted = storage
@@ -117,6 +130,7 @@ pub async fn run_reconciliation(
             &mut previously_alerted_orphans,
             &mut breach_counters,
             &mut halted,
+            &mut liability_dark_ticks,
             &cancellation_token,
         )
         .await
@@ -230,7 +244,7 @@ fn envelope_to_u64(amount: &bigdecimal::BigDecimal) -> u64 {
 /// Raw insolvency tolerance derived from the bps knob, applied to custody so it
 /// mirrors the alert layer's relative comparison. Envelope is the real bound;
 /// this is only a small cushion, and a larger one just delays a real halt.
-fn insolvency_tolerance_raw(custody: u64, tolerance_bps: u16) -> u64 {
+pub(crate) fn insolvency_tolerance_raw(custody: u64, tolerance_bps: u16) -> u64 {
     // Saturate rather than truncate: a >100% bps knob against a huge custody must
     // widen the cushion, never wrap it down to a tiny value that over-halts.
     ((custody as u128 * tolerance_bps as u128) / 10_000).min(u64::MAX as u128) as u64
@@ -264,6 +278,7 @@ async fn perform_reconciliation_check(
     previously_alerted_orphans: &mut Option<HashSet<i64>>,
     breach_counters: &mut BreachCounters,
     halted: &mut bool,
+    liability_dark_ticks: &mut u32,
     cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
     check_orphan_deposit_rows(
@@ -282,43 +297,70 @@ async fn perform_reconciliation_check(
     }
 
     let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
-    let covered = match wait_for_ledger(storage, custody.slot, cancellation_token).await {
-        LedgerWait::Covered => true,
-        LedgerWait::Unknown => false,
-        LedgerWait::Cancelled => return Ok(()),
+
+    // Envelope (DB) and channel supply (PrivateChannel RPC) are read here, next to
+    // custody, because the supply invariant compares all three as one instant. The ledger
+    // wait below costs seconds and must never sit between two readings being compared.
+    let mut mints: HashSet<Pubkey> = custody.balances.keys().copied().collect();
+    mints.extend(fetch_db_mint_set(storage).await?);
+    // A failure of either input holds the breach counters and skips the tick, so a
+    // transient glitch cannot reset a building breach.
+    let (supply, envelope) = match load_halt_inputs(storage, channel_rpc, &mints).await {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            warn!("Skipping halt evaluation this tick (counters held): {}", e);
+            return Ok(());
+        }
     };
 
-    // Rows are read whatever the wait outcome: they enumerate the mints even when
-    // liabilities are unknown, keeping a zero-custody mint with supply in scope.
+    let covered = match wait_for_ledger(storage, custody.slot, cancellation_token).await {
+        LedgerWait::Covered => {
+            *liability_dark_ticks = 0;
+            true
+        }
+        LedgerWait::Unknown => {
+            *liability_dark_ticks += 1;
+            false
+        }
+        LedgerWait::Cancelled => return Ok(()),
+    };
+    report_liability_arm_state(*liability_dark_ticks, config, webhook_client).await;
+
+    // Rows are read whatever the wait outcome. A mint that appeared since the enumeration
+    // has no supply reading, so the supply arm holds it as it holds any unread mint, while
+    // the liability arm still sees it.
     let (ledger_mints, liabilities) = fetch_ledger(storage, custody.slot).await?;
-    let mut mints: HashSet<Pubkey> = custody.balances.keys().copied().collect();
     mints.extend(ledger_mints);
 
-    // Envelope (DB) and channel supply (PrivateChannel RPC) are the remaining
-    // halt inputs. A failure of either holds the breach counters and skips the
-    // tick, so a transient glitch cannot reset a building breach.
-    match load_halt_inputs(storage, channel_rpc, &mints).await {
-        Ok((supply, envelope)) => {
-            evaluate_and_maybe_halt(
-                storage,
-                config,
-                health,
-                webhook_client,
-                &custody.balances,
-                custody.slot,
-                &mints,
-                &supply,
-                &envelope,
-                covered.then_some(&liabilities),
-                breach_counters,
-                halted,
-            )
-            .await;
-        }
-        Err(e) => warn!("Skipping halt evaluation this tick (counters held): {}", e),
-    }
+    evaluate_and_maybe_halt(
+        storage,
+        config,
+        health,
+        webhook_client,
+        &custody.balances,
+        custody.slot,
+        &mints,
+        &supply,
+        &envelope,
+        covered.then_some(&liabilities),
+        breach_counters,
+        halted,
+    )
+    .await;
 
     Ok(())
+}
+
+/// Every mint the DB knows, parsed. Read before the ledger wait so enumeration never
+/// depends on whether the ledger can be pinned this tick.
+async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<HashSet<Pubkey>, OperatorError> {
+    storage
+        .get_mint_addresses()
+        .await
+        .map_err(OperatorError::Storage)?
+        .iter()
+        .map(|address| parse_mint(address))
+        .collect()
 }
 
 /// Whether the ledger can be compared at the custody slot this tick.
@@ -351,6 +393,7 @@ async fn wait_for_ledger(
                     slot,
                     "No escrow indexer checkpoint; ledger liabilities unknown this tick"
                 );
+                count_unknown_ledger("no_checkpoint");
                 return LedgerWait::Unknown;
             }
             Err(e) => warn!("Checkpoint read failed while waiting for the ledger: {}", e),
@@ -361,12 +404,51 @@ async fn wait_for_ledger(
                 slot,
                 "Escrow indexer checkpoint did not reach the custody slot in time; ledger liabilities unknown this tick"
             );
+            count_unknown_ledger("catchup_timeout");
             return LedgerWait::Unknown;
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(LEDGER_CATCHUP_POLL_MS)) => {}
             _ = cancellation_token.cancelled() => return LedgerWait::Cancelled,
         }
+    }
+}
+
+fn count_unknown_ledger(reason: &str) {
+    OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN
+        .with_label_values(&[ProgramType::Escrow.as_label(), reason])
+        .inc();
+}
+
+/// Export how long the liability arm has been unable to pin the ledger, and alert once it
+/// has been dark for `LIABILITY_DARK_ALERT_TICKS` and on every multiple after that.
+async fn report_liability_arm_state(
+    dark_ticks: u32,
+    config: &OperatorConfig,
+    webhook_client: &WebhookClient,
+) {
+    OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS
+        .with_label_values(&[ProgramType::Escrow.as_label()])
+        .set(dark_ticks as f64);
+
+    if dark_ticks == 0 || dark_ticks % LIABILITY_DARK_ALERT_TICKS != 0 {
+        return;
+    }
+    error!(
+        reconciliation_alert = true,
+        dark_ticks,
+        "RECONCILIATION ALERT: the liability invariant has been unchecked for {} consecutive ticks; \
+         the escrow indexer's checkpoint is not reaching the custody slot",
+        dark_ticks
+    );
+    if let Err(e) = send_liability_dark_alert(
+        &config.reconciliation_webhook_url,
+        dark_ticks,
+        webhook_client,
+    )
+    .await
+    {
+        error!("Failed to send dark liability arm webhook: {}", e);
     }
 }
 
@@ -529,8 +611,21 @@ async fn evaluate_and_maybe_halt(
         let c = *custody.get(&mint).unwrap_or(&0);
         let owed = *liabilities.get(&mint).unwrap_or(&0);
         let tolerance = insolvency_tolerance_raw(c, config.reconciliation_tolerance_bps);
+        OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL
+            .with_label_values(&[&mint.to_string()])
+            .set(owed.saturating_sub(c) as f64);
 
         let Some(breach) = evaluate_liability_shortfall(c, owed, tolerance) else {
+            // A shortfall the tolerance absorbs never halts, yet it is exactly what refuses
+            // the next boot. Report it now rather than leaving it to surface at a restart.
+            if owed > c {
+                warn!(
+                    mint = %mint,
+                    shortfall = owed - c,
+                    tolerance,
+                    "Custody short of ledger liabilities but within tolerance"
+                );
+            }
             continue;
         };
 
@@ -811,6 +906,44 @@ pub async fn send_webhook_alert(
             mismatch.mint, mismatch.delta_bps
         );
     }
+
+    Ok(())
+}
+
+/// Posts `{ dark_ticks, timestamp }` when the liability invariant has gone unchecked for
+/// `dark_ticks` consecutive ticks. `None` URL logs a `warn!` and returns `Ok`.
+pub async fn send_liability_dark_alert(
+    webhook_url: &Option<String>,
+    dark_ticks: u32,
+    webhook_client: &WebhookClient,
+) -> Result<(), OperatorError> {
+    let url = match webhook_url {
+        Some(url) => url,
+        None => {
+            warn!(
+                dark_ticks,
+                "Liability invariant unchecked but no webhook URL configured"
+            );
+            return Ok(());
+        }
+    };
+
+    let payload = serde_json::json!({
+        "dark_ticks": dark_ticks,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let context = format!("liability arm dark for {dark_ticks} tick(s)");
+
+    webhook_client
+        .post_json(url, &payload, &context)
+        .await
+        .map_err(|error| {
+            OperatorError::WebhookError(format!(
+                "Failed to send dark liability arm webhook alert after {} attempts: {}",
+                error.attempts(),
+                error.message()
+            ))
+        })?;
 
     Ok(())
 }
@@ -2002,6 +2135,21 @@ mod tests {
             .await;
     }
 
+    /// Register mints in the `mints` table, the universe every ledger read groups over.
+    async fn seed_mints(mock: &MockStorage, mints: &[Pubkey]) {
+        let rows: Vec<_> = mints
+            .iter()
+            .map(|m| {
+                crate::storage::common::storage::DbMint::new(
+                    m.to_string(),
+                    6,
+                    spl_token::id().to_string(),
+                )
+            })
+            .collect();
+        mock.upsert_mints_batch(&rows).await.unwrap();
+    }
+
     /// One ledger aggregate row as the balance query returns it.
     fn ledger_row(mint: &str, deposits: u64, withdrawals: u64) -> MintDbBalance {
         MintDbBalance {
@@ -2088,6 +2236,17 @@ mod tests {
         halted: &mut bool,
         token: &CancellationToken,
     ) -> Result<(), OperatorError> {
+        run_tick_tracking_dark(env, config, counters, halted, token, &mut 0).await
+    }
+
+    async fn run_tick_tracking_dark(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        token: &CancellationToken,
+        dark_ticks: &mut u32,
+    ) -> Result<(), OperatorError> {
         perform_reconciliation_check(
             &env.storage,
             config,
@@ -2099,6 +2258,7 @@ mod tests {
             &mut None,
             counters,
             halted,
+            dark_ticks,
             token,
         )
         .await
@@ -2244,6 +2404,254 @@ mod tests {
         assert!(!halted);
         assert_eq!(counters.supply.get(&mint).copied(), Some(1));
         assert!(env.mock.calls("get_committed_checkpoint") > 1, "it polled");
+    }
+
+    /// Answer channel `getAccountInfo` with a mint at `supply`, recording how many
+    /// checkpoint reads the storage had served by the time the request arrived.
+    async fn mock_channel_supply_recording(
+        server: &mut mockito::Server,
+        supply: u64,
+        mock: MockStorage,
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) {
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        let mint = spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        let mut buf = vec![0u8; spl_token::state::Mint::LEN];
+        mint.pack_into_slice(&mut buf);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                seen.lock()
+                    .unwrap()
+                    .push(mock.calls("get_committed_checkpoint"));
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {
+                            "owner": spl_token::id().to_string(),
+                            "lamports": 1_000_000u64,
+                            "data": [b64, "base64"],
+                            "executable": false,
+                            "rentEpoch": 0,
+                        }
+                    }
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_sub_tolerance_shortfall_is_reported_without_halting() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 1000, 0).await;
+        seed_checkpoint(&env.mock, 1);
+        // Liabilities one unit over custody, against a tolerance of 10 bps of 1000.
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 1001, 0)]);
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        run_tick(
+            &env,
+            &make_operator_config(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!halted);
+        assert!(counters.liability.is_empty(), "within tolerance, no breach");
+        assert_eq!(
+            OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL
+                .with_label_values(&[&mint.to_string()])
+                .get(),
+            1.0,
+            "a shortfall the tolerance absorbs still has to be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn dark_ticks_advance_on_unknown_and_reset_on_covered() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_mints(&env.mock, &[mint]).await;
+        let config = recon_config_zero_tolerance();
+        let mut dark = 0;
+
+        // No checkpoint at all: the arm cannot be pinned, twice.
+        for _ in 0..2 {
+            run_tick_tracking_dark(
+                &env,
+                &config,
+                &mut BreachCounters::default(),
+                &mut false,
+                &CancellationToken::new(),
+                &mut dark,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(dark, 2, "each unpinnable tick is one dark tick");
+
+        seed_checkpoint(&env.mock, 1);
+        run_tick_tracking_dark(
+            &env,
+            &config,
+            &mut BreachCounters::default(),
+            &mut false,
+            &CancellationToken::new(),
+            &mut dark,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dark, 0, "a covered tick rearms the arm");
+    }
+
+    #[tokio::test]
+    async fn a_persistently_dark_arm_alerts_on_every_third_tick() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_mints(&env.mock, &[mint]).await;
+        let mut webhook = mockito::Server::new_async().await;
+        let posted = webhook
+            .mock("POST", "/")
+            .with_status(200)
+            .expect(2)
+            .create_async()
+            .await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(webhook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let mut dark = 0;
+
+        // Six dark ticks: one alert at the third, one at the sixth, silence between.
+        for _ in 0..6 {
+            run_tick_tracking_dark(
+                &env,
+                &config,
+                &mut BreachCounters::default(),
+                &mut false,
+                &CancellationToken::new(),
+                &mut dark,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(dark, 6);
+        posted.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn supply_is_read_before_the_ledger_wait() {
+        let mint = Pubkey::new_unique();
+        let mut custody_server = mockito::Server::new_async().await;
+        mock_custody_sweep(&mut custody_server, mint, 100).await;
+        let mock = MockStorage::new();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut channel = mockito::Server::new_async().await;
+        mock_channel_supply_recording(&mut channel, 100, mock.clone(), seen.clone()).await;
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        // A checkpoint stuck below the custody slot makes the wait spend its whole budget.
+        seed_checkpoint(&mock, 0);
+        mock.set_mint_balances(vec![ledger_row(&mint.to_string(), 100, 0)]);
+        let env = TickEnv {
+            custody: custody_server,
+            channel,
+            mock,
+            storage,
+        };
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut BreachCounters::default(),
+            &mut false,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "the supply read must have happened");
+        assert!(
+            seen.iter().all(|&reads| reads == 0),
+            "custody and supply must be read with no ledger wait between them, saw {seen:?}"
+        );
+        assert!(
+            env.mock.calls("get_committed_checkpoint") > 1,
+            "the wait must still have run, after the supply read"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_enumeration_survives_an_unknown_ledger() {
+        let custody_mint = Pubkey::new_unique();
+        let listed_only = Pubkey::new_unique();
+        let env = tick_env(custody_mint, 100, 1000).await;
+        // Known to the mints table only: no custody, no ledger row, no checkpoint.
+        seed_mints(&env.mock, &[listed_only]).await;
+        let mut counters = BreachCounters::default();
+
+        run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut false,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counters.supply.get(&listed_only).copied(),
+            Some(1),
+            "a mint the ledger read cannot enumerate must still be checked"
+        );
+    }
+
+    #[tokio::test]
+    async fn enumeration_read_failure_holds_counters_and_halt_flag() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 1000).await;
+        seed_checkpoint(&env.mock, 1);
+        env.mock.set_should_fail("get_mint_addresses", true);
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(mint, 2)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+
+        let result = run_tick(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_err(), "the tick must surface the read failure");
+        assert_eq!(counters.supply.get(&mint).copied(), Some(2), "held");
+        assert!(!halted);
     }
 
     #[tokio::test]
@@ -2458,6 +2866,8 @@ mod tests {
         );
         let env = tick_env(c, 100, 50).await;
         seed_checkpoint(&env.mock, 1);
+        // The aggregate's universe is the `mints` table, so a row there implies a row here.
+        seed_mints(&env.mock, &[a, b]).await;
         env.mock.set_mint_balances(vec![
             ledger_row(&a.to_string(), 0, 0),
             ledger_row(&b.to_string(), 300, 300),
@@ -2546,6 +2956,7 @@ mod tests {
             &mut orphans,
             &mut counters,
             &mut halted,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await;
@@ -2599,6 +3010,7 @@ mod tests {
             &mut orphans,
             &mut counters,
             &mut halted,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await;
@@ -2618,6 +3030,7 @@ mod tests {
             &mut orphans,
             &mut counters,
             &mut halted,
+            &mut 0,
             &CancellationToken::new(),
         )
         .await;

@@ -1293,6 +1293,7 @@ async fn test_operator_starts_when_chain_is_ahead_of_db() -> Result<(), Box<dyn 
         user_pubkey,
         50_000,
         0,
+        spl_token::id(),
     )
     .await?;
     let balance_after_orphan = get_token_balance(&client, &user_pubkey, &env.mint).await?;
@@ -1652,6 +1653,7 @@ async fn test_landed_release_with_dead_signatures_is_not_reminted(
         user_pubkey,
         50_000,
         0,
+        spl_token::id(),
     )
     .await?;
     let balance_after_release = get_token_balance(&client, &user_pubkey, &env.mint).await?;

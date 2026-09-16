@@ -126,7 +126,8 @@ async fn insert_withdrawal(
     .await
 }
 
-/// Record that the escrow indexer saw the release for `nonce` land at `slot`.
+/// Record that the escrow indexer saw the release for `nonce` land at `slot`, with no
+/// amount of its own: the shape of a row written before the column existed.
 async fn observe_release(
     storage: &Storage,
     nonce: i64,
@@ -137,6 +138,25 @@ async fn observe_release(
             withdrawal_nonce: nonce,
             signature: format!("release_{nonce}"),
             slot,
+            amount: None,
+        }])
+        .await?;
+    Ok(())
+}
+
+/// Record a release for `nonce` that moved `amount`, which can differ from what the row owes.
+async fn observe_release_of(
+    storage: &Storage,
+    nonce: i64,
+    slot: i64,
+    amount: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: nonce,
+            signature: format!("release_{nonce}"),
+            slot,
+            amount: Some(amount as i64),
         }])
         .await?;
     Ok(())
@@ -303,6 +323,81 @@ async fn unreleased_withdrawals_are_never_subtracted() -> Result<(), Box<dyn std
     assert_eq!(
         withdrawals_at(&storage, &mint, u64::MAX).await?,
         BigDecimal::from(0u64)
+    );
+    Ok(())
+}
+
+/// A release that moves less than its row owes discharges only what moved. The rest is
+/// still custody the escrow should hold, so it stays in the liabilities.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_release_subtracts_only_what_moved() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    let nonce = insert_withdrawal(&pool, "w_partial", &mint, 100_000, "processing", 100).await?;
+    observe_release_of(&storage, nonce, 100, 1).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(1u64)
+    );
+    Ok(())
+}
+
+/// A release that moves more than its row owes discharges only the row. Custody dropped by
+/// the larger figure, so the excess has to stand as a shortfall rather than net itself out.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_over_release_discharges_no_more_than_the_row_owed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    let nonce = insert_withdrawal(&pool, "w_over", &mint, 100, "processing", 100).await?;
+    observe_release_of(&storage, nonce, 100, 200).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(100u64)
+    );
+    Ok(())
+}
+
+/// Rows written before the column existed carry no amount. They have to keep subtracting
+/// the row figure, or the first read after an upgrade calls every past payout still owed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_with_no_recorded_amount_subtracts_the_row_amount(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    let nonce = insert_withdrawal(&pool, "w_legacy", &mint, 100, "processing", 100).await?;
+    observe_release(&storage, nonce, 100).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(100u64)
+    );
+    Ok(())
+}
+
+/// The status fallback has no observed release to read an amount from, but a row that has
+/// one must use it there too, or the fallback would be looser than the pinned read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_unpinned_read_uses_the_observed_amount_when_it_has_one(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    let nonce = insert_withdrawal(&pool, "w_unpinned", &mint, 100_000, "completed", 100).await?;
+    observe_release_of(&storage, nonce, 100, 1).await?;
+
+    assert_eq!(
+        unpinned_withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(1u64)
     );
     Ok(())
 }

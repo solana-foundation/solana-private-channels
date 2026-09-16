@@ -2258,6 +2258,7 @@ mod tests {
             withdrawal_nonce: nonce,
             signature: signature.to_string(),
             slot: 4_000,
+            amount: None,
         }])
         .await
         .unwrap();

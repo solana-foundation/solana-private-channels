@@ -172,6 +172,7 @@ async fn test_reconciliation_catches_corrupted_db() -> Result<(), Box<dyn std::e
 
     let zero_threshold = ReconciliationConfig {
         mismatch_threshold_raw: 0,
+        ..Default::default()
     };
 
     // Step 3: reconciliation must PASS before corruption

@@ -44,6 +44,8 @@ struct StorageSection {
 struct ReconciliationSection {
     #[serde(default)]
     mismatch_threshold_raw: u64,
+    #[serde(default)]
+    reconciliation_tolerance_bps: u16,
 }
 
 #[derive(Deserialize)]
@@ -357,6 +359,7 @@ async fn run_indexer(figment: Figment, verbose: bool) -> Result<(), Box<dyn std:
 
     let reconciliation_config = ReconciliationConfig {
         mismatch_threshold_raw: indexer.reconciliation.mismatch_threshold_raw,
+        reconciliation_tolerance_bps: indexer.reconciliation.reconciliation_tolerance_bps,
     };
 
     let indexer_config = IndexerConfig {

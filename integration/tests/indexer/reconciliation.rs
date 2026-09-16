@@ -203,6 +203,7 @@ async fn test_reconciliation_blocks_on_phantom_deposit() -> Result<(), Box<dyn s
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
         ProgramType::Escrow,
         &storage,
@@ -241,6 +242,7 @@ async fn test_reconciliation_passes_within_threshold() -> Result<(), Box<dyn std
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
             mismatch_threshold_raw: 1_000_000,
+            ..Default::default()
         },
         ProgramType::Escrow,
         &storage,
@@ -332,6 +334,7 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
         ProgramType::Escrow,
         &storage,
@@ -428,6 +431,7 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
     let result = run_startup_reconciliation(
         &ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
         ProgramType::Escrow,
         &storage,

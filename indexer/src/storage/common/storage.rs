@@ -18,6 +18,7 @@ pub mod get_committed_checkpoint;
 pub mod get_completed_withdrawal_nonces;
 pub mod get_in_flight_amounts_by_mint;
 pub mod get_mint;
+pub mod get_mint_addresses;
 pub mod get_mint_balances_for_reconciliation;
 pub mod get_mint_status_at_slot;
 pub mod get_observed_release;
@@ -240,6 +241,11 @@ impl Storage {
     ) -> Result<Vec<MintDbBalance>, StorageError> {
         get_mint_balances_for_reconciliation::get_mint_balances_for_reconciliation(self, as_of_slot)
             .await
+    }
+
+    /// Every mint address the DB knows: the mint universe that runtime reconciliation checks.
+    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
+        get_mint_addresses::get_mint_addresses(self).await
     }
 
     /// The same ledger for a caller that cannot pin the indexer to `as_of_slot`, where a
@@ -1276,6 +1282,23 @@ mod tests {
         assert_eq!(nonces.len(), 2);
         assert!(nonces.contains(&15));
         assert!(nonces.contains(&25));
+    }
+
+    #[tokio::test]
+    async fn dispatch_get_mint_addresses_via_mock() {
+        let (storage, _mock) = make_mock_storage();
+
+        storage
+            .upsert_mints_batch(&[
+                DbMint::new("mint_1".to_string(), 6, TOKEN_PROGRAM.to_string()),
+                DbMint::new("mint_2".to_string(), 9, TOKEN_PROGRAM.to_string()),
+            ])
+            .await
+            .unwrap();
+
+        let mut addresses = storage.get_mint_addresses().await.unwrap();
+        addresses.sort();
+        assert_eq!(addresses, vec!["mint_1", "mint_2"]);
     }
 
     #[tokio::test]

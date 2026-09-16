@@ -191,6 +191,27 @@ pub const BAIL_REASONS: [&str; 8] = [
 // Supervision: a critical task inside the operator exited.  The supervisor
 // aborts the process immediately when this increments; the counter exists
 // so dashboards can alert even if the restart is fast.
+gauge_vec!(
+    OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
+    "private_channel_operator_reconciliation_liability_dark_ticks",
+    "Consecutive reconciliation ticks whose ledger could not be pinned to the custody slot (0 when the liability invariant is armed)",
+    &["program_type"]
+);
+
+gauge_vec!(
+    OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
+    "private_channel_operator_reconciliation_liability_shortfall_raw",
+    "Raw tokens by which ledger liabilities exceed custody, exported every tick whether or not it breaches the halt tolerance",
+    &["mint"]
+);
+
+counter_vec!(
+    OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
+    "private_channel_operator_reconciliation_liability_unknown_total",
+    "Reconciliation ticks that gave up pinning the ledger, by reason",
+    &["program_type", "reason"]
+);
+
 counter_vec!(
     OPERATOR_TASK_EXIT,
     "private_channel_operator_task_exit_total",
@@ -451,6 +472,13 @@ pub fn init_labels(program_type: &str) {
             OPERATOR_ABSENCE_CLASSIFY.with_label_values(&[chain, outcome]);
         }
     }
+
+    for reason in &["no_checkpoint", "catchup_timeout"] {
+        OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN.with_label_values(&[program_type, reason]);
+    }
+    // An armed liability check reports zero, so the series has to exist before the first
+    // dark tick or "no data" and "armed" look the same.
+    OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS.with_label_values(&[program_type]);
 }
 
 pub fn init() {
@@ -484,6 +512,9 @@ pub fn init() {
         OPERATOR_REMINT_CLAIM_LOST,
         OPERATOR_SENDER_LOCK_LOST,
         LIVE_STATE_LOCK_LOST,
+        OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
+        OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
+        OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
     );
 }
 

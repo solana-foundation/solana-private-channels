@@ -38,15 +38,29 @@ The liability check catches a custody drain that the supply check cannot see
 while unminted (`pending`, `failed`, `manual_review`) deposits pad the gap.
 Liabilities are every deposit indexed at or below the custody slot, in any
 status, minus every withdrawal whose `release_funds` the escrow indexer recorded
-in `observed_releases` at or below that slot. Before comparing, the operator
-waits (up to 30 s) for the escrow indexer's committed checkpoint to reach the
-custody slot; if it does not, liabilities are unknown for that tick, the
-counter holds, and a `warn!` names the checkpoint and slot. Its halt reason reads
+in `observed_releases` at or below that slot. A release discharges what it
+actually moved, capped at what its row owed, so a payout smaller than its row
+leaves the rest owed and one larger leaves the excess standing as a shortfall.
+Before comparing, the operator waits (up to 30 s) for the escrow indexer's
+committed checkpoint to reach the custody slot; if it does not, liabilities are
+unknown for that tick and the counter holds. Its halt reason reads
 `... custody <C> short of ledger liabilities <L> by <GAP>, tolerance <T> at slot <S> ...`.
 
+A tick that cannot pin the ledger leaves the liability check unarmed, so
+`private_channel_operator_reconciliation_liability_dark_ticks` counts how many
+consecutive ticks it has been off (0 when armed) and every third dark tick logs
+`reconciliation_alert` and posts a webhook. An indefinitely frozen escrow
+checkpoint keeps that firing rather than going quiet. A shortfall too small to
+halt is still exported per mint as
+`private_channel_operator_reconciliation_liability_shortfall_raw`, because that
+is the state that refuses the next boot.
+
 The DB also supplies the mint universe (every `mints` row, so a blocked or
-not-held mint is still checked) and the in-flight envelope. Both checks use the
-same small bps cushion of custody.
+not-held mint is still checked) and the in-flight envelope. Custody, channel
+supply and the envelope are all read before the checkpoint wait, so the supply
+invariant compares one instant. Both checks use the same small bps cushion of
+custody; startup applies the same formula on top of `mismatch_threshold_raw`,
+defaulting to 0 so a boot tolerates nothing it is not configured to.
 
 When either check breaches for three consecutive ticks, the operator **halts**:
 

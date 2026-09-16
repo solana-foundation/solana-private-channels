@@ -102,8 +102,8 @@ pub async fn release_funds_on_chain(
     user: Pubkey,
     amount: u64,
     nonce: u64,
+    token_program: Pubkey,
 ) -> Result<Signature, Box<dyn std::error::Error>> {
-    let token_program = spl_token::id();
     let release_ix = ReleaseFundsBuilder::new()
         .payer(admin.pubkey())
         .operator(admin.pubkey())

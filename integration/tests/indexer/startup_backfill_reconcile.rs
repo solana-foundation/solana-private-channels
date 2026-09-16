@@ -237,6 +237,7 @@ fn spawn_indexer_with(
         },
         reconciliation: ReconciliationConfig {
             mismatch_threshold_raw: 0,
+            ..Default::default()
         },
     };
 

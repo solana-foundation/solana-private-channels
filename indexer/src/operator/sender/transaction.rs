@@ -5300,6 +5300,7 @@ mod tests {
             withdrawal_nonce: 7,
             signature: "sig-observed-release".to_string(),
             slot: 4_000,
+            amount: None,
         }])
         .await
         .unwrap();

@@ -260,6 +260,12 @@ pub struct ReconciliationConfig {
     /// risk. This also removes the old race-window false positive where a deposit landed in
     /// the ATA before the DB query observed it.
     pub mismatch_threshold_raw: u64,
+    /// Relative shortfall tolerated on top of `mismatch_threshold_raw`, in basis points of
+    /// on-chain custody. The runtime liability check applies the same formula, so set this
+    /// to the operator's `reconciliation_tolerance_bps` to make the two agree. 0 (default)
+    /// leaves `mismatch_threshold_raw` as the only bound.
+    #[serde(default)]
+    pub reconciliation_tolerance_bps: u16,
 }
 
 /// Indexer-specific configuration

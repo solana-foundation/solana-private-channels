@@ -210,6 +210,9 @@ pub struct DbObservedRelease {
     pub withdrawal_nonce: i64,
     pub signature: String,
     pub slot: i64,
+    /// Raw tokens the release instruction moved. `None` on rows written before the
+    /// column existed, where the withdrawal row's own amount is the only figure there is.
+    pub amount: Option<i64>,
 }
 
 /// Resolved mint status at a particular slot, derived from `mint_status_history`.

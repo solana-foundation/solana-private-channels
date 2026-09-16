@@ -623,6 +623,9 @@ fn convert_to_db_models(
                         withdrawal_nonce: data.transaction_nonce as i64,
                         signature: signature.clone(),
                         slot: instruction_meta.slot as i64,
+                        // Saturating, not wrapping: an amount past i64 would otherwise
+                        // record negative, and the query caps it at the row's own amount.
+                        amount: Some(i64::try_from(data.amount).unwrap_or(i64::MAX)),
                     }),
                 ),
                 _ => (None, None, None, None),

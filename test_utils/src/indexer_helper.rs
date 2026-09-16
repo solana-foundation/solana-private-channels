@@ -88,6 +88,7 @@ pub async fn start_private_channel_indexer(
         // while deposits arrived) must not be blocked by startup reconciliation.
         reconciliation: private_channel_indexer::ReconciliationConfig {
             mismatch_threshold_raw: u64::MAX,
+            ..Default::default()
         },
     };
 
@@ -168,6 +169,7 @@ pub async fn start_solana_indexer_rpc_polling(
         // while deposits arrived) must not be blocked by startup reconciliation.
         reconciliation: private_channel_indexer::ReconciliationConfig {
             mismatch_threshold_raw: u64::MAX,
+            ..Default::default()
         },
     };
 
@@ -249,6 +251,7 @@ pub async fn start_solana_indexer(
         // while deposits arrived) must not be blocked by startup reconciliation.
         reconciliation: private_channel_indexer::ReconciliationConfig {
             mismatch_threshold_raw: u64::MAX,
+            ..Default::default()
         },
     };
 
