@@ -505,6 +505,24 @@ async fn seed_phantom_deposit(pool: &PgPool, mint_address: &str, amount: i64) {
     .expect("seed deposit");
 }
 
+/// Insert a withdrawal the operator has already confirmed finalized. It carries no
+/// `observed_releases` row, standing in for a payout the escrow indexer has not reached.
+async fn seed_completed_withdrawal(pool: &PgPool, mint_address: &str, amount: i64) {
+    sqlx::query(
+        "INSERT INTO transactions
+         (signature, slot, initiator, recipient, mint, amount,
+          transaction_type, status, created_at, updated_at)
+         VALUES ($1, 1, 'phantom', 'phantom', $2, $3,
+                 'withdrawal'::transaction_type, 'completed'::transaction_status, NOW(), NOW())",
+    )
+    .bind(format!("phantom_withdrawal_{mint_address}"))
+    .bind(mint_address)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .expect("seed withdrawal");
+}
+
 /// Slot and amount of the single indexed deposit for `mint`, if it has been written yet.
 async fn deposit_row(pool: &PgPool, mint: &str) -> Option<(i64, String)> {
     sqlx::query_as(
@@ -1165,19 +1183,18 @@ fn mock_channel_supply(rpc: &MockRpcServer, supply: u64) {
 
 /// With backfill off nothing imports the slots between the checkpoint and the custody
 /// reading, so a payout that already left custody is not in the ledger yet and the mint
-/// reads as owing more than it holds. That is a lagging ledger, not a shortfall, so the
-/// comparison has to be deferred instead of aborting every boot.
-///
-/// The seeded row is a deposit no custody backs, so a comparison that did run could only
-/// abort. Startup staying up is therefore the deferral and nothing else.
+/// reads as owing more than it holds. The operator's own `completed` row explains that
+/// gap, so the boot has to proceed instead of aborting on the indexer's lag.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn backfill_disabled_defers_the_ledger_comparison_when_the_checkpoint_is_behind() {
+async fn backfill_disabled_counts_completed_withdrawals_when_the_checkpoint_is_behind() {
     init_tracing();
-    let (_pg, pool, postgres) = start_postgres("startup_nofill_defer").await;
+    let (_pg, pool, postgres) = start_postgres("startup_nofill_completed").await;
 
     seed_checkpoint(&pool, "escrow", (MOCK_TIP - 5) as i64).await;
-    let phantom_mint = Pubkey::new_unique().to_string();
-    seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
+    let mint = Pubkey::new_unique().to_string();
+    seed_phantom_deposit(&pool, &mint, PHANTOM_AMOUNT).await;
+    // No `observed_releases` row: the release is exactly what the lagging ledger is missing.
+    seed_completed_withdrawal(&pool, &mint, PHANTOM_AMOUNT).await;
 
     let mut rpc = MockitoServer::new_async().await;
     let _custody = mock_escrow_custody(&mut rpc, &[]).await;
@@ -1199,7 +1216,7 @@ async fn backfill_disabled_defers_the_ledger_comparison_when_the_checkpoint_is_b
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(
         !handle.is_finished(),
-        "a ledger behind the custody snapshot must defer, not abort: {:?}",
+        "a shortfall a completed withdrawal explains must not abort the boot: {:?}",
         (&mut handle).await
     );
 
@@ -1207,9 +1224,54 @@ async fn backfill_disabled_defers_the_ledger_comparison_when_the_checkpoint_is_b
     chain.shutdown().await;
 }
 
-/// The deferral is bounded by the snapshot slot, not by the mere presence of a checkpoint.
-/// A checkpoint that reaches the reading leaves nothing unimported below it, so the same
-/// unbacked row has to abort the boot exactly as it always did.
+/// The fallback is the operator's own completions and nothing else. A lagging checkpoint
+/// with no completion behind the gap is a drain nothing accounts for, so the boot stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backfill_disabled_still_aborts_on_a_shortfall_no_completion_explains() {
+    init_tracing();
+    let (_pg, pool, postgres) = start_postgres("startup_nofill_unexplained").await;
+
+    seed_checkpoint(&pool, "escrow", (MOCK_TIP - 5) as i64).await;
+    let phantom_mint = Pubkey::new_unique().to_string();
+    seed_phantom_deposit(&pool, &phantom_mint, PHANTOM_AMOUNT).await;
+
+    let mut rpc = MockitoServer::new_async().await;
+    let _custody = mock_escrow_custody(&mut rpc, &[]).await;
+
+    let chain = MockRpcServer::start().await;
+    mock_empty_channel_supply(&chain);
+
+    let handle = spawn_indexer_with(
+        postgres,
+        rpc.url(),
+        chain.url(),
+        Pubkey::new_unique(),
+        None,
+        None,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(STARTUP_TIMEOUT_SECS), handle)
+        .await
+        .expect("startup must terminate on an unbacked ledger row")
+        .expect("run task must not panic");
+
+    match result {
+        Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+            threshold,
+            ..
+        })) => assert_eq!(
+            threshold, 0,
+            "the strict threshold must be the one enforced"
+        ),
+        other => panic!("expected a mismatch halt, got {other:?}"),
+    }
+
+    chain.shutdown().await;
+}
+
+/// The fallback is bounded by the snapshot slot, not by the mere presence of a checkpoint.
+/// A checkpoint that reaches the reading leaves nothing unimported below it, so the ledger
+/// is read as it stands and the same unbacked row aborts the boot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backfill_disabled_compares_when_the_checkpoint_reaches_the_snapshot() {
     init_tracing();
@@ -1253,9 +1315,9 @@ async fn backfill_disabled_compares_when_the_checkpoint_reaches_the_snapshot() {
     chain.shutdown().await;
 }
 
-/// Deferring the ledger comparison must not disarm the other invariant. Supply above
-/// custody is read from the chain on both sides, so a lagging ledger says nothing about it
-/// and the boot still has to stop.
+/// The completion fallback must not disarm the other invariant. Supply above custody is
+/// read from the chain on both sides, so a lagging ledger says nothing about it and the
+/// boot still has to stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backfill_disabled_with_a_lagging_checkpoint_still_enforces_the_supply_invariant() {
     init_tracing();
