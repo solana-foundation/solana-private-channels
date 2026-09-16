@@ -680,24 +680,20 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
-        // Idempotent migration: add is_pausable to existing databases.
-        // Nullable = "unknown"; populated lazily by the operator after an RPC
-        // check against the on-chain mint's Token-2022 PausableConfig extension.
-        sqlx::query("ALTER TABLE mints ADD COLUMN IF NOT EXISTS is_pausable BOOLEAN")
-            .execute(&self.pool)
-            .await?;
-
-        // Same pattern for the PermanentDelegate extension — resolved lazily
-        // the first time the operator touches the mint. Gate for the balance
-        // pre-flight that guards against permanent-delegate drains.
-        sqlx::query("ALTER TABLE mints ADD COLUMN IF NOT EXISTS has_permanent_delegate BOOLEAN")
-            .execute(&self.pool)
-            .await?;
-
         // Current allow/block state. Existing rows backfill to 'allowed' via the
         // default; the point-in-time history lives in mint_status_history.
         sqlx::query(
             "ALTER TABLE mints ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'allowed'",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Current withdrawal gate, mirrored from mint_status_history the same way
+        // status is. The withdrawal pre-flight reads this per withdrawal, so an
+        // admin blocking a live mint no longer needs an operator restart to land.
+        // Existing rows backfill to open, which is what they were.
+        sqlx::query(
+            "ALTER TABLE mints ADD COLUMN IF NOT EXISTS withdrawals_blocked BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await?;
@@ -749,6 +745,15 @@ impl PostgresDb {
                 PRIMARY KEY (mint_address, effective_slot)
             );
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // The withdrawal gate as of each transition. Rows predating the split
+        // backfill to open: BlockMint could not gate withdrawals independently
+        // then, so that is what they meant.
+        sqlx::query(
+            "ALTER TABLE mint_status_history ADD COLUMN IF NOT EXISTS withdrawals_blocked BOOLEAN NOT NULL DEFAULT FALSE",
         )
         .execute(&self.pool)
         .await?;
@@ -2624,9 +2629,11 @@ impl PostgresDb {
         sqlx::query(
             r#"
             UPDATE mints m
-            SET status = h.status
+            SET status = h.status,
+                withdrawals_blocked = h.withdrawals_blocked
             FROM (
-                SELECT DISTINCT ON (mint_address) mint_address, status
+                SELECT DISTINCT ON (mint_address)
+                    mint_address, status, withdrawals_blocked
                 FROM mint_status_history
                 WHERE mint_address = ANY($1)
                 ORDER BY mint_address, effective_slot DESC
@@ -2655,13 +2662,14 @@ impl PostgresDb {
             sqlx::query(
                 r#"
                 INSERT INTO mint_status_history
-                    (mint_address, status, effective_slot, signature)
-                VALUES ($1, $2, $3, $4)
+                    (mint_address, status, withdrawals_blocked, effective_slot, signature)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (mint_address, effective_slot) DO NOTHING
                 "#,
             )
             .bind(&status.mint_address)
             .bind(&status.status)
+            .bind(status.withdrawals_blocked)
             .bind(status.effective_slot)
             .bind(&status.signature)
             .execute(&mut *tx)
@@ -2705,37 +2713,6 @@ impl PostgresDb {
             }
             None => Ok(MintStatusAtSlot::NeverAllowed),
         }
-    }
-
-    /// Write-back from the operator's MintCache after it resolves whether
-    /// the on-chain mint carries the Token-2022 PausableConfig and
-    /// PermanentDelegate extensions. Both flags are always resolved in the
-    /// same RPC fetch, so they're persisted together in a single update.
-    /// Errors if the row doesn't exist — the indexer always lands the
-    /// `mints` row before any withdrawal for that mint can reach the
-    /// operator, so a missing row indicates an ordering bug.
-    pub async fn set_mint_extension_flags_internal(
-        &self,
-        mint_address: &str,
-        is_pausable: bool,
-        has_permanent_delegate: bool,
-    ) -> Result<(), StorageError> {
-        let result = sqlx::query(
-            "UPDATE mints SET is_pausable = $2, has_permanent_delegate = $3 WHERE mint_address = $1",
-        )
-        .bind(mint_address)
-        .bind(is_pausable)
-        .bind(has_permanent_delegate)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(StorageError::DatabaseError {
-                message: format!("set_mint_extension_flags: no mints row for {mint_address}"),
-            });
-        }
-
-        Ok(())
     }
 
     pub async fn get_mint_internal(

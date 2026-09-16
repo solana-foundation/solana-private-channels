@@ -27,6 +27,7 @@ pub async fn seed_allowed_mint(
         .insert_mint_statuses_batch(&[DbMintStatus {
             mint_address: mint_address.to_string(),
             status: "allowed".to_string(),
+            withdrawals_blocked: false,
             effective_slot,
             signature: format!("test-seed-{mint_address}"),
             created_at: chrono::Utc::now(),

@@ -6749,8 +6749,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[patch.unused]]
-name = "trident-syscall-stubs-v2"
-version = "0.1.0"
-source = "git+https://github.com/exo-tech-xyz/trident-syscall-stubs.git?branch=fix-rent-pinocchio#4485f4f340568820f662cc6083c61e4a049e0451"

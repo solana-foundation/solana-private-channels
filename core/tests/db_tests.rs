@@ -3,7 +3,7 @@
 //! Uses testcontainers to spin up an isolated Postgres instance for each test.
 //! Requires Docker to be running.
 
-use private_channel_core::accounts::AccountsDB;
+use private_channel_core::accounts::{traits::BlockInfo, AccountsDB};
 use private_channel_core::stages::AccountSettlement;
 use private_channel_core::test_helpers::{
     create_test_block_info, create_test_sanitized_transaction,
@@ -371,7 +371,7 @@ async fn write_batch_rejects_a_block_at_or_below_the_stored_tip() {
 
         let err = result.expect_err("a block at or below the tip must be rejected");
         assert!(
-            err.contains(&slot.to_string()),
+            err.to_string().contains(&slot.to_string()),
             "the error must name the rejected slot, got: {err}"
         );
 
@@ -431,9 +431,9 @@ async fn write_batch_accepts_an_identical_replay_of_the_stored_tip() {
     assert_eq!(db.get_block(5).await.unwrap().unwrap().blockhash, blockhash);
 }
 
-/// The guard rejects rewinds and overwrites, not gaps. The settler only ever
-/// extends by one slot, so gaps cost nothing to allow and keep write_batch
-/// usable for building arbitrary ledger fixtures.
+/// The guard rejects rewinds, overwrites and wrong parents, not gaps. Idle ticks
+/// leave slots without blocks, so a block may skip slots as long as it names the
+/// stored tip as its parent.
 #[tokio::test(flavor = "multi_thread")]
 async fn write_batch_accepts_a_block_above_the_stored_tip() {
     let (mut db, _pg) = start_postgres().await;
@@ -446,9 +446,13 @@ async fn write_batch_accepts_a_block_above_the_stored_tip() {
     .await
     .unwrap();
 
-    for slot in [6u64, 20] {
+    for (slot, parent_slot) in [(6u64, 5u64), (20, 6)] {
         let blockhash = Hash::new_unique();
-        db.write_batch(&[], vec![], Some(create_test_block_info(slot, blockhash)))
+        let block = BlockInfo {
+            parent_slot,
+            ..create_test_block_info(slot, blockhash)
+        };
+        db.write_batch(&[], vec![], Some(block))
             .await
             .unwrap_or_else(|e| panic!("slot {slot} must commit above the tip: {e}"));
 

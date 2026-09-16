@@ -31,6 +31,9 @@ pub(crate) fn resolve_pool_size() -> u32 {
 pub struct PostgresAccountsDB {
     pub pool: Arc<PgPool>,
     pub read_only: bool,
+    /// The epoch this handle's commits are fenced on. `None` writes unfenced,
+    /// which only tests and handles that never commit blocks use.
+    pub writer_epoch: Option<u64>,
 }
 
 /// Returns true when the URL parses and its password is absent or empty (a blanked secret).
@@ -88,6 +91,7 @@ impl PostgresAccountsDB {
         let instance = Self {
             pool: Arc::new(pool),
             read_only,
+            writer_epoch: None,
         };
 
         info!("PostgreSQL accounts database initialized");

@@ -181,6 +181,7 @@ async fn operator_mock_harness_drives_deposit_through_to_send_transaction() {
         .lock()
         .unwrap()
         .push(DbMintStatus {
+            withdrawals_blocked: false,
             mint_address: mint_pk.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,

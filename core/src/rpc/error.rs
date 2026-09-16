@@ -16,7 +16,8 @@ pub const SLOT_SKIPPED_CODE: i32 = -32007;
 /// different answer from a slot the chain has passed without producing one.
 pub const BLOCK_NOT_AVAILABLE_CODE: i32 = -32004;
 
-/// Retryable: the write pipeline ingress queue is full; the tx was not accepted.
+/// Retryable: the write pipeline ingress queue is full, or every simulation slot is
+/// taken; the request was not accepted.
 pub const NODE_AT_CAPACITY_CODE: i32 = -32003;
 
 /// Solana's UnsupportedTransactionVersion: the caller asked for a transaction

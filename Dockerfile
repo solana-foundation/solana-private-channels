@@ -75,6 +75,7 @@ COPY auth/Cargo.toml ./auth/
 # Copy Cargo.toml files for other workspace members (to satisfy workspace references)
 COPY private-channel-escrow-program/program/Cargo.toml ./private-channel-escrow-program/program/
 COPY private-channel-escrow-program/tests/integration-tests/Cargo.toml ./private-channel-escrow-program/tests/integration-tests/
+COPY private-channel-escrow-program/tests/transfer-hook-fixture/Cargo.toml ./private-channel-escrow-program/tests/transfer-hook-fixture/
 COPY private-channel-escrow-program/clients/rust/Cargo.toml ./private-channel-escrow-program/clients/rust/
 COPY private-channel-withdraw-program/program/Cargo.toml ./private-channel-withdraw-program/program/
 COPY private-channel-withdraw-program/tests/integration-tests/Cargo.toml ./private-channel-withdraw-program/tests/integration-tests/
@@ -90,6 +91,7 @@ COPY bench-tps/Cargo.toml ./bench-tps/
 
 # Create dummy lib.rs files for workspace members we're not building
 RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-program/tests/integration-tests/src \
+    private-channel-escrow-program/tests/transfer-hook-fixture/src \
     private-channel-escrow-program/clients/rust/src private-channel-withdraw-program/program/src \
     private-channel-withdraw-program/tests/integration-tests/src \
     integration/src gateway/src indexer/src test_utils/src scripts/devnet/src \
@@ -97,6 +99,7 @@ RUN mkdir -p private-channel-escrow-program/program/src private-channel-escrow-p
     dvp-swap-program/clients/rust/src \
     core/src metrics/src auth/src auth/src/bin bench-tps/src
 RUN touch private-channel-escrow-program/program/src/lib.rs private-channel-escrow-program/tests/integration-tests/src/lib.rs \
+    private-channel-escrow-program/tests/transfer-hook-fixture/src/lib.rs \
     private-channel-escrow-program/clients/rust/src/lib.rs private-channel-withdraw-program/program/src/lib.rs \
     private-channel-withdraw-program/tests/integration-tests/src/lib.rs \
     integration/src/lib.rs gateway/src/lib.rs indexer/src/lib.rs \

@@ -6,13 +6,14 @@ use crate::{
     events::AllowMintEvent,
     processor::{
         shared::{
-            account_check::{verify_signer, verify_system_account, verify_system_program},
+            account_check::{
+                verify_mutability, verify_signer, verify_system_account, verify_system_program,
+            },
             event_utils::emit_event,
             pda_utils::create_pda_account,
-            token_utils::{get_mint_decimals, get_or_create_ata},
+            token_utils::{get_or_create_ata, read_mint_profile},
         },
-        validate_token2022_extensions, verify_account_owner, verify_ata_program,
-        verify_current_program, verify_token_programs,
+        verify_account_owner, verify_ata_program, verify_current_program, verify_token_programs,
     },
     require_len,
     state::{discriminator::AccountSerialize, AllowedMint, Instance},
@@ -25,7 +26,6 @@ use pinocchio::{
     sysvars::{rent::Rent, Sysvar},
     Address, ProgramResult,
 };
-use pinocchio_token_2022::ID as TOKEN_2022_PROGRAM_ID;
 
 /// Processes the AllowMint instruction.
 ///
@@ -57,7 +57,7 @@ pub fn process_allow_mint(
 
     verify_signer(payer_info, true)?;
     verify_signer(admin_info, false)?;
-    verify_system_account(allowed_mint_info, true)?;
+    verify_mutability(allowed_mint_info, true)?;
     verify_ata_program(associated_token_program_info)?;
     verify_system_program(system_program_info)?;
     verify_token_programs(token_program_info)?;
@@ -66,11 +66,11 @@ pub fn process_allow_mint(
     validate_event_authority!(event_authority_info);
 
     verify_account_owner(mint_info, token_program_info.address())?;
-    if token_program_info.address() == &TOKEN_2022_PROGRAM_ID {
-        validate_token2022_extensions(mint_info)?;
-    }
 
-    let mint_decimals = get_mint_decimals(mint_info)?;
+    // Also proves the account is a mint: the decimals below come from this
+    // parse rather than an unchecked cast.
+    let mint_profile = read_mint_profile(mint_info)?;
+    let mint_decimals = mint_profile.decimals;
 
     let instance_data = instance_info.try_borrow()?;
     let instance = Instance::try_from_bytes(&instance_data)?;
@@ -90,7 +90,13 @@ pub fn process_allow_mint(
         token_program_info,
     )?;
 
-    let allowed_mint = AllowedMint::new(args.bump);
+    let allowed_mint = AllowedMint::new(
+        args.bump,
+        mint_decimals,
+        *token_program_info.address(),
+        mint_profile.extensions,
+        mint_profile.has_freeze_authority,
+    );
     allowed_mint
         .validate_pda(
             instance_info.address(),
@@ -99,28 +105,40 @@ pub fn process_allow_mint(
         )
         .map_err(|_| PrivateChannelEscrowProgramError::InvalidAllowedMint)?;
 
-    let bump_seed = [args.bump];
-    let allowed_mint_seeds = [
-        Seed::from(ALLOWED_MINT_SEED),
-        Seed::from(instance_info.address().as_ref()),
-        Seed::from(mint_info.address().as_ref()),
-        Seed::from(&bump_seed),
-    ];
+    // BlockMint no longer closes the PDA, so this is also the re-allow path:
+    // an existing account keeps its rent and just has both gates re-opened.
+    if allowed_mint_info.is_data_empty() {
+        verify_system_account(allowed_mint_info, true)?;
 
-    let rent = Rent::get()?;
-    create_pda_account(
-        payer_info,
-        &rent,
-        AllowedMint::LEN,
-        program_id,
-        allowed_mint_info,
-        allowed_mint_seeds,
-        None,
-    )?;
+        let bump_seed = [args.bump];
+        let allowed_mint_seeds = [
+            Seed::from(ALLOWED_MINT_SEED),
+            Seed::from(instance_info.address().as_ref()),
+            Seed::from(mint_info.address().as_ref()),
+            Seed::from(&bump_seed),
+        ];
+
+        let rent = Rent::get()?;
+        create_pda_account(
+            payer_info,
+            &rent,
+            AllowedMint::LEN,
+            program_id,
+            allowed_mint_info,
+            allowed_mint_seeds,
+            None,
+        )?;
+    } else {
+        // Rejects an account whose layout predates the gates instead of
+        // letting the write below run past the end of it.
+        let existing_data = allowed_mint_info.try_borrow()?;
+        AllowedMint::try_from_bytes(&existing_data)?;
+    }
 
     let allowed_mint_data = allowed_mint.to_bytes();
-    let mut data_slice = allowed_mint_info.try_borrow_mut()?;
-    data_slice[..allowed_mint_data.len()].copy_from_slice(&allowed_mint_data);
+    allowed_mint_info
+        .try_borrow_mut()?
+        .copy_from_slice(&allowed_mint_data);
 
     let event = AllowMintEvent::new(instance.instance_seed, *mint_info.address(), mint_decimals);
     emit_event(

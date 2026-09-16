@@ -160,6 +160,7 @@ jobs:
           tar -czf ci-build-artifacts.tgz \
             target/deploy/private_channel_escrow_program.so \
             target/deploy/private_channel_withdraw_program.so \
+            target/deploy/transfer_hook_fixture.so \
             private-channel-escrow-program/idl \
             private-channel-escrow-program/clients \
             private-channel-withdraw-program/idl \
@@ -225,6 +226,7 @@ jobs:
           cargo fmt \
             -p private-channel-escrow-program \
             -p tests-private-channel-escrow-program \
+            -p transfer-hook-fixture \
             -p private-channel-withdraw-program \
             -p tests-private-channel-withdraw-program \
             -p private-channel-core \

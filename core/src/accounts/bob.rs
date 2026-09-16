@@ -239,9 +239,11 @@ impl BOB {
     ///
     /// A read the store could not answer is an `Err`, never an empty cache: the
     /// SVM cannot tell "unknown" from "does not exist", so the caller must stop.
+    /// So is a fetch whose account data passes `max_fetch_bytes`.
     pub async fn preload_accounts(
         &mut self,
         pubkeys: &[Pubkey],
+        max_fetch_bytes: usize,
     ) -> Result<(usize, usize), crate::accounts::get_accounts::AccountLoadError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -281,7 +283,10 @@ impl BOB {
         // If everything is warm, skip the DB round-trip entirely.
         if !miss_keys.is_empty() {
             // Only fetch the cache-miss keys from the database.
-            let accounts = self.accounts_db.get_accounts(&miss_keys).await?;
+            let accounts = self
+                .accounts_db
+                .get_accounts_within(&miss_keys, max_fetch_bytes)
+                .await?;
             for (index, account_opt) in accounts.iter().enumerate() {
                 if let Some(account) = account_opt {
                     // A DB-loaded account is byte-identical to the DB, so it is
@@ -1960,7 +1965,7 @@ mod tests {
         );
 
         // Everything is cached, so no DB round-trip happens.
-        bob.preload_accounts(&[pubkey]).await.unwrap();
+        bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
 
         let meta = bob.accounts.get(&pubkey).unwrap();
         assert!(
@@ -1984,7 +1989,7 @@ mod tests {
             },
         );
 
-        bob.preload_accounts(&[pubkey]).await.unwrap();
+        bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
 
         let meta = bob.accounts.get(&pubkey).unwrap();
         assert!(
@@ -2094,7 +2099,9 @@ mod tests {
         );
 
         // All keys are cached, so this stays in-memory (no DB round-trip).
-        bob.preload_accounts(&[referenced]).await.unwrap();
+        bob.preload_accounts(&[referenced], usize::MAX)
+            .await
+            .unwrap();
 
         assert!(
             bob.accounts.contains_key(&referenced),
@@ -2207,13 +2214,13 @@ mod tests {
         }
         let (a, b, c, d) = (keys[0], keys[1], keys[2], keys[3]);
 
-        bob.preload_accounts(&[a, b]).await.unwrap();
-        bob.preload_accounts(&[c, d]).await.unwrap();
+        bob.preload_accounts(&[a, b], usize::MAX).await.unwrap();
+        bob.preload_accounts(&[c, d], usize::MAX).await.unwrap();
         assert!(!bob.accounts.contains_key(&a) && !bob.accounts.contains_key(&b));
         assert!(bob.accounts.contains_key(&c) && bob.accounts.contains_key(&d));
         assert_eq!(bob.cache_stats().bytes, 4000);
 
-        bob.preload_accounts(&[a, b, c]).await.unwrap();
+        bob.preload_accounts(&[a, b, c], usize::MAX).await.unwrap();
         assert!(
             [a, b, c].iter().all(|key| bob.accounts.contains_key(key)),
             "a working set larger than the cap must still be fully resident"
@@ -2358,7 +2365,7 @@ mod tests {
         let mut bob = BOB::new_test(SettledInbox::new(), db);
 
         let now = now_secs();
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (1, 0),
@@ -2436,7 +2443,7 @@ mod tests {
             )],
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
@@ -2449,7 +2456,7 @@ mod tests {
 
         // Had the tombstone been erased above, this is the batch where the
         // funded row would be read back in.
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
@@ -2495,7 +2502,7 @@ mod tests {
             )],
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
 
         assert!(
             !bob.accounts.contains_key(&pubkey),
@@ -2523,7 +2530,7 @@ mod tests {
 
         bob.accounts_db.set_account(pubkey, stored.clone()).await;
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
 
         assert_eq!(
             (fetched, cached),
@@ -2563,7 +2570,7 @@ mod tests {
             },
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[pubkey]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[pubkey], usize::MAX).await.unwrap();
 
         assert_eq!(
             (fetched, cached),
@@ -2597,7 +2604,10 @@ mod tests {
             .set_account(floor, make_account(1, &[1, 2, 3], &spl_token::id()))
             .await;
 
-        let (fetched, cached) = bob.preload_accounts(&[zero, floor]).await.unwrap();
+        let (fetched, cached) = bob
+            .preload_accounts(&[zero, floor], usize::MAX)
+            .await
+            .unwrap();
 
         assert_eq!(
             (fetched, cached),
@@ -2696,7 +2706,7 @@ mod tests {
         set_test_retry(2, 1);
         let (mut bob, _inbox) = create_test_bob();
         let pubkey = Pubkey::new_unique();
-        let result = bob.preload_accounts(&[pubkey]).await;
+        let result = bob.preload_accounts(&[pubkey], usize::MAX).await;
         reset_test_retry();
 
         assert!(
@@ -2726,7 +2736,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = bob.preload_accounts(&[corrupt]).await;
+        let result = bob.preload_accounts(&[corrupt], usize::MAX).await;
         assert!(
             matches!(result, Err(AccountLoadError::Corrupt(key)) if key == corrupt),
             "expected Corrupt({corrupt}), got {result:?}"
