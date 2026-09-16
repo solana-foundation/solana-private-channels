@@ -83,10 +83,12 @@ all-test: unit-test integration-test
 # own; needs ../target/deploy/*.so and clients/rust from a prior build.
 # Each run picks a random master seed and prints it, so a failure replays with
 # TRIDENT_FUZZ_DEBUG=<seed>.
+# TRIDENT_WITH_EXIT_CODE is required: Trident catches failed asserts, prints them
+# and exits 0 otherwise, so the harnesses can never fail CI without it.
 fuzz:
 	@echo "Running fuzz harnesses for escrow program..."
-	@cd tests/trident-tests && cargo run --bin fuzz_escrow
-	@cd tests/trident-tests && cargo run --bin fuzz_rotate_bitmap
+	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_escrow
+	@cd tests/trident-tests && TRIDENT_WITH_EXIT_CODE=1 cargo run --locked --bin fuzz_rotate_bitmap
 
 # Run unit tests with coverage
 unit-coverage:

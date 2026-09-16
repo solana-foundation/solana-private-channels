@@ -38,6 +38,12 @@ inputs:
     description: "Build programs and generate clients (make build)"
     required: false
     default: "true"
+  rust-cache-workspaces:
+    description: "Cargo workspaces for rust-cache. Callers with a separate cargo
+      project (e.g. the Trident harnesses) add it here. The cache key is derived
+      from this list, so the default must stay as-is or every job's key changes."
+    required: false
+    default: ". -> target"
 
 runs:
   using: "composite"
@@ -105,6 +111,7 @@ runs:
       with:
         cache-on-failure: true
         cache-bin: false
+        workspaces: ${{ inputs.rust-cache-workspaces }}
 
     # install-dependencies implies Node.js + pnpm prerequisites.
     - name: Setup Node.js
