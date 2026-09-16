@@ -6,6 +6,7 @@ use {
             redis::{RedisAccountsDB, CACHE_FAILURE_LIMIT},
             redis_coherence,
             traits::BlockInfo,
+            write_batch::WriteBatchError,
             AccountsDB,
         },
         nodes::node::WorkerHandle,
@@ -78,7 +79,7 @@ async fn publish_idle_slot(
     postgres_db: &PostgresAccountsDB,
     redis_db: Option<&RedisAccountsDB>,
     slot: u64,
-) -> Result<()> {
+) -> Result<bool> {
     // Awaited on the tick with no retry budget behind it, so a Postgres that sits
     // on the statement would stop the chain here. Bounded, the stall reaches the
     // heartbeat block instead, and that path has retries and a failure budget.
@@ -88,7 +89,12 @@ async fn publish_idle_slot(
     )
     .await
     {
-        Ok(written) => written?,
+        // `false` is a newer writer epoch refusing the tick, so the cache is skipped.
+        Ok(written) => {
+            if !written? {
+                return Ok(false);
+            }
+        }
         Err(_) => {
             return Err(anyhow!(
                 "publishing the idle slot exceeded its {:?} budget",
@@ -100,7 +106,7 @@ async fn publish_idle_slot(
     // the batch path is deliberately not touching is most of the cost the
     // give-up exists to avoid.
     let Some(redis) = redis_db.filter(|redis| !redis.is_mirroring_paused()) else {
-        return Ok(());
+        return Ok(true);
     };
     // Same reason as above: the cache is never allowed to hold the chain, on
     // this path or the batch one.
@@ -116,7 +122,7 @@ async fn publish_idle_slot(
             CACHE_MIRROR_BUDGET
         );
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Bounds one settle attempt, matching the stage health margin so an overrun is
@@ -237,6 +243,8 @@ struct BlockPublishers<'a> {
 #[derive(Debug)]
 enum SettleError {
     AddressIndexWriterGone,
+    /// The database refused this node as the writer. Never retried.
+    Rejected(WriteBatchError),
     Other(String),
 }
 
@@ -244,6 +252,7 @@ impl std::fmt::Display for SettleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AddressIndexWriterGone => f.write_str("address_signatures writer dropped"),
+            Self::Rejected(e) => write!(f, "{e}"),
             Self::Other(s) => f.write_str(s),
         }
     }
@@ -254,6 +263,15 @@ impl std::error::Error for SettleError {}
 impl From<String> for SettleError {
     fn from(s: String) -> Self {
         Self::Other(s)
+    }
+}
+
+impl From<WriteBatchError> for SettleError {
+    fn from(e: WriteBatchError) -> Self {
+        match e {
+            WriteBatchError::Other(s) => Self::Other(s),
+            rejection => Self::Rejected(rejection),
+        }
     }
 }
 
@@ -361,6 +379,9 @@ pub struct SettleArgs {
     pub shutdown_token: CancellationToken,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<crate::health::StageHeartbeat>,
+    /// The epoch the node claimed at startup. `None` commits unfenced, for tests
+    /// that run a settler without a node around it.
+    pub writer_epoch: Option<u64>,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -378,6 +399,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         shutdown_token,
         metrics,
         heartbeat,
+        writer_epoch,
     } = args;
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
@@ -395,6 +417,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             shutdown_token: CancellationToken,
             metrics: SharedMetrics,
             heartbeat: Arc<crate::health::StageHeartbeat>,
+            writer_epoch: Option<u64>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -408,9 +431,11 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             // The cache handle carries the Postgres source of truth so reads
             // through it resolve a miss instead of reporting an absence. The
             // settler itself only writes through it.
-            let AccountsDB::Postgres(ref postgres_db) = accounts_db else {
+            let AccountsDB::Postgres(ref mut postgres_db) = accounts_db else {
                 anyhow::bail!("Settle worker requires a Postgres accounts database");
             };
+            // Set before the clone, so block commits and idle ticks carry the same fence.
+            postgres_db.writer_epoch = writer_epoch;
             let postgres_db = postgres_db.clone();
 
             let mut redis_db: Option<RedisAccountsDB> = match redis_cache_url {
@@ -621,11 +646,24 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             // The chain is on this slot even though no block
                             // backs it. Only reached when the tick carried no
                             // work, so the loaded path never pays for it.
-                            if let Err(e) =
-                                publish_idle_slot(&postgres_db, redis_db.as_ref(), next_slot).await
-                            {
-                                warn!("Failed to publish idle slot {next_slot}, the next tick republishes: {e:#}");
-                                metrics.settler_idle_slot_publish_failed();
+                            match publish_idle_slot(&postgres_db, redis_db.as_ref(), next_slot).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let reason = "a newer write node claimed the writer epoch";
+                                    error!("Stopping the settler at idle slot {next_slot}: {reason}");
+                                    metrics.writer_lease_lost("fenced");
+                                    discard_buffer(
+                                        reason,
+                                        &mut processing_results,
+                                        &mut execution_results_rx,
+                                        &metrics,
+                                    );
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to publish idle slot {next_slot}, the next tick republishes: {e:#}");
+                                    metrics.settler_idle_slot_publish_failed();
+                                }
                             }
                             next_slot += 1;
                             continue;
@@ -694,7 +732,12 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                                     "address_signatures writer dropped, aborting settler"
                                 );
                             }
-                            Err(SettleError::Other(msg)) => {
+                            // A rejection stops here too: another node is the writer now.
+                            Err(e) => {
+                                if let SettleError::Rejected(WriteBatchError::Fenced { .. }) = e {
+                                    metrics.writer_lease_lost("fenced");
+                                }
+                                let msg = e.to_string();
                                 error!("Failed to settle transactions: {}", msg);
                                 // Cleared here so the final flush below does not
                                 // spend a second budget on the same doomed batch.
@@ -865,6 +908,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             shutdown_token,
             metrics,
             heartbeat,
+            writer_epoch,
         )
         .await
         {
@@ -1020,6 +1064,8 @@ async fn settle_with_retry(
             Err(SettleError::AddressIndexWriterGone) => {
                 return Err(SettleError::AddressIndexWriterGone)
             }
+            // Another node is the writer, so a retry would only be refused again.
+            Err(e @ SettleError::Rejected(_)) => return Err(e),
             Err(e) => e,
         };
 
@@ -1785,6 +1831,25 @@ mod tests {
         SettlerSinks,
         Arc<crate::health::StageHeartbeat>,
     ) {
+        settler_under_test_with_epoch(url, blocktime_ms, capacity, metrics, shutdown, None).await
+    }
+
+    /// Same, with the writer epoch a node would have claimed at startup.
+    #[allow(clippy::type_complexity)]
+    async fn settler_under_test_with_epoch(
+        url: String,
+        blocktime_ms: u64,
+        capacity: usize,
+        metrics: SharedMetrics,
+        shutdown: CancellationToken,
+        writer_epoch: Option<u64>,
+    ) -> (
+        mpsc::Sender<ExecutedBatch>,
+        mpsc::UnboundedReceiver<AccountSettlements>,
+        WorkerHandle,
+        SettlerSinks,
+        Arc<crate::health::StageHeartbeat>,
+    ) {
         let (exec_tx, exec_rx) = mpsc::channel(capacity);
         let (settled_accounts_tx, settled_accounts_rx) = mpsc::unbounded_channel();
         let (settled_blockhashes_tx, blockhashes_rx) = mpsc::unbounded_channel();
@@ -1804,6 +1869,7 @@ mod tests {
             metrics,
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: Arc::clone(&heartbeat),
+            writer_epoch,
         })
         .await;
         (
@@ -1911,6 +1977,95 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         None
+    }
+
+    /// A refusal means another node is the writer, so a retry could only delay
+    /// the stop. Retries bump the heartbeat input, so a healthy one proves one try.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_batch_is_not_retried() {
+        use crate::accounts::{write_batch::WriteBatchError, writer_epoch::bump};
+
+        let (db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref pg) = db else {
+            panic!("expected a Postgres accounts database")
+        };
+        let mut stale = pg.clone();
+        stale.writer_epoch = Some(bump(pg).await.unwrap());
+        bump(pg).await.unwrap();
+        let mut stale = AccountsDB::Postgres(stale);
+
+        let heartbeat = crate::health::StageHeartbeat::new();
+        let result = settle_with_retry(
+            0,
+            None,
+            &mut stale,
+            None,
+            &[],
+            &(Arc::new(NoopMetrics) as SharedMetrics),
+            None,
+            0,
+            &heartbeat,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SettleError::Rejected(WriteBatchError::Fenced { .. }))
+            ),
+            "a fenced batch must come back as a rejection, got {:?}",
+            result.as_ref().err()
+        );
+        assert!(heartbeat.is_healthy(), "a rejection must not be retried");
+    }
+
+    /// An idle settler still publishes the slot every tick, so a newer writer
+    /// claiming the database must stop it there and leave the tip alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fenced_idle_tick_stops_the_settler() {
+        use crate::accounts::writer_epoch::bump;
+
+        let (db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let AccountsDB::Postgres(ref pg_db) = db else {
+            panic!("expected a Postgres accounts database")
+        };
+        let epoch = bump(pg_db).await.unwrap();
+
+        let (_exec_tx, _settled_rx, worker, _sinks, _hb) = settler_under_test_with_epoch(
+            url,
+            50,
+            8,
+            Arc::new(NoopMetrics),
+            CancellationToken::new(),
+            Some(epoch),
+        )
+        .await;
+        let pool = test_pool(&db);
+        assert!(
+            await_block(&pool, 0, Duration::from_secs(10)).await,
+            "the settler must produce its genesis block"
+        );
+
+        bump(pg_db).await.unwrap();
+        let tip_after_bump: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), worker.handle)
+            .await
+            .expect("a fenced settler must stop within a few ticks")
+            .expect("the settler must not panic");
+        let tip_now: Option<i64> = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            tip_now, tip_after_bump,
+            "no block may commit after the bump"
+        );
     }
 
     /// The premise the in-flight budget rests on: the settler never holds a
@@ -2210,6 +2365,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: Arc::clone(&heartbeat),
+            writer_epoch: None,
         })
         .await;
 
@@ -2724,6 +2880,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             redis_block_ttl_secs: 0,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -3435,14 +3592,14 @@ mod tests {
 
         // Drains the acknowledgement and drops the tombstone, then proves the
         // now-absent key is not refilled from the database.
-        let (fetched, cached) = bob.preload_accounts(&[closed]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[closed], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 1),
             "the tombstone is still resident when the hit/miss split runs"
         );
 
-        let (fetched, cached) = bob.preload_accounts(&[closed]).await.unwrap();
+        let (fetched, cached) = bob.preload_accounts(&[closed], usize::MAX).await.unwrap();
         assert_eq!(
             (fetched, cached),
             (0, 0),
@@ -3725,6 +3882,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -3774,6 +3932,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -3834,6 +3993,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -3931,6 +4091,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -3976,6 +4137,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -4036,6 +4198,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -5809,6 +5972,7 @@ mod tests {
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -5907,6 +6071,7 @@ mod tests {
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -6201,6 +6366,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -6265,6 +6431,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -6689,6 +6856,7 @@ mod tests {
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 
@@ -6780,6 +6948,7 @@ mod tests {
             shutdown_token: shutdown.clone(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
         })
         .await;
 

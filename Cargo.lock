@@ -6379,6 +6379,7 @@ dependencies = [
  "spl-memo 7.0.0",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-transfer-hook-interface 2.1.0",
  "sqlx",
  "tempfile",
  "testcontainers",
@@ -6431,8 +6432,10 @@ dependencies = [
  "solana-transaction-status",
  "spl-associated-token-account",
  "spl-memo 7.0.0",
+ "spl-tlv-account-resolution 0.11.1",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-transfer-hook-interface 2.1.0",
  "sqlx",
  "test_utils",
  "testcontainers",
@@ -14283,8 +14286,11 @@ dependencies = [
  "solana-sdk-ids 3.1.0",
  "solana-system-interface 3.2.0",
  "spl-associated-token-account",
+ "spl-tlv-account-resolution 0.11.1",
  "spl-token 9.0.0",
  "spl-token-2022 11.0.0",
+ "spl-token-metadata-interface 1.0.1",
+ "spl-transfer-hook-interface 2.1.0",
 ]
 
 [[package]]
@@ -14901,6 +14907,16 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "transfer-hook-fixture"
+version = "0.1.0"
+dependencies = [
+ "pinocchio",
+ "pinocchio-log",
+ "pinocchio-system",
+ "solana-address 2.6.1",
 ]
 
 [[package]]

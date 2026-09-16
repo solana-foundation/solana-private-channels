@@ -17,6 +17,12 @@ pub enum AccountError {
     #[error("Invalid mint {pubkey}: {reason}")]
     InvalidMint { pubkey: Pubkey, reason: String },
 
+    /// The live mint no longer carries something the reviewed profile pinned,
+    /// which is what a close and recreate looks like. Permanent for the row:
+    /// only a fresh AllowMint re-pins the profile.
+    #[error("Mint {pubkey} no longer matches its reviewed profile: {reason}")]
+    MintProfileMismatch { pubkey: Pubkey, reason: String },
+
     #[error("Failed to deserialize account data for {pubkey}: {reason}")]
     AccountDeserializationFailed { pubkey: Pubkey, reason: String },
 

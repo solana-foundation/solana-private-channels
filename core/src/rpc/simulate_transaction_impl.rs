@@ -3,7 +3,7 @@ use crate::{
     rpc::{
         constants::{estimated_encoded_bytes, MAX_SIMULATION_ACCOUNTS_BYTES},
         decode::decode_transaction,
-        error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
+        error::{custom_error, node_at_capacity, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
         ReadDeps,
     },
     scheduler::{ConflictFreeBatch, TransactionWithIndex},
@@ -189,6 +189,13 @@ pub async fn simulate_transaction(
         }
     };
 
+    // Refused rather than queued: the server has no request timeout, so a queue
+    // would hold connections open for as long as the running simulations take.
+    let _permit = read_deps
+        .simulation_permits
+        .try_acquire()
+        .map_err(|_| node_at_capacity())?;
+
     info!("Simulating transaction: {}", sanitized_tx.signature());
 
     // Get the current slot for context
@@ -220,6 +227,9 @@ pub async fn simulate_transaction(
         sim_live_blockhashes,
     )
     .await;
+    // One transaction is never deferred, so the budget only sets the fetch limit.
+    // At the per-transaction cap, each permit holds at most that much account data.
+    execution_deps.preload_budget_bytes = execution_deps.max_tx_loaded_accounts_bytes;
     let noop: SharedMetrics = std::sync::Arc::new(NoopMetrics);
     let execution_result = execute_batch(batch, &mut execution_deps, &noop)
         .await
@@ -606,6 +616,96 @@ mod tests {
         assert!(served[0].is_none(), "a malformed address must map to null");
         assert!(served[1].is_none(), "an unknown address must map to null");
         assert!(served[2].is_some(), "a known account must still be served");
+    }
+
+    /// Base64 of a signed transfer carrying `extra` as unused readonly keys.
+    fn encoded_transfer(extra: &[Pubkey]) -> String {
+        use solana_sdk::{
+            hash::Hash,
+            message::Message,
+            signature::{Keypair, Signer},
+            transaction::{Transaction, VersionedTransaction},
+        };
+        let payer = Keypair::new();
+        let ix = solana_system_interface::instruction::transfer(
+            &payer.pubkey(),
+            &Pubkey::new_unique(),
+            100,
+        );
+        let mut msg = Message::new(&[ix], Some(&payer.pubkey()));
+        msg.account_keys.extend_from_slice(extra);
+        msg.header.num_readonly_unsigned_accounts += extra.len() as u8;
+        let tx = VersionedTransaction::from(Transaction::new(&[&payer], msg, Hash::default()));
+        STANDARD.encode(bincode::serialize(&tx).expect("a transaction must serialize"))
+    }
+
+    fn read_deps(accounts_db: crate::accounts::AccountsDB, permits: usize) -> ReadDeps {
+        ReadDeps {
+            accounts_db,
+            admin_keys: vec![],
+            live_blockhashes: Arc::new(std::sync::RwLock::new(Default::default())),
+            max_blockhashes: 150,
+            simulation_permits: tokio::sync::Semaphore::new(permits),
+        }
+    }
+
+    /// With every permit held a call is refused before it touches the store, and
+    /// a call that fails later still hands its permit back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulation_is_refused_while_every_permit_is_held() {
+        use crate::rpc::error::NODE_AT_CAPACITY_CODE;
+        let deps = read_deps(crate::test_helpers::dead_postgres_db(), 1);
+
+        let held = deps.simulation_permits.try_acquire().unwrap();
+        let err = simulate_transaction(&deps, encoded_transfer(&[]), None)
+            .await
+            .expect_err("no permit is free");
+        assert_eq!(err.code(), NODE_AT_CAPACITY_CODE);
+
+        drop(held);
+        let err = simulate_transaction(&deps, encoded_transfer(&[]), None)
+            .await
+            .expect_err("the store is unreachable");
+        assert_eq!(err.code(), JSON_RPC_SERVER_ERROR, "{}", err.message());
+        assert!(err.message().contains("Failed to get slot"));
+        assert_eq!(
+            deps.simulation_permits.available_permits(),
+            1,
+            "a failed call must release its permit"
+        );
+    }
+
+    /// A simulation may fetch no more than one transaction's account data cap,
+    /// even when the cache serves more than the size read from Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulation_fetch_is_limited_to_the_per_transaction_cap() {
+        use crate::stages::MAX_TX_LOADED_ACCOUNTS_BYTES;
+        let (postgres_db, _pg) = crate::test_helpers::start_test_postgres_raw().await;
+        let (mut redis_db, _redis) =
+            crate::test_helpers::start_stamped_redis(postgres_db.clone()).await;
+        let owner = solana_sdk_ids::system_program::ID;
+        let grown = Pubkey::new_unique();
+        crate::accounts::AccountsDB::Postgres(postgres_db)
+            .set_account(grown, AccountSharedData::new(1, 0, &owner))
+            .await;
+        redis_db
+            .set_account(
+                grown,
+                AccountSharedData::new(1, MAX_TX_LOADED_ACCOUNTS_BYTES + 1, &owner),
+            )
+            .await;
+        let deps = read_deps(crate::accounts::AccountsDB::Redis(redis_db), 8);
+
+        let err = simulate_transaction(&deps, encoded_transfer(&[grown]), None)
+            .await
+            .expect_err("the fetch passes the per-transaction cap");
+        assert_eq!(err.code(), JSON_RPC_SERVER_ERROR, "{}", err.message());
+        assert!(
+            err.message()
+                .contains(&MAX_TX_LOADED_ACCOUNTS_BYTES.to_string()),
+            "the error must name the limit: {}",
+            err.message()
+        );
     }
 
     #[test]

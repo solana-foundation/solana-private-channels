@@ -17,7 +17,6 @@ features = ["token"]
 
 # Patch Trident to work with the syscalls necessary for Pinocchio
 [patch.crates-io]
-trident-syscall-stubs-v2 = { git = "https://github.com/exo-tech-xyz/trident-syscall-stubs.git", package = "trident-syscall-stubs-v2", branch = "fix-rent-pinocchio" }
 trident-svm = { git = "https://github.com/exo-tech-xyz/trident-svm", branch = "fix-syscalls" }
 
 [[bin]]

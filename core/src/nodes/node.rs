@@ -2,7 +2,7 @@ use {
     crate::{
         accounts::{
             address_index_repair::repair_address_signatures, postgres::PostgresAccountsDB,
-            redis::RedisAccountsDB, writer_lease::WriterLease, AccountsDB,
+            redis::RedisAccountsDB, writer_epoch, writer_lease::WriterLease, AccountsDB,
         },
         rpc::{
             server::{start_rpc_service, RpcServiceConfig},
@@ -342,6 +342,14 @@ async fn start_services(
             // The read-only node opens its own read_only=true handle below, where
             // the repair is skipped.
             let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
+            // Claimed under the lease and before anything reads the chain: the bump
+            // waits out the old writer's last batch and fences every later one, so
+            // the dedup state and tip loaded below are final.
+            let AccountsDB::Postgres(ref postgres_db) = db else {
+                return Err("the write pipeline requires a Postgres accounts database".into());
+            };
+            let writer_epoch = writer_epoch::bump(postgres_db).await?;
+            info!("Claimed writer epoch {writer_epoch}");
             repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
             let (initial_live_blockhashes, initial_dedup_cache) =
                 load_dedup_state(&db, config.max_blockhashes).await?;
@@ -435,6 +443,7 @@ async fn start_services(
                 shutdown_token: shutdown_token.clone(),
                 metrics: Arc::clone(&config.metrics),
                 heartbeat: settler_hb,
+                writer_epoch: Some(writer_epoch),
             })
             .await;
             workers.push(settle);
@@ -501,6 +510,9 @@ async fn start_services(
                 accounts_db,
                 live_blockhashes: live_blockhashes_arc,
                 max_blockhashes,
+                simulation_permits: tokio::sync::Semaphore::new(
+                    crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,
+                ),
             })
         }
         NodeMode::Write => None,

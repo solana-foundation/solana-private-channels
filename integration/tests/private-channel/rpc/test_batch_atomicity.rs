@@ -33,10 +33,18 @@
 //!    published by idle ticks outside the block transaction, so it stays where
 //!    those ticks left it when a block rolls back, ahead of the last stored
 //!    block. That is the ordinary idle state, not a partial write.
+//!
+//! 7. `two_writers_on_one_parent_leave_one_block`: a block must build on the
+//!    stored tip, and a writer whose epoch was superseded is refused even when
+//!    its parent is right.
+//!
+//! 8. `concurrent_batches_on_different_slots_serialize`: batches on different
+//!    slots queue behind the epoch row lock, so the second sees the first's
+//!    block and is refused instead of both committing.
 
 use {
     private_channel_core::{
-        accounts::{traits::BlockInfo, AccountsDB},
+        accounts::{traits::BlockInfo, write_batch::WriteBatchError, writer_epoch, AccountsDB},
         stages::AccountSettlement,
     },
     solana_sdk::{account::AccountSharedData, hash::Hash, pubkey::Pubkey},
@@ -166,6 +174,37 @@ fn slot_block_info_with_hash(slot: u64, blockhash: Hash) -> BlockInfo {
         blockhash,
         ..slot_block_info(slot)
     }
+}
+
+/// A block at `slot` that names `parent_slot` as the block it builds on.
+fn block_on(slot: u64, parent_slot: u64) -> BlockInfo {
+    BlockInfo {
+        parent_slot,
+        ..slot_block_info(slot)
+    }
+}
+
+/// One live account, the smallest batch whose rollback can be observed.
+fn one_account(pubkey: Pubkey) -> Vec<(Pubkey, AccountSettlement)> {
+    vec![(
+        pubkey,
+        AccountSettlement {
+            account: bare_account(1_000_000),
+            deleted: false,
+        },
+    )]
+}
+
+/// A write handle that claimed a new writer epoch, the way a starting node does.
+async fn fenced_db(url: &str) -> AccountsDB {
+    let mut db = AccountsDB::new(url, false)
+        .await
+        .expect("Failed to create AccountsDB");
+    let AccountsDB::Postgres(ref mut pg) = db else {
+        panic!("Expected Postgres backend")
+    };
+    pg.writer_epoch = Some(writer_epoch::bump(pg).await.expect("bump must succeed"));
+    db
 }
 
 /// Number of backends on this database currently blocked on a lock.
@@ -353,7 +392,7 @@ async fn a_rolled_back_block_leaves_the_live_slot_ahead() {
         .await
         .expect("Failed to add test constraint");
 
-    let result = db.write_batch(&[], vec![], Some(slot_block_info(6))).await;
+    let result = db.write_batch(&[], vec![], Some(block_on(6, 1))).await;
     assert!(result.is_err(), "the block insert must hit the constraint");
 
     assert_eq!(
@@ -381,7 +420,7 @@ async fn a_rolled_back_block_leaves_the_live_slot_ahead() {
         .await
         .expect("Failed to drop test constraint");
 
-    db.write_batch(&[], vec![], Some(slot_block_info(6)))
+    db.write_batch(&[], vec![], Some(block_on(6, 1)))
         .await
         .expect("slot 6 write_batch must succeed after the constraint is removed");
     assert_eq!(db.get_current_slot().await.unwrap(), Some(6));
@@ -760,4 +799,145 @@ async fn a_writer_whose_slot_was_truncated_away_is_still_rejected() {
         db.get_accounts(&[stale_account]).await.unwrap()[0].is_none(),
         "the stale writer's account must have rolled back with its batch"
     );
+}
+
+/// Test 7: idle ticks leave two writers on different slots with one parent, so a
+/// slot-only guard lets both commit. The parent check refuses the second, and the
+/// writer epoch refuses a superseded writer whatever its parent says.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_writers_on_one_parent_leave_one_block() {
+    let url = create_isolated_db_url("two_writers_on_one_parent").await;
+    let mut db = AccountsDB::new(&url, false)
+        .await
+        .expect("Failed to create AccountsDB");
+
+    db.write_batch(&[], vec![], Some(slot_block_info(1)))
+        .await
+        .expect("slot 1 must commit");
+    let winner = Pubkey::new_unique();
+    db.write_batch(&one_account(winner), vec![], Some(block_on(3, 1)))
+        .await
+        .expect("slot 3 on parent 1 must commit");
+
+    // A higher slot from a writer still on parent 1 passes a slot-only guard.
+    let loser = Pubkey::new_unique();
+    let result = db
+        .write_batch(&one_account(loser), vec![], Some(block_on(5, 1)))
+        .await;
+    assert_eq!(result.err(), Some(WriteBatchError::StaleTip { slot: 5 }));
+    assert_eq!(
+        db.get_blocks(2, None).await.unwrap(),
+        vec![3],
+        "exactly one block may build on slot 1"
+    );
+    assert!(db.get_accounts(&[winner]).await.unwrap()[0].is_some());
+    assert!(
+        db.get_accounts(&[loser]).await.unwrap()[0].is_none(),
+        "the refused writer's account must roll back with its batch"
+    );
+
+    let mut superseded = fenced_db(&url).await;
+    let mut current = fenced_db(&url).await;
+    current
+        .write_batch(&[], vec![], Some(block_on(4, 3)))
+        .await
+        .expect("the current writer must commit");
+
+    // The parent is right, so only the epoch can refuse this.
+    let result = superseded
+        .write_batch(&one_account(loser), vec![], Some(block_on(6, 4)))
+        .await;
+    assert!(
+        matches!(result, Err(WriteBatchError::Fenced { .. })),
+        "a superseded writer must be fenced, got {result:?}"
+    );
+    assert!(db.get_block(6).await.unwrap().is_none());
+    assert!(db.get_accounts(&[loser]).await.unwrap()[0].is_none());
+}
+
+/// Test 8: two in-flight batches on slots 2 and 3 would each see no newer block
+/// under READ COMMITTED. A held epoch row lock forces the overlap, and releasing
+/// it must let only one of them extend the tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_batches_on_different_slots_serialize() {
+    let url = create_isolated_db_url("concurrent_batches_serialize").await;
+    let mut seed = fenced_db(&url).await;
+    seed.write_batch(&[], vec![], Some(slot_block_info(1)))
+        .await
+        .expect("slot 1 must commit");
+    let AccountsDB::Postgres(ref seed_pg) = seed else {
+        panic!("Expected Postgres backend")
+    };
+    let epoch = seed_pg.writer_epoch;
+
+    // Holds the epoch row the way an in-flight batch does.
+    let mut holder = PgConnection::connect(&url)
+        .await
+        .expect("Failed to open holder connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("BEGIN must succeed");
+    writer_epoch::read_locked(&mut holder)
+        .await
+        .expect("the holder must lock the epoch row");
+
+    let mut tasks = Vec::new();
+    for slot in [2u64, 3] {
+        let mut writer = AccountsDB::new(&url, false).await.expect("writer");
+        let AccountsDB::Postgres(ref mut pg) = writer else {
+            panic!("Expected Postgres backend")
+        };
+        pg.writer_epoch = epoch;
+        tasks.push(tokio::spawn(async move {
+            writer
+                .write_batch(&[], vec![], Some(block_on(slot, 1)))
+                .await
+                .map(|_| ())
+        }));
+    }
+
+    let mut observer = PgConnection::connect(&url)
+        .await
+        .expect("Failed to open observer connection");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while backends_waiting_on_a_lock(&mut observer).await < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both batches should have parked on the epoch row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    sqlx::query("COMMIT")
+        .execute(&mut holder)
+        .await
+        .expect("COMMIT must succeed");
+
+    let mut results = Vec::new();
+    for task in tasks {
+        results.push(task.await.expect("writer task panicked"));
+    }
+    let committed = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        committed, 1,
+        "exactly one batch may commit, got {results:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .any(|r| matches!(r, Err(WriteBatchError::StaleTip { .. }))),
+        "the other batch must be refused as stale, got {results:?}"
+    );
+    assert_eq!(db_block_count(&url).await, 2, "slot 1 plus one winner");
+}
+
+async fn db_block_count(url: &str) -> i64 {
+    let mut conn = PgConnection::connect(url)
+        .await
+        .expect("Failed to open count connection");
+    sqlx::query_scalar("SELECT count(*) FROM blocks")
+        .fetch_one(&mut conn)
+        .await
+        .expect("failed to count blocks")
 }
