@@ -26,7 +26,7 @@ const ROTATE_BITMAP: u8 = 8;
 // is not the configured one is dropped before it reaches storage.
 const CREATE_INSTANCE_ACCOUNTS: usize = 8;
 const BLOCK_MINT_ACCOUNTS: usize = 7;
-const RELEASE_FUNDS_ACCOUNTS: usize = 13;
+const RELEASE_FUNDS_ACCOUNTS: usize = 14;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
 
 // BlockMint before the gates: no args, and a system_program at index 5. Removing
