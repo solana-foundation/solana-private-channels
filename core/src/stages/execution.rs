@@ -472,6 +472,7 @@ pub(crate) async fn process_batch(
                 execution_result.admin_transactions,
                 execution_result.admin_generation,
                 MAX_SEND_CHUNK_BYTES,
+                MAX_SEND_CHUNK_ROWS,
                 results_budget,
                 metrics,
             )
@@ -500,6 +501,7 @@ pub(crate) async fn process_batch(
                 execution_result.regular_transactions,
                 execution_result.regular_generation,
                 MAX_SEND_CHUNK_BYTES,
+                MAX_SEND_CHUNK_ROWS,
                 results_budget,
                 metrics,
             )
@@ -613,24 +615,21 @@ fn record_unsent(
     crate::stages::record_discarded("executor", "settler queue closed", &signatures, metrics);
 }
 
-/// Send results to the settler in byte-bounded and row-bounded messages.
-/// A batch under the cap is sent untouched, so ordinary traffic only pays the byte
-/// sum. When split, the real generation rides the last chunk and earlier ones get zero.
-async fn send_results_chunked(
+/// Send results to the settler in byte-bounded and row-bounded messages. A batch
+/// under both caps goes untouched. Every chunk carries the batch's generation: the
+/// settler acknowledges each account at the write it committed, never a whole block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_results_chunked(
     results_tx: &mpsc::Sender<ExecutedBatch>,
     output: LoadAndExecuteSanitizedTransactionsOutput,
     transactions: Vec<SanitizedTransaction>,
     generation: u64,
     cap: usize,
+    row_cap: usize,
     budget: &WeightBudget,
     metrics: &SharedMetrics,
 ) -> SendOutcome {
-    let ranges = chunk_ranges(
-        &output.processing_results,
-        &transactions,
-        cap,
-        MAX_SEND_CHUNK_ROWS,
-    );
+    let ranges = chunk_ranges(&output.processing_results, &transactions, cap, row_cap);
     if ranges.len() <= 1 {
         // Empty only when the batch is empty or its lengths disagree, and the
         // settler rejects the latter on arrival, so nothing is left unweighed.
@@ -670,9 +669,8 @@ async fn send_results_chunked(
     // Batch-wide telemetry has no per-chunk meaning, so it rides the first message.
     let mut head = Some((error_metrics, execute_timings, balance_collector));
 
-    let last = ranges.len() - 1;
     let mut sent = 0usize;
-    for (position, chunk_range) in ranges.iter().enumerate() {
+    for chunk_range in ranges.iter() {
         let take = chunk_range.range.end - chunk_range.range.start;
         let (error_metrics, execute_timings, balance_collector) =
             head.take().unwrap_or_else(|| {
@@ -689,8 +687,6 @@ async fn send_results_chunked(
             balance_collector,
         };
         let chunk_transactions: Vec<SanitizedTransaction> = transactions.drain(..take).collect();
-        // Zero acknowledges nothing, so a partial drain cannot mark writes durable.
-        let chunk_generation = if position == last { generation } else { 0 };
         let Some(permit) = budget.acquire(chunk_range.bytes, results_tx).await else {
             if sent > 0 {
                 metrics.executor_results_sent(sent);
@@ -703,7 +699,7 @@ async fn send_results_chunked(
             ExecutedBatch {
                 output: chunk,
                 transactions: chunk_transactions,
-                generation: chunk_generation,
+                generation,
                 permit,
             },
         )
@@ -1208,9 +1204,8 @@ pub async fn execute_batch(
     let mut t_svm_reg = Duration::ZERO;
     let mut t_bob_reg = Duration::ZERO;
 
-    // Generations stamped by each path's BOB update. They stay 0 when that path
-    // is skipped, which the settler's max() fold and BOB's high-water comparison
-    // both treat as "acknowledges nothing".
+    // Generations stamped by each path's BOB update. A path that wrote nothing to
+    // BOB stays 0, and its message then carries only rejected results, which write no account.
     let mut admin_generation = 0u64;
     let mut regular_generation = 0u64;
 
@@ -1732,54 +1727,84 @@ mod tests {
         assert_eq!(next, txs.len(), "chunks must cover every transaction");
     }
 
-    /// The one assertion standing between the split and a data-loss bug. If a
-    /// non-final chunk carried the real generation, BOB would treat undrained writes
-    /// as durable and drop them, so only the last chunk may advance the watermark.
+    /// A chunk stamped below its batch's generation can never be acknowledged:
+    /// BOB compares each settled account against the write that produced it, so
+    /// every chunk of a split batch must carry the real generation.
     #[tokio::test]
-    async fn chunked_send_stamps_generation_on_final_chunk_only() {
+    async fn every_chunk_carries_the_batch_generation() {
         let cap = 1000usize;
-        let _shutdown = CancellationToken::new();
         let metrics: SharedMetrics = Arc::new(NoopMetrics);
+        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
+        let generations = |rx: &mut mpsc::Receiver<ExecutedBatch>| {
+            let mut gens = Vec::new();
+            while let Ok(batch) = rx.try_recv() {
+                gens.push(batch.generation);
+            }
+            gens
+        };
 
-        // Each transaction alone exceeds the cap, so this splits into three.
+        // Each transaction alone exceeds the byte cap, so this splits into three.
         let (results, txs) = sized_batch(&[5000, 5000, 5000]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let budget = WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES);
         let outcome = send_results_chunked(
             &chan_tx,
             output_of(results),
             txs,
             42,
             cap,
+            MAX_SEND_CHUNK_ROWS,
             &budget,
             &metrics,
         )
         .await;
         assert!(matches!(outcome, SendOutcome::Sent));
-
-        let mut gens = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
-            gens.push(batch.generation);
-        }
         assert_eq!(
-            gens,
-            vec![0, 0, 42],
-            "only the final chunk may carry the generation"
+            generations(&mut rx),
+            vec![42, 42, 42],
+            "every byte-split chunk must carry the batch's generation"
         );
 
-        // Under the cap the batch goes as one message, still stamped.
+        // Weightless transfers of three keys each, so a row cap of three splits per transaction.
+        let (results, txs) = sized_batch(&[0, 0, 0]);
+        let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            43,
+            cap,
+            3,
+            &budget,
+            &metrics,
+        )
+        .await;
+        assert!(matches!(outcome, SendOutcome::Sent));
+        assert_eq!(
+            generations(&mut rx),
+            vec![43, 43, 43],
+            "every row-split chunk must carry the batch's generation"
+        );
+
+        // Under both caps the batch goes as one message, still stamped.
         let (results, txs) = sized_batch(&[10, 10]);
         let (chan_tx, mut rx) = mpsc::channel::<ExecutedBatch>(16);
-        let outcome =
-            send_results_chunked(&chan_tx, output_of(results), txs, 7, cap, &budget, &metrics)
-                .await;
+        let outcome = send_results_chunked(
+            &chan_tx,
+            output_of(results),
+            txs,
+            7,
+            cap,
+            MAX_SEND_CHUNK_ROWS,
+            &budget,
+            &metrics,
+        )
+        .await;
         assert!(matches!(outcome, SendOutcome::Sent));
-
-        let mut gens = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
-            gens.push(batch.generation);
-        }
-        assert_eq!(gens, vec![7], "an unsplit batch stays one message");
+        assert_eq!(
+            generations(&mut rx),
+            vec![7],
+            "an unsplit batch stays one message"
+        );
     }
 
     use crate::stage_metrics::PrometheusMetrics;
@@ -1816,6 +1841,7 @@ mod tests {
             txs,
             1,
             MAX_SEND_CHUNK_BYTES,
+            MAX_SEND_CHUNK_ROWS,
             &WeightBudget::new(MAX_IN_FLIGHT_RESULT_BYTES),
             &metrics,
         )
@@ -1860,6 +1886,7 @@ mod tests {
                 txs,
                 9,
                 1000,
+                MAX_SEND_CHUNK_ROWS,
                 &budget,
                 &metrics,
             )
@@ -1895,6 +1922,7 @@ mod tests {
                     txs,
                     3,
                     1000,
+                    MAX_SEND_CHUNK_ROWS,
                     &budget,
                     &metrics,
                 )
@@ -1939,6 +1967,7 @@ mod tests {
             txs,
             1,
             1000,
+            MAX_SEND_CHUNK_ROWS,
             &budget,
             &metrics,
         )

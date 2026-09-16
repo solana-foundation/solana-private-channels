@@ -30,10 +30,10 @@
 ///
 /// What decides whether `synced_since` may be set at all is `generation`. Every
 /// account BOB writes is stamped with the ordinal of that
-/// write, and settlement feedback carries a high-water generation meaning
-/// "everything up to here is durable". An entry is only ever marked
+/// write, and settlement feedback carries, per account, the generation of the
+/// write the settler made durable. An entry is only ever marked
 /// synchronized, or dropped if it is a tombstone, when its own generation is
-/// covered by that mark. Account bytes are never the deciding test: closed
+/// covered by that acknowledgement. Account bytes are never the deciding test: closed
 /// accounts are all byte-identical, and a live account can return to a value it
 /// held before, so bytes cannot tell an acknowledgement of this write apart from
 /// an acknowledgement of an older one.
@@ -393,13 +393,9 @@ impl BOB {
     ///    entire HashMap to evict entries that have been synced for longer than
     ///    `OLDEST_SYNCED_ACCOUNT_AGE`. This is O(N) so we avoid it on every batch.
     ///
-    /// An entry is reconciled only when its generation is covered by the
-    /// settlement's high-water mark, which is what makes the drain safe:
-    /// `entry.generation <= generation` means the database holds exactly the
-    /// value BOB holds, and a greater generation means the executor is ahead so
-    /// the entry must stay dirty. `<=` and not `==` because a tick acknowledges
-    /// every write up to its mark, and equality would strand any account whose
-    /// write was not the tick's last.
+    /// The settler acknowledges each account at the generation of the write it
+    /// committed, so `entry.generation <= generation` means the database holds what
+    /// BOB holds, and a newer entry means the executor is ahead and it stays dirty.
     fn garbage_collect(&mut self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -459,7 +455,7 @@ impl BOB {
                         // entry dirty, which cannot be evicted or reloaded.
                         let entry_generation = account.generation;
                         warn!(
-                            "Account {} settled under high-water generation {} but its bytes differ from in-memory (entry generation {:?}); leaving it dirty",
+                            "Account {} settled at generation {} but its bytes differ from in-memory (entry generation {:?}); leaving it dirty",
                             pubkey, generation, entry_generation
                         );
                         // Counted as well as logged so the divergence is
@@ -954,7 +950,7 @@ mod tests {
             },
         );
 
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -993,7 +989,7 @@ mod tests {
         );
 
         // Settler sends older (now-stale) feedback
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -1035,7 +1031,7 @@ mod tests {
         );
 
         // Settler sends non-deleted settlement (from before the delete)
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -1073,7 +1069,7 @@ mod tests {
         );
 
         // Settler confirms deletion was persisted to DB
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -1116,7 +1112,7 @@ mod tests {
         );
 
         // Acknowledgement for the first close: durable only up to generation 1.
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -1159,7 +1155,7 @@ mod tests {
             },
         );
 
-        inbox.publish(
+        inbox.publish_at(
             3,
             vec![(
                 pubkey,
@@ -1196,7 +1192,7 @@ mod tests {
             },
         );
 
-        inbox.publish(
+        inbox.publish_at(
             2,
             vec![(
                 pubkey,
@@ -1246,7 +1242,7 @@ mod tests {
             },
         );
 
-        inbox.publish(
+        inbox.publish_at(
             4,
             vec![(
                 pubkey,
@@ -1285,7 +1281,7 @@ mod tests {
             },
         );
 
-        inbox.publish(
+        inbox.publish_at(
             4,
             vec![(
                 pubkey,
@@ -1336,7 +1332,7 @@ mod tests {
         );
 
         // One tick made every generation up to 5 durable, so both entries are covered.
-        inbox.publish(
+        inbox.publish_at(
             5,
             vec![
                 (
@@ -1503,7 +1499,7 @@ mod tests {
         );
 
         // Step 2: Settler settles v1 and sends feedback
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -1560,7 +1556,7 @@ mod tests {
         );
 
         // Two settlement batches queue up before GC runs
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -1570,7 +1566,7 @@ mod tests {
                 },
             )],
         );
-        inbox.publish(
+        inbox.publish_at(
             2,
             vec![(
                 pubkey,
@@ -1605,11 +1601,11 @@ mod tests {
         seed_entry(&mut bob, x, b6.clone(), 6);
         seed_entry(&mut bob, y, make_account(1000, &[7], &Pubkey::default()), 7);
 
-        inbox.publish(
+        inbox.publish_at(
             5,
             vec![(x, settlement(make_account(1000, &[5], &Pubkey::default())))],
         );
-        inbox.publish(
+        inbox.publish_at(
             7,
             vec![(y, settlement(make_account(1000, &[7], &Pubkey::default())))],
         );
@@ -1774,9 +1770,9 @@ mod tests {
                     .iter()
                     .map(|(key, account)| (keys[*key], settlement(account.clone())))
                     .collect();
-                in_order_inbox.publish(*generation, accounts.clone());
+                in_order_inbox.publish_at(*generation, accounts.clone());
                 in_order.garbage_collect();
-                merged_inbox.publish(*generation, accounts);
+                merged_inbox.publish_at(*generation, accounts);
             }
             merged.garbage_collect();
 
@@ -1800,7 +1796,7 @@ mod tests {
         let missing_pubkey = Pubkey::new_unique();
 
         // Settler sends feedback for an account that was never in BOB
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 missing_pubkey,
@@ -2318,7 +2314,7 @@ mod tests {
         assert_eq!(stats.bytes, 5 + 3);
 
         // Settling `a` matches its in-memory bytes, flipping it clean with no sweep.
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 a,
@@ -2429,7 +2425,7 @@ mod tests {
         );
 
         // Acknowledgement for the first close, durable only up to generation 1.
-        inbox.publish(
+        inbox.publish_at(
             1,
             vec![(
                 pubkey,
@@ -2488,7 +2484,7 @@ mod tests {
             },
         );
 
-        inbox.publish(
+        inbox.publish_at(
             3,
             vec![(
                 pubkey,

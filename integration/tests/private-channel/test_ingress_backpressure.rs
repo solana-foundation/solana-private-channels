@@ -101,16 +101,16 @@ async fn start_node(config: NodeConfig) -> (NodeHandles, String) {
 }
 
 /// A unique, allowlisted, signature-valid memo tx against `blockhash`.
-fn memo_tx(blockhash: solana_sdk::hash::Hash, nonce: u64) -> Transaction {
-    memo_from(&Keypair::new(), blockhash, nonce)
+fn memo_tx(blockhash: solana_sdk::hash::Hash, memo_seq: u64) -> Transaction {
+    memo_from(&Keypair::new(), blockhash, memo_seq)
 }
 
 /// The same memo paid for by `payer`, so every one rewrites the payer's account.
-fn memo_from(payer: &Keypair, blockhash: solana_sdk::hash::Hash, nonce: u64) -> Transaction {
+fn memo_from(payer: &Keypair, blockhash: solana_sdk::hash::Hash, memo_seq: u64) -> Transaction {
     let memo = Instruction {
         program_id: spl_memo::id(),
         accounts: vec![],
-        data: format!("backpressure:{nonce}").into_bytes(),
+        data: format!("backpressure:{memo_seq}").into_bytes(),
     };
     Transaction::new_signed_with_payer(&[memo], Some(&payer.pubkey()), &[payer], blockhash)
 }
@@ -233,14 +233,16 @@ async fn bob_dirty_set_drains_through_the_inbox() {
     let slot_start = client.get_slot().await.unwrap_or(0);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut nonce = 0u64;
+    let mut memo_seq = 0u64;
     while std::time::Instant::now() < deadline {
         let bh = client.get_latest_blockhash().await.expect("blockhash");
         for _ in 0..32 {
             // Shed errors are fine: only what executed has to settle.
-            let _ = client.send_transaction(&memo_from(&payer, bh, nonce)).await;
-            let _ = client.send_transaction(&memo_tx(bh, nonce)).await;
-            nonce += 1;
+            let _ = client
+                .send_transaction(&memo_from(&payer, bh, memo_seq))
+                .await;
+            let _ = client.send_transaction(&memo_tx(bh, memo_seq)).await;
+            memo_seq += 1;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -250,7 +252,7 @@ async fn bob_dirty_set_drains_through_the_inbox() {
     // The probe's preload drains the inbox, and the gauges are reported right after it.
     let bh = client.get_latest_blockhash().await.expect("blockhash");
     let probe = client
-        .send_transaction(&memo_tx(bh, nonce))
+        .send_transaction(&memo_tx(bh, memo_seq))
         .await
         .expect("the probe must be admitted");
     let mut landed = false;
@@ -274,6 +276,9 @@ async fn bob_dirty_set_drains_through_the_inbox() {
         slot_end > slot_start,
         "slots must advance: {slot_start} -> {slot_end}"
     );
+    // These metrics are process-wide, so this test is the only one in the binary
+    // that may run a node with Prometheus enabled. The burst test below builds
+    // one too and stays ignored for that reason.
     assert_eq!(
         gauge_value("private_channel_bob_cache_dirty_entries"),
         0.0,
