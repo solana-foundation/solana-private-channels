@@ -431,7 +431,7 @@ async fn report_liability_arm_state(
         .with_label_values(&[ProgramType::Escrow.as_label()])
         .set(dark_ticks as f64);
 
-    if dark_ticks == 0 || dark_ticks % LIABILITY_DARK_ALERT_TICKS != 0 {
+    if dark_ticks == 0 || !dark_ticks.is_multiple_of(LIABILITY_DARK_ALERT_TICKS) {
         return;
     }
     error!(
