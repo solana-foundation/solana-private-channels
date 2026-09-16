@@ -7,10 +7,11 @@ use crate::{
         get_token_balance, hook_extras_for_mint, malicious_hook_extras, set_mint,
         set_mint_2022_basic, set_mint_2022_with_metadata, set_mint_2022_with_metadata_pointer,
         set_mint_2022_with_permanent_delegate, set_mint_with_decimals,
-        set_mint_with_freeze_authority, set_token_2022_with_hook_account, set_token_balance,
-        setup_hook_mint, setup_malicious_hook_mint, setup_test_balances, TestContext,
-        ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR,
-        INVALID_INSTRUCTION_DATA_ERROR, MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
+        set_mint_with_freeze_authority, set_token_2022_with_hook_account,
+        set_token_2022_with_memo_account, set_token_balance, setup_hook_mint,
+        setup_malicious_hook_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
+        INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
+        MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
     },
 };
@@ -338,6 +339,84 @@ fn test_deposit_token_2022_basic_success() {
         false,
     )
     .expect("Token2022 deposit should succeed");
+}
+
+// Deposit passes no memo because its destination is the instance's own ATA,
+// and only that account's owner can turn MemoTransfer on. Forcing the
+// extension on anyway proves the deposit fails if that ever stops holding,
+// rather than transferring without the memo.
+#[test]
+fn test_deposit_token_2022_memo_required_instance_ata_fails() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint_2022_basic(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    let (allowed_mint_pda, _) = assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_2022_PROGRAM_ID,
+        DEPOSIT_AMOUNT,
+        0,
+    );
+    // Swap the escrow's own ATA for one demanding a memo on every transfer in.
+    set_token_2022_with_memo_account(
+        &mut context,
+        &instance_ata,
+        &mint.pubkey(),
+        &instance_pda,
+        0,
+        false,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(DEPOSIT_AMOUNT)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    // Deposit passes no memo account, so `transfer_checked_cpi` errors out
+    // rather than transferring into a destination that requires one.
+    assert_program_error(result, NOT_ENOUGH_ACCOUNT_KEYS_ERROR);
+    assert_eq!(get_token_balance(&mut context, &instance_ata), 0);
+    assert_eq!(get_token_balance(&mut context, &user_ata), DEPOSIT_AMOUNT);
 }
 
 // Transfer fee mints require special handling: when SPL Token 2022 executes a transfer,
