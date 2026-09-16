@@ -327,6 +327,52 @@ async fn unreleased_withdrawals_are_never_subtracted() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// The tick enumerates mints from `get_mint_addresses` and values them from the aggregate.
+/// The two read the same `mints` table, so they have to answer with the same universe or a
+/// mint gets valued without being checked, or checked without being valued.
+#[tokio::test(flavor = "multi_thread")]
+async fn mints_enumeration_matches_the_aggregate_universe() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let token_program = spl_token::id().to_string();
+
+    // A mint with nothing against it, one with only a withdrawal, and one with a deposit
+    // above the bound: the three shapes that could fall out of one read but not the other.
+    let bare = Pubkey::new_unique().to_string();
+    let withdrawal_only = Pubkey::new_unique().to_string();
+    let late_deposit = Pubkey::new_unique().to_string();
+    for mint in [&bare, &withdrawal_only, &late_deposit] {
+        insert_mint(&pool, mint, 6, &token_program).await?;
+    }
+    insert_withdrawal(&pool, "w_enum", &withdrawal_only, 100, "processing", 100).await?;
+    insert_transaction(
+        &pool,
+        "d_enum",
+        &late_deposit,
+        100,
+        "deposit",
+        "completed",
+        900,
+    )
+    .await?;
+
+    let mut enumerated = storage.get_mint_addresses().await?;
+    let mut aggregated: Vec<String> = storage
+        .get_mint_balances_for_reconciliation(10)
+        .await?
+        .into_iter()
+        .map(|r| r.mint_address)
+        .collect();
+    enumerated.sort();
+    aggregated.sort();
+
+    assert_eq!(
+        enumerated, aggregated,
+        "enumeration and valuation must cover the same mints"
+    );
+    Ok(())
+}
+
 /// A release that moves less than its row owes discharges only what moved. The rest is
 /// still custody the escrow should hold, so it stays in the liabilities.
 #[tokio::test(flavor = "multi_thread")]
