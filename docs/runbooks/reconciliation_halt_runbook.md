@@ -118,6 +118,12 @@ the halt reason:
    FROM transactions t WHERE t.mint = '<MINT>';
    ```
 
+   A boot refuses on the same comparison. When the escrow indexer's checkpoint is
+   below the custody snapshot, that boot-time read also counts a `completed`
+   withdrawal as released, since the operator writes that status only after the
+   release confirms. A refusal there is a shortfall neither the chain nor the
+   operator's own records explain.
+
    For a liability halt, custody below `deposits - released` means tokens left
    escrow without a recorded release. Only `ReleaseFunds` is indexed as an
    outflow, so check the escrow token accounts' history for other movements: a

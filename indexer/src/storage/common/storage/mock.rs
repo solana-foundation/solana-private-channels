@@ -31,6 +31,8 @@ pub struct MockStorage {
     pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
+    /// Rows the unpinned reconciliation read answers with; `None` mirrors `mint_balances`.
+    pub unpinned_mint_balances: std::sync::Arc<Mutex<Option<Vec<MintDbBalance>>>>,
     /// Slot the last reconciliation balance read was bounded by, so a test can prove the
     /// bound reached storage. The stored balances are pre-aggregated with no slot of
     /// their own, so the mock records the bound rather than applying it.
@@ -426,6 +428,11 @@ impl MockStorage {
         *self.mint_balances.lock().unwrap() = balances;
     }
 
+    /// Rows the unpinned read answers with. Unset means it mirrors `set_mint_balances`.
+    pub fn set_unpinned_mint_balances(&self, balances: Vec<MintDbBalance>) {
+        *self.unpinned_mint_balances.lock().unwrap() = Some(balances);
+    }
+
     pub async fn get_mint_balances_for_reconciliation(
         &self,
         as_of_slot: u64,
@@ -433,6 +440,18 @@ impl MockStorage {
         self.check_should_fail("get_mint_balances_for_reconciliation")?;
         *self.last_reconciliation_slot.lock().unwrap() = Some(as_of_slot);
         Ok(self.mint_balances.lock().unwrap().clone())
+    }
+
+    pub async fn get_mint_balances_for_unpinned_reconciliation(
+        &self,
+        as_of_slot: u64,
+    ) -> Result<Vec<MintDbBalance>, StorageError> {
+        self.check_should_fail("get_mint_balances_for_unpinned_reconciliation")?;
+        *self.last_reconciliation_slot.lock().unwrap() = Some(as_of_slot);
+        match self.unpinned_mint_balances.lock().unwrap().clone() {
+            Some(rows) => Ok(rows),
+            None => Ok(self.mint_balances.lock().unwrap().clone()),
+        }
     }
 
     /// Slot the last reconciliation balance read was bounded by.

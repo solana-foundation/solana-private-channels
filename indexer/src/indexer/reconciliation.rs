@@ -24,7 +24,8 @@
 //!    indexing more slots. A supply that cannot be read at all aborts too, since an
 //!    unreadable channel and a solvent one look the same from here.
 //! 5. A mint whose shortfall (db_expected minus on-chain) exceeds the threshold means the escrow may not cover its liabilities: log an error, emit an alert, and abort startup.
-//!    Skipped with a warning when the escrow checkpoint is below the snapshot slot, since that ledger lacks recent releases.
+//!    An escrow checkpoint below the snapshot slot cannot account for recent releases, so the
+//!    comparison is re-read with completed withdrawals counted as released before it is judged.
 //! 6. A surplus (on-chain minus db_expected) is benign and attacker-inducible, so it only logs a warning and never blocks; a shortfall within the threshold also just warns.
 //! 7. If all mints balance (or both sides are empty), log info and continue.
 
@@ -226,20 +227,30 @@ pub async fn reconcile_against_snapshot(
     check_channel_supply_invariant(channel_rpc_url, rpc_url, instance_pda, config, &results)
         .await?;
 
-    // A ledger checkpointed below the snapshot lacks releases that already left custody, so its
-    // shortfall proves nothing; runtime reconciliation compares once the indexer catches up.
+    // A ledger checkpointed below the snapshot is missing releases that already left custody,
+    // and reading those as a shortfall would fail an otherwise healthy boot. Re-read it with
+    // the operator's own completions standing in for the releases the indexer has yet to
+    // record, so a drain nothing accounts for still stops the boot.
     let committed = storage
         .get_committed_checkpoint(&program_key(program_type))
         .await
         .map_err(ReconciliationError::Storage)?;
-    if let Some(committed) = committed.filter(|&c| c < snapshot.slot) {
-        warn!(
-            committed,
-            snapshot_slot = snapshot.slot,
-            "Ledger is behind the custody snapshot; ledger comparison deferred to runtime reconciliation"
-        );
-        return Ok(());
-    }
+    let results = match committed.filter(|&c| c < snapshot.slot) {
+        Some(committed) => {
+            warn!(
+                committed,
+                snapshot_slot = snapshot.slot,
+                "Ledger is behind the custody snapshot; counting completed withdrawals as released \
+                 for this comparison"
+            );
+            let unpinned = storage
+                .get_mint_balances_for_unpinned_reconciliation(snapshot.slot)
+                .await
+                .map_err(ReconciliationError::Storage)?;
+            build_reconciliation_set(&unpinned, &snapshot.balances)?
+        }
+        None => results,
+    };
 
     classify_and_report(config, &results)?;
 
@@ -1243,7 +1254,13 @@ mod tests {
 
     /// Run startup reconciliation with custody 980 (slot 100), ledger 1000 and the escrow
     /// checkpoint at `checkpoint`; supply matches custody unless `supply` says otherwise.
-    async fn shortfall_with_checkpoint(checkpoint: u64, supply: u64) -> Result<(), IndexerError> {
+    /// `released_by_status` is what the unpinned read subtracts, i.e. the rows the operator
+    /// marked completed whose release the indexer has not recorded yet.
+    async fn shortfall_with_checkpoint(
+        checkpoint: u64,
+        supply: u64,
+        released_by_status: u64,
+    ) -> Result<(), IndexerError> {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_escrow_sweep(&mut server, &[(mint.to_string(), 980)]).await;
@@ -1251,6 +1268,11 @@ mod tests {
 
         let mock_storage = MockStorage::new();
         mock_storage.set_mint_balances(vec![make_mint_balance(&mint.to_string(), 1000, 0)]);
+        mock_storage.set_unpinned_mint_balances(vec![make_mint_balance(
+            &mint.to_string(),
+            1000,
+            released_by_status,
+        )]);
         mock_storage.set_checkpoint("escrow", checkpoint);
         let storage = Storage::Mock(mock_storage);
 
@@ -1270,16 +1292,52 @@ mod tests {
     }
 
     /// A ledger behind the snapshot is missing the releases that already left custody, so
-    /// its shortfall must not stop startup; runtime reconciliation compares once caught up.
+    /// the rows the operator marked completed stand in for them. A shortfall they explain
+    /// is lag, not a drain, and must not stop startup.
     #[tokio::test]
-    async fn shortfall_from_a_ledger_behind_the_snapshot_does_not_block() {
-        let result = shortfall_with_checkpoint(99, 980).await;
-        assert!(result.is_ok(), "lagging ledger must defer: {result:?}");
+    async fn shortfall_explained_by_completed_withdrawals_does_not_block() {
+        let result = shortfall_with_checkpoint(99, 980, 20).await;
+        assert!(
+            result.is_ok(),
+            "explained shortfall must not block: {result:?}"
+        );
+    }
+
+    /// Nothing in the ledger accounts for the missing custody, by release or by status, so
+    /// a lagging indexer must not turn a real drain into a clean boot.
+    #[tokio::test]
+    async fn unexplained_shortfall_from_a_ledger_behind_the_snapshot_still_blocks() {
+        let result = shortfall_with_checkpoint(99, 980, 0).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "unexplained shortfall must block: {result:?}"
+        );
+    }
+
+    /// The status fallback is only for a ledger that cannot be pinned. Once the checkpoint
+    /// covers the snapshot, a completed row with no observed release stays owed.
+    #[tokio::test]
+    async fn a_covering_ledger_ignores_the_status_fallback() {
+        let result = shortfall_with_checkpoint(100, 980, 20).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::MismatchExceedsThreshold { .. }
+                ))
+            ),
+            "a covering ledger must use observed releases only: {result:?}"
+        );
     }
 
     #[tokio::test]
     async fn shortfall_from_a_ledger_covering_the_snapshot_still_blocks() {
-        let result = shortfall_with_checkpoint(100, 980).await;
+        let result = shortfall_with_checkpoint(100, 980, 0).await;
         assert!(
             matches!(
                 result,
@@ -1293,7 +1351,7 @@ mod tests {
 
     #[tokio::test]
     async fn ledger_behind_the_snapshot_still_enforces_the_supply_invariant() {
-        let result = shortfall_with_checkpoint(99, 1_200).await;
+        let result = shortfall_with_checkpoint(99, 1_200, 0).await;
         assert!(
             matches!(
                 result,

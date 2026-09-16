@@ -242,6 +242,19 @@ impl Storage {
             .await
     }
 
+    /// The same ledger for a caller that cannot pin the indexer to `as_of_slot`, where a
+    /// withdrawal the operator marked `completed` counts as released too. Startup only;
+    /// runtime holds out for the observed release.
+    pub async fn get_mint_balances_for_unpinned_reconciliation(
+        &self,
+        as_of_slot: u64,
+    ) -> Result<Vec<MintDbBalance>, StorageError> {
+        get_mint_balances_for_reconciliation::get_mint_balances_for_unpinned_reconciliation(
+            self, as_of_slot,
+        )
+        .await
+    }
+
     /// Per-mint sum of every unsettled transaction amount (pending / processing /
     /// parked / pending_remint), used as the in-flight envelope by the runtime
     /// reconciliation halt decision.
@@ -1303,6 +1316,36 @@ mod tests {
         assert!(balances.iter().any(|b| b.mint_address == "usdt"
             && b.total_deposits == 8000u64
             && b.total_withdrawals == 3000u64));
+    }
+
+    #[tokio::test]
+    async fn dispatch_get_mint_balances_for_unpinned_reconciliation_via_mock() {
+        let (storage, mock) = make_mock_storage();
+        mock.set_mint_balances(vec![MintDbBalance {
+            mint_address: "usdc".to_string(),
+            token_program: TOKEN_PROGRAM.to_string(),
+            total_deposits: BigDecimal::from(10000u64),
+            total_withdrawals: BigDecimal::from(0u64),
+        }]);
+        mock.set_unpinned_mint_balances(vec![MintDbBalance {
+            mint_address: "usdc".to_string(),
+            token_program: TOKEN_PROGRAM.to_string(),
+            total_deposits: BigDecimal::from(10000u64),
+            total_withdrawals: BigDecimal::from(5000u64),
+        }]);
+
+        let balances = storage
+            .get_mint_balances_for_unpinned_reconciliation(900)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.last_reconciliation_slot(),
+            Some(900),
+            "the slot bound must reach storage, not be dropped on the way"
+        );
+        assert!(balances
+            .iter()
+            .any(|b| b.mint_address == "usdc" && b.total_withdrawals == 5000u64));
     }
 
     #[tokio::test]

@@ -156,6 +156,23 @@ async fn withdrawals_at(
     Ok(row.total_withdrawals)
 }
 
+/// Total withdrawals the unpinned aggregate reports for `mint` at `slot`. This is the read
+/// startup falls back to when the escrow checkpoint sits below the custody snapshot.
+async fn unpinned_withdrawals_at(
+    storage: &Storage,
+    mint: &str,
+    slot: u64,
+) -> Result<BigDecimal, Box<dyn std::error::Error>> {
+    let rows = storage
+        .get_mint_balances_for_unpinned_reconciliation(slot)
+        .await?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.mint_address == mint)
+        .ok_or("mint missing from the aggregate")?;
+    Ok(row.total_withdrawals)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 /// Deposits of every status count, bounded at the slot.
@@ -286,6 +303,77 @@ async fn unreleased_withdrawals_are_never_subtracted() -> Result<(), Box<dyn std
     assert_eq!(
         withdrawals_at(&storage, &mint, u64::MAX).await?,
         BigDecimal::from(0u64)
+    );
+    Ok(())
+}
+
+/// The operator marks a row completed once its release confirms, so an unpinned ledger can
+/// use that where it has no observed release of its own. The pinned read still ignores it.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_withdrawal_is_released_only_in_the_unpinned_read(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+    insert_withdrawal(&pool, "w_done", &mint, 300, "completed", 100).await?;
+
+    assert_eq!(
+        withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(0u64),
+        "the pinned read subtracts only an observed release"
+    );
+    assert_eq!(
+        unpinned_withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(300u64),
+        "the unpinned read stands the row status in for the missing release"
+    );
+    Ok(())
+}
+
+/// Only a completed row stands in for a release. Every other state is still owed, so the
+/// fallback cannot become an allowance for withdrawals that have not paid out.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpinned_read_subtracts_no_other_status() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    for status in [
+        "pending",
+        "processing",
+        "parked",
+        "pending_remint",
+        "failed_reminted",
+        "manual_review",
+        "failed",
+    ] {
+        insert_withdrawal(&pool, &format!("u_{status}"), &mint, 100, status, 100).await?;
+    }
+
+    assert_eq!(
+        unpinned_withdrawals_at(&storage, &mint, u64::MAX).await?,
+        BigDecimal::from(0u64)
+    );
+    Ok(())
+}
+
+/// Both arms still count in the unpinned read, and a payout carrying both an observed
+/// release and a completed status is subtracted once.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpinned_read_counts_each_payout_once() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mint = Pubkey::new_unique().to_string();
+    insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+    let both = insert_withdrawal(&pool, "u_both", &mint, 200, "completed", 100).await?;
+    observe_release(&storage, both, 120).await?;
+    let observed_only =
+        insert_withdrawal(&pool, "u_observed", &mint, 50, "processing", 100).await?;
+    observe_release(&storage, observed_only, 120).await?;
+
+    assert_eq!(
+        unpinned_withdrawals_at(&storage, &mint, 150).await?,
+        BigDecimal::from(250u64)
     );
     Ok(())
 }

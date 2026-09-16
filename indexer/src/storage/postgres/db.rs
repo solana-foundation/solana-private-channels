@@ -185,6 +185,45 @@ const DROP_STATEMENTS: [&str; 10] = [
     "DROP TYPE IF EXISTS transaction_type CASCADE",
 ];
 
+/// A withdrawal counts as paid out when the escrow indexer recorded its release at or below
+/// the bound.
+const RELEASED_BY_OBSERVATION: &str = "EXISTS (SELECT 1 FROM observed_releases r
+                         WHERE r.withdrawal_nonce = t.withdrawal_nonce
+                           AND r.slot <= $1)";
+
+/// The same, plus the operator's own record of a confirmed payout.
+const RELEASED_BY_OBSERVATION_OR_STATUS: &str = "(t.status = 'completed' OR EXISTS (
+                         SELECT 1 FROM observed_releases r
+                         WHERE r.withdrawal_nonce = t.withdrawal_nonce
+                           AND r.slot <= $1))";
+
+/// The per-mint reconciliation aggregate. Only the test for a released withdrawal varies, so
+/// both reads share one shape and one mint universe.
+fn mint_balances_query(released: &str) -> String {
+    format!(
+        r#"
+            SELECT
+                m.mint_address,
+                m.token_program,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
+                    0
+                )::NUMERIC AS total_deposits,
+                COALESCE(
+                    SUM(CASE WHEN t.transaction_type = 'withdrawal'
+                              AND {released}
+                             THEN t.amount ELSE 0 END),
+                    0
+                )::NUMERIC AS total_withdrawals
+            FROM mints m
+            LEFT JOIN transactions t
+              ON t.mint = m.mint_address
+             AND (t.transaction_type = 'withdrawal' OR t.slot <= $1)
+            GROUP BY m.mint_address, m.token_program
+            "#
+    )
+}
+
 impl PostgresDb {
     pub async fn new(config: &PostgresConfig) -> Result<Self, sqlx::Error> {
         // Fail closed: reject a blank password before connecting (blanked env templates interpolate an empty ${POSTGRES_PASSWORD} into a passwordless URL).
@@ -2736,33 +2775,23 @@ impl PostgresDb {
     ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
         // Withdrawal rows carry a channel slot, not a Solana one, so the bound limits deposits only.
         // Status is not trusted for withdrawals: it turns completed after the payout and has no Solana slot.
-        sqlx::query_as::<_, MintDbBalance>(
-            r#"
-            SELECT
-                m.mint_address,
-                m.token_program,
-                COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'deposit' THEN t.amount ELSE 0 END),
-                    0
-                )::NUMERIC AS total_deposits,
-                COALESCE(
-                    SUM(CASE WHEN t.transaction_type = 'withdrawal'
-                              AND EXISTS (SELECT 1 FROM observed_releases r
-                                          WHERE r.withdrawal_nonce = t.withdrawal_nonce
-                                            AND r.slot <= $1)
-                             THEN t.amount ELSE 0 END),
-                    0
-                )::NUMERIC AS total_withdrawals
-            FROM mints m
-            LEFT JOIN transactions t
-              ON t.mint = m.mint_address
-             AND (t.transaction_type = 'withdrawal' OR t.slot <= $1)
-            GROUP BY m.mint_address, m.token_program
-            "#,
-        )
-        .bind(as_of_slot)
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_as::<_, MintDbBalance>(&mint_balances_query(RELEASED_BY_OBSERVATION))
+            .bind(as_of_slot)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// The same ledger for a caller that cannot pin the indexer to `as_of_slot`, which also
+    /// counts a withdrawal the operator marked `completed` as paid out: that status is only
+    /// written once the release confirms, so it stands in for a release row not yet indexed.
+    pub async fn get_mint_balances_for_unpinned_reconciliation_internal(
+        &self,
+        as_of_slot: i64,
+    ) -> Result<Vec<MintDbBalance>, sqlx::Error> {
+        sqlx::query_as::<_, MintDbBalance>(&mint_balances_query(RELEASED_BY_OBSERVATION_OR_STATUS))
+            .bind(as_of_slot)
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Per-mint sum of every unsettled transaction amount (the in-flight

@@ -21,3 +21,20 @@ pub async fn get_mint_balances_for_reconciliation(
         Storage::Mock(mock) => mock.get_mint_balances_for_reconciliation(as_of_slot).await,
     }
 }
+
+/// The unpinned read: the same ledger, also counting a `completed` withdrawal as released.
+pub async fn get_mint_balances_for_unpinned_reconciliation(
+    storage: &Storage,
+    as_of_slot: u64,
+) -> Result<Vec<MintDbBalance>, StorageError> {
+    match storage {
+        Storage::Postgres(db) => Ok(db
+            .get_mint_balances_for_unpinned_reconciliation_internal(slot_bound(as_of_slot))
+            .await?),
+        #[cfg(any(test, feature = "test-mock-storage"))]
+        Storage::Mock(mock) => {
+            mock.get_mint_balances_for_unpinned_reconciliation(as_of_slot)
+                .await
+        }
+    }
+}

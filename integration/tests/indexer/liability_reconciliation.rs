@@ -477,6 +477,31 @@ async fn startup_comparison_at_threshold_zero(
     .await
 }
 
+/// The same comparison with nothing waiting for the ledger to catch up, which is what a boot
+/// gets while the escrow indexer is behind the custody reading.
+async fn startup_comparison_over_a_lagging_ledger(
+    rpc_url: &str,
+    channel_rpc_url: &str,
+    storage: &Storage,
+    instance: Pubkey,
+) -> Result<(), IndexerError> {
+    let snapshot = capture_custody_snapshot(rpc_url, &instance)
+        .await
+        .expect("custody snapshot");
+    reconcile_against_snapshot(
+        &ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+        },
+        ProgramType::Escrow,
+        storage,
+        rpc_url,
+        Some(channel_rpc_url),
+        &instance,
+        &snapshot,
+    )
+    .await
+}
+
 /// The committed escrow checkpoint, which a stopped indexer must have left behind.
 async fn committed_checkpoint(pool: &PgPool) -> u64 {
     db::get_checkpoint_slot(pool, "escrow")
@@ -805,6 +830,22 @@ async fn a_real_drain_halts_the_runtime_refuses_the_next_startup_and_holds_while
     cancel.cancel();
     let _ = ticks.await;
     println!("  Held for {UNPINNABLE_QUIET_SECS}s with the ledger behind the custody slot");
+
+    // A tick may hold on a ledger it cannot pin, but a boot must not: nothing in the ledger
+    // accounts for the missing custody, by release or by status, so startup still refuses.
+    match startup_comparison_over_a_lagging_ledger(&rpc_url, &channel.url(), &storage, instance)
+        .await
+    {
+        Err(IndexerError::Reconciliation(ReconciliationError::MismatchExceedsThreshold {
+            threshold,
+            ..
+        })) => assert_eq!(
+            threshold, 0,
+            "the strict threshold must be the one enforced"
+        ),
+        other => panic!("a boot over a lagging ledger must still refuse a drain, got {other:?}"),
+    }
+    println!("  Startup comparison refused the drain with the ledger behind custody");
 
     channel.shutdown().await;
 }
