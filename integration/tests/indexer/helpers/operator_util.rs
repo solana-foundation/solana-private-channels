@@ -63,9 +63,19 @@ pub async fn wait_for_operator_completion(
         let completed = db::count_transactions_by_status(pool, "completed").await?;
         let failed = db::count_transactions_by_status(pool, "failed").await?;
         let pending = db::count_transactions_by_status(pool, "pending").await?;
+        let processing = db::count_transactions_by_status(pool, "processing").await?;
+        let parked = db::count_transactions_by_status(pool, "parked").await?;
+        let manual_review = db::count_transactions_by_status(pool, "manual_review").await?;
         println!(
-            "✗ Timeout after {}s: completed={}, failed={}, pending={} (expected {} completed)",
-            *WAIT_TIMEOUT_SECS, completed, failed, pending, expected_count
+            "✗ Timeout after {}s: completed={}, failed={}, pending={}, processing={}, parked={}, manual_review={} (expected {} completed)",
+            *WAIT_TIMEOUT_SECS,
+            completed,
+            failed,
+            pending,
+            processing,
+            parked,
+            manual_review,
+            expected_count
         );
     }
 

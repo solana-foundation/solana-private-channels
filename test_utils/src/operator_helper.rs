@@ -36,7 +36,10 @@ fn default_operator_config() -> OperatorConfig {
         channel_buffer_size: 100,
         rpc_commitment: CommitmentLevel::Confirmed,
         alert_webhook_url: None,
-        reconciliation_interval: Duration::from_secs(5 * 60),
+        // Most integration helpers are lifecycle tests for the indexing and
+        // operator pipelines, not reconciliation. Keep the background tick from
+        // freezing long-running flows; reconciliation has dedicated coverage.
+        reconciliation_interval: Duration::from_secs(60 * 60),
         reconciliation_tolerance_bps: 10,
         reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
