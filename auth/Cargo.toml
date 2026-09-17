@@ -39,7 +39,6 @@ tower-http = { workspace = true, features = ["cors"] }
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
 governor = { workspace = true }
-rand = { workspace = true }
 solana-sdk = { workspace = true }
 bs58 = { workspace = true }
 

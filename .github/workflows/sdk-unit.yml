@@ -32,6 +32,10 @@ on:
       - "private-channel-withdraw-program/scripts/**"
       - "private-channel-withdraw-program/package.json"
 
+# Build and test only. Nothing here writes back to the repo or the PR.
+permissions:
+  contents: read
+
 jobs:
   typescript-sdk-unit:
     name: TypeScript SDK Unit Tests

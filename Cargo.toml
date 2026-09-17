@@ -65,7 +65,9 @@ pinocchio-system = "^0.5.0"
 pinocchio-token = "0.5.0"
 pinocchio-token-2022 = "^0.2.0"
 prometheus = "0.14"
-rand = "0.7.3"
+# 0.8.6 is the first release without the unsound-logger advisory. Older copies
+# still reach the lockfile via solana-test-validator, which is test-only.
+rand = "0.8.6"
 redis = { version = "0.27", features = [
     "tokio-comp",
     "connection-manager",
