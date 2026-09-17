@@ -1080,8 +1080,8 @@ mod tests {
     fn test_release_funds_account_offsets() {
         let user = Pubkey::new_unique();
         let data = create_release_funds_borsh_data(1_000, user, 42);
-        let instruction = create_instruction_with_accounts(13, "dummy".to_string());
-        let account_keys = create_n_account_keys(13);
+        let instruction = create_instruction_with_accounts(14, "dummy".to_string());
+        let account_keys = create_n_account_keys(14);
 
         let parsed = parse_release_funds(&data, &instruction, &account_keys)
             .expect("must parse")
@@ -1105,8 +1105,8 @@ mod tests {
     fn test_release_funds_malformed_data_errors() {
         let mut data = create_release_funds_borsh_data(1_000, Pubkey::new_unique(), 42);
         data.truncate(40);
-        let instruction = create_instruction_with_accounts(13, "dummy".to_string());
-        let account_keys = create_n_account_keys(13);
+        let instruction = create_instruction_with_accounts(14, "dummy".to_string());
+        let account_keys = create_n_account_keys(14);
 
         let err = parse_release_funds(&data, &instruction, &account_keys)
             .expect_err("short data must not parse")
