@@ -1410,12 +1410,16 @@ async fn drill_17_deposit_manual_review_allowlist_gate_recovery_flows(
     // swallows Path G's own recovery SQL, so take the nearest of all three
     // depths rather than assuming which one follows.
     let rest = &step_3c_section[1..];
-    let next_section_idx = [rest.find("\n## "), rest.find("\n### "), rest.find("\n#### ")]
-        .into_iter()
-        .flatten()
-        .min()
-        .map(|i| i + 1)
-        .unwrap_or(step_3c_section.len());
+    let next_section_idx = [
+        rest.find("\n## "),
+        rest.find("\n### "),
+        rest.find("\n#### "),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|i| i + 1)
+    .unwrap_or(step_3c_section.len());
     let step_3c_body = &step_3c_section[..next_section_idx];
     assert!(
         !step_3c_body.contains("UPDATE transactions")

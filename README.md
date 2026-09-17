@@ -213,7 +213,7 @@ make all-test
 
 ### Prerequisites
 
-- [**Rust**](https://rust-lang.org/tools/install/): 1.91 (pinned via `rust-toolchain.toml`; install [rustup](https://rustup.rs) and it will fetch the right channel automatically)
+- [**Rust**](https://rust-lang.org/tools/install/): 1.96.1 (pinned via `rust-toolchain.toml`; install [rustup](https://rustup.rs) and it will fetch the right channel automatically)
 - [**Solana CLI**](https://solana.com/docs/intro/installation): version pinned in [`versions.env`](versions.env). Run `make install-toolchain` to install/verify. Do not install a specific version by hand — `versions.env` is the source of truth for every Dockerfile, the Yellowstone Geyser plugin build, and CI.
 - [**Docker**](https://docs.docker.com/get-docker/): 26.0+ with Docker Compose
 - [**pnpm**](https://pnpm.io/installation): 10.0+ (for TypeScript clients)

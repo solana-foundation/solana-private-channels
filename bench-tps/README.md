@@ -77,7 +77,7 @@ signing a unique transfer + memo instruction per transaction.
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Solana Private Channels gateway endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Channel write-node. In bench topology the gateway is `8898`; `.env.sample` and `run.sh` both point this at the gateway instead, so reads route to the read-node |
 | `--accounts` | `BENCH_ACCOUNTS` | `200` | Source keypairs; must be ≥ `--threads` |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `16` | Concurrent sender tasks |
@@ -178,7 +178,7 @@ on port 9103).
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Solana Private Channels gateway endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Channel write-node; `.env.sample` and `run.sh` point this at the gateway (`8898`) instead |
 | `--solana-rpc-url` | `BENCH_SOLANA_RPC_URL` | `http://localhost:18899` | Solana validator endpoint |
 | `--accounts` | `BENCH_WITHDRAW_ACCOUNTS` | `20` | Withdrawer keypairs |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
