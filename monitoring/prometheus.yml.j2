@@ -12,6 +12,12 @@ global:
   scrape_interval: 10s
   scrape_timeout: 5s
   evaluation_interval: 15s
+  # Every deployment posts to the same Slack channel, and the job names are
+  # identical across them, so an alert without this is unattributable. Named
+  # `deployment` because the scrape configs below already pin a `stack` target
+  # label, and a target label shadows an external one.
+  external_labels:
+    deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
 
 scrape_configs:
 
@@ -78,24 +84,28 @@ scrape_configs:
       - targets: ['indexer-solana:9100']
         labels:
           stack: private-channel
+          deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
 
   - job_name: private-channel-indexer-private-channel
     static_configs:
       - targets: ['indexer-private-channel:9100']
         labels:
           stack: private-channel
+          deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
 
   - job_name: private-channel-operator-solana
     static_configs:
       - targets: ['operator-solana:9102']
         labels:
           stack: private-channel
+          deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
 
   - job_name: private-channel-operator-private-channel
     static_configs:
       - targets: ['operator-private-channel:9103']
         labels:
           stack: private-channel
+          deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
 
   # ── Solana Private Channels write/read node /metrics (only when the node is run
   # with --metrics / PRIVATE_CHANNEL_METRICS=true; otherwise these targets show
@@ -108,6 +118,7 @@ scrape_configs:
           - 'read-node:9090'
         labels:
           stack: private-channel
+          deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
 
   # ── Gateway /metrics. The gateway always serves metrics (no flag) on
   # METRICS_PORT, default 9101. The RPC dashboard filters on job="gateway".
@@ -117,3 +128,4 @@ scrape_configs:
           - 'gateway:9101'
         labels:
           stack: private-channel
+          deployment: "{{ env | default(group_names | difference(['all']) | first | default('dev')) }}"
