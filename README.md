@@ -226,10 +226,15 @@ make all-test
 | **Solana Private Channels DB** | [core/src/accounts/](core/src/accounts/) | Accounts database with multi-backend support |
 | **Gateway** | [gateway/](gateway/) | Read/write node routing service with optional RBAC enforcement |
 | **Auth** | [auth/](auth/) | Authentication service — user registration, login, wallet verification, JWT issuance |
+| **Metrics** | [metrics/](metrics/) | Shared Prometheus registry and metric-declaration macros |
 | **Escrow Program** | [private-channel-escrow-program/](private-channel-escrow-program/) | Mainnet token deposit via escrow |
 | **Withdrawal Program** | [private-channel-withdraw-program/](private-channel-withdraw-program/) | Channel token withdrawal via burning |
+| **DvP Swap Program** | [dvp-swap-program/](dvp-swap-program/) | Vendored Rust client for the swap program; the compiled `.so` it pairs with lives in `core/precompiles/` |
 | **Indexer + Operator** | [indexer/](indexer/) | Mainnet & channel transaction monitoring & automation |
+| **Devnet Scripts** | [scripts/devnet/](scripts/devnet/) | CLI tools for instance management, deposits, and withdrawals |
 | **Integration Tests** | [integration/](integration/) | Cross-workspace integration tests |
+| **Test Utilities** | [test_utils/](test_utils/) | Shared test harness — validator, indexer/operator helpers, RPC and Yellowstone mocks |
+| **Load Testing** | [bench-tps/](bench-tps/) | Transfer, deposit, and withdraw load generators |
 | **Deployment** | [docker-compose.yml](docker-compose.yml) | Full stack deployment configuration |
 
 ### Install Dependencies
@@ -370,10 +375,10 @@ CI and local runs.
 
 | Tool             | Version    | Install command                                        |
 |------------------|------------|--------------------------------------------------------|
-| Rust toolchain   | `1.91.0`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically (host *and* Docker builder) |
+| Rust toolchain   | `1.96.1`   | Pinned in `rust-toolchain.toml` — `rustup` picks it up automatically (host *and* Docker builder) |
 | cargo-llvm-cov   | `0.8.4`    | `cargo install cargo-llvm-cov@0.8.4`                   |
 | cargo-nextest    | `0.9.130`  | `cargo install cargo-nextest@0.9.130 --locked`         |
-| Solana CLI       | `3.1.13`   | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |
+| Solana CLI       | `4.2.2`    | Pinned in [`versions.env`](versions.env); run `make install-toolchain` to install/verify |
 | Node.js          | `24.x`     | Installed from NodeSource (`setup_24.x`) in the main [`Dockerfile`](Dockerfile) for the pnpm-based build steps |
 | pnpm             | `10.15.1`  | Pinned in [`versions.env`](versions.env) (`PNPM_VERSION`); also via `packageManager` in each `package.json` |
 | Grafana          | `11.4.0`   | Pinned in [`versions.env`](versions.env) (`GRAFANA_VERSION`) |

@@ -17,9 +17,9 @@ Reference for configuring, tuning, and operating Solana Private Channels service
 | `--mode` | `PRIVATE_CHANNEL_MODE` | — | Node mode: `read`, `write`, or `aio` (all-in-one). Required, so a dropped variable fails startup instead of starting a read deployment as a writer |
 | `--port` | `PRIVATE_CHANNEL_PORT` | `8899` | RPC listen port |
 | `--sigverify-workers` | `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | `4` | Parallel signature verification threads |
-| `--sigverify-queue-size` | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded queue between dedup and sigverify |
-| `--ingress-queue-capacity` | `PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY` | `10000` | Bounded RPC→dedup queue; a full queue sheds (`sendTransaction` returns `-32003`, retryable) and increments `rpc_ingress_shed_total` |
-| `--sequencer-queue-capacity` | `PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY` | `1000` | Bounded sigverify→sequencer queue; a full queue applies upstream backpressure |
+| `--sigverify-queue-size` | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | `1000` | Bounded sigverify→dedup queue |
+| `--ingress-queue-capacity` | `PRIVATE_CHANNEL_INGRESS_QUEUE_CAPACITY` | `10000` | Bounded RPC→sigverify queue; a full queue sheds (`sendTransaction` returns `-32003`, retryable) and increments `rpc_ingress_shed_total` |
+| `--sequencer-queue-capacity` | `PRIVATE_CHANNEL_SEQUENCER_QUEUE_CAPACITY` | `1000` | Bounded dedup→sequencer queue; a full queue applies upstream backpressure |
 | `--execution-results-capacity` | `PRIVATE_CHANNEL_EXECUTION_RESULTS_CAPACITY` | `1000` | Bounded queue from the executor to the settler; a full queue applies upstream backpressure. Also bounded by an internal in-flight byte budget, and the settler stops draining once a tick's buffered account bytes reach a budget of their own |
 | `--max-tx-per-batch` | `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | `64` | Max transactions per sequencer batch |
 | `--max-connections` | `PRIVATE_CHANNEL_MAX_CONNECTIONS` | `100` | Max concurrent RPC connections |
@@ -83,7 +83,7 @@ the stack still looks healthy. Use:
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `PORT` (fallback: `STREAMER_PORT`) | `8902` | WebSocket listen port |
+| `--port` | `STREAMER_PORT` | `8902` | WebSocket listen port |
 | `--accountsdb-connection-url` | `STREAMER_ACCOUNTSDB_CONNECTION_URL` | — | Solana Private Channels DB connection |
 | `--poll-interval-ms` | `STREAMER_POLL_INTERVAL_MS` | `700` | DB polling interval (ms) |
 | `--cors-allowed-origin` | `STREAMER_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |

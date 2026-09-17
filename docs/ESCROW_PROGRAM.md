@@ -218,6 +218,7 @@ Discriminator: `7`
 | 10 | `associated_token_program` | | | Associated Token program |
 | 11 | `event_authority` | | | Event authority PDA for emitting events |
 | 12 | `private_channel_escrow_program` | | | Current program for CPI |
+| 13 | `memo_program` | | | SPL Memo program, used only when `user_ata` requires a memo |
 
 Replay protection is the bitmap alone: the nonce's bit must be clear, and the
 nonce must fall in the generation the bitmap currently covers. The instance is
@@ -422,4 +423,3 @@ The program defines the following custom errors:
 
 Under the `test-tree` feature these shrink to 8 nonces in 1 byte, so integration
 tests can cross a generation boundary without 65,536 withdrawals.
-- **Non-Empty Leaf Hash**: SHA256 hash of `[1u8; 32]`

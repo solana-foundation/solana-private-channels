@@ -44,10 +44,7 @@ Anyone can create an instance--the `admin` signer will have authority for managi
 ### TypeScript Example
 
 ```typescript
-import {
-  getCreateInstanceInstructionAsync,
-  findInstancePda,
-} from 'private-channel-escrow-program';
+import { getCreateInstanceInstructionAsync } from 'private-channel-escrow-program';
 import { generateKeyPairSigner } from '@solana/kit';
 
 // Generate unique instance seed (save securely for future Instance retrieval)
@@ -258,11 +255,7 @@ Locks tokens in the Mainnet escrow for minting on the Solana Private Channels pa
 ### TypeScript Example
 
 ```typescript
-import {
-  getDepositInstructionAsync,
-  findAllowedMintPda,
-} from 'private-channel-escrow-program';
-import { findAssociatedTokenPda } from '@solana-program/token';
+import { getDepositInstructionAsync } from 'private-channel-escrow-program';
 import { address, none } from '@solana/kit';
 
 const user = await generateKeyPairSigner();
@@ -275,7 +268,7 @@ const depositIx = await getDepositInstructionAsync({
   instance: process.env.INSTANCE_ADDRESS,
   mint: process.env.ALLOWED_MINT_ADDRESS,
   amount: depositAmount,
-  recipient: none(), // or address('RecipientAddressOnSolana Private Channels...') if you want to credit to a different address
+  recipient: none(), // or address('RecipientAddress...') if you want to credit to a different address
 });
 
 // Send and sign transaction with payer and user as signers

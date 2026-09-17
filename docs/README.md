@@ -5,6 +5,7 @@
 - **[Architecture Overview](ARCHITECTURE.md)** — Core components, transaction pipeline, and design decisions
 - **[Solana Private Channels Core](CORE.md)** — Transaction pipeline, supported programs, and limitations
 - **[Indexer & Operator](INDEXER.md)** — Datasource strategies, backfill, reconciliation, and operator pipeline
+- **[JSON-RPC Divergence](RPC_COMPATIBILITY_ANALYSIS.md)** — Where the exposed RPC surface differs from Solana's behavior
 
 ## Programs
 
@@ -22,3 +23,6 @@
 - **[System Invariants](INVARIANTS.md)** — Safety and correctness invariants with implementation status
 - **[Technical Requirements](TECHNICAL_REQUIREMENTS.md)** — Hardware specs, software versions, ports, and firewall rules
 - **[Configuration & Operations](CONFIG.md)** — Service configuration, tuning guidelines, restart/recovery, and operational tools
+- **[Environment Variable Contract](ENV_CONTRACT.md)** — Canonical key set, per-surface value sources, and load order
+- **[Point-in-Time Recovery](PITR.md)** — WAL archiving, base backups, and PostgreSQL recovery
+- **[Operator Runbooks](runbooks/README.md)** — Incident response for deposit, withdrawal, indexer, and lock failures

@@ -4,7 +4,7 @@ Load testing binary for the Solana Private Channels payment channel. Supports th
 
 | Flow | What it stresses |
 |------|-----------------|
-| \`transfer\` | Solana Private Channels SPL token transfer pipeline (dedup → sigverify → sequencer → executor → settler) |
+| `transfer` | Solana Private Channels SPL token transfer pipeline (sigverify → dedup → sequencer → executor → settler) |
 | `deposit` | Solana escrow deposits (Solana → Solana Private Channels, measured end-to-end via operator-solana) |
 | `withdraw` | Solana Private Channels burn + Solana release (Solana Private Channels → Solana, measured end-to-end via operator-private-channel) |
 
@@ -49,7 +49,7 @@ containers on exit.
 ### What it does
 
 Generates sustained Solana Private Channels SPL token transfers against the Solana Private Channels write-node
-(via the gateway).  Each sender thread cycles through funded source accounts,
+(via the gateway).  Each sender task cycles through funded source accounts,
 signing a unique transfer + memo instruction per transaction.
 
 ### How to run
@@ -68,7 +68,7 @@ signing a unique transfer + memo instruction per transaction.
 
 | Field | Source | Meaning |
 |-------|--------|---------|
-| `sent` | `AtomicU64` counter | Transactions dispatched by sender threads |
+| `sent` | `AtomicU64` counter | Transactions dispatched by sender tasks |
 | `landed` | `getTransactionCount` delta | Transactions confirmed by the node |
 | `dropped` | `sent - landed` | Rejected by dedup / sigverify / sequencer / network |
 | `tps` | `landed / duration` | Effective pipeline throughput |
@@ -77,13 +77,14 @@ signing a unique transfer + memo instruction per transaction.
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Solana Private Channels gateway endpoint |
-| `--accounts` | `BENCH_ACCOUNTS` | `50` | Source keypairs; must be ≥ `--threads` |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Solana Private Channels gateway endpoint |
+| `--accounts` | `BENCH_ACCOUNTS` | `200` | Source keypairs; must be ≥ `--threads` |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
-| `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
-| `--num-conflict-groups` | `BENCH_NUM_CONFLICT_GROUPS` | `== accounts` | Distinct destination ATAs (1 = max contention) |
+| `--threads` | `BENCH_THREADS` | `16` | Concurrent sender tasks |
+| `--batch-size` | `BENCH_BATCH_SIZE` | `200` | Transactions per batch; each batch is sent concurrently by one task |
+| `--num-conflict-groups` | `BENCH_NUM_CONFLICT_GROUPS` | `accounts / 2` | Distinct receivers (1 = max contention) |
 | `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Raw token units per account |
-| `--sender-sleep-ms` | `BENCH_SENDER_SLEEP_MS` | `5` | Throttle per-thread (0 = max throughput) |
+| `--sender-sleep-ms` | `BENCH_SENDER_SLEEP_MS` | `0` | Throttle per-task (0 = max throughput) |
 
 ---
 
@@ -127,9 +128,11 @@ exposes metrics on port 9102).
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
 | `--solana-rpc-url` | `BENCH_SOLANA_RPC_URL` | `http://localhost:18899` | Solana validator endpoint |
+| `--private-channel-rpc-url` | `BENCH_PRIVATE_CHANNEL_RPC_URL` | `http://localhost:8898` | Channel endpoint; setup initializes the mint here so the operator can mint without JIT |
 | `--accounts` | `BENCH_DEPOSIT_ACCOUNTS` | `20` | Depositor keypairs |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
+| `--sender-sleep-ms` | `BENCH_SENDER_SLEEP_MS` | `5` | Throttle per-thread (0 = max throughput) |
 | `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Solana token units per account |
 | `--operator-metrics-url` | `BENCH_OPERATOR_METRICS_URL` | — | `http://localhost:9102/metrics` for e2e tracking |
 | `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Reuse persistent escrow instance across runs |
@@ -175,11 +178,12 @@ on port 9103).
 
 | Flag | Env var | Default | Notes |
 |------|---------|---------|-------|
-| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8898` | Solana Private Channels gateway endpoint |
+| `--rpc-url` | `BENCH_RPC_URL` | `http://localhost:8899` | Solana Private Channels gateway endpoint |
 | `--solana-rpc-url` | `BENCH_SOLANA_RPC_URL` | `http://localhost:18899` | Solana validator endpoint |
 | `--accounts` | `BENCH_WITHDRAW_ACCOUNTS` | `20` | Withdrawer keypairs |
 | `--duration` | `BENCH_DURATION` | `60` | Load phase seconds |
 | `--threads` | `BENCH_THREADS` | `4` | Concurrent sender threads |
+| `--sender-sleep-ms` | `BENCH_SENDER_SLEEP_MS` | `5` | Throttle per-thread (0 = max throughput) |
 | `--initial-balance` | `BENCH_INITIAL_BALANCE` | `1_000_000` | Solana Private Channels token units per account |
 | `--operator-metrics-url` | `BENCH_WITHDRAW_OPERATOR_METRICS_URL` | — | `http://localhost:9103/metrics` for e2e tracking |
 | `--instance-seed-keypair` | `BENCH_INSTANCE_SEED_KEYPAIR` | — | Must match `COMMON_ESCROW_INSTANCE_ID` in docker-compose |
@@ -260,7 +264,8 @@ bench-tps/src/
 ├── setup_deposit.rs   Deposit setup — escrow instance, depositor accounts
 ├── setup_withdraw.rs  Withdraw setup — escrow instance, Solana Private Channels accounts, Solana ATAs
 ├── background.rs      Blockhash poller, metrics sampler, operator mints sampler
-├── load.rs            Transfer generator + sender threads
+├── bench_metrics.rs   Prometheus counters exposed on --metrics-port
+├── load.rs            Transfer generator + sender tasks
 ├── load_deposit.rs    Deposit generator + sender threads
 ├── load_withdraw.rs   Withdraw generator + sender threads
 └── rpc.rs             Helpers — send_parallel, poll_confirmations
@@ -279,7 +284,24 @@ bench-tps/src/
   `private_channel_operator_mints_sent_total` from the operator Prometheus endpoint
   every second for e2e confirmation tracking.
 
-**Phase 3 — Load generation**:
+**Phase 3 — Load generation**. A generator task signs batches and hands them to
+`--threads` senders. The two flows differ in how that handoff works.
+
+Transfer:
+```
+Generator (async tokio task)
+  reads current_blockhash → signs batch of --batch-size → send to channel
+        │
+        └─ async_channel::bounded(32)   (backpressure: generator awaits when full)
+              │
+        ┌─────┴──────┐
+    Sender 0      Sender N   (tokio tasks, --threads count)
+    recv batch → join_all(send_transaction)  (nonblocking RpcClient)
+    sent_count += batch.len()
+    sleep --sender-sleep-ms
+```
+
+Deposit and withdraw:
 ```
 Generator (async tokio task)
   reads current_blockhash → signs batch → push to BatchQueue

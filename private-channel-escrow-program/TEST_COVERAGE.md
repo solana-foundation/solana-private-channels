@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**62 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **96 integration tests** (end-to-end behavior).
+**61 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **100 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -88,7 +88,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (21 integration tests)
+### Deposit (22 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -111,8 +111,9 @@
 - `test_deposit_rejected_after_mint_gains_freeze_authority` — MintProfileChanged; a freeze authority cannot be re-enabled once revoked, so gaining one means a recreate
 - `test_deposit_succeeds_after_freeze_authority_revoked` — the other direction; revoking leaves the mint strictly safer and must not strand deposits, so tightening the check into an equality breaks this
 - `test_deposit_succeeds_after_mint_gains_metadata` — an issuer writing metadata onto a live mint is routine, not a recreate; dropping the metadata and group bits from the exemption mask breaks this
+- `test_deposit_token_2022_memo_required_instance_ata_fails` — a deposit into an instance ATA carrying `MemoTransfer` fails, since `Deposit` emits no memo
 
-### ReleaseFunds (21 integration tests)
+### ReleaseFunds (24 integration tests)
 
 - `test_release_funds_success` — happy path; asserts the nonce bit is consumed
 - `test_release_funds_insufficient_funds` — insufficient balance error
@@ -135,6 +136,9 @@
 - `test_release_funds_token_2022_transfer_fee_success` — escrow is debited the full release amount and the user receives it minus the fee, so the fee falls on the user, not the escrow
 - `test_release_funds_token_2022_transfer_hook_forwards_extras` — the hook runs once on the way out of escrow and the nonce is consumed
 - `test_release_funds_rejects_signer_bearing_hook_extra` — the release leg of the signer-strip guard, where the escrow PDA is the transfer authority; the release reverts and the nonce stays spendable
+- `test_release_funds_token_2022_memo_required_destination` — a destination ATA carrying `MemoTransfer` is released to, with the memo CPI emitted as the transfer's preceding sibling
+- `test_release_funds_token_2022_memo_with_transfer_hook` — memo and transfer hook on one release, so the memo sibling and the forwarded hook extras coexist
+- `test_release_funds_memo_required_wrong_memo_program_rejected` — the memo program account is only address-checked on the memo path; a wrong one there is rejected
 
 ### RotateBitmap (6 integration tests)
 

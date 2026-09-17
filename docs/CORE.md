@@ -151,18 +151,21 @@ Privileged execution for token mint operations (bypasses BPF execution). This en
 GaslessCallback intercepts SVM account lookups to synthesize fee payer accounts on-demand (fixed lamports, owned by system program):
 
 ```rust
-fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
-    if let Some(account) = self.bob.get_account_shared_data(pubkey) {
-        return Some(account);
-    } else if self.fee_payers.contains(pubkey) {
+fn account(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+    self.bob.get_account_shared_data(pubkey).or_else(|| {
         // Synthesize fee payer with minimal lamports
-        return Some(AccountSharedData::new(
-            DEFAULT_FEE_PAYER_LAMPORTS,
-            0,
-            &solana_sdk_ids::system_program::ID,
-        ));
-    }
-    None
+        self.fee_payers.contains(pubkey).then(|| {
+            AccountSharedData::new(
+                DEFAULT_FEE_PAYER_LAMPORTS,
+                0,
+                &solana_sdk_ids::system_program::ID,
+            )
+        })
+    })
+}
+
+fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+    self.account(pubkey).map(|account| (account, CHANNEL_SLOT))
 }
 ```
 
@@ -184,13 +187,6 @@ Lamports sent *to* a synthesized payer are burned with it. Persisting the payer 
 Because the SVM already enforces per-instruction lamport conservation, blocking the fabricated lamports at their source means every other balance is made of lamports that already existed, so no other account needs inspecting. Accounts a transaction merely carries as writable keys are never rewritten.
 
 **Location**: [`enforce_lamport_conservation` in `core/src/stages/execution.rs`](../core/src/stages/execution.rs)
-
-#### GaslessRentCollector
-
-Intercepts rent collection to prevent the runtime from debiting lamports from synthesized fee payer accounts. Works alongside GaslessCallback to maintain the zero-fee model.
-
-**Location**: [`core/src/vm/gasless_rent_collector.rs`](../core/src/vm/gasless_rent_collector.rs)
-
 
 ### Stage 5: Settler
 
@@ -216,13 +212,14 @@ Solana Private Channels restricts which programs can execute in the payment chan
 
 | Program | Status | Notes |
 |---------|--------|-------|
-| **SPL Token** | Supported | Full support including Token-2022 |
+| **SPL Token** | Supported | Token-2022 is **not** admitted at ingress; the escrow program on Mainnet accepts it, the channel does not |
 | **SPL Associated Token Account** | Supported | ATA creation and lookup |
 | **SPL Memo** | Supported | Memo attachments |
-| **System Program** | Supported | Native transfers and account creation |
+| **System Program** | Supported | `Transfer` only; `CreateAccount`, `Allocate` and their seeded forms are rejected |
 | **Solana Private Channels Withdraw Program** | Supported | Token burns for withdrawal flow |
+| **DvP Swap Program** | Supported | Delivery-versus-payment swaps |
 
-**Source**: [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs)
+**Source**: [`is_allowed_program_instruction` in `core/src/transactions.rs`](../core/src/transactions.rs) (predicate), [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs) (enforcement)
 
 ### AdminVM Program Support
 
@@ -277,4 +274,4 @@ protection, when reasoning about memory.
 
 ### No Fork Choice
 
-Solana Private Channels does not implement slots or forks. The fork graph is stubbed — all blocks are final on write. There is no rollback mechanism.
+Solana Private Channels does not implement forks. The fork graph is stubbed — all blocks are final on write. There is no rollback mechanism. Slots do advance at the ledger level: they tick every `blocktime_ms` whether or not a block is produced, and are what `getSlot` answers. The SVM executes every transaction at a fixed slot, so the program cache never reasons across slots or forks.

@@ -13,12 +13,12 @@ all three bench flows.  The dashboard is structured to mirror the pipeline order
 The transfer flow exercises the full Solana Private Channels processing pipeline:
 
 ```
-Sent TPS → Dedup → Sigverify → Sequencer → Executor → Settler → Landed TPS
+Sent TPS → Sigverify → Dedup → Sequencer → Executor → Settler → Landed TPS
 ```
 
 **Healthy steady state:** all rates approximately equal:
 ```
-Sent ≈ Dedup forwarded ≈ Sigverify forwarded ≈ Sequencer emitted
+Sent ≈ Sigverify forwarded ≈ Dedup forwarded ≈ Sequencer emitted
       ≈ Executor results ≈ Settler settled ≈ Landed TPS
 ```
 
@@ -42,26 +42,26 @@ is the ground truth (no replication lag).
 
 ### Panel-by-panel signals
 
-**Dedup Throughput**
-
-| Series | Metric | Signal when elevated |
-|--------|--------|----------------------|
-| Received | `private_channel_dedup_received_total` | Baseline input rate |
-| Forwarded | `private_channel_dedup_forwarded_total` | — |
-| Dropped (dup) | `private_channel_dedup_dropped_duplicate_total` | Bench reusing tx signatures — check memo nonce |
-| Dropped (bh) | `private_channel_dedup_dropped_unknown_bh_total` | Blockhash poller lagging; blockhash too old |
-
 **Sigverify Throughput**
 
 | Series | Metric | Signal |
 |--------|--------|--------|
-| Forwarded | `private_channel_sigverify_forwarded_total` | Lower than dedup → increase `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` |
+| Forwarded | `private_channel_sigverify_forwarded_total` | Lower than Sent TPS → increase `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` |
 | Rejected (sig_failed) | `private_channel_sigverify_rejected_total` | Signing error in bench |
 | Rejected (invalid/not_admin) | `private_channel_sigverify_rejected_total` | Wrong program or key |
 
+**Dedup Throughput**
+
+| Series | Metric | Signal when elevated |
+|--------|--------|----------------------|
+| Received | `private_channel_dedup_received_total` | What sigverify forwarded; equals Sigverify Forwarded in steady state |
+| Forwarded | `private_channel_dedup_forwarded_total` | — |
+| Dropped (dup) | `private_channel_dedup_dropped_duplicate_total` | Bench reusing tx signatures — check memo nonce |
+| Dropped (bh) | `private_channel_dedup_dropped_unknown_bh_total` | Blockhash poller lagging; blockhash too old |
+
 **Sequencer Throughput**
 
-- `Collected` < `Sigverify forwarded` → executor is the bottleneck; backpressure visible here
+- `Collected` < `Dedup forwarded` → executor is the bottleneck; backpressure visible here
 - `Emitted` should equal `Collected` — sequencer reorders into conflict-free batches, never drops
 
 **Executor Throughput**
@@ -79,10 +79,10 @@ is the ground truth (no replication lag).
 ```
 Sent >> Landed at steady state?
 │
+├─ Sigverify Forwarded << Sent?  → increase PRIVATE_CHANNEL_SIGVERIFY_WORKERS
 ├─ Dedup Dropped (bh) high?   → blockhash poller lagging; reduce send rate
 ├─ Dedup Dropped (dup) high?  → duplicate signatures; memo nonce not incrementing
-├─ Sigverify Forwarded << Dedup Forwarded?  → increase PRIVATE_CHANNEL_SIGVERIFY_WORKERS
-├─ Sequencer Collected << Sigverify Forwarded?  → executor saturated (backpressure)
+├─ Sequencer Collected << Dedup Forwarded?  → executor saturated (backpressure)
 ├─ Executor Results << Sequencer Emitted?  → SVM is the bottleneck; check CPU
 ├─ Settler Settled << Executor Results?  → Postgres write throughput; check I/O
 └─ Settler ≈ Executor but Landed lower?  → replication lag; Settler is ground truth
@@ -152,7 +152,7 @@ validator: 500–2000 TPS depending on hardware.
 
 ```
 bench (Solana Private Channels WithdrawFunds / burn)
-  → Solana Private Channels write-node confirms (dedup → sigverify → sequencer → executor → settler)
+  → Solana Private Channels write-node confirms (sigverify → dedup → sequencer → executor → settler)
     → indexer-private-channel detects burn event, saves to DB
       → operator-private-channel fetches from DB, sends Solana ReleaseFunds
 ```

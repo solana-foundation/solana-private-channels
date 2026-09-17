@@ -123,6 +123,12 @@ The runbooks call this out at every relevant site.
   Every "escalate" call-site in the recovery runbooks links here.
 - [`withdrawal_pipeline_halt_runbook.md`](withdrawal_pipeline_halt_runbook.md) -
   the withdrawal-bitmap startup halt (log-discovered, not paged).
+- [`reconciliation_halt_runbook.md`](reconciliation_halt_runbook.md) - the runtime
+  reconciliation halt: a proven per-mint insolvency freezes both operators'
+  fetchers, quarantines active withdrawals and forces the escrow operator's
+  `/health` to 503. The halt webhook is the only alert (configure
+  `reconciliation_webhook_url`); the 503 also trips the service-down probes.
+  Recovery is manual.
 - [`indexer_block_unavailable.md`](indexer_block_unavailable.md) - the indexer
   refusing to checkpoint past a slot whose block the RPC endpoint will not serve.
   Paged by the `indexer-block-unavailable` Grafana alert, not by the webhook
@@ -166,7 +172,7 @@ pins the relevant contract.
 | `drill_12_withdrawal_failed_recovery_flows` | withdrawal | `withdrawal_failed.md` LANDED → completed-with-sig; cross-row signature fence still applies on `failed`; NOT_LANDED is terminal (markdown + operator code grep); AMBIGUOUS escalates without SQL. |
 | `drill_13_withdrawal_failed_reminted_reconcile` | withdrawal | `failed_reminted` transition writes `remint_signatures`; runbook contains zero mutating SQL; LANDED verdict cannot be silently absorbed via `SET status='completed'`; webhook `remint_signature` (singular) ↔ DB `remint_signatures` (plural) asymmetry pinned. |
 | `drill_14_deposit_manual_review_post_jit_recovery_flows` | deposit | `deposit_manual_review.md` § Path D: post-JIT trigger strings present in `mint.rs`; re-arm SQL flips `manual_review` → `pending` and is targeted by id (not error_message); idempotency memo prefix anchored. |
-| `drill_15_deposit_manual_review_recovery_idempotency_failure_flow` | deposit | `deposit_manual_review.md` § Path E: recovery-worker `deposit idempotency:` triage substring present in `recovery.rs`; re-arm SQL flips `manual_review` → `pending` and is row-scoped by id. |
+| `drill_15_deposit_manual_review_recovery_idempotency_failure_flow` | deposit | `deposit_manual_review.md` § Path E: recovery-worker `could not verify mint landed` triage substring present in `recovery.rs`; re-arm SQL flips `manual_review` → `pending` and is row-scoped by id. |
 | `drill_16_withdrawal_manual_review_recovery_missing_nonce_flow` | withdrawal | `withdrawal_manual_review.md` § Path F: recovery-worker `withdrawal row missing nonce` triage substring present in `recovery.rs`; recovery branch SQL is row-scoped; no re-arm SQL exists for this path. |
 | `drill_17_deposit_manual_review_allowlist_gate_recovery_flows` | deposit | Allowlist-gate recovery flow in `deposit_manual_review.md` is in sync with source: triage strings still exist and recovery SQL is row-scoped. |
 | `drill_18_halt_sweep_respects_nonce_floor` | withdrawal | Halt sweep is bounded below by the poison nonce: sub-poison `pending`/`processing`/`parked` rows survive; the poison and everything above it are quarantined. |
