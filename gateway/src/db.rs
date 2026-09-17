@@ -13,7 +13,7 @@ pub struct OwnerChange {
     pub new_owner: String,
 }
 
-/// Up to `limit` recorded owner handoffs for `address`, oldest first.
+/// The `limit` most recent recorded owner handoffs for `address`, oldest first.
 ///
 /// This is the gateway's one read outside the `private_channel_auth` schema.
 /// The auth service keeps its objects in their own schema to stay clear of the
@@ -23,7 +23,10 @@ pub struct OwnerChange {
 ///
 /// Handing an account on is unrestricted and costs the sender nothing, so the
 /// row count for one address is attacker-controlled and has to be bounded. The
-/// caller decides what an over-long chain means.
+/// newest rows are the ones worth spending that bound on: these rows are never
+/// deleted, so reading from the oldest end would let churn that has long since
+/// scrolled past decide what the current owner may read. The caller decides what
+/// a chain that fills the limit means.
 pub async fn owner_changes(
     pool: &PgPool,
     address: &[u8],
@@ -34,7 +37,7 @@ pub async fn owner_changes(
         SELECT slot, prev_owner, new_owner
         FROM public.token_account_owner_change
         WHERE address = $1
-        ORDER BY slot ASC, tx_index ASC
+        ORDER BY slot DESC, tx_index DESC
         LIMIT $2
         "#,
     )
@@ -43,8 +46,11 @@ pub async fn owner_changes(
     .fetch_all(pool)
     .await?;
 
+    // Taken newest first to bound the read, handed back oldest first because
+    // that is the order the timeline chains in.
     Ok(rows
         .into_iter()
+        .rev()
         .map(|(slot, prev_owner, new_owner)| OwnerChange {
             slot,
             prev_owner: bs58::encode(prev_owner).into_string(),

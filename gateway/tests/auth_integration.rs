@@ -1698,8 +1698,15 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
     insert_wallet(&pool, user_id, &owner_pubkey).await;
     let token = generate_token(user_id, "user");
 
-    let ata_pubkey = bs58::encode([51u8; 32]).into_string();
-    let backend = start_mock_backend_with_body(token_account_response(&owner_bytes, None)).await;
+    // Its own derived address: an arbitrary one reads as an account whose owner
+    // was moved with no row recorded, which is served an empty page that a 200
+    // alone would not tell apart from this one.
+    let ata_pubkey = bs58::encode(untouched_ata_of(&owner_bytes)).into_string();
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner_bytes, None),
+        history_page_for_slots(&[1]),
+    ])
+    .await;
     let addr = start_gateway(
         pool,
         "http://127.0.0.1:1".to_string(),
@@ -1721,6 +1728,11 @@ async fn test_get_signatures_for_address_token_account_owner_is_proxied() {
         .unwrap();
 
     assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        None,
+        "the owner of an account that never moved reads its history unscoped"
+    );
 }
 
 /// Approving a delegate must not cost the owner access to its own history.
@@ -1739,11 +1751,11 @@ async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() 
     insert_wallet(&pool, user_id, &owner_pubkey).await;
     let token = generate_token(user_id, "user");
 
-    let ata_pubkey = bs58::encode([54u8; 32]).into_string();
-    let backend = start_mock_backend_with_body(token_account_response(
-        &owner_bytes,
-        Some(&unrelated_delegate),
-    ))
+    let ata_pubkey = bs58::encode(untouched_ata_of(&owner_bytes)).into_string();
+    let (backend, requests) = start_recording_mock_backend(vec![
+        token_account_response(&owner_bytes, Some(&unrelated_delegate)),
+        history_page_for_slots(&[1]),
+    ])
     .await;
     let addr = start_gateway(
         pool,
@@ -1766,6 +1778,11 @@ async fn test_get_signatures_for_address_owner_keeps_history_after_delegating() 
         .unwrap();
 
     assert_eq!(res.status(), 200);
+    assert_eq!(
+        forwarded_slot_ranges(&requests),
+        None,
+        "a delegate on the account must not narrow what its owner reads"
+    );
 }
 
 /// `getSignaturesForAddress` with an Operator JWT must be proxied for any address.
@@ -2091,28 +2108,52 @@ async fn test_get_signatures_for_address_same_slot_handoffs_follow_execution_ord
     );
 }
 
-/// Handing an account on is free, so the length of its chain is up to whoever
-/// holds it. Past the cap the timeline cannot be accounted for end to end, and
-/// the caller is served nothing rather than the gateway walking it.
+/// Handing an account on is free, and these rows are never deleted, so anyone
+/// who holds an account can churn its chain past the gateway's cap and hand it
+/// back. The cap bounds how far back the owner reads, so the windows after the
+/// churn are still theirs; only what the read did not reach is withheld.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_get_signatures_for_address_overlong_chain_serves_nothing() {
+async fn test_get_signatures_for_address_churned_chain_still_serves_the_newest_windows() {
     let (pool, _url, _container) = start_postgres().await;
     db::init_schema(&pool).await.unwrap();
     init_owner_change_table(&pool).await;
 
     let owner = [1u8; 32];
     let token_account = [8u8; 32];
+    let handback_slot = 66;
 
     let user_id = insert_user(&pool, "user").await;
     insert_wallet(&pool, user_id, &bs58::encode(owner).into_string()).await;
     let token = generate_token(user_id, "user");
 
-    // One past the gateway's cap of 64.
-    for slot in 1..=65i64 {
-        let mut interim = [0u8; 32];
-        interim[0] = slot as u8;
-        insert_owner_change(&pool, &token_account, slot, 0, slot as u8, &interim, &owner).await;
+    // The owner hands it on once, it is passed hand to hand past the cap of 64,
+    // and the last holder hands it back.
+    let mut holder = owner;
+    for slot in 1..handback_slot {
+        let mut next_holder = [0u8; 32];
+        next_holder[0] = slot as u8;
+        insert_owner_change(
+            &pool,
+            &token_account,
+            slot,
+            0,
+            slot as u8,
+            &holder,
+            &next_holder,
+        )
+        .await;
+        holder = next_holder;
     }
+    insert_owner_change(
+        &pool,
+        &token_account,
+        handback_slot,
+        0,
+        handback_slot as u8,
+        &holder,
+        &owner,
+    )
+    .await;
 
     let (backend, requests) = start_recording_mock_backend(vec![
         token_account_response(&owner, None),
@@ -2142,8 +2183,8 @@ async fn test_get_signatures_for_address_overlong_chain_serves_nothing() {
     assert_eq!(res.status(), 200);
     assert_eq!(
         forwarded_slot_ranges(&requests),
-        Some(json!([])),
-        "an unreadable chain must scope the page to nothing"
+        Some(json!([[handback_slot + 1, i64::MAX]])),
+        "churn below the cap must not cost the owner the window they hold now"
     );
 }
 

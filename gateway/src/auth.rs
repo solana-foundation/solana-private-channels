@@ -415,13 +415,18 @@ pub async fn resolve_owned_slot_ranges(
         record_scope_outcome("watermarked");
         return Ok(Some(vec![(indexed_from, i64::MAX)]));
     }
-    if changes.len() as i64 > MAX_OWNER_CHANGES {
-        // The timeline is longer than we will read, so it cannot be accounted
-        // for end to end. Handing an account on is free, which makes this shape
-        // cheap to manufacture; serving nothing is the only safe answer.
-        warn!("Owner-change chain for {pubkey} exceeds {MAX_OWNER_CHANGES}; serving no history");
-        record_scope_outcome("chain_too_long");
-        return Ok(Some(Vec::new()));
+    // Past the cap what we hold is a suffix of the timeline. Every window inside
+    // it is still accounted for by the handoffs on either side of it, so the cap
+    // decides how far back the caller reads, not whether they read at all. The
+    // alternative would be permanent: these rows are never deleted, so whoever
+    // held the account could churn it past the cap and take the history of every
+    // later owner with it.
+    let chain_is_complete = changes.len() as i64 <= MAX_OWNER_CHANGES;
+    if !chain_is_complete {
+        warn!(
+            "Owner-change chain for {pubkey} exceeds {MAX_OWNER_CHANGES}; \
+             serving only what its newest handoffs account for"
+        );
     }
 
     // Every distinct wallet in the chain in one round trip, rather than a query
@@ -435,7 +440,7 @@ pub async fn resolve_owned_slot_ranges(
     let owned = owned_wallets(auth_db, user_id, &candidates).await?;
 
     let current_owner = bs58::encode(&data[OWNER_OFFSET..OWNER_END]).into_string();
-    let ranges = slot_ranges_for_owner(&changes, &current_owner, &owned)
+    let ranges = slot_ranges_for_owner(&changes, &current_owner, &owned, chain_is_complete)
         .into_iter()
         .filter_map(|(first, last)| {
             (last >= indexed_from).then_some((first.max(indexed_from), last))
@@ -448,8 +453,10 @@ pub async fn resolve_owned_slot_ranges(
         // both are worth seeing before the support ticket arrives.
         warn!("Owner-change chain for {pubkey} leaves this caller no readable window");
         record_scope_outcome("no_window");
-    } else {
+    } else if chain_is_complete {
         record_scope_outcome("scoped");
+    } else {
+        record_scope_outcome("scoped_to_newest_handoffs");
     }
 
     Ok(Some(ranges))
@@ -468,10 +475,16 @@ pub async fn resolve_owned_slot_ranges(
 /// and the last one's new owner holds the account now. A link that doesn't join
 /// means a handoff went unrecorded, so no slot after it can be placed and the
 /// caller gets nothing.
+///
+/// `chain_is_complete` says whether `changes` starts at the account's first
+/// handoff. When it doesn't, the slots below the oldest row belong to whoever
+/// held the account over handoffs nobody read, so only the windows between the
+/// rows in hand can be handed out.
 fn slot_ranges_for_owner(
     changes: &[OwnerChange],
     current_owner: &str,
     owned: &HashSet<String>,
+    chain_is_complete: bool,
 ) -> Vec<(i64, i64)> {
     let Some(last) = changes.last() else {
         return Vec::new();
@@ -489,7 +502,7 @@ fn slot_ranges_for_owner(
 
     // Before the first handoff the account belonged to whoever signed it away.
     let head_end = changes[0].slot.saturating_sub(1);
-    if owned.contains(&changes[0].prev_owner) && head_end >= 0 {
+    if chain_is_complete && owned.contains(&changes[0].prev_owner) && head_end >= 0 {
         ranges.push((0, head_end));
     }
 
@@ -1005,6 +1018,7 @@ mod tests {
             &[handoff(handoff_slot, "alice", "bob")],
             "bob",
             &wallets(&["bob"]),
+            true,
         );
 
         assert_eq!(ranges, vec![(handoff_slot + 1, i64::MAX)]);
@@ -1020,6 +1034,7 @@ mod tests {
             &[handoff(away, "alice", "bob"), handoff(back, "bob", "alice")],
             "alice",
             &wallets(&["alice"]),
+            true,
         );
 
         assert_eq!(ranges, vec![(0, away - 1), (back + 1, i64::MAX)]);
@@ -1035,6 +1050,7 @@ mod tests {
             &[handoff(500, "alice", "bob")],
             "carol",
             &wallets(&["carol", "alice"]),
+            true,
         );
 
         assert!(ranges.is_empty());
@@ -1048,6 +1064,7 @@ mod tests {
             &[handoff(100, "alice", "bob"), handoff(200, "carol", "dave")],
             "dave",
             &wallets(&["alice", "dave"]),
+            true,
         );
 
         assert!(ranges.is_empty());
@@ -1062,6 +1079,7 @@ mod tests {
             &[handoff(100, "alice", "bob")],
             "alice",
             &wallets(&["alice"]),
+            true,
         );
 
         assert!(ranges.is_empty());
@@ -1075,6 +1093,7 @@ mod tests {
             &[handoff(slot, "alice", "bob"), handoff(slot, "bob", "carol")],
             "carol",
             &wallets(&["alice", "bob", "carol"]),
+            true,
         );
 
         assert_eq!(ranges, vec![(0, slot - 1), (slot + 1, i64::MAX)]);
@@ -1088,9 +1107,27 @@ mod tests {
             &[handoff(100, "alice", "bob"), handoff(200, "bob", "carol")],
             "carol",
             &wallets(&["carol"]),
+            true,
         );
 
         assert_eq!(ranges, vec![(201, i64::MAX)]);
+    }
+
+    /// Past the read cap the rows in hand are the newest ones, not the whole
+    /// timeline. Each still accounts for the window above it, but the slots
+    /// below the oldest of them were never read and stay unreadable.
+    #[test]
+    fn a_truncated_chain_withholds_the_window_before_its_oldest_handoff() {
+        let away = 100;
+        let back = 200;
+        let ranges = slot_ranges_for_owner(
+            &[handoff(away, "alice", "bob"), handoff(back, "bob", "alice")],
+            "alice",
+            &wallets(&["alice"]),
+            false,
+        );
+
+        assert_eq!(ranges, vec![(back + 1, i64::MAX)]);
     }
 
     // ── redacts_transaction_errors ────────────────────────────────────────────
