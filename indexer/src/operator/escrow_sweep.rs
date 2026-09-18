@@ -267,6 +267,10 @@ mod tests {
     use solana_commitment_config::CommitmentConfig;
     use spl_token::solana_program::program_option::COption;
     use spl_token::state::AccountState;
+    use spl_token_2022::extension::transfer_hook::TransferHookAccount;
+    use spl_token_2022::extension::{
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    };
 
     fn client(url: &str) -> RpcClientWithRetry {
         RpcClientWithRetry::with_retry_config(
@@ -661,8 +665,8 @@ mod tests {
         );
     }
 
-    fn base64_token2022_account(mint: Pubkey, amount: u64) -> String {
-        let account = Token2022Account {
+    fn token2022_base(mint: Pubkey, amount: u64) -> Token2022Account {
+        Token2022Account {
             mint,
             owner: Pubkey::new_unique(),
             amount,
@@ -671,16 +675,49 @@ mod tests {
             is_native: COption::None,
             delegated_amount: 0,
             close_authority: COption::None,
-        };
-        let mut buf = vec![0u8; Token2022Account::LEN];
-        account.pack_into_slice(&mut buf);
-        buf.push(spl_token_2022::extension::AccountType::Account as u8);
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+        }
+    }
+
+    /// Wrap raw Token-2022 account data as one base64 `RpcKeyedAccount`, reporting the
+    /// real length as `space` so the fixture stays self-consistent.
+    fn keyed_token2022_account(data: &[u8]) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(data);
         format!(
-            r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":166,"data":["{b64}","base64"]}}}}"#,
+            r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":{space},"data":["{b64}","base64"]}}}}"#,
             ata = Pubkey::new_unique(),
             prog = spl_token_2022::id(),
+            space = data.len(),
         )
+    }
+
+    /// An extended Token-2022 account, sized by the library so the fixture cannot drift
+    /// from the on-chain layout: base state, account-type discriminator, then a TLV entry
+    /// costing four bytes of header before its value.
+    fn base64_token2022_account(mint: Pubkey, amount: u64) -> String {
+        let len = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+            ExtensionType::TransferHookAccount,
+        ])
+        .expect("a fixed-length extension has a calculable account length");
+        let mut buf = vec![0u8; len];
+        let mut state = StateWithExtensionsMut::<Token2022Account>::unpack_uninitialized(&mut buf)
+            .expect("a zeroed buffer holds an uninitialized account");
+        state
+            .init_extension::<TransferHookAccount>(true)
+            .expect("the extension fits the calculated length");
+        state.base = token2022_base(mint, amount);
+        state.pack_base();
+        state
+            .init_account_type()
+            .expect("the account type matches the extension");
+        keyed_token2022_account(&buf)
+    }
+
+    /// The other layout Token-2022 produces: no extensions, so the account stays at the
+    /// bare 165-byte base with no discriminator and no TLV data.
+    fn base64_token2022_account_without_extensions(mint: Pubkey, amount: u64) -> String {
+        let mut buf = vec![0u8; Token2022Account::LEN];
+        token2022_base(mint, amount).pack_into_slice(&mut buf);
+        keyed_token2022_account(&buf)
     }
 
     /// Mirror of `mock_sweep` with the accounts on the Token-2022 side instead, so the
@@ -717,6 +754,47 @@ mod tests {
         assert_eq!(
             balances[&mint], 4_242,
             "token-2022 extension layout must unpack"
+        );
+    }
+
+    /// The common case: a Token-2022 account carrying no extensions is the bare base
+    /// layout, and dispatching it through `StateWithExtensions` must still read it.
+    #[tokio::test]
+    async fn decodes_token2022_account_without_extensions() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        mock_sweep_token_2022(
+            &mut server,
+            &[base64_token2022_account_without_extensions(mint, 7_000)],
+        )
+        .await;
+
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+            .await
+            .unwrap()
+            .balances;
+
+        assert_eq!(
+            balances[&mint], 7_000,
+            "an unextended token-2022 account must unpack"
+        );
+    }
+
+    /// Guards the fixtures themselves: Token-2022 allocates either the bare base or the
+    /// base plus a discriminator plus at least one four-byte TLV header, never the
+    /// base-plus-discriminator layout in between.
+    #[test]
+    fn token2022_fixtures_use_lengths_the_program_allocates() {
+        let bare = ExtensionType::try_calculate_account_len::<Token2022Account>(&[]).unwrap();
+        let extended = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
+            ExtensionType::TransferHookAccount,
+        ])
+        .unwrap();
+
+        assert_eq!(bare, Token2022Account::LEN, "no extensions means no suffix");
+        assert!(
+            extended >= Token2022Account::LEN + 5,
+            "an extended account carries a discriminator and a TLV header, got {extended}"
         );
     }
 }
