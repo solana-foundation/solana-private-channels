@@ -70,7 +70,7 @@ backfill_only = false
 # Batch size for backfill operations
 batch_size = 5
 
-# Max gap in slots before requiring manual intervention (~45 days at 400ms slots)
+# Max gap in slots before requiring manual intervention (~29 days at 250ms slots)
 max_gap_slots = 10000000
 
 # RPC URL for backfill (optional, defaults to common.rpc_url)

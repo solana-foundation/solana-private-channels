@@ -24,5 +24,5 @@ batch_size = 10
 retry_max_attempts = 3
 retry_base_delay_secs = 1
 channel_buffer_size = 100
-# Solana devnet block time is ~400 ms
-confirmation_poll_interval_ms = 400
+# Solana devnet slot time is ~250 ms
+confirmation_poll_interval_ms = 250

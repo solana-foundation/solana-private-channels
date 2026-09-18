@@ -199,6 +199,7 @@
       },
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
       "id": 18,
+      "description": "Lag in slots, not seconds. At the current 250ms slot time 40 slots is roughly the 10s point where the lag alert fires.",
       "options": {
         "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "desc" }
@@ -313,6 +314,7 @@
       },
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 48 },
       "id": 30,
+      "description": "Lag in slots, not seconds. At the current 250ms slot time 40 slots is roughly the 10s point where the lag alert fires.",
       "options": {
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
         "showThresholdLabels": false,

@@ -40,8 +40,9 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
-/// Safety delay before checking finality and reminting.
-/// Solana finalized ≈ 32 slots × 400ms = ~12.8s. We use 2.5× safety factor.
+/// Safety delay before checking finality and reminting. Pre-Alpenglow finality is
+/// 32 slots, about 8s at the current 250 ms slot time, so 32s is a wide margin.
+/// Shrink once Alpenglow finality is live on the deployment's RPC.
 pub const FINALITY_SAFETY_DELAY: Duration = Duration::from_secs(32);
 
 const MAX_SIGS_PER_CALL: usize = 256;
@@ -3783,8 +3784,8 @@ mod tests {
     ///   1. `set_pending_remint` is called exactly once with the correct transaction_id.
     ///   2. All withdrawal signatures are stored — missing even one could cause a
     ///      false "not finalized" result on recovery, leading to a duplicate remint.
-    ///   3. The deadline is ~32s in the future so recovery restores the correct wait
-    ///      time rather than firing the remint immediately on restart.
+    ///   3. The deadline is FINALITY_SAFETY_DELAY in the future so recovery restores
+    ///      the correct wait time rather than firing the remint on restart.
     #[tokio::test]
     async fn permanent_failure_calls_set_pending_remint_with_correct_args() {
         // `set_pending_remint` is a compare-and-set from Processing, so the row
@@ -3892,13 +3893,16 @@ mod tests {
             "sig2's lvbh must be persisted"
         );
 
-        // Deadline must be ~FINALITY_SAFETY_DELAY (32s) from now.
-        // We allow a ±3s window to absorb test execution time.
-        let expected_min = before + chrono::Duration::seconds(29);
-        let expected_max = after + chrono::Duration::seconds(35);
+        // Derived from FINALITY_SAFETY_DELAY so retuning the const is a one-line
+        // edit; 3s of slack absorbs test execution time.
+        let delay = chrono::Duration::from_std(FINALITY_SAFETY_DELAY).unwrap();
+        let slack = chrono::Duration::seconds(3);
+        let expected_min = before + delay - slack;
+        let expected_max = after + delay + slack;
         assert!(
             *stored_deadline >= expected_min && *stored_deadline <= expected_max,
-            "deadline should be ~32s from now, got {stored_deadline}"
+            "deadline should be ~{}s from now, got {stored_deadline}",
+            FINALITY_SAFETY_DELAY.as_secs()
         );
     }
 

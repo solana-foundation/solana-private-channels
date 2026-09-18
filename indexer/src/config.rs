@@ -389,14 +389,15 @@ pub struct OperatorConfig {
     pub feepayer_monitor_interval: std::time::Duration,
     /// Milliseconds between `getSignatureStatuses` polls when confirming a sent transaction.
     /// Lower values reduce per-tx latency on PrivateChannel (~100 ms); higher values suit Solana
-    /// (~400 ms block time). Defaults to `DEFAULT_CONFIRMATION_POLL_INTERVAL_MS`.
+    /// (~250 ms slot time). Defaults to `DEFAULT_CONFIRMATION_POLL_INTERVAL_MS`.
     #[serde(default = "default_confirmation_poll_interval_ms")]
     pub confirmation_poll_interval_ms: u64,
 }
 
-/// Default poll interval for `confirmation_poll_interval_ms`, matching Solana's ~400 ms block time.
+/// Default poll interval for `confirmation_poll_interval_ms`, tracking Solana's slot time,
+/// which stepped down from 400 ms and is 250 ms today (200 ms target).
 /// operator-solana overrides this to 100 ms since PrivateChannel confirms faster.
-pub const DEFAULT_CONFIRMATION_POLL_INTERVAL_MS: u64 = 400;
+pub const DEFAULT_CONFIRMATION_POLL_INTERVAL_MS: u64 = 250;
 
 fn default_reconciliation_interval() -> std::time::Duration {
     std::time::Duration::from_secs(5 * 60) // 5 minutes
