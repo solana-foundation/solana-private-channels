@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to Solana Private Channels! This document provides guidelines and instructions for contributing to the project. 
 
-See [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) for detailed system requirements.
+See [TECHNICAL_REQUIREMENTS.md](docs/TECHNICAL_REQUIREMENTS.md) for detailed system requirements.
 
 - [Getting Started](#getting-started)
 - [Development Workflow](#development-workflow)
@@ -10,7 +10,6 @@ See [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) for detailed system r
 - [Report a Bug](#non-security-issuesbugs)
 - [Feature Requests](#feature-requests)
 - [Code Style Guidelines](#code-style-guidelines)
-- [Project Structure](#project-structure)
 - [Getting Help](#getting-help)
 - [License](#license)
 
@@ -20,7 +19,7 @@ See [TECHNICAL_REQUIREMENTS.md](TECHNICAL_REQUIREMENTS.md) for detailed system r
 ```bash
 # Clone the repository
 git clone https://github.com/solana-foundation/solana-private-channels.git
-cd private_channel
+cd solana-private-channels
 
 # Install dependencies for all projects
 make install
@@ -72,7 +71,7 @@ git commit -m "refactor(lib): simplify token validation logic"
 6. **Address review feedback**
 7. **Merge** (squash merge preferred)
 
-All contributions must pass CI/CD checks before requesting a review. The project uses GitHub Actions for continuous integration and deployment. See [.github/workflows/core-ci.yml](../.github/workflows/) for the CI/CD workflow.
+All contributions must pass CI/CD checks before requesting a review. The project uses GitHub Actions for continuous integration and deployment. See [.github/workflows/](.github/workflows/) for the CI/CD workflows.
 
 ## Bug Reporting
 
@@ -174,10 +173,10 @@ mod tests {
 }
 ```
 
-**Integration tests**: Place in `integration/tests/` directory:
+**Integration tests**: Place in `integration/tests/`. Files in subdirectories are not auto-discovered, so either declare the file as a `[[test]]` target in `integration/Cargo.toml` or pull it into an existing target with `#[path]`:
 ```rust
-// integration/tests/private_channel/test_transaction_flow.rs
-use private_channel_test_utils::*;
+// integration/tests/private-channel/test_transaction_flow.rs
+use test_utils::*;
 
 #[tokio::test]
 async fn my_test_function() {

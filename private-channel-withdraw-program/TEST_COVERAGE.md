@@ -23,7 +23,7 @@
 
 ### Unit Tests (11 tests)
 
-#### Instruction Data Parsing (7 tests in `withdraw_funds.rs`)
+#### Instruction Data Parsing (8 tests in `withdraw_funds.rs`)
 
 - `test_parse_instruction_data_valid_with_destination` — 41-byte data with destination
 - `test_parse_instruction_data_valid_without_destination` — 9-byte data, no destination
@@ -31,6 +31,7 @@
 - `test_parse_instruction_data_empty` — empty data
 - `test_parse_instruction_data_zero_amount` — zero amount succeeds at parse level
 - `test_parse_instruction_data_truncated_destination` — flag=1 but pubkey truncated
+- `test_parse_instruction_data_non_canonical_option_tag` — Option tag byte other than 0/1 rejected
 - `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
 
 #### Discriminator (2 tests in `discriminator.rs`)
@@ -85,8 +86,8 @@
 
 ### Remaining Untested Paths
 
-- Token2022 support — not tested (withdraw program uses burn, which may differ for Token2022)
+- Token-2022 rejection — the program accepts only the legacy SPL Token program, but no test asserts that a Token-2022 `token_program` is rejected
 
 ### Priority Recommendations
 
-1. **Medium**: Add Token2022 withdrawal test
+1. **Medium**: Add a test asserting Token-2022 is rejected with `IncorrectProgramId`

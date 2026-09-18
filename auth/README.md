@@ -134,6 +134,14 @@ List all verified wallets for the authenticated user. Requires a valid JWT.
 
 ---
 
+### `DELETE /auth/wallets/{pubkey}` 🔒
+
+Remove a verified wallet from the authenticated user. Requires a valid JWT.
+Returns `204 No Content` on success, or `400` with `wallet not associated with
+this user` when the pubkey is not one of the caller's verified wallets.
+
+---
+
 ### `GET /health`
 
 Liveness check. Returns `200 ok`.

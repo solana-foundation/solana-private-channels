@@ -195,6 +195,21 @@ fn drill_header(runbook: &str, section: &str) {
     eprintln!("──────────────────────────────────────────────");
 }
 
+/// Join Rust string-literal line continuations so a contract substring that is
+/// contiguous at runtime still matches the source text. A literal wrapped with a
+/// trailing `\` drops the newline and the next line's indentation at compile
+/// time, so grepping the raw file for the assembled message would miss it.
+fn join_continuations(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(idx) = rest.find("\\\n") {
+        out.push_str(&rest[..idx]);
+        rest = rest[idx + 2..].trim_start_matches([' ', '\t']);
+    }
+    out.push_str(rest);
+    out
+}
+
 // ── Drill 1: dispatch table — error_message contracts ───────────────────────
 //
 // The dispatch table in withdrawal_manual_review.md keys recovery on
@@ -241,26 +256,26 @@ fn drill_1_error_message_contracts_present_in_source() {
         // Withdrawal — sender side.
         ("remint failed:", "indexer/src/operator/sender/remint.rs"),
         (
-            "finality check failed after",
+            "remint idempotency classification unavailable",
             "indexer/src/operator/sender/remint.rs",
         ),
         (
-            "no signatures to verify — remint unsafe",
+            "no signatures to verify, remint unsafe",
             "indexer/src/operator/sender/transaction.rs",
         ),
         // Withdrawal, recovery worker. The signatureless-row verdicts; the
         // proof-gated requeue never reaches manual review, so only the two
         // terminal ones are dispatchable.
         (
-            "released on-chain with no recorded broadcast signature",
+            "with no recorded broadcast signature",
             "indexer/src/operator/recovery.rs",
         ),
         (
-            "release verification still uncertain after",
+            "release still unproven after",
             "indexer/src/operator/recovery.rs",
         ),
         (
-            "release signature journal still unreadable after",
+            "release signature lookup failed:",
             "indexer/src/operator/recovery.rs",
         ),
         (
@@ -328,8 +343,9 @@ fn drill_1_error_message_contracts_present_in_source() {
     let mut missing: Vec<String> = Vec::new();
     for (substr, path) in contracts {
         let full = workspace_root.join(path);
-        let content =
-            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}"));
+        let content = join_continuations(
+            &std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {full:?}: {e}")),
+        );
         if content.contains(substr) {
             eprintln!("OK   {path}: {substr:?}");
         } else {
@@ -1389,10 +1405,21 @@ async fn drill_17_deposit_manual_review_allowlist_gate_recovery_flows(
         .find("Step 3c")
         .expect("Path F Step 3c heading must exist");
     let step_3c_section = &runbook[step_3c_idx..];
-    let next_section_idx = step_3c_section[1..]
-        .find("\n## ")
-        .map(|i| i + 1)
-        .unwrap_or(step_3c_section.len());
+    // Step 3c is a `####` heading and ends at whichever heading comes next,
+    // today `### Path G`. Matching only "\n## " runs straight past that and
+    // swallows Path G's own recovery SQL, so take the nearest of all three
+    // depths rather than assuming which one follows.
+    let rest = &step_3c_section[1..];
+    let next_section_idx = [
+        rest.find("\n## "),
+        rest.find("\n### "),
+        rest.find("\n#### "),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .map(|i| i + 1)
+    .unwrap_or(step_3c_section.len());
     let step_3c_body = &step_3c_section[..next_section_idx];
     assert!(
         !step_3c_body.contains("UPDATE transactions")
@@ -1829,10 +1856,10 @@ async fn drill_15_deposit_manual_review_recovery_idempotency_failure_flow(
     let recovery = std::fs::read_to_string(&recovery_path)
         .unwrap_or_else(|e| panic!("read {recovery_path:?}: {e}"));
     assert!(
-        recovery.contains("deposit idempotency:"),
+        recovery.contains("could not verify mint landed"),
         "Path E dispatch substring missing from recovery.rs"
     );
-    eprintln!("OK   recovery.rs: \"deposit idempotency:\"");
+    eprintln!("OK   recovery.rs: \"could not verify mint landed\"");
 
     // ── Re-arm SQL is row-scoped and fungible across Path-E substrings ──
     let (pool, _storage, _pg) = start_postgres().await?;

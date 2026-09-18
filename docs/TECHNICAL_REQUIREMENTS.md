@@ -74,8 +74,8 @@ streams WAL to archive volumes, wire those volumes to S3 lifecycle policies.
 
 | Software | Minimum | Purpose |
 |---|---|---|
-| [Rust](https://rust-lang.org/tools/install/) | 1.91+ | Build (`rust-toolchain.toml` is authoritative) |
-| [Solana CLI](https://solana.com/docs/intro/installation) | 3.1.13 (see [`versions.env`](../versions.env)) | Program deployment; `make install-toolchain` |
+| [Rust](https://rust-lang.org/tools/install/) | 1.96+ | Build (`rust-toolchain.toml` is authoritative) |
+| [Solana CLI](https://solana.com/docs/intro/installation) | 4.2.2 (see [`versions.env`](../versions.env)) | Program deployment; `make install-toolchain` |
 | [Docker](https://docs.docker.com/get-docker/) | 26.0+ | Container runtime |
 | [Docker Compose](https://docs.docker.com/compose/install/) | 2.20+ | Stack orchestration |
 | [PostgreSQL](https://www.postgresql.org/download/) | 16+ | Database (skip if using bundled containers) |
@@ -118,7 +118,7 @@ Tune the write node's 5-stage pipeline via environment variables:
 |---|---|---|
 | `PRIVATE_CHANNEL_SIGVERIFY_WORKERS` | 4 | Parallel Ed25519 verification workers. Primary CPU lever. |
 | `PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE` | 1000 | Bounded backlog before sigverify. Trade burst tolerance for memory. |
-| `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | 256 | Sequencer batch size; larger amortises executor overhead. |
+| `PRIVATE_CHANNEL_MAX_TX_PER_BATCH` | 64 | Sequencer batch size; larger amortises executor overhead. |
 | `PRIVATE_CHANNEL_BATCH_DEADLINE_MS` | 10 | Force-flush timer for partial batches. |
 | `PRIVATE_CHANNEL_MAX_SVM_WORKERS` | 8 | Executor's parallel SVM threads per batch. |
 | `PRIVATE_CHANNEL_BLOCKTIME_MS` | 100 | Settlement interval. |

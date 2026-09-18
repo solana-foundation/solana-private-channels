@@ -283,8 +283,9 @@ all-test: unit-test integration-test
 # verify the SQL in docs/runbooks/*.md still matches the schema and the
 # operator code's contracts. They are NOT in CI by design, run them
 # manually before merging a runbook edit, or after touching processor.rs /
-# sender/transaction.rs / sender/remint.rs / db_transaction_writer.rs /
-# db_transaction_writer's webhook serializer / the indexer schema.
+# recovery.rs / sender/transaction.rs / sender/remint.rs /
+# db_transaction_writer.rs / db_transaction_writer's webhook serializer /
+# the indexer schema.
 drills:
 	@cargo test -p private-channel-indexer --test runbook_drills -- --ignored --nocapture
 

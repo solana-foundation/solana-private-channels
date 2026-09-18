@@ -99,7 +99,7 @@ do not mark Completed. Wait for RPC to recover and re-run the procedure, or
 
 The operator code itself implements the same fence: when the sender cannot
 verify whether a release landed, it routes the row to `manual_review` with
-`error_message` containing `no signatures to verify — remint unsafe`
+`error_message` ending in `| no signatures to verify, remint unsafe`
 (`indexer/src/operator/sender/transaction.rs`). Honor that fence.
 
 ## After running this procedure

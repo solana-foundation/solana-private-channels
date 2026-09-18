@@ -2,7 +2,7 @@
 
 This guide explains how to withdraw tokens from the Solana Private Channels payment channel back to Solana Mainnet, and how the on-chain withdrawal bitmap stops a withdrawal from being released twice.
 
-Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-withdrawal-on-private_channel)
+Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-withdrawal-on-solana-private-channels)
 
 ## Overview
 
@@ -160,11 +160,14 @@ Users initiate withdrawals by burning tokens on the Solana Private Channels paym
 ### TypeScript Example
 
 ```typescript
+import { getWithdrawFundsInstructionAsync } from 'private-channel-withdraw-program';
 import {
-  getWithdrawFundsInstructionAsync,
-  PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS
-} from 'private-channel-withdraw-program';
-import { address, generateKeyPairSigner, none } from '@solana/kit';
+  address,
+  createDefaultRpcTransport,
+  createSolanaRpc,
+  generateKeyPairSigner,
+  none,
+} from '@solana/kit';
 
 const user = await generateKeyPairSigner();
 const withdrawAmount = 1_000_000n; // 1 USDC (6 decimals)
@@ -191,7 +194,7 @@ const private_channelRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'htt
 - **Permissionless**: Any user can burn their tokens on Solana Private Channels
 - **Destination Field**:
   - If `null`: Tokens released to `user` address on Mainnet
-  - If specified: Tokens released to `destination` address on Mainnet (associated token account must already exist for this user's address on Mainnet)
+  - If specified: Tokens released to `destination` address on Mainnet (its associated token account must already exist on Mainnet; `ReleaseFunds` validates the ATA, it does not create it)
 - Executing the `WithdrawFunds` instruction will burn tokens from the Solana Private Channels payment channel immediately.
 
 ### Related Documentation

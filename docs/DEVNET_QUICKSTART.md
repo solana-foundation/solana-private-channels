@@ -19,9 +19,9 @@ Before starting, ensure you have:
 
 - **Docker Engine ≥ 26** (Engine or Desktop) — required for the BuildKit cache mounts the Dockerfiles use  
   - macOS Apple Silicon: Enable "Docker VMM" in Docker settings (configurable in "Settings" \-\> "Virtual Machine Options")  
-- **Node.js 24.7.0** and **pnpm 10.15.1**  
-- **Solana CLI 3.1.13** (Agave)  
-- **Rust 1.91.0** (Agave v3.1.13 requires ≥ 1.86)  
+- **Node.js 24.x** and **pnpm 10.15.1**  
+- **Solana CLI 4.2.2** (Agave)  
+- **Rust 1.96.1** (Agave v4.2.2 and the geyser plugin require ≥ 1.96)  
 - **Solana Wallet** that supports localhost or custom RPC (e.g., Backpack, Phantom, Solflare)  
 - **Solana Devnet RPC** endpoint  
 - **Yellowstone gRPC (Devnet)** endpoint (for real-time Solana event streaming)  
@@ -29,7 +29,7 @@ Before starting, ensure you have:
 
 > **Pinned versions.** Match these on the host to avoid drift from the images:
 >
-> - Solana, Node, and pnpm are the values in [`versions.env`](../versions.env), used as Docker build args — the images build with exactly these.
+> - Solana and pnpm are the values in [`versions.env`](../versions.env), used as Docker build args — the images build with exactly these. Node is not pinned there; the images install the current 24.x from NodeSource.
 > - Rust is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml).
 > - Docker's `≥ 26` floor is enforced by `scripts/check-docker.sh` and the deploy preflight.
 
@@ -214,6 +214,8 @@ For reference, here are the ports and endpoints that are now running:
 | PostgreSQL Primary | `5432` | State database (write) — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | PostgreSQL Replica | `5433` | State database (read) — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | PostgreSQL Indexer | `5434` | Indexer/operator database — bound to `127.0.0.1` (loopback-only), not externally reachable |
+| Operator (Solana) | `9102` | Deposit operator metrics |
+| Operator (channel) | `9103` | Withdrawal operator metrics |
 | Grafana | `37429` | Metrics dashboard (default password: `admin`) |
 | Prometheus | `9090` | Metrics collection |
 | cAdvisor | `8080` | Container metrics |

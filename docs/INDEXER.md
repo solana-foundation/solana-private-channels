@@ -23,12 +23,6 @@ Slots and blocks are decoupled on a Solana Private Channels node: slots tick eve
 **Location**: [`indexer/src/indexer/datasource/rpc_polling/`](../indexer/src/indexer/datasource/rpc_polling/)
 
 
-**3. Vixen**
-
-Alternative datasource using the Vixen parsing framework for instruction decoding.
-
-**Location**: [`indexer/src/datasource/vixen/`](../indexer/src/datasource/vixen/)
-
 ### Backfill Strategy
 
 Recovers missed slots on indexer restart or network issues:

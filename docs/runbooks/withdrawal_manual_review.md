@@ -48,13 +48,13 @@ have prefixes.
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
 | `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
 | `remint failed:` | B - stranded after remint failure | no | `sender/remint.rs` |
-| `finality check failed after` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
+| `remint idempotency classification unavailable` | C - ambiguous (RPC unreachable) | no | `sender/remint.rs` |
 | `but the bitmap is on generation` together with `no signatures to verify` | H - rotated past generation (use this, not C) | no | `sender/transaction.rs` |
 | `no signatures to verify` | C - ambiguous (RPC may have broadcast) | no | `sender/transaction.rs` |
 | `withdrawal row missing nonce` | F - corrupt withdrawal row | no | recovery worker quarantine |
-| `released on-chain with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
-| `release verification still uncertain after` | C - ambiguous (proof unavailable past the escalation window) | no | recovery worker quarantine |
-| `release signature journal still unreadable after` | C - ambiguous (database unreadable past the escalation window; check Postgres first) | no | recovery worker quarantine |
+| `with no recorded broadcast signature` | C - proven landed, journal empty (Step 2 resolves it) | no | recovery worker quarantine |
+| `release still unproven after` | C - ambiguous (proof unavailable past the escalation window) | no | recovery worker quarantine |
+| `release still unproven after` together with `release signature lookup failed:` | C - ambiguous (database unreadable past the escalation window; check Postgres first) | no | recovery worker quarantine |
 | `malformed stored release signature` | C - ambiguous (journal corrupt, so a signature was recorded) | no | recovery worker quarantine |
 | `no escrow instance configured to verify the release against` | C - ambiguous (operator has no escrow instance configured) | no | recovery worker quarantine |
 | `could not verify release landed (` | C - ambiguous (RPC unreachable during recovery) | no | recovery worker quarantine |

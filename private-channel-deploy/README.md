@@ -75,7 +75,7 @@ The token pins the project + config, so the playbook needs nothing else. The fil
 The deploy pulls images from GHCR. Build + push them once from the control node, then every host can `docker compose pull`.
 
 1. **Create a GitHub Personal Access Token (PAT)** with the `write:packages` [scope](https://github.com/settings/tokens/new?scopes=write:packages) (covers both push and pull)
-2. **Set the Personal Access Token (PAT) in [`secrets.yml`](./secrets.yml):**
+2. **Set the Personal Access Token (PAT) in `secrets.yml`:**
    - `ghcr_user`: GitHub username
    - `ghcr_token`: the PAT from step 1.
 3. **Build and push from the control node.** Set `image_registry` and `image_tag` in [`vars/dev.yml`](./vars/dev.yml) (e.g. `image_registry: ghcr.io/<your-github-username-lowercase>`, `image_tag: v0.1.0`), then run the snippet below from inside the `private-channel-deploy/` directory.
@@ -159,7 +159,7 @@ Operator feepayer balance is **not** a sanity gate. It's monitored continuously 
 
 Default-on (skip with `--skip-tags monitoring`). PHASE 6 brings up Prometheus + Grafana + cAdvisor + node_exporter + postgres_exporter + blackbox-exporter on the private-channel Docker network via a sibling `monitoring.compose.yml`.
 
-- **Grafana** — `http://<host>:3001`, login `admin` / `grafana_admin_password` from [`secrets.yml`](./secrets.yml). Dashboards (Health, Containers, Host, Postgres, RPC, Indexer, Operator) and datasources are provisioned read-only from [`monitoring/`](../monitoring/).
+- **Grafana** — `http://<host>:3001`, login `admin` / `grafana_admin_password` from `secrets.yml`. Dashboards (Health, Containers, Host, Postgres, RPC, Indexer, Operator) and datasources are provisioned read-only from [`monitoring/`](../monitoring/).
 - **Prometheus** — `http://<host>:9090`. Scrape config rendered from [`monitoring/prometheus.yml.j2`](../monitoring/prometheus.yml.j2); 15d retention. Use `Status → Targets` to see what's UP.
 - **Blackbox probes** — external `/health` checks (gateway / write / read / indexer / operator); query `probe_success` in Prometheus.
 
@@ -170,11 +170,11 @@ Dashboard JSON + alerting rules live under [`monitoring/`](../monitoring/) — e
 | #   | Symptom                                                                                              | Fix                                                                                                                                                                                                                                                                                                                                           |
 | --- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | Indexer crashes with `MismatchExceedsThreshold`                                                      | Validator was reset but indexer DB wasn't. Run [`teardown.yml`](./teardown.yml) then redeploy: `reset_state: true` (default in [`vars/dev.yml`](./vars/dev.yml)) wipes both in lockstep.                                                                                                                                                      |
-| 2   | `postgres-replica` unhealthy / `pg_basebackup: password authentication failed for user "replicator"` | The primary's stored credentials drifted from `postgres_replication_password` in [`secrets.yml`](./secrets.yml) (typically a stale Postgres volume from an earlier password). Run `ansible-playbook teardown.yml -l dev && ansible-playbook deploy.yml -l dev` so the volume is wiped and the primary re-initialises with the current secret. |
+| 2   | `postgres-replica` unhealthy / `pg_basebackup: password authentication failed for user "replicator"` | The primary's stored credentials drifted from `postgres_replication_password` in `secrets.yml` (typically a stale Postgres volume from an earlier password). Run `ansible-playbook teardown.yml -l dev && ansible-playbook deploy.yml -l dev` so the volume is wiped and the primary re-initialises with the current secret. |
 | 3   | `dependency failed to start: container ... is unhealthy`                                             | Stale Postgres volume from a different password. Teardown + redeploy.                                                                                                                                                                                                                                                                         |
 
 ## Potential future improvements
 
-- **Encrypt [`secrets.yml`](./secrets.yml) with SOPS+age** so it can live in git instead of travelling out of band.
+- **Encrypt `secrets.yml` with SOPS+age** so it can live in git instead of travelling out of band.
 - **Harden runtime alert delivery** (timeouts, retries, rate-limit, dead-letter) — today it's a fire-and-forget POST to `ALERT_WEBHOOK_URL`. Until then, route alerts via Grafana, which handles those concerns.
 - **CI-built images via GHCR** instead of building on the deploy host (~3 min faster, pull-only deploys).
