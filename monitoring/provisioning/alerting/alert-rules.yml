@@ -28,7 +28,10 @@ groups:
               to: 0
             datasourceUid: prometheus
             model:
-              expr: (private_channel_indexer_chain_tip_slot - private_channel_indexer_current_slot) * 0.4
+              # Seconds per slot. Mainnet stepped down from 400ms and is 250ms
+              # today; retune this factor when the 200ms target lands, or the
+              # summary reports the wrong number of seconds.
+              expr: (private_channel_indexer_chain_tip_slot - private_channel_indexer_current_slot) * 0.25
               instant: true
               refId: A
           - refId: C

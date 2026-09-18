@@ -11,7 +11,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Indexer lag (chain_tip − current_slot)",
-      "description": "How far behind chain tip the indexer is, per program_type. Sanity threshold: ≤ 50.",
+      "description": "How far behind chain tip the indexer is, per program_type. Measured in slots, not seconds. Sanity threshold: ≤ 50.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
