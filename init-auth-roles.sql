@@ -124,7 +124,8 @@ CREATE SCHEMA IF NOT EXISTS private_channel_auth AUTHORIZATION private_channel_a
 ALTER SCHEMA private_channel_auth OWNER TO private_channel_auth_owner;
 REVOKE ALL ON SCHEMA private_channel_auth FROM PUBLIC;
 -- Who may do what inside this schema is the auth service's schema init to say,
--- alongside the tables it grants on. This file stops at the schema boundary.
+-- alongside the tables it grants on. The gateway's read is the one exception,
+-- reasserted at the end of this file.
 
 -- On a cluster where the auth service already ran, its tables belong to the
 -- bootstrap user. The owner role has to hold them to grant on them.
@@ -146,5 +147,21 @@ BEGIN
         WHERE pg_namespace.nspname = 'private_channel_auth' AND pg_type.typname = 'user_role'
     ) THEN
         ALTER TYPE private_channel_auth.user_role OWNER TO private_channel_auth_owner;
+    END IF;
+END $$;
+
+-- The gateway's two reads. `auth-admin migrate` grants these, but it runs in the
+-- auth profile and the gateway is deployed without it, so on an upgrade nothing
+-- else would. Reassert what exists, skip what doesn't.
+DO $$
+BEGIN
+    GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_gateway;
+
+    IF to_regclass('private_channel_auth.users') IS NOT NULL THEN
+        GRANT SELECT ON private_channel_auth.users TO private_channel_gateway;
+    END IF;
+
+    IF to_regclass('private_channel_auth.verified_wallets') IS NOT NULL THEN
+        GRANT SELECT ON private_channel_auth.verified_wallets TO private_channel_gateway;
     END IF;
 END $$;

@@ -1498,11 +1498,32 @@ async fn auth_runtime_login_cannot_forge_roles_or_audit_rows() {
         .await
         .expect_err("must not erase the audit trail");
 
+    // Promotion is barred above; naming the column on a fresh row is the other
+    // way to reach `operator`, and it leaves no admin_audit row either.
+    sqlx::query(
+        r#"
+        INSERT INTO private_channel_auth.users (id, username, password_hash, role)
+        VALUES ($1, 'forged-operator', '$argon2id$placeholder', 'operator')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .execute(&runtime_pool)
+    .await
+    .expect_err("must not register a user as operator");
+
     // Everything the service itself serves has to keep working under the same
     // login, or the grants are too tight to deploy.
     let registered = db::insert_user(&runtime_pool, "bobob", "$argon2id$placeholder")
         .await
         .expect("register must work");
+    // Read back, not the struct: the column default decides this now.
+    let (stored_role,): (String,) =
+        sqlx::query_as("SELECT role::text FROM private_channel_auth.users WHERE id = $1")
+            .bind(registered.id)
+            .fetch_one(&runtime_pool)
+            .await
+            .expect("role lookup failed");
+    assert_eq!(stored_role, "user", "registration must default to user");
     db::find_user_by_username(&runtime_pool, "bobob")
         .await
         .expect("login must work");
@@ -1638,6 +1659,124 @@ async fn admin_audit_rejects_rewrites_from_its_owner() {
 
     let surviving: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM private_channel_auth.admin_audit")
         .fetch_one(&pool)
+        .await
+        .expect("count query failed");
+
+    assert_eq!(surviving.0, 1, "the recorded grant must survive");
+}
+
+/// The channel runtime owns the ledger schema and must reach nothing in this
+/// one. Production enforces that by ownership rather than by any grant, so the
+/// setup reproduces that boundary instead of leaning on the test superuser
+/// owning the schema, which denies the same statements for a reason the
+/// deployment does not rely on.
+#[tokio::test(flavor = "multi_thread")]
+async fn channel_runtime_login_reaches_nothing_in_the_auth_schema() {
+    let owner_password = "owner-password";
+    let runtime_password = "runtime-password";
+    let (db_url, container) = start_postgres().await;
+    let bootstrap_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    // init-auth-roles.sql, in the order it runs.
+    sqlx::query(&format!(
+        "CREATE ROLE private_channel_auth_owner LOGIN PASSWORD '{owner_password}'"
+    ))
+    .execute(&bootstrap_pool)
+    .await
+    .expect("failed to create the owner role");
+
+    sqlx::query(&format!(
+        "CREATE ROLE private_channel_runtime LOGIN PASSWORD '{runtime_password}'"
+    ))
+    .execute(&bootstrap_pool)
+    .await
+    .expect("failed to create the runtime role");
+
+    sqlx::query("GRANT CREATE ON DATABASE auth_test TO private_channel_auth_owner")
+        .execute(&bootstrap_pool)
+        .await
+        .expect("failed to grant CREATE on the database");
+
+    sqlx::query("CREATE SCHEMA private_channel_auth AUTHORIZATION private_channel_auth_owner")
+        .execute(&bootstrap_pool)
+        .await
+        .expect("failed to create the auth schema");
+
+    sqlx::query("REVOKE ALL ON SCHEMA private_channel_auth FROM PUBLIC")
+        .execute(&bootstrap_pool)
+        .await
+        .expect("failed to revoke the public grant");
+
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+
+    // `auth-admin migrate` connects as the owner, so the tables land on it.
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&format!(
+            "postgres://private_channel_auth_owner:{owner_password}@{host}:{port}/auth_test"
+        ))
+        .await
+        .expect("failed to connect as the owner role");
+
+    db::init_schema(&owner_pool)
+        .await
+        .expect("failed to init schema");
+
+    let victim = db::insert_user(&owner_pool, "alice", "$argon2id$placeholder")
+        .await
+        .expect("failed to insert user");
+    db::insert_admin_audit(&owner_pool, "admin", "set_role", victim.id, "user -> operator")
+        .await
+        .expect("failed to record the grant");
+
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://private_channel_runtime:{runtime_password}@{host}:{port}/auth_test"
+        ))
+        .await
+        .expect("failed to connect as the runtime role");
+
+    // The message is asserted because without USAGE on the schema every one of
+    // these would also fail on a table that was never created, which would pass
+    // for a reason that proves nothing.
+    for (statement, what) in [
+        (
+            "SELECT role::text FROM private_channel_auth.users",
+            "must not read the identity tables",
+        ),
+        (
+            "UPDATE private_channel_auth.users SET role = 'operator'",
+            "must not promote a user",
+        ),
+        (
+            "INSERT INTO private_channel_auth.verified_wallets (id, user_id, pubkey)
+             VALUES (gen_random_uuid(), gen_random_uuid(), 'attacker-wallet')",
+            "must not forge a wallet link",
+        ),
+        (
+            "DELETE FROM private_channel_auth.admin_audit",
+            "must not erase the audit trail",
+        ),
+    ] {
+        let err = sqlx::query(statement)
+            .execute(&runtime_pool)
+            .await
+            .expect_err(what);
+
+        assert!(
+            err.to_string().contains("permission denied for schema"),
+            "{what}, and for lack of schema access: {err}"
+        );
+    }
+
+    let surviving: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM private_channel_auth.admin_audit")
+        .fetch_one(&owner_pool)
         .await
         .expect("count query failed");
 

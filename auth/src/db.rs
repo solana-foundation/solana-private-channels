@@ -170,7 +170,13 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
         BEGIN
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'private_channel_auth_runtime') THEN
                 GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_auth_runtime;
-                GRANT SELECT, INSERT
+                -- Registration's three columns, not the table: a table-wide
+                -- INSERT lets this login name its own `role` and mint an
+                -- operator admin_audit never sees. The revoke narrows an
+                -- existing cluster, and clears column grants too, so it leads.
+                REVOKE INSERT ON private_channel_auth.users FROM private_channel_auth_runtime;
+                GRANT SELECT ON private_channel_auth.users TO private_channel_auth_runtime;
+                GRANT INSERT (id, username, password_hash)
                     ON private_channel_auth.users TO private_channel_auth_runtime;
                 GRANT SELECT, INSERT, UPDATE, DELETE
                     ON private_channel_auth.challenges TO private_channel_auth_runtime;
@@ -255,8 +261,8 @@ pub async fn find_username_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<St
 pub async fn insert_user(pool: &PgPool, username: &str, password_hash: &str) -> AppResult<User> {
     let row: (Uuid, String, String, String, DateTime<Utc>) = sqlx::query_as(
         r#"
-        INSERT INTO private_channel_auth.users (id, username, password_hash, role)
-        VALUES ($1, $2, $3, 'user')
+        INSERT INTO private_channel_auth.users (id, username, password_hash)
+        VALUES ($1, $2, $3)
         RETURNING id, username, password_hash, role::text, created_at
         "#,
     )

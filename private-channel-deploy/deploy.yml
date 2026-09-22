@@ -483,6 +483,9 @@
         vars:
           candidates:
             - "{{ postgres_password }}"
+            # Carries REPLICATION, so it can pg_basebackup the whole cluster,
+            # auth schema included, whatever the grants say.
+            - "{{ postgres_replication_password }}"
             - "{{ postgres_runtime_password }}"
             - "{{ postgres_auth_runtime_password }}"
             - "{{ postgres_auth_owner_password }}"
