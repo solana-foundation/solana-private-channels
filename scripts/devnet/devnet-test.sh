@@ -28,6 +28,15 @@
 
 set -eo pipefail
 
+# The indexer cluster has its own superuser, distinct from the primary's. Read it
+# from the container rather than the host env, so this works whether the volume
+# was created fresh (the login exists from initdb) or migrated (created by
+# init-indexer-login.sql). Local socket auth needs no password.
+indexer_psql() {
+  docker exec private-channel-postgres-indexer \
+    sh -c 'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" "$@"' sh "$@"
+}
+
 # Source .env if it exists
 if [ -f .env ]; then
   set -a
@@ -176,7 +185,7 @@ for i in {1..30}; do
 done
 
 # Get initial deposit count from database
-INITIAL_DEPOSIT_COUNT=$(docker exec private-channel-postgres-indexer psql -U private_channel -d indexer -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n' || echo "0")
+INITIAL_DEPOSIT_COUNT=$(indexer_psql -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" | tr -d ' \n')
 EXPECTED_DEPOSIT_COUNT=$((INITIAL_DEPOSIT_COUNT + 2))
 echo "Initial deposit count: $INITIAL_DEPOSIT_COUNT, expecting: $EXPECTED_DEPOSIT_COUNT after test"
 
@@ -235,7 +244,7 @@ echo "=== Step 9: Validate Backfill ==="
 echo "Waiting for backfill to complete..."
 
 for i in {1..30}; do
-  TX_COUNT=$(docker exec private-channel-postgres-indexer psql -U private_channel -d indexer -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n')
+  TX_COUNT=$(indexer_psql -t -c "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit' AND status = 'completed';" 2>/dev/null | tr -d ' \n')
   if [ "$TX_COUNT" -eq "$EXPECTED_DEPOSIT_COUNT" ]; then
     echo "✅ Backfill validated: $EXPECTED_DEPOSIT_COUNT completed deposits found (added 2 new)!"
     break
@@ -252,7 +261,7 @@ fi
 
 echo ""
 echo "=== Deposit Details ==="
-docker exec private-channel-postgres-indexer psql -U private_channel -d indexer -c "SELECT id, signature, slot, initiator, amount, status, transaction_type FROM transactions WHERE transaction_type = 'deposit' ORDER BY slot;" 2>/dev/null
+indexer_psql -c "SELECT id, signature, slot, initiator, amount, status, transaction_type FROM transactions WHERE transaction_type = 'deposit' ORDER BY slot;" 2>/dev/null
 
 echo ""
 echo "=== Step 10: Additional Deposits ==="

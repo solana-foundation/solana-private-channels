@@ -75,6 +75,8 @@
         postgres_auth_owner_password: "{{ _d.POSTGRES_AUTH_OWNER_PASSWORD | default('') }}"
         postgres_gateway_password: "{{ _d.POSTGRES_GATEWAY_PASSWORD | default('') }}"
         postgres_monitoring_password: "{{ _d.POSTGRES_MONITORING_PASSWORD | default('') }}"
+        postgres_grafana_password: "{{ _d.POSTGRES_GRAFANA_PASSWORD | default('') }}"
+        postgres_indexer_password: "{{ _d.POSTGRES_INDEXER_PASSWORD | default('') }}"
         jwt_secret: "{{ _d.JWT_SECRET | default('') }}"
         grafana_admin_password: "{{ _d.GRAFANA_ADMIN_PASSWORD | default('') }}"
         ghcr_user: "{{ _d.GHCR_USER | default('') }}"
@@ -469,11 +471,15 @@
           - postgres_auth_owner_password | default('') | length > 0
           - postgres_gateway_password | default('') | length > 0
           - postgres_monitoring_password | default('') | length > 0
+          - postgres_grafana_password | default('') | length > 0
+          - postgres_indexer_password | default('') | length > 0
         fail_msg: |
           One of `postgres_runtime_password`, `postgres_auth_runtime_password`, `postgres_auth_owner_password`,
-          `postgres_gateway_password`, `postgres_monitoring_password` is empty in secrets.yml. init-auth-roles.sql
-          sets one per service login on postgres-primary. Fix: edit secrets.yml and add all five.
-          Generate each fresh: openssl rand -hex 16.
+          `postgres_gateway_password`, `postgres_monitoring_password`, `postgres_grafana_password`,
+          `postgres_indexer_password` is empty in secrets.yml. init-auth-roles.sql sets one per service
+          login on postgres-primary, init-indexer-roles.sql sets Grafana's on postgres-indexer, and
+          postgres_indexer_password is that cluster's own superuser. Fix: edit secrets.yml and add all
+          seven. Generate each fresh: openssl rand -hex 16.
 
     # Sharing one value would give a compromised service every other login's
     # rights, which is exactly what separating them is for.
@@ -491,6 +497,8 @@
             - "{{ postgres_auth_owner_password }}"
             - "{{ postgres_gateway_password }}"
             - "{{ postgres_monitoring_password }}"
+            - "{{ postgres_grafana_password }}"
+            - "{{ postgres_indexer_password }}"
         fail_msg: |
           Two postgres logins share a password. Each needs its own, or a compromised service
           holds the others' rights. Fix: edit secrets.yml and give each one a distinct value.
@@ -873,6 +881,8 @@
       - init-primary.sql
       - init-primary-hba.sh
       - init-auth-roles.sql
+      - init-indexer-roles.sql
+      - init-indexer-login.sql
       - yellowstone-config.json
 
     - name: Copy postgres init SQL to target
@@ -892,6 +902,21 @@
       ansible.builtin.copy:
         src: "{{ repo_root }}/init-auth-roles.sql"
         dest: "{{ target_config_dir }}/init-auth-roles.sql"
+        mode: "0644"
+
+    # Same, for the indexer cluster's Grafana login.
+    - name: Copy postgres indexer-role SQL to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/init-indexer-roles.sql"
+        dest: "{{ target_config_dir }}/init-indexer-roles.sql"
+        mode: "0644"
+
+    # Creates the indexer cluster's own login on a data directory that predates
+    # it; the entrypoint never would.
+    - name: Copy postgres indexer-login SQL to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/init-indexer-login.sql"
+        dest: "{{ target_config_dir }}/init-indexer-login.sql"
         mode: "0644"
 
     - name: Copy indexer/operator TOML configs to target
@@ -1121,6 +1146,67 @@
       no_log: true
       changed_when: true
 
+    # Same shape for the indexer cluster, which holds the rows Grafana reads.
+    - name: Bring postgres-indexer up first
+      ansible.builtin.shell: "{{ compose_cmd }} up -d --wait postgres-indexer"
+      args:
+        chdir: "{{ target_config_dir }}"
+      changed_when: true
+
+    # initdb creates POSTGRES_USER and nothing else ever does, so on a cluster
+    # that predates the split the indexer login does not exist yet and the task
+    # below could not connect. Find whichever login works, then make the new one.
+    #
+    # Over the container's local socket, which pg_hba trusts. That is also what
+    # lets a rotated postgres_indexer_password be applied: the role's stored
+    # password is the old one, so a password-authenticated probe would reject
+    # exactly the case this has to fix.
+    - name: Find a working login for the indexer cluster
+      ansible.builtin.shell:
+        cmd: >-
+          for candidate in "{{ postgres_indexer_user }}:{{ postgres_indexer_password }}"
+          "{{ postgres_user }}:{{ postgres_password }}"; do
+          user="${candidate%%:*}"; pass="${candidate#*:}";
+          if docker exec -e PGPASSWORD="$pass" private-channel-postgres-indexer
+          psql -U "$user" -d {{ postgres_indexer_db }} -tAc 'SELECT 1' >/dev/null 2>&1;
+          then echo "$user"; exit 0; fi; done; exit 1
+      register: _indexer_login
+      changed_when: false
+      no_log: true
+
+    # SUPERUSER for parity with a fresh cluster, where this role is the one initdb
+    # created. The prior login is a copy of the primary's superuser credential, so
+    # its LOGIN goes away once nothing connects as it; it keeps what it owns.
+    - name: Ensure the indexer login exists and the prior one cannot log in
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec -i -e PGPASSWORD private-channel-postgres-indexer
+          psql -v ON_ERROR_STOP=1 -q -U {{ _indexer_login.stdout | trim }}
+          -d {{ postgres_indexer_db }}
+          -v target_user={{ postgres_indexer_user | quote }}
+          -v target_pw={{ postgres_indexer_password | quote }}
+          -v prior_user={{ postgres_user | quote }}
+          -f - < {{ target_config_dir }}/init-indexer-login.sql
+      environment:
+        PGPASSWORD: "{{ postgres_indexer_password if (_indexer_login.stdout | trim) == postgres_indexer_user else postgres_password }}"
+      no_log: true
+      changed_when: true
+
+    # POSTGRES_DB is already the indexer database inside this container, and
+    # docker exec inherits it, so the script resolves it without being told.
+    - name: Apply the Grafana role definition to the indexer cluster
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec -i -e PGPASSWORD -e POSTGRES_GRAFANA_PASSWORD
+          private-channel-postgres-indexer
+          psql -v ON_ERROR_STOP=1 -U {{ postgres_indexer_user }} -d {{ postgres_indexer_db }} -f -
+          < {{ target_config_dir }}/init-indexer-roles.sql
+      environment:
+        PGPASSWORD: "{{ postgres_indexer_password }}"
+        POSTGRES_GRAFANA_PASSWORD: "{{ postgres_grafana_password }}"
+      no_log: true
+      changed_when: true
+
     # `up -d --wait` blocks until each service's healthcheck passes (or fails).
     # That's the bulk of the deploy-time gating; the explicit health phase
     # below is the second layer (HTTP probes from the control node).
@@ -1342,6 +1428,19 @@
       ansible.builtin.shell: "{{ mon_compose_cmd }} up -d --wait"
       changed_when: true
       register: _mon_up
+
+    # Grafana applies GF_SECURITY_ADMIN_PASSWORD only when it first creates the
+    # admin user, so on an existing grafana volume a rotated
+    # `grafana_admin_password` would otherwise never take effect.
+    - name: Reset the stored Grafana admin password
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec private-channel-mon-grafana
+          grafana-cli --homepath /usr/share/grafana admin reset-admin-password "$GF_PASSWORD"
+      environment:
+        GF_PASSWORD: "{{ grafana_admin_password }}"
+      no_log: true
+      changed_when: true
 
     - name: Verify Prometheus is ready
       ansible.builtin.uri:

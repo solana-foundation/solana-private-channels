@@ -330,13 +330,16 @@ services:
     logging: *default-logging
     environment:
       - POSTGRES_DB=${POSTGRES_INDEXER_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_USER=${POSTGRES_INDEXER_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_INDEXER_PASSWORD}
+      # Read by init-indexer-roles.sql, for the Grafana datasource login.
+      - POSTGRES_GRAFANA_PASSWORD=${POSTGRES_GRAFANA_PASSWORD}
     ports:
       - "127.0.0.1:5434:5432"
     volumes:
       - postgres-indexer-data:/var/lib/postgresql/data
       - postgres-indexer-wal-archive:/wal_archive
+      - ./init-indexer-roles.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
     command: |
       postgres
       -c wal_level=replica
@@ -346,7 +349,7 @@ services:
     networks:
       - private-channel-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_INDEXER_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_INDEXER_USER} -d ${POSTGRES_INDEXER_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -365,7 +368,7 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
       # source_rpc_url = channel read-node for the startup supply invariant
       # (supply <= custody). Required for escrow: the indexer refuses to start without it.
@@ -411,7 +414,7 @@ services:
         condition: service_started
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # Read channel blocks straight from the read-node, not the gateway. The
       # gateway's public port enforces JWT auth on getBlock/getSignaturesForAddress
       # when JWT_SECRET is set, and internal services carry no token, so routing
@@ -450,7 +453,7 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       # Mints go through the gateway (only it routes writes to the write node and
       # reads to the read node), on the internal listener: this operator carries
       # no JWT, and its confirmation handling routes on the exact error the
@@ -506,7 +509,7 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info,private_channel_indexer=debug
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
+      - DATABASE_URL=postgres://${POSTGRES_INDEXER_USER}:${POSTGRES_INDEXER_PASSWORD}@postgres-indexer:5432/${POSTGRES_INDEXER_DB}
       - COMMON_RPC_URL=${DEVNET_RPC_URL}
       # Archival Solana fallback that re-checks a Dead finality verdict before a remint.
       # Empty is treated as unset (single-endpoint).
@@ -586,8 +589,8 @@ services:
     # TODO: same pg_hba/role mismatch as pg-backup-primary above.
     environment:
       - PGHOST=postgres-indexer
-      - PGUSER=${POSTGRES_USER}
-      - PGPASSWORD=${POSTGRES_PASSWORD}
+      - PGUSER=${POSTGRES_INDEXER_USER}
+      - PGPASSWORD=${POSTGRES_INDEXER_PASSWORD}
       - PG_BACKUP_INTERVAL_HOURS=${PG_BACKUP_INTERVAL_HOURS:-6}
       - PG_BACKUP_RETENTION_COUNT=${PG_BACKUP_RETENTION_COUNT:-3}
     volumes:
@@ -620,7 +623,7 @@ services:
     restart: unless-stopped
     logging: *default-logging
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - /:/rootfs:ro
       - /var/run:/var/run:ro
@@ -643,7 +646,9 @@ services:
     restart: unless-stopped
     logging: *default-logging
     ports:
-      - "9090:9090"
+      # Prometheus scrapes over the compose network; this port is only for a
+      # human at the host.
+      - "127.0.0.1:9090:9090"
     volumes:
       - prometheus-data:/prometheus
     environment:
@@ -675,7 +680,10 @@ services:
     restart: unless-stopped
     logging: *default-logging
     ports:
-      - "37429:3000"
+      # Loopback like every database port here. Grafana's datasource reaches the
+      # indexer database, so publishing this port publishes participant state to
+      # anyone who reaches the host. Front it with a reverse proxy for real use.
+      - "127.0.0.1:37429:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/provisioning:/etc/grafana/provisioning:ro
@@ -685,8 +693,7 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - POSTGRES_INDEXER_DB=${POSTGRES_INDEXER_DB}
       - POSTGRES_INDEXER_HOST=${POSTGRES_INDEXER_HOST:-postgres-indexer}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_GRAFANA_PASSWORD=${POSTGRES_GRAFANA_PASSWORD}
       - PROMETHEUS_URL=${PROMETHEUS_URL:-http://prometheus:9090}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://localhost:9/no-op}
       - ALERT_CONTACT_TYPE=${ALERT_CONTACT_TYPE:-webhook}

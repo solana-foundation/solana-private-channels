@@ -247,7 +247,7 @@
           "datasource": { "type": "postgres", "uid": "postgres-indexer" },
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT status AS metric, COUNT(*) AS value\nFROM transactions\nWHERE transaction_type = 'withdrawal'\nGROUP BY status",
+          "rawSql": "SELECT status AS metric, COUNT(*) AS value\nFROM transaction_monitoring\nWHERE transaction_type = 'withdrawal'\nGROUP BY status",
           "refId": "A"
         }
       ],
@@ -271,7 +271,7 @@
           "datasource": { "type": "postgres", "uid": "postgres-indexer" },
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  $__timeGroup(created_at, $__interval) AS time,\n  COUNT(*) AS \"pending withdrawals\"\nFROM transactions\nWHERE transaction_type = 'withdrawal'\n  AND status = 'pending'\n  AND $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
+          "rawSql": "SELECT\n  $__timeGroup(created_at, $__interval) AS time,\n  COUNT(*) AS \"pending withdrawals\"\nFROM transaction_monitoring\nWHERE transaction_type = 'withdrawal'\n  AND status = 'pending'\n  AND $__timeFilter(created_at)\nGROUP BY 1\nORDER BY 1",
           "refId": "A"
         }
       ],
