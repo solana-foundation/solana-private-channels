@@ -2,7 +2,7 @@ name: Program Integration Tests
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
@@ -11,7 +11,7 @@ on:
       - ".github/workflows/program-integration.yml"
       - "scripts/**"
   pull_request:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"

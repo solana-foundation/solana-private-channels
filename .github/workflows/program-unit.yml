@@ -2,14 +2,14 @@ name: Program Unit Tests
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
       - "Cargo.*"
       - ".github/workflows/program-unit.yml"
   pull_request:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
     paths:
       - "private-channel-escrow-program/**"
       - "private-channel-withdraw-program/**"
