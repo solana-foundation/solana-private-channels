@@ -37,6 +37,9 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Create or update the auth schema. Runs as its owner, before the service
+    /// starts: the login the service runs as has no DDL rights
+    Migrate,
     /// Look up a user's immutable id, role and creation time
     ShowUser(ShowUserArgs),
     /// Attach a wallet to a user without verification — operator asserts trust
@@ -141,6 +144,20 @@ async fn run(args: Args) -> Result<()> {
     // The actor is resolved before connecting so a missing one fails without the
     // tool having touched the database.
     match args.command {
+        // The one command that runs the DDL even when the schema is already
+        // there, so triggers and grants added later land on it. It connects
+        // without `connect`'s guard for that reason.
+        Command::Migrate => {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .map_err(|e| anyhow!("Failed to connect to auth DB: {}", e))?;
+
+            db::init_schema(&pool).await?;
+            info!("schema initialized");
+            println!("schema initialized");
+        }
         Command::ShowUser(args) => show_user(&connect(&database_url).await?, args).await?,
         Command::AttachWallet(args) => {
             let actor = admin_actor()?;

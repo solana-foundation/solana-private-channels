@@ -154,7 +154,9 @@ services:
     container_name: private-channel-mon-pgexp-primary
     restart: unless-stopped
     environment:
-      - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
+      # pg_monitor only. This container is long-lived on the same network as the
+      # auth tables, so the bootstrap superuser has no business being here.
+      - DATA_SOURCE_NAME=postgresql://private_channel_monitoring:{{ postgres_monitoring_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
     ports:
       - "{{ monitoring_postgres_exporter_port }}:9187"
     networks: [private-channel]

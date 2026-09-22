@@ -109,6 +109,86 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // No application role is granted UPDATE or DELETE on admin_audit below, and
+    // this guard binds the owner too. It does not bind a superuser, which can
+    // turn triggers off for its session with session_replication_role.
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION private_channel_auth.reject_admin_audit_rewrite()
+        RETURNS trigger AS $guard$
+        BEGIN
+            RAISE EXCEPTION 'private_channel_auth.admin_audit is append-only';
+        END;
+        $guard$ LANGUAGE plpgsql
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Dropped and recreated rather than CREATE OR REPLACE TRIGGER, which the
+    // Postgres the integration tests run predates.
+    sqlx::query(
+        r#"DROP TRIGGER IF EXISTS admin_audit_append_only ON private_channel_auth.admin_audit"#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER admin_audit_append_only
+        BEFORE UPDATE OR DELETE ON private_channel_auth.admin_audit
+        FOR EACH ROW EXECUTE FUNCTION private_channel_auth.reject_admin_audit_rewrite()
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"DROP TRIGGER IF EXISTS admin_audit_no_truncate ON private_channel_auth.admin_audit"#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER admin_audit_no_truncate
+        BEFORE TRUNCATE ON private_channel_auth.admin_audit
+        FOR EACH STATEMENT EXECUTE FUNCTION private_channel_auth.reject_admin_audit_rewrite()
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // What the auth service's login may do: register and authenticate users,
+    // and manage their wallets. Changing a role and writing the audit trail are
+    // the admin CLI's, which connects as the owner of this schema. The gateway
+    // only ever reads, so it holds none of the writes. Skipped when a role is
+    // absent, as both are in tests and in single-login dev setups.
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'private_channel_auth_runtime') THEN
+                GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_auth_runtime;
+                GRANT SELECT, INSERT
+                    ON private_channel_auth.users TO private_channel_auth_runtime;
+                GRANT SELECT, INSERT, UPDATE, DELETE
+                    ON private_channel_auth.challenges TO private_channel_auth_runtime;
+                GRANT SELECT, INSERT, DELETE
+                    ON private_channel_auth.verified_wallets TO private_channel_auth_runtime;
+            END IF;
+
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'private_channel_gateway') THEN
+                GRANT USAGE ON SCHEMA private_channel_auth TO private_channel_gateway;
+                GRANT SELECT ON private_channel_auth.users TO private_channel_gateway;
+                GRANT SELECT ON private_channel_auth.verified_wallets TO private_channel_gateway;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

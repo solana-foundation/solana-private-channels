@@ -1435,3 +1435,211 @@ async fn test_delete_wallet_cannot_delete_other_users_wallet() {
 
     assert_eq!(res.status(), 400);
 }
+
+/// The login the service runs as is what a compromise of the service yields. It
+/// must not be able to promote a user or touch the audit trail, while every path
+/// it actually serves keeps working.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_runtime_login_cannot_forge_roles_or_audit_rows() {
+    let runtime_password = "runtime-password";
+    let (db_url, container) = start_postgres().await;
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    // The role has to exist before the schema init, which is what grants to it.
+    sqlx::query(&format!(
+        "CREATE ROLE private_channel_auth_runtime LOGIN PASSWORD '{runtime_password}'"
+    ))
+    .execute(&owner_pool)
+    .await
+    .expect("failed to create the runtime role");
+
+    db::init_schema(&owner_pool)
+        .await
+        .expect("failed to init schema");
+
+    let victim = db::insert_user(&owner_pool, "alice", "$argon2id$placeholder")
+        .await
+        .expect("failed to insert user");
+
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let runtime_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://private_channel_auth_runtime:{runtime_password}@{host}:{port}/auth_test"
+        ))
+        .await
+        .expect("failed to connect as the runtime role");
+
+    sqlx::query("UPDATE private_channel_auth.users SET role = 'operator' WHERE id = $1")
+        .bind(victim.id)
+        .execute(&runtime_pool)
+        .await
+        .expect_err("must not promote a user");
+
+    sqlx::query(
+        r#"
+        INSERT INTO private_channel_auth.admin_audit (id, actor, action, target_user_id, detail)
+        VALUES ($1, 'forged', 'set_role', $2, 'user -> operator')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(victim.id)
+    .execute(&runtime_pool)
+    .await
+    .expect_err("must not write the audit trail");
+
+    sqlx::query("DELETE FROM private_channel_auth.admin_audit")
+        .execute(&runtime_pool)
+        .await
+        .expect_err("must not erase the audit trail");
+
+    // Everything the service itself serves has to keep working under the same
+    // login, or the grants are too tight to deploy.
+    let registered = db::insert_user(&runtime_pool, "bobob", "$argon2id$placeholder")
+        .await
+        .expect("register must work");
+    db::find_user_by_username(&runtime_pool, "bobob")
+        .await
+        .expect("login must work");
+    db::insert_challenge(&runtime_pool, registered.id, Uuid::new_v4())
+        .await
+        .expect("issuing a challenge must work");
+    let wallet = db::insert_verified_wallet(&runtime_pool, registered.id, "wallet-pubkey")
+        .await
+        .expect("verifying a wallet must work");
+    db::delete_verified_wallet(&runtime_pool, registered.id, &wallet.pubkey)
+        .await
+        .expect("removing a wallet must work");
+    db::cleanup_stale_challenges(&runtime_pool)
+        .await
+        .expect("challenge cleanup must work");
+}
+
+/// The gateway only ever reads. Its login must not be able to forge a wallet
+/// link, which is the ownership check it exists to enforce.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_login_cannot_write_to_the_auth_tables() {
+    let gateway_password = "gateway-password";
+    let (db_url, container) = start_postgres().await;
+    let owner_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    sqlx::query(&format!(
+        "CREATE ROLE private_channel_gateway LOGIN PASSWORD '{gateway_password}'"
+    ))
+    .execute(&owner_pool)
+    .await
+    .expect("failed to create the gateway role");
+
+    db::init_schema(&owner_pool)
+        .await
+        .expect("failed to init schema");
+
+    let user = db::insert_user(&owner_pool, "alice", "$argon2id$placeholder")
+        .await
+        .expect("failed to insert user");
+    db::insert_verified_wallet(&owner_pool, user.id, "wallet-pubkey")
+        .await
+        .expect("failed to attach wallet");
+
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let gateway_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://private_channel_gateway:{gateway_password}@{host}:{port}/auth_test"
+        ))
+        .await
+        .expect("failed to connect as the gateway role");
+
+    // The two reads the gateway actually performs.
+    let (role,): (String,) =
+        sqlx::query_as("SELECT role::text FROM private_channel_auth.users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(&gateway_pool)
+            .await
+            .expect("role lookup must work");
+    assert_eq!(role, "user");
+
+    let owned: Vec<(String,)> =
+        sqlx::query_as("SELECT pubkey FROM private_channel_auth.verified_wallets WHERE user_id = $1")
+            .bind(user.id)
+            .fetch_all(&gateway_pool)
+            .await
+            .expect("wallet lookup must work");
+    assert_eq!(owned.len(), 1);
+
+    sqlx::query(
+        r#"
+        INSERT INTO private_channel_auth.verified_wallets (id, user_id, pubkey)
+        VALUES ($1, $2, 'attacker-wallet')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(user.id)
+    .execute(&gateway_pool)
+    .await
+    .expect_err("must not forge a wallet link");
+
+    sqlx::query("UPDATE private_channel_auth.users SET role = 'operator' WHERE id = $1")
+        .bind(user.id)
+        .execute(&gateway_pool)
+        .await
+        .expect_err("must not promote a user");
+
+    sqlx::query("DELETE FROM private_channel_auth.verified_wallets")
+        .execute(&gateway_pool)
+        .await
+        .expect_err("must not remove a wallet link");
+}
+
+/// The trigger rather than the grants: the owner of the schema holds every
+/// privilege on the table and still must not rewrite what it records.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_audit_rejects_rewrites_from_its_owner() {
+    let (db_url, _container) = start_postgres().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    db::init_schema(&pool).await.expect("failed to init schema");
+
+    let user = db::insert_user(&pool, "alice", "$argon2id$placeholder")
+        .await
+        .expect("failed to insert user");
+    db::insert_admin_audit(&pool, "admin", "set_role", user.id, "user -> operator")
+        .await
+        .expect("failed to record the grant");
+
+    sqlx::query("UPDATE private_channel_auth.admin_audit SET detail = 'nothing happened'")
+        .execute(&pool)
+        .await
+        .expect_err("audit rows must not be rewritten");
+
+    sqlx::query("DELETE FROM private_channel_auth.admin_audit")
+        .execute(&pool)
+        .await
+        .expect_err("audit rows must not be deleted");
+
+    sqlx::query("TRUNCATE private_channel_auth.admin_audit")
+        .execute(&pool)
+        .await
+        .expect_err("the audit table must not be truncated");
+
+    let surviving: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM private_channel_auth.admin_audit")
+        .fetch_one(&pool)
+        .await
+        .expect("count query failed");
+
+    assert_eq!(surviving.0, 1, "the recorded grant must survive");
+}

@@ -477,7 +477,7 @@ fn redact_transaction_errors(body: Bytes) -> Bytes {
     Bytes::from(json.to_string())
 }
 
-/// Report at boot when the ledger table that scopes history is missing.
+/// Report at boot when the ledger table that scopes history can't be read.
 ///
 /// The core node creates it at startup and the gateway only reads it, so on a
 /// cold start of the whole stack the gateway can easily win the race. That is
@@ -485,18 +485,31 @@ fn redact_transaction_errors(body: Bytes) -> Bytes {
 /// the node caught up, and the requests that need the table already fail closed
 /// with a 500 meanwhile. What they don't do is say why, which is this log line's
 /// job.
-async fn warn_if_owner_change_table_missing(pool: &PgPool) {
-    let present: Result<Option<String>, _> =
-        sqlx::query_scalar("SELECT to_regclass('public.token_account_owner_change')::text")
-            .fetch_one(pool)
-            .await;
+///
+/// Asking for the privilege rather than the relation covers both ways this ends
+/// in a 500: a table that isn't there yet, and one this login may not read.
+async fn warn_if_owner_change_table_unreadable(pool: &PgPool) {
+    // NULL when the table is absent — to_regclass yields NULL and the privilege
+    // check is strict. False when it exists and this login cannot read it.
+    let readable: Result<Option<bool>, _> = sqlx::query_scalar(
+        "SELECT has_table_privilege(to_regclass('public.token_account_owner_change'), 'SELECT')",
+    )
+    .fetch_one(pool)
+    .await;
 
-    match present {
-        Ok(Some(_)) => {}
+    match readable {
+        Ok(Some(true)) => {}
         Ok(None) => error!(
             "token_account_owner_change is missing from the ledger database. \
              getSignaturesForAddress will answer 500 for every User-role caller \
              until the core node starts and creates it."
+        ),
+        Ok(Some(false)) => error!(
+            "token_account_owner_change is not readable by the gateway's database \
+             login. The node grants it when it creates the table; a database that \
+             predates that needs init-auth-roles.sql applied. \
+             getSignaturesForAddress will answer 500 for every User-role caller \
+             until then."
         ),
         Err(e) => error!("Could not check for token_account_owner_change: {}", e),
     }
@@ -1543,7 +1556,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 "  Auth DB: connected (max_connections={})",
                 args.auth_database_max_connections
             );
-            warn_if_owner_change_table_missing(&pool).await;
+            warn_if_owner_change_table_unreadable(&pool).await;
             Some(pool)
         }
         None => {

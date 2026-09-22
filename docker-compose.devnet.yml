@@ -54,6 +54,12 @@ services:
       - POSTGRES_REPLICATION_MODE=master
       - POSTGRES_REPLICATION_USER=${POSTGRES_REPLICATION_USER}
       - POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+      # Read by init-auth-roles.sql, one per service login it creates.
+      - POSTGRES_RUNTIME_PASSWORD=${POSTGRES_RUNTIME_PASSWORD}
+      - POSTGRES_AUTH_RUNTIME_PASSWORD=${POSTGRES_AUTH_RUNTIME_PASSWORD}
+      - POSTGRES_AUTH_OWNER_PASSWORD=${POSTGRES_AUTH_OWNER_PASSWORD}
+      - POSTGRES_GATEWAY_PASSWORD=${POSTGRES_GATEWAY_PASSWORD}
+      - POSTGRES_MONITORING_PASSWORD=${POSTGRES_MONITORING_PASSWORD}
       # Enable replication - allow connections from Docker network
       - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
       - POSTGRES_HOST_AUTH_METHOD=scram-sha-256
@@ -64,6 +70,7 @@ services:
       - postgres-primary-wal-archive:/wal_archive
       - ./init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./init-primary-hba.sh:/docker-entrypoint-initdb.d/02-hba.sh:ro
+      - ./init-auth-roles.sql:/docker-entrypoint-initdb.d/03-roles.sql:ro
     # `synchronous_commit` defaults to `on` (full crash durability). The bench
     # profile in bench-tps/.env explicitly opts into `off` for throughput;
     # operators who want the same trade-off in production must do so deliberately.
@@ -106,7 +113,7 @@ services:
     environment:
       - RUST_LOG=info
       - PRIVATE_CHANNEL_PORT=${PRIVATE_CHANNEL_WRITE_PORT}
-      - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+      - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://private_channel_runtime:${POSTGRES_RUNTIME_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE=${PRIVATE_CHANNEL_SIGVERIFY_QUEUE_SIZE}
       - PRIVATE_CHANNEL_SIGVERIFY_WORKERS=${PRIVATE_CHANNEL_SIGVERIFY_WORKERS}
       - PRIVATE_CHANNEL_MAX_CONNECTIONS=${PRIVATE_CHANNEL_WRITE_MAX_CONNECTIONS}
@@ -198,7 +205,7 @@ services:
     environment:
       - RUST_LOG=info
       - PRIVATE_CHANNEL_PORT=${PRIVATE_CHANNEL_READ_PORT}
-      - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
+      - PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL=postgres://private_channel_runtime:${POSTGRES_RUNTIME_PASSWORD}@postgres-replica:5432/${POSTGRES_DB}
       - PRIVATE_CHANNEL_MAX_CONNECTIONS=${PRIVATE_CHANNEL_READ_MAX_CONNECTIONS}
       - PRIVATE_CHANNEL_PG_MAX_CONNECTIONS=${PRIVATE_CHANNEL_PG_MAX_CONNECTIONS:-32}
       - PRIVATE_CHANNEL_LOG_LEVEL=info
@@ -237,7 +244,9 @@ services:
       - GATEWAY_READ_URL=${GATEWAY_READ_URL}
       # Optional — omit or leave blank to disable RBAC enforcement.
       - JWT_SECRET=${JWT_SECRET:-}
-      - AUTH_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+      # A SELECT-only login: the two auth tables it checks roles and wallets
+      # against, and the two ledger tables core grants it. No writes anywhere.
+      - AUTH_DATABASE_URL=postgres://private_channel_gateway:${POSTGRES_GATEWAY_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}
     ports:
       - "${GATEWAY_PORT}:${GATEWAY_PORT}"
@@ -247,6 +256,26 @@ services:
     healthcheck:
       <<: *default-healthcheck
       test: ["CMD-SHELL", "curl -fsS http://localhost:${GATEWAY_PORT}/health || exit 1"]
+
+  # Creates the auth schema, then exits. Runs as the schema's owner, which is
+  # the one credential that can change the shape of the auth tables or who may
+  # write them — so it lives here, in a container that is gone by the time the
+  # service starts, rather than in the service's own environment.
+  auth-migrate:
+    profiles: [auth]
+    <<: *private-channel-app
+    container_name: private-channel-auth-migrate
+    restart: "no"
+    logging: *default-logging
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info
+      - AUTH_DATABASE_URL=postgres://private_channel_auth_owner:${POSTGRES_AUTH_OWNER_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+    command: ["/usr/local/bin/auth-admin", "migrate"]
+    networks:
+      - private-channel-network
 
   # Auth Service (optional — run with: docker compose --profile auth up)
   auth:
@@ -265,10 +294,12 @@ services:
     depends_on:
       postgres-primary:
         condition: service_healthy
+      auth-migrate:
+        condition: service_completed_successfully
     environment:
       - RUST_LOG=info
       - AUTH_PORT=${AUTH_PORT}
-      - AUTH_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
+      - AUTH_DATABASE_URL=postgres://private_channel_auth_runtime:${POSTGRES_AUTH_RUNTIME_PASSWORD}@postgres-primary:5432/${POSTGRES_DB}
       - JWT_SECRET=${JWT_SECRET}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-*}
       - AUTH_DATABASE_MAX_CONNECTIONS=${AUTH_DATABASE_MAX_CONNECTIONS:-10}

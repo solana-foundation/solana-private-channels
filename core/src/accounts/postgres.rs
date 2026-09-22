@@ -257,6 +257,23 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .execute(pool)
     .await?;
 
+    // The gateway reads these two to scope a user's history to the slots they
+    // owned an address for. The grant lives here because only the owner of a
+    // table can issue it, and the node is that owner. Skipped when the role is
+    // absent, as it is in tests and in single-login dev setups.
+    sqlx::query(
+        r#"
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'private_channel_gateway') THEN
+                GRANT SELECT ON token_account_owner_change, metadata TO private_channel_gateway;
+            END IF;
+        END $$;
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("PostgreSQL tables initialized");
     Ok(())
 }

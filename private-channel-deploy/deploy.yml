@@ -70,6 +70,11 @@
       ansible.builtin.set_fact:
         postgres_password: "{{ _d.POSTGRES_PASSWORD | default('') }}"
         postgres_replication_password: "{{ _d.POSTGRES_REPLICATION_PASSWORD | default('') }}"
+        postgres_runtime_password: "{{ _d.POSTGRES_RUNTIME_PASSWORD | default('') }}"
+        postgres_auth_runtime_password: "{{ _d.POSTGRES_AUTH_RUNTIME_PASSWORD | default('') }}"
+        postgres_auth_owner_password: "{{ _d.POSTGRES_AUTH_OWNER_PASSWORD | default('') }}"
+        postgres_gateway_password: "{{ _d.POSTGRES_GATEWAY_PASSWORD | default('') }}"
+        postgres_monitoring_password: "{{ _d.POSTGRES_MONITORING_PASSWORD | default('') }}"
         jwt_secret: "{{ _d.JWT_SECRET | default('') }}"
         grafana_admin_password: "{{ _d.GRAFANA_ADMIN_PASSWORD | default('') }}"
         ghcr_user: "{{ _d.GHCR_USER | default('') }}"
@@ -456,6 +461,37 @@
           `postgres_replication_password` empty in secrets.yml. postgres-replica uses it for streaming replication.
           Fix: edit secrets.yml and add `postgres_replication_password: repl_password` (literal, until init-primary.sql is parameterised).
 
+    - name: Assert the per-service postgres passwords are set
+      ansible.builtin.assert:
+        that:
+          - postgres_runtime_password | default('') | length > 0
+          - postgres_auth_runtime_password | default('') | length > 0
+          - postgres_auth_owner_password | default('') | length > 0
+          - postgres_gateway_password | default('') | length > 0
+          - postgres_monitoring_password | default('') | length > 0
+        fail_msg: |
+          One of `postgres_runtime_password`, `postgres_auth_runtime_password`, `postgres_auth_owner_password`,
+          `postgres_gateway_password`, `postgres_monitoring_password` is empty in secrets.yml. init-auth-roles.sql
+          sets one per service login on postgres-primary. Fix: edit secrets.yml and add all five.
+          Generate each fresh: openssl rand -hex 16.
+
+    # Sharing one value would give a compromised service every other login's
+    # rights, which is exactly what separating them is for.
+    - name: Assert the postgres logins do not share a password
+      ansible.builtin.assert:
+        that: (candidates | unique | length) == (candidates | length)
+        vars:
+          candidates:
+            - "{{ postgres_password }}"
+            - "{{ postgres_runtime_password }}"
+            - "{{ postgres_auth_runtime_password }}"
+            - "{{ postgres_auth_owner_password }}"
+            - "{{ postgres_gateway_password }}"
+            - "{{ postgres_monitoring_password }}"
+        fail_msg: |
+          Two postgres logins share a password. Each needs its own, or a compromised service
+          holds the others' rights. Fix: edit secrets.yml and give each one a distinct value.
+
     # Only required when enforcement is on: env.j2 blanks JWT_SECRET when
     # gateway_enforce_jwt is false, so the secret's value is unused there.
     # Mirror the template's `default(true)` so an unset flag still requires it.
@@ -833,6 +869,7 @@
       loop:
       - init-primary.sql
       - init-primary-hba.sh
+      - init-auth-roles.sql
       - yellowstone-config.json
 
     - name: Copy postgres init SQL to target
@@ -846,6 +883,13 @@
         src: "{{ repo_root }}/init-primary-hba.sh"
         dest: "{{ target_config_dir }}/init-primary-hba.sh"
         mode: "0755"
+
+    # Applied again in PHASE 4: the entrypoint only runs it on an empty PGDATA.
+    - name: Copy postgres service-role SQL to target
+      ansible.builtin.copy:
+        src: "{{ repo_root }}/init-auth-roles.sql"
+        dest: "{{ target_config_dir }}/init-auth-roles.sql"
+        mode: "0644"
 
     - name: Copy indexer/operator TOML configs to target
       ansible.builtin.copy:
@@ -1041,6 +1085,37 @@
       loop:
         - postgres-primary-wal-archive
         - postgres-indexer-wal-archive
+      changed_when: true
+
+    # Every other service logs in as a role init-auth-roles.sql creates, so the
+    # primary comes up alone first. Doing this after the full `up -d --wait`
+    # would be too late: without the roles, --wait fails first.
+    - name: Bring postgres-primary up first
+      ansible.builtin.shell: "{{ compose_cmd }} up -d --wait postgres-primary"
+      args:
+        chdir: "{{ target_config_dir }}"
+      changed_when: true
+
+    # Idempotent, so it runs every deploy — that is what applies a password
+    # change. `docker exec -e` keeps the passwords out of the process list.
+    - name: Apply service role definitions to the primary
+      ansible.builtin.shell:
+        cmd: >-
+          docker exec -i -e PGPASSWORD -e POSTGRES_REPLICATION_USER -e POSTGRES_RUNTIME_PASSWORD
+          -e POSTGRES_AUTH_RUNTIME_PASSWORD -e POSTGRES_AUTH_OWNER_PASSWORD
+          -e POSTGRES_GATEWAY_PASSWORD -e POSTGRES_MONITORING_PASSWORD
+          private-channel-postgres-primary
+          psql -v ON_ERROR_STOP=1 -U {{ postgres_user }} -d {{ postgres_db }} -f -
+          < {{ target_config_dir }}/init-auth-roles.sql
+      environment:
+        PGPASSWORD: "{{ postgres_password }}"
+        POSTGRES_REPLICATION_USER: "{{ postgres_replication_user }}"
+        POSTGRES_RUNTIME_PASSWORD: "{{ postgres_runtime_password }}"
+        POSTGRES_AUTH_RUNTIME_PASSWORD: "{{ postgres_auth_runtime_password }}"
+        POSTGRES_AUTH_OWNER_PASSWORD: "{{ postgres_auth_owner_password }}"
+        POSTGRES_GATEWAY_PASSWORD: "{{ postgres_gateway_password }}"
+        POSTGRES_MONITORING_PASSWORD: "{{ postgres_monitoring_password }}"
+      no_log: true
       changed_when: true
 
     # `up -d --wait` blocks until each service's healthcheck passes (or fails).
