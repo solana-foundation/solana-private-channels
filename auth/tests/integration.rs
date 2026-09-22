@@ -1590,12 +1590,13 @@ async fn gateway_login_cannot_write_to_the_auth_tables() {
             .expect("role lookup must work");
     assert_eq!(role, "user");
 
-    let owned: Vec<(String,)> =
-        sqlx::query_as("SELECT pubkey FROM private_channel_auth.verified_wallets WHERE user_id = $1")
-            .bind(user.id)
-            .fetch_all(&gateway_pool)
-            .await
-            .expect("wallet lookup must work");
+    let owned: Vec<(String,)> = sqlx::query_as(
+        "SELECT pubkey FROM private_channel_auth.verified_wallets WHERE user_id = $1",
+    )
+    .bind(user.id)
+    .fetch_all(&gateway_pool)
+    .await
+    .expect("wallet lookup must work");
     assert_eq!(owned.len(), 1);
 
     sqlx::query(
@@ -1730,9 +1731,15 @@ async fn channel_runtime_login_reaches_nothing_in_the_auth_schema() {
     let victim = db::insert_user(&owner_pool, "alice", "$argon2id$placeholder")
         .await
         .expect("failed to insert user");
-    db::insert_admin_audit(&owner_pool, "admin", "set_role", victim.id, "user -> operator")
-        .await
-        .expect("failed to record the grant");
+    db::insert_admin_audit(
+        &owner_pool,
+        "admin",
+        "set_role",
+        victim.id,
+        "user -> operator",
+    )
+    .await
+    .expect("failed to record the grant");
 
     let runtime_pool = PgPoolOptions::new()
         .max_connections(1)

@@ -159,7 +159,7 @@ Operator feepayer balance is **not** a sanity gate. It's monitored continuously 
 
 Default-on (skip with `--skip-tags monitoring`). PHASE 6 brings up Prometheus + Grafana + cAdvisor + node_exporter + postgres_exporter + blackbox-exporter on the private-channel Docker network via a sibling `monitoring.compose.yml`.
 
-- **Grafana** — `http://<host>:3001`, login `admin` / `grafana_admin_password` from `secrets.yml`. Dashboards (Health, Containers, Host, Postgres, RPC, Indexer, Operator) and datasources are provisioned read-only from [`monitoring/`](../monitoring/).
+- **Grafana** — bound to loopback on the target host, so reach it over an SSH tunnel: `ssh -L 3001:127.0.0.1:3001 <host>`, then `http://127.0.0.1:3001`. Login `admin` / `grafana_admin_password` from `secrets.yml`. Its datasource reads the indexer database, which is why the port is not published; set `monitoring_bind_address: ""` in `vars/<env>.yml` to publish on every interface, and only behind a reverse proxy with TLS and an allowlist. Dashboards (Health, Containers, Host, Postgres, RPC, Indexer, Operator) and datasources are provisioned read-only from [`monitoring/`](../monitoring/).
 - **Prometheus** — `http://<host>:9090`. Scrape config rendered from [`monitoring/prometheus.yml.j2`](../monitoring/prometheus.yml.j2); 15d retention. Use `Status → Targets` to see what's UP.
 - **Blackbox probes** — external `/health` checks (gateway / write / read / indexer / operator); query `probe_success` in Prometheus.
 

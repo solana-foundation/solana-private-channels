@@ -34,11 +34,14 @@ compose_file: "{{ 'docker-compose.devnet.yml' if network | default('localnet') i
 compose_services_base: "postgres-primary postgres-replica write-node read-node gateway postgres-indexer indexer-solana indexer-private-channel operator-solana operator-private-channel"
 compose_services: "{{ compose_services_base }}{{ ' validator' if network | default('localnet') == 'localnet' else '' }}"
 
-# Host interface the monitoring ports bind to. Empty publishes on all of them,
-# which is the long-standing behaviour and what remote access to Grafana relies
-# on. Set to "127.0.0.1:" (trailing colon) to keep them on loopback and reach
-# Grafana over an SSH tunnel instead; the raw compose stack already does that.
-monitoring_bind_address: ""
+# Host interface the monitoring ports bind to. Loopback by default, matching the
+# raw compose stack: Grafana's datasource reads the indexer database, so an
+# unprotected port there is a data exposure, not just an ops inconvenience.
+# Reach it over an SSH tunnel:
+#   ssh -L 3001:127.0.0.1:{{ monitoring_grafana_port }} <host>
+# Set to "" (empty) in vars/<env>.yml to publish on every interface instead. Only
+# do that behind a reverse proxy with TLS and a network allowlist.
+monitoring_bind_address: "127.0.0.1:"
 
 # --- Ports (host-side) — read by health probes ---
 gateway_port: 8899
