@@ -85,6 +85,8 @@ const RESYNC_TIMEOUT_SECS: u64 = 180;
 /// -32004 near the finalized edge; each retry re-runs the whole resync (including
 /// consumed-set enumeration), so channel scripts enqueue this many copies.
 const RESYNC_ATTEMPTS: usize = 4;
+/// Channel mint authority the reconcile harness enumerates; scripted mints are signed by it.
+const CHANNEL_AUTHORITY: Pubkey = Pubkey::new_from_array([7u8; 32]);
 /// Per-user SPL balance minted at setup, large enough to fund deposits.
 const USER_BALANCE: u64 = 1_000_000;
 /// Deposit amount used by single-deposit scenarios.
@@ -300,6 +302,40 @@ fn channel_sig_entry(landed: &Signature, memo: &str) -> Value {
     })
 }
 
+/// `getTransaction` result for a successful channel tx signed only by `signer`, with
+/// `mentioned` as a non-signing account key.
+fn channel_transaction(signer: &Pubkey, mentioned: &Pubkey) -> Value {
+    json!({
+        "slot": 100u64,
+        "blockTime": 1_700_000_000i64,
+        "transaction": {
+            "signatures": [Signature::new_unique().to_string()],
+            "message": {
+                "header": {
+                    "numRequiredSignatures": 1,
+                    "numReadonlySignedAccounts": 0,
+                    "numReadonlyUnsignedAccounts": 1,
+                },
+                "accountKeys": [signer.to_string(), mentioned.to_string()],
+                "recentBlockhash": "11111111111111111111111111111111",
+                "instructions": [],
+            },
+        },
+        "meta": {
+            "err": null,
+            "status": {"Ok": null},
+            "fee": 5000u64,
+            "preBalances": [0u64, 0u64],
+            "postBalances": [0u64, 0u64],
+        },
+    })
+}
+
+/// A channel mint the authority signed.
+fn authority_signed_transaction() -> Value {
+    channel_transaction(&CHANNEL_AUTHORITY, &Pubkey::new_unique())
+}
+
 /// A non-idempotency filler entry (null memo) used only to pad a full page.
 fn channel_filler_entry() -> Value {
     json!({
@@ -333,6 +369,12 @@ fn script_channel_consumed(
             .map(|(id, kind, landed)| channel_sig_entry(landed, &memo_for(id, *kind)))
             .collect();
         mock.enqueue("getSignaturesForAddress", Reply::result(Value::Array(page)));
+        for _ in entries {
+            mock.enqueue(
+                "getTransaction",
+                Reply::result(authority_signed_transaction()),
+            );
+        }
     }
 }
 
@@ -375,6 +417,10 @@ fn script_channel_consumed_on_page2(
         mock.enqueue(
             "getSignaturesForAddress",
             Reply::result(json!([channel_sig_entry(landed, &memo_for(id, kind))])),
+        );
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(authority_signed_transaction()),
         );
     }
 }
@@ -588,7 +634,7 @@ impl Harness {
             self.program_type,
             self.instance,
             self.channel_url.clone(),
-            Pubkey::new_unique(),
+            CHANNEL_AUTHORITY,
         );
         run_resync(&service, self.genesis).await
     }
@@ -1225,7 +1271,8 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
 
 /// IT-R8: channel mints that do not match this deposit's source event must never
 /// mark it completed: (a) a valid memo for a DIFFERENT source event, (b) a
-/// non-idempotency memo, (c) a wrong-prefix memo. The deposit stays pending.
+/// non-idempotency memo, (c) a wrong-prefix memo, (d) this deposit's memo on a user
+/// tx that only names the authority as an account. The deposit stays pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn resync_ignores_foreign_event_and_nonidempotency_memos(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1267,8 +1314,9 @@ async fn resync_ignores_foreign_event_and_nonidempotency_memos(
     // (a) Valid current-scheme memo, but for a DIFFERENT source event -> wrong id.
     let foreign_id = SourceEventId::new("some-other-source-event", 7, None);
     let foreign_memo = mint_idempotency_memo(&foreign_id);
-    // (b) non-idempotency memo, (c) wrong-prefix memo. Enqueue one page per
-    // possible resync attempt (transient-block retries re-enumerate the channel).
+    let attacker = Pubkey::new_unique();
+    // (b) non-idempotency memo, (c) wrong-prefix memo, (d) forged memo. Enqueue one
+    // page per possible resync attempt (transient-block retries re-enumerate the channel).
     for _ in 0..RESYNC_ATTEMPTS {
         let page = json!([
             channel_sig_entry(&Signature::new_unique(), &foreign_memo),
@@ -1277,15 +1325,27 @@ async fn resync_ignores_foreign_event_and_nonidempotency_memos(
                 &Signature::new_unique(),
                 &format!("private_channel:not-idempotency:{}", foreign_id.as_str())
             ),
+            channel_sig_entry(
+                &Signature::new_unique(),
+                &mint_idempotency_memo(&dep.source_event_id())
+            ),
         ]);
         mock.enqueue("getSignaturesForAddress", Reply::result(page));
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(authority_signed_transaction()),
+        );
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(channel_transaction(&attacker, &CHANNEL_AUTHORITY)),
+        );
     }
     h.run().await.expect("resync should succeed");
 
     let st = status_of(&db_url, &dep).await;
     assert_eq!(
         st.status, "pending",
-        "no foreign-event/non-idempotency memo may mark this deposit completed"
+        "no foreign-event/non-idempotency/unsigned memo may mark this deposit completed"
     );
     assert!(st.counterpart_signature.is_none());
 
@@ -1488,13 +1548,17 @@ async fn resync_aborts_on_legacy_scheme_memo_db_intact() -> Result<(), Box<dyn s
         "private_channel:mint-idempotency:42"
     )]);
     mock.enqueue("getSignaturesForAddress", Reply::result(legacy));
+    mock.enqueue(
+        "getTransaction",
+        Reply::result(authority_signed_transaction()),
+    );
     let service = make_channel_resync_service(
         validator.rpc_url(),
         storage,
         ProgramType::Escrow,
         Some(Pubkey::new_unique()),
         mock.url(),
-        Pubkey::new_unique(),
+        CHANNEL_AUTHORITY,
     );
 
     let result = service.run(current_slot).await;

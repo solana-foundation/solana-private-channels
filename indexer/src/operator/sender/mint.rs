@@ -427,7 +427,7 @@ pub enum ConsumedMintKind {
 pub type ConsumedSet = HashMap<SourceEventId, (Signature, ConsumedMintKind)>;
 
 /// Enumerate every idempotency-memo'd mint the `authority` has confirmed on the channel
-/// into a `ConsumedSet`.
+/// into a `ConsumedSet`. Only transactions the authority signed count.
 ///
 /// Fails closed on any RPC/pagination error, and on an idempotency-prefixed memo that
 /// doesn't parse to a current source-event-id (a serviced mint resync can't reconcile —
@@ -465,6 +465,18 @@ pub async fn enumerate_consumed_mints(
                     continue;
                 };
 
+            let signature = Signature::from_str(&status.signature)
+                .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
+            let transaction = rpc.get_transaction(&signature).await.map_err(|e| {
+                format!("consumed-set enumeration failed fetching {signature}: {e}")
+            })?;
+            // History lists every tx that mentions the authority, not only ones it signed.
+            if !transaction_succeeded(&transaction)
+                || !transaction_signed_by(&transaction, authority)
+            {
+                continue;
+            }
+
             let Some(source_event_id) = SourceEventId::from_encoded(encoded) else {
                 return Err(format!(
                     "channel mint {} carries an idempotency memo that does not parse to a \
@@ -474,8 +486,6 @@ pub async fn enumerate_consumed_mints(
                 ));
             };
 
-            let signature = Signature::from_str(&status.signature)
-                .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
             // First (newest) confirmed mint for an id wins; a re-send would tie anyway.
             set.entry(source_event_id).or_insert((signature, kind));
         }
@@ -600,6 +610,20 @@ fn transaction_succeeded(
         .meta
         .as_ref()
         .is_some_and(|meta| meta.err.is_none())
+}
+
+fn transaction_signed_by(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+    signer: &Pubkey,
+) -> bool {
+    let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
+        return false;
+    };
+
+    match &ui_transaction.message {
+        UiMessage::Parsed(parsed_message) => parsed_message_has_signer(parsed_message, signer),
+        UiMessage::Raw(raw_message) => raw_message_has_signer(raw_message, signer),
+    }
 }
 
 fn transaction_matches_expected_mint(
@@ -1062,6 +1086,15 @@ mod consumed_set_tests {
         )
     }
 
+    /// `getTransaction` reply for a successful tx signed only by `signer`, with `mentioned`
+    /// as a non-signing account key.
+    fn transaction_reply(signer: &Pubkey, mentioned: &Pubkey) -> String {
+        let signature = Signature::new_unique();
+        format!(
+            r#"{{"jsonrpc":"2.0","result":{{"slot":1,"blockTime":null,"transaction":{{"signatures":["{signature}"],"message":{{"header":{{"numRequiredSignatures":1,"numReadonlySignedAccounts":0,"numReadonlyUnsignedAccounts":1}},"accountKeys":["{signer}","{mentioned}"],"recentBlockhash":"11111111111111111111111111111111","instructions":[]}}}},"meta":{{"err":null,"status":{{"Ok":null}},"fee":5000,"preBalances":[0,0],"postBalances":[0,0]}}}},"id":0}}"#
+        )
+    }
+
     /// A serviced mint that sits on the second page (reached via the `before` cursor)
     /// must still be collected, guarding the bounded-lookback blind spot.
     #[tokio::test]
@@ -1106,6 +1139,17 @@ mod consumed_set_tests {
                 r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
                 sig_entry(&page2_a, &mint_idempotency_memo(&id2)),
             ))
+            .create_async()
+            .await;
+
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(&authority, &Pubkey::new_unique()))
             .create_async()
             .await;
 
@@ -1155,6 +1199,7 @@ mod consumed_set_tests {
     #[tokio::test]
     async fn enumerate_legacy_scheme_memo_is_err() {
         let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
         let _m = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -1172,13 +1217,73 @@ mod consumed_set_tests {
             ))
             .create_async()
             .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(&authority, &Pubkey::new_unique()))
+            .create_async()
+            .await;
 
         let rpc = fast_rpc(&server.url());
-        let result = enumerate_consumed_mints(&rpc, &Pubkey::new_unique(), PAGE_LIMIT).await;
+        let result = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT).await;
         let err = result.expect_err("legacy-scheme memo must abort enumeration");
         assert!(
             err.contains("cutover"),
             "error should name the memo cutover: {err}"
+        );
+    }
+
+    /// A user tx that only names the authority as an account (e.g. a transfer recipient)
+    /// must not count as a mint, nor abort enumeration with a legacy-looking memo.
+    #[tokio::test]
+    async fn enumerate_skips_memo_the_authority_did_not_sign() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        let victim_id = SourceEventId::new("evt-victim", 0, None);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                // One short page, so pagination stops after it.
+                sig_entry(
+                    &Signature::new_unique().to_string(),
+                    &format!(
+                        "{}; private_channel:mint-idempotency:42",
+                        mint_idempotency_memo(&victim_id)
+                    )
+                ),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(&attacker, &authority))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("unsigned memos must be skipped, not abort enumeration");
+        assert!(
+            set.is_empty(),
+            "an unsigned memo must not mark a deposit minted"
         );
     }
 }
