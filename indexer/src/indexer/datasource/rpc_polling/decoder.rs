@@ -965,10 +965,10 @@ mod tests {
             }]
         });
 
-        let block: RpcBlock =
-            serde_json::from_value(complete_block.clone()).expect("the complete block deserializes");
-        let rows = decode_slot(&block, slot, ProgramType::Withdraw, None)
-            .expect("complete meta decodes");
+        let block: RpcBlock = serde_json::from_value(complete_block.clone())
+            .expect("the complete block deserializes");
+        let rows =
+            decode_slot(&block, slot, ProgramType::Withdraw, None).expect("complete meta decodes");
         assert_eq!(rows.len(), 1, "the fixture holds one valid WithdrawFunds");
 
         for required_key in ["err", "innerInstructions", "loadedAddresses"] {
@@ -1048,7 +1048,11 @@ mod tests {
             serde_json::from_value(loaded_block.clone()).expect("the loaded block deserializes");
         let rows = decode_slot(&block, slot, ProgramType::Withdraw, None)
             .expect("a CPI to the ALT-loaded program decodes");
-        assert_eq!(rows.len(), 1, "the fixture holds one ALT-loaded WithdrawFunds");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the fixture holds one ALT-loaded WithdrawFunds"
+        );
 
         let mut null_block = loaded_block;
         null_block["transactions"][0]["meta"]["loadedAddresses"] = serde_json::Value::Null;
@@ -1090,13 +1094,14 @@ mod tests {
 
         let mut tx =
             create_successful_transaction("sig_cpi".to_string(), account_keys, vec![foreign]);
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![
-                inner(1, "skip", 2),             // foreign inner, filtered out
-                inner(0, "cpi_deposit_data", 2), // our program, indexed
-            ],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    inner(1, "skip", 2),             // foreign inner, filtered out
+                    inner(0, "cpi_deposit_data", 2), // our program, indexed
+                ],
+            }]));
         block.transactions.push(tx);
 
         let result =
@@ -1161,19 +1166,20 @@ mod tests {
         // Discriminator 7 (ReleaseFunds) is excluded; 6 (Deposit) is indexed.
         let release_data = bs58::encode([7u8]).into_string();
         let deposit_data = bs58::encode([6u8]).into_string();
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![
-                InnerInstruction {
-                    instruction: create_instruction(0, vec![], release_data),
-                    stack_height: Some(2),
-                },
-                InnerInstruction {
-                    instruction: create_instruction(0, vec![], deposit_data.clone()),
-                    stack_height: Some(2),
-                },
-            ],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    InnerInstruction {
+                        instruction: create_instruction(0, vec![], release_data),
+                        stack_height: Some(2),
+                    },
+                    InnerInstruction {
+                        instruction: create_instruction(0, vec![], deposit_data.clone()),
+                        stack_height: Some(2),
+                    },
+                ],
+            }]));
         block.transactions.push(tx);
 
         let result = parse_block_for_program(
@@ -1217,17 +1223,18 @@ mod tests {
         let top = create_instruction(0, vec![], "top".to_string());
         let mut tx = create_successful_transaction("sig_alt".to_string(), account_keys, vec![top]);
         // Inner account[0] = 3 points past the 2 static keys into the readonly loaded slot (static 0,1 + writable 2 + readonly 3).
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: 1, // our program (CPI'd)
-                    accounts: vec![3],
-                    data: "inner".to_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 1, // our program (CPI'd)
+                        accounts: vec![3],
+                        data: "inner".to_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
         tx.meta.as_mut().unwrap().loaded_addresses = Some(UiLoadedAddresses {
             writable: vec![loaded_writable.clone()],
             readonly: vec![loaded_readonly.clone()],
@@ -1265,17 +1272,18 @@ mod tests {
             writable: vec![TEST_PROGRAM_ID.to_string()],
             readonly: vec![],
         });
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: 1, // points into loaded addresses
-                    accounts: vec![],
-                    data: "cpi".to_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 1, // points into loaded addresses
+                        accounts: vec![],
+                        data: "cpi".to_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
         block.transactions.push(tx);
 
         let result =
@@ -1381,10 +1389,11 @@ mod tests {
         //   [1]   event 300 height 3   (A's subtree)
         //   [2] deposit B   height 2
         //   [3]   event 480 height 3   (B's subtree)
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![deposit(), event(300), deposit(), event(480)],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![deposit(), event(300), deposit(), event(480)],
+            }]));
 
         let mut block = create_test_block();
         block.transactions.push(tx);
@@ -1436,17 +1445,18 @@ mod tests {
             readonly: vec![],
         });
         // The deposit's event self-CPI, emitted by the ALT-loaded escrow program.
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: 12, // escrow via ALT
-                    accounts: vec![],
-                    data: bs58::encode(deposit_event_bytes(555)).into_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 12, // escrow via ALT
+                        accounts: vec![],
+                        data: bs58::encode(deposit_event_bytes(555)).into_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
 
         let mut block = create_test_block();
         block.transactions.push(tx);
@@ -1518,20 +1528,21 @@ mod tests {
         //   [6]     event 222  h6
         //   [7] deposit D3     h2   (1 hop)   -> event 333
         //   [8]   event 333    h3
-        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![
-                foreign(2),
-                deposit(3),
-                event(111, 4),
-                foreign(3),
-                foreign(4),
-                deposit(5),
-                event(222, 6),
-                deposit(2),
-                event(333, 3),
-            ],
-        }]));
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    foreign(2),
+                    deposit(3),
+                    event(111, 4),
+                    foreign(3),
+                    foreign(4),
+                    deposit(5),
+                    event(222, 6),
+                    deposit(2),
+                    event(333, 3),
+                ],
+            }]));
 
         let mut block = create_test_block();
         block.transactions.push(tx);

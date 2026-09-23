@@ -987,8 +987,9 @@ mod tests {
         let mut saw_slot_complete = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
         while tokio::time::Instant::now() < deadline && !saw_slot_complete {
-            if let Ok(Some(ProcessorMessage::SlotComplete { slot: completed, .. })) =
-                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            if let Ok(Some(ProcessorMessage::SlotComplete {
+                slot: completed, ..
+            })) = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
             {
                 saw_slot_complete = completed == slot;
             }

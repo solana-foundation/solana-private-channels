@@ -151,14 +151,12 @@ fn rejected_slot_error(slot: u64, rejection: SlotRejection) -> IndexerError {
         SlotRejection::MissingMeta { signature } => {
             BackfillError::MissingMeta { slot, signature }.into()
         }
-        SlotRejection::MissingMetaField { signature, field } => {
-            BackfillError::MissingMetaField {
-                slot,
-                signature,
-                field,
-            }
-            .into()
+        SlotRejection::MissingMetaField { signature, field } => BackfillError::MissingMetaField {
+            slot,
+            signature,
+            field,
         }
+        .into(),
         SlotRejection::Undecodable(failure) => BackfillError::InstructionUndecodable {
             slot,
             signature: failure.signature,
