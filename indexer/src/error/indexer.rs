@@ -194,6 +194,13 @@ pub enum BackfillError {
     #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
     MissingMeta { slot: u64, signature: String },
 
+    #[error("Slot {slot} transaction {signature} meta is missing `{field}`; block is incomplete")]
+    MissingMetaField {
+        slot: u64,
+        signature: String,
+        field: &'static str,
+    },
+
     #[error("Slot {slot} transaction {signature} instruction {instruction_index} (inner {inner_index:?}) will not decode, so the slot's contents are unknown: {reason}")]
     InstructionUndecodable {
         slot: u64,
