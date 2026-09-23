@@ -399,10 +399,9 @@ async fn test_deposit_operator_processes_single_mint() -> Result<(), Box<dyn std
 }
 
 /// Inserts the same deposit row twice (same signature), starts the operator,
-/// and asserts that the recipient receives exactly `amount` tokens — not `2 ×
-/// amount`.  Verifies that the idempotency memo mechanism in `find_existing_
-/// mint_signature` prevents a second on-chain mint for an already-processed
-/// deposit.
+/// and asserts that the recipient receives exactly `amount` tokens, not `2 ×
+/// amount`. The second insert resolves to the existing row by its natural key,
+/// so only one mint is ever issued.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_issuance_operator_idempotent_no_double_mint() -> Result<(), Box<dyn std::error::Error>>
 {

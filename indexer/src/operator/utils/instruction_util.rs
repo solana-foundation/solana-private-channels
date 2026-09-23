@@ -373,16 +373,6 @@ impl MintToBuilder {
         self.recipient_ata
     }
 
-    pub fn try_as_expected_mint(&self) -> Option<(Pubkey, Pubkey, Pubkey, Pubkey, u64)> {
-        Some((
-            self.mint?,
-            self.recipient_ata?,
-            self.mint_authority?,
-            self.token_program?,
-            self.amount?,
-        ))
-    }
-
     /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to]
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         let mint = self.mint.ok_or_else(|| ProgramError::InvalidBuilder {
@@ -519,32 +509,6 @@ mod tests {
     // ========================================================================
     // MintToBuilder
     // ========================================================================
-
-    #[test]
-    fn try_as_expected_mint_all_set() {
-        let mut b = MintToBuilder::new();
-        b.mint(pk(1))
-            .recipient_ata(pk(3))
-            .mint_authority(pk(5))
-            .token_program(pk(6))
-            .amount(100);
-        let result = b.try_as_expected_mint();
-        assert!(result.is_some());
-        let (mint, ata, auth, tp, amt) = result.unwrap();
-        assert_eq!(mint, pk(1));
-        assert_eq!(ata, pk(3));
-        assert_eq!(auth, pk(5));
-        assert_eq!(tp, pk(6));
-        assert_eq!(amt, 100);
-    }
-
-    #[test]
-    fn try_as_expected_mint_missing_field() {
-        let mut b = MintToBuilder::new();
-        b.mint(pk(1)).recipient_ata(pk(3));
-        // missing mint_authority, token_program, amount
-        assert!(b.try_as_expected_mint().is_none());
-    }
 
     fn fully_configured_builder() -> MintToBuilder {
         let mut b = MintToBuilder::new();
@@ -805,6 +769,22 @@ mod tests {
         let none = SourceEventId::new("sig", 0, None);
         let sentinel = SourceEventId::new("sig", 0, Some(NO_INNER_INDEX));
         assert_eq!(none, sentinel);
+    }
+
+    /// Pins the derivation the runbooks document
+    /// (`docs/runbooks/_verify_onchain_mint.md`): base58 of sha256 over the signature
+    /// bytes, then instruction_index and inner_index (or -1) as i32 little-endian. Resync
+    /// matches memos written by earlier operators, so the derivation must never drift.
+    #[test]
+    fn source_event_id_matches_documented_vector() {
+        assert_eq!(
+            SourceEventId::new("sig-xyz", 3, Some(2)).as_str(),
+            "FdWXgg6U7JCJ6vqmped1SzickKQKw6xdpongJaaNDznN"
+        );
+        assert_eq!(
+            SourceEventId::new("sig", 0, None).as_str(),
+            "E8kpWjKC4dYwBVzpiiVhcPjwy8ZBSvxAUAUkgQ5nQFKj"
+        );
     }
 
     /// A current-scheme memo value round-trips through from_encoded; a legacy serial-id

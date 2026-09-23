@@ -94,7 +94,7 @@ verification before recovery. The signature-driven recovery worker (Path E)
 is the gate against a double-mint: it re-arms (`pending`) only a deposit it
 has proven did not mint - either no signature was ever persisted (so it was
 never broadcast) or the persisted signature is provably dead. An on-chain
-mint memo (`private_channel:mint-idempotency:<transaction_id>`) is still
+mint memo (`private_channel:mint-idempotency:<source_event_id>`) is still
 emitted as a forensic marker for manual review, but recovery no longer
 depends on scanning for it.
 

@@ -22,7 +22,7 @@ You need:
 
 Exactly one of:
 - `LANDED <signature>` - mint confirmed on the private channel; tokens were minted.
-- `NOT_LANDED` - no mint in operator history for this transaction_id.
+- `NOT_LANDED` - no mint in operator history for this deposit's source event.
 - `AMBIGUOUS` - RPC unreachable, no decisive evidence, or the lookback
   window does not cover `processed_at`.
 
@@ -37,8 +37,12 @@ the RPC's signature lookback window.
 
 ```sql
 SELECT id,
+       signature,
+       instruction_index,
+       inner_index,
        recipient,
        mint,
+       amount,
        counterpart_signature,
        status,
        updated_at
@@ -64,8 +68,35 @@ solana confirm -v <counterpart_signature> --url <private-channel-rpc-url>
 ### Step 3 - search by idempotency memo
 
 The operator attaches a deterministic memo to every mint:
-`private_channel:mint-idempotency:<transaction_id>`
+`private_channel:mint-idempotency:<source_event_id>`
 (`indexer/src/operator/constants.rs::MINT_IDEMPOTENCY_MEMO_PREFIX`).
+
+`source_event_id` is base58 of sha256 over the row's `signature` bytes, then
+`instruction_index` and `inner_index` (`-1` when NULL), each as i32
+little-endian. Compute the memo from the Step 1 values (omit the last
+argument when `inner_index` is NULL):
+
+```bash
+python3 - <signature> <instruction_index> [<inner_index>] <<'EOF'
+import hashlib, struct, sys
+
+signature, instruction_index = sys.argv[1], int(sys.argv[2])
+inner_index = int(sys.argv[3]) if len(sys.argv) > 3 else -1
+digest = hashlib.sha256(
+    signature.encode() + struct.pack("<i", instruction_index) + struct.pack("<i", inner_index)
+).digest()
+alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+number, encoded = int.from_bytes(digest, "big"), ""
+while number:
+    number, remainder = divmod(number, 58)
+    encoded = alphabet[remainder] + encoded
+encoded = "1" * (len(digest) - len(digest.lstrip(b"\0"))) + encoded
+print("private_channel:mint-idempotency:" + encoded)
+EOF
+```
+
+The derivation is pinned by `source_event_id_matches_documented_vector` in
+`indexer/src/operator/utils/instruction_util.rs`.
 
 Derive the recipient ATA:
 
@@ -90,9 +121,9 @@ solana confirm -v <signature> --url <private-channel-rpc-url>
 ```
 
 A match has all of:
-- A `MintTo` instruction targeting the same mint and recipient ATA.
-- A memo instruction whose data contains
-  `private_channel:mint-idempotency:<transaction_id>`.
+- A `MintTo` instruction for the row's `amount` of the same mint into the
+  recipient ATA.
+- A memo instruction whose data is exactly the memo computed above.
 - `Finalized` commitment, no error.
 
 Outcomes:
@@ -107,17 +138,17 @@ Outcomes:
 
 ## Idempotency safety net
 
-The operator's `find_existing_mint_signature_with_memo`
-(`indexer/src/operator/sender/mint.rs`) runs the same memo-scan on every
-deposit attempt before sending. If you re-arm a deposit row to `pending`
-without recovery and the original mint did land, the next operator tick
-will find the existing memo'd signature and short-circuit to `Completed`
-without minting again.
+The operator does not scan for the memo before minting. Its guard is the
+write-ahead journal: every mint signature is stored in
+`pending_release_signatures` before broadcast, and a re-picked deposit is
+classified against those signatures on the channel before any new mint
+(`gate_reopened_deposit` in `indexer/src/operator/processor.rs`).
 
-This safety net works only when the original mint is still inside the
-RPC's signature lookback window. **It is the primary defense against
-double-minting on retry, but it is not a substitute for this procedure
-in `AMBIGUOUS` cases.**
+The recovery sweep deletes the journal once the row is `completed`, `failed`
+or `failed_reminted`. **Re-arming a terminal row has no automatic guard: this
+procedure is the only thing standing between a landed mint and a second
+one.** The memo is a forensic marker and what resync uses to rebuild
+serviced rows.
 
 ## After running this procedure
 

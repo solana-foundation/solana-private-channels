@@ -290,10 +290,6 @@ fn drill_1_error_message_contracts_present_in_source() {
         // invalid_builder, program_error) are shared with withdrawals via
         // `classify_processor_error` and already covered above.
         (
-            "Failed idempotency lookup for transaction_id",
-            "indexer/src/operator/sender/mint.rs",
-        ),
-        (
             "Mint initialization failed",
             "indexer/src/operator/sender/transaction.rs",
         ),
@@ -1144,9 +1140,10 @@ async fn drill_10_deposit_failed_recovery_flows() -> Result<(), Box<dyn std::err
 //   1. The two new error_message substrings exist in mint.rs (also
 //      covered by drill_1 globally; re-asserted here so the drill is
 //      self-contained for an operator running it ad-hoc).
-//   2. The idempotency memo prefix is still anchored — the recovery
-//      flow re-arms to `pending`, and that re-arm is only safe because
-//      the operator's pre-send memo scan dedupes on this prefix.
+//   2. The idempotency memo prefix is still anchored: resync and
+//      `_verify_onchain_mint.md` search for it. The re-arm to `pending`
+//      itself is guarded by the row's write-ahead journal, which a
+//      `manual_review` row keeps and the pre-mint gate re-checks.
 //   3. Recovery SQL flips `manual_review` → `pending` for the trigger
 //      row only; collateral and terminal rows are untouched.
 //   4. Recovery SQL is targeted by `id`, not by `error_message` — pins
@@ -1190,8 +1187,8 @@ async fn drill_14_deposit_manual_review_post_jit_recovery_flows(
         .unwrap_or_else(|e| panic!("read {constants_path:?}: {e}"));
     assert!(
         constants_content.contains("private_channel:mint-idempotency:"),
-        "idempotency memo prefix must remain anchored — Path D re-arm \
-         relies on the pre-send memo scan to prevent double-mint",
+        "idempotency memo prefix must remain anchored: resync and the \
+         verify-on-chain procedure search for it",
     );
     eprintln!("OK   constants.rs: idempotency memo prefix anchored");
 
