@@ -850,7 +850,7 @@ impl PostgresDb {
                 withdrawal_nonce BIGINT PRIMARY KEY,
                 signature TEXT NOT NULL,
                 slot BIGINT NOT NULL,
-                amount BIGINT,
+                amount NUMERIC(20,0),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -860,9 +860,28 @@ impl PostgresDb {
 
         // Nullable on purpose: rows written before this column fall back to the withdrawal
         // row's own amount, so the upgrade needs no backfill.
-        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount BIGINT")
+        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount NUMERIC(20,0)")
             .execute(&self.pool)
             .await?;
+
+        // Widen a legacy BIGINT amount to NUMERIC(20,0) so a release past i64::MAX is
+        // recorded in full. Lossless, and a no-op once already NUMERIC.
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'observed_releases'
+                      AND column_name = 'amount'
+                      AND data_type = 'bigint'
+                ) THEN
+                    ALTER TABLE observed_releases ALTER COLUMN amount TYPE NUMERIC(20,0);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Write-ahead log for compensating remint MintTo signatures. Separate
         // from pending_release_signatures because these land on the source

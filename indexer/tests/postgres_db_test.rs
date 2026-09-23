@@ -226,6 +226,87 @@ async fn init_schema_widens_legacy_bigint_amount_column() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// An older database still has `observed_releases.amount BIGINT`, which cannot hold a
+/// release past i64::MAX. init_schema must widen it in place without touching the
+/// amounts already recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_widens_legacy_bigint_observed_release_amount(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let container = Postgres::default()
+        .with_db_name("db_test")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{}:{}/db_test", host, port);
+    let pool = PgPool::connect(&db_url).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE observed_releases (
+            withdrawal_nonce BIGINT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            slot BIGINT NOT NULL,
+            amount BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    let legacy_nonce: u64 = 1;
+    let legacy_amount: u64 = 500;
+    sqlx::query(
+        "INSERT INTO observed_releases (withdrawal_nonce, signature, slot, amount)
+         VALUES ($1, 'legacy_release', 100, $2)",
+    )
+    .bind(legacy_nonce as i64)
+    .bind(legacy_amount as i64)
+    .execute(&pool)
+    .await?;
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url,
+            max_connections: 5,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    let (data_type,): (String,) = sqlx::query_as(
+        "SELECT data_type::text FROM information_schema.columns
+         WHERE table_name = 'observed_releases' AND column_name = 'amount'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(data_type, "numeric", "amount must be widened to NUMERIC");
+
+    let legacy = storage
+        .get_observed_release(legacy_nonce)
+        .await?
+        .ok_or("legacy release missing after widening")?;
+    assert_eq!(legacy.amount, Some(TokenAmount(legacy_amount)));
+
+    let large_nonce: u64 = 2;
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: large_nonce as i64,
+            signature: "large_release".to_string(),
+            slot: 101,
+            amount: Some(TokenAmount(u64::MAX)),
+        }])
+        .await?;
+    let large = storage
+        .get_observed_release(large_nonce)
+        .await?
+        .ok_or("large release missing")?;
+    assert_eq!(large.amount, Some(TokenAmount(u64::MAX)));
+    Ok(())
+}
+
 // ── 2. Single transaction insert ─────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
