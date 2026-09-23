@@ -103,6 +103,19 @@ pub async fn run(
         ));
     }
 
+    // Escrow mints land on the channel, and nothing proves a fallback serves the channel. A
+    // wrong-chain fallback's honest absence would read as Dead and re-mint a landed deposit.
+    // Without one, a pruned primary degrades to Uncertain instead.
+    if common_config.program_type == crate::config::ProgramType::Escrow
+        && normalized_fallback_url.is_some()
+    {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url is not supported for the escrow operator: its finality checks \
+             must come from the channel rpc_url alone"
+                .to_string(),
+        ));
+    }
+
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require
     // an independent, same-cluster, reachable fallback before starting.
     validate_withdraw_fallback(

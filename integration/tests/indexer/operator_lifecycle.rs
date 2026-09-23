@@ -129,10 +129,11 @@ async fn start_operator_with_alert(
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
         source_rpc_url: Some(rpc_url.clone()),
-        // The withdraw operator now requires an independent, same-cluster fallback.
-        // Reach the same node via a distinct host string so the URL differs while
-        // the genesis hash matches. Harmless for Escrow callers (never validated).
-        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
+        // The withdraw operator requires an independent, same-cluster fallback. Reach
+        // the same node via a distinct host string so the URL differs while the genesis
+        // hash matches. The escrow operator refuses a fallback, so it gets none.
+        fallback_rpc_url: (program_type == ProgramType::Withdraw)
+            .then(|| same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
@@ -180,10 +181,11 @@ async fn start_operator_with_config(
         // Withdraw operator requires a source chain for remints; single-validator
         // test, so point it at the same RPC. Harmless for Escrow callers.
         source_rpc_url: Some(rpc_url.clone()),
-        // The withdraw operator now requires an independent, same-cluster fallback.
-        // Reach the same node via a distinct host string so the URL differs while
-        // the genesis hash matches. Harmless for Escrow callers (never validated).
-        fallback_rpc_url: Some(same_host_fallback_url(&rpc_url)),
+        // The withdraw operator requires an independent, same-cluster fallback. Reach
+        // the same node via a distinct host string so the URL differs while the genesis
+        // hash matches. The escrow operator refuses a fallback, so it gets none.
+        fallback_rpc_url: (program_type == ProgramType::Withdraw)
+            .then(|| same_host_fallback_url(&rpc_url)),
         postgres: postgres_config,
         escrow_instance_id: Some(instance),
     };
