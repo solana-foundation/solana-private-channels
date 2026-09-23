@@ -481,7 +481,11 @@ enum EndpointVerdict {
 
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
 /// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
-/// proves retention. Assumes a single consistent archival endpoint, not a split pool.
+/// proves retention.
+///
+/// Sound on one endpoint whose state only moves forward, such as a lagging replica: height
+/// is read before status and the floor after, so no answer comes from an older state than
+/// the one before it. Not sound behind a load balancer whose backends can disagree.
 ///
 /// The bottom of the range is the slot the attempt's blockhash was read at, journaled
 /// with the broadcast. An attempt journaled before that column existed carries none, and
@@ -632,6 +636,11 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
 async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
+    // Height before status: on an endpoint whose state only moves forward, the status
+    // then comes from a state at least as new, so a null is never paired with an expiry
+    // its own view had not reached. Held as a Result so an outage only matters below.
+    let block_height = rpc.get_block_height().await;
+
     let response = match rpc.get_signature_statuses_with_history(&flat).await {
         Ok(r) => r,
         Err(e) => {
@@ -659,10 +668,10 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
         return EndpointVerdict::Landed(flat[index]);
     }
 
-    // Fetch block height only for the lvbh check on null-status sigs, so a
+    // Block height is needed only for the lvbh check on null-status sigs, so a
     // transient getBlockHeight outage isn't treated as uncertainty otherwise.
     let current_height = if response.value.iter().any(|s| s.is_none()) {
-        match rpc.get_block_height().await {
+        match block_height {
             Ok(h) => h,
             Err(e) => {
                 return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
@@ -1253,6 +1262,7 @@ mod tests {
 
     use solana_sdk::pubkey::Pubkey;
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Once;
     use tokio::sync::{mpsc, Semaphore};
@@ -3908,5 +3918,90 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    }
+
+    /// One endpoint is not one snapshot: the channel read node serves a replica that can
+    /// lag and catch up between two calls. A status read on the lagging state paired with
+    /// a height read on the caught-up one proves a landed mint dead, and the deposit is
+    /// minted twice. Reading height first means status never comes from an older state.
+    #[tokio::test]
+    async fn classify_replica_catching_up_between_calls_is_not_dead() {
+        let last_valid_block_height = 1150;
+        let blockhash_slot = 1000;
+        let lagging_height = 1005;
+        let caught_up_height = 1300;
+        let landed_sig = Signature::new_unique();
+
+        // The first request of any method sees the lagging replica; every later one sees
+        // it caught up, with the mint finalized.
+        let requests_seen = Arc::new(AtomicUsize::new(0));
+        let mut server = mockito::Server::new_async().await;
+        let status_requests = requests_seen.clone();
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                let status = if status_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "null"
+                } else {
+                    r#"{"slot":1010,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#
+                };
+                format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1300}},"value":[{status}]}},"id":1}}"#
+                )
+                .into_bytes()
+            })
+            .create();
+        let height_requests = requests_seen.clone();
+        let _height = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                let height = if height_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    lagging_height
+                } else {
+                    caught_up_height
+                };
+                format!(r#"{{"jsonrpc":"2.0","result":{height},"id":1}}"#).into_bytes()
+            })
+            .create();
+        // Floor below the blockhash slot: coverage would let an absence stand as Dead.
+        let _floor = mock_rpc(
+            &mut server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":400,"id":1}"#,
+        )
+        .await;
+
+        let client = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let sigs = vec![PendingSig {
+            signature: landed_sig,
+            last_valid_block_height,
+            blockhash_slot: Some(blockhash_slot),
+        }];
+
+        match classify_signatures(&FinalityRpc::channel(&client, None), &sigs).await {
+            SigFinality::Landed(signature) => assert_eq!(signature, landed_sig),
+            SigFinality::Dead => panic!("a landed mint was proven dead and would be re-minted"),
+            SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
+                panic!("expected Landed, got an unresolved verdict: {reason}")
+            }
+        }
     }
 }
