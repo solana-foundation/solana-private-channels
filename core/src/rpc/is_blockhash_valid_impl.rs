@@ -1,25 +1,21 @@
 use crate::rpc::{
-    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
-    ReadDeps,
+    error::{custom_error, INVALID_PARAMS_CODE},
+    WriteDeps,
 };
 use jsonrpsee::core::RpcResult;
 use solana_rpc_client_types::config::RpcContextConfig;
 use solana_rpc_client_types::response::{Response, RpcResponseContext};
 use solana_sdk::hash::Hash;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
 
 pub async fn is_blockhash_valid_impl(
-    read_deps: &ReadDeps,
+    write_deps: &WriteDeps,
     blockhash: String,
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<bool>> {
-    // Get the current slot
-    let slot = read_deps
-        .accounts_db
-        .get_current_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
-        .unwrap_or(0);
+    // Public traffic reaches the writer here, so nothing below touches the DB or awaits.
+    let slot = write_deps.settled_slot.load(Ordering::Acquire);
 
     // Parse the provided blockhash
     let provided_hash = Hash::from_str(&blockhash)
@@ -32,7 +28,7 @@ pub async fn is_blockhash_valid_impl(
     // Edge cases:
     // - Empty window: iter().any() returns false (all blockhashes rejected at startup)
     // - Lock poisoning: handled with map_err instead of unwrap()
-    let live_blockhashes = read_deps
+    let live_blockhashes = write_deps
         .live_blockhashes
         .read()
         .map_err(|e| custom_error(-32603, format!("Failed to acquire blockhash lock: {}", e)))?;

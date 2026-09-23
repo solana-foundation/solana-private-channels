@@ -162,6 +162,7 @@ pub(crate) async fn verify_release_landed(
         rpc,
         &find_withdrawal_bitmap_pda(&instance_pda),
         Some(ref_slot),
+        CommitmentConfig::finalized(),
     )
     .await
     {
@@ -210,10 +211,13 @@ pub(crate) async fn validate_bitmap_consistency(
         "Validating withdrawal bitmap against completed withdrawals"
     );
 
+    // Finalized, not the client's commitment: releases stay processing until final, and a
+    // fork-only bit on such a row would otherwise send it to manual review at boot.
     let bitmap = fetch_consumed_nonces(
         rpc_client,
         &bitmap_pda,
         Some(finalized_anchor(rpc_client).await?),
+        CommitmentConfig::finalized(),
     )
     .await?;
     let (mut db_only, mut chain_only) = diff_bitmap(storage, &bitmap).await?;
@@ -338,6 +342,7 @@ async fn confirm_divergence(
         rpc_client,
         bitmap_pda,
         Some(finalized_anchor(rpc_client).await?),
+        CommitmentConfig::finalized(),
     )
     .await?;
     diff_bitmap(storage, &bitmap).await
@@ -814,7 +819,7 @@ impl SenderState {
 mod tests {
     use super::*;
     use crate::operator::sender::test_support::{
-        mock_bitmap_account, mock_bitmap_at_slot, mock_bitmap_sequence,
+        mock_bitmap_account, mock_bitmap_at_commitment, mock_bitmap_at_slot, mock_bitmap_sequence,
         mock_bitmap_then_read_failure, mock_finalized_anchor, sender_state_with_storage,
         sender_state_with_storage_and_role,
     };
@@ -2065,6 +2070,74 @@ mod tests {
         );
         boot.assert();
         reread.assert();
+    }
+
+    /// A bit set only at confirmed can still be rolled back by a fork, so it must not
+    /// count as proof that a release landed. The client itself runs at confirmed.
+    #[tokio::test]
+    async fn verify_release_landed_reads_bitmap_at_finalized() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+        let _finalized = mock_bitmap_at_slot(&mut server, 500, 0, &[]);
+        let _fork_only = mock_bitmap_at_commitment(&mut server, "confirmed", 0, &[4]);
+        let state = sender_state_with_storage(&server.url(), MockStorage::new());
+
+        let verdict =
+            super::verify_release_landed(&state.rpc_client, Some(Pubkey::new_unique()), 4, 10)
+                .await;
+
+        assert!(
+            matches!(verdict, ReleaseVerdict::NotLanded),
+            "a fork-only bit must not read as a landed release"
+        );
+    }
+
+    /// Releases now stay processing until finality, so a restart in that window sees a bit
+    /// at confirmed whose signature is not final yet. The boot read must ignore it rather
+    /// than send the row to manual review.
+    #[tokio::test]
+    async fn validate_bitmap_consistency_ignores_a_confirmed_only_bit() {
+        let mut server = mockito::Server::new_async().await;
+        let _anchor = mock_finalized_anchor(&mut server, vec![500]);
+        let _finalized = mock_bitmap_at_slot(&mut server, 500, 0, &[]);
+        let _fork_only = mock_bitmap_at_commitment(&mut server, "confirmed", 0, &[4]);
+        let _statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{
+                "slot":100,"confirmations":5,"err":null,"status":{"Ok":null},
+                "confirmationStatus":"confirmed"}]},"id":0}"#,
+            )
+            .create();
+
+        let mock = MockStorage::new();
+        seed_withdrawal(&mock, 5, 4, TransactionStatus::Processing, None);
+        let state = sender_state_with_storage(&server.url(), mock);
+        state
+            .storage
+            .insert_release_signature(5, Signature::new_unique().to_string(), 1, None)
+            .await
+            .unwrap();
+        let (storage_tx, mut rx) = mpsc::channel(8);
+
+        let result = super::validate_bitmap_consistency(
+            &state.storage,
+            &state.rpc_client,
+            None,
+            Some(Pubkey::new_unique()),
+            &storage_tx,
+        )
+        .await;
+
+        assert!(result.is_ok(), "boot must pass: {result:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "an in-flight release must not be escalated at boot"
+        );
     }
 
     /// The anchor is what makes the bitmap trustworthy, so without one there is

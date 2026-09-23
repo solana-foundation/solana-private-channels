@@ -8,7 +8,8 @@ use crate::{
     error::StorageError,
     storage::common::models::{
         DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-        MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
+        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, StoredSig, TransactionStatus,
+        TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::RequeueOutcome,
@@ -2364,6 +2365,38 @@ impl PostgresDb {
             "#,
         )
         .bind(transaction_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Processing withdrawals with at least one journaled release signature, for the
+    /// promotion pass. Keyset paging on `id`, like the stalled-withdrawal sweep, so rows
+    /// that are not final yet cannot starve the ones behind them. A row with a refund
+    /// claimed or landed is left to recovery, which checks the bitmap first.
+    pub async fn get_released_withdrawals_internal(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ReleasedWithdrawal>, sqlx::Error> {
+        sqlx::query_as::<_, ReleasedWithdrawal>(
+            r#"
+            SELECT t.id, t.updated_at, array_agg(p.signature ORDER BY p.id) AS signatures
+            FROM transactions t
+            JOIN pending_release_signatures p ON p.transaction_id = t.id
+            WHERE t.transaction_type = 'withdrawal'
+              AND t.status = 'processing'
+              AND t.landed_remint_signature IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_remint_signatures r WHERE r.transaction_id = t.id
+              )
+              AND t.id > $1
+            GROUP BY t.id, t.updated_at
+            ORDER BY t.id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
     }

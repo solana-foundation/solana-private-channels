@@ -23,7 +23,10 @@ use {
     futures::future::FutureExt,
     solana_hash::Hash,
     solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
-    std::{sync::Arc, time::Duration},
+    std::{
+        sync::{atomic::AtomicU64, Arc},
+        time::Duration,
+    },
     tokio::{sync::mpsc, task::JoinHandle},
     tokio_util::sync::CancellationToken,
     tracing::{error, info, warn},
@@ -299,182 +302,180 @@ async fn start_services(
     let mut heartbeats = crate::health::HeartbeatRegistry::new();
 
     // Only create write pipeline for Write and Aio modes
-    let (write_deps, live_blockhashes_arc) =
-        if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
-            // RPC ingress channel (receives from RPC, feeds the sigverify worker
-            // pool). MPMC so many sigverify workers can pull; a full queue sheds
-            // load at RPC ingress.
-            let (ingress_tx, ingress_rx) =
-                crate::stages::create_ingress_channel(config.ingress_queue_capacity);
+    let write_deps = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
+        // RPC ingress channel (receives from RPC, feeds the sigverify worker
+        // pool). MPMC so many sigverify workers can pull; a full queue sheds
+        // load at RPC ingress.
+        let (ingress_tx, ingress_rx) =
+            crate::stages::create_ingress_channel(config.ingress_queue_capacity);
 
-            // sigverify to dedup channel: dedup is a single consumer, so mpsc.
-            let (dedup_tx, dedup_rx) =
-                mpsc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
+        // sigverify to dedup channel: dedup is a single consumer, so mpsc.
+        let (dedup_tx, dedup_rx) =
+            mpsc::channel::<SanitizedTransaction>(config.sigverify_queue_size);
 
-            // Create sequencer channel (bounded so backpressure chains upstream)
-            let (sequencer_tx, sequencer_rx) =
-                mpsc::channel::<SanitizedTransaction>(config.sequencer_queue_capacity);
+        // Create sequencer channel (bounded so backpressure chains upstream)
+        let (sequencer_tx, sequencer_rx) =
+            mpsc::channel::<SanitizedTransaction>(config.sequencer_queue_capacity);
 
-            // Create batch channel between sequencer and executor (bounded for back-pressure)
-            let (batch_tx, batch_rx) =
-                mpsc::channel::<ConflictFreeBatch>(config.batch_channel_capacity);
+        // Create batch channel between sequencer and executor (bounded for back-pressure)
+        let (batch_tx, batch_rx) =
+            mpsc::channel::<ConflictFreeBatch>(config.batch_channel_capacity);
 
-            // Create execution results channel between executor and settler (bounded for back-pressure)
-            let (execution_results_tx, execution_results_rx) =
-                mpsc::channel::<ExecutedBatch>(config.execution_results_capacity);
+        // Create execution results channel between executor and settler (bounded for back-pressure)
+        let (execution_results_tx, execution_results_rx) =
+            mpsc::channel::<ExecutedBatch>(config.execution_results_capacity);
 
-            // Settled accounts from settler to the executor's BOB. Exactly one inbox,
-            // cloned to both: a second would compile and strand every dirty entry.
-            let settled_inbox = SettledInbox::new();
+        // Settled accounts from settler to the executor's BOB. Exactly one inbox,
+        // cloned to both: a second would compile and strand every dirty entry.
+        let settled_inbox = SettledInbox::new();
 
-            // Settled blockhashes from settler to dedup, as deep as dedup's window so
-            // a full queue holds only hashes a caught-up dedup would still keep.
-            let (settled_blockhashes_tx, settled_blockhashes_rx) =
-                mpsc::channel::<Hash>(config.max_blockhashes);
+        // Settled blockhashes from settler to dedup, as deep as dedup's window so
+        // a full queue holds only hashes a caught-up dedup would still keep.
+        let (settled_blockhashes_tx, settled_blockhashes_rx) =
+            mpsc::channel::<Hash>(config.max_blockhashes);
 
-            // Load persisted dedup state from DB before starting the stage.
-            // Failure here is fatal: starting with an empty cache could allow
-            // duplicate transactions to execute after a restart.
-            //
-            // Opened writable (read_only=false): this is the Write/Aio node, which
-            // connects to the primary and owns address_signatures index
-            // consistency. repair_address_signatures writes (seeds the watermark
-            // and re-derives rows), so it must run against a writable handle.
-            // The read-only node opens its own read_only=true handle below, where
-            // the repair is skipped.
-            let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
-            // Claimed under the lease and before anything reads the chain: the bump
-            // waits out the old writer's last batch and fences every later one, so
-            // the dedup state and tip loaded below are final.
-            let AccountsDB::Postgres(ref postgres_db) = db else {
-                return Err("the write pipeline requires a Postgres accounts database".into());
-            };
-            let writer_epoch = writer_epoch::bump(postgres_db).await?;
-            info!("Claimed writer epoch {writer_epoch}");
-            repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
-            let (initial_live_blockhashes, initial_dedup_cache) =
-                load_dedup_state(&db, config.max_blockhashes).await?;
-
-            let dedup_hb = crate::health::StageHeartbeat::new();
-            let sigverify_hb = crate::health::StageHeartbeat::new();
-            let sequencer_hb = crate::health::StageHeartbeat::new();
-            let executor_hb = crate::health::StageHeartbeat::new();
-            let settler_hb = crate::health::StageHeartbeat::new();
-            let addr_index_writer_hb = crate::health::StageHeartbeat::new();
-            heartbeats.dedup = Some(Arc::clone(&dedup_hb));
-            heartbeats.sigverify = Some(Arc::clone(&sigverify_hb));
-            heartbeats.sequencer = Some(Arc::clone(&sequencer_hb));
-            heartbeats.executor = Some(Arc::clone(&executor_hb));
-            heartbeats.settler = Some(Arc::clone(&settler_hb));
-            heartbeats.address_index_writer = Some(Arc::clone(&addr_index_writer_hb));
-
-            // Start sigverify worker pool (first stage). Verification runs before
-            // dedup so only verified transactions ever reach the dedup cache.
-            let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
-                num_workers: config.sigverify_workers,
-                admin_keys: config.admin_keys.clone(),
-                rx: ingress_rx,
-                output_tx: dedup_tx,
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: sigverify_hb,
-            })
-            .await;
-            workers.extend(sigverify_workers);
-
-            // Start dedup stage (drops replays after verification, keyed on the
-            // message hash so signature variants of one message collapse to one).
-            let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
-                max_blockhashes: config.max_blockhashes,
-                input_rx: dedup_rx,
-                settled_blockhashes_rx,
-                output_tx: sequencer_tx,
-                initial_live_blockhashes,
-                initial_dedup_cache,
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: dedup_hb,
-            })
-            .await;
-            workers.push(dedup);
-
-            // Start sequencer (produces conflict-free batches)
-            let sequence = start_sequence_worker(crate::stages::SequencerArgs {
-                max_tx_per_batch: config.max_tx_per_batch,
-                batch_deadline_ms: config.batch_deadline_ms,
-                rx: sequencer_rx,
-                batch_tx,
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: sequencer_hb,
-            })
-            .await;
-            workers.push(sequence);
-
-            // Start executor (executes and settles batches)
-            let execution = start_execution_worker(crate::stages::ExecutionArgs {
-                batch_rx,
-                settled_accounts: settled_inbox.clone(),
-                execution_results_tx,
-                accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-                metrics: Arc::clone(&config.metrics),
-                max_svm_workers: config.max_svm_workers,
-                heartbeat: executor_hb,
-                live_blockhashes: Arc::clone(&live_blockhashes),
-            })
-            .await;
-            workers.push(execution);
-
-            // Each item is one tick worth of (address, slot, signature) rows.
-            const ADDR_SIG_QUEUE_CAPACITY: usize = 1024;
-            // Hard cap on rows per writer COMMIT so individual flushes stay
-            // sub-second even under sustained load, keeps PG commit latency
-            // bounded regardless of how much the writer has backlogged.
-            const ADDR_SIG_FLUSH_CHUNK: usize = 5000;
-            let (addr_sig_tx, addr_sig_rx) = mpsc::channel(ADDR_SIG_QUEUE_CAPACITY);
-
-            let settle = start_settle_worker(crate::stages::SettleArgs {
-                execution_results_rx,
-                settled_accounts_tx: settled_inbox,
-                settled_blockhashes_tx,
-                address_signatures_tx: addr_sig_tx,
-                accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-                redis_cache_url: config.redis_cache_url.clone(),
-                redis_block_ttl_secs: config.redis_block_ttl_secs,
-                blocktime_ms: config.blocktime_ms,
-                cache_mirror_cooldown: crate::stages::settle::CACHE_MIRROR_COOLDOWN,
-                perf_sample_period_secs: config.perf_sample_period_secs,
-                shutdown_token: shutdown_token.clone(),
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: settler_hb,
-                writer_epoch: Some(writer_epoch),
-            })
-            .await;
-            workers.push(settle);
-
-            // Push the writer AFTER the settler so shutdown awaits in the
-            // right order: settler drains its buffer, drops its sender, the
-            // writer's recv_many returns 0, then it flushes any remainder.
-            let addr_index_writer = start_address_index_writer(AddressIndexWriterArgs {
-                rows_rx: addr_sig_rx,
-                accountsdb_connection_url: config.accountsdb_connection_url.clone(),
-                flush_chunk_size: ADDR_SIG_FLUSH_CHUNK,
-                metrics: Arc::clone(&config.metrics),
-                heartbeat: addr_index_writer_hb,
-            })
-            .await;
-            workers.push(addr_index_writer);
-
-            (
-                Some(WriteDeps {
-                    dedup_tx: ingress_tx,
-                    metrics: Arc::clone(&config.metrics),
-                }),
-                live_blockhashes,
-            )
-        } else {
-            // Read-only node: no write pipeline, create empty live_blockhashes Arc
-            use std::collections::LinkedList;
-            use std::sync::{Arc, RwLock};
-            (None, Arc::new(RwLock::new(LinkedList::new())))
+        // Load persisted dedup state from DB before starting the stage.
+        // Failure here is fatal: starting with an empty cache could allow
+        // duplicate transactions to execute after a restart.
+        //
+        // Opened writable (read_only=false): this is the Write/Aio node, which
+        // connects to the primary and owns address_signatures index
+        // consistency. repair_address_signatures writes (seeds the watermark
+        // and re-derives rows), so it must run against a writable handle.
+        // The read-only node opens its own read_only=true handle below, where
+        // the repair is skipped.
+        let db = AccountsDB::new(&config.accountsdb_connection_url, false).await?;
+        // Claimed under the lease and before anything reads the chain: the bump
+        // waits out the old writer's last batch and fences every later one, so
+        // the dedup state and tip loaded below are final.
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            return Err("the write pipeline requires a Postgres accounts database".into());
         };
+        let writer_epoch = writer_epoch::bump(postgres_db).await?;
+        info!("Claimed writer epoch {writer_epoch}");
+        repair_address_signatures(&db, Arc::clone(&config.metrics)).await?;
+        let (initial_live_blockhashes, initial_dedup_cache) =
+            load_dedup_state(&db, config.max_blockhashes).await?;
+        // Seeded before RPC starts so isBlockhashValid never reports slot 0 on a live chain.
+        let settled_slot = Arc::new(AtomicU64::new(db.get_current_slot().await?.unwrap_or(0)));
+
+        let dedup_hb = crate::health::StageHeartbeat::new();
+        let sigverify_hb = crate::health::StageHeartbeat::new();
+        let sequencer_hb = crate::health::StageHeartbeat::new();
+        let executor_hb = crate::health::StageHeartbeat::new();
+        let settler_hb = crate::health::StageHeartbeat::new();
+        let addr_index_writer_hb = crate::health::StageHeartbeat::new();
+        heartbeats.dedup = Some(Arc::clone(&dedup_hb));
+        heartbeats.sigverify = Some(Arc::clone(&sigverify_hb));
+        heartbeats.sequencer = Some(Arc::clone(&sequencer_hb));
+        heartbeats.executor = Some(Arc::clone(&executor_hb));
+        heartbeats.settler = Some(Arc::clone(&settler_hb));
+        heartbeats.address_index_writer = Some(Arc::clone(&addr_index_writer_hb));
+
+        // Start sigverify worker pool (first stage). Verification runs before
+        // dedup so only verified transactions ever reach the dedup cache.
+        let sigverify_workers = start_sigverify_workerpool(crate::stages::SigverifyArgs {
+            num_workers: config.sigverify_workers,
+            admin_keys: config.admin_keys.clone(),
+            rx: ingress_rx,
+            output_tx: dedup_tx,
+            metrics: Arc::clone(&config.metrics),
+            heartbeat: sigverify_hb,
+        })
+        .await;
+        workers.extend(sigverify_workers);
+
+        // Start dedup stage (drops replays after verification, keyed on the
+        // message hash so signature variants of one message collapse to one).
+        let (dedup, live_blockhashes) = crate::stages::start_dedup(crate::stages::DedupArgs {
+            max_blockhashes: config.max_blockhashes,
+            input_rx: dedup_rx,
+            settled_blockhashes_rx,
+            output_tx: sequencer_tx,
+            initial_live_blockhashes,
+            initial_dedup_cache,
+            metrics: Arc::clone(&config.metrics),
+            heartbeat: dedup_hb,
+        })
+        .await;
+        workers.push(dedup);
+
+        // Start sequencer (produces conflict-free batches)
+        let sequence = start_sequence_worker(crate::stages::SequencerArgs {
+            max_tx_per_batch: config.max_tx_per_batch,
+            batch_deadline_ms: config.batch_deadline_ms,
+            rx: sequencer_rx,
+            batch_tx,
+            metrics: Arc::clone(&config.metrics),
+            heartbeat: sequencer_hb,
+        })
+        .await;
+        workers.push(sequence);
+
+        // Start executor (executes and settles batches)
+        let execution = start_execution_worker(crate::stages::ExecutionArgs {
+            batch_rx,
+            settled_accounts: settled_inbox.clone(),
+            execution_results_tx,
+            accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+            metrics: Arc::clone(&config.metrics),
+            max_svm_workers: config.max_svm_workers,
+            heartbeat: executor_hb,
+            live_blockhashes: Arc::clone(&live_blockhashes),
+        })
+        .await;
+        workers.push(execution);
+
+        // Each item is one tick worth of (address, slot, signature) rows.
+        const ADDR_SIG_QUEUE_CAPACITY: usize = 1024;
+        // Hard cap on rows per writer COMMIT so individual flushes stay
+        // sub-second even under sustained load, keeps PG commit latency
+        // bounded regardless of how much the writer has backlogged.
+        const ADDR_SIG_FLUSH_CHUNK: usize = 5000;
+        let (addr_sig_tx, addr_sig_rx) = mpsc::channel(ADDR_SIG_QUEUE_CAPACITY);
+
+        let settle = start_settle_worker(crate::stages::SettleArgs {
+            execution_results_rx,
+            settled_accounts_tx: settled_inbox,
+            settled_blockhashes_tx,
+            address_signatures_tx: addr_sig_tx,
+            accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+            redis_cache_url: config.redis_cache_url.clone(),
+            redis_block_ttl_secs: config.redis_block_ttl_secs,
+            blocktime_ms: config.blocktime_ms,
+            cache_mirror_cooldown: crate::stages::settle::CACHE_MIRROR_COOLDOWN,
+            perf_sample_period_secs: config.perf_sample_period_secs,
+            shutdown_token: shutdown_token.clone(),
+            metrics: Arc::clone(&config.metrics),
+            heartbeat: settler_hb,
+            writer_epoch: Some(writer_epoch),
+            settled_slot: Arc::clone(&settled_slot),
+        })
+        .await;
+        workers.push(settle);
+
+        // Push the writer AFTER the settler so shutdown awaits in the
+        // right order: settler drains its buffer, drops its sender, the
+        // writer's recv_many returns 0, then it flushes any remainder.
+        let addr_index_writer = start_address_index_writer(AddressIndexWriterArgs {
+            rows_rx: addr_sig_rx,
+            accountsdb_connection_url: config.accountsdb_connection_url.clone(),
+            flush_chunk_size: ADDR_SIG_FLUSH_CHUNK,
+            metrics: Arc::clone(&config.metrics),
+            heartbeat: addr_index_writer_hb,
+        })
+        .await;
+        workers.push(addr_index_writer);
+
+        Some(WriteDeps {
+            dedup_tx: ingress_tx,
+            metrics: Arc::clone(&config.metrics),
+            live_blockhashes,
+            settled_slot,
+        })
+    } else {
+        None
+    };
 
     let read_deps = match config.mode {
         NodeMode::Read | NodeMode::Aio => {
@@ -509,7 +510,6 @@ async fn start_services(
             Some(ReadDeps {
                 admin_keys: config.admin_keys,
                 accounts_db,
-                live_blockhashes: live_blockhashes_arc,
                 max_blockhashes,
                 simulation_permits: tokio::sync::Semaphore::new(
                     crate::rpc::constants::MAX_CONCURRENT_SIMULATIONS,

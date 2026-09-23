@@ -62,7 +62,7 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | `--read-url` | `GATEWAY_READ_URL` | — | Read node URL |
 | `--cors-allowed-origin` | `GATEWAY_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
 
-Routes `sendTransaction` to the write node; all other RPC methods go to the read node.
+Routes `sendTransaction` and `isBlockhashValid` to the write node; all other RPC methods go to the read node.
 
 The internal port serves the operator's own services: no RBAC, no rate limiting,
 and transaction errors are not collapsed. It must never be published to the host.
@@ -151,12 +151,32 @@ The durable checkpoint is always the lower bound. `indexer.backfill.start_slot` 
 The `private-channel-admin` binary provides database maintenance commands:
 
 ```shell
-# Truncate old blocks/transactions (requires recent backup)
-private-channel-admin truncate --keep-slots 100000
+# Take a custom-format dump of the primary first; truncation refuses without one
+pg_dump -Fc -f ledger.dump "$PRIVATE_CHANNEL_ACCOUNTSDB_CONNECTION_URL"
 
-# Dry run to preview what would be deleted
-private-channel-admin truncate --keep-slots 100000 --dry-run
+# Truncate old blocks/transactions
+private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump
+
+# Dry run to preview what would be deleted (proves the dump too)
+private-channel-admin truncate --keep-slots 100000 --pg-dump-path ledger.dump --dry-run
 ```
+
+Nothing is deleted, not even in a dry run, until the dump is proven to hold every
+row the run would delete. The proof reads the whole dump once through `pg_restore`
+and requires: a clean exit with nothing on stderr, data for `blocks`,
+`transactions`, `metadata` (and `account_history` if present), the live
+database's `deployment_id`, and exactly the live number of blocks and
+`account_history` rows below the cutoff. The report prints the dump's SHA-256 so it
+can be matched against the backup you keep. WAL archiving and file age are not
+accepted as proof.
+
+- Only custom format (`-Fc`) is accepted, and `pg_restore` must be at least the
+  server's major version.
+- The runtime image ships no PostgreSQL client. Run `admin` from a host with PG16
+  client tools, or pass `--pg-restore-bin` pointing at a wrapper such as
+  `docker exec -i <pg16 container> pg_restore "$@"`.
+- Run it against the primary, never a replica.
+- `--max-backup-age-hours` is deprecated and ignored.
 
 Truncation deletes in batches, and each batch commits the new retention floor
 (`getFirstAvailableBlock`) in the same transaction as its deletions. A partial or

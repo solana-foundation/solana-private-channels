@@ -189,7 +189,13 @@ mod tests {
         metrics: SharedMetrics,
     ) -> (WriteDeps, async_channel::Receiver<SanitizedTransaction>) {
         let (dedup_tx, rx) = async_channel::bounded(TEST_INGRESS_CAP);
-        (WriteDeps { dedup_tx, metrics }, rx)
+        let deps = WriteDeps {
+            dedup_tx,
+            metrics,
+            live_blockhashes: Arc::default(),
+            settled_slot: Arc::default(),
+        };
+        (deps, rx)
     }
 
     /// A shutting-down node must refuse admission rather than acknowledge work

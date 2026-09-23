@@ -346,6 +346,14 @@ committing the row to manual review. Sub-triggers below; same recovery.
 > demoted to `Pending`; a still-live signature is left in `Processing` for
 > the next sweep.
 >
+> **A released withdrawal becomes `Completed` only on finalized proof.** The
+> sender no longer marks it `Completed` at `confirmed`, since a fork can still
+> drop a confirmed release. The row stays `Processing` with its journal, and a
+> promotion pass that runs every second completes it once one of its journaled
+> signatures is finalized. That is usually seconds after the release; if the
+> pass cannot reach the RPC, the recovery sweep above does it within about 6
+> minutes. A recently released row sitting in `Processing` is expected.
+>
 > **A row with no recorded signature is no longer quarantined on sight.**
 > The signature is written in the same transaction that claims the row, so
 > an empty journal means the release never broadcast. Recovery corroborates

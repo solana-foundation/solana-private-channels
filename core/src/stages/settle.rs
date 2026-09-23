@@ -30,7 +30,10 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     std::{
         collections::{hash_map::Entry, HashMap},
-        sync::Arc,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{
@@ -512,6 +515,8 @@ pub struct SettleArgs {
     /// The epoch the node claimed at startup. `None` commits unfenced, for tests
     /// that run a settler without a node around it.
     pub writer_epoch: Option<u64>,
+    /// The slot last published to the DB, read by isBlockhashValid for its context.
+    pub settled_slot: Arc<AtomicU64>,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -530,6 +535,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         metrics,
         heartbeat,
         writer_epoch,
+        settled_slot,
     } = args;
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
@@ -548,6 +554,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             metrics: SharedMetrics,
             heartbeat: Arc<crate::health::StageHeartbeat>,
             writer_epoch: Option<u64>,
+            settled_slot: Arc<AtomicU64>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -773,7 +780,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             // backs it. Only reached when the tick carried no
                             // work, so the loaded path never pays for it.
                             match publish_idle_slot(&postgres_db, redis_db.as_ref(), next_slot).await {
-                                Ok(true) => {}
+                                Ok(true) => settled_slot.store(next_slot, Ordering::Release),
                                 Ok(false) => {
                                     let reason = "a newer write node claimed the writer epoch";
                                     error!("Stopping the settler at idle slot {next_slot}: {reason}");
@@ -818,6 +825,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                         .await
                         {
                             Ok(settle_result) => {
+                                settled_slot.store(settle_result.slot, Ordering::Release);
                                 heartbeat.record_progress();
                                 perf_num_transactions += num_results as u64;
                                 if num_results > 0 {
@@ -997,6 +1005,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 .await
                 {
                     Ok(settle_result) => {
+                        settled_slot.store(settle_result.slot, Ordering::Release);
                         if num_results > 0 {
                             metrics.settler_txs_settled(num_results);
                         }
@@ -1047,6 +1056,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             metrics,
             heartbeat,
             writer_epoch,
+            settled_slot,
         )
         .await
         {
@@ -2130,6 +2140,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: Arc::clone(&heartbeat),
             writer_epoch,
+            settled_slot: Arc::default(),
         })
         .await;
         (
@@ -2802,6 +2813,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: Arc::clone(&heartbeat),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -2828,6 +2840,59 @@ mod tests {
         }
 
         feeder.abort();
+        shutdown.cancel();
+    }
+
+    /// isBlockhashValid reports this slot as its context, so it must track the published slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_publishes_the_committed_slot() {
+        let (db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (exec_tx, exec_rx) = mpsc::channel(1);
+        let inbox = SettledInbox::new();
+        let (settled_blockhashes_tx, _bh_rx) = mpsc::channel(TEST_BLOCKHASH_SINK);
+        let (address_signatures_tx, _as_rx) = mpsc::channel(64);
+        let settled_slot = Arc::new(AtomicU64::new(0));
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx: inbox.clone(),
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            redis_block_ttl_secs: 0,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
+            settled_slot: Arc::clone(&settled_slot),
+        })
+        .await;
+
+        let (output, txs) = sized_settle_batch(1024);
+        exec_tx.send(batch_of(output, txs, 1)).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(60), inbox.notified()).await;
+        assert!(first.is_ok(), "settler must produce a block");
+
+        // Idle ticks move the counter too, so poll until a read lands between two ticks.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let current = db.get_current_slot().await.unwrap().unwrap_or(0);
+            if current > 0 && settled_slot.load(Ordering::Acquire) == current {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "settled slot {} never matched the published slot {current}",
+                settled_slot.load(Ordering::Acquire)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         shutdown.cancel();
     }
 
@@ -3315,6 +3380,7 @@ mod tests {
             redis_block_ttl_secs: 0,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -4983,6 +5049,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -5035,6 +5102,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -5095,6 +5163,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -5224,6 +5293,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -6976,6 +7046,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -7075,6 +7146,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -7370,6 +7442,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -7435,6 +7508,7 @@ mod tests {
             cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -7972,6 +8046,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 
@@ -8064,6 +8139,7 @@ mod tests {
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
+            settled_slot: Arc::default(),
         })
         .await;
 

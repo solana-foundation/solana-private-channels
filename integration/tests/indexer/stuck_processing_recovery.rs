@@ -8,6 +8,7 @@ use {
         metrics::OPERATOR_STALE_PROCESSING_RECOVERED,
         operator::{
             recovery::{boot_reconcile_processing, test_hooks},
+            release_promotion::test_hooks as promotion,
             utils::rpc_util::{RetryConfig, RpcClientWithRetry},
             TransactionStatusUpdate,
         },
@@ -1770,6 +1771,202 @@ async fn it17_stuck_batch_does_not_starve_later_stalled_rows() {
         status_of(&pool, blocked[0]).await,
         "pending_remint",
         "rows that cannot classify stay exactly where they are"
+    );
+    mock.shutdown().await;
+}
+
+// ── release promotion ───────────────────────────────────────────────────────
+
+/// One `getSignatureStatuses` reply carrying `entries`, in request order.
+fn statuses_reply(entries: Vec<serde_json::Value>) -> Reply {
+    Reply::result(json!({"context": {"slot": 200}, "value": entries}))
+}
+
+fn finalized_ok() -> serde_json::Value {
+    json!({"slot": 100, "confirmations": null, "err": null, "status": {"Ok": null},
+           "confirmationStatus": "finalized"})
+}
+
+/// A processing withdrawal whose attempts were journaled the way the sender does it:
+/// the claim CAS and the journal insert in one DB transaction, before broadcast.
+async fn seed_released_withdrawal(
+    db: &PostgresDb,
+    pool: &sqlx::PgPool,
+    nonce: i64,
+    attempts: usize,
+) -> (i64, Vec<Signature>) {
+    let tx = make_withdrawal(&Signature::new_unique().to_string(), nonce);
+    let tx_id = db.insert_transaction_internal(&tx).await.unwrap();
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(tx_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut sigs = Vec::new();
+    for _ in 0..attempts {
+        let sig = Signature::new_unique();
+        db.claim_and_persist_signature_internal(
+            tx_id,
+            updated_at_of(pool, tx_id).await,
+            sig.to_string(),
+            100,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("the claim must win on a fresh row");
+        sigs.push(sig);
+    }
+    (tx_id, sigs)
+}
+
+/// The pass sees every processing withdrawal with a journal, whatever its age, and
+/// nothing else: no remint, parked, terminal or deposit row.
+#[tokio::test(flavor = "multi_thread")]
+async fn released_withdrawals_selection() {
+    let (db, url, _container) = start_pg("promotion_select").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+
+    let (fresh, _) = seed_released_withdrawal(&db, &pool, 1, 1).await;
+    let (old, _) = seed_released_withdrawal(&db, &pool, 2, 1).await;
+    seed_backdated_processing(&pool, old, ChronoDuration::minutes(10)).await;
+    let (no_journal, _) = seed_released_withdrawal(&db, &pool, 3, 0).await;
+    let mut excluded = vec![no_journal];
+    for (nonce, status) in [(4, "pending_remint"), (5, "parked"), (6, "completed")] {
+        let (id, _) = seed_released_withdrawal(&db, &pool, nonce, 1).await;
+        sqlx::query(&format!(
+            "UPDATE transactions SET status = '{status}'::transaction_status WHERE id = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        excluded.push(id);
+    }
+    let deposit = make_deposit(
+        &Signature::new_unique().to_string(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        100,
+    );
+    let deposit_id = db.insert_transaction_internal(&deposit).await.unwrap();
+    seed_backdated_processing(&pool, deposit_id, ChronoDuration::minutes(1)).await;
+    db.insert_release_signature_internal(deposit_id, Signature::new_unique().to_string(), 1, None)
+        .await
+        .unwrap();
+
+    let rows = storage.get_released_withdrawals(0, 256).await.unwrap();
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![fresh, old],
+        "excluded: {excluded:?}, deposit {deposit_id}"
+    );
+    assert_eq!(rows[1].updated_at, updated_at_of(&pool, old).await);
+}
+
+/// SOLA6-47: a confirmed release stays processing with its journal, and is completed
+/// only once finalized, by a pass that keeps no memory across a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_promoted_only_after_finalized() {
+    let (db, url, _container) = start_pg("promotion_finalized").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (id, sigs) = seed_released_withdrawal(&db, &pool, 1, 1).await;
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue_sequence(
+        "getSignatureStatuses",
+        [
+            statuses_reply(vec![json!({"slot": 100, "confirmations": 3, "err": null,
+                "status": {"Ok": null}, "confirmationStatus": "confirmed"})]),
+            statuses_reply(vec![finalized_ok()]),
+        ],
+    );
+    let client = test_client(mock.url());
+
+    promotion::promote_once(&storage, &client, &mut 0, 256)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&pool, id).await, "processing");
+    assert_eq!(counterpart_sig_of(&pool, id).await, None);
+    assert_eq!(journal_len(&pool, id).await, 1);
+
+    // A fresh cursor, as after a restart.
+    promotion::promote_once(&storage, &client, &mut 0, 256)
+        .await
+        .unwrap();
+    assert_eq!(status_of(&pool, id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, id).await,
+        Some(sigs[0].to_string())
+    );
+    mock.shutdown().await;
+}
+
+/// Recovery and the pass write through the same `updated_at` CAS, so when recovery
+/// moves the row first the pass's write is a no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_and_recovery_race_single_write() {
+    let (db, url, _container) = start_pg("promotion_race").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (id, sigs) = seed_released_withdrawal(&db, &pool, 1, 1).await;
+    let captured = storage
+        .get_released_withdrawals(0, 256)
+        .await
+        .unwrap()
+        .remove(0)
+        .updated_at;
+
+    assert!(storage
+        .try_quarantine_processing(id, captured, None, None)
+        .await
+        .unwrap());
+    let completed = storage
+        .try_complete_processing(id, captured, Some(sigs[0].to_string()), None)
+        .await
+        .unwrap();
+
+    assert!(!completed, "the losing writer must not land");
+    assert_eq!(status_of(&pool, id).await, "manual_review");
+}
+
+/// A timeout retry journals a second attempt with the same nonce. Only one can pay; the
+/// other fails NonceAlreadyUsed. The row completes against the one that paid.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_then_nonce_already_used_promotes_first_attempt() {
+    let (db, url, _container) = start_pg("promotion_retry").await;
+    let storage = Storage::Postgres(db.clone());
+    storage.init_schema().await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (id, sigs) = seed_released_withdrawal(&db, &pool, 1, 2).await;
+
+    let mock = MockRpcServer::start().await;
+    mock.enqueue(
+        "getSignatureStatuses",
+        statuses_reply(vec![
+            finalized_ok(),
+            json!({"slot": 101, "confirmations": null,
+                   "err": {"InstructionError": [0, {"Custom": 12}]},
+                   "status": {"Err": {"InstructionError": [0, {"Custom": 12}]}},
+                   "confirmationStatus": "finalized"}),
+        ]),
+    );
+    let client = test_client(mock.url());
+
+    promotion::promote_once(&storage, &client, &mut 0, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(status_of(&pool, id).await, "completed");
+    assert_eq!(
+        counterpart_sig_of(&pool, id).await,
+        Some(sigs[0].to_string())
     );
     mock.shutdown().await;
 }

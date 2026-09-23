@@ -14,7 +14,7 @@ That said, divergence shows up in three distinct buckets:
 
 ### SPC gateway, with auth disabled (`JWT_SECRET` unset)
 
-The gateway acts as a pure HTTP reverse proxy: it inspects the request body to find the `method` field, routes `sendTransaction` to the write upstream and everything else to the read upstream, adds CORS headers, and forwards. Liveness via GET `/health` (gateway-only) and readiness via GET `/ready` (probes both upstreams) are gateway-only additions.
+The gateway acts as a pure HTTP reverse proxy: it inspects the request body to find the `method` field, routes `sendTransaction` and `isBlockhashValid` to the write upstream and everything else to the read upstream, adds CORS headers, and forwards. Liveness via GET `/health` (gateway-only) and readiness via GET `/ready` (probes both upstreams) are gateway-only additions.
 
 ### SPC gateway, with auth enabled (`JWT_SECRET` + `AUTH_DATABASE_URL` both set)
 
@@ -56,7 +56,7 @@ Ordered from most divergent → closest match.
 | `getSupply` | All zeros - SPC has no native token supply. Block-explorers will render "0 SOL". |
 | `getVoteAccounts` | `{current: [], delinquent: []}` - SPC has no validators. |
 | `getSlotLeaders` | `[]` - SPC has no leader rotation. Jito-style "predict next leader" lookups get nothing. |
-| `isBlockhashValid` | Checks the Dedup stage's in-memory live-blockhash window via linear scan. Identical contract to Solana but the window is `max_blockhashes` blocks, which an operator may configure below 150; older hashes return `false` indistinguishably from "never existed". |
+| `isBlockhashValid` | Served by the write node (the gateway routes it there) from the Dedup stage's in-memory live-blockhash window via linear scan, with no database read. A read-only node returns a `-32000` server error instead of an answer, since it holds no window. Identical contract to Solana but the window is `max_blockhashes` blocks, which an operator may configure below 150; older hashes return `false` indistinguishably from "never existed". |
 | `getRecentPerformanceSamples` | Real data from SPC's pipeline; default/max 720 (matches Solana). Numbers reflect SPC, not mainnet - by design. |
 | `getLatestBlockhash` | `lastValidBlockHeight = block_height + max_blockhashes - 1`, the last height at which the hash is still in the window, tracking the node's configured window rather than Solana's fixed 150. Both sides of a client's confirmation loop are block heights, and the dedup window evicts one entry per produced block, so the published deadline and the eviction rule are the same quantity. The response context stays a slot, as Solana reports it. The wall-clock duration of the window moves with load: roughly 15s under continuous load and 2.5min fully idle at the default 150. |
 | `getSignatureStatuses` | `confirmation_status = Finalized`, `confirmations = None` on every found tx (correct under SPC's single timeline). `searchTransactionHistory` accepted but ignored. A storage or decode failure returns a `-32000` server error, never a `null` element, so a `null` means the signature is genuinely absent. A malformed signature fails the whole call with `-32602` invalid params, matching Solana, rather than nulling that one element. Max 256 sigs. |
