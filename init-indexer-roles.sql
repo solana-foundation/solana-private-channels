@@ -8,6 +8,11 @@
 -- backup sidecar. Grafana connecting as it would put every column of
 -- `transactions` — signature, initiator, recipient, mint, amount, memo,
 -- withdrawal_nonce — behind a single HTTP login.
+--
+-- Runs as superuser, so unqualified calls resolve to the built-ins only, never
+-- to a function some other login created in public.
+SET search_path = pg_catalog, pg_temp;
+
 \set grafana_password `echo "$POSTGRES_GRAFANA_PASSWORD"`
 \set app_db `echo "$POSTGRES_DB"`
 

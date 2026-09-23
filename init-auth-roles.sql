@@ -17,6 +17,11 @@
 -- sidecars and the replica's startup wait. A service that serves requests
 -- connecting as it would bypass every grant below.
 --
+-- The runtime can create functions in public, and this runs as superuser, so an
+-- unqualified call like format() could resolve to one it planted. Pin lookups
+-- to the built-ins before anything runs.
+SET search_path = pg_catalog, pg_temp;
+
 -- Passwords arrive as env vars the Postgres entrypoint exports. They are staged
 -- through set_config because psql substitutes :'vars' only outside quoted
 -- strings, and the role statements below are built inside dollar-quoted blocks.

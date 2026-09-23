@@ -503,6 +503,18 @@
           Two postgres logins share a password. Each needs its own, or a compromised service
           holds the others' rights. Fix: edit secrets.yml and give each one a distinct value.
 
+    # Grafana's datasource reads the indexer database, so this login guards
+    # participant state. The rejected values were once shipped in tracked presets.
+    - name: Assert grafana_admin_password is set and not a shipped default
+      ansible.builtin.assert:
+        that:
+          - grafana_admin_password | default('') | length > 0
+          - grafana_admin_password not in ['admin', 'admin123']
+        fail_msg: |
+          `grafana_admin_password` is empty or a value once shipped in the repository. It is Grafana's
+          admin login, whose datasource queries the indexer database.
+          Fix: edit secrets.yml and set `grafana_admin_password` to a fresh value: openssl rand -hex 16.
+
     # Only required when enforcement is on: env.j2 blanks JWT_SECRET when
     # gateway_enforce_jwt is false, so the secret's value is unused there.
     # Mirror the template's `default(true)` so an unset flag still requires it.

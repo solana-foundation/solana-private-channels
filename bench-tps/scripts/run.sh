@@ -286,16 +286,16 @@ patch_env "COMMON_ESCROW_INSTANCE_ID" "${BENCH_DEPOSIT_INSTANCE_PDA}"
 # values for any that are empty and patch them into .env (same mechanism as
 # the admin keypair), so a blanked sample never ships or requires a default.
 # ---------------------------------------------------------------------------
-if [ -z "${POSTGRES_PASSWORD:-}" ]; then
-    POSTGRES_PASSWORD=$(openssl rand -hex 32)
-    patch_env "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD}"
-    echo "Generated random POSTGRES_PASSWORD in ${BENCH_ENV}"
-fi
-if [ -z "${POSTGRES_REPLICATION_PASSWORD:-}" ]; then
-    POSTGRES_REPLICATION_PASSWORD=$(openssl rand -hex 32)
-    patch_env "POSTGRES_REPLICATION_PASSWORD" "${POSTGRES_REPLICATION_PASSWORD}"
-    echo "Generated random POSTGRES_REPLICATION_PASSWORD in ${BENCH_ENV}"
-fi
+for secret_key in POSTGRES_PASSWORD POSTGRES_REPLICATION_PASSWORD \
+                  POSTGRES_RUNTIME_PASSWORD POSTGRES_AUTH_RUNTIME_PASSWORD \
+                  POSTGRES_AUTH_OWNER_PASSWORD POSTGRES_GATEWAY_PASSWORD \
+                  POSTGRES_MONITORING_PASSWORD POSTGRES_GRAFANA_PASSWORD \
+                  POSTGRES_INDEXER_PASSWORD GF_ADMIN_PASSWORD; do
+    if [ -z "${!secret_key:-}" ]; then
+        patch_env "${secret_key}" "$(openssl rand -hex 32)"
+        echo "Generated random ${secret_key} in ${BENCH_ENV}"
+    fi
+done
 
 # Re-source so the shell environment reflects the patched values before
 # `docker compose up` (Step 10).  Shell env vars take precedence over
@@ -305,11 +305,10 @@ fi
 # shellcheck disable=SC1091
 set -a; source "${BENCH_ENV}"; set +a
 
-# Fail closed before bringing the stack up if any required DB secret is empty.
-if [ -z "${POSTGRES_PASSWORD:-}" ] || [ -z "${POSTGRES_REPLICATION_PASSWORD:-}" ]; then
-    echo "ERROR: POSTGRES_PASSWORD and POSTGRES_REPLICATION_PASSWORD must be non-empty" >&2
-    exit 1
-fi
+# Fail closed before bringing the stack up: the same check `make docker-up`
+# runs, against the same files compose is handed below. Rejects blank, shared
+# and once-shipped values like GF_ADMIN_PASSWORD=admin123.
+"${REPO_ROOT}/scripts/check-required-env.sh" "${REPO_ROOT}/versions.env" "${BENCH_ENV}"
 
 # (BENCH_METRICS_TARGET is set in Step 10b after the Docker network exists)
 

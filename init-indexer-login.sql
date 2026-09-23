@@ -5,6 +5,11 @@
 -- Not an entrypoint script: the entrypoint only ever runs on an empty data
 -- directory, which is exactly the case this file does not have to handle. It is
 -- driven by `make docker-migrate` and by the Ansible deploy.
+--
+-- Runs as superuser, so unqualified calls resolve to the built-ins only, never
+-- to a function some other login created in public.
+SET search_path = pg_catalog, pg_temp;
+
 \o /dev/null
 SELECT set_config('init.target_user', :'target_user', false);
 SELECT set_config('init.target_pw', :'target_pw', false);

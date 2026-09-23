@@ -63,7 +63,7 @@ fi
 # Values that are non-empty but were once shipped in a tracked preset, so an
 # operator who started the stack before they were removed still carries one.
 # KEY=VALUE, checked after the non-empty pass.
-REJECTED_VALUES=(GF_ADMIN_PASSWORD=admin)
+REJECTED_VALUES=(GF_ADMIN_PASSWORD=admin GF_ADMIN_PASSWORD=admin123)
 
 placeheld=()
 for entry in "${REJECTED_VALUES[@]}"; do
