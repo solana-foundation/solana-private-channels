@@ -158,6 +158,9 @@ pub async fn release_advisory_lock(conn: &mut PgConnection, key: i64) -> Result<
     Ok(())
 }
 
+/// Advisory key that serializes `init_schema` across processes. Distinct from every other key.
+const SCHEMA_INIT_LOCK_KEY: i64 = 0x53_43_48_45_4D_41_5F_49; // "SCHEMA_I"
+
 // Returns true when the URL parses and its password is absent or empty (a blanked secret).
 // Kept in sync with the identical guard in core's accounts/postgres.rs.
 fn database_url_password_is_blank(database_url: &str) -> bool {
@@ -279,7 +282,25 @@ impl PostgresDb {
         }
     }
 
+    /// Every indexer and operator runs this at boot against the same database, and its
+    /// DDL is not safe to run concurrently, so inits take turns on an advisory lock.
+    /// The lock lives on its own connection, so closing it releases the lock on any exit.
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
+        let mut lock_conn =
+            <PgConnection as sqlx::Connection>::connect_with(&self.pool.connect_options()).await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(SCHEMA_INIT_LOCK_KEY)
+            .execute(&mut lock_conn)
+            .await?;
+        let result = self.init_schema_locked().await;
+        // A failed close means the session is already gone, and the lock with it.
+        if let Err(e) = sqlx::Connection::close(lock_conn).await {
+            warn!("Schema init lock session did not close cleanly: {e}");
+        }
+        result
+    }
+
+    async fn init_schema_locked(&self) -> Result<(), sqlx::Error> {
         // Ensure pgcrypto is available for gen_random_uuid()
         sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#)
             .execute(&self.pool)

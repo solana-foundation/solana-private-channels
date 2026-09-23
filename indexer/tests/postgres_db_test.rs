@@ -116,6 +116,43 @@ async fn init_schema_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Every component inits the shared schema on boot, so concurrent inits must all succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_concurrent() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, _storage, pg) = start_postgres().await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/db_test",
+        pg.get_host().await?,
+        pg.get_host_port_ipv4(5432).await?
+    );
+
+    for _ in 0..5 {
+        let mut inits = Vec::new();
+        for _ in 0..8 {
+            let db_url = db_url.clone();
+            inits.push(tokio::spawn(async move {
+                let db = PostgresDb::new(&PostgresConfig {
+                    database_url: db_url,
+                    max_connections: 2,
+                })
+                .await?;
+                Storage::Postgres(db).init_schema().await
+            }));
+        }
+        for init in inits {
+            init.await??;
+        }
+    }
+
+    let (triggers,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint FROM pg_trigger WHERE tgname = 'trigger_assign_withdrawal_nonce'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(triggers, 1);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn drop_tables_then_reinit() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
