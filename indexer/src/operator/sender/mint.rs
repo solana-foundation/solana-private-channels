@@ -1060,7 +1060,9 @@ mod tests {
 #[cfg(test)]
 mod consumed_set_tests {
     use super::{enumerate_consumed_mints, ConsumedMintKind};
-    use crate::operator::instruction_util::{mint_idempotency_memo, SourceEventId};
+    use crate::operator::instruction_util::{
+        mint_idempotency_memo, remint_idempotency_memo, SourceEventId,
+    };
     use crate::operator::{RetryConfig, RpcClientWithRetry};
     use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
@@ -1086,12 +1088,26 @@ mod consumed_set_tests {
         )
     }
 
-    /// `getTransaction` reply for a successful tx signed only by `signer`, with `mentioned`
-    /// as a non-signing account key.
-    fn transaction_reply(signer: &Pubkey, mentioned: &Pubkey) -> String {
+    /// Raw-message `getTransaction` reply for a tx signed only by `signer`, with `mentioned`
+    /// as a non-signing account key. `meta_err` is the JSON error, or `"null"` for success.
+    fn transaction_reply(signer: &Pubkey, mentioned: &Pubkey, meta_err: &str) -> String {
+        let signature = Signature::new_unique();
+        let status = if meta_err == "null" {
+            r#"{"Ok":null}"#.to_string()
+        } else {
+            format!(r#"{{"Err":{meta_err}}}"#)
+        };
+        format!(
+            r#"{{"jsonrpc":"2.0","result":{{"slot":1,"blockTime":null,"transaction":{{"signatures":["{signature}"],"message":{{"header":{{"numRequiredSignatures":1,"numReadonlySignedAccounts":0,"numReadonlyUnsignedAccounts":1}},"accountKeys":["{signer}","{mentioned}"],"recentBlockhash":"11111111111111111111111111111111","instructions":[]}}}},"meta":{{"err":{meta_err},"status":{status},"fee":5000,"preBalances":[0,0],"postBalances":[0,0]}}}},"id":0}}"#
+        )
+    }
+
+    /// Parsed-message (`jsonParsed`, as production fetches) `getTransaction` reply for a
+    /// successful tx signed only by `signer`, with `mentioned` as a non-signing account key.
+    fn parsed_transaction_reply(signer: &Pubkey, mentioned: &Pubkey) -> String {
         let signature = Signature::new_unique();
         format!(
-            r#"{{"jsonrpc":"2.0","result":{{"slot":1,"blockTime":null,"transaction":{{"signatures":["{signature}"],"message":{{"header":{{"numRequiredSignatures":1,"numReadonlySignedAccounts":0,"numReadonlyUnsignedAccounts":1}},"accountKeys":["{signer}","{mentioned}"],"recentBlockhash":"11111111111111111111111111111111","instructions":[]}}}},"meta":{{"err":null,"status":{{"Ok":null}},"fee":5000,"preBalances":[0,0],"postBalances":[0,0]}}}},"id":0}}"#
+            r#"{{"jsonrpc":"2.0","result":{{"slot":1,"blockTime":null,"transaction":{{"signatures":["{signature}"],"message":{{"accountKeys":[{{"pubkey":"{signer}","writable":true,"signer":true,"source":"transaction"}},{{"pubkey":"{mentioned}","writable":true,"signer":false,"source":"transaction"}}],"recentBlockhash":"11111111111111111111111111111111","instructions":[]}}}},"meta":{{"err":null,"status":{{"Ok":null}},"fee":5000,"preBalances":[0,0],"postBalances":[0,0]}}}},"id":0}}"#
         )
     }
 
@@ -1149,7 +1165,7 @@ mod consumed_set_tests {
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(transaction_reply(&authority, &Pubkey::new_unique()))
+            .with_body(transaction_reply(&authority, &Pubkey::new_unique(), "null"))
             .create_async()
             .await;
 
@@ -1224,7 +1240,7 @@ mod consumed_set_tests {
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(transaction_reply(&authority, &Pubkey::new_unique()))
+            .with_body(transaction_reply(&authority, &Pubkey::new_unique(), "null"))
             .create_async()
             .await;
 
@@ -1273,7 +1289,7 @@ mod consumed_set_tests {
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(transaction_reply(&attacker, &authority))
+            .with_body(transaction_reply(&attacker, &authority, "null"))
             .create_async()
             .await;
 
@@ -1285,5 +1301,142 @@ mod consumed_set_tests {
             set.is_empty(),
             "an unsigned memo must not mark a deposit minted"
         );
+    }
+
+    /// Production fetches `jsonParsed`, so the parsed signer check must accept a mint the
+    /// authority signed.
+    #[tokio::test]
+    async fn enumerate_collects_parsed_memo_the_authority_signed() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let source_event_id = SourceEventId::new("evt-parsed", 0, None);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(
+                    &landed.to_string(),
+                    &mint_idempotency_memo(&source_event_id)
+                ),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(parsed_transaction_reply(&authority, &Pubkey::new_unique()))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("enumeration should succeed");
+        assert_eq!(
+            set.get(&source_event_id),
+            Some(&(landed, ConsumedMintKind::Deposit))
+        );
+    }
+
+    /// A forged remint memo on a user tx that only names the authority must not count.
+    #[tokio::test]
+    async fn enumerate_skips_remint_memo_the_authority_did_not_sign() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        let victim_id = SourceEventId::new("evt-victim-remint", 0, None);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(
+                    &Signature::new_unique().to_string(),
+                    &remint_idempotency_memo(&victim_id)
+                ),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(parsed_transaction_reply(&attacker, &authority))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("unsigned memos must be skipped, not abort enumeration");
+        assert!(
+            set.is_empty(),
+            "an unsigned remint memo must not mark a withdrawal reminted"
+        );
+    }
+
+    /// A tx whose fetched meta failed must not count, even if the authority signed it and
+    /// the history entry reported no error.
+    #[tokio::test]
+    async fn enumerate_skips_failed_transaction() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let source_event_id = SourceEventId::new("evt-failed", 0, None);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(
+                    &Signature::new_unique().to_string(),
+                    &mint_idempotency_memo(&source_event_id)
+                ),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                r#"{"InstructionError":[0,{"Custom":1}]}"#,
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("a failed tx must be skipped, not abort enumeration");
+        assert!(set.is_empty(), "a failed tx must not mark a deposit minted");
     }
 }
