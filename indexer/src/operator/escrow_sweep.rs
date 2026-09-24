@@ -431,8 +431,8 @@ pub async fn fetch_channel_supply_at(
     Ok((mint_state.supply, slot))
 }
 
-/// Oldest the channel's newest block may be before its reads count as unknown. Far above
-/// the one-second heartbeat plus normal replica lag, far below the halt confirmation window.
+/// Oldest the channel's newest block may be, and how far its time may run ahead of ours, before
+/// its reads count as unknown. Far above heartbeat, replica lag and clock skew, far below the halt window.
 pub const CHANNEL_MAX_AGE_SECS: i64 = 120;
 
 /// Slot windows searched below the tip for the newest block, smallest first.
@@ -484,6 +484,13 @@ pub async fn channel_anchor(channel_rpc: &RpcClientWithRetry) -> Result<u64, Esc
     if age > CHANNEL_MAX_AGE_SECS {
         return Err(fail(format!(
             "channel's newest block {block} is {age}s old, past the {CHANNEL_MAX_AGE_SECS}s limit"
+        )));
+    }
+    // A clock far ahead of ours would hide a frozen node for as long as it is ahead.
+    if age < -CHANNEL_MAX_AGE_SECS {
+        return Err(fail(format!(
+            "channel's newest block {block} is stamped {}s ahead of our clock, past the {CHANNEL_MAX_AGE_SECS}s limit",
+            -age
         )));
     }
     Ok(block)
@@ -1347,7 +1354,7 @@ pub(crate) mod tests {
     async fn channel_anchor_requires_a_recent_block() {
         // (label, tip, blocks, block age, expected anchor)
         type Case = (&'static str, u64, Vec<u64>, Option<i64>, Option<u64>);
-        let cases: [Case; 6] = [
+        let cases: [Case; 7] = [
             (
                 "fresh block in the first window",
                 1_000,
@@ -1377,6 +1384,13 @@ pub(crate) mod tests {
                 vec![995],
                 Some(-30),
                 Some(995),
+            ),
+            (
+                "clock far ahead of ours",
+                1_000,
+                vec![995],
+                Some(-(CHANNEL_MAX_AGE_SECS + 1)),
+                None,
             ),
         ];
         for (label, tip, blocks, age, expected) in cases {
