@@ -27,11 +27,7 @@ use {
     },
     solana_sdk::{hash::Hash, signature::Signature},
     sqlx::PgPool,
-    std::{
-        fs,
-        path::{Path, PathBuf},
-        time::{Duration, SystemTime, UNIX_EPOCH},
-    },
+    std::path::PathBuf,
     testcontainers::runners::AsyncRunner,
     testcontainers_modules::postgres::Postgres,
 };
@@ -53,26 +49,6 @@ async fn start_postgres(
         .await
         .map_err(|e| anyhow!("PostgresAccountsDB::new: {e}"))?;
     Ok((db, container))
-}
-
-fn make_backup_dir(tag: &str) -> Result<PathBuf> {
-    let u = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "private_channel_t19_{}_{}_{}",
-        tag,
-        std::process::id(),
-        u
-    ));
-    fs::create_dir_all(&dir)?;
-    let file = dir.join("backup.dump");
-    fs::write(&file, b"fixture-backup")?;
-    Ok(file)
-}
-
-fn cleanup(p: &Path) {
-    if let Some(parent) = p.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 async fn seed_blocks(pool: &PgPool, n: u64) -> Result<()> {
@@ -128,13 +104,19 @@ async fn test_truncate_concurrent_lock_contention() -> Result<()> {
     let (db, _container) = start_postgres("truncate_lock_contention").await?;
     seed_blocks(&db.pool, 10).await?;
 
-    let b1 = make_backup_dir("t1")?;
-    let b2 = make_backup_dir("t2")?;
+    // One dump serves both contenders; the loser fails on the lock, not on the proof.
+    let dump = super::container_pg_dump(
+        &_container,
+        "truncate_lock_contention",
+        &["-Fc"],
+        "lock_contention",
+    )?;
+    let restore_bin = super::container_pg_restore_bin(&_container, "lock_contention")?;
 
     let opts_for = |bp: PathBuf| TruncateOptions {
         keep_slots: 3,
-        max_backup_age: Duration::from_secs(60 * 60),
         pg_dump_path: Some(bp),
+        pg_restore_bin: restore_bin.clone(),
         batch_size: 2,
         dry_run: false,
     };
@@ -144,8 +126,8 @@ async fn test_truncate_concurrent_lock_contention() -> Result<()> {
     // pg_try_advisory_lock rather than on a Rust-level mutex.
     let db1 = db.clone();
     let db2 = db.clone();
-    let opts1 = opts_for(b1.clone());
-    let opts2 = opts_for(b2.clone());
+    let opts1 = opts_for(dump.clone());
+    let opts2 = opts_for(dump.clone());
 
     let (r1, r2) = tokio::join!(
         tokio::spawn(async move { truncate_slots(&db1, &opts1).await }),
@@ -173,7 +155,7 @@ async fn test_truncate_concurrent_lock_contention() -> Result<()> {
     assert_eq!(report.account_history_rows_deleted, 7);
     assert_eq!(report.latest_slot, Some(10));
 
-    cleanup(&b1);
-    cleanup(&b2);
+    super::cleanup_backup_artifact(&dump);
+    super::cleanup_backup_artifact(&restore_bin);
     Ok(())
 }

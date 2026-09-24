@@ -26,6 +26,7 @@ pub mod get_orphan_deposit_ids;
 pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
+pub mod get_released_withdrawals;
 pub mod get_remint_signatures;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
@@ -333,6 +334,16 @@ impl Storage {
             self, status, after_id, limit,
         )
         .await
+    }
+
+    /// Processing withdrawals that hold at least one journaled release signature,
+    /// keyed forward from `after_id`, of any age.
+    pub async fn get_released_withdrawals(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ReleasedWithdrawal>, StorageError> {
+        get_released_withdrawals::get_released_withdrawals(self, after_id, limit).await
     }
 
     /// The withdrawal row that owns `nonce`, if any.

@@ -40,11 +40,16 @@ const FIRST_FLOOR: u64 = 20;
 const SECOND_KEEP_SLOTS: u64 = 5;
 const SECOND_FLOOR: u64 = 56;
 
-fn opts(keep_slots: u64, batch_size: usize, backup: &std::path::Path) -> TruncateOptions {
+fn opts(
+    keep_slots: u64,
+    batch_size: usize,
+    backup: &std::path::Path,
+    pg_restore_bin: &std::path::Path,
+) -> TruncateOptions {
     TruncateOptions {
         keep_slots,
-        max_backup_age: Duration::from_secs(60 * 60),
         pg_dump_path: Some(backup.to_path_buf()),
+        pg_restore_bin: pg_restore_bin.to_path_buf(),
         batch_size,
         dry_run: false,
     }
@@ -198,7 +203,14 @@ async fn await_blocked_by(pool: &PgPool, blocker_pid: i32) -> Result<()> {
 async fn test_floor_and_deletions_commit_together() -> Result<()> {
     let (db, container) = super::start_postgres("truncate_floor_atomicity").await?;
     seed_blocks(&db.pool, SEEDED_SLOTS).await?;
-    let backup_path = super::create_backup_artifact("floor_atomicity")?;
+    // One dump serves both runs: the first run's deletions sit below the live minimum.
+    let backup_path = super::container_pg_dump(
+        &container,
+        "truncate_floor_atomicity",
+        &["-Fc"],
+        "floor_atomicity",
+    )?;
+    let restore_bin = super::container_pg_restore_bin(&container, "floor_atomicity")?;
 
     let host = container.get_host().await?;
     let port = container.get_host_port_ipv4(5432).await?;
@@ -209,8 +221,12 @@ async fn test_floor_and_deletions_commit_together() -> Result<()> {
 
     // First run creates the metadata key. Without it the read path falls back to
     // MIN(slot), which is always truthful, and the window cannot be observed.
-    let first =
-        truncate_on_fresh_pool(&url, &opts(FIRST_KEEP_SLOTS, 100, &backup_path), &db.pool).await?;
+    let first = truncate_on_fresh_pool(
+        &url,
+        &opts(FIRST_KEEP_SLOTS, 100, &backup_path, &restore_bin),
+        &db.pool,
+    )
+    .await?;
     assert_eq!(first.first_available_block, Some(FIRST_FLOOR));
     assert_eq!(
         snapshot_floor_and_min(&db.pool).await?,
@@ -246,7 +262,7 @@ async fn test_floor_and_deletions_commit_together() -> Result<()> {
         .context("Failed to read the lock holder's backend pid")?;
 
     let second_url = url.clone();
-    let second_opts = opts(SECOND_KEEP_SLOTS, 3, &backup_path);
+    let second_opts = opts(SECOND_KEEP_SLOTS, 3, &backup_path, &restore_bin);
     let observer = db.pool.clone();
     let task =
         tokio::spawn(
@@ -288,5 +304,6 @@ async fn test_floor_and_deletions_commit_together() -> Result<()> {
 
     holder_pool.close().await;
     super::cleanup_backup_artifact(&backup_path);
+    super::cleanup_backup_artifact(&restore_bin);
     Ok(())
 }

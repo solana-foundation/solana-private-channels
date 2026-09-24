@@ -2,20 +2,14 @@
 //! Binary: `truncate_integration` (existing).
 //! Fixture: one testcontainers Postgres per sub-case.
 //!
-//! The production code calls `verify_backup_readiness` *before* any rows
-//! are deleted; a failure there returns an `anyhow!("Backup verification
-//! failed. WAL: {}. pg_dump: {}")` with no side effects. This test proves
-//! that contract across two realistic failure modes:
+//! The production code proves the dump before any rows are deleted; a failure
+//! there returns `anyhow!("Backup verification failed. pg_dump: {}")` with no
+//! side effects. This test proves that contract across two failure modes:
 //!
 //!   A. `pg_dump_path` points at a file that cannot be read (e.g. missing
 //!      parent dir). Backup is considered invalid; truncate aborts; all
 //!      rows remain; `first_available_block` unchanged.
-//!   B. `pg_dump_path` points at a file whose mtime is *too old*
-//!      (`max_backup_age` exceeded). Same abort contract.
-//!
-//! NOTE on scope: chmod-style mid-write failures are timing-sensitive and
-//! hard to reproduce on tmpfs. The two cases above hit the
-//! same error return path in `check_pg_dump_recency` with zero flake risk.
+//!   B. No `pg_dump_path` at all. Same abort contract.
 
 use {
     anyhow::{anyhow, Context, Result},
@@ -29,7 +23,7 @@ use {
     std::{
         fs,
         path::{Path, PathBuf},
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     },
     testcontainers::runners::AsyncRunner,
     testcontainers_modules::postgres::Postgres,
@@ -157,7 +151,7 @@ async fn test_truncate_aborts_when_backup_path_missing() -> Result<()> {
 
     let opts = TruncateOptions {
         keep_slots: 3,
-        max_backup_age: Duration::from_secs(60 * 60),
+        pg_restore_bin: PathBuf::from("pg_restore"),
         pg_dump_path: Some(missing),
         batch_size: 2,
         dry_run: false,
@@ -183,8 +177,8 @@ async fn test_truncate_aborts_when_backup_path_missing() -> Result<()> {
 }
 
 // ── Case B ──────────────────────────────────────────────────────────────────
-// Exercises the explicit "no backup path" branch in `check_pg_dump_recency`.
-// Complements Case A which tests path-is-not-a-file.
+// Exercises the explicit "no backup path" branch of the proof.
+// Complements Case A which tests an unreadable path.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_truncate_aborts_when_backup_path_not_supplied() -> Result<()> {
     let (db, _container) = start_postgres("truncate_backup_none").await?;
@@ -193,7 +187,7 @@ async fn test_truncate_aborts_when_backup_path_not_supplied() -> Result<()> {
 
     let opts = TruncateOptions {
         keep_slots: 3,
-        max_backup_age: Duration::from_secs(60 * 60),
+        pg_restore_bin: PathBuf::from("pg_restore"),
         pg_dump_path: None, // ← the violation
         batch_size: 2,
         dry_run: false,
@@ -222,7 +216,7 @@ async fn test_truncate_rejects_keep_slots_zero() -> Result<()> {
 
     let opts = TruncateOptions {
         keep_slots: 0,
-        max_backup_age: Duration::from_secs(60 * 60),
+        pg_restore_bin: PathBuf::from("pg_restore"),
         pg_dump_path: None,
         batch_size: 2,
         dry_run: false,

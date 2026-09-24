@@ -111,7 +111,7 @@ pub(super) fn mock_with_processing_row(transaction_id: i64) -> MockStorage {
 }
 
 /// Add another `Processing` withdrawal row to an existing mock.
-pub(super) fn push_processing_row(mock: &MockStorage, transaction_id: i64) {
+pub(crate) fn push_processing_row(mock: &MockStorage, transaction_id: i64) {
     mock.pending_transactions
         .lock()
         .unwrap()
@@ -122,7 +122,7 @@ pub(super) fn push_processing_row(mock: &MockStorage, transaction_id: i64) {
 }
 
 /// Add a `Processing` deposit row, the state a mint the sender owns starts from.
-pub(super) fn push_processing_deposit_row(mock: &MockStorage, transaction_id: i64) {
+pub(crate) fn push_processing_deposit_row(mock: &MockStorage, transaction_id: i64) {
     let mut row = withdrawal_row(transaction_id, TransactionStatus::Processing);
     row.transaction_type = TransactionType::Deposit;
     row.withdrawal_nonce = None;
@@ -153,7 +153,7 @@ pub(super) fn push_withdrawal_with_nonce(
 }
 
 /// The status of `transaction_id` in `mock`, or `None` if it holds no such row.
-pub(super) fn row_status(mock: &MockStorage, transaction_id: i64) -> Option<TransactionStatus> {
+pub(crate) fn row_status(mock: &MockStorage, transaction_id: i64) -> Option<TransactionStatus> {
     mock.pending_transactions
         .lock()
         .unwrap()
@@ -277,7 +277,7 @@ pub(super) fn mock_finalized_anchor(
         .create()
 }
 
-/// A bitmap that answers only a read bound to `slot`. An unanchored read finds
+/// A bitmap that answers only a finalized read bound to `slot`. Any other read finds
 /// no matching mock and errors, which is what a lagging backend would do.
 pub(super) fn mock_bitmap_at_slot(
     server: &mut mockito::ServerGuard,
@@ -290,10 +290,30 @@ pub(super) fn mock_bitmap_at_slot(
         .match_body(mockito::Matcher::AllOf(vec![
             mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
             mockito::Matcher::Regex(format!(r#""minContextSlot"\s*:\s*{slot}\b"#)),
+            mockito::Matcher::Regex(r#""commitment"\s*:\s*"finalized""#.into()),
         ]))
         .with_status(200)
         .with_body(bitmap_account_response(generation, consumed))
         .expect(1)
+        .create()
+}
+
+/// A bitmap that answers only reads at `commitment`, to model a bit a fork has set
+/// but finality has not.
+pub(super) fn mock_bitmap_at_commitment(
+    server: &mut mockito::ServerGuard,
+    commitment: &str,
+    generation: u64,
+    consumed: &[u64],
+) -> mockito::Mock {
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::Regex(r#""method"\s*:\s*"getAccountInfo""#.into()),
+            mockito::Matcher::Regex(format!(r#""commitment"\s*:\s*"{commitment}""#)),
+        ]))
+        .with_status(200)
+        .with_body(bitmap_account_response(generation, consumed))
         .create()
 }
 

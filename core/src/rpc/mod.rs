@@ -45,6 +45,7 @@ mod tests {
     use solana_account_decoder_client_types::{UiAccountEncoding, UiDataSliceConfig};
     use solana_client::rpc_config::RpcAccountInfoConfig;
     use solana_rpc_client_types::response::RpcPerfSample;
+    use solana_sdk::transaction::SanitizedTransaction;
     use solana_sdk::{
         account::AccountSharedData,
         hash::Hash,
@@ -57,7 +58,10 @@ mod tests {
     };
     use solana_svm::transaction_processing_result::ProcessedTransaction;
     use std::collections::{HashMap, LinkedList};
-    use std::sync::{Arc, RwLock};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    };
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
 
@@ -86,10 +90,24 @@ mod tests {
         ReadDeps {
             accounts_db: db,
             admin_keys: vec![],
-            live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
             max_blockhashes: TEST_MAX_BLOCKHASHES,
             simulation_permits: tokio::sync::Semaphore::new(constants::MAX_CONCURRENT_SIMULATIONS),
         }
+    }
+
+    /// Write-side deps with no database behind them; the receiver keeps ingress open.
+    fn make_write_deps(
+        settled_slot: u64,
+    ) -> (WriteDeps, async_channel::Receiver<SanitizedTransaction>) {
+        let (dedup_tx, rx) = async_channel::bounded(1);
+        let deps = WriteDeps {
+            dedup_tx,
+            metrics: Arc::new(crate::stage_metrics::NoopMetrics),
+            live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
+            settled_slot: Arc::new(AtomicU64::new(settled_slot)),
+            blockhash_progress: Arc::default(),
+        };
+        (deps, rx)
     }
 
     /// A block whose height is deliberately not its slot, which is what a chain
@@ -460,13 +478,10 @@ mod tests {
 
     // ── is_blockhash_valid ────────────────────────────────────────────────
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_is_blockhash_valid_in_window() {
-        let (mut db, _pg) = start_pg().await;
-        seed_db(&mut db).await;
-
         let blockhash = Hash::new_unique();
-        let deps = make_read_deps(db);
+        let (deps, _rx) = make_write_deps(10);
         deps.live_blockhashes.write().unwrap().push_back(blockhash);
 
         let resp =
@@ -476,11 +491,13 @@ mod tests {
         assert!(resp.value);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_is_blockhash_valid_not_in_window() {
-        let (mut db, _pg) = start_pg().await;
-        seed_db(&mut db).await;
-        let deps = make_read_deps(db);
+        let (deps, _rx) = make_write_deps(10);
+        deps.live_blockhashes
+            .write()
+            .unwrap()
+            .push_back(Hash::new_unique());
 
         let resp = is_blockhash_valid_impl::is_blockhash_valid_impl(
             &deps,
@@ -492,14 +509,91 @@ mod tests {
         assert!(!resp.value);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_is_blockhash_valid_invalid_input() {
-        let (db, _pg) = start_pg().await;
-        let deps = make_read_deps(db);
+        let (deps, _rx) = make_write_deps(10);
         let result =
             is_blockhash_valid_impl::is_blockhash_valid_impl(&deps, "not_a_hash".to_string(), None)
                 .await;
         assert!(result.is_err());
+    }
+
+    /// A hash getLatestBlockhash can already serve may not have reached dedup yet,
+    /// so a lagging window must answer retry, never false.
+    #[tokio::test]
+    async fn is_blockhash_valid_asks_for_retry_while_window_lags() {
+        let (deps, _rx) = make_write_deps(10);
+        deps.blockhash_progress.announced.store(2, Ordering::SeqCst);
+        deps.blockhash_progress.ingested.store(1, Ordering::SeqCst);
+
+        let err = is_blockhash_valid_impl::is_blockhash_valid_impl(
+            &deps,
+            Hash::new_unique().to_string(),
+            None,
+        )
+        .await
+        .expect_err("a lagging window must not answer false");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn is_blockhash_valid_answers_from_a_lagging_window_when_present() {
+        let blockhash = Hash::new_unique();
+        let (deps, _rx) = make_write_deps(10);
+        deps.live_blockhashes.write().unwrap().push_back(blockhash);
+        deps.blockhash_progress.announced.store(2, Ordering::SeqCst);
+        deps.blockhash_progress.ingested.store(1, Ordering::SeqCst);
+
+        let resp =
+            is_blockhash_valid_impl::is_blockhash_valid_impl(&deps, blockhash.to_string(), None)
+                .await
+                .unwrap();
+        assert!(resp.value);
+    }
+
+    #[tokio::test]
+    async fn is_blockhash_valid_answers_false_once_caught_up() {
+        let (deps, _rx) = make_write_deps(10);
+        deps.blockhash_progress.announced.store(2, Ordering::SeqCst);
+        deps.blockhash_progress.ingested.store(2, Ordering::SeqCst);
+
+        let resp = is_blockhash_valid_impl::is_blockhash_valid_impl(
+            &deps,
+            Hash::new_unique().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!resp.value);
+    }
+
+    /// Public traffic reaches the writer, so the answer must come from memory, not its pool.
+    #[tokio::test]
+    async fn is_blockhash_valid_reads_no_db() {
+        let blockhash = Hash::new_unique();
+        let (deps, _rx) = make_write_deps(42);
+        deps.live_blockhashes.write().unwrap().push_back(blockhash);
+        let rpc = rpc_impl::PrivateChannelRpcImpl::new(None, Some(deps)).await;
+
+        let resp = rpc
+            .is_blockhash_valid(blockhash.to_string(), None)
+            .await
+            .unwrap();
+        assert!(resp.value);
+        assert_eq!(resp.context.slot, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_node_returns_server_error() {
+        let (mut db, _pg) = start_pg().await;
+        seed_db(&mut db).await;
+        let rpc = rpc_impl::PrivateChannelRpcImpl::new(Some(make_read_deps(db)), None).await;
+
+        let err = rpc
+            .is_blockhash_valid(Hash::new_unique().to_string(), None)
+            .await
+            .expect_err("a read-only node must not answer false");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
     }
 
     // ── get_block ─────────────────────────────────────────────────────────

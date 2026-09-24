@@ -958,24 +958,8 @@ pub(super) async fn handle_success(
             .with_label_values(&[state.program_type.as_label()])
             .inc();
 
-        if let Some(txn_id) = ctx.transaction_id {
-            send_guaranteed(
-                storage_tx,
-                TransactionStatusUpdate {
-                    transaction_id: txn_id,
-                    trace_id: ctx.trace_id.clone(),
-                    status: TransactionStatus::Completed,
-                    counterpart_signature: Some(signature.to_string()),
-                    processed_at: Some(Utc::now()),
-                    error_message: None,
-                    remint_signature: None,
-                    remint_attempted: false,
-                },
-                "transaction status update",
-            )
-            .await
-            .ok();
-        }
+        // No status write: a confirmed release can still be dropped by a fork. The row stays
+        // processing with its journal and the promotion pass completes it on finalized proof.
     }
     // Handle Mint (transaction_id-based) transactions
     else if let Some(transaction_id) = ctx.transaction_id {
@@ -2222,7 +2206,7 @@ pub(super) async fn route_poll_results(
 /// Why a chunked status fetch was rejected. Both variants make the caller reinsert
 /// the batch and retry; the split only picks the metric reason label.
 #[derive(Debug)]
-enum StatusFetchError {
+pub(crate) enum StatusFetchError {
     /// A chunk response length did not equal the request (short or oversized).
     MalformedLength,
     /// The RPC call itself failed after retries.
@@ -2241,13 +2225,20 @@ impl StatusFetchError {
 /// Fetch statuses in `MAX_SIGS_PER_CALL` chunks. `getSignatureStatuses` is positional, so a
 /// chunk whose length differs from the request would misalign every later status; reject it.
 /// Returns `Err` on any RPC error or length mismatch so the caller reinserts the batch and retries.
-async fn fetch_statuses_checked(
+/// `history` searches the ledger too, for signatures that may have left the status cache.
+pub(crate) async fn fetch_statuses_checked(
     rpc_client: &RpcClientWithRetry,
     signatures: &[Signature],
+    history: bool,
 ) -> Result<Vec<Option<solana_transaction_status::TransactionStatus>>, StatusFetchError> {
     let mut statuses = Vec::with_capacity(signatures.len());
     for chunk in signatures.chunks(MAX_SIGS_PER_CALL) {
-        match rpc_client.get_signature_statuses(chunk).await {
+        let response = if history {
+            rpc_client.get_signature_statuses_with_history(chunk).await
+        } else {
+            rpc_client.get_signature_statuses(chunk).await
+        };
+        match response {
             Ok(resp) if resp.value.len() == chunk.len() => statuses.extend(resp.value),
             Ok(resp) => {
                 warn!(
@@ -2287,7 +2278,7 @@ pub(super) async fn poll_in_flight(
     let batch = state.in_flight.drain_all();
     let signatures: Vec<Signature> = batch.iter().map(|t| t.signature).collect();
 
-    let statuses = match fetch_statuses_checked(&state.rpc_client, &signatures).await {
+    let statuses = match fetch_statuses_checked(&state.rpc_client, &signatures, false).await {
         Ok(s) => s,
         Err(e) => {
             metrics::OPERATOR_TRANSACTION_ERRORS
@@ -2361,7 +2352,7 @@ pub(super) async fn run_poll_task(
         signatures.clear();
         signatures.extend(batch.iter().map(|t| t.signature));
 
-        let statuses = match fetch_statuses_checked(&rpc_client, &signatures).await {
+        let statuses = match fetch_statuses_checked(&rpc_client, &signatures, false).await {
             Ok(s) => s,
             Err(e) => {
                 metrics::OPERATOR_TRANSACTION_ERRORS
@@ -3376,10 +3367,8 @@ mod tests {
             "pending_signatures should be cleared on success"
         );
 
-        // Should send Completed status
-        let update = storage_rx.try_recv().expect("should receive status update");
-        assert_eq!(update.transaction_id, 50);
-        assert_eq!(update.status, TransactionStatus::Completed);
+        // The row is completed by the promotion pass, never by the sender
+        assert!(storage_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -4162,9 +4151,10 @@ mod tests {
 
         handle_success(&mut state, &ctx, sig, &tx).await;
 
-        let update = rx.recv().await.unwrap();
-        assert_eq!(update.transaction_id, 99);
-        assert_eq!(update.status, TransactionStatus::Completed);
+        assert!(
+            rx.try_recv().is_err(),
+            "a release is completed by the promotion pass"
+        );
 
         // Retry count should be cleaned up
         assert!(!state.retry_counts.contains_key(&5));
@@ -4651,10 +4641,10 @@ mod tests {
             .contains("retries"));
     }
 
-    /// A `Confirmed` result must emit `Completed` with the on-chain signature stored as
-    /// `counterpart_signature`, confirming the happy-path status-update flow.
+    /// A confirmed release can still be dropped by a fork, so the sender writes no status and
+    /// leaves the row for the promotion pass, which completes it on finalized proof.
     #[tokio::test]
-    async fn confirmation_result_confirmed_sends_completed_status() {
+    async fn confirmed_release_writes_no_status() {
         let mut state = make_sender_state();
         let (tx, mut rx) = mpsc::channel(10);
         let ctx = TransactionContext {
@@ -4679,13 +4669,12 @@ mod tests {
         )
         .await;
 
-        let update = rx.recv().await.unwrap();
-        assert_eq!(update.transaction_id, 30);
-        assert_eq!(update.status, TransactionStatus::Completed);
-        assert_eq!(
-            update.counterpart_signature.as_deref(),
-            Some(sig.to_string().as_str())
+        assert!(
+            rx.try_recv().is_err(),
+            "a confirmed release must not be terminalized"
         );
+        assert!(!state.in_flight_withdrawals.contains(&2));
+        assert!(!state.retry_counts.contains_key(&2));
     }
 
     // ── NonceAlreadyUsed routing ─────────────────────────────────────
@@ -4772,17 +4761,17 @@ mod tests {
         "confirmationStatus":"confirmed"}]},"id":0}"#;
 
     /// The bit was set by our own earlier broadcast, and that signature finalized
-    /// successfully. The withdrawal did happen, so the row is Completed against it
-    /// rather than failed and reminted.
+    /// successfully. The withdrawal did happen, so nothing fails or remints it; the row
+    /// stays processing with its journal and the promotion pass completes it.
     #[tokio::test]
-    async fn nonce_already_used_with_landed_signature_completes() {
+    async fn nonce_already_used_with_landed_signature_leaves_row_for_promotion() {
         let mut server = mockito::Server::new_async().await;
         let (state, mut rx) = route_nonce_already_used(&mut server, FINALIZED_OK, true).await;
 
-        let update = rx.try_recv().expect("a landed release must be recorded");
-        assert_eq!(update.transaction_id, 70);
-        assert_eq!(update.status, TransactionStatus::Completed);
-        assert!(update.counterpart_signature.is_some());
+        assert!(
+            rx.try_recv().is_err(),
+            "no status may be written for a landed release"
+        );
         assert!(state.pending_remints.is_empty(), "no remint may be queued");
     }
 
@@ -4883,8 +4872,11 @@ mod tests {
         )
         .await;
 
-        let update = rx.try_recv().expect("the landed release must be recorded");
-        assert_eq!(update.status, TransactionStatus::Completed);
+        assert!(
+            rx.try_recv().is_err(),
+            "no status may be written for a landed release"
+        );
+        assert!(state.pending_remints.is_empty(), "no remint may be queued");
     }
 
     // ── NonceOutsideCurrentGeneration routing ────────────────────────
@@ -6087,7 +6079,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
 
-        let statuses = fetch_statuses_checked(&rpc, &sigs)
+        let statuses = fetch_statuses_checked(&rpc, &sigs, false)
             .await
             .expect("exact chunk must be Ok");
         assert_eq!(statuses.len(), 10);
@@ -6101,7 +6093,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// An oversized single chunk (N+1 for N) is rejected.
@@ -6112,7 +6104,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..10).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// An empty value array for a non-empty request is rejected.
@@ -6123,7 +6115,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..5).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// Every chunk exact returns Ok, concatenated in request order.
@@ -6141,7 +6133,7 @@ mod tests {
         // 600 sigs -> chunks of 256 + 256 + 88.
         let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
 
-        let statuses = fetch_statuses_checked(&rpc, &sigs)
+        let statuses = fetch_statuses_checked(&rpc, &sigs, false)
             .await
             .expect("all-exact multi-chunk must be Ok");
         assert_eq!(statuses.len(), 600);
@@ -6166,7 +6158,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// A short middle chunk is rejected.
@@ -6183,7 +6175,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// A short final chunk is rejected.
@@ -6200,7 +6192,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// An oversized middle chunk is rejected.
@@ -6217,7 +6209,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..600).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// An RPC transport error on a chunk is surfaced as Err.
@@ -6242,7 +6234,7 @@ mod tests {
         let rpc = make_rpc_client(&server.url());
         let sigs: Vec<Signature> = (0..3).map(|_| Signature::new_unique()).collect();
 
-        assert!(fetch_statuses_checked(&rpc, &sigs).await.is_err());
+        assert!(fetch_statuses_checked(&rpc, &sigs, false).await.is_err());
     }
 
     /// An empty signature slice returns Ok(empty) and issues no RPC call.
@@ -6261,7 +6253,7 @@ mod tests {
             .create();
         let rpc = make_rpc_client(&server.url());
 
-        let statuses = fetch_statuses_checked(&rpc, &[])
+        let statuses = fetch_statuses_checked(&rpc, &[], false)
             .await
             .expect("empty is Ok");
         assert!(statuses.is_empty());

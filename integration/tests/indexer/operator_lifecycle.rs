@@ -262,6 +262,27 @@ async fn wait_for_release_signature_journaled(
     .into())
 }
 
+async fn wait_for_finalized_account(
+    client: &RpcClient,
+    pubkey: &Pubkey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < *WAIT_TIMEOUT_SECS {
+        let account = client
+            .get_account_with_commitment(pubkey, CommitmentConfig::finalized())
+            .await?;
+        if account.value.is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "account {pubkey} was not finalized within {}s",
+        *WAIT_TIMEOUT_SECS
+    )
+    .into())
+}
+
 fn make_withdrawal_transaction(
     signature: String,
     mint: String,
@@ -1197,6 +1218,13 @@ async fn test_operator_refuses_to_start_when_db_is_ahead_of_bitmap(
         1, // nonce
     );
     storage.insert_db_transaction(&trigger_withdrawal).await?;
+
+    // The boot check reads the bitmap at finalized, so the fresh one must be final first.
+    wait_for_finalized_account(
+        &client,
+        &private_channel_indexer::operator::find_withdrawal_bitmap_pda(&env.instance),
+    )
+    .await?;
 
     let operator_keypair = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
     let operator_handle = start_private_channel_to_solana_operator(
