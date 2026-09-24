@@ -8,13 +8,16 @@ use solana_rpc_client_types::config::RpcContextConfig;
 /// The count of blocks produced, which is what a client polls against
 /// `lastValidBlockHeight`. It is not the slot: idle ticks advance the slot
 /// without producing a block.
+///
+/// Served from Postgres, never the cache, so it never runs ahead of the store that
+/// answers a getSignatureStatuses miss. Lagging only delays an expiry, never fakes one.
 pub async fn get_block_height_impl(
     read_deps: &ReadDeps,
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<u64> {
     read_deps
         .accounts_db
-        .get_block_height()
+        .get_source_block_height()
         .await
         .map(|opt| opt.unwrap_or(0))
         .map_err(|e| {

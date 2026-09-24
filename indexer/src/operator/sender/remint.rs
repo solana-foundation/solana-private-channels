@@ -485,7 +485,9 @@ enum EndpointVerdict {
 ///
 /// Sound on one endpoint whose state only moves forward, such as a lagging replica: height
 /// is read before status and the floor after, so no answer comes from an older state than
-/// the one before it. Not sound behind a load balancer whose backends can disagree.
+/// the one before it. The channel's read cache keeps this, since it serves getBlockHeight
+/// from Postgres, the store that answers a status miss. Not sound behind a load balancer
+/// whose backends can disagree.
 ///
 /// The bottom of the range is the slot the attempt's blockhash was read at, journaled
 /// with the broadcast. An attempt journaled before that column existed carries none, and

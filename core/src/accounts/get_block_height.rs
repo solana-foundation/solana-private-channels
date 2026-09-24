@@ -16,6 +16,16 @@ pub async fn get_block_height(db: &AccountsDB) -> Result<Option<u64>> {
     }
 }
 
+/// The durable block height from Postgres, never the cache. A status miss is
+/// answered by Postgres, which can lag the cache, so a cached height could pass a
+/// deadline the store answering that null has not reached.
+pub async fn get_source_block_height(db: &AccountsDB) -> Result<Option<u64>> {
+    match db {
+        AccountsDB::Postgres(postgres_db) => get_block_height_postgres(postgres_db).await,
+        AccountsDB::Redis(redis_db) => get_block_height_postgres(&redis_db.fallback).await,
+    }
+}
+
 /// The stored counter and nothing else: `None` means the key is absent or
 /// undecodable. Callers that must not accept a substitute for it read this, and
 /// it takes an executor so one can read it in the same snapshot as the blocks.

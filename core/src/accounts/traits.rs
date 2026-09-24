@@ -102,6 +102,10 @@ impl AccountsDB {
         super::get_block_height::get_block_height(self).await
     }
 
+    pub async fn get_source_block_height(&self) -> Result<Option<u64>> {
+        super::get_block_height::get_source_block_height(self).await
+    }
+
     pub async fn get_current_slot(&self) -> Result<Option<u64>> {
         super::current_slot::get_current_slot(self).await
     }
