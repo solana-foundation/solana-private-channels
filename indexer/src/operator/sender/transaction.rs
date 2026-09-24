@@ -384,7 +384,7 @@ pub(super) enum SignatureClaim {
     /// The row is still the incarnation we were handed; `lease` is the token the
     /// next claim on it must present.
     Owned(chrono::DateTime<Utc>),
-    /// Another writer reached the row first. Never broadcast.
+    /// Another writer reached the row first, or a reconciliation halt is active. Never broadcast.
     Lost,
     /// The claim write itself failed, so ownership is unknown. Never broadcast.
     Failed,
@@ -421,14 +421,26 @@ pub(super) async fn claim_and_persist_or_abort(
     {
         Ok(Some(lease)) => SignatureClaim::Owned(lease),
         Ok(None) => {
-            metrics::OPERATOR_TRANSACTION_ERRORS
-                .with_label_values(&[pt, lost_label])
-                .inc();
-            warn!(
-                transaction_id,
-                signature = %signature,
-                "Ownership lost before broadcast; dropping stale builder without sending"
-            );
+            // The send is already refused; this read only picks the label, so an error falls back to lost.
+            if matches!(storage.is_reconciliation_halted().await, Ok(Some(_))) {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, "halted_before_broadcast"])
+                    .inc();
+                warn!(
+                    transaction_id,
+                    signature = %signature,
+                    "Reconciliation halt active; dropping builder without sending"
+                );
+            } else {
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[pt, lost_label])
+                    .inc();
+                warn!(
+                    transaction_id,
+                    signature = %signature,
+                    "Ownership lost before broadcast; dropping stale builder without sending"
+                );
+            }
             SignatureClaim::Lost
         }
         Err(e) => {
@@ -2465,7 +2477,7 @@ mod tests {
     use crate::operator::utils::instruction_util::{SourceEventId, WithdrawalRemintInfo};
     use crate::operator::utils::rpc_util::{RetryConfig, RpcClientWithRetry};
     use crate::operator::SignerUtil;
-    use crate::storage::common::models::DbObservedRelease;
+    use crate::storage::common::models::{DbObservedRelease, HaltInfo};
     use crate::storage::common::storage::mock::MockStorage;
     use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
     use solana_commitment_config::CommitmentConfig;
@@ -3610,29 +3622,123 @@ mod tests {
             .create()
     }
 
-    /// The core safety property of the claim: once recovery has demoted the row,
-    /// the lease the sender holds is dead, so a sender slow past the stale
-    /// threshold must not broadcast and must leave no signature behind.
+    /// How a release's claim is taken away before it broadcasts.
+    #[derive(Clone, Copy, Debug)]
+    enum Disown {
+        /// Recovery demoted the row, so the sender's lease is dead.
+        Demote,
+        /// Reconciliation halted, so no value may move.
+        Halt,
+    }
+
+    /// The core safety property of the claim: once recovery has demoted the row or a
+    /// reconciliation halt is set, a sender must not broadcast and must leave no
+    /// signature behind.
     #[tokio::test]
     async fn release_send_drops_builder_when_claim_lost() {
+        for disown in [Disown::Demote, Disown::Halt] {
+            let txn_id = 10;
+            let nonce = 5;
+            let mut server = mockito::Server::new_async().await;
+            let _hash = mock_blockhash(&mut server);
+            let send = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                    "method": "sendTransaction"
+                })))
+                .expect(0)
+                .create();
+
+            let mut state = make_sender_state_with_server(&server.url());
+            seed_release_claim(&mut state, txn_id, nonce);
+            state.in_flight_withdrawals.insert(nonce);
+            match disown {
+                Disown::Demote => demote_seeded_row(&state, txn_id),
+                Disown::Halt => state
+                    .storage
+                    .set_reconciliation_halt("test halt")
+                    .await
+                    .unwrap(),
+            }
+
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+            send_and_confirm(
+                &mut state,
+                dummy_instruction(),
+                None,
+                &withdrawal_ctx(txn_id, nonce),
+                RetryPolicy::Idempotent,
+                &ExtraErrorCheckPolicy::None,
+                &storage_tx,
+            )
+            .await;
+
+            send.assert();
+            let Storage::Mock(ref mock) = *state.storage else {
+                panic!("expected mock storage");
+            };
+            assert!(
+                mock.get_release_signatures(txn_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{disown:?}: a lost claim must persist no signature"
+            );
+            assert!(
+                storage_rx.try_recv().is_err(),
+                "{disown:?}: a lost claim writes no terminal status; the winning writer owns the row"
+            );
+            assert!(
+                !state.pending_signatures.contains_key(&nonce),
+                "{disown:?}: nothing stashed when nothing broadcast"
+            );
+            assert!(
+                !state.in_flight_withdrawals.contains(&nonce),
+                "{disown:?}: a nonce that never broadcast must not hold the rotation barrier"
+            );
+        }
+    }
+
+    /// A halt set while a release waits on confirmation stops the retry: the first
+    /// attempt already broadcast, but the re-claim is refused so nothing is sent again.
+    #[tokio::test]
+    async fn release_retry_is_refused_once_halted() {
         let txn_id = 10;
         let nonce = 5;
         let mut server = mockito::Server::new_async().await;
         let _hash = mock_blockhash(&mut server);
+        let _status = mock_get_signature_statuses_null(&mut server);
+
+        let mut state = make_sender_state_with_server(&server.url());
+        seed_release_claim(&mut state, txn_id, nonce);
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        let mock = mock.clone();
+        // The halt lands right after the first broadcast reaches the node.
+        let halting = mock.clone();
         let send = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "method": "sendTransaction"
             })))
-            .expect(0)
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                *halting.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
+                    reason: "test halt".to_string(),
+                    halted_at: Utc::now(),
+                });
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": Signature::default().to_string()
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .expect(1)
             .create();
 
-        let mut state = make_sender_state_with_server(&server.url());
-        seed_release_claim(&mut state, txn_id, nonce);
-        state.in_flight_withdrawals.insert(nonce);
-        demote_seeded_row(&state, txn_id);
-
-        let (storage_tx, mut storage_rx) = mpsc::channel(10);
         send_and_confirm(
             &mut state,
             dummy_instruction(),
@@ -3640,28 +3746,15 @@ mod tests {
             &withdrawal_ctx(txn_id, nonce),
             RetryPolicy::Idempotent,
             &ExtraErrorCheckPolicy::None,
-            &storage_tx,
+            &mpsc::channel(10).0,
         )
         .await;
 
         send.assert();
-        let Storage::Mock(ref mock) = *state.storage else {
-            panic!("expected mock storage");
-        };
-        assert!(
-            mock.get_release_signatures(txn_id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a lost claim must persist no signature"
-        );
-        assert!(
-            storage_rx.try_recv().is_err(),
-            "a lost claim writes no terminal status; the winning writer owns the row"
-        );
-        assert!(
-            !state.pending_signatures.contains_key(&nonce),
-            "nothing stashed when nothing broadcast"
+        assert_eq!(
+            mock.get_release_signatures(txn_id).await.unwrap().len(),
+            1,
+            "only the pre-halt attempt is journaled"
         );
     }
 
@@ -6701,6 +6794,70 @@ mod tests {
             state.semaphore.available_permits(),
             before + 1,
             "permit must be dropped on abort"
+        );
+    }
+
+    /// A reconciliation halt refuses the deposit mint's claim, so nothing is broadcast
+    /// and the row is left Processing for recovery, labelled as a halt, not a lost race.
+    #[tokio::test]
+    async fn mint_send_aborts_when_halted() {
+        let mut server = mockito::Server::new_async().await;
+        let _hash = mock_blockhash(&mut server);
+        let send = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "sendTransaction"
+            })))
+            .expect(0)
+            .create();
+
+        let (state, lease) = mint_state_with_lease(&server.url(), 77);
+        state
+            .storage
+            .set_reconciliation_halt("test halt")
+            .await
+            .unwrap();
+        let halted_label = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[state.program_type.as_label(), "halted_before_broadcast"]);
+        let halted_before = halted_label.get();
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let before = state.semaphore.available_permits();
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        fire_and_store_task(
+            state.rpc_client.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            state.program_type,
+            dummy_instruction(),
+            None,
+            mint_ctx(77),
+            RetryPolicy::None,
+            ExtraErrorCheckPolicy::None,
+            storage_tx,
+            SendDurability::Recoverable {
+                deposit_expected_updated_at: lease,
+            },
+            permit,
+        )
+        .await;
+
+        send.assert();
+        let Storage::Mock(ref mock) = *state.storage else {
+            panic!("expected mock storage");
+        };
+        assert!(mock.get_release_signatures(77).await.unwrap().is_empty());
+        assert_eq!(
+            row_status(mock, 77),
+            Some(crate::storage::common::models::TransactionStatus::Processing),
+            "the row stays Processing for recovery"
+        );
+        assert!(storage_rx.try_recv().is_err(), "no status update");
+        assert!(state.in_flight.is_empty(), "nothing stashed");
+        assert_eq!(state.semaphore.available_permits(), before + 1);
+        assert!(
+            halted_label.get() > halted_before,
+            "a halted claim is counted as halted_before_broadcast"
         );
     }
 

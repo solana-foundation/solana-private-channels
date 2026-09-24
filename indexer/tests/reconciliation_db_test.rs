@@ -156,7 +156,7 @@ async fn observe_release_of(
             withdrawal_nonce: nonce,
             signature: format!("release_{nonce}"),
             slot,
-            amount: Some(amount as i64),
+            amount: Some(TokenAmount(amount)),
         }])
         .await?;
     Ok(())
@@ -356,7 +356,12 @@ async fn mints_enumeration_matches_the_aggregate_universe() -> Result<(), Box<dy
     )
     .await?;
 
-    let mut enumerated = storage.get_mint_addresses().await?;
+    let mut enumerated: Vec<String> = storage
+        .get_mint_addresses()
+        .await?
+        .into_iter()
+        .map(|(mint, _)| mint)
+        .collect();
     let mut aggregated: Vec<String> = storage
         .get_mint_balances_for_reconciliation(10)
         .await?
@@ -407,6 +412,34 @@ async fn an_over_release_discharges_no_more_than_the_row_owed(
         withdrawals_at(&storage, &mint, u64::MAX).await?,
         BigDecimal::from(100u64)
     );
+    Ok(())
+}
+
+/// A release above `i64::MAX` discharges exactly what it moved. A capped record would
+/// leave phantom liability that halts a solvent bridge.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_past_i64_max_discharges_exactly() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    for amount in [i64::MAX as u64 + 1, u64::MAX] {
+        let mint = Pubkey::new_unique().to_string();
+        insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+        let nonce = insert_withdrawal(
+            &pool,
+            &format!("w_big_{amount}"),
+            &mint,
+            amount,
+            "completed",
+            100,
+        )
+        .await?;
+        observe_release_of(&storage, nonce, 100, amount).await?;
+
+        assert_eq!(
+            withdrawals_at(&storage, &mint, u64::MAX).await?,
+            BigDecimal::from(amount),
+            "amount {amount}"
+        );
+    }
     Ok(())
 }
 

@@ -372,8 +372,8 @@ pub async fn run(
     //
     // The recovery worker is critical: if it dies, stuck-Processing rows stop
     // being recovered, so an unexpected exit must page and restart like the
-    // pipeline stages. Non-critical tasks (reconciliation, feepayer monitor)
-    // are not watched here.
+    // pipeline stages. Reconciliation is critical on the escrow role: a dead
+    // loop silently stops every solvency check. The feepayer monitor is not watched.
     //
     // Handles are polled by mutable reference so ownership stays here and
     // they can still be moved into `shutdown_operator` below — awaiting an
@@ -383,6 +383,9 @@ pub async fn run(
     let mut sender_handle = sender_handle;
     let mut storage_writer_handle = storage_writer_handle;
     let mut recovery_handle = recovery_handle;
+    let mut reconciliation_handle = reconciliation_handle;
+    // The withdraw role's placeholder finishes at once, so only escrow watches it.
+    let watch_reconciliation = program_type == crate::config::ProgramType::Escrow;
     let pt_label = program_type.as_label();
 
     // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
@@ -433,6 +436,9 @@ pub async fn run(
         }
         _ = &mut recovery_handle => {
             critical_exit(pt_label, "recovery");
+        }
+        _ = &mut reconciliation_handle, if watch_reconciliation => {
+            critical_exit(pt_label, "reconciliation");
         }
     }
 

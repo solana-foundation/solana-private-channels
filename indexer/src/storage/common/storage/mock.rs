@@ -463,9 +463,15 @@ impl MockStorage {
     }
 
     /// Reads the mints map, mirroring the Postgres query's `mints` table source.
-    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
+    pub async fn get_mint_addresses(&self) -> Result<Vec<(String, String)>, StorageError> {
         self.check_should_fail("get_mint_addresses")?;
-        Ok(self.mints.lock().unwrap().keys().cloned().collect())
+        Ok(self
+            .mints
+            .lock()
+            .unwrap()
+            .values()
+            .map(|m| (m.mint_address.clone(), m.token_program.clone()))
+            .collect())
     }
 
     pub async fn get_in_flight_amounts_by_mint(
@@ -1162,6 +1168,10 @@ impl MockStorage {
         blockhash_slot: Option<i64>,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
         self.check_should_fail("claim_and_persist_signature")?;
+        // Mirrors the SQL halt predicate; read before the row lock so the guards never nest.
+        if self.reconciliation_halt.lock().unwrap().is_some() {
+            return Ok(None);
+        }
         // Scope the guard so it is released before the await below.
         let lease = {
             let mut pending = self.pending_transactions.lock().unwrap();

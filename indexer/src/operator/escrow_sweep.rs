@@ -10,10 +10,12 @@
 
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
-use solana_account_decoder_client_types::UiAccountData;
-use solana_client::rpc_request::TokenAccountsFilter;
+use solana_account_decoder_client_types::{UiAccount, UiAccountData};
+use solana_client::rpc_request::{RpcRequest, TokenAccountsFilter};
+use solana_client::rpc_response::Response;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
 use spl_token::state::Mint;
@@ -131,6 +133,163 @@ pub async fn fetch_escrow_balances_by_mint(
     }
 }
 
+/// Most keys one `getMultipleAccounts` call accepts.
+const MAX_ACCOUNTS_PER_CALL: usize = 100;
+
+/// Escrow custody read from the instance ATA of each `(mint, token_program)`. The program only
+/// moves funds through these ATAs, and reading them by address, unlike listing every account the
+/// escrow owns, is a fixed request nobody can inflate by creating accounts for the escrow.
+pub async fn fetch_escrow_custody(
+    rpc_client: &RpcClientWithRetry,
+    escrow_instance_id: Pubkey,
+    mints: &[(Pubkey, Pubkey)],
+) -> Result<CustodySnapshot, SweepFailure> {
+    if mints.is_empty() {
+        let slot = rpc_client
+            .with_retry("get_slot", RetryPolicy::Idempotent, || async {
+                rpc_client
+                    .rpc_client
+                    .get_slot_with_commitment(CommitmentConfig::finalized())
+                    .await
+            })
+            .await
+            .map_err(|e| read_failure(format!("Failed to read the finalized slot: {e}")))?;
+        return Ok(CustodySnapshot {
+            balances: HashMap::new(),
+            slot,
+        });
+    }
+
+    let mut attempt = 1;
+    loop {
+        let (balances, low, high) = read_custody_once(rpc_client, escrow_instance_id, mints)
+            .await
+            .map_err(SweepFailure::Read)?;
+        if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
+            attempt += 1;
+            continue;
+        }
+        if low != high {
+            warn!(
+                low_slot = low,
+                high_slot = high,
+                attempts = SWEEP_SLOT_AGREEMENT_ATTEMPTS,
+                "Escrow custody: ATA reads kept answering at different slots"
+            );
+            return Err(SweepFailure::SlotUnsettled {
+                attempts: SWEEP_SLOT_AGREEMENT_ATTEMPTS,
+                low,
+                high,
+            });
+        }
+        return Ok(CustodySnapshot {
+            balances,
+            slot: low,
+        });
+    }
+}
+
+fn read_failure(reason: String) -> SweepFailure {
+    SweepFailure::Read(EscrowSweepError { reason })
+}
+
+/// One pass over every ATA. Returns the balances plus the lowest and highest slot seen.
+async fn read_custody_once(
+    rpc_client: &RpcClientWithRetry,
+    escrow_instance_id: Pubkey,
+    mints: &[(Pubkey, Pubkey)],
+) -> Result<(HashMap<Pubkey, u64>, u64, u64), EscrowSweepError> {
+    let mut balances = HashMap::new();
+    let mut lowest_slot = u64::MAX;
+    let mut highest_slot = 0u64;
+
+    for chunk in mints.chunks(MAX_ACCOUNTS_PER_CALL) {
+        let keys: Vec<String> = chunk
+            .iter()
+            .map(|(mint, token_program)| {
+                get_associated_token_address_with_program_id(
+                    &escrow_instance_id,
+                    mint,
+                    token_program,
+                )
+                .to_string()
+            })
+            .collect();
+        // Raw request so an account that will not decode is an error, never "absent".
+        let response = rpc_client
+            .with_retry("get_multiple_accounts", RetryPolicy::Idempotent, || async {
+                rpc_client
+                    .rpc_client
+                    .send::<Response<Vec<Option<UiAccount>>>>(
+                        RpcRequest::GetMultipleAccounts,
+                        serde_json::json!([
+                            keys,
+                            {"encoding": "base64", "commitment": "finalized"}
+                        ]),
+                    )
+                    .await
+            })
+            .await
+            .map_err(|e| EscrowSweepError {
+                reason: format!("Failed to read escrow ATAs: {e}"),
+            })?;
+        if response.value.len() != chunk.len() {
+            return Err(EscrowSweepError {
+                reason: format!(
+                    "Escrow ATA read returned {} accounts for {} keys",
+                    response.value.len(),
+                    chunk.len()
+                ),
+            });
+        }
+        lowest_slot = lowest_slot.min(response.context.slot);
+        highest_slot = highest_slot.max(response.context.slot);
+
+        for ((mint, token_program), account) in chunk.iter().zip(response.value) {
+            // No account at the ATA means the escrow holds none of this mint.
+            let Some(account) = account else { continue };
+            let amount = decode_ata_amount(&account, mint, token_program)?;
+            balances.insert(*mint, amount);
+        }
+    }
+
+    Ok((balances, lowest_slot, highest_slot))
+}
+
+/// The balance of one escrow ATA, refusing anything that is not `mint`'s token account.
+fn decode_ata_amount(
+    account: &UiAccount,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<u64, EscrowSweepError> {
+    let fail = |why: &str| EscrowSweepError {
+        reason: format!("Escrow ATA for mint {mint} {why}"),
+    };
+    if account.owner != token_program.to_string() {
+        return Err(fail(&format!(
+            "is owned by {} instead of {token_program}",
+            account.owner
+        )));
+    }
+    let data = account
+        .data
+        .decode()
+        .ok_or_else(|| fail("did not decode"))?;
+    let (account_mint, amount) = if *token_program == spl_token_2022::id() {
+        let state = StateWithExtensions::<Token2022Account>::unpack(&data)
+            .map_err(|e| fail(&format!("is not a token account: {e}")))?;
+        (state.base.mint, state.base.amount)
+    } else {
+        let state = TokenAccount::unpack(&data)
+            .map_err(|e| fail(&format!("is not a token account: {e}")))?;
+        (state.mint, state.amount)
+    };
+    if account_mint != *mint {
+        return Err(fail(&format!("holds mint {account_mint}")));
+    }
+    Ok(amount)
+}
+
 /// One pass over both token programs. Returns the merged balances plus the lowest and
 /// highest slot the two responses reported, which agree when the pass saw one instant.
 async fn sweep_once(
@@ -237,6 +396,17 @@ pub async fn fetch_channel_supply(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
 ) -> Result<u64, EscrowSweepError> {
+    fetch_channel_supply_at(channel_rpc, mint)
+        .await
+        .map(|(supply, _)| supply)
+}
+
+/// Channel supply for `mint` and the context slot the node answered at. The node reads
+/// its slot before the account, so the supply is at least as new as that slot.
+pub async fn fetch_channel_supply_at(
+    channel_rpc: &RpcClientWithRetry,
+    mint: &Pubkey,
+) -> Result<(u64, u64), EscrowSweepError> {
     // Only a truly absent account is Ok(None); a node error or data that will not
     // decode is Err, so neither can masquerade as zero supply.
     let response = channel_rpc
@@ -246,21 +416,81 @@ pub async fn fetch_channel_supply(
             reason: format!("Failed to fetch channel mint account {mint}: {e}"),
         })?;
 
+    let slot = response.context.slot;
+
     // Absent account = nothing minted yet.
     let account = match response.value {
         Some(account) => account,
-        None => return Ok(0),
+        None => return Ok((0, slot)),
     };
 
     // The channel program mints classic SPL tokens (not Token-2022).
     let mint_state = Mint::unpack(&account.data).map_err(|e| EscrowSweepError {
         reason: format!("Failed to parse channel mint account {mint}: {e}"),
     })?;
-    Ok(mint_state.supply)
+    Ok((mint_state.supply, slot))
+}
+
+/// Oldest the channel's newest block may be before its reads count as unknown. Far above
+/// the one-second heartbeat plus normal replica lag, far below the halt confirmation window.
+pub const CHANNEL_MAX_AGE_SECS: i64 = 120;
+
+/// Slot windows searched below the tip for the newest block, smallest first.
+const ANCHOR_WINDOWS: [u64; 3] = [64, 4_096, 262_144];
+
+/// The channel's newest block slot, proven younger than `CHANNEL_MAX_AGE_SECS`. The node ignores
+/// `minContextSlot`, so a supply read answered at or after this slot is what proves freshness;
+/// a frozen node, a lagging replica or an older load-balanced backend all fail it.
+pub async fn channel_anchor(channel_rpc: &RpcClientWithRetry) -> Result<u64, EscrowSweepError> {
+    let fail = |reason: String| EscrowSweepError { reason };
+    // Finalized like the supply read, so a node that honors commitment compares like with like.
+    let finalized = CommitmentConfig::finalized();
+    let tip = channel_rpc
+        .with_retry("get_slot", RetryPolicy::Idempotent, || async {
+            channel_rpc
+                .rpc_client
+                .get_slot_with_commitment(finalized)
+                .await
+        })
+        .await
+        .map_err(|e| fail(format!("Failed to read the channel slot: {e}")))?;
+
+    // Idle slots carry no block, so look back for the newest one that does.
+    let mut block = None;
+    for window in ANCHOR_WINDOWS {
+        let start = tip.saturating_sub(window);
+        let blocks = channel_rpc
+            .with_retry("get_blocks", RetryPolicy::Idempotent, || async {
+                channel_rpc
+                    .rpc_client
+                    .get_blocks_with_commitment(start, Some(tip), finalized)
+                    .await
+            })
+            .await
+            .map_err(|e| fail(format!("Failed to list channel blocks: {e}")))?;
+        if let Some(newest) = blocks.into_iter().max() {
+            block = Some(newest);
+            break;
+        }
+    }
+    let block =
+        block.ok_or_else(|| fail(format!("no channel block found at or below slot {tip}")))?;
+
+    let block_time = channel_rpc
+        .get_block_time(block)
+        .await
+        .map_err(|e| fail(format!("channel block {block} has no time: {e}")))?;
+    let age = chrono::Utc::now().timestamp().saturating_sub(block_time);
+    if age > CHANNEL_MAX_AGE_SECS {
+        return Err(fail(format!(
+            "channel's newest block {block} is {age}s old, past the {CHANNEL_MAX_AGE_SECS}s limit"
+        )));
+    }
+    Ok(block)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::operator::RetryConfig;
     use base64::Engine as _;
@@ -271,6 +501,8 @@ mod tests {
     use spl_token_2022::extension::{
         BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn client(url: &str) -> RpcClientWithRetry {
         RpcClientWithRetry::with_retry_config(
@@ -694,6 +926,11 @@ mod tests {
     /// from the on-chain layout: base state, account-type discriminator, then a TLV entry
     /// costing four bytes of header before its value.
     fn base64_token2022_account(mint: Pubkey, amount: u64) -> String {
+        keyed_token2022_account(&token2022_extended_bytes(mint, amount))
+    }
+
+    /// Raw bytes of an extended Token-2022 account.
+    fn token2022_extended_bytes(mint: Pubkey, amount: u64) -> Vec<u8> {
         let len = ExtensionType::try_calculate_account_len::<Token2022Account>(&[
             ExtensionType::TransferHookAccount,
         ])
@@ -709,7 +946,7 @@ mod tests {
         state
             .init_account_type()
             .expect("the account type matches the extension");
-        keyed_token2022_account(&buf)
+        buf
     }
 
     /// The other layout Token-2022 produces: no extensions, so the account stays at the
@@ -796,5 +1033,387 @@ mod tests {
             extended >= Token2022Account::LEN + 5,
             "an extended account carries a discriminator and a TLV header, got {extended}"
         );
+    }
+
+    // ── fetch_escrow_custody ──────────────────────────────────────────
+
+    /// Raw bytes of an SPL token account for `mint`.
+    fn spl_account_bytes(mint: Pubkey, amount: u64) -> Vec<u8> {
+        let account = TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount,
+            delegate: COption::None,
+            state: AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        let mut buf = vec![0u8; TokenAccount::LEN];
+        account.pack_into_slice(&mut buf);
+        buf
+    }
+
+    /// One `getMultipleAccounts` entry holding `data` under the program `owner`.
+    fn ui_account(owner: Pubkey, data: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "lamports": 2_039_280u64,
+            "owner": owner.to_string(),
+            "executable": false,
+            "rentEpoch": 0,
+            "space": data.len(),
+            "data": [base64::engine::general_purpose::STANDARD.encode(data), "base64"],
+        })
+    }
+
+    /// Answer `getMultipleAccounts` per requested key from `accounts` (absent keys are null).
+    /// Call `n` answers at `slots[n]`, repeating the last slot; requested keys are recorded.
+    async fn mock_multiple_accounts(
+        server: &mut mockito::Server,
+        accounts: HashMap<Pubkey, serde_json::Value>,
+        slots: Vec<u64>,
+        requested: Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getMultipleAccounts"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                let keys: Vec<String> = body["params"][0]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|k| k.as_str().unwrap().to_string())
+                    .collect();
+                let value: Vec<serde_json::Value> = keys
+                    .iter()
+                    .map(|k| {
+                        accounts
+                            .get(&Pubkey::from_str(k).unwrap())
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect();
+                requested.lock().unwrap().push(keys);
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let slot = slots[n.min(slots.len() - 1)];
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"context": {"slot": slot}, "value": value}
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    fn ata(instance: &Pubkey, mint: &Pubkey, program: &Pubkey) -> Pubkey {
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            instance, mint, program,
+        )
+    }
+
+    /// Custody is exactly the instance ATAs: an absent ATA holds zero, both token programs
+    /// decode, and nothing else the escrow owns is ever listed, so it cannot be inflated.
+    #[tokio::test]
+    async fn custody_reads_only_the_instance_atas() {
+        let mut server = mockito::Server::new_async().await;
+        let owner_sweep = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getTokenAccountsByOwner"}),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+        let instance = Pubkey::new_unique();
+        let (absent, spl, t22) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let accounts = HashMap::from([
+            (
+                ata(&instance, &spl, &spl_token::id()),
+                ui_account(spl_token::id(), &spl_account_bytes(spl, 500)),
+            ),
+            (
+                ata(&instance, &t22, &spl_token_2022::id()),
+                ui_account(spl_token_2022::id(), &token2022_extended_bytes(t22, 700)),
+            ),
+        ]);
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        mock_multiple_accounts(&mut server, accounts, vec![42], requested.clone()).await;
+        let mints = [
+            (absent, spl_token::id()),
+            (spl, spl_token::id()),
+            (t22, spl_token_2022::id()),
+        ];
+
+        let snapshot = fetch_escrow_custody(&client(&server.url()), instance, &mints)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.slot, 42);
+        assert_eq!(snapshot.balances.get(&absent).copied().unwrap_or(0), 0);
+        assert_eq!(snapshot.balances[&spl], 500);
+        assert_eq!(snapshot.balances[&t22], 700);
+        let expected: Vec<String> = mints
+            .iter()
+            .map(|(m, p)| ata(&instance, m, p).to_string())
+            .collect();
+        assert_eq!(*requested.lock().unwrap(), vec![expected]);
+        owner_sweep.assert_async().await;
+    }
+
+    /// An account that does not look like this mint's token account is an error, never zero.
+    #[tokio::test]
+    async fn custody_rejects_an_account_that_is_not_the_mints_ata() {
+        let instance = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let key = ata(&instance, &mint, &spl_token::id());
+        let cases = [
+            (
+                "other mint",
+                ui_account(spl_token::id(), &spl_account_bytes(Pubkey::new_unique(), 5)),
+            ),
+            (
+                "other program",
+                ui_account(Pubkey::new_unique(), &spl_account_bytes(mint, 5)),
+            ),
+            ("undecodable", ui_account(spl_token::id(), &[1, 2, 3])),
+        ];
+        for (label, account) in cases {
+            let mut server = mockito::Server::new_async().await;
+            mock_multiple_accounts(
+                &mut server,
+                HashMap::from([(key, account)]),
+                vec![1],
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            let result =
+                fetch_escrow_custody(&client(&server.url()), instance, &[(mint, spl_token::id())])
+                    .await;
+
+            assert!(
+                matches!(result, Err(SweepFailure::Read(_))),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    /// More mints than one call takes are read in chunks that must share a slot.
+    #[tokio::test]
+    async fn custody_chunks_merge_only_at_one_slot() {
+        let instance = Pubkey::new_unique();
+        let mints: Vec<(Pubkey, Pubkey)> = (0..101)
+            .map(|_| (Pubkey::new_unique(), spl_token::id()))
+            .collect();
+        let held = mints[100].0;
+        let accounts = HashMap::from([(
+            ata(&instance, &held, &spl_token::id()),
+            ui_account(spl_token::id(), &spl_account_bytes(held, 9)),
+        )]);
+
+        let mut agreeing = mockito::Server::new_async().await;
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        mock_multiple_accounts(&mut agreeing, accounts.clone(), vec![7], requested.clone()).await;
+        let snapshot = fetch_escrow_custody(&client(&agreeing.url()), instance, &mints)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.slot, 7);
+        assert_eq!(snapshot.balances[&held], 9);
+        let sizes: Vec<usize> = requested.lock().unwrap().iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![100, 1], "one call per 100 keys");
+
+        let mut split = mockito::Server::new_async().await;
+        let alternating = (0..20).map(|n| 10 + n % 2).collect();
+        mock_multiple_accounts(
+            &mut split,
+            accounts,
+            alternating,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let result = fetch_escrow_custody(&client(&split.url()), instance, &mints).await;
+        assert!(
+            matches!(result, Err(SweepFailure::SlotUnsettled { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// With no mints there is nothing to read, but the snapshot still needs a slot to pin the ledger.
+    #[tokio::test]
+    async fn custody_with_no_mints_takes_the_finalized_slot() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getSlot"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":77}"#)
+            .create_async()
+            .await;
+
+        let snapshot = fetch_escrow_custody(&client(&server.url()), Pubkey::new_unique(), &[])
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.slot, 77);
+        assert!(snapshot.balances.is_empty());
+    }
+
+    // ── channel freshness ─────────────────────────────────────────────
+
+    /// Mock the channel clock: `getSlot` answers `tip`, `getBlocks` answers the slots of
+    /// `blocks` inside the requested range, and `getBlockTime` answers `age_secs` before
+    /// the moment of the request (null when `age_secs` is None).
+    pub(crate) async fn mock_channel_clock(
+        server: &mut mockito::Server,
+        tip: u64,
+        blocks: Vec<u64>,
+        age_secs: Option<i64>,
+    ) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getSlot"}),
+            ))
+            .with_status(200)
+            .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":{tip}}}"#))
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getBlocks"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                let start = body["params"][0].as_u64().unwrap();
+                let end = body["params"][1].as_u64().unwrap();
+                let hits: Vec<u64> = blocks
+                    .iter()
+                    .copied()
+                    .filter(|b| (start..=end).contains(b))
+                    .collect();
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": hits})
+                    .to_string()
+                    .into_bytes()
+            })
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getBlockTime"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let time = age_secs.map(|age| chrono::Utc::now().timestamp() - age);
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": time})
+                    .to_string()
+                    .into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    /// A single-attempt client so an error case fails fast.
+    fn fast_client(url: &str) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::finalized(),
+        )
+    }
+
+    /// The anchor is the newest block at or below the tip, and only if it is recent.
+    #[tokio::test]
+    async fn channel_anchor_requires_a_recent_block() {
+        // (label, tip, blocks, block age, expected anchor)
+        type Case = (&'static str, u64, Vec<u64>, Option<i64>, Option<u64>);
+        let cases: [Case; 6] = [
+            (
+                "fresh block in the first window",
+                1_000,
+                vec![990, 995],
+                Some(1),
+                Some(995),
+            ),
+            (
+                "block only in a wider window",
+                10_000,
+                vec![8_000],
+                Some(1),
+                Some(8_000),
+            ),
+            ("no block at all", 10_000, vec![], Some(1), None),
+            ("block with no time", 1_000, vec![995], None, None),
+            (
+                "stale block",
+                1_000,
+                vec![995],
+                Some(CHANNEL_MAX_AGE_SECS + 1),
+                None,
+            ),
+            (
+                "clock ahead of ours",
+                1_000,
+                vec![995],
+                Some(-30),
+                Some(995),
+            ),
+        ];
+        for (label, tip, blocks, age, expected) in cases {
+            let mut server = mockito::Server::new_async().await;
+            mock_channel_clock(&mut server, tip, blocks, age).await;
+
+            let anchor = channel_anchor(&fast_client(&server.url())).await;
+
+            assert_eq!(anchor.ok(), expected, "{label}");
+        }
+    }
+
+    /// The supply read reports the slot it was answered at, even for a mint not created yet.
+    #[tokio::test]
+    async fn channel_supply_reports_its_context_slot() {
+        let mut present = mockito::Server::new_async().await;
+        present
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(mint_account_body(1_234).replace(r#""slot":1"#, r#""slot":4242"#))
+            .create_async()
+            .await;
+        let got = fetch_channel_supply_at(&client(&present.url()), &Pubkey::new_unique())
+            .await
+            .unwrap();
+        assert_eq!(got, (1_234, 4242));
+
+        let mut absent = mockito::Server::new_async().await;
+        absent
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":77},"value":null}}"#)
+            .create_async()
+            .await;
+        let got = fetch_channel_supply_at(&client(&absent.url()), &Pubkey::new_unique())
+            .await
+            .unwrap();
+        assert_eq!(got, (0, 77));
     }
 }

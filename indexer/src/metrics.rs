@@ -192,6 +192,13 @@ pub const BAIL_REASONS: [&str; 8] = [
 // aborts the process immediately when this increments; the counter exists
 // so dashboards can alert even if the restart is fast.
 gauge_vec!(
+    OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
+    "private_channel_operator_reconciliation_input_dark_ticks",
+    "Consecutive reconciliation ticks with a required input unreadable (0 when every input was read)",
+    &["program_type"]
+);
+
+gauge_vec!(
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
     "private_channel_operator_reconciliation_liability_dark_ticks",
     "Consecutive reconciliation ticks whose ledger could not be pinned to the custody slot (0 when the liability invariant is armed)",
@@ -379,6 +386,8 @@ pub fn init_labels(program_type: &str) {
         "confirmation_error",
         "deposit_ownership_lost",
         "release_claim_lost",
+        "halted_before_broadcast",
+        "halt_read_error",
         "release_missing_claim_lease",
         "jit_missing_claim_lease",
         "malformed_status_response",
@@ -479,6 +488,7 @@ pub fn init_labels(program_type: &str) {
     // An armed liability check reports zero, so the series has to exist before the first
     // dark tick or "no data" and "armed" look the same.
     OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS.with_label_values(&[program_type]);
+    OPERATOR_RECONCILIATION_INPUT_DARK_TICKS.with_label_values(&[program_type]);
 }
 
 pub fn init() {
@@ -513,6 +523,7 @@ pub fn init() {
         OPERATOR_SENDER_LOCK_LOST,
         LIVE_STATE_LOCK_LOST,
         OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
+        OPERATOR_RECONCILIATION_INPUT_DARK_TICKS,
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
         OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
     );
@@ -565,6 +576,7 @@ mod tests {
             "private_channel_operator_backlog_depth",
             "private_channel_feepayer_balance_lamports",
             "private_channel_operator_remint_claim_lost_total",
+            "private_channel_operator_reconciliation_input_dark_ticks",
         ];
 
         for name in single_label_metrics {

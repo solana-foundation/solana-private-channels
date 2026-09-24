@@ -34,26 +34,7 @@ pub async fn run_fetcher(
             break;
         }
 
-        // Durable cross-process freeze: a reconciliation halt stops BOTH operators'
-        // fetchers here, the single point that moves rows pending -> processing.
-        // A read error falls through (fail-open on the read only): the flag is
-        // re-checked next poll and quarantine already blunts the pipeline, so a
-        // transient DB blip must not wedge an otherwise-healthy operator.
-        match storage.is_reconciliation_halted().await {
-            Ok(Some(halt)) => {
-                warn!(reason = %halt.reason, "Reconciliation halt active; skipping fetch");
-                if let Some(h) = &health {
-                    h.force_unhealthy(halt.reason.clone());
-                }
-                tokio::time::sleep(config.db_poll_interval).await;
-                continue;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("Failed to read reconciliation halt flag; proceeding: {}", e);
-            }
-        }
-
+        // Measured before the halt gate so /health can still report a stalled backlog.
         match storage.count_pending_transactions(transaction_type).await {
             Ok(count) => {
                 metrics::OPERATOR_BACKLOG_DEPTH
@@ -68,6 +49,33 @@ pub async fn run_fetcher(
                     "Failed to count pending transactions for backlog metric: {}",
                     e
                 );
+            }
+        }
+
+        // Durable cross-process freeze: a reconciliation halt stops BOTH operators'
+        // fetchers here, the single point that moves rows pending -> processing.
+        // An unreadable flag cannot prove the halt is clear, so it skips the poll too.
+        match storage.is_reconciliation_halted().await {
+            Ok(Some(halt)) => {
+                warn!(reason = %halt.reason, "Reconciliation halt active; skipping fetch");
+                if let Some(h) = &health {
+                    h.force_unhealthy(halt.reason.clone());
+                }
+                tokio::time::sleep(config.db_poll_interval).await;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Not latched unhealthy: a DB blip must not need a restart to clear.
+                metrics::OPERATOR_TRANSACTION_ERRORS
+                    .with_label_values(&[program_type.as_label(), "halt_read_error"])
+                    .inc();
+                warn!(
+                    "Failed to read reconciliation halt flag; skipping fetch: {}",
+                    e
+                );
+                tokio::time::sleep(config.db_poll_interval).await;
+                continue;
             }
         }
 
@@ -268,21 +276,31 @@ mod tests {
         assert!(handle.await.unwrap().is_ok());
     }
 
+    /// A halt flag that cannot be read cannot prove the halt is clear, so the fetcher
+    /// claims nothing. It still measures the backlog so /health can report the stall.
     #[tokio::test]
-    async fn fetcher_halt_read_error_falls_through() {
+    async fn fetcher_halt_read_error_skips_fetch() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
         let mock = MockStorage::new();
         mock.pending_transactions
             .lock()
             .unwrap()
             .push(make_test_transaction("sig_err"));
-        // The halt read errors; the fetcher must proceed (fail-open on the read).
         mock.set_should_fail("is_reconciliation_halted", true);
+        let health = HealthState::new(HealthConfig::operator());
+        // An old progress stamp lets a measured backlog surface as Stalled.
+        health
+            .last_progress_at()
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let read_errors = metrics::OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&[ProgramType::Escrow.as_label(), "halt_read_error"]);
+        let errors_before = read_errors.get();
 
-        let storage = Arc::new(Storage::Mock(mock));
+        let storage = Arc::new(Storage::Mock(mock.clone()));
         let (tx, mut rx) = mpsc::channel(10);
         let token = CancellationToken::new();
-
         let token_clone = token.clone();
+        let health_clone = Some(health.clone());
         let handle = tokio::spawn(async move {
             run_fetcher(
                 storage,
@@ -290,11 +308,34 @@ mod tests {
                 test_config(),
                 ProgramType::Escrow,
                 token_clone,
-                None,
+                health_clone,
             )
             .await
         });
 
+        // Several polls while the read keeps failing.
+        let got = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            got.is_err(),
+            "halt read error must not forward transactions"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Pending,
+            "nothing is claimed while the flag is unreadable"
+        );
+        assert!(
+            read_errors.get() > errors_before,
+            "each failed read is counted"
+        );
+        assert!(
+            matches!(health.check(), HealthOutcome::Stalled { pending: 1, .. }),
+            "backlog is still measured and never latched: {:?}",
+            health.check()
+        );
+
+        // Once the flag reads clear again the row goes through.
+        mock.set_should_fail("is_reconciliation_halted", false);
         let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("timeout waiting for transaction")

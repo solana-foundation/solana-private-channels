@@ -122,6 +122,11 @@ sustained rate only signals the in-flight cap or the JIT window is stranding
 builders long enough for recovery to reclaim them (a throughput tuning
 signal, not a correctness bug).
 
+A claim refused because a reconciliation halt is active is counted separately as
+`error_reason="halted_before_broadcast"`, not as `deposit_ownership_lost`. That row
+is left `processing`, moved back to `pending` by recovery, and mints once the halt
+is cleared; see [`reconciliation_halt_runbook.md`](reconciliation_halt_runbook.md).
+
 `OPERATOR_TRANSACTION_ERRORS{error_reason="jit_missing_claim_lease"}` is a
 defensive counter that should never fire: a JIT re-fire arrived without the
 ownership epoch its first claim stored. The re-fire is dropped without

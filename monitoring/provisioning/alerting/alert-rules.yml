@@ -737,3 +737,71 @@ groups:
                     type: gt
                     params: [0]
               refId: C
+
+      - uid: halt-flag-unreadable
+        title: "Operator cannot read the reconciliation halt flag"
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Operator {{ $labels.job }} ({{ $labels.program_type }}) cannot read the reconciliation halt flag, so its fetcher is claiming nothing. No value moves while this fires, but deposits and withdrawals are stuck. Check the operator's database connection. Runbook: docs/runbooks/reconciliation_halt_runbook.md."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: increase(private_channel_operator_transaction_errors_total{error_reason="halt_read_error"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+      - uid: reconciliation-inputs-dark
+        title: "Reconciliation cannot read a required input"
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Escrow operator {{ $labels.job }} has gone {{ $values.A }} reconciliation tick(s) without reading every required input (custody, mint set, envelope, fresh channel supply or ledger rows). Three in a row halt both pipelines. The last reason is in the operator log. Runbook: docs/runbooks/reconciliation_halt_runbook.md, section Inputs-dark halt."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: max by (job, program_type) (private_channel_operator_reconciliation_input_dark_ticks)
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C

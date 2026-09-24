@@ -24,7 +24,9 @@ use private_channel_indexer::indexer::reconciliation::{
 use private_channel_indexer::operator::escrow_sweep::fetch_escrow_balances_by_mint;
 use private_channel_indexer::operator::reconciliation::run_reconciliation;
 use private_channel_indexer::operator::{RetryConfig, RpcClientWithRetry};
-use private_channel_indexer::storage::common::models::{DbTransactionBuilder, TransactionType};
+use private_channel_indexer::storage::common::models::{
+    DbMint, DbTransactionBuilder, TransactionType,
+};
 use private_channel_indexer::storage::{PostgresDb, Storage};
 use private_channel_indexer::{DatasourceType, YellowstoneConfig};
 use private_channel_metrics::{HealthConfig, HealthState};
@@ -109,10 +111,32 @@ async fn start_postgres(
 }
 
 /// Answer every channel-supply read with "this mint does not exist", which the invariant
-/// reads as zero supply. The queue is stocked well past what any run here consumes.
+/// reads as zero supply, from a live channel whose slot advances with wall time and whose
+/// newest block is always current, so every read passes the freshness anchor. The queues
+/// are stocked well past what any run here consumes.
 fn mock_absent_channel_mint(rpc: &MockRpcServer) {
-    let reply = Reply::result(json!({"context": {"slot": 1}, "value": null}));
-    rpc.enqueue_sequence("getAccountInfo", std::iter::repeat_n(reply, 4096));
+    let started = Instant::now();
+    let slot_now = move || 1 + started.elapsed().as_millis() as u64 / 100;
+    let replies = |reply: Reply| std::iter::repeat_n(reply, 4096);
+    rpc.enqueue_sequence(
+        "getSlot",
+        replies(Reply::dynamic(move |_| json!(slot_now()))),
+    );
+    // Every slot carries a block, so the newest block is the top of the requested range.
+    rpc.enqueue_sequence(
+        "getBlocks",
+        replies(Reply::dynamic(|req| json!([req["params"][1]]))),
+    );
+    rpc.enqueue_sequence(
+        "getBlockTime",
+        replies(Reply::dynamic(|_| json!(chrono::Utc::now().timestamp()))),
+    );
+    rpc.enqueue_sequence(
+        "getAccountInfo",
+        replies(Reply::dynamic(
+            move |_| json!({"context": {"slot": slot_now()}, "value": null}),
+        )),
+    );
 }
 
 /// A real escrow indexer over geyser, on a runtime of its own so it can actually be
@@ -588,8 +612,8 @@ async fn wait_for_halt(
 ) -> String {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(halt) = storage.is_reconciliation_halted().await.expect("halt read") {
-            return halt.reason;
+        if let Some(reason) = poll_halt(storage, Duration::ZERO).await {
+            return reason;
         }
         assert!(
             !indexer.task.is_finished(),
@@ -600,6 +624,20 @@ async fn wait_for_halt(
             Instant::now() < deadline,
             "reconciliation never halted within {timeout:?}"
         );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The halt reason once the durable flag is set, polling for up to `timeout`.
+async fn poll_halt(storage: &Storage, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(halt) = storage.is_reconciliation_halted().await.expect("halt read") {
+            return Some(halt.reason);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -1187,4 +1225,52 @@ async fn a_partial_release_does_not_discharge_the_whole_row() {
 
     indexer.stop();
     channel.shutdown().await;
+}
+
+/// Custody that cannot be read for three ticks freezes the bridge: the durable flag is set
+/// and /health fails, but active withdrawals stay where they are for when inputs return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unreadable_custody_halts_without_quarantine() {
+    let (_pg, pool, db_url, storage) = start_postgres("inputs_dark").await;
+    let channel = MockRpcServer::start().await;
+    mock_absent_channel_mint(&channel);
+    let mint = Pubkey::new_unique();
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            mint.to_string(),
+            MINT_DECIMALS as i16,
+            spl_token::id().to_string(),
+        )])
+        .await
+        .expect("seed mint");
+    let withdrawal = seed_pending_withdrawal(&storage, mint, WITHDRAWAL_AMOUNT, 1).await;
+
+    let health = HealthState::new(HealthConfig::operator());
+    let cancel = CancellationToken::new();
+    // Nothing listens on port 1, so every custody read fails.
+    let task = spawn_reconciliation(
+        &db_url,
+        "http://127.0.0.1:1",
+        &channel.url(),
+        Pubkey::new_unique(),
+        tick_config("http://127.0.0.1:1/webhook".to_string()),
+        health.clone(),
+        cancel.clone(),
+    );
+
+    let reason = poll_halt(&storage, Duration::from_secs(180))
+        .await
+        .expect("unreadable custody must halt");
+    cancel.cancel();
+    let _ = task.await;
+
+    assert!(reason.contains("required inputs unavailable"), "{reason}");
+    assert!(!health.is_healthy(), "the halt must fail /health");
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+            .bind(&withdrawal)
+            .fetch_one(&pool)
+            .await
+            .expect("withdrawal row");
+    assert_eq!(status, "pending", "an outage halt must not quarantine");
 }

@@ -171,7 +171,8 @@ state needs human investigation before any retry can succeed.
 
 Note: the JIT retry's journal is ownership-checked; a retry that loses
 its lease surfaces as `deposit_ownership_lost` (see
-[`deposit_failed.md`](deposit_failed.md)), not as manual review.
+[`deposit_failed.md`](deposit_failed.md)), not as manual review. A retry refused by
+an active reconciliation halt surfaces as `halted_before_broadcast` instead.
 
 #### Step 1 - verify on-chain
 

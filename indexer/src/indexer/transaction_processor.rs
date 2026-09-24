@@ -12,9 +12,12 @@ use crate::{
     },
     operator::{instruction_util::SourceEventId, ConsumedMint, ConsumedMintKind, ConsumedSet},
     storage::{
-        common::models::{
-            DbMint, DbMintStatus, DbObservedRelease, DbTransaction, DbTransactionBuilder,
-            TransactionStatus, TransactionType,
+        common::{
+            amount::TokenAmount,
+            models::{
+                DbMint, DbMintStatus, DbObservedRelease, DbTransaction, DbTransactionBuilder,
+                TransactionStatus, TransactionType,
+            },
         },
         Storage,
     },
@@ -737,9 +740,7 @@ fn convert_to_db_models(
                         withdrawal_nonce: data.transaction_nonce as i64,
                         signature: signature.clone(),
                         slot: instruction_meta.slot as i64,
-                        // Saturating, not wrapping: an amount past i64 would otherwise
-                        // record negative, and the query caps it at the row's own amount.
-                        amount: Some(i64::try_from(data.amount).unwrap_or(i64::MAX)),
+                        amount: Some(TokenAmount(data.amount)),
                     }),
                 ),
                 _ => (None, None, None, None),
@@ -1044,6 +1045,29 @@ mod tests {
         let txn = txn.unwrap();
         // recipient should default to accounts.user
         assert_eq!(txn.recipient, make_pubkey(1).to_string());
+    }
+
+    /// A `ReleaseFunds` for `amount`, otherwise the same as `make_release_funds_instruction`.
+    fn make_release_funds_instruction_with_amount(amount: u64) -> InstructionWithMetadata {
+        let mut ix = make_release_funds_instruction(300, Some("sig-amount".to_string()), 42);
+        if let ProgramInstruction::Escrow(escrow_ix) = &mut ix.instruction {
+            if let EscrowInstruction::ReleaseFunds { data, .. } = escrow_ix.as_mut() {
+                data.amount = amount;
+            }
+        }
+        ix
+    }
+
+    /// A release records exactly what it moved across the whole u64 range; a capped
+    /// amount would leave phantom liability behind and trip a false halt.
+    #[test]
+    fn convert_release_keeps_the_full_amount() {
+        for amount in [750, i64::MAX as u64 + 1, u64::MAX] {
+            let ix = make_release_funds_instruction_with_amount(amount);
+            let (_, _, _, release) = convert_to_db_models(&ix, Some(&release_funds_instance()));
+            let release = release.expect("a release on the watched instance is recorded");
+            assert_eq!(release.amount, Some(TokenAmount(amount)), "amount {amount}");
+        }
     }
 
     #[test]

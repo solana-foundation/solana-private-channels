@@ -850,7 +850,7 @@ impl PostgresDb {
                 withdrawal_nonce BIGINT PRIMARY KEY,
                 signature TEXT NOT NULL,
                 slot BIGINT NOT NULL,
-                amount BIGINT,
+                amount NUMERIC(20,0),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -860,9 +860,32 @@ impl PostgresDb {
 
         // Nullable on purpose: rows written before this column fall back to the withdrawal
         // row's own amount, so the upgrade needs no backfill.
-        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount BIGINT")
+        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount NUMERIC(20,0)")
             .execute(&self.pool)
             .await?;
+
+        // Widen a legacy BIGINT amount so releases above i64::MAX are stored exactly.
+        // The old writer capped those at i64::MAX, so such rows are cleared to fall back
+        // to the row's own amount. The type guard makes this run exactly once.
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'observed_releases'
+                      AND column_name = 'amount'
+                      AND data_type = 'bigint'
+                ) THEN
+                    UPDATE observed_releases SET amount = NULL
+                    WHERE amount = 9223372036854775807;
+                    ALTER TABLE observed_releases ALTER COLUMN amount TYPE NUMERIC(20,0);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Write-ahead log for compensating remint MintTo signatures. Separate
         // from pending_release_signatures because these land on the source
@@ -2325,7 +2348,8 @@ impl PostgresDb {
     /// demote (also a CAS on that column) loses; sharing one transaction leaves no
     /// bumped-but-unsigned window. `Ok(Some(lease))` returns the committed
     /// post-claim `updated_at`, valid as the next CAS token; `Ok(None)` means the
-    /// row was demoted or re-locked, so the caller must not broadcast.
+    /// row was demoted or re-locked, or a reconciliation halt is active, so the
+    /// caller must not broadcast.
     ///
     /// Nothing here is type-specific: the deposit mint and the withdrawal release
     /// both need exactly this ownership proof before they move funds.
@@ -2348,6 +2372,10 @@ impl PostgresDb {
             WHERE id = $1
               AND status = 'processing'
               AND updated_at = $2
+              -- Last gate before any value moves, so a halt also stops rows claimed earlier.
+              AND NOT EXISTS (
+                  SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
+              )
             RETURNING updated_at
             "#,
         )
@@ -2841,8 +2869,9 @@ impl PostgresDb {
     /// Every mint address the DB knows: the mint universe runtime reconciliation checks.
     /// Addresses only, so it can be read before the tick knows whether the ledger is
     /// pinnable at all.
-    pub async fn get_mint_addresses_internal(&self) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT mint_address FROM mints")
+    /// Every mint with its token program, which custody needs to derive the escrow ATA.
+    pub async fn get_mint_addresses_internal(&self) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as("SELECT mint_address, token_program FROM mints")
             .fetch_all(&self.pool)
             .await
     }
