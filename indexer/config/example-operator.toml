@@ -15,7 +15,8 @@ rpc_url = "http://localhost:8899"
 # Solana custody RPC. Required for escrow: the reconciliation solvency check reads custody from it.
 source_rpc_url = "http://localhost:18899"
 
-# Escrow instance ID (required for escrow program type, omit for withdraw)
+# Escrow instance ID. REQUIRED for every operator (escrow and withdraw) or it refuses to start.
+# Env: COMMON_ESCROW_INSTANCE_ID
 # escrow_instance_id = "YourPubkeyHere..."
 
 [storage]

@@ -165,7 +165,8 @@ pub struct PrivateChannelIndexerConfig {
     pub source_rpc_url: Option<String>,
     /// Postgres configuration
     pub postgres: PostgresConfig,
-    /// Instance ID to filter (required for Escrow program)
+    /// Escrow instance. Required for the escrow indexer and every operator; the withdraw
+    /// indexer must omit it.
     pub escrow_instance_id: Option<Pubkey>,
 }
 
