@@ -14,8 +14,10 @@ use crate::storage::common::storage::mock::MockStorage;
 use crate::storage::Storage;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 use spl_token::solana_program::program_pack::Pack;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -240,6 +242,64 @@ pub(super) fn mock_bitmap_account(
         ))
         .with_status(200)
         .with_body(bitmap_account_response(generation, consumed))
+        .create()
+}
+
+/// `getTransaction` whose runtime log shows `origin` raising `code`, inside the escrow's
+/// frame when it is another program. Only the escrow as origin decodes as an escrow error.
+pub(super) fn mock_rejection_logs(
+    server: &mut mockito::ServerGuard,
+    origin: Pubkey,
+    code: u32,
+) -> mockito::Mock {
+    let escrow = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+    let mut logs = vec![format!("Program {escrow} invoke [1]")];
+    if origin != escrow {
+        logs.push(format!("Program {origin} invoke [2]"));
+        logs.push(format!(
+            "Program {origin} failed: custom program error: {code:#x}"
+        ));
+    }
+    logs.push(format!(
+        "Program {escrow} failed: custom program error: {code:#x}"
+    ));
+    let err = serde_json::json!({"InstructionError": [0, {"Custom": code}]});
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "slot": 100,
+            "blockTime": null,
+            "transaction": {
+                "signatures": [Signature::new_unique().to_string()],
+                "message": {
+                    "header": {
+                        "numRequiredSignatures": 1,
+                        "numReadonlySignedAccounts": 0,
+                        "numReadonlyUnsignedAccounts": 1,
+                    },
+                    "accountKeys": [Pubkey::new_unique().to_string(), escrow.to_string()],
+                    "recentBlockhash": "11111111111111111111111111111111",
+                    "instructions": [],
+                },
+            },
+            "meta": {
+                "err": err,
+                "status": {"Err": err},
+                "fee": 5000,
+                "preBalances": [0, 0],
+                "postBalances": [0, 0],
+                "logMessages": logs,
+            },
+        },
+    });
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Regex(
+            r#""method"\s*:\s*"getTransaction""#.into(),
+        ))
+        .with_status(200)
+        .with_body(body.to_string())
         .create()
 }
 

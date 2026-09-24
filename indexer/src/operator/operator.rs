@@ -235,7 +235,7 @@ pub async fn run(
             sender_tx,
             processor_storage_tx,
             program_type,
-            instance_pda,
+            escrow_instance,
             processor_storage,
             processor_rpc,
             processor_fallback_rpc,

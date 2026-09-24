@@ -1,5 +1,6 @@
 use crate::operator::utils::instruction_util::{
     mint_idempotency_memo, remint_idempotency_memo, InitializeMintBuilder, TransactionBuilder,
+    TransactionKind,
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{
@@ -261,6 +262,7 @@ pub(super) async fn try_jit_mint_initialization(
     let result = match check_transaction_status(
         state.rpc_client.clone(),
         &sig,
+        TransactionKind::InitializeMint,
         CommitmentConfig::confirmed(),
         &init_tx_builder.extra_error_checks_policy(),
         state.confirmation_poll_interval_ms,

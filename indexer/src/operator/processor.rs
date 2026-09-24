@@ -395,7 +395,7 @@ pub async fn run_processor(
     sender_tx: mpsc::Sender<TransactionBuilder>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     program_type: ProgramType,
-    instance_pda: Option<Pubkey>,
+    instance_pda: Pubkey,
     storage: Arc<Storage>,
     rpc_client: Arc<crate::operator::RpcClientWithRetry>,
     fallback_rpc_client: Option<Arc<crate::operator::RpcClientWithRetry>>,
@@ -405,13 +405,6 @@ pub async fn run_processor(
 
     match program_type {
         ProgramType::Withdraw => {
-            // A withdrawal operator without an instance_pda is misconfigured.
-            let Some(instance_pda) = instance_pda else {
-                error!(
-                    "Withdraw operator missing escrow_instance_id, cannot build ReleaseFunds instructions; processor exiting"
-                );
-                return;
-            };
             let mut processor_state = ProcessorState::new_with_release_funds_state(
                 instance_pda,
                 storage.clone(),

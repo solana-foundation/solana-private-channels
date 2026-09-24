@@ -659,6 +659,8 @@ impl PostgresDb {
 
         // Create only if missing. Live workers insert during boot, so dropping and
         // recreating would let a withdrawal land without a nonce between the two.
+        // A change to this definition therefore needs its own migration; only the
+        // function body above is applied to existing databases.
         sqlx::query(
             r#"
             DO $$

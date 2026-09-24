@@ -14,7 +14,7 @@ use crate::{
             transaction::FINALITY_SAFETY_DELAY,
             types::{InstructionWithSigners, PendingRemint, PendingSig},
         },
-        utils::instruction_util::WithdrawalRemintInfo,
+        utils::instruction_util::{TransactionKind, WithdrawalRemintInfo},
         utils::transaction_util::{build_and_sign, send_signed},
         ConfirmationResult, ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, RpcClientWithRetry,
         SignerUtil, TransactionStatusUpdate,
@@ -233,6 +233,7 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
     let result = match check_transaction_status(
         state.source_rpc_client.clone(),
         &signature,
+        TransactionKind::Mint,
         CommitmentConfig::finalized(),
         &ExtraErrorCheckPolicy::None,
         state.confirmation_poll_interval_ms,
