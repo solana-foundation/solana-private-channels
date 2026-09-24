@@ -12,7 +12,9 @@ pub use mint::{
     ConsumedSet, JitOutcome,
 };
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
-pub(crate) use state::{validate_bitmap_consistency, verify_release_landed, ReleaseVerdict};
+pub(crate) use state::{
+    release_seen_at_confirmed, validate_bitmap_consistency, verify_release_landed, ReleaseVerdict,
+};
 pub(crate) use transaction::fetch_statuses_checked;
 pub use types::TransactionStatusUpdate;
 

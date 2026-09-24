@@ -188,6 +188,31 @@ pub(crate) async fn verify_release_landed(
     }
 }
 
+/// Whether `nonce`'s bit is already set at confirmed. Anchored at the finalized tip, so a
+/// backend behind it errors instead of answering with bits older than that proof.
+pub(crate) async fn release_seen_at_confirmed(
+    rpc: &RpcClientWithRetry,
+    instance_pda: Pubkey,
+    nonce: u64,
+) -> Result<bool, String> {
+    let anchor = finalized_anchor(rpc).await.map_err(|e| e.to_string())?;
+    let bitmap = fetch_consumed_nonces(
+        rpc,
+        &find_withdrawal_bitmap_pda(&instance_pda),
+        Some(anchor),
+        CommitmentConfig::confirmed(),
+    )
+    .await
+    .map_err(|e| format!("confirmed bitmap read failed: {e}"))?;
+    if !bitmap.covers(nonce) {
+        return Err(format!(
+            "the confirmed bitmap is on generation {} and its bits say nothing about nonce {nonce}",
+            bitmap.generation
+        ));
+    }
+    Ok(bitmap.is_consumed(nonce))
+}
+
 /// Boot pre-flight diffing the current generation's released nonces against the
 /// ones the database calls Completed. A consumed nonce with no Completed row is
 /// lost bookkeeping for a release that did land, so it is repaired in place and
