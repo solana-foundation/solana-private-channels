@@ -432,9 +432,20 @@ async fn assert_dump_refused(
     dump_args: &[&str],
     after_dump: impl AsyncFnOnce(&PgPool, &Path) -> Result<()>,
 ) -> Result<()> {
+    assert_dump_refused_with(db_name, dump_args, async |_| Ok(()), after_dump).await
+}
+
+/// The same, with `before_dump` changing the ledger the dump is taken of.
+async fn assert_dump_refused_with(
+    db_name: &str,
+    dump_args: &[&str],
+    before_dump: impl AsyncFnOnce(&PgPool) -> Result<()>,
+    after_dump: impl AsyncFnOnce(&PgPool, &Path) -> Result<()>,
+) -> Result<()> {
     let (db, container) = start_postgres(db_name).await?;
     let pool = db.pool.clone();
     seed_fixture(pool.as_ref()).await?;
+    before_dump(pool.as_ref()).await?;
     let dump = container_pg_dump(&container, db_name, dump_args, db_name)?;
     let restore_bin = container_pg_restore_bin(&container, db_name)?;
     after_dump(pool.as_ref(), &dump).await?;
@@ -496,6 +507,45 @@ async fn partial_table_dump_is_refused() -> Result<()> {
         &["-Fc", "--exclude-table-data=transactions"],
         async |_, _| Ok(()),
     )
+    .await
+}
+
+/// The transactions section is there, but without a row truncation would delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn dump_missing_transaction_rows_is_refused() -> Result<()> {
+    assert_dump_refused_with(
+        "truncate_missing_tx_rows",
+        &["-Fc"],
+        async |pool| {
+            sqlx::raw_sql(
+                "CREATE TABLE held AS SELECT * FROM transactions WHERE data = '\\x01';
+                 DELETE FROM transactions WHERE data = '\\x01';",
+            )
+            .execute(pool)
+            .await?;
+            Ok(())
+        },
+        async |pool, _| {
+            sqlx::raw_sql("INSERT INTO transactions SELECT * FROM held; DROP TABLE held;")
+                .execute(pool)
+                .await?;
+            Ok(())
+        },
+    )
+    .await
+}
+
+/// A row the dump holds with other bytes than the live row cannot restore it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dump_with_other_transaction_data_is_refused() -> Result<()> {
+    assert_dump_refused("truncate_other_tx_data", &["-Fc"], async |pool, _| {
+        let updated = sqlx::query("UPDATE transactions SET data = '\\x63' WHERE data = '\\x01'")
+            .execute(pool)
+            .await?
+            .rows_affected();
+        assert_eq!(updated, 1);
+        Ok(())
+    })
     .await
 }
 

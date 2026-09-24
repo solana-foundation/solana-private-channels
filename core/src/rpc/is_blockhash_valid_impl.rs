@@ -1,5 +1,5 @@
 use crate::rpc::{
-    error::{custom_error, INVALID_PARAMS_CODE},
+    error::{custom_error, INVALID_PARAMS_CODE, JSON_RPC_SERVER_ERROR},
     WriteDeps,
 };
 use jsonrpsee::core::RpcResult;
@@ -21,6 +21,12 @@ pub async fn is_blockhash_valid_impl(
     let provided_hash = Hash::from_str(&blockhash)
         .map_err(|e| custom_error(INVALID_PARAMS_CODE, format!("Invalid blockhash: {}", e)))?;
 
+    // Ingested first: the scan below then holds every hash it counts, while announced,
+    // read last, covers any hash the caller could have seen. So ingested >= announced
+    // means a missing hash is not a lagging one.
+    let progress = &write_deps.blockhash_progress;
+    let ingested = progress.ingested.load(Ordering::Acquire);
+
     // Check if the blockhash is in the live blockhash window.
     // Validates against the full window maintained by the Dedup stage,
     // not just the single latest blockhash.
@@ -34,6 +40,14 @@ pub async fn is_blockhash_valid_impl(
         .map_err(|e| custom_error(-32603, format!("Failed to acquire blockhash lock: {}", e)))?;
 
     let is_valid = live_blockhashes.iter().any(|h| h == &provided_hash);
+    drop(live_blockhashes);
+
+    if !is_valid && ingested < progress.announced.load(Ordering::SeqCst) {
+        return Err(custom_error(
+            JSON_RPC_SERVER_ERROR,
+            "Blockhash window is catching up, retry",
+        ));
+    }
 
     Ok(Response {
         context: RpcResponseContext::new(slot),

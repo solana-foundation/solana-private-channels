@@ -490,8 +490,9 @@ async fn a_failed_startup_frees_the_lease_before_returning() {
     );
 }
 
-/// Poll `isBlockhashValid` on the write node until it gives `expected`. Dedup takes a
-/// settled hash in or out just after the block lands, so one read can race it.
+/// Poll `isBlockhashValid` on the write node until it gives `expected`. A hash already
+/// handed out must never read false; only the writer's catching-up error is retried.
+/// An expired hash can still read true until dedup takes in the block that evicts it.
 async fn await_blockhash_validity(
     client: &RpcClient,
     hash: &solana_sdk::hash::Hash,
@@ -499,13 +500,12 @@ async fn await_blockhash_validity(
 ) {
     let commitment = solana_commitment_config::CommitmentConfig::processed();
     for _ in 0..50 {
-        if client
-            .is_blockhash_valid(hash, commitment)
-            .await
-            .expect("isBlockhashValid")
-            == expected
-        {
-            return;
+        match client.is_blockhash_valid(hash, commitment).await {
+            Ok(valid) if valid == expected => return,
+            Ok(false) => panic!("the write node reported the live blockhash {hash} as invalid"),
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("catching up") => {}
+            Err(e) => panic!("isBlockhashValid: {e}"),
         }
         sleep(Duration::from_millis(100)).await;
     }

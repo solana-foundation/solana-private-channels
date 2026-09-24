@@ -358,6 +358,8 @@ async fn start_services(
             load_dedup_state(&db, config.max_blockhashes).await?;
         // Seeded before RPC starts so isBlockhashValid never reports slot 0 on a live chain.
         let settled_slot = Arc::new(AtomicU64::new(db.get_current_slot().await?.unwrap_or(0)));
+        // Both counters start at zero: the window loaded above is already in dedup.
+        let blockhash_progress = Arc::new(crate::stages::BlockhashProgress::default());
 
         let dedup_hb = crate::health::StageHeartbeat::new();
         let sigverify_hb = crate::health::StageHeartbeat::new();
@@ -396,6 +398,7 @@ async fn start_services(
             initial_dedup_cache,
             metrics: Arc::clone(&config.metrics),
             heartbeat: dedup_hb,
+            blockhash_progress: Arc::clone(&blockhash_progress),
         })
         .await;
         workers.push(dedup);
@@ -450,6 +453,7 @@ async fn start_services(
             heartbeat: settler_hb,
             writer_epoch: Some(writer_epoch),
             settled_slot: Arc::clone(&settled_slot),
+            blockhash_progress: Arc::clone(&blockhash_progress),
         })
         .await;
         workers.push(settle);
@@ -472,6 +476,7 @@ async fn start_services(
             metrics: Arc::clone(&config.metrics),
             live_blockhashes,
             settled_slot,
+            blockhash_progress,
         })
     } else {
         None

@@ -7,7 +7,7 @@ use {
     anyhow::{anyhow, bail, Context, Result},
     sha2::{Digest, Sha256},
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs::File,
         io::{self, BufRead, BufReader, Read, Write},
         path::Path,
@@ -26,6 +26,19 @@ const TRANSACTIONS: &str = "public.transactions";
 const METADATA: &str = "public.metadata";
 const ACCOUNT_HISTORY: &str = "public.account_history";
 const DEPLOYMENT_ID_KEY: &[u8] = b"deployment_id";
+/// Most transaction rows one run may prove; each costs roughly 130 bytes of proof memory.
+pub const MAX_TRANSACTION_SIGNATURES: usize = 5_000_000;
+
+/// Refuse a range whose transaction rows would not fit the proof's memory budget.
+pub fn check_transaction_cap(count: usize) -> Result<()> {
+    if count > MAX_TRANSACTION_SIGNATURES {
+        bail!(
+            "over {MAX_TRANSACTION_SIGNATURES} transactions would be deleted in one run; \
+             keep more slots so each run deletes a smaller range"
+        );
+    }
+    Ok(())
+}
 
 /// What the live database holds for the range about to be deleted.
 #[derive(Debug, Clone)]
@@ -39,6 +52,8 @@ pub struct LiveLedger {
     pub account_history_count: Option<u64>,
     /// Oldest live `account_history` slot, for the same reason as `live_min_slot`.
     pub account_history_min_slot: u64,
+    /// The transaction rows truncation deletes, as signature to SHA-256 of the row's data.
+    pub transactions: HashMap<[u8; 64], [u8; 32]>,
 }
 
 /// What the restore stream says about the archive.
@@ -48,6 +63,8 @@ struct DumpFacts {
     deployment_id: Option<Vec<u8>>,
     blocks_in_range: u64,
     account_history_below: u64,
+    /// Distinct rows truncation deletes, each matched byte for byte against the live row.
+    transactions_found: u64,
 }
 
 /// Run the proof and return the SHA-256 of the exact bytes proven. Blocking; the
@@ -180,6 +197,14 @@ fn decide(facts: &DumpFacts, live: &LiveLedger) -> Result<()> {
             );
         }
     }
+    // Found rows are distinct live rows, so equal counts mean every row is there.
+    let expected = live.transactions.len() as u64;
+    if facts.transactions_found != expected {
+        bail!(
+            "the dump holds {} of the {expected} transactions this run would delete",
+            facts.transactions_found
+        );
+    }
     Ok(())
 }
 
@@ -196,12 +221,19 @@ enum Section {
         key: usize,
         value: usize,
     },
+    /// Rows whose signature truncation deletes are folded into the digest.
+    Transactions {
+        signature: usize,
+        data: usize,
+    },
     Skip,
 }
 
 /// Read pg_restore's SQL stream and collect the facts `decide` needs.
 fn parse_restore_output<R: BufRead>(mut reader: R, live: &LiveLedger) -> Result<DumpFacts> {
     let mut facts = DumpFacts::default();
+    // Borrowed from the live set, so a repeated row costs no copy of its signature.
+    let mut found: HashSet<&[u8; 64]> = HashSet::new();
     let mut line = Vec::new();
     while read_line_bounded(&mut reader, &mut line)? {
         let Some((table, columns)) = parse_copy_header(&line)? else {
@@ -230,18 +262,28 @@ fn parse_restore_output<R: BufRead>(mut reader: R, live: &LiveLedger) -> Result<
                 key: column("key")?,
                 value: column("value")?,
             },
+            TRANSACTIONS => {
+                let (signature, data) = (column("signature")?, column("data")?);
+                // The signature decides whether data is hashed, so it has to come first.
+                if data < signature {
+                    bail!("{table} in the dump has its data column before its signature");
+                }
+                Section::Transactions { signature, data }
+            }
             _ => Section::Skip,
         };
-        read_copy_rows(&mut reader, &section, &mut facts)?;
+        read_copy_rows(&mut reader, &section, live, &mut found, &mut facts)?;
         facts.tables.insert(table);
     }
     Ok(facts)
 }
 
 /// Read one COPY section's rows up to its `\.` terminator.
-fn read_copy_rows<R: BufRead>(
+fn read_copy_rows<'a, R: BufRead>(
     reader: &mut R,
     section: &Section,
+    live: &'a LiveLedger,
+    found: &mut HashSet<&'a [u8; 64]>,
     facts: &mut DumpFacts,
 ) -> Result<()> {
     loop {
@@ -293,7 +335,37 @@ fn read_copy_rows<R: BufRead>(
                     if facts.deployment_id.is_some() {
                         bail!("the dump holds more than one deployment_id");
                     }
-                    facts.deployment_id = Some(decode_bytea(raw_value)?);
+                    facts.deployment_id = Some(decode_bytea(raw_value, "deployment_id")?);
+                }
+            }
+            Section::Transactions { signature, data } => {
+                let raw = if *signature == 0 {
+                    first
+                } else {
+                    skip_fields(reader, &mut ended, *signature - 1, TRANSACTIONS)?;
+                    expect_more(ended, TRANSACTIONS)?;
+                    let (raw, row_ended) = next_field(reader, Some(256))?;
+                    ended = row_ended;
+                    raw
+                };
+                let key: [u8; 64] = decode_bytea(&raw, "a transaction signature")?
+                    .try_into()
+                    .map_err(|_| anyhow!("a transaction signature in the dump is not 64 bytes"))?;
+                if let Some((key, expected)) = live.transactions.get_key_value(&key) {
+                    if !found.insert(key) {
+                        bail!("the dump holds a transaction row more than once");
+                    }
+                    skip_fields(reader, &mut ended, *data - *signature - 1, TRANSACTIONS)?;
+                    expect_more(ended, TRANSACTIONS)?;
+                    let mut hasher = Sha256::new();
+                    ended = hash_bytea_field(reader, &mut hasher)?;
+                    if hasher.finalize().as_slice() != expected {
+                        bail!(
+                            "the dump's transaction {} differs from the live row",
+                            hex::encode(&key[..8])
+                        );
+                    }
+                    facts.transactions_found += 1;
                 }
             }
         }
@@ -302,6 +374,72 @@ fn read_copy_rows<R: BufRead>(
                 .skip_until(b'\n')
                 .context("Failed to read the restore output")?;
         }
+    }
+}
+
+/// Consume `count` fields without keeping them.
+fn skip_fields<R: BufRead>(
+    reader: &mut R,
+    ended: &mut bool,
+    count: usize,
+    table: &str,
+) -> Result<()> {
+    for _ in 0..count {
+        expect_more(*ended, table)?;
+        *ended = next_field(reader, None)?.1;
+    }
+    Ok(())
+}
+
+/// Stream one hex-format bytea field into `hasher` without buffering it. Returns whether
+/// the field ended the row.
+fn hash_bytea_field<R: BufRead>(reader: &mut R, hasher: &mut Sha256) -> Result<bool> {
+    // COPY doubles the backslash of bytea's `\x` prefix.
+    const PREFIX: &[u8] = b"\\\\x";
+    let mut matched = 0;
+    let mut high: Option<u8> = None;
+    let mut decoded = Vec::with_capacity(MAX_LINE / 2);
+    loop {
+        let available = reader
+            .fill_buf()
+            .context("Failed to read the restore output")?;
+        if available.is_empty() {
+            bail!("the restore output ended inside a COPY section");
+        }
+        let end = available.iter().position(|&b| b == b'\t' || b == b'\n');
+        let take = end.unwrap_or(available.len());
+        decoded.clear();
+        for &b in &available[..take] {
+            if matched < PREFIX.len() {
+                if b != PREFIX[matched] {
+                    bail!("transaction data in the dump is not hex-format bytea");
+                }
+                matched += 1;
+                continue;
+            }
+            let nibble = (b as char)
+                .to_digit(16)
+                .ok_or_else(|| anyhow!("transaction data in the dump is not valid hex"))?
+                as u8;
+            match high.take() {
+                Some(h) => decoded.push(h << 4 | nibble),
+                None => high = Some(nibble),
+            }
+        }
+        hasher.update(&decoded);
+        let Some(i) = end else {
+            reader.consume(take);
+            continue;
+        };
+        let row_ended = available[i] == b'\n';
+        reader.consume(i + 1);
+        if matched < PREFIX.len() {
+            bail!("transaction data in the dump is not hex-format bytea");
+        }
+        if high.is_some() {
+            bail!("transaction data in the dump is not valid hex");
+        }
+        return Ok(row_ended);
     }
 }
 
@@ -417,12 +555,12 @@ fn unescape_copy(raw: &[u8]) -> Result<Option<Vec<u8>>> {
 }
 
 /// A hex-format bytea field. Escape format is refused rather than guessed at.
-fn decode_bytea(raw: &[u8]) -> Result<Vec<u8>> {
-    let text = unescape_copy(raw)?.ok_or_else(|| anyhow!("deployment_id in the dump is NULL"))?;
+fn decode_bytea(raw: &[u8], what: &str) -> Result<Vec<u8>> {
+    let text = unescape_copy(raw)?.ok_or_else(|| anyhow!("{what} in the dump is NULL"))?;
     let hex_digits = text
         .strip_prefix(b"\\x")
-        .ok_or_else(|| anyhow!("deployment_id in the dump is not hex-format bytea"))?;
-    hex::decode(hex_digits).context("deployment_id in the dump is not valid hex")
+        .ok_or_else(|| anyhow!("{what} in the dump is not hex-format bytea"))?;
+    hex::decode(hex_digits).with_context(|| format!("{what} in the dump is not valid hex"))
 }
 
 #[cfg(test)]
@@ -431,6 +569,13 @@ mod tests {
     use std::io::Cursor;
 
     const ID_HEX: &str = "0102ff";
+    /// The one transaction row in the deleted range; a second, kept row uses `[2; 64]`.
+    const DOOMED_SIG: [u8; 64] = [1; 64];
+    const DOOMED_DATA: &[u8] = &[0xaa, 0xbb];
+
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data).into()
+    }
 
     /// pg_restore's SQL for a small ledger: blocks 1..=5, one account_history row per slot.
     fn restore_sql(extra_metadata: &str) -> String {
@@ -440,12 +585,15 @@ mod tests {
              COPY public.accounts (pubkey, data) FROM stdin;\n\\\\x01\t\\\\x02\n\\.\n\n\
              COPY public.blocks (slot, data) FROM stdin;\n\
              1\t\\\\x0a\n2\t\\\\x0b\n3\t\\\\x0c\n4\t\\\\x0d\n5\t\\\\x0e\n\\.\n\n\
-             COPY public.transactions (signature, data) FROM stdin;\n\\\\x01\t\\\\x01\n\\.\n\n\
+             COPY public.transactions (signature, data) FROM stdin;\n\
+             \\\\x{doomed}\t\\\\xaabb\n\\\\x{kept}\t\\\\x01\n\\.\n\n\
              COPY public.account_history (id, slot, data) FROM stdin;\n\
              1\t1\t\\\\x01\n2\t2\t\\\\x02\n3\t3\t\\\\x03\n\\.\n\n\
              COPY public.metadata (key, value) FROM stdin;\n\
              deployment_id\t\\\\x{ID_HEX}\nk\\\\tx\t\\\\x00\n{extra_metadata}\\.\n\n\
-             ALTER TABLE ONLY public.blocks\n    ADD CONSTRAINT blocks_pkey PRIMARY KEY (slot);\n"
+             ALTER TABLE ONLY public.blocks\n    ADD CONSTRAINT blocks_pkey PRIMARY KEY (slot);\n",
+            doomed = hex::encode(DOOMED_SIG),
+            kept = hex::encode([2u8; 64]),
         )
     }
 
@@ -465,6 +613,7 @@ mod tests {
             live_block_count: block_count,
             account_history_count: history,
             account_history_min_slot: 1,
+            transactions: HashMap::from([(DOOMED_SIG, sha256(DOOMED_DATA))]),
         }
     }
 
@@ -526,6 +675,37 @@ mod tests {
                 "over",
             ),
             (
+                "duplicate transaction row",
+                restore_sql("").replace(
+                    "\\\\x01\n\\.",
+                    &format!("\\\\x01\n\\\\x{}\t\\\\xaabb\n\\.", hex::encode(DOOMED_SIG)),
+                ),
+                "more than once",
+            ),
+            (
+                "transaction data before its signature",
+                restore_sql("").replace(
+                    "public.transactions (signature, data)",
+                    "public.transactions (data, signature)",
+                ),
+                "before",
+            ),
+            (
+                "short transaction signature",
+                restore_sql("").replace(&hex::encode([2u8; 64]), "02"),
+                "64 bytes",
+            ),
+            (
+                "NULL transaction data",
+                restore_sql("").replace("\\\\xaabb", "\\N"),
+                "not hex-format",
+            ),
+            (
+                "odd transaction data",
+                restore_sql("").replace("\\\\xaabb", "\\\\xaab"),
+                "not valid hex",
+            ),
+            (
                 "output ends inside a section",
                 "COPY public.blocks (slot, data) FROM stdin;\n1\t\\\\x0a\n".to_string(),
                 "ended inside",
@@ -561,6 +741,37 @@ mod tests {
         let mut other = live(2, Some(2));
         other.deployment_id = vec![9];
         assert!(decide(&facts, &other).is_err(), "another ledger");
+    }
+
+    #[test]
+    fn transactions_must_match_the_rows_truncation_deletes() {
+        let facts = parse(&restore_sql(""), 3, 1).unwrap();
+        assert_eq!(facts.transactions_found, 1, "the kept row is not counted");
+        assert!(decide(&facts, &live(2, Some(2))).is_ok());
+
+        let mut wider = live(2, Some(2));
+        wider.transactions.insert([3; 64], sha256(b"x"));
+        let sql = restore_sql("");
+        let facts = parse_restore_output(Cursor::new(sql.into_bytes()), &wider).unwrap();
+        let err = decide(&facts, &wider).unwrap_err().to_string();
+        assert!(
+            err.contains("1 of the 2 transactions"),
+            "missing row: {err}"
+        );
+
+        let altered = restore_sql("").replace("\\\\xaabb", "\\\\xaabc");
+        let err = parse(&altered, 3, 1).unwrap_err().to_string();
+        assert!(
+            err.contains("differs from the live row"),
+            "altered data: {err}"
+        );
+    }
+
+    #[test]
+    fn transaction_signature_cap() {
+        assert!(check_transaction_cap(MAX_TRANSACTION_SIGNATURES).is_ok());
+        let err = check_transaction_cap(MAX_TRANSACTION_SIGNATURES + 1).unwrap_err();
+        assert!(err.to_string().contains("keep more slots"), "{err}");
     }
 
     /// A reader that yields one `blocks` row of `len` bytes without ever holding it.

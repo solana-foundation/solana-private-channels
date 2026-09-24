@@ -1,15 +1,16 @@
 use {
     super::{
-        pg_dump_proof::{prove_dump, LiveLedger},
+        pg_dump_proof::{check_transaction_cap, prove_dump, LiveLedger},
         postgres::PostgresAccountsDB,
         redis_coherence::read_deployment_id,
         traits::BlockInfo,
     },
     crate::accounts::address_index_watermark::ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
     anyhow::{anyhow, Context, Result},
+    sha2::{Digest, Sha256},
     sqlx::{Connection, Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row},
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         path::{Path, PathBuf},
     },
     tracing::error,
@@ -182,6 +183,7 @@ async fn truncate_slots_inner(
 
     // Taken after T is fixed: rows written during the proof land at or above T and are
     // never deleted. Blocks land in slot order, so nothing new can appear below T.
+    let transactions = live_doomed_transactions(pool, truncate_before_slot).await?;
     let live = LiveLedger {
         deployment_id: read_deployment_id(db).await?,
         truncate_before_slot,
@@ -193,6 +195,7 @@ async fn truncate_slots_inner(
         } else {
             0
         },
+        transactions,
     };
     let dump_path = options.pg_dump_path.clone();
     let pg_restore_bin = options.pg_restore_bin.clone();
@@ -541,6 +544,67 @@ fn verify_backup(
     }
 }
 
+/// Blocks, then transaction rows, read per query when collecting what truncation deletes.
+const LIVE_SCAN_BLOCKS: i64 = 1_000;
+const LIVE_SCAN_TRANSACTIONS: usize = 1_000;
+
+/// The transaction rows truncation deletes (named by a block below the cut, and present),
+/// as signature to SHA-256 of data. Rows are immutable once written, so a hash is stable.
+async fn live_doomed_transactions(
+    pool: &PgPool,
+    truncate_before_slot: u64,
+) -> Result<HashMap<[u8; 64], [u8; 32]>> {
+    let mut transactions = HashMap::new();
+    let mut after_slot = -1_i64;
+    loop {
+        let blocks = sqlx::query(
+            "SELECT slot, data FROM blocks WHERE slot < $1 AND slot > $2 ORDER BY slot LIMIT $3",
+        )
+        .bind(truncate_before_slot as i64)
+        .bind(after_slot)
+        .bind(LIVE_SCAN_BLOCKS)
+        .fetch_all(pool)
+        .await
+        .context("Failed to fetch blocks for the dump proof")?;
+        let Some(last) = blocks.last() else {
+            break;
+        };
+        after_slot = last.get("slot");
+
+        let mut named = Vec::new();
+        for row in blocks {
+            let slot: i64 = row.get("slot");
+            let block: BlockInfo = bincode::deserialize(row.get::<&[u8], _>("data"))
+                .with_context(|| format!("Failed to deserialize block at slot {slot}"))?;
+            named.extend(
+                block
+                    .transaction_signatures
+                    .iter()
+                    .map(|s| s.as_ref().to_vec()),
+            );
+        }
+        for chunk in named.chunks(LIVE_SCAN_TRANSACTIONS) {
+            let rows =
+                sqlx::query("SELECT signature, data FROM transactions WHERE signature = ANY($1)")
+                    .bind(chunk)
+                    .fetch_all(pool)
+                    .await
+                    .context("Failed to fetch transactions for the dump proof")?;
+            for row in rows {
+                let key: [u8; 64] = row
+                    .get::<&[u8], _>("signature")
+                    .try_into()
+                    .map_err(|_| anyhow!("a live transaction signature is not 64 bytes"))?;
+                transactions
+                    .entry(key)
+                    .or_insert_with(|| Sha256::digest(row.get::<&[u8], _>("data")).into());
+            }
+            check_transaction_cap(transactions.len())?;
+        }
+    }
+    Ok(transactions)
+}
+
 async fn count_blocks_before(pool: &PgPool, truncate_before_slot: u64) -> Result<u64> {
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM blocks WHERE slot < $1")
         .bind(truncate_before_slot as i64)
@@ -625,6 +689,7 @@ mod tests {
             live_block_count: 10,
             account_history_count: None,
             account_history_min_slot: 0,
+            transactions: Default::default(),
         };
         let check = verify_backup(None, Path::new("pg_restore"), &live);
         assert!(!check.has_valid_backup());
@@ -728,16 +793,21 @@ mod tests {
             .map(|slot| slot as u64)
     }
 
-    /// Make one block undeserializable so the batch loop aborts at a known slot.
-    async fn corrupt_block_data(pool: &PgPool, slot: u64) {
-        let updated = sqlx::query("UPDATE blocks SET data = $2 WHERE slot = $1")
-            .bind(slot as i64)
-            .bind(b"not-a-block".to_vec())
-            .execute(pool)
-            .await
-            .unwrap()
-            .rows_affected();
-        assert_eq!(updated, 1, "expected to corrupt exactly one block");
+    /// Make deleting one block fail so the batch loop aborts at a known slot. A corrupt
+    /// block would not do: the proof decodes every doomed block before anything is deleted.
+    async fn pin_block(pool: &PgPool, slot: u64) {
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION refuse_pinned_delete() RETURNS trigger AS $$
+             BEGIN
+                 IF OLD.slot = {slot} THEN RAISE EXCEPTION 'slot {slot} is pinned'; END IF;
+                 RETURN OLD;
+             END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER pin_block BEFORE DELETE ON blocks
+                 FOR EACH ROW EXECUTE FUNCTION refuse_pinned_delete();"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     /// Run one truncation against a pool of its own and prove the lock is gone
@@ -969,16 +1039,16 @@ mod tests {
         assert_eq!(first.truncate_before_slot, Some(10));
         assert_eq!(read_floor_metadata(&db.pool).await, Some(10));
 
-        corrupt_block_data(&db.pool, 20).await;
+        pin_block(&db.pool, 20).await;
 
         // Batches of 3 delete slots 10-12 and 13-15, then abort on slot 20.
         let aborted =
             truncate_on_fresh_pool(&url, &apply_opts(5, 3, dump.path(), &restore), &db.pool).await;
-        assert!(aborted.is_err(), "run must abort on the corrupt block");
+        assert!(aborted.is_err(), "run must abort on the pinned block");
         assert!(aborted
             .unwrap_err()
             .to_string()
-            .contains("Failed to deserialize block at slot 20"));
+            .contains("Failed to delete old blocks"));
 
         assert_eq!(min_block_slot(&db.pool).await, Some(20));
         assert_eq!(

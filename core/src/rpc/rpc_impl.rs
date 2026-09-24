@@ -32,6 +32,7 @@ use {
             simulate_transaction_impl::simulate_transaction,
         },
         stage_metrics::SharedMetrics,
+        stages::BlockhashProgress,
     },
     jsonrpsee::core::{async_trait, RpcResult},
     serde_json::Value,
@@ -76,6 +77,8 @@ pub struct WriteDeps {
     pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
     /// The slot the settler last published, kept in memory so isBlockhashValid never uses the DB pool.
     pub settled_slot: Arc<AtomicU64>,
+    /// Lets isBlockhashValid tell a window still ingesting settled hashes from an absent hash.
+    pub blockhash_progress: Arc<BlockhashProgress>,
 }
 
 /// RPC implementation for PrivateChannel

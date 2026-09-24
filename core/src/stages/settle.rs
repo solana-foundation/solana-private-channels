@@ -11,7 +11,7 @@ use {
         },
         nodes::node::WorkerHandle,
         stage_metrics::SharedMetrics,
-        stages::{AddressSignatureBatch, WeightBudget, MAX_QUEUED_ADDRESS_ROWS},
+        stages::{AddressSignatureBatch, BlockhashProgress, WeightBudget, MAX_QUEUED_ADDRESS_ROWS},
     },
     anyhow::{anyhow, Context, Result},
     redis::AsyncCommands,
@@ -365,6 +365,8 @@ struct BlockPublishers<'a> {
     /// Advances the dedup window. Until dedup holds the hash, transactions
     /// built on it are dropped. Bounded to dedup's window.
     blockhashes: &'a mpsc::Sender<Hash>,
+    /// Counts each block once before its commit, so RPC can tell dedup is behind.
+    blockhash_progress: &'a BlockhashProgress,
     /// Acks the commit to BOB, which unpins the settled accounts. A merge into
     /// an inbox rather than a send, so it never waits on BOB.
     accounts: &'a SettledInbox,
@@ -517,6 +519,7 @@ pub struct SettleArgs {
     pub writer_epoch: Option<u64>,
     /// The slot last published to the DB, read by isBlockhashValid for its context.
     pub settled_slot: Arc<AtomicU64>,
+    pub blockhash_progress: Arc<BlockhashProgress>,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -536,6 +539,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         heartbeat,
         writer_epoch,
         settled_slot,
+        blockhash_progress,
     } = args;
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
@@ -555,6 +559,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             heartbeat: Arc<crate::health::StageHeartbeat>,
             writer_epoch: Option<u64>,
             settled_slot: Arc<AtomicU64>,
+            blockhash_progress: Arc<BlockhashProgress>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -815,6 +820,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             &metrics,
                             Some(BlockPublishers {
                                 blockhashes: &settled_blockhashes_tx,
+                                blockhash_progress: &blockhash_progress,
                                 accounts: &settled_accounts_tx,
                                 address_signatures: &address_signatures_tx,
                                 rows_budget: &rows_budget,
@@ -995,6 +1001,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                     &metrics,
                     Some(BlockPublishers {
                         blockhashes: &settled_blockhashes_tx,
+                        blockhash_progress: &blockhash_progress,
                         accounts: &settled_accounts_tx,
                         address_signatures: &address_signatures_tx,
                         rows_budget: &rows_budget,
@@ -1057,6 +1064,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             heartbeat,
             writer_epoch,
             settled_slot,
+            blockhash_progress,
         )
         .await
         {
@@ -1143,6 +1151,15 @@ async fn settle_with_retry(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+
+    // Once per block, not per attempt: every attempt rebuilds the same hash. A block
+    // that never commits fails the settler, so the count cannot stay ahead on a live node.
+    if let Some(publishers) = publishers {
+        publishers
+            .blockhash_progress
+            .announced
+            .fetch_add(1, Ordering::SeqCst);
+    }
 
     let has_work = !processing_results.is_empty();
     let mut backoff = SETTLE_RETRY_BACKOFF_BASE;
@@ -1810,6 +1827,7 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &blockhashes_tx,
+                blockhash_progress: &BlockhashProgress::default(),
                 accounts: inbox,
                 address_signatures: &address_signatures_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -2141,6 +2159,7 @@ mod tests {
             heartbeat: Arc::clone(&heartbeat),
             writer_epoch,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
         (
@@ -2814,6 +2833,7 @@ mod tests {
             heartbeat: Arc::clone(&heartbeat),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -2871,6 +2891,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::clone(&settled_slot),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -2893,6 +2914,62 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        shutdown.cancel();
+    }
+
+    /// isBlockhashValid reads a missing hash as catching up only while announced leads,
+    /// so a block is counted once and before its hash is readable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settler_announces_a_blockhash_before_it_is_readable() {
+        let (db, _pg) = start_test_postgres().await;
+        let url = crate::test_helpers::postgres_container_url(&_pg, "test_db").await;
+        let shutdown = CancellationToken::new();
+
+        let (_exec_tx, exec_rx) = mpsc::channel(1);
+        // A full queue parks the settler on its first send, right after the commit.
+        let (settled_blockhashes_tx, mut bh_rx) = mpsc::channel(1);
+        let filler = Hash::new_unique();
+        settled_blockhashes_tx.try_send(filler).unwrap();
+        let (address_signatures_tx, _as_rx) = mpsc::channel(64);
+        let progress = Arc::new(BlockhashProgress::default());
+        let _handle = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx: SettledInbox::new(),
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url: url,
+            redis_cache_url: None,
+            redis_block_ttl_secs: 0,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
+            settled_slot: Arc::default(),
+            blockhash_progress: Arc::clone(&progress),
+        })
+        .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let committed = loop {
+            if let Ok(hash) = db.get_latest_blockhash().await {
+                break hash;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "settler must commit the genesis block"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            progress.announced.load(Ordering::Acquire),
+            1,
+            "the block is counted once, before its hash is readable"
+        );
+        assert_eq!(bh_rx.recv().await, Some(filler));
+        assert_eq!(bh_rx.recv().await, Some(committed));
         shutdown.cancel();
     }
 
@@ -3381,6 +3458,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -5050,6 +5128,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -5103,6 +5182,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -5164,6 +5244,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -5294,6 +5375,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -6242,6 +6324,7 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &blockhashes_tx,
+                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &accounts_tx,
                     address_signatures: &address_signatures_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -6334,6 +6417,7 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &blockhashes_tx,
+                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &accounts_tx,
                     address_signatures: &address_signatures_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7047,6 +7131,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -7147,6 +7232,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -7443,6 +7529,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -7509,6 +7596,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -7585,6 +7673,7 @@ mod tests {
             &metrics,
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
+                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &budget,
@@ -7652,6 +7741,7 @@ mod tests {
                 &metrics,
                 Some(BlockPublishers {
                     blockhashes: &settled_blockhashes_tx,
+                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &budget,
@@ -7723,6 +7813,7 @@ mod tests {
                 &metrics,
                 Some(BlockPublishers {
                     blockhashes: &settled_blockhashes_tx,
+                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7796,6 +7887,7 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &parked_tx,
+                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7851,6 +7943,7 @@ mod tests {
                 &(Arc::new(NoopMetrics) as SharedMetrics),
                 Some(BlockPublishers {
                     blockhashes: &blockhashes_tx,
+                    blockhash_progress: &BlockhashProgress::default(),
                     accounts: &settled_accounts_tx,
                     address_signatures: &addr_sig_tx,
                     rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7891,6 +7984,7 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
+                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7930,6 +8024,7 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
+                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -7978,6 +8073,7 @@ mod tests {
             &(Arc::new(NoopMetrics) as SharedMetrics),
             Some(BlockPublishers {
                 blockhashes: &settled_blockhashes_tx,
+                blockhash_progress: &BlockhashProgress::default(),
                 accounts: &settled_accounts_tx,
                 address_signatures: &addr_sig_tx,
                 rows_budget: &WeightBudget::new(MAX_QUEUED_ADDRESS_ROWS),
@@ -8047,6 +8143,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -8062,6 +8159,7 @@ mod tests {
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -8140,6 +8238,7 @@ mod tests {
             heartbeat: crate::health::StageHeartbeat::new(),
             writer_epoch: None,
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 

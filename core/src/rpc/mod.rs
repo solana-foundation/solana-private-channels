@@ -58,7 +58,10 @@ mod tests {
     };
     use solana_svm::transaction_processing_result::ProcessedTransaction;
     use std::collections::{HashMap, LinkedList};
-    use std::sync::{atomic::AtomicU64, Arc, RwLock};
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    };
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::postgres::Postgres;
 
@@ -102,6 +105,7 @@ mod tests {
             metrics: Arc::new(crate::stage_metrics::NoopMetrics),
             live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
             settled_slot: Arc::new(AtomicU64::new(settled_slot)),
+            blockhash_progress: Arc::default(),
         };
         (deps, rx)
     }
@@ -512,6 +516,55 @@ mod tests {
             is_blockhash_valid_impl::is_blockhash_valid_impl(&deps, "not_a_hash".to_string(), None)
                 .await;
         assert!(result.is_err());
+    }
+
+    /// A hash getLatestBlockhash can already serve may not have reached dedup yet,
+    /// so a lagging window must answer retry, never false.
+    #[tokio::test]
+    async fn is_blockhash_valid_asks_for_retry_while_window_lags() {
+        let (deps, _rx) = make_write_deps(10);
+        deps.blockhash_progress.announced.store(2, Ordering::SeqCst);
+        deps.blockhash_progress.ingested.store(1, Ordering::SeqCst);
+
+        let err = is_blockhash_valid_impl::is_blockhash_valid_impl(
+            &deps,
+            Hash::new_unique().to_string(),
+            None,
+        )
+        .await
+        .expect_err("a lagging window must not answer false");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn is_blockhash_valid_answers_from_a_lagging_window_when_present() {
+        let blockhash = Hash::new_unique();
+        let (deps, _rx) = make_write_deps(10);
+        deps.live_blockhashes.write().unwrap().push_back(blockhash);
+        deps.blockhash_progress.announced.store(2, Ordering::SeqCst);
+        deps.blockhash_progress.ingested.store(1, Ordering::SeqCst);
+
+        let resp =
+            is_blockhash_valid_impl::is_blockhash_valid_impl(&deps, blockhash.to_string(), None)
+                .await
+                .unwrap();
+        assert!(resp.value);
+    }
+
+    #[tokio::test]
+    async fn is_blockhash_valid_answers_false_once_caught_up() {
+        let (deps, _rx) = make_write_deps(10);
+        deps.blockhash_progress.announced.store(2, Ordering::SeqCst);
+        deps.blockhash_progress.ingested.store(2, Ordering::SeqCst);
+
+        let resp = is_blockhash_valid_impl::is_blockhash_valid_impl(
+            &deps,
+            Hash::new_unique().to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!resp.value);
     }
 
     /// Public traffic reaches the writer, so the answer must come from memory, not its pool.

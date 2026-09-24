@@ -194,6 +194,7 @@ mod tests {
             metrics,
             live_blockhashes: Arc::default(),
             settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
         };
         (deps, rx)
     }
