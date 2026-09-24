@@ -4,7 +4,7 @@ use solana_sdk::pubkey::Pubkey;
 
 pub const LOCAL_RPC_URL: &str = "http://localhost:18899";
 pub const DEFAULT_INDEXER_DB_URL: &str =
-    "postgres://private_channel:private_channel_password@localhost:5434/indexer";
+    "postgres://private_channel_indexer:private_channel_password@localhost:5434/indexer";
 pub const INDEXER_DB_ENV_VAR: &str = "TEST_INDEXER_DB_URL";
 
 pub const NUM_USERS: usize = 5;

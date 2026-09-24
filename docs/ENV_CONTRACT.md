@@ -53,11 +53,26 @@ required secrets before the stack starts. It is shared: the Makefile's
 `check-env-*` targets and the Ansible deploy (after rendering `.env`) both run it,
 so a blank secret is caught identically on both surfaces. Currently required:
 
-- `POSTGRES_PASSWORD`
-- `POSTGRES_REPLICATION_PASSWORD`
+- `POSTGRES_PASSWORD` — primary cluster superuser
+- `POSTGRES_REPLICATION_PASSWORD` — streaming replication
+- `POSTGRES_RUNTIME_PASSWORD` — write-node, read-node, streamer
+- `POSTGRES_AUTH_RUNTIME_PASSWORD` — auth service
+- `POSTGRES_AUTH_OWNER_PASSWORD` — auth schema owner; migrations + admin CLI
+- `POSTGRES_GATEWAY_PASSWORD` — gateway; `SELECT` only
+- `POSTGRES_MONITORING_PASSWORD` — postgres_exporter; `pg_monitor` only
+- `POSTGRES_GRAFANA_PASSWORD` — Grafana's datasource; one view only
+- `POSTGRES_INDEXER_PASSWORD` — indexer cluster superuser
+- `GF_ADMIN_PASSWORD` — Grafana's admin login; the literal `admin` is rejected
 
-No working defaults ship for these. Generate values with `openssl rand -hex 32`.
+No working defaults ship for these. Generate each with `openssl rand -hex 32`.
 `JWT_SECRET` is required only when auth/RBAC is enabled (see `.env.example`).
+
+The nine `POSTGRES_*` values must also be **distinct from one another**, which the
+same script enforces. Each names a login with different rights, so reusing one
+hands a compromised service the others' access. The sharp case is
+`POSTGRES_INDEXER_PASSWORD` equal to `POSTGRES_PASSWORD`: the indexer processes
+share a network with `postgres-primary` and the primary's username is in this
+repository, so an equal value lets them authenticate there as superuser.
 
 ## Adding or removing a variable
 

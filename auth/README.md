@@ -7,7 +7,7 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | Variable | Default | Description |
 |---|---|---|
 | `AUTH_PORT` | `8903` | Port to listen on |
-| `AUTH_DATABASE_URL` | — | Postgres connection URL |
+| `AUTH_DATABASE_URL` | — | Postgres connection URL. Connect as `private_channel_auth_runtime`, which may read and write users, challenges and wallets, and nothing else. Creating the schema is `auth-admin migrate`'s job, as its owner. |
 | `JWT_SECRET` | — | HS256 signing secret. Must match the gateway's `JWT_SECRET`. |
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
@@ -165,10 +165,18 @@ Operator-only commands for managing users directly against the auth database.
 
 | Variable | Description |
 |---|---|
-| `AUTH_DATABASE_URL` | Same DB the auth service uses. |
+| `AUTH_DATABASE_URL` | Same DB the auth service uses, but connect as `private_channel_auth_owner` — the login that owns the schema. The service's own login cannot change a role or write the audit trail. |
 | `AUTH_ADMIN_ACTOR` | Who is running the command. Required for `set-role` and `attach-wallet`; recorded in the audit trail. |
 
 Both mutating commands print the target's id, username, current role and creation time and wait for a typed `yes` before proceeding. `--yes` skips the prompt for scripted use.
+
+### Create or update the schema
+
+Runs before the service first starts, and again after any release that changes the tables, triggers or grants. Compose does this in the `auth-migrate` one-shot; run it by hand against a database the deploy does not manage:
+
+```bash
+AUTH_DATABASE_URL=postgres://... cargo run -p auth --bin auth-admin -- migrate
+```
 
 ### Provisioning flow
 
@@ -196,7 +204,7 @@ AUTH_DATABASE_URL=postgres://... AUTH_ADMIN_ACTOR=you@example.com cargo run -p a
 
 ### Audit trail
 
-Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). The `set-role` detail is read by the same statement that performs the update, so it records the role actually replaced.
+Every role change and administrative wallet attach writes a row to `private_channel_auth.admin_audit` in the same transaction as the change itself, recording the actor, action, target user id and detail (`user -> operator`, or the attached pubkey). The `set-role` detail is read by the same statement that performs the update, so it records the role actually replaced. The table is append-only: no application login holds `UPDATE` or `DELETE` on it, and a trigger rejects both even for its owner.
 
 This is the trail of privileged grants — one account acting on another. Self-service wallet changes are not in it: verification proves key ownership before it stores anything, and removal only ever touches the caller's own wallets.
 

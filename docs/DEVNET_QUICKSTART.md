@@ -137,12 +137,29 @@ solana-keygen pubkey operator-keypair.json
 
 Update `.env.devnet` (tracked template) for non-secret values, and put all secrets in the gitignored `.env` in the project root — it is loaded last and overrides the templates. `make build-devnet` writes `ADMIN_PRIVATE_KEY` to `.env` for you.
 
-> **Required secrets — no defaults are shipped.** `POSTGRES_PASSWORD`, `POSTGRES_REPLICATION_PASSWORD`, and `ADMIN_PRIVATE_KEY` (and `JWT_SECRET` if you enable auth) MUST be set or the services fail to start. Generate strong passwords with `openssl rand -hex 32`.
+> **Required secrets — no defaults are shipped.** Every value below MUST be set, and the nine `POSTGRES_*` passwords MUST each be different from one another. `make docker-devnet-up` refuses to start otherwise, naming what is missing or shared. Generate each with `openssl rand -hex 32`.
+>
+> The database passwords are distinct because each names a login with different rights. Reusing one hands a compromised service the others' access — in particular, `POSTGRES_INDEXER_PASSWORD` matching `POSTGRES_PASSWORD` would let the indexer processes authenticate on the primary as superuser.
 
 ```shell
 # Required secrets: put these in the gitignored `.env`, NOT in .env.devnet
-POSTGRES_PASSWORD=<openssl rand -hex 32>
-POSTGRES_REPLICATION_PASSWORD=<openssl rand -hex 32>
+# Each a fresh `openssl rand -hex 32`, all nine different from each other.
+POSTGRES_PASSWORD=<primary cluster superuser>
+POSTGRES_REPLICATION_PASSWORD=<streaming replication>
+POSTGRES_RUNTIME_PASSWORD=<write-node, read-node, streamer>
+POSTGRES_AUTH_RUNTIME_PASSWORD=<auth service>
+POSTGRES_AUTH_OWNER_PASSWORD=<auth schema owner; migrations + admin CLI>
+POSTGRES_GATEWAY_PASSWORD=<gateway; SELECT only>
+POSTGRES_MONITORING_PASSWORD=<postgres_exporter; pg_monitor only>
+POSTGRES_GRAFANA_PASSWORD=<grafana datasource; one view only>
+POSTGRES_INDEXER_PASSWORD=<indexer cluster superuser>
+
+# Grafana's admin login. The literal `admin` is rejected.
+GF_ADMIN_PASSWORD=<openssl rand -hex 32>
+
+# Only when enabling auth (gateway RBAC)
+JWT_SECRET=<openssl rand -hex 32>
+
 # Operator keypair (written to `.env` automatically by `make build-devnet`)
 ADMIN_PRIVATE_KEY=<your_operator_private_key_u8array_or_b58>
 
@@ -216,9 +233,9 @@ For reference, here are the ports and endpoints that are now running:
 | PostgreSQL Indexer | `5434` | Indexer/operator database — bound to `127.0.0.1` (loopback-only), not externally reachable |
 | Operator (Solana) | `9102` | Deposit operator metrics |
 | Operator (channel) | `9103` | Withdrawal operator metrics |
-| Grafana | `37429` | Metrics dashboard (default password: `admin`) |
-| Prometheus | `9090` | Metrics collection |
-| cAdvisor | `8080` | Container metrics |
+| Grafana | `37429` | Metrics dashboard — bound to `127.0.0.1` (loopback-only); set `GF_ADMIN_PASSWORD` before startup |
+| Prometheus | `9090` | Metrics collection — bound to `127.0.0.1` (loopback-only) |
+| cAdvisor | `8080` | Container metrics — bound to `127.0.0.1` (loopback-only) |
 
 ### Node RPC ports and the RBAC boundary
 
