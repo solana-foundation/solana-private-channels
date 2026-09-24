@@ -64,6 +64,18 @@ pub async fn run(
     // resync is dropping.
     storage.init_schema().await?;
 
+    // Taken before the boot pre-flight, not when the sender starts. The pre-flight
+    // completes rows a running sender may be reminting, so a second operator has to
+    // be refused before it gets that far. Held without a gap until the sender exits.
+    let sender_lock = sender::acquire_sender_lock(
+        &storage,
+        common_config.program_type,
+        cancellation_token.clone(),
+        sender::SENDER_LOCK_HEARTBEAT_INTERVAL,
+    )
+    .await
+    .inspect_err(|e| error!("Operator refusing to start: {}", e))?;
+
     // Initialize global RPC client with retry
     let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(
         common_config.rpc_url.clone(),
@@ -164,7 +176,16 @@ pub async fn run(
                 &storage_tx,
                 &cancellation_token,
             )
-            .await;
+            .await
+            // Only a lost sender lock cancels the token this early. Its fenced writes
+            // already failed, but another operator may now own the rows, so stop.
+            .and_then(|()| {
+                if cancellation_token.is_cancelled() {
+                    Err(OperatorError::SenderLockLostAtBoot { program_type })
+                } else {
+                    Ok(())
+                }
+            });
 
             if let Err(e) = preflight {
                 error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
@@ -253,7 +274,7 @@ pub async fn run(
             config.retry_max_attempts,
             config.confirmation_poll_interval_ms,
             sender_source_rpc,
-            sender::SENDER_LOCK_HEARTBEAT_INTERVAL,
+            sender_lock,
         )
         .await
         {
@@ -513,7 +534,9 @@ async fn run_withdraw_preflight(
     // Boot is the only safe window for the pending_remint pass. Once run_sender
     // starts it rehydrates every such row into its in-memory queue and may put a
     // remint in flight; completing one from underneath it would pay the
-    // withdrawal and remint the burn. This returns before the sender is spawned.
+    // withdrawal and remint the burn. This returns before our sender is spawned,
+    // and the sender lock held since startup keeps any other operator's out. The
+    // completion runs on that lock's session, so it cannot land once the lock is lost.
     // Best-effort for the same reason as the reconcile above: validation is the
     // gate, and a transient error here must not crash-loop the operator.
     // Time-bounded because startup waits on it: an unbounded pass over a large

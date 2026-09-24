@@ -31,6 +31,8 @@ pub struct MockStorage {
     pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     /// Storage operation names in call order, for tests that pin read ordering.
     pub call_order: std::sync::Arc<Mutex<Vec<String>>>,
+    /// Per-op latency, for tests that need a write still in flight when a deadline passes.
+    pub delays: std::sync::Arc<Mutex<HashMap<String, std::time::Duration>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
     /// Rows the unpinned reconciliation read answers with; `None` mirrors `mint_balances`.
@@ -125,6 +127,14 @@ impl MockStorage {
             .lock()
             .unwrap()
             .insert(program_type.to_string(), should_fail);
+    }
+
+    /// Make every call to `operation` take `delay` before it applies.
+    pub fn set_delay(&self, operation: &str, delay: std::time::Duration) {
+        self.delays
+            .lock()
+            .unwrap()
+            .insert(operation.to_string(), delay);
     }
 
     /// How many times `operation` has been invoked on this mock.
@@ -1069,6 +1079,15 @@ impl MockStorage {
         counterpart_signature: Option<String>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_complete_stalled_withdrawal")?;
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .get("try_complete_stalled_withdrawal")
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if !matches!(
             from_status,
             TransactionStatus::ManualReview | TransactionStatus::PendingRemint

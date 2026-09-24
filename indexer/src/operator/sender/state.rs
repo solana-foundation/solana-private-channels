@@ -428,10 +428,10 @@ fn report_unrepaired(nonce: u64) {
 /// Completed against it. Anything else leaves the payout real but unattributed,
 /// which a human has to close out.
 ///
-/// The status write only touches rows the operator still owns, so a row that has
-/// already reached a terminal state absorbs the update silently. Those cases are
-/// reported rather than repaired, because claiming a repair that the database
-/// dropped is how a real divergence disappears into an info log.
+/// The completion is a CAS on the row as read before the RPC call, so a row that
+/// moved in the meantime is left alone. Those cases are reported rather than
+/// repaired, because claiming a repair that the database dropped is how a real
+/// divergence disappears into an info log.
 async fn resolve_chain_ahead_nonce(
     storage: &Storage,
     finality: &FinalityRpc<'_>,
@@ -495,68 +495,85 @@ async fn resolve_chain_ahead_nonce(
         }
     };
 
-    // Only a payout attributed to one of our sends is closed by the write below; the rest are left for a human.
-    let attributed = verdict.is_some();
+    // Only a payout attributed to one of our sends is closed here; the rest are left for a human.
+    //
+    // Both CASes pin the `updated_at` read before the RPC call, so a row a replacement
+    // operator moved meanwhile is not completed from under it. The generic status
+    // writer checks neither version nor lock and must not carry this write.
+    if let (Some(sig), true) = (verdict, repairable) {
+        let completed = match row.status {
+            // Fenced on the sender lock: the sender may be reminting this row.
+            TransactionStatus::PendingRemint => {
+                storage
+                    .try_complete_stalled_withdrawal(
+                        row.id,
+                        row.updated_at,
+                        TransactionStatus::PendingRemint,
+                        Some(sig.to_string()),
+                    )
+                    .await
+            }
+            _ => {
+                storage
+                    .try_complete_processing(row.id, row.updated_at, Some(sig.to_string()), None)
+                    .await
+            }
+        };
+        return match completed {
+            Ok(true) => {
+                info!(
+                    nonce,
+                    transaction_id = row.id,
+                    status = ?row.status,
+                    "Consumed nonce matched a landed signature; marked the row Completed"
+                );
+                ChainAheadOutcome::Repaired
+            }
+            outcome => {
+                error!(
+                    nonce,
+                    transaction_id = row.id,
+                    status = ?row.status,
+                    ?outcome,
+                    "Consumed nonce matched a landed signature but the repair did not apply"
+                );
+                report_unrepaired(nonce);
+                ChainAheadOutcome::Unrepaired
+            }
+        };
+    }
 
-    let update = match verdict {
-        Some(sig) if repairable => {
-            info!(
-                nonce,
-                transaction_id = row.id,
-                "Consumed nonce matched a landed signature; marking Completed"
-            );
-            TransactionStatusUpdate {
-                transaction_id: row.id,
-                trace_id: Some(row.trace_id.clone()),
-                status: TransactionStatus::Completed,
-                counterpart_signature: Some(sig.to_string()),
-                processed_at: Some(Utc::now()),
-                error_message: None,
-                remint_signature: None,
-                remint_attempted: false,
-            }
-        }
-        verdict => {
-            let reason = if repairable {
-                format!(
-                    "nonce {nonce} is consumed on-chain but no broadcast signature accounts for it"
-                )
-            } else {
-                format!(
-                    "nonce {nonce} is consumed on-chain but the row is already {:?}, so it cannot be reconciled automatically",
-                    row.status
-                )
-            };
-            error!(
-                nonce,
-                transaction_id = row.id,
-                status = ?row.status,
-                attributed = verdict.is_some(),
-                "Consumed nonce cannot be reconciled; escalating"
-            );
-            TransactionStatusUpdate {
-                transaction_id: row.id,
-                trace_id: Some(row.trace_id.clone()),
-                status: TransactionStatus::ManualReview,
-                counterpart_signature: None,
-                processed_at: Some(Utc::now()),
-                error_message: Some(reason),
-                remint_signature: None,
-                remint_attempted: false,
-            }
-        }
+    let reason = if repairable {
+        format!("nonce {nonce} is consumed on-chain but no broadcast signature accounts for it")
+    } else {
+        format!(
+            "nonce {nonce} is consumed on-chain but the row is already {:?}, so it cannot be reconciled automatically",
+            row.status
+        )
     };
-
+    error!(
+        nonce,
+        transaction_id = row.id,
+        status = ?row.status,
+        attributed = verdict.is_some(),
+        "Consumed nonce cannot be reconciled; escalating"
+    );
+    let update = TransactionStatusUpdate {
+        transaction_id: row.id,
+        trace_id: Some(row.trace_id.clone()),
+        status: TransactionStatus::ManualReview,
+        counterpart_signature: None,
+        processed_at: Some(Utc::now()),
+        error_message: Some(reason),
+        remint_signature: None,
+        remint_attempted: false,
+    };
     send_guaranteed(storage_tx, update, "transaction status update")
         .await
         .ok();
 
-    if repairable && attributed {
-        ChainAheadOutcome::Repaired
-    } else {
-        report_unrepaired(nonce);
-        ChainAheadOutcome::Unrepaired
-    }
+    report_unrepaired(nonce);
+    ChainAheadOutcome::Unrepaired
 }
 
 impl SenderState {
@@ -1633,10 +1650,17 @@ mod tests {
             )
             .create();
 
+        let transaction_id = 7;
         let mock = MockStorage::new();
-        seed_withdrawal(&mock, 7, 2, TransactionStatus::Processing, Some(landed));
+        seed_withdrawal(
+            &mock,
+            transaction_id,
+            2,
+            TransactionStatus::Processing,
+            Some(landed),
+        );
 
-        let state = sender_state_with_storage(&server.url(), mock);
+        let state = sender_state_with_storage(&server.url(), mock.clone());
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
 
         let result = super::validate_bitmap_consistency(
@@ -1649,10 +1673,17 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "chain-ahead must not halt: {result:?}");
-        let update = storage_rx.try_recv().expect("row must be reconciled");
-        assert_eq!(update.transaction_id, 7);
-        assert_eq!(update.status, TransactionStatus::Completed);
-        assert_eq!(update.counterpart_signature, Some(landed.to_string()));
+        assert!(storage_rx.try_recv().is_err(), "the repair is a direct CAS");
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Completed);
+        assert_eq!(row.counterpart_signature, Some(landed.to_string()));
     }
 
     /// Chain ahead with nothing to attribute the payout to: still start, but the
@@ -1739,8 +1770,155 @@ mod tests {
             )
             .create();
 
+        let transaction_id = 7;
+        let nonce = 2;
         let mock = MockStorage::new();
-        seed_withdrawal(&mock, 7, 2, TransactionStatus::Processing, Some(landed));
+        seed_withdrawal(
+            &mock,
+            transaction_id,
+            nonce,
+            TransactionStatus::Processing,
+            Some(landed),
+        );
+
+        let state = sender_state_with_storage(&server.url(), mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            nonce,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, super::ChainAheadOutcome::Repaired),
+            "an attributed payout closes the gap"
+        );
+        assert!(storage_rx.try_recv().is_err(), "the repair is a direct CAS");
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Completed);
+    }
+
+    /// A pending_remint row belongs to the sender, which may be reminting it, so the
+    /// repair must go through the CAS that is fenced on the sender lock rather than the
+    /// unfenced status writer.
+    #[tokio::test]
+    async fn chain_ahead_pending_remint_row_completes_through_the_stalled_cas() {
+        let mut server = mockito::Server::new_async().await;
+        let landed = Signature::new_unique();
+        let _statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "slot": 10,
+                            "confirmations": null,
+                            "err": null,
+                            "status": {"Ok": null},
+                            "confirmationStatus": "finalized"
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let transaction_id = 7;
+        let nonce = 2;
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            transaction_id,
+            nonce,
+            TransactionStatus::PendingRemint,
+            Some(landed),
+        );
+
+        let state = sender_state_with_storage(&server.url(), mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            nonce,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ChainAheadOutcome::Repaired));
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a pending_remint repair must not go through the status writer"
+        );
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::Completed);
+        assert_eq!(row.counterpart_signature, Some(landed.to_string()));
+    }
+
+    /// A repair the database refused is still an unattributed payout, so it must not report as repaired.
+    #[tokio::test]
+    async fn chain_ahead_pending_remint_row_whose_cas_fails_reports_unrepaired() {
+        let mut server = mockito::Server::new_async().await;
+        let landed = Signature::new_unique();
+        let _statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "slot": 10,
+                            "confirmations": null,
+                            "err": null,
+                            "status": {"Ok": null},
+                            "confirmationStatus": "finalized"
+                        }]
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+
+        let nonce = 2;
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            7,
+            nonce,
+            TransactionStatus::PendingRemint,
+            Some(landed),
+        );
+        mock.set_should_fail("try_complete_stalled_withdrawal", true);
 
         let state = sender_state_with_storage(&server.url(), mock);
         let (storage_tx, mut storage_rx) = mpsc::channel(8);
@@ -1749,16 +1927,90 @@ mod tests {
             &state.storage,
             &FinalityRpc::solana(&state.rpc_client, None),
             &storage_tx,
-            2,
+            nonce,
         )
         .await;
 
-        assert!(
-            matches!(outcome, super::ChainAheadOutcome::Repaired),
-            "an attributed payout closes the gap"
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
+        assert!(storage_rx.try_recv().is_err());
+    }
+
+    /// The repair decides on a status read before its RPC call. If this operator's lock
+    /// dies during that call, a replacement can move the row to pending_remint and start
+    /// reminting it, so the stale completion must not land on the row it now sees.
+    #[tokio::test]
+    async fn chain_ahead_processing_row_moved_to_pending_remint_mid_repair_is_not_completed() {
+        let transaction_id = 7;
+        let nonce = 2;
+        let mock = MockStorage::new();
+        seed_withdrawal(
+            &mock,
+            transaction_id,
+            nonce,
+            TransactionStatus::Processing,
+            Some(Signature::new_unique()),
         );
-        let update = storage_rx.try_recv().expect("the row must be completed");
-        assert_eq!(update.status, TransactionStatus::Completed);
+
+        // The replacement's transition lands while our status read is in flight.
+        let replacement = mock.clone();
+        let mut server = mockito::Server::new_async().await;
+        let _statuses = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getSignatureStatuses"
+            })))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                for txn in replacement.pending_transactions.lock().unwrap().iter_mut() {
+                    if txn.id == transaction_id {
+                        txn.status = TransactionStatus::PendingRemint;
+                        txn.updated_at += chrono::Duration::seconds(1);
+                    }
+                }
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "context": {"slot": 100},
+                        "value": [{
+                            "slot": 10,
+                            "confirmations": null,
+                            "err": null,
+                            "status": {"Ok": null},
+                            "confirmationStatus": "finalized"
+                        }]
+                    }
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .create();
+
+        let state = sender_state_with_storage(&server.url(), mock.clone());
+        let (storage_tx, mut storage_rx) = mpsc::channel(8);
+
+        let outcome = super::resolve_chain_ahead_nonce(
+            &state.storage,
+            &FinalityRpc::solana(&state.rpc_client, None),
+            &storage_tx,
+            nonce,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::ChainAheadOutcome::Unrepaired));
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "a boot completion must not go through the status writer"
+        );
+        let row = mock
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|txn| txn.id == transaction_id)
+            .cloned()
+            .expect("seeded row");
+        assert_eq!(row.status, TransactionStatus::PendingRemint);
     }
 
     /// A row that already refunded the burn, whose nonce the chain also records

@@ -1,8 +1,8 @@
 //! Sender singleton advisory lock.
 //!
-//! Target: `run_sender` in `indexer/src/operator/sender/mod.rs`, which acquires
-//! a per-role advisory lock before recovery and refuses to start if another
-//! sender already holds it.
+//! Target: `acquire_sender_lock` in `indexer/src/operator/sender/mod.rs`, which
+//! `operator::run` calls before the boot pre-flight to take a per-role advisory
+//! lock, refusing to start if another sender already holds it.
 //! Binary: `reconciliation_integration` (attached via `#[path]` mod from
 //! `tests/indexer/reconciliation.rs`).
 //!
@@ -15,12 +15,14 @@ use solana_commitment_config::CommitmentLevel;
 use {
     private_channel_indexer::{
         config::{
-            PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
+            OperatorConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         error::OperatorError,
         metrics::OPERATOR_SENDER_LOCK_LOST,
-        operator::{run_sender, sender_lock_key, utils::TransactionBuilder},
+        operator::{
+            self, acquire_sender_lock, run_sender, sender_lock_key, utils::TransactionBuilder,
+        },
         storage::{PostgresDb, Storage},
     },
     private_channel_metrics::MetricLabel,
@@ -93,6 +95,13 @@ fn spawn_sender(
     let sender_token = token.clone();
     let handle = tokio::spawn(async move {
         let (storage_tx, _storage_rx) = mpsc::channel(10);
+        let sender_lock = acquire_sender_lock(
+            &storage,
+            program_type,
+            sender_token.clone(),
+            heartbeat_interval,
+        )
+        .await?;
         run_sender(
             &role_config(program_type),
             CommitmentLevel::Confirmed,
@@ -103,7 +112,7 @@ fn spawn_sender(
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
-            heartbeat_interval,
+            sender_lock,
         )
         .await
     });
@@ -303,5 +312,97 @@ async fn graceful_cancellation_releases_the_lock_without_a_lost_signal() {
     assert!(
         wait_for_lock_available(&url, Duration::from_secs(15), role).await,
         "the lock must be released explicitly on graceful shutdown"
+    );
+}
+
+/// A withdraw operator whose RPC endpoints refuse every connection, so anything past
+/// the startup lock checks surfaces as an RPC failure instead.
+fn withdraw_operator_configs(
+    url: &str,
+    source_rpc_url: Option<String>,
+) -> (PrivateChannelIndexerConfig, OperatorConfig) {
+    let common = PrivateChannelIndexerConfig {
+        program_type: ProgramType::Withdraw,
+        storage_type: StorageType::Postgres,
+        rpc_url: "http://127.0.0.1:1".to_string(),
+        source_rpc_url,
+        fallback_rpc_url: None,
+        postgres: PostgresConfig {
+            database_url: url.to_string(),
+            max_connections: 5,
+        },
+        escrow_instance_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+    };
+    let operator = OperatorConfig {
+        db_poll_interval: Duration::from_secs(60),
+        batch_size: 10,
+        retry_max_attempts: 1,
+        retry_base_delay: Duration::from_secs(1),
+        channel_buffer_size: 10,
+        rpc_commitment: CommitmentLevel::Finalized,
+        alert_webhook_url: None,
+        reconciliation_interval: Duration::from_secs(300),
+        reconciliation_tolerance_bps: 10,
+        reconciliation_webhook_url: None,
+        feepayer_monitor_interval: Duration::from_secs(60),
+        confirmation_poll_interval_ms: DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
+    };
+    (common, operator)
+}
+
+/// The boot pre-flight completes pending_remint rows the running sender may be
+/// reminting, so a second operator must be refused before it gets that far.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_operator_is_refused_before_its_boot_preflight() {
+    let (url, _container) = start_postgres().await;
+    let holder = connect(&url).await;
+    let _held = holder
+        .try_acquire_sender_lock(
+            sender_lock_key(ProgramType::Withdraw),
+            ProgramType::Withdraw.as_label(),
+            CancellationToken::new(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("lock query")
+        .expect("the lock must be free");
+
+    let (common, operator_config) =
+        withdraw_operator_configs(&url, Some("http://127.0.0.1:1".to_string()));
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        operator::run(connect(&url).await, common, operator_config, None),
+    )
+    .await
+    .expect("a refused operator must return promptly");
+
+    assert!(
+        matches!(
+            result,
+            Err(OperatorError::SenderAlreadyRunning {
+                program_type: ProgramType::Withdraw
+            })
+        ),
+        "the second operator must be refused at startup; got {result:?}"
+    );
+}
+
+/// A startup failure after the lock is taken must not strand it, or the restart
+/// that follows would be refused forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_startup_releases_the_sender_lock() {
+    let (url, _container) = start_postgres().await;
+
+    // No source_rpc_url is a withdraw refuse-to-start.
+    let (common, operator_config) = withdraw_operator_configs(&url, None);
+    let result = operator::run(connect(&url).await, common, operator_config, None).await;
+    assert!(
+        matches!(result, Err(OperatorError::RpcError(_))),
+        "startup must fail on the missing source_rpc_url; got {result:?}"
+    );
+
+    assert!(
+        wait_for_lock_available(&url, Duration::from_secs(15), ProgramType::Withdraw).await,
+        "a failed startup must leave the lock free for the restart"
     );
 }

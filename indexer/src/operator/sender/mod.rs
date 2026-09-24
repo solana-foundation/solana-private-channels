@@ -184,7 +184,7 @@ use crate::operator::utils::instruction_util::{
     ExtraErrorCheckPolicy, RetryPolicy, TransactionBuilder,
 };
 use crate::operator::RpcClientWithRetry;
-use crate::storage::common::storage::Storage;
+use crate::storage::common::storage::{sender_lock::SenderLockGuard, Storage};
 use crate::PrivateChannelIndexerConfig;
 use crate::ProgramType;
 use private_channel_metrics::MetricLabel;
@@ -234,6 +234,27 @@ pub fn sender_lock_key(program_type: ProgramType) -> i64 {
     }
 }
 
+/// Become the singleton sender for `program_type`, or refuse because another
+/// process already is. Stops two overlapping operators (e.g. a rolling restart)
+/// from both working the same rows. Taken before the boot pre-flight, which
+/// completes rows a running sender may be reminting.
+pub async fn acquire_sender_lock(
+    storage: &Storage,
+    program_type: ProgramType,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    heartbeat_interval: Duration,
+) -> Result<SenderLockGuard, OperatorError> {
+    storage
+        .try_acquire_sender_lock(
+            sender_lock_key(program_type),
+            program_type.as_label(),
+            cancellation_token,
+            heartbeat_interval,
+        )
+        .await?
+        .ok_or(OperatorError::SenderAlreadyRunning { program_type })
+}
+
 /// Sends transactions to the blockchain and updates their status
 ///
 /// Receives TransactionBuilder (either ReleaseFunds or Mint) from processor,
@@ -249,7 +270,7 @@ pub async fn run_sender(
     retry_max_attempts: u32,
     confirmation_poll_interval_ms: u64,
     source_rpc_client: Option<Arc<RpcClientWithRetry>>,
-    sender_lock_heartbeat_interval: Duration,
+    sender_lock: SenderLockGuard,
 ) -> Result<(), OperatorError> {
     info!("Starting sender");
 
@@ -268,32 +289,14 @@ pub async fn run_sender(
         source_rpc_client,
     )?;
 
-    // Refuse to start if another sender for this role already holds the lock.
-    // Held for the rest of run_sender; released on drop or process crash. Stops
-    // two overlapping senders (e.g. a rolling restart) from both reminting the
-    // same row before either confirms on-chain.
+    // Taken by the caller via `acquire_sender_lock`, held for the rest of
+    // run_sender, released on drop or process crash.
     //
-    // Declared after `state` on purpose. Locals drop in reverse declaration
-    // order, so the guard drops first and the storage Arc carrying the pool is
-    // still alive for the release query. Moving it above `state` would invert
-    // that and must not be done.
-    let _sender_lock = match state
-        .storage
-        .try_acquire_sender_lock(
-            sender_lock_key(config.program_type),
-            config.program_type.as_label(),
-            cancellation_token.clone(),
-            sender_lock_heartbeat_interval,
-        )
-        .await?
-    {
-        Some(guard) => guard,
-        None => {
-            return Err(OperatorError::SenderAlreadyRunning {
-                program_type: config.program_type,
-            });
-        }
-    };
+    // Rebound after `state` on purpose. Parameters drop after locals, and locals
+    // drop in reverse declaration order, so this rebinding makes the guard drop
+    // first while the storage Arc carrying the pool is still alive for the
+    // release query. Moving it above `state` would invert that and must not be done.
+    let _sender_lock = sender_lock;
 
     // Re-hydrate the deferred remint queue from any PendingRemint rows written
     // before a crash. These will be picked up by process_pending_remints on the
@@ -686,7 +689,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
-            SENDER_LOCK_HEARTBEAT_INTERVAL,
+            SenderLockGuard::Noop,
         )
         .await;
 
@@ -720,7 +723,7 @@ mod tests {
             3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             None,
-            SENDER_LOCK_HEARTBEAT_INTERVAL,
+            SenderLockGuard::Noop,
         )
         .await;
 

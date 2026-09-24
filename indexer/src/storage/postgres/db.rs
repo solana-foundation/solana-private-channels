@@ -157,6 +157,41 @@ pub async fn release_advisory_lock(conn: &mut PgConnection, key: i64) -> Result<
     Ok(())
 }
 
+/// Server-side bounds on an unfenced stalled completion, matching the sender lock session's.
+const UNFENCED_COMPLETION_LOCK_TIMEOUT_MS: &str = "3000";
+const UNFENCED_COMPLETION_STATEMENT_TIMEOUT_MS: &str = "5000";
+
+/// The CAS behind `try_complete_stalled_withdrawal_internal`, on whichever session the caller picked.
+async fn complete_stalled_withdrawal(
+    conn: &mut PgConnection,
+    transaction_id: i64,
+    expected_updated_at: chrono::DateTime<chrono::Utc>,
+    from_status: TransactionStatus,
+    counterpart_signature: Option<String>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE transactions
+        SET status = 'completed',
+            counterpart_signature = COALESCE($4, counterpart_signature),
+            processed_at = NOW()
+        WHERE id = $1
+          AND updated_at = $2
+          AND status = $3
+          AND status IN ('manual_review', 'pending_remint')
+          AND transaction_type = 'withdrawal'
+        "#,
+    )
+    .bind(transaction_id)
+    .bind(expected_updated_at)
+    .bind(from_status)
+    .bind(counterpart_signature)
+    .execute(conn)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 // Returns true when the URL parses and its password is absent or empty (a blanked secret).
 // Kept in sync with the identical guard in core's accounts/postgres.rs.
 fn database_url_password_is_blank(database_url: &str) -> bool {
@@ -263,8 +298,10 @@ impl PostgresDb {
     /// ownership; without one it behaves exactly as an unfenced pool write.
     ///
     /// Only ops whose sole production caller is the sender may use this. Routing
-    /// recovery, the processor or the boot pre-flight through here would make a
-    /// dead sender's rows uncleanable, which is the opposite of the intent.
+    /// recovery or the processor through here would make a dead sender's rows
+    /// uncleanable, which is the opposite of the intent. The one exception is the
+    /// boot pre-flight completing a `pending_remint` row: it runs under the lock,
+    /// and a process that loses it exits, so the next boot clears the row.
     async fn run_sender_owned<T, F>(&self, f: F) -> Result<T, sqlx::Error>
     where
         F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
@@ -2086,6 +2123,10 @@ impl PostgresDb {
     /// guard is what stops this from resurrecting a terminal row or stealing a
     /// `processing` row from a live sender, and it belongs in the SQL rather
     /// than resting on every present and future caller binding the right value.
+    ///
+    /// A `pending_remint` row belongs to the sender, which may be reminting it, so
+    /// completing one runs on the sender lock session and fails once the lock is
+    /// gone. `manual_review` has no owner and stays on the pool.
     pub async fn try_complete_stalled_withdrawal_internal(
         &self,
         transaction_id: i64,
@@ -2093,27 +2134,43 @@ impl PostgresDb {
         from_status: TransactionStatus,
         counterpart_signature: Option<String>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE transactions
-            SET status = 'completed',
-                counterpart_signature = COALESCE($4, counterpart_signature),
-                processed_at = NOW()
-            WHERE id = $1
-              AND updated_at = $2
-              AND status = $3
-              AND status IN ('manual_review', 'pending_remint')
-              AND transaction_type = 'withdrawal'
-            "#,
-        )
-        .bind(transaction_id)
-        .bind(expected_updated_at)
-        .bind(from_status)
-        .bind(counterpart_signature)
-        .execute(&self.pool)
-        .await?;
+        if from_status == TransactionStatus::PendingRemint {
+            return self
+                .run_sender_owned(move |conn| {
+                    Box::pin(complete_stalled_withdrawal(
+                        conn,
+                        transaction_id,
+                        expected_updated_at,
+                        from_status,
+                        counterpart_signature,
+                    ))
+                })
+                .await;
+        }
 
-        Ok(result.rows_affected() == 1)
+        // The caller awaits this to its outcome rather than timing it out, since a
+        // dropped future leaves the statement running. So bound it in Postgres:
+        // a row lock someone else holds fails it instead of wedging the sweep.
+        // Transaction-local, so the pooled connection keeps its defaults.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(UNFENCED_COMPLETION_LOCK_TIMEOUT_MS)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(UNFENCED_COMPLETION_STATEMENT_TIMEOUT_MS)
+            .execute(&mut *tx)
+            .await?;
+        let completed = complete_stalled_withdrawal(
+            &mut tx,
+            transaction_id,
+            expected_updated_at,
+            from_status,
+            counterpart_signature,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(completed)
     }
 
     /// Transitions a withdrawal to PendingRemint status, storing the withdrawal

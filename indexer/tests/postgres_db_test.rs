@@ -2363,6 +2363,166 @@ async fn fenced_write_on_a_killed_session_fails_and_does_not_apply(
     Ok(())
 }
 
+/// A booting operator whose lock dies mid-preflight must not complete a pending_remint
+/// row, because the replacement holding the lock may already be reminting it. A
+/// manual_review row has no owner, so its completion must not depend on the lock.
+#[tokio::test]
+async fn completing_a_pending_remint_after_the_lock_is_lost_does_not_apply(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let pending_remint = storage
+        .insert_db_transaction(&make_db_transaction(
+            "boot-pending-remint",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    let manual_review = storage
+        .insert_db_transaction(&make_db_transaction(
+            "boot-manual-review",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    for (id, status) in [
+        (pending_remint, "pending_remint"),
+        (manual_review, "manual_review"),
+    ] {
+        sqlx::query("UPDATE transactions SET status = $2::transaction_status WHERE id = $1")
+            .bind(id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+    }
+
+    let key = sender_lock_key(ProgramType::Withdraw);
+    let _guard = storage
+        .try_acquire_sender_lock(
+            key,
+            "withdraw",
+            CancellationToken::new(),
+            Duration::from_secs(3600),
+        )
+        .await?
+        .expect("the lock must be free");
+
+    let mut killer = pg_connect(&url).await;
+    let pid: i32 = sqlx::query_scalar(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+         AND granted AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(key)
+    .fetch_one(&mut killer)
+    .await?;
+    let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&mut killer)
+        .await?;
+
+    // The replacement takes over the lock before the old preflight gets to write.
+    let replacement = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: url.clone(),
+            max_connections: 2,
+        })
+        .await?,
+    );
+    let _replacement_guard = replacement
+        .try_acquire_sender_lock(key, "withdraw", CancellationToken::new(), Duration::ZERO)
+        .await?
+        .expect("a killed holder must leave the lock free");
+
+    let result = storage
+        .try_complete_stalled_withdrawal(
+            pending_remint,
+            updated_at_of(&pool, pending_remint).await,
+            TransactionStatus::PendingRemint,
+            Some("sig-release-landed".to_string()),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "completing a pending_remint row without the lock must fail, got {result:?}"
+    );
+    assert_eq!(status_of(&pool, pending_remint).await, "pending_remint");
+
+    assert!(
+        storage
+            .try_complete_stalled_withdrawal(
+                manual_review,
+                updated_at_of(&pool, manual_review).await,
+                TransactionStatus::ManualReview,
+                Some("sig-release-landed".to_string()),
+            )
+            .await?,
+        "a manual_review row must still complete without the lock"
+    );
+    assert_eq!(status_of(&pool, manual_review).await, "completed");
+    Ok(())
+}
+
+/// The reconcile sweep awaits every completion to its outcome, so a manual_review
+/// completion stuck behind someone else's row lock must fail on its own rather than
+/// wait forever and wedge recovery, or boot while it holds the sender lock.
+#[tokio::test]
+async fn completing_a_manual_review_row_blocked_on_a_row_lock_fails_instead_of_waiting(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "blocked-manual-review",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'manual_review' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let updated_at = updated_at_of(&pool, id).await;
+
+    // An open transaction holding the row, e.g. an operator investigating it by hand.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT id FROM transactions WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut blocker)
+        .await?;
+
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(15),
+        storage.try_complete_stalled_withdrawal(
+            id,
+            updated_at,
+            TransactionStatus::ManualReview,
+            Some("sig-release-landed".to_string()),
+        ),
+    )
+    .await
+    .expect("a blocked completion must give up on its own, not wait for the row lock");
+    assert!(
+        blocked.is_err(),
+        "a completion that could not take the row lock must fail, got {blocked:?}"
+    );
+    assert_eq!(status_of(&pool, id).await, "manual_review");
+
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+    assert!(
+        storage
+            .try_complete_stalled_withdrawal(
+                id,
+                updated_at,
+                TransactionStatus::ManualReview,
+                Some("sig-release-landed".to_string()),
+            )
+            .await?,
+        "once the lock is gone the completion must apply"
+    );
+    assert_eq!(status_of(&pool, id).await, "completed");
+    Ok(())
+}
+
 /// A constraint violation means the server answered, so it must not read as lock loss.
 #[tokio::test]
 async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
