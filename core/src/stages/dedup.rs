@@ -7,7 +7,10 @@ use {
     solana_sdk::{hash::Hash, transaction::SanitizedTransaction},
     std::{
         collections::{HashMap, HashSet, LinkedList},
-        sync::{Arc, RwLock},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, RwLock,
+        },
     },
     tokio::sync::mpsc,
     tracing::{info, warn},
@@ -24,6 +27,17 @@ pub struct DedupArgs {
     pub initial_dedup_cache: HashMap<Hash, HashSet<Hash>>,
     pub metrics: SharedMetrics,
     pub heartbeat: Arc<StageHeartbeat>,
+    pub blockhash_progress: Arc<BlockhashProgress>,
+}
+
+/// Settled blockhashes counted on both sides of the settler to dedup channel, so
+/// isBlockhashValid can tell a window still catching up from an absent hash.
+#[derive(Debug, Default)]
+pub struct BlockhashProgress {
+    /// Bumped by the settler before the block's hash becomes readable.
+    pub announced: AtomicU64,
+    /// Bumped by dedup once the hash is in the live window.
+    pub ingested: AtomicU64,
 }
 
 /// Bounded ingress queue from RPC into the pipeline; when full it rejects new
@@ -116,6 +130,7 @@ fn ingest_blockhashes(
     live_blockhashes: &RwLock<LinkedList<Hash>>,
     dedup_cache: &mut HashMap<Hash, HashSet<Hash>>,
     max_blockhashes: usize,
+    progress: &BlockhashProgress,
 ) {
     let first = match first.or_else(|| settled_blockhashes_rx.try_recv().ok()) {
         Some(h) => h,
@@ -123,9 +138,13 @@ fn ingest_blockhashes(
     };
     let mut bh_list = live_blockhashes.write().expect("blockhash lock poisoned");
     bh_list.push_back(first);
+    let mut ingested = 1;
     while let Ok(blockhash) = settled_blockhashes_rx.try_recv() {
         bh_list.push_back(blockhash);
+        ingested += 1;
     }
+    // Counted under the lock, so a reader that sees the count also sees the hashes.
+    progress.ingested.fetch_add(ingested, Ordering::Release);
     while bh_list.len() > max_blockhashes {
         if let Some(expired) = bh_list.pop_front() {
             dedup_cache.remove(&expired);
@@ -188,6 +207,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
         initial_dedup_cache,
         metrics,
         heartbeat,
+        blockhash_progress,
     } = args;
 
     let live_blockhashes = Arc::new(RwLock::new(initial_live_blockhashes));
@@ -207,6 +227,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                 &live_blockhashes_clone,
                 &mut dedup_cache,
                 max_blockhashes,
+                &blockhash_progress,
             );
 
             // Exits when the input closes, never on a shutdown signal: waiting on
@@ -230,6 +251,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                 &live_blockhashes_clone,
                                 &mut dedup_cache,
                                 max_blockhashes,
+                                &blockhash_progress,
                             );
                         }
                         None => {
@@ -276,6 +298,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                 &live_blockhashes_clone,
                                 &mut dedup_cache,
                                 max_blockhashes,
+                                &blockhash_progress,
                             );
 
                             if !live_blockhashes_clone.read()
@@ -322,6 +345,7 @@ pub async fn start_dedup(args: DedupArgs) -> (WorkerHandle, Arc<RwLock<LinkedLis
                                                     &live_blockhashes_clone,
                                                     &mut dedup_cache,
                                                     max_blockhashes,
+                                                    &blockhash_progress,
                                                 );
                                                 // Loop back to retry the send.
                                             }
@@ -465,6 +489,7 @@ mod tests {
             initial_dedup_cache: HashMap::new(),
             metrics: Arc::new(NoopMetrics),
             heartbeat: crate::health::StageHeartbeat::new(),
+            blockhash_progress: Arc::default(),
         })
         .await;
 
@@ -666,7 +691,14 @@ mod tests {
             cache.insert(*hash, HashSet::from([Hash::new_unique()]));
             let (_tx, mut rx) = mpsc::channel(1);
             rx.close();
-            ingest_blockhashes(Some(*hash), &mut rx, &live, &mut cache, max_blockhashes);
+            ingest_blockhashes(
+                Some(*hash),
+                &mut rx,
+                &live,
+                &mut cache,
+                max_blockhashes,
+                &BlockhashProgress::default(),
+            );
         }
 
         let window: Vec<Hash> = live.read().unwrap().iter().copied().collect();
@@ -680,6 +712,35 @@ mod tests {
         for kept in &hashes[2..] {
             assert!(cache.contains_key(kept), "a live blockhash keeps its entry");
         }
+    }
+
+    /// isBlockhashValid reads the lag from this counter, so every hash taken in counts once.
+    #[test]
+    fn ingest_counts_each_hash_it_takes_in() {
+        let live = RwLock::new(LinkedList::new());
+        let mut cache: HashMap<Hash, HashSet<Hash>> = HashMap::new();
+        let progress = BlockhashProgress::default();
+        let (tx, mut rx) = mpsc::channel(4);
+
+        ingest_blockhashes(None, &mut rx, &live, &mut cache, 2, &progress);
+        assert_eq!(progress.ingested.load(Ordering::Acquire), 0);
+
+        for _ in 0..3 {
+            tx.try_send(Hash::new_unique()).unwrap();
+        }
+        ingest_blockhashes(
+            Some(Hash::new_unique()),
+            &mut rx,
+            &live,
+            &mut cache,
+            2,
+            &progress,
+        );
+        assert_eq!(
+            progress.ingested.load(Ordering::Acquire),
+            4,
+            "evicted hashes were still taken in"
+        );
     }
 
     /// The bound is the number of live blocks, and block cadence is not an input
@@ -707,7 +768,14 @@ mod tests {
                     tx.try_send(*hash).expect("queue the settled blockhash");
                 }
                 drop(tx);
-                ingest_blockhashes(None, &mut rx, &live, &mut cache, max_blockhashes);
+                ingest_blockhashes(
+                    None,
+                    &mut rx,
+                    &live,
+                    &mut cache,
+                    max_blockhashes,
+                    &BlockhashProgress::default(),
+                );
             }
 
             assert_eq!(
@@ -879,6 +947,7 @@ mod tests {
                 initial_dedup_cache: HashMap::new(),
                 metrics: Arc::new(NoopMetrics),
                 heartbeat: crate::health::StageHeartbeat::new(),
+                blockhash_progress: Arc::default(),
             })
             .await;
         });

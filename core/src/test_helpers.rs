@@ -150,6 +150,55 @@ pub(crate) async fn start_test_postgres_with_url() -> (
     (db, container, url)
 }
 
+/// Dump `db` in custom format from inside its test container, as an operator would.
+#[cfg(test)]
+pub(crate) fn container_pg_dump(
+    container: &testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    db: &str,
+) -> tempfile::NamedTempFile {
+    container_pg_dump_with(container, db, &[])
+}
+
+/// Same, with extra `pg_dump` arguments such as a format or an excluded table.
+#[cfg(test)]
+pub(crate) fn container_pg_dump_with(
+    container: &testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    db: &str,
+    extra: &[&str],
+) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let status = std::process::Command::new("docker")
+        .args(["exec", container.id(), "pg_dump", "-U", "postgres", "-Fc"])
+        .args(extra)
+        .arg(db)
+        .stdout(file.reopen().unwrap())
+        .status()
+        .expect("docker runs pg_dump");
+    assert!(status.success(), "pg_dump failed in the test container");
+    file
+}
+
+/// A `pg_restore` that runs inside the test container, so the host needs no client tools.
+#[cfg(test)]
+pub(crate) fn container_pg_restore_bin(
+    container: &testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+) -> tempfile::TempPath {
+    executable_script(&format!(
+        "#!/bin/sh\nexec docker exec -i {} pg_restore \"$@\"\n",
+        container.id()
+    ))
+}
+
+/// Write `body` to an executable temp file, closed so it can run.
+#[cfg(test)]
+pub(crate) fn executable_script(body: &str) -> tempfile::TempPath {
+    use std::os::unix::fs::PermissionsExt;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), body).unwrap();
+    std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    file.into_temp_path()
+}
+
 /// Synchronously insert `address_signatures` rows that `write_batch` would
 /// otherwise emit asynchronously through the `address_index_writer` worker.
 ///

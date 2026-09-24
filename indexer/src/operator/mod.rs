@@ -8,6 +8,7 @@ pub mod operator;
 pub mod processor;
 pub mod reconciliation;
 pub mod recovery;
+pub mod release_promotion;
 pub mod sender;
 pub mod utils;
 

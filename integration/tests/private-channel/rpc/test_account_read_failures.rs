@@ -19,10 +19,6 @@ use {
     },
     solana_client::nonblocking::rpc_client::RpcClient,
     solana_sdk::{account::AccountSharedData, pubkey::Pubkey},
-    std::{
-        collections::LinkedList,
-        sync::{Arc, RwLock},
-    },
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,
     tokio_util::sync::CancellationToken,
@@ -65,7 +61,6 @@ async fn start_read_only_rpc() -> (
         read_deps: Some(ReadDeps {
             accounts_db: db.clone(),
             admin_keys: vec![],
-            live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
             max_blockhashes: 150,
             simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
         }),

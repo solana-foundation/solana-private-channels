@@ -2,8 +2,8 @@ use crate::config::OperatorConfig;
 use crate::error::{OperatorError, StorageError};
 use crate::metrics;
 use crate::operator::{
-    feepayer_monitor, fetcher, processor, reconciliation, recovery, sender, DbTransactionWriter,
-    RetryConfig, RpcClientWithRetry,
+    feepayer_monitor, fetcher, processor, reconciliation, recovery, release_promotion, sender,
+    DbTransactionWriter, RetryConfig, RpcClientWithRetry,
 };
 use crate::shutdown_utils::{shutdown_operator, stop_signal, StopReason};
 use crate::storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL};
@@ -340,6 +340,21 @@ pub async fn run(
         })
     };
 
+    // Completes released withdrawals on finalized proof. Its own task, not a sender arm,
+    // so a sender blocked in a send cannot hold the rotation gate behind it.
+    let promotion_handle = if program_type == crate::config::ProgramType::Withdraw {
+        let promotion_storage = storage.clone();
+        let promotion_rpc = rpc_client.clone();
+        let promotion_token = cancellation_token.clone();
+        tokio::spawn(release_promotion::run_release_promotion(
+            promotion_storage,
+            promotion_rpc,
+            promotion_token,
+        ))
+    } else {
+        tokio::spawn(async {})
+    };
+
     // Start feepayer balance monitor for escrow operators only.
     // Monitors SOL balance of the feepayer wallet used for ReleaseFunds transactions.
     let feepayer_monitor_handle =
@@ -377,7 +392,8 @@ pub async fn run(
     //
     // The recovery worker is critical: if it dies, stuck-Processing rows stop
     // being recovered, so an unexpected exit must page and restart like the
-    // pipeline stages. Non-critical tasks (reconciliation, feepayer monitor)
+    // pipeline stages. Release promotion is critical for the same reason on the
+    // withdraw role. Non-critical tasks (reconciliation, feepayer monitor)
     // are not watched here.
     //
     // Handles are polled by mutable reference so ownership stays here and
@@ -388,6 +404,9 @@ pub async fn run(
     let mut sender_handle = sender_handle;
     let mut storage_writer_handle = storage_writer_handle;
     let mut recovery_handle = recovery_handle;
+    let mut promotion_handle = promotion_handle;
+    // A JoinHandle panics if polled again after it completed, so remember when select did.
+    let mut promotion_joined = false;
     let pt_label = program_type.as_label();
 
     // Two orderings matter here. `biased;` keeps the stop signal ahead of every task
@@ -412,6 +431,7 @@ pub async fn run(
                             sender_handle.abort_handle(),
                             storage_writer_handle.abort_handle(),
                             recovery_handle.abort_handle(),
+                            promotion_handle.abort_handle(),
                             reconciliation_handle.abort_handle(),
                             feepayer_monitor_handle.abort_handle(),
                         ],
@@ -439,6 +459,10 @@ pub async fn run(
         _ = &mut recovery_handle => {
             critical_exit(pt_label, "recovery");
         }
+        _ = &mut promotion_handle, if program_type == crate::config::ProgramType::Withdraw => {
+            promotion_joined = true;
+            critical_exit(pt_label, "release_promotion");
+        }
     }
 
     // A critical task dying and the lock going are one failure when the database is what
@@ -453,6 +477,7 @@ pub async fn run(
                 sender_handle.abort_handle(),
                 storage_writer_handle.abort_handle(),
                 recovery_handle.abort_handle(),
+                promotion_handle.abort_handle(),
                 reconciliation_handle.abort_handle(),
                 feepayer_monitor_handle.abort_handle(),
             ],
@@ -479,6 +504,12 @@ pub async fn run(
     )
     .await
     .map_err(|_| OperatorError::ShutdownChannelSend)?;
+    // Already cancelled by shutdown_operator; this only waits out the pass in progress.
+    if !promotion_joined {
+        if let Err(e) = promotion_handle.await {
+            error!("Release promotion join error during shutdown: {}", e);
+        }
+    }
 
     info!("Operator shutdown complete");
     Ok(())
