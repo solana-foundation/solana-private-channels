@@ -1093,16 +1093,14 @@ impl PostgresDb {
             .bind(program.owned_transaction_type())
             .execute(&mut *tx)
             .await?;
-        match program {
-            ProgramType::Escrow => {
-                sqlx::query("DELETE FROM mints").execute(&mut *tx).await?;
-            }
-            // Every withdrawal row is gone, so the rebuild numbers them from 0 like a fresh schema.
-            ProgramType::Withdraw => {
-                sqlx::query("SELECT setval('withdrawal_nonce_seq', 0, false)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
+        // `mints` is kept: withdrawals survive an escrow resync, and reconciliation only sees
+        // mints listed there. The rebuild upserts rows and replays status changes after genesis.
+        if program == ProgramType::Withdraw {
+            // Every withdrawal row is gone, so nonces restart at 0. RESTART is transactional,
+            // unlike setval, so a wipe that rolls back leaves the sequence where it was.
+            sqlx::query("ALTER SEQUENCE withdrawal_nonce_seq RESTART WITH 0")
+                .execute(&mut *tx)
+                .await?;
         }
         sqlx::query("DELETE FROM indexer_state WHERE program_type = $1")
             .bind(&key)

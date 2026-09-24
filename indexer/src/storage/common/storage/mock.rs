@@ -170,7 +170,7 @@ impl MockStorage {
         Ok(())
     }
 
-    /// Same rules as the Postgres wipe: own-type rows, escrow mints, own checkpoint, marker and halt.
+    /// Same rules as the Postgres wipe: own-type rows, own checkpoint, marker and halt.
     pub fn wipe_program(&self, program: crate::config::ProgramType) -> Result<(), StorageError> {
         self.check_should_fail("wipe_program")?;
         let key = crate::indexer::checkpoint::program_key(program);
@@ -197,9 +197,6 @@ impl MockStorage {
             .lock()
             .unwrap()
             .retain(|t| t.transaction_type != own);
-        if program == crate::config::ProgramType::Escrow {
-            self.mints.lock().unwrap().clear();
-        }
         self.committed_checkpoints.lock().unwrap().remove(&key);
         Ok(())
     }

@@ -3175,8 +3175,11 @@ async fn escrow_wipe_keeps_withdrawal_side() -> Result<(), Box<dyn std::error::E
     assert_eq!(side_fingerprint(&pool, "withdrawal").await, withdrawals);
     assert_eq!(
         side_fingerprint(&pool, "deposit").await,
-        vec!["checkpoint=None".to_string(), "mints=[]".to_string()],
-        "deposits, their journals, mints and the escrow checkpoint must be gone"
+        vec![
+            "checkpoint=None".to_string(),
+            "mints=[\"mint_addr\"]".to_string()
+        ],
+        "deposits, their journals and the escrow checkpoint go; mints stay"
     );
     let orphans: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pending_release_signatures WHERE signature = 'dep-done-attempt'",
@@ -3297,6 +3300,52 @@ async fn blocked_wipe_leaves_no_marker_and_no_deletes() -> Result<(), Box<dyn st
         "a rolled-back wipe must not leave a marker"
     );
     assert_eq!(active_halt(&pool).await, None, "nor a halt");
+    Ok(())
+}
+
+/// P4b. A withdraw wipe that fails after resetting the nonce sequence must leave the sequence
+/// where it was, or the next withdrawal would reuse a nonce the kept rows still hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_withdraw_wipe_keeps_the_nonce_sequence() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    seed_both_sides(&pool, &storage).await?;
+    let withdrawals = side_fingerprint(&pool, "withdrawal").await;
+    let highest: i64 = sqlx::query_scalar(
+        "SELECT MAX(withdrawal_nonce) FROM transactions WHERE transaction_type = 'withdrawal'",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p4b_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    // The checkpoint delete comes after the reset; a row lock makes it hit lock_timeout.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT 1 FROM indexer_state WHERE program_type = 'withdraw' FOR UPDATE")
+        .execute(&mut blocker)
+        .await?;
+    let blocked = storage
+        .wipe_program_fenced(&guard, ProgramType::Withdraw)
+        .await;
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+
+    assert!(blocked.is_err(), "the wipe must fail, got {blocked:?}");
+    assert_eq!(side_fingerprint(&pool, "withdrawal").await, withdrawals);
+    assert_eq!(marker(&pool).await, None);
+    assert_eq!(active_halt(&pool).await, None);
+    let next: i64 = sqlx::query_scalar("SELECT nextval('withdrawal_nonce_seq')")
+        .fetch_one(&pool)
+        .await?;
+    assert!(
+        next > highest,
+        "the rolled-back wipe reset the sequence: next {next}, highest kept nonce {highest}"
+    );
     Ok(())
 }
 

@@ -28,18 +28,23 @@ mod helpers;
 #[path = "setup.rs"]
 mod setup;
 
+use helpers::WAIT_TIMEOUT_SECS;
 use private_channel_escrow_program_client::{
     instructions::DepositBuilder, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_indexer::{
-    config::{BackfillConfig, ProgramType, ReconciliationConfig},
-    error::{IndexerError, ReconciliationError, StorageError},
+    config::{
+        BackfillConfig, IndexerConfig, OperatorConfig, PrivateChannelIndexerConfig, ProgramType,
+        ReconciliationConfig, RpcPollingConfig, StorageType,
+    },
+    error::{IndexerError, OperatorError, ReconciliationError, StorageError},
     indexer::{
         datasource::rpc_polling::rpc::RpcPoller,
         reconciliation::run_startup_reconciliation,
         resync::{ChannelReconcileConfig, ResyncService},
     },
     operator::{
+        self,
         utils::instruction_util::{mint_idempotency_memo, remint_idempotency_memo, SourceEventId},
         ConsumedMintKind, CONSUMED_SET_PAGE_SIZE,
     },
@@ -48,10 +53,10 @@ use private_channel_indexer::{
         common::storage::resync_state::resync_halt_reason,
         PostgresDb, Storage,
     },
-    PostgresConfig,
+    DatasourceType, PostgresConfig,
 };
 use serde_json::{json, Value};
-use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment};
+use setup::{find_allowed_mint_pda, find_event_authority_pda, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_sdk::{
@@ -66,7 +71,12 @@ use spl_token::ID as TOKEN_PROGRAM_ID;
 use sqlx::{PgPool, Row};
 use std::{str::FromStr, sync::Arc, time::Duration};
 use test_utils::{
+    indexer_helper::{start_private_channel_indexer, start_solana_indexer_rpc_polling},
     mock_rpc::{MockRpcServer, Reply},
+    operator_helper::{
+        default_operator_config, start_private_channel_to_solana_operator_with_config,
+        start_solana_to_private_channel_operator_with_config,
+    },
     validator_helper::{start_test_validator, start_test_validator_no_geyser},
 };
 use testcontainers::runners::AsyncRunner;
@@ -812,10 +822,9 @@ async fn do_deposit(
     instance: Pubkey,
     mint: Pubkey,
     amount: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Signature, Box<dyn std::error::Error>> {
     let ix = deposit_ix(user, instance, mint, amount);
-    helpers::send_and_confirm_instructions(client, &[ix], user, &[user], "Deposit").await?;
-    Ok(())
+    helpers::send_and_confirm_instructions(client, &[ix], user, &[user], "Deposit").await
 }
 
 /// Two Deposit instructions in ONE transaction (same signature, distinct
@@ -2479,5 +2488,922 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
         );
         assert_eq!(marker(&db_url).await, before, "{case}");
     }
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// End to end: real indexers and operators around a resync, on one validator
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A worker on its own runtime, so stopping it ends every task it spawned, like a process exit.
+struct Worker {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    /// Returns once `start` has finished, so workers start one at a time.
+    async fn spawn<F, Fut>(start: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let (ready, started) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime");
+            runtime.block_on(async move {
+                start().await;
+                let _ = ready.send(());
+                let _ = stopped.await;
+            });
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        });
+        let _ = started.await;
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    async fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .expect("join the worker thread")
+                .expect("a worker failed to start");
+        }
+    }
+}
+
+/// The helper default gives up confirming after five 400ms polls, but this validator confirms a
+/// mint in several seconds under four workers, which would leave every mint to the 5-minute recovery.
+fn e2e_operator_config() -> OperatorConfig {
+    OperatorConfig {
+        confirmation_poll_interval_ms: 4_000,
+        ..default_operator_config()
+    }
+}
+
+fn admin() -> Keypair {
+    Keypair::try_from(&TEST_ADMIN_KEYPAIR[..]).expect("admin keypair")
+}
+
+/// Both indexers and both operators, wired to one validator as the single-node harness runs them.
+struct Stack(Vec<Worker>);
+
+impl Stack {
+    /// Started one at a time: concurrent schema creation races in Postgres ("tuple concurrently
+    /// updated"), which is a startup artefact of this harness, not of the resync.
+    async fn start(rpc_url: &str, db_url: &str, instance: Pubkey) -> Self {
+        let (rpc, db) = (rpc_url.to_string(), db_url.to_string());
+        let mut workers = Vec::new();
+        {
+            let (rpc, db) = (rpc.clone(), db.clone());
+            workers.push(
+                Worker::spawn(move || async move {
+                    start_solana_indexer_rpc_polling(rpc, db, Some(instance))
+                        .await
+                        .expect("start the escrow indexer");
+                })
+                .await,
+            );
+        }
+        {
+            let (rpc, db) = (rpc.clone(), db.clone());
+            workers.push(
+                Worker::spawn(move || async move {
+                    start_private_channel_indexer(None, rpc, db)
+                        .await
+                        .expect("start the withdraw indexer");
+                })
+                .await,
+            );
+        }
+        {
+            let (rpc, db) = (rpc.clone(), db.clone());
+            workers.push(
+                Worker::spawn(move || async move {
+                    start_solana_to_private_channel_operator_with_config(
+                        rpc,
+                        db,
+                        admin(),
+                        instance,
+                        e2e_operator_config(),
+                    )
+                    .await
+                    .expect("start the escrow operator");
+                    // The helper returns before the operator creates its schema.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                })
+                .await,
+            );
+        }
+        workers.push(
+            Worker::spawn(move || async move {
+                start_private_channel_to_solana_operator_with_config(
+                    rpc.clone(),
+                    rpc,
+                    db,
+                    admin(),
+                    instance,
+                    e2e_operator_config(),
+                )
+                .await
+                .expect("start the withdraw operator");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            })
+            .await,
+        );
+        Self(workers)
+    }
+
+    async fn stop(self) {
+        for worker in self.0 {
+            worker.stop().await;
+        }
+    }
+}
+
+/// An escrow resync reconciled against the real channel, retried while stopped workers' sessions close.
+async fn escrow_resync(
+    rpc_url: &str,
+    db_url: &str,
+    instance: Pubkey,
+    genesis: u64,
+) -> Result<(), IndexerError> {
+    for _ in 0..40 {
+        let service = make_channel_resync_service(
+            rpc_url.to_string(),
+            new_storage(db_url).await,
+            ProgramType::Escrow,
+            Some(instance),
+            rpc_url.to_string(),
+            admin().pubkey(),
+        );
+        match run_resync(&service, genesis).await {
+            Err(IndexerError::Storage(StorageError::LiveStateLockHeld { .. })) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            other => return other,
+        }
+    }
+    panic!("stopped workers never released the live-state lock");
+}
+
+async fn checkpoint_of(db_url: &str, program: &str) -> Option<i64> {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query_scalar("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
+        .bind(program)
+        .fetch_optional(&pool)
+        .await
+        .expect("checkpoint read")
+        .flatten()
+}
+
+/// Each deposit's status and mint signature: what a rebuild must reproduce exactly.
+async fn deposit_outcomes(db_url: &str) -> Vec<(String, String, Option<String>)> {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query_as(
+        "SELECT signature, status::text, counterpart_signature FROM transactions
+         WHERE transaction_type = 'deposit' ORDER BY signature",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("deposit read")
+}
+
+/// Status, nonce and counterpart of the row indexed from `signature`.
+async fn row_of(db_url: &str, signature: &str) -> (String, Option<i64>, Option<String>) {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query_as(
+        "SELECT status::text, withdrawal_nonce, counterpart_signature
+         FROM transactions WHERE signature = $1",
+    )
+    .bind(signature)
+    .fetch_one(&pool)
+    .await
+    .expect("row read")
+}
+
+async fn wait_for_status(db_url: &str, signature: &str, status: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(*WAIT_TIMEOUT_SECS);
+    let pool = fresh_pool(db_url).await;
+    loop {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+                .bind(signature)
+                .fetch_optional(&pool)
+                .await
+                .expect("status read");
+        if current.as_deref() == Some(status) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{signature} never reached {status} (last {current:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_any_status(db_url: &str, signature: &str, statuses: &[&str]) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(*WAIT_TIMEOUT_SECS);
+    let pool = fresh_pool(db_url).await;
+    loop {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT status::text FROM transactions WHERE signature = $1")
+                .bind(signature)
+                .fetch_optional(&pool)
+                .await
+                .expect("status read");
+        if let Some(status) = current.as_deref().filter(|s| statuses.contains(s)) {
+            return status.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{signature} never reached any of {statuses:?} (last {current:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Remint a failed withdrawal the way the operator does: a memo'd mint back to the burner,
+/// recorded on the row as `failed_reminted` with the landed signature.
+async fn remint_as_operator(
+    client: &RpcClient,
+    db_url: &str,
+    signature: &str,
+    burner: Pubkey,
+    mint: Pubkey,
+) {
+    let pool = fresh_pool(db_url).await;
+    let (ix, inner, amount): (i32, Option<i32>, i64) = sqlx::query_as(
+        "SELECT instruction_index, inner_index, amount::bigint FROM transactions WHERE signature = $1",
+    )
+    .bind(signature)
+    .fetch_one(&pool)
+    .await
+    .expect("withdrawal row");
+    let memo = remint_idempotency_memo(&SourceEventId::new(signature, ix, inner));
+    let (landed, _) = send_memo_mint(client, &memo, burner, mint, amount as u64).await;
+    sqlx::query(
+        "UPDATE transactions SET status = 'failed_reminted'::transaction_status,
+                landed_remint_signature = $2 WHERE signature = $1",
+    )
+    .bind(signature)
+    .bind(landed.to_string())
+    .execute(&pool)
+    .await
+    .expect("record the remint");
+}
+
+/// An admin mint to `owner` carrying an idempotency `memo`, as the operator sends it. Returns
+/// the signature and the blockhash's last valid block height, which the operator journals.
+async fn send_memo_mint(
+    client: &RpcClient,
+    memo: &str,
+    owner: Pubkey,
+    mint: Pubkey,
+    amount: u64,
+) -> (Signature, u64) {
+    let admin = admin();
+    let ata = get_associated_token_address_with_program_id(&owner, &mint, &TOKEN_PROGRAM_ID);
+    let (blockhash, last_valid) = client
+        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        .await
+        .expect("blockhash");
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[
+            Instruction {
+                program_id: spl_memo::id(),
+                accounts: vec![solana_sdk::instruction::AccountMeta::new_readonly(
+                    admin.pubkey(),
+                    true,
+                )],
+                data: memo.as_bytes().to_vec(),
+            },
+            spl_token::instruction::mint_to(
+                &TOKEN_PROGRAM_ID,
+                &mint,
+                &ata,
+                &admin.pubkey(),
+                &[],
+                amount,
+            )
+            .expect("mint_to"),
+        ],
+        Some(&admin.pubkey()),
+        &[&admin],
+        blockhash,
+    );
+    let signature = client
+        .send_and_confirm_transaction(&tx)
+        .await
+        .expect("memo mint");
+    (signature, last_valid)
+}
+
+/// The nonces the escrow's withdrawal bitmap records as released.
+async fn consumed_nonces(client: &RpcClient, instance: Pubkey) -> Vec<u64> {
+    let pda = private_channel_indexer::operator::find_withdrawal_bitmap_pda(&instance);
+    private_channel_indexer::operator::parse_withdrawal_bitmap(
+        &client.get_account_data(&pda).await.expect("bitmap account"),
+    )
+    .expect("bitmap parse")
+    .consumed
+}
+
+async fn token_balance(client: &RpcClient, owner: Pubkey, mint: Pubkey) -> u64 {
+    helpers::get_token_balance(client, &owner, &mint)
+        .await
+        .unwrap_or(0)
+}
+
+async fn custody(client: &RpcClient, instance: Pubkey, mint: Pubkey) -> u64 {
+    let ata = get_associated_token_address_with_program_id(&instance, &mint, &TOKEN_PROGRAM_ID);
+    client
+        .get_token_account_balance(&ata)
+        .await
+        .expect("custody balance")
+        .amount
+        .parse()
+        .expect("custody amount")
+}
+
+async fn supply(client: &RpcClient, mint: Pubkey) -> u64 {
+    client
+        .get_token_supply(&mint)
+        .await
+        .expect("mint supply")
+        .amount
+        .parse()
+        .expect("supply amount")
+}
+
+/// Let the restarted stack index up to now and give the operators a few polls to act.
+async fn let_stack_settle(db_url: &str, client: &RpcClient) {
+    let tip = client.get_slot().await.expect("slot");
+    let pool = fresh_pool(db_url).await;
+    for program in ["escrow", "withdraw"] {
+        assert!(
+            helpers::db::wait_for_checkpoint(&pool, program, tip, *WAIT_TIMEOUT_SECS)
+                .await
+                .expect("checkpoint wait"),
+            "the {program} indexer never caught up to slot {tip}"
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(15)).await;
+}
+
+/// E2E-1 (#9, 26): a reminted withdrawal whose destination account appears later must not be
+/// released by an escrow resync and restart. Custody, destination, row and bitmap bit all hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_reminted").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet, env.instance).await?;
+    let user = &env.users[0];
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    let deposit = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    wait_for_status(&db_url, &deposit.to_string(), "completed").await;
+
+    // The release fails because the destination has no token account, so the burn is reminted.
+    let destination = Keypair::new().pubkey();
+    let withdrawal =
+        helpers::execute_user_withdrawal_to(&client, user, env.mint, WITHDRAW_AMOUNT, destination)
+            .await?;
+    let settled = wait_for_any_status(
+        &db_url,
+        &withdrawal.signature,
+        &["pending_remint", "manual_review", "failed_reminted"],
+    )
+    .await;
+    // The operator proves non-release before reminting, and on this validator finality and
+    // indexing lag can outrun its three 32s tries. If it did not finish, remint as it would.
+    if settled != "failed_reminted" {
+        stack.stop().await;
+        remint_as_operator(
+            &client,
+            &db_url,
+            &withdrawal.signature,
+            user.pubkey(),
+            env.mint,
+        )
+        .await;
+    } else {
+        stack.stop().await;
+    }
+    assert_eq!(
+        row_of(&db_url, &withdrawal.signature).await.0,
+        "failed_reminted"
+    );
+    let (_, nonce, _) = row_of(&db_url, &withdrawal.signature).await;
+    let nonce = nonce.expect("a withdrawal carries a nonce") as u64;
+
+    // The attacker now creates the destination account, so a second release would land.
+    let attacker_ata_ix =
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+            &user.pubkey(),
+            &destination,
+            &env.mint,
+            &TOKEN_PROGRAM_ID,
+        );
+    helpers::send_and_confirm_instructions(&client, &[attacker_ata_ix], user, &[user], "ATA")
+        .await?;
+    let custody_before = custody(&client, env.instance, env.mint).await;
+    let user_before = token_balance(&client, user.pubkey(), env.mint).await;
+
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+        .await
+        .expect("the escrow resync must succeed on a live database");
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    let_stack_settle(&db_url, &client).await;
+    stack.stop().await;
+
+    assert_eq!(
+        token_balance(&client, destination, env.mint).await,
+        0,
+        "nothing may be released to the destination"
+    );
+    assert_eq!(
+        custody(&client, env.instance, env.mint).await,
+        custody_before,
+        "escrow custody must not move"
+    );
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before,
+        "the user must not be reminted twice"
+    );
+    assert_eq!(
+        row_of(&db_url, &withdrawal.signature).await.0,
+        "failed_reminted"
+    );
+    assert_eq!(
+        row_of(&db_url, &withdrawal.signature).await.1,
+        Some(nonce as i64)
+    );
+    assert!(
+        !consumed_nonces(&client, env.instance)
+            .await
+            .contains(&nonce),
+        "the reminted withdrawal's bit must stay clear"
+    );
+    Ok(())
+}
+
+/// E2E-2 (26): an escrow resync on a busy system keeps every withdrawal and nonce, the withdraw
+/// indexer resumes from its kept checkpoint, and nothing is minted or released twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_escrow_resync_on_a_busy_system() -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_busy").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    // Strictly after the AllowMint, so a resync from here cannot recreate the mint row itself.
+    let after_allow_mint = client.get_slot().await? + 1;
+    TestEnvironment::setup_operator(&client, &faucet, env.instance).await?;
+    let user = &env.users[0];
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    let deposit_a = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT_A).await?;
+    let deposit_b = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT_B).await?;
+    wait_for_status(&db_url, &deposit_a.to_string(), "completed").await;
+    wait_for_status(&db_url, &deposit_b.to_string(), "completed").await;
+    let paid = helpers::execute_user_withdrawal(&client, user, env.mint, WITHDRAW_AMOUNT).await?;
+    wait_for_status(&db_url, &paid.signature, "completed").await;
+    stack.stop().await;
+
+    let deposits = deposit_outcomes(&db_url).await;
+    let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
+    let kept_checkpoint = checkpoint_of(&db_url, "withdraw").await;
+    assert!(
+        kept_checkpoint.is_some(),
+        "the withdraw indexer had a checkpoint"
+    );
+
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+        .await
+        .expect("the escrow resync must succeed on a busy database");
+    assert_eq!(side_fingerprint(&db_url, "withdrawal").await, withdrawals);
+    assert_eq!(checkpoint_of(&db_url, "withdraw").await, kept_checkpoint);
+    // Deposits come back completed with the same mint signatures, so none is minted again.
+    assert_eq!(deposit_outcomes(&db_url).await, deposits);
+
+    // A withdrawal lands while every worker is down.
+    let supply_before = supply(&client, env.mint).await;
+    let custody_before = custody(&client, env.instance, env.mint).await;
+    let user_before = token_balance(&client, user.pubkey(), env.mint).await;
+    let downtime =
+        helpers::execute_user_withdrawal(&client, user, env.mint, WITHDRAW_AMOUNT + 1).await?;
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    wait_for_status(&db_url, &downtime.signature, "completed").await;
+    let_stack_settle(&db_url, &client).await;
+    stack.stop().await;
+
+    let withdrawal_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'withdrawal'",
+    )
+    .fetch_one(&fresh_pool(&db_url).await)
+    .await?;
+    assert_eq!(
+        withdrawal_rows, 2,
+        "the downtime withdrawal is indexed exactly once"
+    );
+    assert_eq!(row_of(&db_url, &paid.signature).await.1, Some(0));
+    assert_eq!(row_of(&db_url, &downtime.signature).await.1, Some(1));
+    assert_eq!(consumed_nonces(&client, env.instance).await, vec![0, 1]);
+    assert_eq!(
+        supply(&client, env.mint).await,
+        supply_before - (WITHDRAW_AMOUNT + 1),
+        "only the downtime burn changes supply: no mint and no remint"
+    );
+    assert_eq!(
+        custody(&client, env.instance, env.mint).await,
+        custody_before - (WITHDRAW_AMOUNT + 1),
+        "only the downtime release leaves custody"
+    );
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before,
+        "burned and released once"
+    );
+
+    // Custody against the rebuilt ledger. The single-validator harness cannot model separate
+    // channel supply, so the supply invariant reads an empty mock channel, as IT-R12 does.
+    let mock = MockRpcServer::start().await;
+    script_channel_empty_supply(&mock);
+    let recon_storage = new_storage(&db_url).await;
+    let recon = run_startup_reconciliation(
+        &ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        },
+        ProgramType::Escrow,
+        &recon_storage,
+        &rpc_url,
+        Some(&mock.url()),
+        &env.instance,
+    )
+    .await;
+    assert!(recon.is_ok(), "startup reconciliation must pass: {recon:?}");
+
+    // A resync from after the AllowMint keeps the mint row, so reconciliation still sees
+    // the rebuilt deposits and the kept withdrawals for this mint.
+    escrow_resync(&rpc_url, &db_url, env.instance, after_allow_mint)
+        .await
+        .expect("an escrow resync from after the AllowMint");
+    assert_eq!(mint_row_count(&db_url, &env.mint.to_string()).await, 1);
+    let balances = new_storage(&db_url)
+        .await
+        .get_mint_balances_for_reconciliation(i64::MAX as u64)
+        .await?;
+    let ours = balances
+        .iter()
+        .find(|b| b.mint_address == env.mint.to_string())
+        .expect("the mint must stay in the reconciliation universe");
+    assert_eq!(
+        ours.total_deposits.to_string(),
+        (DEPOSIT_AMOUNT_A + DEPOSIT_AMOUNT_B).to_string()
+    );
+    assert_eq!(
+        ours.total_withdrawals.to_string(),
+        (2 * WITHDRAW_AMOUNT + 1).to_string()
+    );
+    script_channel_empty_supply(&mock);
+    let recon_storage = new_storage(&db_url).await;
+    let recon = run_startup_reconciliation(
+        &ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        },
+        ProgramType::Escrow,
+        &recon_storage,
+        &rpc_url,
+        Some(&mock.url()),
+        &env.instance,
+    )
+    .await;
+    assert!(
+        recon.is_ok(),
+        "reconciliation after the later-genesis resync: {recon:?}"
+    );
+    mock.shutdown().await;
+    Ok(())
+}
+
+/// Escrow indexer and operator configs for calling the real `run` functions directly.
+fn escrow_worker_configs(
+    rpc_url: &str,
+    db_url: &str,
+    instance: Pubkey,
+) -> (PrivateChannelIndexerConfig, IndexerConfig, OperatorConfig) {
+    let common = PrivateChannelIndexerConfig {
+        program_type: ProgramType::Escrow,
+        storage_type: StorageType::Postgres,
+        rpc_url: rpc_url.to_string(),
+        source_rpc_url: Some(rpc_url.to_string()),
+        fallback_rpc_url: None,
+        postgres: PostgresConfig {
+            database_url: db_url.to_string(),
+            max_connections: 5,
+        },
+        escrow_instance_id: Some(instance),
+    };
+    let indexer = IndexerConfig {
+        datasource_type: DatasourceType::RpcPolling,
+        rpc_polling: Some(RpcPollingConfig {
+            poll_interval_ms: 200,
+            error_retry_interval_ms: 1_000,
+            batch_size: 10,
+            from_slot: Some(1),
+            encoding: UiTransactionEncoding::Json,
+            commitment: CommitmentLevel::Confirmed,
+        }),
+        yellowstone: None,
+        backfill: BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: rpc_url.to_string(),
+            batch_size: 100,
+            max_gap_slots: u64::MAX,
+            start_slot: None,
+        },
+        reconciliation: ReconciliationConfig {
+            mismatch_threshold_raw: u64::MAX,
+            ..Default::default()
+        },
+    };
+    let operator = OperatorConfig {
+        db_poll_interval: Duration::from_millis(500),
+        batch_size: 10,
+        retry_max_attempts: 3,
+        retry_base_delay: Duration::from_secs(1),
+        channel_buffer_size: 100,
+        rpc_commitment: CommitmentLevel::Confirmed,
+        alert_webhook_url: None,
+        reconciliation_interval: Duration::from_secs(60 * 60),
+        reconciliation_tolerance_bps: 10,
+        reconciliation_webhook_url: Some("http://127.0.0.1:0/recon-test".to_string()),
+        feepayer_monitor_interval: Duration::from_secs(60),
+        confirmation_poll_interval_ms: 400,
+    };
+    (common, indexer, operator)
+}
+
+/// E2E-3 (94): a resync killed mid-rebuild leaves the marker and halt; the real indexer and
+/// operator refuse to start; a rerun finishes and clears both; the workers then run normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_interrupted_resync_blocks_workers_until_rerun(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_interrupted").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet, env.instance).await?;
+    let user = &env.users[0];
+
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    let deposit_a = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT_A).await?;
+    let deposit_b = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT_B).await?;
+    wait_for_status(&db_url, &deposit_a.to_string(), "completed").await;
+    wait_for_status(&db_url, &deposit_b.to_string(), "completed").await;
+    stack.stop().await;
+    let deposits = deposit_outcomes(&db_url).await;
+    let supply_before = supply(&client, env.mint).await;
+
+    // One slot per round trip and a fast heartbeat, so the kill lands while the fill runs.
+    wait_for_finalized_slot(&rpc_url, genesis + MIN_FILL_SLOTS).await;
+    let service = ResyncService::new(
+        new_storage(&db_url).await,
+        Arc::new(RpcPoller::new(
+            rpc_url.clone(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        )),
+        ProgramType::Escrow,
+        BackfillConfig {
+            enabled: true,
+            exit_after_backfill: true,
+            rpc_url: rpc_url.clone(),
+            batch_size: 1,
+            max_gap_slots: u64::MAX,
+            start_slot: None,
+        },
+        Some(env.instance),
+    )
+    .with_channel_reconcile(ChannelReconcileConfig {
+        channel_rpc_url: rpc_url.clone(),
+        authority: admin().pubkey(),
+    })
+    .with_lock_heartbeat_interval(Duration::from_millis(5));
+    let killer_url = db_url.clone();
+    let killer = tokio::spawn(async move {
+        let pool = fresh_pool(&killer_url).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let marked: Option<String> =
+                sqlx::query_scalar("SELECT program_type FROM resync_state")
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if marked.is_some() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        terminate_live_lock_holder(&pool).await;
+        true
+    });
+    let aborted = service.run(genesis).await;
+    assert!(killer.await?, "the resync never reached the wipe");
+    assert!(
+        matches!(
+            aborted,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "a lock lost mid-rebuild must abort, got {aborted:?}"
+    );
+    assert_eq!(marker(&db_url).await.as_deref(), Some("escrow"));
+    assert_eq!(
+        active_halt(&db_url).await,
+        Some(resync_halt_reason(ProgramType::Escrow))
+    );
+
+    // The real worker entry points refuse; a timeout means one started on the half-built rows.
+    let (common, indexer_config, operator_config) =
+        escrow_worker_configs(&rpc_url, &db_url, env.instance);
+    let indexer = tokio::time::timeout(
+        Duration::from_secs(60),
+        private_channel_indexer::run(common.clone(), indexer_config, None),
+    )
+    .await
+    .expect("the indexer must refuse, not start");
+    assert!(
+        matches!(&indexer, Err(IndexerError::Storage(StorageError::UnfinishedResync { program })) if program == "escrow"),
+        "indexer: {indexer:?}"
+    );
+    let operator = tokio::time::timeout(
+        Duration::from_secs(60),
+        operator::run(new_storage(&db_url).await, common, operator_config, None),
+    )
+    .await
+    .expect("the operator must refuse, not start");
+    assert!(
+        matches!(&operator, Err(OperatorError::Storage(StorageError::UnfinishedResync { program })) if program == "escrow"),
+        "operator: {operator:?}"
+    );
+
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+        .await
+        .expect("a same-program rerun must finish the interrupted resync");
+    assert_eq!(marker(&db_url).await, None);
+    assert_eq!(active_halt(&db_url).await, None);
+    assert_eq!(deposit_outcomes(&db_url).await, deposits);
+
+    // The workers run normally again: one new deposit is minted once and nothing else is.
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    let deposit_c = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    wait_for_status(&db_url, &deposit_c.to_string(), "completed").await;
+    let_stack_settle(&db_url, &client).await;
+    stack.stop().await;
+    assert_eq!(deposit_count(&db_url).await, 3, "no duplicate deposit rows");
+    assert_eq!(
+        supply(&client, env.mint).await,
+        supply_before + DEPOSIT_AMOUNT,
+        "only the new deposit is minted"
+    );
+    Ok(())
+}
+
+/// E2E-4 (#2): a deposit left processing with a landed, journaled mint refuses the resync with
+/// the database untouched; once the operator settles it, the resync rebuilds it completed with one mint.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_in_flight_mint_refuses_then_resync_succeeds() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_in_flight").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    TestEnvironment::setup_operator(&client, &faucet, env.instance).await?;
+    let user = &env.users[0];
+    let deposit = do_deposit(&client, user, env.instance, env.mint, DEPOSIT_AMOUNT).await?;
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&rpc_url, tip + 5).await;
+
+    // Index the real deposit with a resync against the (still empty) channel.
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+        .await
+        .expect("indexing resync");
+    let pool = fresh_pool(&db_url).await;
+    let (id, ix, inner): (i64, i32, Option<i32>) = sqlx::query_as(
+        "SELECT id, instruction_index, inner_index FROM transactions WHERE signature = $1",
+    )
+    .bind(deposit.to_string())
+    .fetch_one(&pool)
+    .await?;
+
+    // The operator's crash after broadcast: its memo'd mint landed, the row stays processing
+    // with the attempt journaled, and it is old enough for the recovery sweep.
+    let memo = mint_idempotency_memo(&SourceEventId::new(&deposit.to_string(), ix, inner));
+    let (landed, last_valid) =
+        send_memo_mint(&client, &memo, user.pubkey(), env.mint, DEPOSIT_AMOUNT).await;
+    let user_after_mint = token_balance(&client, user.pubkey(), env.mint).await;
+    sqlx::query("UPDATE transactions SET status = 'processing'::transaction_status WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    seed_journal(
+        &db_url,
+        "pending_release_signatures",
+        id,
+        &landed.to_string(),
+    )
+    .await;
+    sqlx::query("UPDATE pending_release_signatures SET last_valid_block_height = $2 WHERE transaction_id = $1")
+        .bind(id)
+        .bind(last_valid as i64)
+        .execute(&pool)
+        .await?;
+    seed_sql(
+        &db_url,
+        "ALTER TABLE transactions DISABLE TRIGGER update_transactions_updated_at",
+    )
+    .await;
+    sqlx::query("UPDATE transactions SET updated_at = NOW() - INTERVAL '10 minutes' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    seed_sql(
+        &db_url,
+        "ALTER TABLE transactions ENABLE TRIGGER update_transactions_updated_at",
+    )
+    .await;
+
+    let before = side_fingerprint(&db_url, "deposit").await;
+    let refused = escrow_resync(&rpc_url, &db_url, env.instance, genesis).await;
+    assert!(
+        matches!(
+            refused,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::UnsettledWork
+            ))
+        ),
+        "an in-flight mint must refuse the resync, got {refused:?}"
+    );
+    assert_eq!(side_fingerprint(&db_url, "deposit").await, before);
+    assert_eq!(marker(&db_url).await, None);
+
+    // The operator's recovery sweep finds the landed mint and completes the row.
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&rpc_url, tip + 1).await;
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    wait_for_status(&db_url, &deposit.to_string(), "completed").await;
+    stack.stop().await;
+    assert_eq!(
+        row_of(&db_url, &deposit.to_string()).await.2,
+        Some(landed.to_string())
+    );
+
+    escrow_resync(&rpc_url, &db_url, env.instance, genesis)
+        .await
+        .expect("the resync succeeds once the mint has settled");
+    let (status, _, counterpart) = row_of(&db_url, &deposit.to_string()).await;
+    assert_eq!(status, "completed");
+    assert_eq!(counterpart, Some(landed.to_string()));
+
+    // Restarted workers must not mint it again.
+    let stack = Stack::start(&rpc_url, &db_url, env.instance).await;
+    let_stack_settle(&db_url, &client).await;
+    stack.stop().await;
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_after_mint,
+        "exactly one mint for the deposit"
+    );
     Ok(())
 }

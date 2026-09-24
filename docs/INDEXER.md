@@ -103,10 +103,13 @@ raising the start slot.
 
 ### Resync and the live-state lock
 
-`resync` deletes the rows of one program (escrow: deposits, `mints` and its checkpoint;
-withdraw: withdrawals, the nonce sequence and its checkpoint) and rebuilds them from chain.
-It never touches the other program's rows, journals, nonces or checkpoint, because it
-cannot rebuild them. It is guarded these ways.
+`resync` deletes the rows of one program (escrow: deposits and its checkpoint; withdraw:
+withdrawals, the nonce sequence and its checkpoint) and rebuilds them from chain. It never
+touches the other program's rows, journals, nonces or checkpoint, because it cannot rebuild
+them. It also keeps `mints` and `mint_status_history`: withdrawals survive an escrow resync
+and reconciliation only sees mints listed in `mints`, and the rebuild upserts both. The
+nonce reset is an `ALTER SEQUENCE ... RESTART`, which rolls back with the rest of the delete
+if anything fails. It is guarded these ways.
 
 1. **`--destroy-existing-data` is required.** No environment variable binding, so it
    cannot be left switched on in a deployment's env file.

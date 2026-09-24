@@ -27,7 +27,7 @@ impl OperatorHandle {
     }
 }
 
-fn default_operator_config() -> OperatorConfig {
+pub fn default_operator_config() -> OperatorConfig {
     OperatorConfig {
         db_poll_interval: Duration::from_millis(500),
         batch_size: 10,
@@ -62,6 +62,24 @@ pub async fn start_solana_to_private_channel_operator(
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
+    start_solana_to_private_channel_operator_with_config(
+        private_channel_rpc_url,
+        solana_indexer_db_url,
+        operator_keypair,
+        escrow_instance_id,
+        default_operator_config(),
+    )
+    .await
+}
+
+/// Same as `start_solana_to_private_channel_operator`, with a caller-supplied operator config.
+pub async fn start_solana_to_private_channel_operator_with_config(
+    private_channel_rpc_url: String,
+    solana_indexer_db_url: String,
+    operator_keypair: Keypair,
+    escrow_instance_id: Pubkey,
+    operator_config: OperatorConfig,
+) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
     let postgres_config = PostgresConfig {
         database_url: solana_indexer_db_url,
         max_connections: 10,
@@ -79,8 +97,6 @@ pub async fn start_solana_to_private_channel_operator(
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
-
-    let operator_config = default_operator_config();
 
     set_operator_env_vars(&operator_keypair);
 
@@ -292,6 +308,26 @@ pub async fn start_private_channel_to_solana_operator(
     operator_keypair: Keypair,
     escrow_instance_id: Pubkey,
 ) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
+    start_private_channel_to_solana_operator_with_config(
+        solana_rpc_url,
+        private_channel_rpc_url,
+        private_channel_indexer_db_url,
+        operator_keypair,
+        escrow_instance_id,
+        default_operator_config(),
+    )
+    .await
+}
+
+/// Same as `start_private_channel_to_solana_operator`, with a caller-supplied operator config.
+pub async fn start_private_channel_to_solana_operator_with_config(
+    solana_rpc_url: String,
+    private_channel_rpc_url: String,
+    private_channel_indexer_db_url: String,
+    operator_keypair: Keypair,
+    escrow_instance_id: Pubkey,
+    operator_config: OperatorConfig,
+) -> Result<OperatorHandle, Box<dyn std::error::Error>> {
     let postgres_config = PostgresConfig {
         database_url: private_channel_indexer_db_url,
         max_connections: 10,
@@ -313,8 +349,6 @@ pub async fn start_private_channel_to_solana_operator(
         postgres: postgres_config,
         escrow_instance_id: Some(escrow_instance_id),
     };
-
-    let operator_config = default_operator_config();
 
     set_operator_env_vars(&operator_keypair);
 
