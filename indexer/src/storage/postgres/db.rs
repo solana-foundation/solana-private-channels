@@ -657,20 +657,17 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Create only if missing. Live workers insert during boot, so dropping and
+        // recreating would let a withdrawal land without a nonce between the two.
         sqlx::query(
             r#"
-            DROP TRIGGER IF EXISTS trigger_assign_withdrawal_nonce ON transactions;
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TRIGGER trigger_assign_withdrawal_nonce
-            BEFORE INSERT ON transactions
-            FOR EACH ROW
-            EXECUTE FUNCTION assign_withdrawal_nonce();
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trigger_assign_withdrawal_nonce') THEN
+                    CREATE TRIGGER trigger_assign_withdrawal_nonce BEFORE INSERT ON transactions
+                    FOR EACH ROW EXECUTE FUNCTION assign_withdrawal_nonce();
+                END IF;
+            END $$;
             "#,
         )
         .execute(&self.pool)
