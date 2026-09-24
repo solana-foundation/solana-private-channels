@@ -431,6 +431,18 @@ pub(super) async fn claim_and_persist_or_abort(
                     signature = %signature,
                     "Reconciliation halt active; dropping builder without sending"
                 );
+                // An unsent row waits in Pending, so recovery never spends a requeue attempt on a halt.
+                match storage
+                    .requeue_halted_claim(transaction_id, expected_updated_at)
+                    .await
+                {
+                    Ok(true) => info!(transaction_id, "Returned the halted row to Pending"),
+                    Ok(false) => {}
+                    Err(e) => warn!(
+                        transaction_id,
+                        "Could not return the halted row to Pending; recovery will: {}", e
+                    ),
+                }
             } else {
                 metrics::OPERATOR_TRANSACTION_ERRORS
                     .with_label_values(&[pt, lost_label])
@@ -2461,7 +2473,7 @@ mod tests {
     use crate::operator::sender::test_support::{
         ensure_test_signer, mock_bitmap_account, mock_bitmap_account_counted,
         mock_initialized_mint, mock_with_processing_row, push_processing_deposit_row,
-        push_withdrawal_with_nonce, row_status, row_updated_at,
+        push_withdrawal_with_nonce, requeue_attempts, row_status, row_updated_at,
         sender_state as make_sender_state_with_server, sender_state_with_storage,
     };
     use crate::operator::utils::instruction_util::MintToBuilder;
@@ -3685,6 +3697,16 @@ mod tests {
                 !state.in_flight_withdrawals.contains(&nonce),
                 "{disown:?}: a nonce that never broadcast must not hold the rotation barrier"
             );
+            assert_eq!(
+                row_status(mock, txn_id),
+                Some(crate::storage::common::models::TransactionStatus::Pending),
+                "{disown:?}: the unsent row is back in Pending"
+            );
+            assert_eq!(
+                requeue_attempts(mock, txn_id),
+                0,
+                "{disown:?}: no attempt spent"
+            );
         }
     }
 
@@ -3744,6 +3766,11 @@ mod tests {
             mock.get_release_signatures(txn_id).await.unwrap().len(),
             1,
             "only the pre-halt attempt is journaled"
+        );
+        assert_eq!(
+            row_status(&mock, txn_id),
+            Some(crate::storage::common::models::TransactionStatus::Processing),
+            "a row with a broadcast attempt stays Processing so recovery can classify it"
         );
     }
 
@@ -6789,8 +6816,8 @@ mod tests {
         );
     }
 
-    /// A reconciliation halt refuses the deposit mint's claim, so nothing is broadcast
-    /// and the row is left Processing for recovery, labelled as a halt, not a lost race.
+    /// A reconciliation halt refuses the deposit mint's claim, so nothing is broadcast and
+    /// the unsent row goes back to Pending without spending a requeue attempt, even at the cap.
     #[tokio::test]
     async fn mint_send_aborts_when_halted() {
         let mut server = mockito::Server::new_async().await;
@@ -6804,6 +6831,15 @@ mod tests {
             .create();
 
         let (state, lease) = mint_state_with_lease(&server.url(), 77);
+        {
+            let Storage::Mock(ref mock) = *state.storage else {
+                panic!("expected mock storage");
+            };
+            let mut rows = mock.pending_transactions.lock().unwrap();
+            let row = rows.iter_mut().find(|r| r.id == 77).expect("seeded row");
+            row.recovery_requeue_attempts =
+                crate::operator::recovery::MAX_RECOVERY_REQUEUE_ATTEMPTS;
+        }
         state
             .storage
             .set_reconciliation_halt("test halt")
@@ -6841,8 +6877,13 @@ mod tests {
         assert!(mock.get_release_signatures(77).await.unwrap().is_empty());
         assert_eq!(
             row_status(mock, 77),
-            Some(crate::storage::common::models::TransactionStatus::Processing),
-            "the row stays Processing for recovery"
+            Some(crate::storage::common::models::TransactionStatus::Pending),
+            "the unsent row waits in Pending for the halt to clear"
+        );
+        assert_eq!(
+            requeue_attempts(mock, 77),
+            crate::operator::recovery::MAX_RECOVERY_REQUEUE_ATTEMPTS,
+            "a halt spends no requeue attempt"
         );
         assert!(storage_rx.try_recv().is_err(), "no status update");
         assert!(state.in_flight.is_empty(), "nothing stashed");

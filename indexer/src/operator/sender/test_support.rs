@@ -162,6 +162,17 @@ pub(crate) fn row_status(mock: &MockStorage, transaction_id: i64) -> Option<Tran
         .map(|txn| txn.status)
 }
 
+/// Recovery requeues `transaction_id` has spent toward its quarantine cap.
+pub(crate) fn requeue_attempts(mock: &MockStorage, transaction_id: i64) -> i32 {
+    mock.pending_transactions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|txn| txn.id == transaction_id)
+        .map(|txn| txn.recovery_requeue_attempts)
+        .expect("row present")
+}
+
 /// When `transaction_id` was last written, which is what the park heartbeat
 /// refreshes and the recovery sweep ages out.
 pub(super) fn row_updated_at(

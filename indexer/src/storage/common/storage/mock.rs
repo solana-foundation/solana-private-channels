@@ -898,6 +898,36 @@ impl MockStorage {
         Ok(false)
     }
 
+    pub async fn requeue_halted_claim(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("requeue_halted_claim")?;
+        // Snapshot the other guards first so no two locks are held at once.
+        let halted = self.reconciliation_halt.lock().unwrap().is_some();
+        let journaled = self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .is_some_and(|sigs| !sigs.is_empty());
+        if !halted || journaled {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let Some(txn) = pending.iter_mut().find(|t| {
+            t.id == transaction_id
+                && t.status == TransactionStatus::Processing
+                && t.updated_at == expected_updated_at
+        }) else {
+            return Ok(false);
+        };
+        txn.status = TransactionStatus::Pending;
+        txn.updated_at = Utc::now();
+        Ok(true)
+    }
+
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,

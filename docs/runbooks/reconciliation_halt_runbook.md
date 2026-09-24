@@ -87,20 +87,23 @@ When either check breaches for three consecutive ticks, the operator **halts**:
 
 The checks are only as good as their inputs. A tick that cannot read a required
 input (the DB mint set, custody, the in-flight envelope, a fresh channel supply
-for any mint, or the ledger rows) counts as a dark tick, exported as
+for any mint, the escrow checkpoint, or the ledger rows) counts as a dark tick, exported as
 `private_channel_operator_reconciliation_input_dark_ticks`. Three dark ticks in
 a row (about 10 minutes at the default 5 minute interval) halt with the reason
 `reconciliation halt: required inputs unavailable for <N> consecutive ticks (last: <reason>)`.
 Any tick that reads everything resets the count. A lagging escrow checkpoint is
-not a dark tick; it stays on the liability-dark alert described above.
+not a dark tick; it stays on the liability-dark alert described above. A
+checkpoint that cannot be read at all during the wait is a dark tick.
 
 This halt sets the flag, forces `/health` to 503 and posts a webhook with
 `halt_reason` and `dark_ticks`, but it does **not** quarantine withdrawals: nothing
 is proven wrong, and the flag alone already blocks every send. Typical causes are
 a Solana RPC or DB outage, a channel node that is down, frozen or more than 120 s
-behind, clock skew between the channel write node and the operator, or an
-unreadable `mints` row. Restore the input first. Clearing the flag while the
-input is still unreadable halts again on the next tick.
+behind, more than 120 s of clock skew either way between the channel write node
+and the operator, or an unreadable `mints` row. Restore the input first. Clearing
+the flag while the input is still unreadable halts again on the next tick. If the
+flag write itself fails, the operator retries it within the tick and again on
+later ticks until it lands.
 
 ### Where the halt is enforced
 
@@ -113,10 +116,11 @@ cannot read the flag skips the poll too, counted as
 The flag is also checked in the same database statement that claims a row right
 before its mint or release is broadcast, so work already in the pipeline when the
 halt lands is not sent either. Such a claim is counted as
-`error_reason="halted_before_broadcast"`. A deposit stopped this way is moved back
-to `pending` by the recovery worker (using one of its requeue attempts) and mints
-once the flag is cleared. A transaction whose claim committed just before the halt
-is still sent; each later attempt is refused.
+`error_reason="halted_before_broadcast"`. A deposit or withdrawal stopped this way
+that never broadcast is put back to `pending` right away, without using a requeue
+attempt, and goes out once the flag is cleared. One with an earlier broadcast
+attempt stays `processing` for the recovery worker to check on chain. A claim whose
+statement ran before the halt committed is still sent; each later attempt is refused.
 
 Remints are not gated by the halt. A remint only returns tokens that were burned
 for a withdrawal whose release is proven not to have happened, so it cannot push

@@ -43,6 +43,7 @@ pub mod live_lock;
 pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
+pub mod requeue_halted_claim;
 pub mod sender_lock;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
@@ -504,6 +505,16 @@ impl Storage {
     ) -> Result<bool, StorageError> {
         try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
             .await
+    }
+
+    /// CAS `Processing` to `Pending` for a claim refused by a halt, only if nothing was
+    /// ever journaled for the row; spends no requeue attempt.
+    pub async fn requeue_halted_claim(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        requeue_halted_claim::requeue_halted_claim(self, transaction_id, expected_updated_at).await
     }
 
     /// Cap-gated CAS `Processing` → `Pending` for sender-side pre-broadcast failures

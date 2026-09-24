@@ -1789,6 +1789,36 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// CAS `Processing` to `Pending` for a claim a reconciliation halt refused. Only a row
+    /// with no journaled signature qualifies, since that proves it never broadcast; it spends
+    /// no requeue attempt, so a halt alone can never push a row into manual review.
+    pub async fn requeue_halted_claim_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+              AND EXISTS (
+                  SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+              )
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Status-only CAS `Processing` to `Pending` for pre-broadcast build/sign
     /// failures. Bumps `recovery_requeue_attempts` so the recovery quarantine cap
     /// survives restarts.
