@@ -5,7 +5,7 @@ use crate::config::ProgramType;
 use crate::metrics::{
     OPERATOR_ABSENCE_CLASSIFY, OPERATOR_RELEASE_VERIFY, OPERATOR_REMINT_CLAIM_LOST,
 };
-use crate::operator::sender::{verify_release_landed, ReleaseVerdict};
+use crate::operator::sender::{release_seen_at_confirmed, verify_release_landed, ReleaseVerdict};
 use crate::{
     channel_utils::send_guaranteed,
     operator::{
@@ -809,6 +809,18 @@ pub async fn process_pending_remints(
                 // credit the user again, so an unanswerable bitmap takes the same
                 // route as an unclassifiable signature: wait a while, look
                 // again, and hand the entry to a human if it stays unanswerable.
+                // A refusal of our own attempt says nothing about a release still at confirmed.
+                BitmapVerdict::Unfinalized(reason) => {
+                    defer_or_escalate(
+                        &mut remaining,
+                        entry,
+                        &nonce_label,
+                        &reason,
+                        &state.storage,
+                        storage_tx,
+                    )
+                    .await;
+                }
                 BitmapVerdict::Unknown(reason) if !entry.release_refused_on_chain => {
                     defer_or_escalate(
                         &mut remaining,
@@ -897,6 +909,8 @@ enum BitmapVerdict {
     Clear,
     /// The bitmap could not answer, which is not the same as answering "no".
     Unknown(String),
+    /// Set at confirmed but not yet finalized. Only finality settles it, so this always waits.
+    Unfinalized(String),
 }
 
 /// Ask the chain whether this nonce was actually released before crediting the
@@ -944,7 +958,26 @@ async fn bitmap_verdict(state: &SenderState, entry: &PendingRemint) -> BitmapVer
             "nonce {nonce} is consumed on-chain in generation {generation}, so the release \
              landed despite every signature looking dead; reminting would credit it twice"
         )),
-        ReleaseVerdict::NotLanded => BitmapVerdict::Clear,
+        // Minting on the channel never checks this bitmap, so a release still at confirmed must
+        // hold the remint: clear at finalized alone would let it pay out twice once it finalizes.
+        ReleaseVerdict::NotLanded => {
+            match release_seen_at_confirmed(&state.rpc_client, instance_pda, nonce).await {
+                Ok(false) => BitmapVerdict::Clear,
+                Ok(true) => {
+                    OPERATOR_RELEASE_VERIFY
+                        .with_label_values(&["remint", "unfinalized"])
+                        .inc();
+                    BitmapVerdict::Unfinalized(format!(
+                        "nonce {nonce} is consumed at confirmed but not yet finalized, so a \
+                         release may be landing; waiting for finality before reminting"
+                    ))
+                }
+                Err(reason) => {
+                    warn!("Could not prove nonce {nonce} unreleased before reminting: {reason}");
+                    BitmapVerdict::Unknown(reason)
+                }
+            }
+        }
         ReleaseVerdict::Uncertain(reason) => {
             warn!("Could not prove nonce {nonce} unreleased before reminting: {reason}");
             BitmapVerdict::Unknown(reason)
@@ -1237,7 +1270,9 @@ fn requeue_in_flight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::sender::test_support::{mock_bitmap_account, mock_bitmap_read_failure};
+    use crate::operator::sender::test_support::{
+        mock_bitmap_account, mock_bitmap_at_commitment, mock_bitmap_read_failure,
+    };
     use crate::operator::sender::types::{
         PendingRemint, PendingSig, SenderState, TransactionContext, MAX_IN_FLIGHT,
     };
@@ -2130,6 +2165,58 @@ mod tests {
             1,
             "a clear bit must let the remint run as far as its write-ahead journal"
         );
+    }
+
+    /// A release we never journaled can sit at confirmed while the finalized bit is still clear.
+    /// Reminting then pays twice once it finalizes, so the entry must wait, even after our own
+    /// attempt was refused on-chain.
+    #[tokio::test]
+    async fn remint_waits_while_the_release_is_only_confirmed() {
+        for refused in [false, true] {
+            ensure_test_signer();
+            let mut server = mockito::Server::new_async().await;
+            let _dead = mock_dead_signature(&mut server).await;
+            let _finalized = mock_bitmap_at_commitment(&mut server, "finalized", 0, &[]);
+            let _confirmed = mock_bitmap_at_commitment(&mut server, "confirmed", 0, &[3]);
+            let _blockhash = mock_remint_blockhash(&mut server).await;
+
+            let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+            state.instance_pda = Some(Pubkey::new_unique());
+            let _cover = cover_release_window(&mut server, &mock).await;
+            seed_pending_remint_row(&mock, 99, 0);
+            let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+            queue_dead_remint(&mut state, 3);
+            state.pending_remints[0].release_refused_on_chain = refused;
+            process_pending_remints(&mut state, &storage_tx).await;
+
+            assert_eq!(journaled_attempts(&mock, 99), 0, "refused={refused}");
+            assert!(storage_rx.try_recv().is_err(), "refused={refused}");
+            assert_eq!(state.pending_remints.len(), 1, "refused={refused}");
+            assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+        }
+    }
+
+    /// A bit that was only ever set on a dropped fork clears at confirmed too, so the remint
+    /// goes ahead instead of waiting forever.
+    #[tokio::test]
+    async fn remint_proceeds_once_a_fork_only_bit_is_gone() {
+        ensure_test_signer();
+        let mut server = mockito::Server::new_async().await;
+        let _dead = mock_dead_signature(&mut server).await;
+        let _finalized = mock_bitmap_at_commitment(&mut server, "finalized", 0, &[]);
+        let _confirmed = mock_bitmap_at_commitment(&mut server, "confirmed", 0, &[]);
+        let _blockhash = mock_remint_blockhash(&mut server).await;
+
+        let (mut state, mock) = make_sender_state_with_rpc(&server.url());
+        state.instance_pda = Some(Pubkey::new_unique());
+        let _cover = cover_release_window(&mut server, &mock).await;
+        let (storage_tx, _storage_rx) = mpsc::channel(10);
+
+        queue_dead_remint(&mut state, 3);
+        process_pending_remints(&mut state, &storage_tx).await;
+
+        assert_eq!(journaled_attempts(&mock, 99), 1);
     }
 
     /// A bitmap we could not read says nothing about the nonce, and "nothing"

@@ -9,6 +9,7 @@ use bigdecimal::BigDecimal;
 use chrono::Utc;
 use private_channel_indexer::{
     config::ProgramType,
+    error::StorageError,
     metrics::LIVE_STATE_LOCK_LOST,
     operator::sender_lock_key,
     storage::{
@@ -18,7 +19,7 @@ use private_channel_indexer::{
         common::storage::sender_lock::SenderLockGuard,
         postgres::db::{
             apply_lock_session_keepalives, apply_lock_session_lock_timeout,
-            probe_advisory_lock_held, release_advisory_lock,
+            probe_advisory_lock_held, release_advisory_lock, SCHEMA_INIT_LOCK_KEY,
         },
         DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
     },
@@ -113,6 +114,65 @@ async fn init_schema_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
     // Second call should not error
     storage.init_schema().await?;
+    Ok(())
+}
+
+/// Every component inits the shared schema on boot, so concurrent inits must all succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_concurrent() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, _storage, pg) = start_postgres().await?;
+    let db_url = format!(
+        "postgres://postgres:password@{}:{}/db_test",
+        pg.get_host().await?,
+        pg.get_host_port_ipv4(5432).await?
+    );
+
+    for _ in 0..5 {
+        let mut inits = Vec::new();
+        for _ in 0..8 {
+            let db_url = db_url.clone();
+            inits.push(tokio::spawn(async move {
+                let db = PostgresDb::new(&PostgresConfig {
+                    database_url: db_url,
+                    max_connections: 2,
+                })
+                .await?;
+                Storage::Postgres(db).init_schema().await
+            }));
+        }
+        for init in inits {
+            init.await??;
+        }
+    }
+
+    let (triggers,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint FROM pg_trigger WHERE tgname = 'trigger_assign_withdrawal_nonce'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(triggers, 1);
+    Ok(())
+}
+
+/// A session stuck holding the init lock must fail boot, not hang it.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_fails_when_lock_is_held() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut holder = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SCHEMA_INIT_LOCK_KEY)
+        .execute(&mut *holder)
+        .await?;
+
+    let result = tokio::time::timeout(Duration::from_secs(90), storage.init_schema())
+        .await
+        .expect("init_schema hung on a held lock");
+    let err = result.expect_err("init_schema must fail while the lock is held");
+    let StorageError::QueryFailed(err) = err else {
+        panic!("expected a query error, got {err}");
+    };
+    let code = err.as_database_error().and_then(|e| e.code());
+    assert_eq!(code.as_deref(), Some("55P03"));
     Ok(())
 }
 

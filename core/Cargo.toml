@@ -32,6 +32,7 @@ reqwest = { workspace = true }
 rocksdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 solana-account-decoder-client-types = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
@@ -78,7 +79,6 @@ url = { workspace = true }
 # forge a second valid signature for one message (issue-279 replay repro).
 ed25519-dalek = { version = "2.2", features = ["hazmat"] }
 serial_test = "3.2.0"
-sha2 = "0.10"
 solana-logger = { workspace = true }
 tempfile = "3"
 testcontainers = { workspace = true }

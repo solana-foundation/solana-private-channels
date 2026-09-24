@@ -3,7 +3,7 @@ use {
     crate::{
         accounts::AccountsDB,
         rpc::{
-            error::{read_not_enabled, write_not_enabled},
+            error::{custom_error, read_not_enabled, write_not_enabled, JSON_RPC_SERVER_ERROR},
             get_account_info_impl::get_account_info_impl,
             get_block_height_impl::get_block_height_impl,
             get_block_impl::get_block_impl,
@@ -32,6 +32,7 @@ use {
             simulate_transaction_impl::simulate_transaction,
         },
         stage_metrics::SharedMetrics,
+        stages::BlockhashProgress,
     },
     jsonrpsee::core::{async_trait, RpcResult},
     serde_json::Value,
@@ -55,7 +56,7 @@ use {
     solana_transaction_status_client_types::TransactionStatus,
     std::{
         collections::LinkedList,
-        sync::{Arc, RwLock},
+        sync::{atomic::AtomicU64, Arc, RwLock},
     },
 };
 
@@ -63,7 +64,6 @@ pub struct ReadDeps {
     pub accounts_db: AccountsDB,
     // Used for simulating sigverify
     pub admin_keys: Vec<Pubkey>,
-    pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
     pub max_blockhashes: u64,
     /// One permit per running `simulateTransaction`; a call finding none is refused.
     pub simulation_permits: tokio::sync::Semaphore,
@@ -73,6 +73,12 @@ pub struct WriteDeps {
     /// RPC ingress sender feeding the sigverify worker pool (the first stage).
     pub dedup_tx: async_channel::Sender<SanitizedTransaction>,
     pub metrics: SharedMetrics,
+    /// The dedup window, so isBlockhashValid answers with exactly what admission accepts.
+    pub live_blockhashes: Arc<RwLock<LinkedList<Hash>>>,
+    /// The slot the settler last published, kept in memory so isBlockhashValid never uses the DB pool.
+    pub settled_slot: Arc<AtomicU64>,
+    /// Lets isBlockhashValid tell a window still ingesting settled hashes from an absent hash.
+    pub blockhash_progress: Arc<BlockhashProgress>,
 }
 
 /// RPC implementation for PrivateChannel
@@ -245,8 +251,14 @@ impl PrivateChannelRpcServer for PrivateChannelRpcImpl {
         blockhash: String,
         _config: Option<RpcContextConfig>,
     ) -> RpcResult<Response<bool>> {
-        let read_deps = self.read_deps.as_ref().ok_or_else(|| read_not_enabled())?;
-        is_blockhash_valid_impl(read_deps, blockhash, _config).await
+        // A read-only node has no admission window, and a false here makes clients re-sign live payments.
+        let write_deps = self.write_deps.as_ref().ok_or_else(|| {
+            custom_error(
+                JSON_RPC_SERVER_ERROR,
+                "isBlockhashValid is served by the write node",
+            )
+        })?;
+        is_blockhash_valid_impl(write_deps, blockhash, _config).await
     }
 
     async fn get_signatures_for_address(

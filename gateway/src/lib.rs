@@ -1253,13 +1253,15 @@ impl Gateway {
             },
         };
 
-        let (target_url, target_label) = if method == "sendTransaction" {
-            info!("Routing sendTransaction to write node");
-            (&self.write_url, "write")
-        } else {
-            info!("Routing {} to read node", method);
-            (&self.read_url, "read")
-        };
+        // isBlockhashValid must answer from the writer's own admission window.
+        let (target_url, target_label) =
+            if method == "sendTransaction" || method == "isBlockhashValid" {
+                info!("Routing {} to write node", method);
+                (&self.write_url, "write")
+            } else {
+                info!("Routing {} to read node", method);
+                (&self.read_url, "read")
+            };
 
         let uri = match target_url.parse::<hyper::Uri>() {
             Ok(uri) => uri,
@@ -2002,6 +2004,26 @@ mod tests {
         assert!(
             response.contains("sig123"),
             "response should contain backend body"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_blockhash_valid_routes_to_write_node_mock() {
+        let backend_addr = start_mock_http_backend(r#"{"result":"from-writer"}"#).await;
+        let write_url = format!("http://{backend_addr}");
+        let addr = start_gateway_with_urls(&write_url, "http://127.0.0.1:1").await;
+
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"isBlockhashValid","params":["11111111111111111111111111111111"]}"#;
+        let req = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = send_raw(addr, req.as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains("from-writer"),
+            "isBlockhashValid must reach the write node: {response}"
         );
     }
 
