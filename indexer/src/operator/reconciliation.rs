@@ -66,6 +66,18 @@ const LEDGER_CATCHUP_POLL_MS: u64 = 5;
 struct BreachCounters {
     supply: HashMap<Pubkey, u32>,
     liability: HashMap<Pubkey, u32>,
+    /// The current incident has paged, so a flag write that keeps failing retries without re-paging.
+    announced: bool,
+}
+
+impl BreachCounters {
+    /// Whether any mint has reached the breach count that trips a halt.
+    fn any_confirmed(&self) -> bool {
+        self.supply
+            .values()
+            .chain(self.liability.values())
+            .any(|&count| count >= HALT_CONFIRM_TICKS)
+    }
 }
 
 /// Runs periodic escrow balance reconciliation checks
@@ -327,14 +339,20 @@ async fn perform_reconciliation_check(
         missing,
         input_dark_ticks,
         halted,
+        &mut breach_counters.announced,
     )
     .await;
+    // An incident whose flag never landed ends once nothing would trip it, so the next one pages.
+    if !*halted && *input_dark_ticks < INPUT_DARK_HALT_TICKS && !breach_counters.any_confirmed() {
+        breach_counters.announced = false;
+    }
     result.map(|_| ())
 }
 
 /// Count a tick with a missing input and freeze once the streak reaches the limit. Unread
 /// inputs mean the invariants are unchecked, so value stops rather than moves blind; `>=`
 /// sets a flag cleared while the inputs are still dark again on the next dark tick.
+#[allow(clippy::too_many_arguments)]
 async fn track_input_state(
     storage: &Arc<Storage>,
     config: &OperatorConfig,
@@ -343,6 +361,7 @@ async fn track_input_state(
     missing: Option<String>,
     input_dark_ticks: &mut u32,
     halted: &mut bool,
+    announced: &mut bool,
 ) {
     match missing {
         None => *input_dark_ticks = 0,
@@ -361,15 +380,18 @@ async fn track_input_state(
                 error!(reason = %halt_reason, "RECONCILIATION HALT tripped; freezing both pipelines");
                 // No quarantine: nothing is proven wrong, and the flag alone blocks every send.
                 *halted = freeze_pipelines(storage, health, &halt_reason, false).await;
-                if let Err(e) = send_inputs_dark_halt_alert(
-                    &config.reconciliation_webhook_url,
-                    *input_dark_ticks,
-                    &halt_reason,
-                    webhook_client,
-                )
-                .await
-                {
-                    error!("Failed to send inputs-dark halt webhook: {}", e);
+                if !*announced {
+                    match send_inputs_dark_halt_alert(
+                        &config.reconciliation_webhook_url,
+                        *input_dark_ticks,
+                        &halt_reason,
+                        webhook_client,
+                    )
+                    .await
+                    {
+                        Ok(()) => *announced = true,
+                        Err(e) => error!("Failed to send inputs-dark halt webhook: {}", e),
+                    }
                 }
             }
         }
@@ -409,6 +431,10 @@ async fn check_invariants(
     // (runbook) must let a fresh insolvency re-trip, while a still-set flag keeps
     // re-firing suppressed. On a read error leave the guard as-is.
     if let Ok(flag) = storage.is_reconciliation_halted().await {
+        // A flag cleared after it landed ends the incident, so a re-trip pages again.
+        if *halted && flag.is_none() {
+            breach_counters.announced = false;
+        }
         *halted = flag.is_some();
     }
 
@@ -711,7 +737,10 @@ async fn evaluate_and_maybe_halt(
 ) {
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
-    let mut next_counters = BreachCounters::default();
+    let mut next_counters = BreachCounters {
+        announced: breach_counters.announced,
+        ..Default::default()
+    };
     for &mint in mints {
         // A mint absent from `supply` had its read fail this tick (an absent
         // account reads as Ok(0), not a miss). Hold its counter rather than
@@ -763,6 +792,7 @@ async fn evaluate_and_maybe_halt(
             breach.supply_gap,
             c.saturating_add(breach.supply_gap),
             &reason,
+            &mut next_counters.announced,
         )
         .await;
     }
@@ -828,6 +858,7 @@ async fn evaluate_and_maybe_halt(
             breach.gap,
             breach.liabilities,
             &reason,
+            &mut next_counters.announced,
         )
         .await;
     }
@@ -850,8 +881,12 @@ async fn trip_halt(
     gap: u64,
     db_balance: u64,
     reason: &str,
+    announced: &mut bool,
 ) -> bool {
     let persisted = freeze_pipelines(storage, health, reason, true).await;
+    if *announced {
+        return persisted;
+    }
     // Payload carries real custody and the amount the escrow should hold (supply it
     // could not honor, or ledger liabilities); delta_bps is u64::MAX when custody is 0.
     let alert = BalanceMismatch {
@@ -860,10 +895,9 @@ async fn trip_halt(
         db_balance,
         delta_bps: insolvency_delta_bps(custody, gap),
     };
-    if let Err(e) =
-        send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await
-    {
-        error!("Failed to send reconciliation halt webhook: {}", e);
+    match send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await {
+        Ok(()) => *announced = true,
+        Err(e) => error!("Failed to send reconciliation halt webhook: {}", e),
     }
     persisted
 }
@@ -2598,6 +2632,7 @@ mod tests {
         let mut counters = BreachCounters {
             supply: HashMap::from([(mint, 2)]),
             liability: HashMap::from([(mint, 2)]),
+            ..Default::default()
         };
         let mut halted = false;
 
@@ -3698,6 +3733,165 @@ mod tests {
             env.mock.reconciliation_halt.lock().unwrap().is_some(),
             "the next dark tick writes the flag"
         );
+    }
+
+    /// A webhook that counts every halt alert it receives.
+    async fn counting_halt_hook() -> (mockito::ServerGuard, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut hook = mockito::Server::new_async().await;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        hook.mock("POST", "/")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+            .create_async()
+            .await;
+        (hook, seen)
+    }
+
+    /// One tick whose result is ignored, for tests that only watch state across ticks.
+    async fn one_tick(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        input_dark: &mut u32,
+    ) {
+        let _ = run_tick_full(
+            env,
+            config,
+            counters,
+            halted,
+            &CancellationToken::new(),
+            &mut 0,
+            input_dark,
+        )
+        .await;
+    }
+
+    /// While the flag write keeps failing, every dark tick retries it but the incident pages
+    /// once; a manual clear starts a new incident that pages again.
+    #[tokio::test]
+    async fn a_failing_halt_write_alerts_once_per_incident() {
+        use std::sync::atomic::Ordering;
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Ledger, true).await;
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let (hook, alerts) = counting_halt_hook().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS + 2 {
+            one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        }
+        assert!(!halted, "an unwritten flag must not latch the guard");
+        assert_eq!(
+            env.mock.calls("set_reconciliation_halt"),
+            3 * HALT_WRITE_ATTEMPTS as usize,
+            "the write is retried on every dark tick past the limit"
+        );
+        assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
+
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        assert!(halted, "the guard latches once the write lands");
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            1,
+            "landing the flag does not page again"
+        );
+
+        env.storage.clear_reconciliation_halt().await.unwrap();
+        one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        assert!(halted);
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            2,
+            "a cleared halt that re-trips is a new incident"
+        );
+    }
+
+    /// An incident whose flag never landed ends when its inputs come back, so the next one pages.
+    #[tokio::test]
+    async fn an_unwritten_halt_rearms_its_alert_once_the_inputs_recover() {
+        use std::sync::atomic::Ordering;
+        let (mut env, _) = dark_env().await;
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let (hook, alerts) = counting_halt_hook().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        let dark = INPUT_DARK_HALT_TICKS as usize;
+        let pattern = std::iter::repeat_n(true, dark)
+            .chain([false])
+            .chain(std::iter::repeat_n(true, dark));
+        for failing in pattern {
+            set_input_failing(&mut env, Input::Envelope, failing).await;
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            2,
+            "two separate incidents page twice"
+        );
+    }
+
+    /// A confirmed breach whose flag write keeps failing retries the write each tick and pages once.
+    #[tokio::test]
+    async fn a_breach_with_a_failing_halt_write_alerts_once() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_reconciliation_halt", true);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, db_mints, supply, envelope, _) = breach_maps();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for _ in 0..HALT_CONFIRM_TICKS + 2 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &db_mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(!halted);
+        assert_eq!(
+            mock.calls("set_reconciliation_halt"),
+            3 * HALT_WRITE_ATTEMPTS as usize,
+            "the write is retried on every confirmed tick"
+        );
+        assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
     }
 
     /// An existing halt is never overwritten or re-announced by a dark streak.

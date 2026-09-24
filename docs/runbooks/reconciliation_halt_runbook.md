@@ -103,7 +103,8 @@ behind, more than 120 s of clock skew either way between the channel write node
 and the operator, or an unreadable `mints` row. Restore the input first. Clearing
 the flag while the input is still unreadable halts again on the next tick. If the
 flag write itself fails, the operator retries it within the tick and again on
-later ticks until it lands.
+later ticks until it lands. The halt webhook fires once per incident, not on
+every retry.
 
 ### Where the halt is enforced
 
