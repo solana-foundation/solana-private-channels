@@ -37,6 +37,9 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// corrupt RPC read cannot halt while a persistent shortfall always will.
 const HALT_CONFIRM_TICKS: u32 = 3;
 
+/// Tries at writing the halt flag within one tick; the guard stays down until one lands.
+const HALT_WRITE_ATTEMPTS: u32 = 3;
+
 /// Consecutive ticks with a required input unreadable before the pipelines are frozen.
 const INPUT_DARK_HALT_TICKS: u32 = 3;
 
@@ -351,14 +354,13 @@ async fn track_input_state(
                 "Reconciliation could not read a required input this tick"
             );
             if *input_dark_ticks >= INPUT_DARK_HALT_TICKS && !*halted {
-                *halted = true;
                 let halt_reason = format!(
                     "reconciliation halt: required inputs unavailable for {} consecutive ticks (last: {})",
                     input_dark_ticks, reason
                 );
                 error!(reason = %halt_reason, "RECONCILIATION HALT tripped; freezing both pipelines");
                 // No quarantine: nothing is proven wrong, and the flag alone blocks every send.
-                freeze_pipelines(storage, health, &halt_reason, false).await;
+                *halted = freeze_pipelines(storage, health, &halt_reason, false).await;
                 if let Err(e) = send_inputs_dark_halt_alert(
                     &config.reconciliation_webhook_url,
                     *input_dark_ticks,
@@ -744,15 +746,14 @@ async fn evaluate_and_maybe_halt(
             continue;
         }
 
-        // Confirmed insolvency: trip the halt exactly once.
-        *halted = true;
+        // Confirmed insolvency: trip the halt once the flag lands; a failed write retries next tick.
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of supply by {}, \
              envelope {} tolerance {} over {} consecutive finalized ticks",
             mint, c, breach.supply_gap, breach.envelope, breach.tolerance, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-        trip_halt(
+        *halted = trip_halt(
             storage,
             health,
             webhook_client,
@@ -811,14 +812,13 @@ async fn evaluate_and_maybe_halt(
             continue;
         }
 
-        *halted = true;
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of ledger liabilities {} by {}, \
              tolerance {} at slot {} over {} consecutive finalized ticks",
             mint, c, breach.liabilities, breach.gap, breach.tolerance, slot, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-        trip_halt(
+        *halted = trip_halt(
             storage,
             health,
             webhook_client,
@@ -850,8 +850,8 @@ async fn trip_halt(
     gap: u64,
     db_balance: u64,
     reason: &str,
-) {
-    freeze_pipelines(storage, health, reason, true).await;
+) -> bool {
+    let persisted = freeze_pipelines(storage, health, reason, true).await;
     // Payload carries real custody and the amount the escrow should hold (supply it
     // could not honor, or ledger liabilities); delta_bps is u64::MAX when custody is 0.
     let alert = BalanceMismatch {
@@ -865,19 +865,30 @@ async fn trip_halt(
     {
         error!("Failed to send reconciliation halt webhook: {}", e);
     }
+    persisted
 }
 
-/// The levers every halt pulls: the durable flag, then optionally quarantine, then
-/// forced-unhealthy. Quarantine is for a proven insolvency, where each active withdrawal
+/// The levers every halt pulls: the durable flag, optional quarantine, forced-unhealthy; returns
+/// whether the flag landed. Quarantine is for a proven insolvency, where each active withdrawal
 /// needs a human; an outage halt skips it because the flag already blocks every send.
 async fn freeze_pipelines(
     storage: &Arc<Storage>,
     health: &Option<Arc<HealthState>>,
     reason: &str,
     quarantine: bool,
-) {
-    if let Err(e) = storage.set_reconciliation_halt(reason).await {
-        error!("Failed to set durable reconciliation halt flag: {}", e);
+) -> bool {
+    let mut persisted = false;
+    for attempt in 1..=HALT_WRITE_ATTEMPTS {
+        match storage.set_reconciliation_halt(reason).await {
+            Ok(()) => {
+                persisted = true;
+                break;
+            }
+            Err(e) => error!(
+                attempt,
+                "Failed to set durable reconciliation halt flag: {}", e
+            ),
+        }
     }
     if quarantine {
         // Unbounded on purpose: an insolvency halt is not nonce-scoped.
@@ -889,6 +900,7 @@ async fn freeze_pipelines(
     if let Some(h) = health {
         h.force_unhealthy(reason.to_string());
     }
+    persisted
 }
 
 /// Posts the inputs-dark halt as `{ halt_reason, dark_ticks, timestamp }`, retrying
@@ -3074,13 +3086,16 @@ mod tests {
             .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
         let mut counters = BreachCounters::default();
         let mut halted = false;
+        let mut input_dark = 0;
 
-        run_tick(
+        run_tick_full(
             &env,
             &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
             &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
         )
         .await
         .unwrap();
@@ -3102,16 +3117,13 @@ mod tests {
             .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
         let mut counters = BreachCounters::default();
         let mut halted = false;
-        let mut input_dark = 0;
 
-        run_tick_full(
+        run_tick(
             &env,
             &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
             &CancellationToken::new(),
-            &mut 0,
-            &mut input_dark,
         )
         .await
         .unwrap();
@@ -3644,6 +3656,50 @@ mod tests {
         );
     }
 
+    /// A halt whose flag write failed is not treated as set, so a later tick writes it,
+    /// even while the flag cannot be read back to resync the guard.
+    #[tokio::test]
+    async fn a_failed_halt_write_is_retried_on_the_next_tick() {
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Ledger, true).await;
+        env.mock.set_should_fail("is_reconciliation_halted", true);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert!(!halted, "an unwritten flag must not latch the guard");
+        assert!(env.mock.reconciliation_halt.lock().unwrap().is_none());
+
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        let _ = run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
+        )
+        .await;
+
+        assert!(halted);
+        assert!(
+            env.mock.reconciliation_halt.lock().unwrap().is_some(),
+            "the next dark tick writes the flag"
+        );
+    }
+
     /// An existing halt is never overwritten or re-announced by a dark streak.
     #[tokio::test]
     async fn a_dark_streak_under_an_existing_halt_trips_nothing() {
@@ -3786,8 +3842,10 @@ mod tests {
             let storage = Arc::new(Storage::Mock(mock.clone()));
             let health = HealthState::new(HealthConfig::operator());
 
-            freeze_pipelines(&storage, &Some(health.clone()), "test freeze", quarantine).await;
+            let persisted =
+                freeze_pipelines(&storage, &Some(health.clone()), "test freeze", quarantine).await;
 
+            assert!(persisted);
             assert!(storage.is_reconciliation_halted().await.unwrap().is_some());
             assert_eq!(
                 mock.pending_transactions.lock().unwrap()[0].status,
@@ -3798,6 +3856,21 @@ mod tests {
                 health.check(),
                 HealthOutcome::ForcedUnhealthy { .. }
             ));
+        }
+    }
+
+    /// The flag write is retried within the tick, and a write that never lands is reported.
+    #[tokio::test]
+    async fn freeze_pipelines_reports_whether_the_flag_landed() {
+        for (failures, expected) in [(1, true), (HALT_WRITE_ATTEMPTS as usize, false)] {
+            let mock = MockStorage::new();
+            mock.set_fail_times("set_reconciliation_halt", failures);
+            let storage = Arc::new(Storage::Mock(mock.clone()));
+
+            let persisted = freeze_pipelines(&storage, &None, "test freeze", false).await;
+
+            assert_eq!(persisted, expected, "{failures} failed writes");
+            assert_eq!(mock.reconciliation_halt.lock().unwrap().is_some(), expected);
         }
     }
 
