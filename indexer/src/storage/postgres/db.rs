@@ -665,7 +665,7 @@ impl PostgresDb {
             r#"
             DO $$
             BEGIN
-                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trigger_assign_withdrawal_nonce') THEN
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trigger_assign_withdrawal_nonce' AND tgrelid = 'transactions'::regclass) THEN
                     CREATE TRIGGER trigger_assign_withdrawal_nonce BEFORE INSERT ON transactions
                     FOR EACH ROW EXECUTE FUNCTION assign_withdrawal_nonce();
                 END IF;

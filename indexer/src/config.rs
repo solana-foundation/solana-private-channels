@@ -176,6 +176,8 @@ fn normalized(v: &Option<String>) -> Option<&str> {
 }
 
 impl PrivateChannelIndexerConfig {
+    /// Indexer rules only. The operator needs `escrow_instance_id` for both program types
+    /// and enforces that in `operator::run`, so it never calls this.
     pub fn validate(&self) -> Result<(), String> {
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {

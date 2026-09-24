@@ -159,8 +159,8 @@ async fn init_schema_concurrent() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn init_schema_keeps_the_nonce_trigger() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
-    let trigger_oid_sql =
-        "SELECT oid::bigint FROM pg_trigger WHERE tgname = 'trigger_assign_withdrawal_nonce'";
+    let trigger_oid_sql = "SELECT oid::bigint FROM pg_trigger \
+        WHERE tgname = 'trigger_assign_withdrawal_nonce' AND tgrelid = 'transactions'::regclass";
 
     let (before,): (i64,) = sqlx::query_as(trigger_oid_sql).fetch_one(&pool).await?;
     storage.init_schema().await?;
