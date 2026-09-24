@@ -1,5 +1,5 @@
 use crate::error::DataSourceRpcError;
-use crate::indexer::datasource::rpc_polling::types::{BlockFetch, RpcBlock};
+use crate::indexer::datasource::rpc_polling::types::{BlockFetch, RpcBlock, SignaturesBlock};
 use futures::future::join_all;
 use serde_json::json;
 use solana_commitment_config::CommitmentLevel;
@@ -94,6 +94,50 @@ impl RpcPoller {
         let block: RpcBlock =
             serde_json::from_value(json["result"].clone()).map_err(DataSourceRpcError::from)?;
         Ok(Some(block))
+    }
+
+    /// Re-reads a block that came back with no transactions through its signatures view.
+    /// True only if that view names the same blockhash and lists no signatures either.
+    pub async fn confirm_empty_block(
+        &self,
+        slot: u64,
+        blockhash: &str,
+    ) -> Result<bool, DataSourceRpcError> {
+        let response = self
+            .client
+            .post(&self.rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBlock",
+                "params": [
+                    slot,
+                    {
+                        "encoding": self.encoding.to_string(),
+                        "transactionDetails": "signatures",
+                        "maxSupportedTransactionVersion": MAX_SUPPORTED_TRANSACTION_VERSION,
+                        "rewards": false,
+                        "commitment": self.commitment.to_string(),
+                    }
+                ]
+            }))
+            .send()
+            .await?;
+
+        let json: serde_json::Value = response.json().await?;
+        if let Some(error) = json.get("error") {
+            return Err(DataSourceRpcError::Protocol {
+                reason: format!("RPC error: {}", error),
+            });
+        }
+        // The block was just served, so a null here is not a proof of anything.
+        if json["result"].is_null() {
+            return Ok(false);
+        }
+
+        let view: SignaturesBlock =
+            serde_json::from_value(json["result"].clone()).map_err(DataSourceRpcError::from)?;
+        Ok(view.blockhash == blockhash && view.signatures.is_empty())
     }
 
     /// Enumerate the slots in `[start, end]` that actually produced a block.
@@ -252,28 +296,25 @@ impl RpcPoller {
                     // The link has to be judged even when there is no gap to fill:
                     // between adjacent producers the range is empty, and discarding
                     // the verdict there would let a contradiction re-anchor the walk.
-                    let extends = proven.gap_is_empty_below(block.parent_slot);
+                    // Genesis has no parent to check, so a walk from slot 0 accepts it.
+                    let extends = match proven {
+                        Proven::Unanchored => slot == 0,
+                        _ => proven.gap_is_empty_below(block.parent_slot),
+                    };
                     if !extends {
                         debug!(
                             "Slot {slot} names parent {} which does not extend {proven:?}, so slots {pending}..={slot} cannot be proven",
                             block.parent_slot
                         );
-                    }
-                    let gap = if extends {
-                        BlockFetch::Skipped
+                        // A block whose parent contradicts the chain may be on another fork,
+                        // so it is never handed over; `Broken` keeps every later block out too.
+                        fill_verdict(&mut verdicts, pending..=slot, BlockFetch::Unavailable);
+                        proven = Proven::Broken;
                     } else {
-                        BlockFetch::Unavailable
-                    };
-                    fill_verdict(&mut verdicts, pending..slot, gap);
-                    verdicts.insert(slot, Ok(BlockFetch::Present(block)));
-                    // A link that contradicts a block already in hand means the
-                    // endpoint is serving two forks, so nothing after it can be
-                    // trusted. A link that merely fails to cover a gap still leaves
-                    // this block in hand as a sound anchor for what follows.
-                    proven = match proven {
-                        Proven::Block(_) if !extends => Proven::Broken,
-                        _ => Proven::Block(slot),
-                    };
+                        fill_verdict(&mut verdicts, pending..slot, BlockFetch::Skipped);
+                        verdicts.insert(slot, Ok(BlockFetch::Present(block)));
+                        proven = Proven::Block(slot);
+                    }
                 }
                 Ok(None) => {
                     debug!("Slot {slot} was listed as a producer but could not be fetched");
@@ -626,9 +667,14 @@ mod tests {
 
         let results = poller(&server).get_blocks_batch(vec![11, 12, 13]).await;
 
+        // 13's parent contradicts what the batch proved, so 13 itself is not served either.
         assert_eq!(
             tags(&results),
-            vec![(11, "unavailable"), (12, "unavailable"), (13, "present")]
+            vec![
+                (11, "unavailable"),
+                (12, "unavailable"),
+                (13, "unavailable")
+            ]
         );
     }
 
@@ -665,11 +711,50 @@ mod tests {
 
         let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
 
-        // 102 must not be proven empty off a chain that already contradicted itself.
+        // 101 contradicts 100, so it is never handed over, and 102 cannot be proven off it.
+        assert_eq!(
+            tags(&results),
+            vec![(100, "present"), (101, "unavailable"), (102, "unavailable")]
+        );
+    }
+
+    /// A contradiction on the last producer of the batch still withholds that block.
+    #[tokio::test]
+    async fn broken_link_on_the_last_producer_is_unavailable() {
+        let mut server = Server::new_async().await;
+        let _c = chain(&mut server, 100, 102, &[(100, 99), (101, 100), (102, 55)]);
+
+        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+
         assert_eq!(
             tags(&results),
             vec![(100, "present"), (101, "present"), (102, "unavailable")]
         );
+    }
+
+    /// Once a link contradicts, a later block that chains onto the contradicting one proves nothing.
+    #[tokio::test]
+    async fn a_broken_chain_does_not_re_anchor_on_the_next_block() {
+        let mut server = Server::new_async().await;
+        let _c = chain(&mut server, 100, 102, &[(100, 99), (101, 55), (102, 101)]);
+
+        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+
+        assert_eq!(
+            tags(&results),
+            vec![(100, "present"), (101, "unavailable"), (102, "unavailable")]
+        );
+    }
+
+    /// Genesis has no parent to check, so a walk that starts at slot 0 still serves it.
+    #[tokio::test]
+    async fn genesis_block_is_served_when_the_walk_starts_at_zero() {
+        let mut server = Server::new_async().await;
+        let _c = chain(&mut server, 0, 1, &[(0, 0), (1, 0)]);
+
+        let results = poller(&server).get_blocks_batch(vec![0, 1]).await;
+
+        assert_eq!(tags(&results), vec![(0, "present"), (1, "present")]);
     }
 
     /// U-2. The exact case the retention floor got wrong: slot 102 holds a real
@@ -691,7 +776,7 @@ mod tests {
                 (101, "unavailable"),
                 (102, "unavailable"),
                 (103, "unavailable"),
-                (104, "present"),
+                (104, "unavailable"),
             ]
         );
     }
@@ -984,6 +1069,97 @@ mod tests {
         enumerate.assert();
         fetch.assert();
         assert_eq!(tags(&results), vec![(100, "present")]);
+    }
+
+    /// A signatures-view `getBlock` body exactly as the Solana encoder produces it.
+    fn signatures_view(blockhash: &str, signatures: Vec<[u8; 64]>) -> serde_json::Value {
+        use solana_transaction_status::{
+            BlockEncodingOptions, ConfirmedBlock, TransactionDetails, TransactionWithStatusMeta,
+        };
+        let transactions = signatures
+            .into_iter()
+            .map(|bytes| {
+                TransactionWithStatusMeta::MissingMetadata(solana_sdk::transaction::Transaction {
+                    signatures: vec![solana_sdk::signature::Signature::from(bytes)],
+                    message: Default::default(),
+                })
+            })
+            .collect();
+        let block = ConfirmedBlock {
+            previous_blockhash: "Prev1111111111111111111111111111111111111111".to_string(),
+            blockhash: blockhash.to_string(),
+            parent_slot: 99,
+            transactions,
+            rewards: vec![],
+            num_partitions: None,
+            block_time: None,
+            block_height: None,
+        };
+        let encoded = block
+            .encode_with_options(
+                UiTransactionEncoding::Json,
+                BlockEncodingOptions {
+                    transaction_details: TransactionDetails::Signatures,
+                    show_rewards: false,
+                    max_supported_transaction_version: Some(0),
+                },
+            )
+            .unwrap();
+        serde_json::to_value(encoded).unwrap()
+    }
+
+    /// Serves `body` only to the signatures-view `getBlock` of `slot`.
+    fn mock_signatures_view(
+        server: &mut Server,
+        slot: u64,
+        body: serde_json::Value,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getBlock",
+                "params": [slot, { "transactionDetails": "signatures" }]
+            })))
+            .with_status(200)
+            .with_body(serde_json::json!({ "jsonrpc": "2.0", "result": body, "id": 1 }).to_string())
+            .expect(1)
+            .create()
+    }
+
+    /// The confirm call reads the real encoder's signatures view, which has no `transactions`.
+    #[tokio::test]
+    async fn confirm_empty_block_reads_the_real_signatures_view() {
+        let mut server = Server::new_async().await;
+        let _empty = mock_signatures_view(&mut server, 100, signatures_view("B100", vec![]));
+        let _one = mock_signatures_view(&mut server, 101, signatures_view("B101", vec![[3u8; 64]]));
+        let _other = mock_signatures_view(&mut server, 102, signatures_view("Fork", vec![]));
+        let poller = poller(&server);
+
+        assert!(poller.confirm_empty_block(100, "B100").await.unwrap());
+        assert!(
+            !poller.confirm_empty_block(101, "B101").await.unwrap(),
+            "a listed signature means the full view dropped a transaction"
+        );
+        assert!(
+            !poller.confirm_empty_block(102, "B102").await.unwrap(),
+            "a different blockhash proves nothing about the block that was served"
+        );
+    }
+
+    /// A confirm call that errors is an error, never a proof.
+    #[tokio::test]
+    async fn confirm_empty_block_surfaces_errors() {
+        let mut server = Server::new_async().await;
+        let _err = server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"boom"},"id":1}"#)
+            .create();
+
+        assert!(poller(&server)
+            .confirm_empty_block(100, "B100")
+            .await
+            .is_err());
     }
 
     /// U-15. An empty batch is answered without touching the network.

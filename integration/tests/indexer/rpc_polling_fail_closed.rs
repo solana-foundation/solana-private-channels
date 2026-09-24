@@ -102,7 +102,7 @@ fn withdraw_block_transaction(meta: serde_json::Value, data: Vec<u8>) -> serde_j
     }
     json!({
         "transaction": {
-            "signatures": ["sig_undecodable"],
+            "signatures": [bs58::encode([9u8; 64]).into_string()],
             "message": {
                 "accountKeys": account_keys,
                 "instructions": [{

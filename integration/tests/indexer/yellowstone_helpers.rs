@@ -18,18 +18,35 @@ use yellowstone_grpc_proto::solana::storage::confirmed_block::{
     Transaction as ProtoTransaction, TransactionStatusMeta,
 };
 
-/// Wrap tx infos in one atomic block update for `slot`. Each block delivers the
-/// slot's boundary and all of its transactions in a single message.
+/// Wrap tx infos in one atomic block update for `slot`, chained onto `slot - 1`. Each
+/// block delivers the slot's boundary and all of its transactions in a single message.
 pub fn block(slot: u64, txs: Vec<SubscribeUpdateTransactionInfo>) -> SubscribeUpdate {
+    block_after(slot, slot.saturating_sub(1), txs)
+}
+
+/// A block whose parent is `parent_slot`, for a chain that skips slots or leaves a hole.
+pub fn block_after(
+    slot: u64,
+    parent_slot: u64,
+    txs: Vec<SubscribeUpdateTransactionInfo>,
+) -> SubscribeUpdate {
     SubscribeUpdate {
         filters: vec!["private_channel_blocks".to_string()],
         update_oneof: Some(UpdateOneof::Block(SubscribeUpdateBlock {
             slot,
+            blockhash: block_hash(slot),
+            parent_slot,
+            parent_blockhash: block_hash(parent_slot),
             transactions: txs,
             ..Default::default()
         })),
         created_at: None,
     }
+}
+
+/// A stable per-slot blockhash, so a block's parent link names its parent's hash.
+pub fn block_hash(slot: u64) -> String {
+    format!("hash{slot}")
 }
 
 /// A produced block with no program transactions still completes its slot.

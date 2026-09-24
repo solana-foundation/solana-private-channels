@@ -11,11 +11,16 @@ use crate::indexer::datasource::common::parser::withdraw::{
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
 };
 use crate::indexer::datasource::common::parser::{EscrowInstruction, WithdrawInstruction};
+use crate::indexer::datasource::common::tx_validation::{
+    check_inner_set_index, check_instruction, check_loaded_counts, check_signature,
+};
 use crate::indexer::datasource::common::types::CompiledInstruction;
 use crate::indexer::datasource::common::types::*;
-use crate::indexer::datasource::rpc_polling::types::{InnerInstructions, RpcBlock};
+use crate::indexer::datasource::rpc_polling::types::{
+    InnerInstructions, RpcBlock, RpcTransactionWithMeta,
+};
 use solana_sdk::pubkey::Pubkey;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 type ParseInstructionFn<T> = fn(
     instruction: &CompiledInstruction,
@@ -45,6 +50,10 @@ pub enum SlotRejection {
     MissingMeta { signature: String },
     /// An instruction the indexer supports would not decode.
     Undecodable(UndecodableInstruction),
+    /// A successful transaction breaks a rule the runtime enforces, so the provider corrupted it.
+    Malformed { signature: String, reason: String },
+    /// An escrow block came back with no transactions and its signatures view did not confirm it.
+    EmptyUnconfirmed { reason: String },
 }
 
 impl SlotRejection {
@@ -54,6 +63,8 @@ impl SlotRejection {
         match self {
             Self::MissingMeta { .. } => "missing_meta",
             Self::Undecodable(_) => "parse_failed",
+            Self::Malformed { .. } => "malformed_tx",
+            Self::EmptyUnconfirmed { .. } => "empty_block_unconfirmed",
         }
     }
 }
@@ -67,6 +78,15 @@ impl std::fmt::Display for SlotRejection {
                 "transaction {} instruction {} (inner {:?}) will not decode: {}",
                 failure.signature, failure.instruction_index, failure.inner_index, failure.source
             ),
+            Self::Malformed { signature, reason } => {
+                write!(f, "transaction {signature} is malformed: {reason}")
+            }
+            Self::EmptyUnconfirmed { reason } => {
+                write!(
+                    f,
+                    "came back with no transactions and could not be confirmed empty: {reason}"
+                )
+            }
         }
     }
 }
@@ -75,14 +95,9 @@ impl std::fmt::Display for SlotRejection {
 /// transaction in `block`, or `None` if all carry metadata; a single `meta: null`
 /// tx makes the slot unverifiable, so callers MUST fail closed on `Some(_)`.
 ///
-/// A null `innerInstructions` list is deliberately NOT rejected here. Chains that
-/// record no inner instructions at all (the private-channel node among them) return
-/// null legitimately for every transaction, so rejecting it wedges them on every
-/// block.
-///
-/// An escrow deposit whose event self-CPI is absent still passes this guard, which
-/// cannot tell it apart from a chain that records no inner instructions. The parser
-/// catches that case instead, and `parse_block` fails the slot closed on it.
+/// A null `innerInstructions` list is deliberately NOT rejected here: the private-channel
+/// node records no inner instructions and returns null for every transaction. The escrow
+/// parse rejects null on its own transactions instead, since Solana always records them.
 fn first_missing_meta(block: &RpcBlock) -> Option<String> {
     for (index, tx_with_meta) in block.transactions.iter().enumerate() {
         if tx_with_meta.meta.is_none() {
@@ -108,7 +123,7 @@ fn parse_block(
     slot: u64,
     program_type: ProgramType,
     escrow_instance_id: Option<&Pubkey>,
-) -> Result<Vec<InstructionWithMetadata>, UndecodableInstruction> {
+) -> Result<Vec<InstructionWithMetadata>, SlotRejection> {
     match program_type {
         ProgramType::Escrow => Ok(parse_block_for_program::<EscrowInstruction>(
             block,
@@ -116,6 +131,7 @@ fn parse_block(
             parse_escrow_instruction,
             escrow_inner_discriminator_excluded,
             escrow_instance_id,
+            true,
         )?
         .into_iter()
         .map(|(signature, location, ix)| InstructionWithMetadata {
@@ -133,6 +149,7 @@ fn parse_block(
             parse_withdraw_instruction,
             withdraw_inner_discriminator_excluded,
             None,
+            false,
         )?
         .into_iter()
         .map(|(signature, location, ix)| InstructionWithMetadata {
@@ -160,7 +177,7 @@ pub fn decode_slot(
         return Err(SlotRejection::MissingMeta { signature });
     }
 
-    parse_block(block, slot, program_type, escrow_instance_id).map_err(SlotRejection::Undecodable)
+    parse_block(block, slot, program_type, escrow_instance_id)
 }
 
 /// Whether this instruction names the configured escrow instance among its own accounts.
@@ -191,6 +208,69 @@ fn instruction_discriminator(instruction: &CompiledInstruction) -> Option<u8> {
         .and_then(|d| d.first().copied())
 }
 
+/// Runs the shared structural checks on one successful transaction and returns its full
+/// key list (static, then loaded writable, then loaded readonly) and its signature.
+fn validate_transaction(
+    tx_with_meta: &RpcTransactionWithMeta,
+) -> Result<(Vec<Pubkey>, String), String> {
+    let tx = &tx_with_meta.transaction;
+    let meta = tx_with_meta.meta.as_ref();
+
+    let (loaded_writable, loaded_readonly): (&[String], &[String]) = meta
+        .and_then(|meta| meta.loaded_addresses.as_ref())
+        .map_or((&[], &[]), |loaded| (&loaded.writable, &loaded.readonly));
+    let expected = tx.message.address_table_lookups.iter().flatten().fold(
+        (0, 0),
+        |(writable, readonly), lookup| {
+            (
+                writable + lookup.writable_indexes.len(),
+                readonly + lookup.readonly_indexes.len(),
+            )
+        },
+    );
+    check_loaded_counts(expected, loaded_writable.len(), loaded_readonly.len())?;
+
+    let account_pubkeys = tx
+        .message
+        .account_keys
+        .iter()
+        .chain(loaded_writable)
+        .chain(loaded_readonly)
+        .map(|key| Pubkey::from_str(key).map_err(|e| format!("invalid account key {key}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let signature = tx
+        .signatures
+        .first()
+        .ok_or_else(|| "transaction has no signature".to_string())?;
+    let signature_bytes = bs58::decode(signature)
+        .into_vec()
+        .map_err(|e| format!("signature is not base58: {e}"))?;
+    check_signature(&signature_bytes)?;
+
+    let num_keys = account_pubkeys.len();
+    for instruction in &tx.message.instructions {
+        check_instruction(
+            num_keys,
+            instruction.program_id_index.into(),
+            &instruction.accounts,
+        )?;
+    }
+    let inner_sets = meta.and_then(|meta| meta.inner_instructions.as_deref());
+    for inner_set in inner_sets.unwrap_or_default() {
+        check_inner_set_index(inner_set.index.into(), tx.message.instructions.len())?;
+        for inner in &inner_set.instructions {
+            check_instruction(
+                num_keys,
+                inner.instruction.program_id_index.into(),
+                &inner.instruction.accounts,
+            )?;
+        }
+    }
+
+    Ok((account_pubkeys, signature.clone()))
+}
+
 /// Parse a block and return (signature, location, instruction) for every
 /// instruction of the given program.
 fn parse_block_for_program<T>(
@@ -199,61 +279,47 @@ fn parse_block_for_program<T>(
     parse_instruction: ParseInstructionFn<T>,
     inner_discriminator_excluded: fn(u8) -> bool,
     escrow_instance_id: Option<&Pubkey>,
-) -> Result<Vec<(String, InstructionLocation, T)>, UndecodableInstruction>
+    require_inner_instructions: bool,
+) -> Result<Vec<(String, InstructionLocation, T)>, SlotRejection>
 where
     T: std::fmt::Debug,
 {
     let mut instructions = Vec::new();
 
-    for tx_with_meta in &block.transactions {
-        let mut inner_instructions_list: &[InnerInstructions] = &[];
-        let mut loaded_writable: &[String] = &[];
-        let mut loaded_readonly: &[String] = &[];
+    // The filter program id is a hardcoded constant; a parse failure is a
+    // programming error, not a per-transaction condition.
+    let Ok(filter_pubkey) = Pubkey::from_str(filter_program_id) else {
+        error!("Invalid filter program id: {filter_program_id}");
+        return Ok(instructions);
+    };
 
+    for (tx_position, tx_with_meta) in block.transactions.iter().enumerate() {
         // Skip failed transactions
-        if let Some(meta) = &tx_with_meta.meta {
-            if meta.err.is_some() {
-                continue;
-            }
-
-            if let Some(inner_ix) = &meta.inner_instructions {
-                inner_instructions_list = inner_ix;
-            }
-
-            if let Some(loaded) = &meta.loaded_addresses {
-                loaded_writable = &loaded.writable;
-                loaded_readonly = &loaded.readonly;
-            }
+        if tx_with_meta
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.err.is_some())
+        {
+            continue;
         }
 
         let tx = &tx_with_meta.transaction;
-        let account_keys = &tx.message.account_keys;
+        let malformed = |reason: String| SlotRejection::Malformed {
+            signature: tx
+                .signatures
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("tx#{tx_position}")),
+            reason,
+        };
 
-        // Get transaction signature (first signature is the tx signature)
-        // Skip transactions without valid signatures
-        let Some(signature) = tx.signatures.first().cloned() else {
-            warn!("Skipping transaction with no signature");
+        // Checked on every successful transaction before scoping: a corrupt key list could
+        // otherwise hide our program or instance and make the transaction look unrelated.
+        let (account_pubkeys, signature) = validate_transaction(tx_with_meta).map_err(malformed)?;
+
+        if !account_pubkeys.contains(&filter_pubkey) {
             continue;
-        };
-
-        // Inner (and v0 top-level) account indices reference the full key list:
-        // static message keys, then loaded writable, then readonly. Append the
-        // already-resolved loaded keys so those indices resolve.
-        // A malformed key makes every account index untrustworthy (dropping one
-        // would shift the rest), so skip the whole transaction rather than panic.
-        let account_pubkeys: Vec<Pubkey> = match account_keys
-            .iter()
-            .chain(loaded_writable.iter())
-            .chain(loaded_readonly.iter())
-            .map(|s| Pubkey::from_str(s))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(keys) => keys,
-            Err(e) => {
-                warn!("Skipping transaction {signature}: invalid account key: {e}");
-                continue;
-            }
-        };
+        }
 
         // Filter transactions by instance ID if provided
         // Check if any account in the transaction matches the instance ID
@@ -263,12 +329,17 @@ where
             }
         }
 
-        // The filter program id is a hardcoded constant; a parse failure is a
-        // programming error, not a per-transaction condition.
-        let Ok(filter_pubkey) = Pubkey::from_str(filter_program_id) else {
-            error!("Invalid filter program id: {filter_program_id}");
-            return Ok(instructions);
-        };
+        let inner_instructions = tx_with_meta
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.inner_instructions.as_deref());
+        if require_inner_instructions && inner_instructions.is_none() {
+            return Err(malformed(
+                "innerInstructions is null, so a CPI into our program would be invisible"
+                    .to_string(),
+            ));
+        }
+        let inner_instructions_list: &[InnerInstructions] = inner_instructions.unwrap_or(&[]);
 
         // Enumerate before the program-id filter so the index is the instruction's
         // absolute position in the transaction, independent of how many are relevant.
@@ -302,12 +373,12 @@ where
                             debug!("Skipped undecodable instruction for a foreign instance");
                             continue;
                         }
-                        return Err(UndecodableInstruction {
+                        return Err(SlotRejection::Undecodable(UndecodableInstruction {
                             signature: signature.clone(),
                             instruction_index: location.top_level_index,
                             inner_index: location.inner.map(|inner| inner.inner_index),
                             source,
-                        });
+                        }));
                     }
                 }
             }
@@ -355,12 +426,12 @@ where
                             debug!("Skipped undecodable inner instruction for a foreign instance");
                             continue;
                         }
-                        return Err(UndecodableInstruction {
+                        return Err(SlotRejection::Undecodable(UndecodableInstruction {
                             signature: signature.clone(),
                             instruction_index: location.top_level_index,
                             inner_index: location.inner.map(|inner| inner.inner_index),
                             source,
-                        });
+                        }));
                     }
                 }
             }
@@ -377,7 +448,7 @@ mod tests {
         error::ParserError,
         test_utils::{
             escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes},
-            pubkey::test_pubkey,
+            pubkey::{test_pubkey, test_sig},
             rpc_blocks::*,
         },
     };
@@ -426,6 +497,25 @@ mod tests {
         false
     }
 
+    /// Appends a foreign program key, so a fixture can target it with an in-range index.
+    fn with_foreign_program(mut account_keys: Vec<String>) -> Vec<String> {
+        account_keys.push(test_pubkey(99).to_string());
+        account_keys
+    }
+
+    /// Declares one lookup table that loads `writable` and `readonly` addresses, matching meta.loadedAddresses.
+    fn declare_lookups(
+        tx: &mut crate::indexer::datasource::rpc_polling::types::RpcTransactionWithMeta,
+        writable: u8,
+        readonly: u8,
+    ) {
+        tx.transaction.message.address_table_lookups = Some(vec![UiAddressTableLookup {
+            account_key: test_pubkey(77).to_string(),
+            writable_indexes: (0..writable).collect(),
+            readonly_indexes: (0..readonly).collect(),
+        }]);
+    }
+
     /// Wrapper so mock-parser tests keep their shape over the (signature, location, value) result tuple.
     fn parse_for_test(
         block: &RpcBlock,
@@ -439,6 +529,7 @@ mod tests {
             parse_instruction,
             never_excluded,
             escrow_instance_id,
+            false,
         )
         .expect("the mock parsers used here decode every instruction")
         .into_iter()
@@ -513,15 +604,17 @@ mod tests {
         let result = parse_for_test(&block, TEST_PROGRAM_ID, mock_parser, None);
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0], ("sig1".to_string(), 0u32, "data1".to_string()));
-        assert_eq!(result[1], ("sig1".to_string(), 1u32, "data2".to_string()));
-        assert_eq!(result[2], ("sig1".to_string(), 2u32, "data3".to_string()));
+        assert_eq!(result[0], (test_sig("sig1"), 0u32, "data1".to_string()));
+        assert_eq!(result[1], (test_sig("sig1"), 1u32, "data2".to_string()));
+        assert_eq!(result[2], (test_sig("sig1"), 2u32, "data3".to_string()));
     }
 
     #[test]
     fn test_index_is_absolute_position_across_filtered_instructions() {
         let mut block = create_test_block();
-        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        // Key 1 is a foreign program, so instructions naming it resolve but are not ours.
+        let account_keys =
+            with_foreign_program(create_account_keys_with_program(TEST_PROGRAM_ID, 0));
 
         let ix0 = create_instruction(0, vec![], "data0".to_string());
         // Middle instruction targets a different program and is filtered out.
@@ -537,8 +630,8 @@ mod tests {
         let result = parse_for_test(&block, TEST_PROGRAM_ID, mock_parser, None);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ("sig1".to_string(), 0u32, "data0".to_string()));
-        assert_eq!(result[1], ("sig1".to_string(), 2u32, "data2".to_string()));
+        assert_eq!(result[0], (test_sig("sig1"), 0u32, "data0".to_string()));
+        assert_eq!(result[1], (test_sig("sig1"), 2u32, "data2".to_string()));
     }
 
     #[test]
@@ -566,8 +659,8 @@ mod tests {
         let result = parse_for_test(&block, TEST_PROGRAM_ID, mock_parser, None);
 
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ("sig1".to_string(), 0u32, "data1".to_string()));
-        assert_eq!(result[1], ("sig2".to_string(), 0u32, "data2".to_string()));
+        assert_eq!(result[0], (test_sig("sig1"), 0u32, "data1".to_string()));
+        assert_eq!(result[1], (test_sig("sig2"), 0u32, "data2".to_string()));
     }
 
     #[test]
@@ -606,31 +699,159 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0],
-            ("sig_success".to_string(), 0u32, "success".to_string())
+            (test_sig("sig_success"), 0u32, "success".to_string())
         );
         assert_eq!(
             result[1],
-            ("sig_success2".to_string(), 0u32, "success2".to_string())
+            (test_sig("sig_success2"), 0u32, "success2".to_string())
         );
     }
 
-    #[test]
-    fn test_missing_signature_skips_transaction() {
+    /// Parses `tx` alone and returns the malformed-transaction reason, failing if it was accepted.
+    fn malformed_reason(
+        tx: crate::indexer::datasource::rpc_polling::types::RpcTransactionWithMeta,
+    ) -> String {
         let mut block = create_test_block();
-        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
-        let instruction = create_instruction(0, vec![], "test_data".to_string());
+        block.transactions.push(tx);
+        match parse_block_for_program(
+            &block,
+            TEST_PROGRAM_ID,
+            mock_parser,
+            never_excluded,
+            None,
+            false,
+        ) {
+            Err(SlotRejection::Malformed { reason, .. }) => reason,
+            Err(other) => panic!("expected a malformed rejection, got {other}"),
+            Ok(rows) => panic!(
+                "a malformed transaction was accepted with {} rows",
+                rows.len()
+            ),
+        }
+    }
 
-        // Create transaction with empty signatures
-        let mut tx =
-            create_successful_transaction("dummy".to_string(), account_keys, vec![instruction]);
-        tx.transaction.signatures = vec![]; // Clear signatures
+    /// Every structural corruption of a successful transaction fails the whole slot instead
+    /// of dropping the transaction, whether or not it touches our program.
+    #[test]
+    fn malformed_transaction_fails_the_slot() {
+        type Corrupt =
+            fn(&mut crate::indexer::datasource::rpc_polling::types::RpcTransactionWithMeta);
+        let cases: Vec<(&str, Corrupt)> = vec![
+            ("no signature", |tx| tx.transaction.signatures.clear()),
+            ("63-byte signature", |tx| {
+                tx.transaction.signatures = vec![bs58::encode([1u8; 63]).into_string()]
+            }),
+            ("non-base58 signature", |tx| {
+                tx.transaction.signatures = vec!["0OIl".to_string()]
+            }),
+            ("bad account key", |tx| {
+                tx.transaction.message.account_keys[0] = "not a key".to_string()
+            }),
+            ("loaded addresses without a lookup", |tx| {
+                tx.meta.as_mut().unwrap().loaded_addresses = Some(UiLoadedAddresses {
+                    writable: vec![test_pubkey(50).to_string()],
+                    readonly: vec![],
+                })
+            }),
+            ("lookup without its loaded address", |tx| {
+                declare_lookups(tx, 0, 1)
+            }),
+            ("top-level program index out of range", |tx| {
+                tx.transaction.message.instructions[0].program_id_index = 9
+            }),
+            ("top-level account index out of range", |tx| {
+                tx.transaction.message.instructions[0].accounts = vec![9]
+            }),
+            ("inner set names no top-level instruction", |tx| {
+                tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+                    index: 3,
+                    instructions: vec![],
+                }])
+            }),
+            ("inner program index out of range", |tx| {
+                tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+                    index: 0,
+                    instructions: vec![inner(9, "x", 2)],
+                }])
+            }),
+            ("inner account index out of range", |tx| {
+                let mut ix = inner(0, "x", 2);
+                ix.instruction.accounts = vec![9];
+                tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+                    index: 0,
+                    instructions: vec![ix],
+                }])
+            }),
+        ];
 
+        // One transaction of ours and one that never names our program.
+        let ours = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        let foreign =
+            create_account_keys_with_program("DifferentProgram1111111111111111111111111111", 0);
+        for keys in [ours, foreign] {
+            for (name, corrupt) in &cases {
+                let mut tx = create_successful_transaction(
+                    "sig1".to_string(),
+                    keys.clone(),
+                    vec![create_instruction(0, vec![0], "data".to_string())],
+                );
+                corrupt(&mut tx);
+                let reason = malformed_reason(tx);
+                assert!(!reason.is_empty(), "{name}");
+            }
+        }
+    }
+
+    /// The same checks leave a failed transaction alone: it is skipped whatever it holds.
+    #[test]
+    fn malformed_failed_transaction_is_still_skipped() {
+        let mut block = create_test_block();
+        let mut tx = create_failed_transaction(
+            "sig_failed".to_string(),
+            create_account_keys_with_program(TEST_PROGRAM_ID, 0),
+            vec![create_instruction(9, vec![9], "data".to_string())],
+        );
+        tx.transaction.signatures.clear();
         block.transactions.push(tx);
 
-        let result = parse_for_test(&block, TEST_PROGRAM_ID, mock_parser, None);
+        assert!(parse_for_test(&block, TEST_PROGRAM_ID, mock_parser, None).is_empty());
+    }
 
-        // Transaction without signature should be skipped entirely
-        assert!(result.is_empty());
+    /// Escrow requires inner metadata on its own transactions: without it a CPI-only deposit
+    /// is invisible. Withdraw keeps accepting null, since the channel node records none.
+    #[test]
+    fn null_inner_instructions_fail_escrow_but_not_withdraw() {
+        use crate::indexer::datasource::common::parser::withdraw::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID;
+
+        let block_with = |program: &str| {
+            // A foreign top-level call (key 1); the watched program at key 0 could only run as a CPI.
+            let mut tx = create_transaction_incomplete_meta(
+                "sig_cpi_hidden".to_string(),
+                with_foreign_program(create_account_keys_with_program(program, 0)),
+                vec![create_instruction(1, vec![], "foreign".to_string())],
+            );
+            tx.meta.as_mut().unwrap().inner_instructions = None;
+            let mut block = create_test_block();
+            block.transactions.push(tx);
+            block
+        };
+
+        let escrow = block_with(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID);
+        assert!(matches!(
+            decode_slot(&escrow, 7, ProgramType::Escrow, None),
+            Err(SlotRejection::Malformed { .. })
+        ));
+
+        let withdraw = block_with(PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID);
+        assert!(decode_slot(&withdraw, 7, ProgramType::Withdraw, None)
+            .expect("the channel node returns null inner lists for every transaction")
+            .is_empty());
+
+        // An escrow block whose null-inner transaction never names the escrow program is fine.
+        let unrelated = block_with("DifferentProgram1111111111111111111111111111");
+        assert!(decode_slot(&unrelated, 7, ProgramType::Escrow, None)
+            .expect("a transaction that cannot touch escrow needs no inner metadata")
+            .is_empty());
     }
 
     #[test]
@@ -673,10 +894,14 @@ mod tests {
             mock_parser_returns_error,
             never_excluded,
             None,
+            false,
         )
         .expect_err("an undecodable supported instruction must fail the slot");
+        let SlotRejection::Undecodable(failure) = failure else {
+            panic!("expected an undecodable rejection, got {failure}");
+        };
 
-        assert_eq!(failure.signature, signature);
+        assert_eq!(failure.signature, test_sig(signature));
         assert_eq!(failure.instruction_index, 0);
         assert!(
             failure.inner_index.is_none(),
@@ -766,11 +991,11 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(
             result[0],
-            ("sig1".to_string(), 0u32, "at_index_0".to_string())
+            (test_sig("sig1"), 0u32, "at_index_0".to_string())
         );
         assert_eq!(
             result[1],
-            ("sig2".to_string(), 0u32, "at_index_5".to_string())
+            (test_sig("sig2"), 0u32, "at_index_5".to_string())
         );
     }
 
@@ -815,7 +1040,7 @@ mod tests {
             vec![ix],
         ));
 
-        assert_eq!(first_missing_meta(&block), Some("sig_no_meta".to_string()));
+        assert_eq!(first_missing_meta(&block), Some(test_sig("sig_no_meta")));
     }
 
     /// A meta-less transaction with no signature falls back to `tx#<index>` (no panic).
@@ -879,7 +1104,7 @@ mod tests {
             vec![ix],
         ));
 
-        assert_eq!(first_missing_meta(&block), Some("sig_no_meta".to_string()));
+        assert_eq!(first_missing_meta(&block), Some(test_sig("sig_no_meta")));
     }
 
     // ============================================================================
@@ -887,7 +1112,7 @@ mod tests {
     // ============================================================================
 
     use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
-    use solana_transaction_status::UiLoadedAddresses;
+    use solana_transaction_status::{UiAddressTableLookup, UiLoadedAddresses};
 
     fn inner(program_id_index: u8, data: &str, stack_height: u32) -> InnerInstruction {
         InnerInstruction {
@@ -901,7 +1126,9 @@ mod tests {
     fn inner_only_instruction_yields_top_and_inner_index() {
         let mut block = create_test_block();
         // Top-level targets a foreign program (index 1); our program (key index 0) is only invoked via CPI.
-        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        // Key 1 is a foreign program, so instructions naming it resolve but are not ours.
+        let account_keys =
+            with_foreign_program(create_account_keys_with_program(TEST_PROGRAM_ID, 0));
         let foreign = create_instruction(1, vec![], "foreign".to_string());
 
         let mut tx =
@@ -915,13 +1142,19 @@ mod tests {
         }]);
         block.transactions.push(tx);
 
-        let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
-                .expect("the mock parser decodes every instruction");
+        let result = parse_block_for_program(
+            &block,
+            TEST_PROGRAM_ID,
+            mock_parser,
+            never_excluded,
+            None,
+            false,
+        )
+        .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 1);
         let (sig, location, data) = &result[0];
-        assert_eq!(sig, "sig_cpi");
+        assert_eq!(sig, &test_sig("sig_cpi"));
         assert_eq!(location.top_level_index, 0);
         assert_eq!(location.inner.unwrap().inner_index, 1);
         assert_eq!(data, "cpi_deposit_data");
@@ -934,7 +1167,9 @@ mod tests {
         let mut block = create_test_block();
         // Our program at key index 0; the two top-level instructions both target
         // a foreign program (index 1), so neither is indexed at top level.
-        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        // Key 1 is a foreign program, so instructions naming it resolve but are not ours.
+        let account_keys =
+            with_foreign_program(create_account_keys_with_program(TEST_PROGRAM_ID, 0));
         let foreign_0 = create_instruction(1, vec![], "foreign_0".to_string());
         let foreign_1 = create_instruction(1, vec![], "foreign_1".to_string());
 
@@ -955,9 +1190,15 @@ mod tests {
         ]);
         block.transactions.push(tx);
 
-        let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
-                .expect("the mock parser decodes every instruction");
+        let result = parse_block_for_program(
+            &block,
+            TEST_PROGRAM_ID,
+            mock_parser,
+            never_excluded,
+            None,
+            false,
+        )
+        .expect("the mock parser decodes every instruction");
 
         assert_eq!(result.len(), 2);
         // Each CPI deposit is attributed to the top-level instruction it ran under.
@@ -971,7 +1212,9 @@ mod tests {
     #[test]
     fn excluded_inner_discriminator_is_skipped() {
         let mut block = create_test_block();
-        let account_keys = create_account_keys_with_program(TEST_PROGRAM_ID, 0);
+        // Key 1 is a foreign program, so instructions naming it resolve but are not ours.
+        let account_keys =
+            with_foreign_program(create_account_keys_with_program(TEST_PROGRAM_ID, 0));
         let top = create_instruction(1, vec![], "foreign".to_string());
         let mut tx = create_successful_transaction("sig_excl".to_string(), account_keys, vec![top]);
         // Discriminator 7 (ReleaseFunds) is excluded; 6 (Deposit) is indexed.
@@ -998,6 +1241,7 @@ mod tests {
             mock_parser,
             escrow_inner_discriminator_excluded,
             None,
+            false,
         )
         .expect("the mock parser decodes every instruction");
 
@@ -1048,6 +1292,7 @@ mod tests {
             writable: vec![loaded_writable.clone()],
             readonly: vec![loaded_readonly.clone()],
         });
+        declare_lookups(&mut tx, 1, 1);
         block.transactions.push(tx);
 
         let result = parse_block_for_program(
@@ -1056,6 +1301,7 @@ mod tests {
             count_keys_parser,
             never_excluded,
             None,
+            false,
         )
         .expect("the key-counting parser decodes every instruction");
 
@@ -1081,6 +1327,7 @@ mod tests {
             writable: vec![TEST_PROGRAM_ID.to_string()],
             readonly: vec![],
         });
+        declare_lookups(&mut tx, 1, 0);
         tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
             index: 0,
             instructions: vec![InnerInstruction {
@@ -1094,9 +1341,15 @@ mod tests {
         }]);
         block.transactions.push(tx);
 
-        let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
-                .expect("the mock parser decodes every instruction");
+        let result = parse_block_for_program(
+            &block,
+            TEST_PROGRAM_ID,
+            mock_parser,
+            never_excluded,
+            None,
+            false,
+        )
+        .expect("the mock parser decodes every instruction");
 
         assert_eq!(
             result.len(),
@@ -1122,11 +1375,18 @@ mod tests {
             writable: vec![TEST_PROGRAM_ID.to_string()],
             readonly: vec![],
         });
+        declare_lookups(&mut tx, 1, 0);
         block.transactions.push(tx);
 
-        let result =
-            parse_block_for_program(&block, TEST_PROGRAM_ID, mock_parser, never_excluded, None)
-                .expect("the mock parser decodes every instruction");
+        let result = parse_block_for_program(
+            &block,
+            TEST_PROGRAM_ID,
+            mock_parser,
+            never_excluded,
+            None,
+            false,
+        )
+        .expect("the mock parser decodes every instruction");
 
         assert_eq!(
             result.len(),
@@ -1251,6 +1511,7 @@ mod tests {
             writable: vec![PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string()],
             readonly: vec![],
         });
+        declare_lookups(&mut tx, 1, 0);
         // The deposit's event self-CPI, emitted by the ALT-loaded escrow program.
         tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
             index: 0,

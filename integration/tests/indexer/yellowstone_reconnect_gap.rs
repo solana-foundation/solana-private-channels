@@ -21,13 +21,16 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "yellowstone_helpers.rs"]
 mod yellowstone_helpers;
-use yellowstone_helpers::{empty_block, slot_update};
+use yellowstone_helpers::{block_after, empty_block, slot_update};
 
-fn empty_block_json() -> serde_json::Value {
+/// An empty block chained onto `slot - 1`. It also answers the signatures view, so the
+/// escrow gap-fill can confirm it empty.
+fn empty_block_json(slot: u64) -> serde_json::Value {
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
-        "parentSlot": 0,
-        "transactions": []
+        "parentSlot": slot - 1,
+        "transactions": [],
+        "signatures": []
     })
 }
 
@@ -75,7 +78,7 @@ async fn gap_fill_runs_after_drop_stream() {
             .with_body(
                 json!({
                     "jsonrpc": "2.0",
-                    "result": empty_block_json(),
+                    "result": empty_block_json(slot),
                     "id": 1,
                 })
                 .to_string(),
@@ -406,7 +409,9 @@ async fn first_connection_arms_when_startup_backfill_anchored() {
                 json!({"method": "getBlock", "params": [slot]}),
             ))
             .with_status(200)
-            .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string())
+            .with_body(
+                json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1}).to_string(),
+            )
             .expect_at_least(1)
             .create_async()
             .await;
@@ -493,8 +498,8 @@ async fn first_connection_arms_when_startup_backfill_anchored() {
     server.shutdown().await;
 }
 
-/// Blocks are program-filtered, so a quiet program leaves a long stretch between the resume
-/// slot and the first block. Arming on the block would measure idle time and trip the bound.
+/// A long run of skipped slots can separate the resume slot from the next block. Arming on
+/// the block would count those skipped slots as a gap and trip the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quiet_program_arms_on_the_resume_slot_not_the_first_block() {
     let _ = tracing_subscriber::fmt()
@@ -504,7 +509,7 @@ async fn quiet_program_arms_on_the_resume_slot_not_the_first_block() {
 
     const CHECKPOINT: u64 = 100;
     const RESUME: u64 = 103;
-    // Far above the resume slot, as a program left idle for a long stretch would be.
+    // Far above the resume slot; its parent is RESUME, so every slot between was skipped.
     const FIRST_BLOCK: u64 = 5_000;
     // Comfortably smaller than FIRST_BLOCK - CHECKPOINT, so arming there would fail closed.
     const MAX_GAP: u64 = 100;
@@ -530,7 +535,8 @@ async fn quiet_program_arms_on_the_resume_slot_not_the_first_block() {
                 ))
                 .with_status(200)
                 .with_body(
-                    json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string(),
+                    json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1})
+                        .to_string(),
                 )
                 .expect_at_least(1)
                 .create_async()
@@ -574,9 +580,12 @@ async fn quiet_program_arms_on_the_resume_slot_not_the_first_block() {
         .await
         .expect("yellowstone source start");
 
-    // The stream resumes at RESUME, then the program stays silent until FIRST_BLOCK.
+    // The stream resumes at RESUME, and the next block is FIRST_BLOCK.
     server.enqueue(UpdateMatcher, Update::ok(slot_update(RESUME)));
-    server.enqueue(UpdateMatcher, Update::ok(empty_block(FIRST_BLOCK)));
+    server.enqueue(
+        UpdateMatcher,
+        Update::ok(block_after(FIRST_BLOCK, RESUME, vec![])),
+    );
 
     let mut regate: Option<(u64, u64)> = None;
     let mut seen: HashSet<u64> = HashSet::new();
@@ -644,7 +653,8 @@ async fn first_block_still_arms_when_no_slot_update_arrives() {
                 ))
                 .with_status(200)
                 .with_body(
-                    json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string(),
+                    json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1})
+                        .to_string(),
                 )
                 .expect_at_least(1)
                 .create_async()

@@ -10,6 +10,13 @@ pub struct RpcBlock {
     pub transactions: Vec<RpcTransactionWithMeta>,
 }
 
+/// A `getBlock` answer in the signatures view, which lists signatures instead of `transactions`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SignaturesBlock {
+    pub blockhash: String,
+    pub signatures: Vec<String>,
+}
+
 /// Outcome of fetching one slot's block. The domain has three states:
 /// a proven-empty slot is safe to checkpoint past, but a slot the endpoint
 /// cannot serve has unknown contents and must never
@@ -43,6 +50,9 @@ pub struct EncodedMessage {
     #[serde(rename = "accountKeys")]
     pub account_keys: Vec<String>,
     pub instructions: Vec<CompiledInstruction>,
+    /// ALT lookups of a v0 message; absent for legacy and v1, which load no addresses.
+    #[serde(rename = "addressTableLookups", default)]
+    pub address_table_lookups: Option<Vec<solana_transaction_status::UiAddressTableLookup>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
