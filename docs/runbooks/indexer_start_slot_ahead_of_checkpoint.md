@@ -87,8 +87,9 @@ checkpoint and the tip is actually fetched.
 ### 2c. The skip is genuinely intended
 
 If the skipped range is known-empty or its history is deliberately being abandoned, the
-supported path is a destructive resync, which drops the checkpoint and rebuilds from a
-chosen genesis slot under fail-closed channel reconciliation:
+supported path is a destructive resync of that program, which deletes its rows and its
+checkpoint and rebuilds them from a chosen genesis slot under fail-closed channel
+reconciliation. The other program's rows and checkpoint are left untouched:
 
 ```bash
 # Stop every indexer and operator on this database first; resync refuses otherwise.
@@ -102,12 +103,20 @@ Resync takes the live-state lock exclusively and holds it for the whole rebuild,
 refuses to start while any indexer or operator is running, and those refuse to start
 while it runs. Scale them to zero first. Note the guarantee only covers workers running
 a build that takes the lock, so during a rolling upgrade confirm by process, not by the
-refusal alone. Resync also refuses when the reconciliation halt flag is set: resolve and
-clear the halt first, since the rebuild would otherwise drop the table holding it. See
+refusal alone. Resync also refuses when the reconciliation halt flag is set (resolve and
+clear the halt first), and while any row it would delete still has work in flight (run
+the operator until those rows settle, then stop it). See
 [`live_state_lock_runbook.md`](live_state_lock_runbook.md).
 A withdraw resync additionally needs `common.escrow_instance_id` and `--escrow-rpc-url`
 (a Solana RPC), and refuses unless the escrow's withdrawal bitmap is at generation 0 with
-no set bits.
+no set bits and the database holds no `completed` or `failed` withdrawal and no observed
+release. For an escrow resync, choose a genesis slot at or below the instance's first
+deposit: withdrawals are kept, so a later genesis leaves deposits missing and startup
+reconciliation reports the shortfall.
+
+Stop the streamer too and restart it after the resync: rebuilt rows get new ids, so a
+running streamer would re-emit them. If the resync dies part way, workers refuse to start
+until it is re-run to completion (see Symptom 4 of the live-state lock runbook).
 
 Do **not** hand-edit `indexer_state` to make the refusal go away. That is the silent data
 loss the refusal exists to prevent, and it is the same move

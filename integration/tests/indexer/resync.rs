@@ -2,13 +2,13 @@
 //!
 //! Two groups:
 //!
-//! 1. Legacy rebuild behavior (source-RPC only): resync drops the DB, recreates
-//!    the schema, and backfills from a caller-supplied genesis slot.
+//! 1. Legacy rebuild behavior (source-RPC only): resync deletes its own program's
+//!    rows and backfills them from a caller-supplied genesis slot.
 //! 2. Reconcile-on-rebuild: with a PrivateChannel RPC configured via
 //!    `.with_channel_reconcile(...)`, resync builds a consumed-set from the
-//!    channel BEFORE dropping tables (fail closed) and rebuilds each already
+//!    channel BEFORE deleting rows (fail closed) and rebuilds each already
 //!    serviced deposit/remint in its terminal state instead of `pending`. All
-//!    pre-flight runs before the drop, so any abort leaves the live DB intact.
+//!    pre-flight runs before the delete, so any abort leaves the live DB intact.
 //!
 //! The channel is scripted with `test_utils::mock_rpc::{MockRpcServer, Reply}`;
 //! real escrow/withdraw events are produced on a `solana-test-validator` so the
@@ -45,6 +45,7 @@ use private_channel_indexer::{
     },
     storage::{
         common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
+        common::storage::resync_state::resync_halt_reason,
         PostgresDb, Storage,
     },
     PostgresConfig,
@@ -78,8 +79,10 @@ use tokio_util::sync::CancellationToken;
 /// that the fill is still running well after the lock is pulled, and recent enough
 /// that every block in the range is retrievable.
 const BACKFILL_SPAN_SLOTS: u64 = 300;
+/// Finalized slots the mid-rebuild loss test waits for, so its fill is not over in one heartbeat.
+const MIN_FILL_SLOTS: u64 = 40;
 
-/// Upper bound for a full resync (drop + schema + backfill + drain).
+/// Upper bound for a full resync (wipe + backfill + drain).
 const RESYNC_TIMEOUT_SECS: u64 = 180;
 /// Resync run attempts: the one-shot backfill can hit a transient `getBlock`
 /// -32004 near the finalized edge; each retry re-runs the whole resync (including
@@ -611,19 +614,161 @@ async fn status_of(db_url: &str, key: &RowKey) -> RowStatus {
 }
 
 async fn seed_pending_deposit(db_url: &str, signature: &str) {
+    seed_tx(db_url, signature, "deposit", "pending").await;
+}
+
+/// Insert one row of `ty` in `status`; a withdrawal takes its nonce from the sequence.
+async fn seed_tx(db_url: &str, signature: &str, ty: &str, status: &str) -> i64 {
     let pool = fresh_pool(db_url).await;
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
           transaction_type, status, created_at, updated_at)
          VALUES ($1, 1, 'seed', 'seed', 'seed_mint', 100,
-                 'deposit'::transaction_type, 'pending'::transaction_status,
-                 NOW(), NOW())",
+                 $2::transaction_type, $3::transaction_status, NOW(), NOW())
+         RETURNING id",
     )
+    .bind(signature)
+    .bind(ty)
+    .bind(status)
+    .fetch_one(&pool)
+    .await
+    .expect("seed transaction")
+}
+
+/// Journal one broadcast attempt for `tx_id` in `table`.
+async fn seed_journal(db_url: &str, table: &str, tx_id: i64, signature: &str) {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query(&format!(
+        "INSERT INTO {table} (transaction_id, signature, last_valid_block_height) VALUES ($1, $2, 1)"
+    ))
+    .bind(tx_id)
     .bind(signature)
     .execute(&pool)
     .await
-    .expect("seed pending deposit");
+    .expect("seed journal");
+}
+
+async fn seed_sql(db_url: &str, sql: &str) {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query(sql).execute(&pool).await.expect("seed sql");
+}
+
+/// Paid, reminted and in-flight withdrawals with journals, an observed release and a checkpoint.
+async fn seed_withdrawal_side(db_url: &str) {
+    seed_tx(db_url, "wd-paid", "withdrawal", "completed").await;
+    seed_tx(db_url, "wd-reminted", "withdrawal", "failed_reminted").await;
+    let live = seed_tx(db_url, "wd-live", "withdrawal", "processing").await;
+    seed_journal(
+        db_url,
+        "pending_release_signatures",
+        live,
+        "wd-live-attempt",
+    )
+    .await;
+    let remint = seed_tx(db_url, "wd-remint", "withdrawal", "pending_remint").await;
+    seed_journal(
+        db_url,
+        "pending_remint_signatures",
+        remint,
+        "wd-remint-attempt",
+    )
+    .await;
+    seed_sql(
+        db_url,
+        "INSERT INTO observed_releases (withdrawal_nonce, signature, slot) VALUES (0, 'obs-0', 5)",
+    )
+    .await;
+    seed_sql(
+        db_url,
+        "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('withdraw', 222)",
+    )
+    .await;
+}
+
+/// A deposit, a mints row and the escrow checkpoint.
+async fn seed_escrow_side(db_url: &str) {
+    seed_tx(db_url, "dep-seed", "deposit", "completed").await;
+    seed_sql(db_url, "INSERT INTO mints (mint_address, decimals, token_program) VALUES ('seed_mint', 6, 'token')").await;
+    seed_sql(
+        db_url,
+        "INSERT INTO indexer_state (program_type, last_committed_slot) VALUES ('escrow', 111)",
+    )
+    .await;
+}
+
+/// Everything a resync of the other program must leave alone, as comparable text.
+async fn side_fingerprint(db_url: &str, ty: &str) -> Vec<String> {
+    let pool = fresh_pool(db_url).await;
+    let mut out: Vec<String> = sqlx::query_scalar(
+        "SELECT t.signature || '|' || t.status::text || '|' || COALESCE(t.withdrawal_nonce::text, '-')
+                || '|' || COALESCE((SELECT string_agg(signature, ',' ORDER BY signature)
+                                    FROM pending_release_signatures WHERE transaction_id = t.id), '-')
+                || '|' || COALESCE((SELECT string_agg(signature, ',' ORDER BY signature)
+                                    FROM pending_remint_signatures WHERE transaction_id = t.id), '-')
+         FROM transactions t WHERE t.transaction_type::text = $1 ORDER BY t.signature",
+    )
+    .bind(ty)
+    .fetch_all(&pool)
+    .await
+    .expect("rows");
+    let program = if ty == "deposit" {
+        "escrow"
+    } else {
+        "withdraw"
+    };
+    let checkpoint: Option<i64> =
+        sqlx::query_scalar("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
+            .bind(program)
+            .fetch_optional(&pool)
+            .await
+            .expect("checkpoint")
+            .flatten();
+    out.push(format!("checkpoint={checkpoint:?}"));
+    if ty == "deposit" {
+        let mints: Vec<String> = sqlx::query_scalar("SELECT mint_address FROM mints ORDER BY 1")
+            .fetch_all(&pool)
+            .await
+            .expect("mints");
+        out.push(format!("mints={mints:?}"));
+    } else {
+        let seq: i64 = sqlx::query_scalar("SELECT last_value FROM withdrawal_nonce_seq")
+            .fetch_one(&pool)
+            .await
+            .expect("seq");
+        let observed: Vec<i64> =
+            sqlx::query_scalar("SELECT withdrawal_nonce FROM observed_releases ORDER BY 1")
+                .fetch_all(&pool)
+                .await
+                .expect("observed");
+        out.push(format!("seq={seq} observed={observed:?}"));
+    }
+    out
+}
+
+async fn marker(db_url: &str) -> Option<String> {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query_scalar("SELECT program_type FROM resync_state")
+        .fetch_optional(&pool)
+        .await
+        .expect("marker read")
+}
+
+/// The active halt's reason, or `None` when no halt is set.
+async fn active_halt(db_url: &str) -> Option<String> {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query_scalar("SELECT reason FROM reconciliation_halt WHERE id = TRUE AND halted")
+        .fetch_optional(&pool)
+        .await
+        .expect("halt read")
+}
+
+async fn deposit_count(db_url: &str) -> i64 {
+    let pool = fresh_pool(db_url).await;
+    sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit'")
+        .fetch_one(&pool)
+        .await
+        .expect("count deposits")
 }
 
 async fn mint_row_count(db_url: &str, mint: &str) -> i64 {
@@ -756,9 +901,9 @@ impl Harness {
 // Legacy rebuild behavior (source-RPC only)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// ResyncService drops all DB tables, recreates the schema, then runs a short
-/// backfill (genesis_slot ~= current_slot -> very few slots to process).
-/// After `run()` returns `Ok`, the transactions table must be empty.
+/// An escrow resync deletes its deposits and rebuilds them from a short backfill
+/// (genesis_slot ~= current_slot), while every withdrawal, nonce, journal, observed
+/// release and the withdraw checkpoint survive untouched, even with work in flight.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error::Error>> {
     let (test_validator, _faucet) = start_test_validator_no_geyser().await;
@@ -793,15 +938,28 @@ async fn test_resync_clears_db_and_returns_ok() -> Result<(), Box<dyn std::error
         client.get_slot()?
     };
 
+    seed_withdrawal_side(&db_url).await;
+    let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
+
     let service = make_resync_service(rpc_url.clone(), storage);
     run_resync(&service, current_slot)
         .await
         .expect("resync should succeed");
 
     assert_eq!(
-        row_count(&db_url).await,
+        deposit_count(&db_url).await,
         0,
-        "Transactions table must be empty after resync"
+        "the seeded deposit must be deleted"
+    );
+    assert_eq!(
+        side_fingerprint(&db_url, "withdrawal").await,
+        withdrawals,
+        "an escrow resync must not touch the withdrawal side"
+    );
+    assert_eq!(
+        marker(&db_url).await,
+        None,
+        "a finished resync clears its marker"
     );
     Ok(())
 }
@@ -1676,8 +1834,16 @@ async fn resync_reclassifies_failed_reminted_withdrawal() -> Result<(), Box<dyn 
     let wd = withdrawals[0].clone();
 
     let landed = Signature::new_unique();
+    // Escrow data a withdraw resync cannot rebuild, so it must come through untouched.
+    seed_escrow_side(&db_url).await;
+    let deposits = side_fingerprint(&db_url, "deposit").await;
     script_channel_consumed(&mock, &[(&wd, ConsumedMintKind::Remint, landed)]);
     h.run().await.expect("resync should succeed");
+    assert_eq!(
+        side_fingerprint(&db_url, "deposit").await,
+        deposits,
+        "a withdraw resync must not touch the escrow side"
+    );
 
     let st = status_of(&db_url, &wd).await;
     assert_eq!(
@@ -2042,6 +2208,10 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
 
     seed_pending_deposit(&db_url, "resync_lock_lost_seed").await;
 
+    // A fresh validator has only a few slots, and the wipe no longer rebuilds the schema,
+    // so wait for enough finalized slots that the fill outlasts a few heartbeats.
+    wait_for_finalized_slot(&rpc_url, MIN_FILL_SLOTS).await;
+
     let current_slot = {
         let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
         client.get_slot()?
@@ -2062,7 +2232,7 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
         BackfillConfig {
             enabled: true,
             exit_after_backfill: true,
-            rpc_url,
+            rpc_url: rpc_url.clone(),
             batch_size: 1,
             max_gap_slots: u64::MAX,
             start_slot: None,
@@ -2071,13 +2241,13 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
     )
     .with_lock_heartbeat_interval(Duration::from_millis(5));
 
-    // Pull the lock the moment the seeded row is gone, which is the drop landing. One
+    // Pull the lock the moment the seeded row is gone, which is the wipe landing. One
     // pool for the whole task, since opening a fresh one per poll would cost more than
     // the window being aimed at.
     let killer_url = db_url.clone();
     let killer = tokio::spawn(async move {
         let pool = fresh_pool(&killer_url).await;
-        // Bounded, so a resync that failed before the drop fails this test instead of
+        // Bounded, so a resync that failed before the wipe fails this test instead of
         // hanging it: nothing would ever clear the seed.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while seeded_rows_remain(&pool).await {
@@ -2108,15 +2278,206 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
     // thing that must never survive a lost lock. Every phase of the rebuild is watched
     // for exactly this reason, including the flush that runs after the fill returns.
     let pool = fresh_pool(&db_url).await;
-    let committed: Option<i64> =
-        sqlx::query_scalar("SELECT last_committed_slot FROM indexer_state LIMIT 1")
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten();
+    let committed: Option<i64> = sqlx::query_scalar(
+        "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'escrow'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
     assert!(
         committed.is_none_or(|slot| slot <= genesis_slot as i64),
         "a lost lock must not leave a durable frontier over a half-rebuilt database, got {committed:?}"
     );
+
+    // The lock is gone, so the marker (new workers) and the halt (older operators) keep them off.
+    assert_eq!(marker(&db_url).await.as_deref(), Some("escrow"));
+    assert_eq!(
+        active_halt(&db_url).await,
+        Some(resync_halt_reason(ProgramType::Escrow))
+    );
+    assert!(matches!(
+        new_storage(&db_url)
+            .await
+            .ensure_no_unfinished_resync()
+            .await,
+        Err(StorageError::UnfinishedResync { .. })
+    ));
+
+    // A rerun of the same program finishes the rebuild and clears it.
+    let current_slot = {
+        let client = solana_client::rpc_client::RpcClient::new(rpc_url.clone());
+        client.get_slot()?
+    };
+    let rerun = make_resync_service(rpc_url, new_storage(&db_url).await);
+    run_resync(&rerun, current_slot)
+        .await
+        .expect("a same-program rerun must finish the interrupted resync");
+    assert_eq!(marker(&db_url).await, None);
+    assert_eq!(
+        active_halt(&db_url).await,
+        None,
+        "the rerun clears its own halt"
+    );
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Pre-wipe gates: refusals that must land before any RPC and any delete
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Every RPC points at a dead port, so a refusal that is not the gate's surfaces as an RPC error.
+fn dead_rpc_service(storage: Arc<Storage>, program: ProgramType) -> ResyncService {
+    const DEAD: &str = "http://127.0.0.1:1";
+    let rpc_poller = Arc::new(RpcPoller::new(
+        DEAD.to_string(),
+        UiTransactionEncoding::Json,
+        CommitmentLevel::Finalized,
+    ));
+    let backfill_config = BackfillConfig {
+        enabled: true,
+        exit_after_backfill: true,
+        rpc_url: DEAD.to_string(),
+        batch_size: 50,
+        max_gap_slots: u64::MAX,
+        start_slot: None,
+    };
+    ResyncService::new(
+        storage,
+        rpc_poller,
+        program,
+        backfill_config,
+        Some(Pubkey::new_unique()),
+    )
+    .with_withdrawal_bitmap_rpc(DEAD.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Refusal {
+    Unsettled,
+    ReleaseEvidence,
+    OtherMarker,
+}
+
+/// IT-G1: each unsafe state refuses before any RPC, and leaves both programs' data and
+/// the marker exactly as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn std::error::Error>> {
+    let (db_url, _storage, _container) = start_postgres_for_resync("resync_gates").await?;
+    let cases: [(&str, ProgramType, Refusal); 8] = [
+        (
+            "withdraw: processing withdrawal",
+            ProgramType::Withdraw,
+            Refusal::Unsettled,
+        ),
+        (
+            "withdraw: journaled pending withdrawal",
+            ProgramType::Withdraw,
+            Refusal::Unsettled,
+        ),
+        (
+            "withdraw: pending remint",
+            ProgramType::Withdraw,
+            Refusal::Unsettled,
+        ),
+        (
+            "escrow: processing deposit",
+            ProgramType::Escrow,
+            Refusal::Unsettled,
+        ),
+        (
+            "escrow: journaled pending deposit",
+            ProgramType::Escrow,
+            Refusal::Unsettled,
+        ),
+        (
+            "withdraw: failed withdrawal",
+            ProgramType::Withdraw,
+            Refusal::ReleaseEvidence,
+        ),
+        (
+            "withdraw: observed release",
+            ProgramType::Withdraw,
+            Refusal::ReleaseEvidence,
+        ),
+        (
+            "escrow: withdraw resync unfinished",
+            ProgramType::Escrow,
+            Refusal::OtherMarker,
+        ),
+    ];
+    for (i, (case, program, expected)) in cases.into_iter().enumerate() {
+        seed_sql(
+            &db_url,
+            "TRUNCATE transactions, observed_releases, resync_state, indexer_state, mints CASCADE",
+        )
+        .await;
+        match i {
+            0 => {
+                seed_tx(&db_url, "w", "withdrawal", "processing").await;
+            }
+            1 => {
+                let id = seed_tx(&db_url, "w", "withdrawal", "pending").await;
+                seed_journal(&db_url, "pending_release_signatures", id, "w-attempt").await;
+            }
+            2 => {
+                seed_tx(&db_url, "w", "withdrawal", "pending_remint").await;
+            }
+            3 => {
+                seed_tx(&db_url, "d", "deposit", "processing").await;
+            }
+            4 => {
+                let id = seed_tx(&db_url, "d", "deposit", "pending").await;
+                seed_journal(&db_url, "pending_release_signatures", id, "d-attempt").await;
+            }
+            5 => {
+                seed_tx(&db_url, "w", "withdrawal", "failed").await;
+            }
+            6 => {
+                seed_sql(&db_url, "INSERT INTO observed_releases (withdrawal_nonce, signature, slot) VALUES (4, 'o', 1)").await;
+            }
+            _ => {
+                seed_escrow_side(&db_url).await;
+                seed_sql(
+                    &db_url,
+                    "INSERT INTO resync_state (program_type) VALUES ('withdraw')",
+                )
+                .await;
+            }
+        }
+        let deposits = side_fingerprint(&db_url, "deposit").await;
+        let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
+        let before = marker(&db_url).await;
+
+        let result = dead_rpc_service(new_storage(&db_url).await, program)
+            .run(0)
+            .await;
+        let got = match &result {
+            Err(IndexerError::Reconciliation(ReconciliationError::UnsettledWork)) => {
+                Refusal::Unsettled
+            }
+            Err(IndexerError::Reconciliation(ReconciliationError::ReleaseEvidenceRecorded {
+                ..
+            })) => Refusal::ReleaseEvidence,
+            Err(IndexerError::Storage(StorageError::UnfinishedResync { program }))
+                if program == "withdraw" =>
+            {
+                Refusal::OtherMarker
+            }
+            other => panic!("{case}: expected {expected:?}, got {other:?}"),
+        };
+        assert_eq!(got, expected, "{case}");
+        assert_eq!(
+            side_fingerprint(&db_url, "deposit").await,
+            deposits,
+            "{case}"
+        );
+        assert_eq!(
+            side_fingerprint(&db_url, "withdrawal").await,
+            withdrawals,
+            "{case}"
+        );
+        assert_eq!(marker(&db_url).await, before, "{case}");
+    }
     Ok(())
 }

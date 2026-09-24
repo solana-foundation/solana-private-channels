@@ -103,7 +103,10 @@ raising the start slot.
 
 ### Resync and the live-state lock
 
-`resync` drops every table and rebuilds from chain, so it is guarded three ways.
+`resync` deletes the rows of one program (escrow: deposits, `mints` and its checkpoint;
+withdraw: withdrawals, the nonce sequence and its checkpoint) and rebuilds them from chain.
+It never touches the other program's rows, journals, nonces or checkpoint, because it
+cannot rebuild them. It is guarded these ways.
 
 1. **`--destroy-existing-data` is required.** No environment variable binding, so it
    cannot be left switched on in a deployment's env file.
@@ -119,9 +122,22 @@ raising the start slot.
    proof and stops the role at once. The indexer and operator also increment
    `private_channel_live_state_lock_lost_total{role,reason}`, while resync, being a
    one-shot command with no metrics server, reports it as a failed command instead.
-3. **The reconciliation halt flag.** The rebuild drops the table that flag lives in, so
-   resync refuses while a halt is set rather than clearing an unresolved one and
-   destroying the evidence behind it.
+3. **The reconciliation halt flag.** A halt means custody and the ledger disagree, so
+   resync refuses while one is set rather than rebuilding over the evidence behind it.
+4. **Nothing it deletes may be in flight.** A row of its own program that is
+   `processing`, `pending_remint` or `manual_review`, or a non-terminal row with a
+   broadcast journal, refuses the resync: deleting the journal would let the rebuilt row
+   be sent again. Run the operator until the rows settle, stop it, then retry.
+5. **A withdraw resync needs proof no nonce was spent.** It restarts the nonce sequence, so
+   it refuses on any `completed` or `failed` withdrawal, any `observed_releases` row, or a
+   bitmap that has advanced or cannot be read.
+6. **An unfinished resync blocks every worker.** The delete writes a `resync_state` row and
+   sets the reconciliation halt with a resync reason, in the same transaction; only a
+   rebuild that completes clears both (on the lock's own session, and the halt only if its
+   reason is still the resync's). A resync that dies after the delete leaves both, so
+   indexers and operators refuse to start, and operators built before the marker stop
+   fetching because of the halt, until the same program's resync is rerun to completion.
+   A resync refuses under any halt except its own next to its own marker.
 
 The lock session sets its own TCP keepalives, so a holder whose host vanishes is reaped
 by Postgres in under two minutes instead of the OS default of roughly two hours. Without
@@ -129,6 +145,11 @@ that, one dead worker host would refuse every resync for that long with nothing 
 
 Only workers running a build that takes the lock are visible to the refusal, so during
 a rolling upgrade confirm they are stopped by process, not by the refusal alone.
+Operators from a build older than the `resync_state` marker still stop on its halt. An
+older indexer can still start, but it moves no value, and the resync rerun (which needs it
+stopped) rebuilds its rows. Only builds older than the live-state lock are fully
+unprotected, and those are already excluded above. Stop the streamer during a
+resync and restart it after: rebuilt rows get new ids, so a running streamer would re-emit them.
 Session-level advisory locks also do not survive a pooler in transaction-pooling mode,
 the same constraint the sender's singleton lock already carries.
 

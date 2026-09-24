@@ -149,6 +149,17 @@ pub struct HaltInfo {
     pub halted_at: DateTime<Utc>,
 }
 
+/// What a resync reads before wiping its program's rows; each flag is a reason it may refuse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResyncBlockers {
+    /// A row of the resync's own type has an attempt that may still be in flight.
+    pub unsettled_work: bool,
+    /// A withdrawal is `failed`, so a release for it may still have landed.
+    pub failed_withdrawals: bool,
+    /// The escrow indexer recorded a release, so some nonce is already spent.
+    pub observed_releases: bool,
+}
+
 /// Per-mint sum of every in-flight (unsettled) transaction amount. This bounds
 /// the maximum transient balance swing reconciliation may observe, so a gap
 /// larger than it cannot be explained by pending work alone.

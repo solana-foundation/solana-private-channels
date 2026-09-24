@@ -154,7 +154,7 @@ enum Mode {
         /// refuses to run without it so it cannot rebuild without fail-closed reconciliation.
         #[arg(long)]
         channel_rpc_url: Option<String>,
-        /// Acknowledge that this drops every table and rebuilds from chain. Required.
+        /// Acknowledge that this deletes this program's rows and rebuilds them. Required.
         /// Deliberately not bound to an environment variable, so it cannot be left
         /// switched on in a deployment's env file.
         #[arg(long)]
@@ -477,9 +477,11 @@ async fn run_resync(
     // opening the database. The live-state lock is the real guard; this only makes the
     // destruction something the operator had to ask for by name.
     if !destroy_existing_data {
-        return Err("resync drops every table and rebuilds from chain; pass \
+        return Err(
+            "resync deletes this program's rows and rebuilds them from chain; pass \
                     --destroy-existing-data to confirm"
-            .into());
+                .into(),
+        );
     }
 
     tracing_subscriber::fmt()

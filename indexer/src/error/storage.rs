@@ -17,4 +17,11 @@ pub enum StorageError {
     /// Ownership of a live-state lock we already hold stopped being provable.
     #[error("live-state lock ownership could not be proven")]
     LiveStateLockLost,
+
+    /// A resync deleted rows and did not finish rebuilding them, so the database is incomplete.
+    #[error(
+        "an unfinished {program} resync owns this database; rerun resync for {program} \
+         before starting workers (see docs/runbooks/live_state_lock_runbook.md)"
+    )]
+    UnfinishedResync { program: String },
 }

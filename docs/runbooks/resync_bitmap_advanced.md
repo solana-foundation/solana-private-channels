@@ -31,6 +31,22 @@ That one is `ReconciliationError::WithdrawalNoncesReleased`. It is the same
 refusal as an advanced bitmap, reached from local evidence rather than from the
 chain, and no RPC answer can clear it.
 
+Another local refusal fires when the database holds `failed` withdrawals or any
+`observed_releases` row, also before any RPC:
+
+```
+the database records failed withdrawals, so a release may already have spent a
+nonce; a withdraw resync would restart the nonce sequence under it. Aborted before
+any delete. See docs/runbooks/resync_bitmap_advanced.md
+```
+
+(`observed releases` in place of `failed withdrawals` for the second case.) That
+one is `ReconciliationError::ReleaseEvidenceRecorded`. A `failed` withdrawal can
+still have a landed release (the operator's boot bitmap check repairs exactly that
+case), and an observed release is the escrow indexer's own proof that a nonce was
+paid. Neither can be cleared by an RPC answer, so treat it like
+`WithdrawalNoncesReleased`.
+
 A third refusal fires when the bitmap could not be read at all:
 
 ```
@@ -54,13 +70,13 @@ Two of its reasons are about the RPC endpoint rather than the bitmap account:
 
 **Nothing has been destroyed.** The bitmap is read in the same fail-closed
 pre-flight block as the genesis-slot, channel-reachability and memo-scheme
-checks, all of which run before the resync drops anything. The database is
+checks, all of which run before the resync deletes anything. The database is
 exactly as it was. There is no data loss to recover from and no rush.
 
 ## Why the resync refuses rather than continuing
 
-A resync drops every indexer table and recreates the schema, which recreates
-`withdrawal_nonce_seq` starting at 0. The on-chain withdrawal bitmap is not
+A withdraw resync deletes every withdrawal row and restarts `withdrawal_nonce_seq`
+at 0. The on-chain withdrawal bitmap is not
 touched: it keeps its generation and every bit already set. Rebuilt withdrawals
 would then be numbered against nonces the chain has already spent, and two
 things break:
@@ -85,9 +101,10 @@ chain has issued a nonce.
 It takes two independent proofs, in that order, so a wrong answer from one cannot
 open the gate on its own:
 
-1. **The database's own completed withdrawals.** A `completed` withdrawal row is
-   this indexer's record that the chain released that nonce. No RPC answer can
-   contradict it, so this runs first and needs no network at all.
+1. **The database's own release evidence.** A `completed` or `failed` withdrawal,
+   or an `observed_releases` row, is this database's record that a nonce may have
+   been released. No RPC answer can contradict it, so this runs first and needs no
+   network at all.
 2. **The bitmap, read at a tip proven fresh.** The check reads the node's
    finalized tip, refuses if that tip's block time is more than 120 seconds
    behind wall clock, and then reads the bitmap bound to that exact slot with
@@ -100,7 +117,7 @@ open the gate on its own:
 Aligning the rebuilt rows with the chain would mean assigning each rebuilt
 withdrawal the nonce the chain already released it under. Nothing in the source
 history records that mapping: the nonce was assigned by the database at the
-time, and the database is what the resync is about to destroy. Any renumbering
+time, and those rows are what the resync is about to delete. Any renumbering
 scheme would be guessing which withdrawal a set bit belongs to, and a wrong
 guess is silent. A withdrawal attributed to the wrong nonce looks fully
 reconciled while paying, or refusing to pay, the wrong user.
@@ -121,8 +138,8 @@ solana account <BITMAP_PDA> --url <ESCROW_RPC> --output json
 If the account is at generation 0 with no set bits and the resync still refused,
 either the RPC is serving stale or wrong state, or the database holds completed
 withdrawals whose bits a rotation has since cleared. Check which refusal fired:
-`WithdrawalNoncesReleased` is the local one and names a row count, and no change
-of endpoint will clear it. For the others, point `--escrow-rpc-url` at a node at
+`WithdrawalNoncesReleased` and `ReleaseEvidenceRecorded` are the local ones, and
+no change of endpoint will clear them. For the others, point `--escrow-rpc-url` at a node at
 the live tip and rerun before doing anything else.
 
 ### 2. Do not resync; stand up a fresh instance
@@ -158,8 +175,8 @@ that plan exists.
   consistency check would still be comparing rows against bits set under the
   old numbering, and the rows in between would be unattributable.
 - **Do not remove or bypass the pre-flight.** It is the only check that reads
-  chain-side withdrawal state before the drop. Without it the resync destroys the
-  database and discovers the problem at the first release.
+  chain-side withdrawal state before the delete. Without it the resync deletes the
+  withdrawals and discovers the problem at the first release.
 - **Do not resync without `--escrow-rpc-url` configured** hoping the check is
   skipped. It is not; an unreadable bitmap refuses the same way.
 - **Do not point `--escrow-rpc-url` at a lagging node** to get an empty bitmap

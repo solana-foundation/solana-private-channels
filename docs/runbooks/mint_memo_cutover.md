@@ -17,7 +17,7 @@ cutover - drain the operator and follow the cutover runbook
 
 The error surfaces as `ReconciliationError::ConsumedSetUnavailable`.
 
-**Nothing has been destroyed.** The consumed-set is built before the resync drops
+**Nothing has been destroyed.** The consumed-set is built before the resync deletes
 any state, so the abort leaves the database exactly as it was. There is no data
 loss to recover from and no rush.
 

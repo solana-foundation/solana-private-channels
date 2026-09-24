@@ -5,7 +5,8 @@ database. Every indexer and operator takes one Postgres advisory key in **shared
 mode for its whole life; `resync` takes the same key in **exclusive** mode. Postgres
 enforces the rest: workers coexist freely, and the two sides can never overlap.
 
-This runbook covers the two refusals it produces and the alert for losing it.
+This runbook covers the refusals it produces, the unfinished-resync marker that backs it
+up, and the alert for losing it.
 
 As with every runbook here, any recovery SQL is **bookkeeping, not fund movement** -
 see [`README.md`](README.md).
@@ -21,9 +22,9 @@ rebuilding this database; refusing to start
 
 (The operator logs the same line with `Operator refusing to start`.)
 
-**This is correct behaviour, not a fault.** A resync is dropping and rebuilding the
-tables this process would write to. Starting anyway would write rows into tables that
-are about to be dropped, and advance a checkpoint over slots that no longer exist.
+**This is correct behaviour, not a fault.** A resync is deleting and rebuilding rows
+this process would act on. Starting anyway would write rows the resync is about to
+delete, and advance a checkpoint over slots that are not rebuilt yet.
 
 **Action:** wait for the resync to finish, then let orchestration restart the worker.
 Confirm a resync really is running:
@@ -62,18 +63,65 @@ and re-run. If a holder outlives it, confirm the pid against
 ## Symptom 3: resync refuses because of a reconciliation halt
 
 ```
-reconciliation halt is set (<reason>); resync would erase it, so resolve and clear
-the halt first
+reconciliation halt is set (<reason>); a rebuild would hide the evidence behind it,
+so resolve and clear the halt first
 ```
 
-The halt flag lives in a table the rebuild drops, so resyncing now would silently
-clear an unresolved solvency halt and destroy the ledger evidence behind it.
+A halt means custody and the ledger disagree. Rebuilding the ledger now would bury the
+evidence of why, before anyone has worked out what went wrong.
 
 **Action:** work the halt to a conclusion first via
 [`reconciliation_halt_runbook.md`](reconciliation_halt_runbook.md), clear the flag,
 then resync. There is deliberately no override flag.
 
-## Symptom 4: `live-state-lock-lost` alert
+## Symptom 4: a worker or resync refuses because a resync did not finish
+
+```
+Indexer refusing to start: an unfinished <program> resync owns this database; rerun
+resync for <program> before starting workers
+```
+
+(The operator logs the same line with `Operator refusing to start`. A resync of the other
+program refuses with the same message.)
+
+A resync deletes its program's rows and, in the same transaction, writes a
+`resync_state` row and sets the reconciliation halt with the reason `unfinished
+<program> resync: rerun resync for <program>; do not clear this halt by hand`. The
+halt is what stops operators built before the marker: they still skip fetching
+while a halt is set. Only a rebuild that completes clears both, again in one
+transaction on the lock session, and it clears the halt only if the reason is
+still its own. The row survives the resync
+process, so its presence means a resync died after deleting rows: a crash, an OOM, a lost
+lock, or a connection that failed at COMMIT. The rows it deleted are not rebuilt, and a
+worker starting now would mint or release against a half-built ledger.
+
+**Action:** re-run `resync` for the named program, with the same arguments, until it
+completes. The rerun deletes and rebuilds that program's rows again from scratch, and
+clears the row and its halt only when it finishes. Do not delete the `resync_state` row
+or clear that halt by hand: that is exactly what lets a worker start on the half-built
+rows. If the halt reason has been replaced (an older operator's reconciliation tripped
+meanwhile), the rerun refuses; work that halt through the reconciliation halt runbook
+first, clear it, then rerun.
+
+## Symptom 5: resync refuses because work is still in flight
+
+```
+rows this resync would rebuild are still processing, pending remint, in manual review,
+or have unsettled broadcast journals; run the operator until they settle, stop it, then
+retry
+```
+
+A row of the resyncing program has a mint, remint or release that may still land. The
+resync deletes the row's broadcast journal, so a transaction landing after the resync
+reads the chain would leave the rebuilt row `pending` and be sent again.
+
+**Action:** start the operator for that program and let recovery settle the rows until
+none is `processing` or `pending_remint` and every journaled row reaches a terminal
+status. Work any `manual_review` row to a conclusion. Then stop every worker and re-run the resync. There
+is no override. Rows of the other program never block it: the resync leaves them, and
+their journals, untouched.
+
+## Symptom 6: `live-state-lock-lost` alert
 
 `private_channel_live_state_lock_lost_total` increased. A role could not prove it
 still owns the lock, so it stopped itself. `role` is `indexer` or `operator`;
@@ -88,13 +136,13 @@ long, and no longer: the 30s is an upper bound, not an approximation.
 
 A role that loses the lock stops without draining and exits non-zero, so its supervisor
 restarts it. That is deliberate. Postgres frees the lock the moment the session dies, so
-a resync may already be dropping these tables, and a drain would keep writing into them.
+a resync may already be deleting these rows, and a drain would keep writing into them.
 Nothing is lost that an abrupt restart would not also lose: the durable checkpoint stands
 and the role replays from it once the resync has finished and the lock is free again.
 
 Resync stops on the same verdict but cannot page here: it is a one-shot command with
 no metrics server, so a losing resync surfaces as a failed command with the error in
-its output. Treat that the same way as Symptom 4 below, then re-run it.
+its output. Treat that the same way as this symptom, then re-run it.
 
 A session-scoped advisory lock dies with its session, so this means the session went
 away while the process kept running. Establish the database-side cause, in order:
@@ -109,5 +157,6 @@ away while the process kept running. Establish the database-side cause, in order
 
 **Mitigation:** normally none for a worker; the restart is the mitigation and one
 isolated firing after a failover is expected. A resync that reported the same verdict
-aborted partway and left the database half rebuilt: re-run it to completion. The chain
-is still the source of truth, so a rerun recovers it.
+aborted partway and left the database half rebuilt, with the `resync_state` marker set
+(Symptom 4): re-run it to completion. The chain is still the source of truth, so a rerun
+recovers it.

@@ -73,6 +73,8 @@ git commit -m "refactor(lib): simplify token validation logic"
 
 All contributions must pass CI/CD checks before requesting a review. The project uses GitHub Actions for continuous integration and deployment. See [.github/workflows/](.github/workflows/) for the CI/CD workflows.
 
+**Pull requests from forks** do not run the build and test jobs: those run on a private runner that only executes code from branches in this repository. A maintainer reviews the change and pushes the branch to this repository to run the full CI.
+
 ## Bug Reporting
 
 ### Security Vulnerabilities

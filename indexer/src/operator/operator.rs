@@ -63,6 +63,11 @@ pub async fn run(
     // Moved here from the binary so it runs under the lock, never against tables a
     // resync is dropping.
     storage.init_schema().await?;
+    // A resync that deleted rows and died no longer holds the lock; its marker is what stops us.
+    storage
+        .ensure_no_unfinished_resync()
+        .await
+        .inspect_err(|e| error!("Operator refusing to start: {}", e))?;
 
     // Initialize global RPC client with retry
     let rpc_client = Arc::new(RpcClientWithRetry::with_retry_config(

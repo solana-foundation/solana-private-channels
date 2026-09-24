@@ -28,6 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Private-runner jobs skip fork PRs: that runner only runs code from this repo's branches.
   init-coverage-table:
     name: Initialize Coverage Table
     # Skip on fork PRs: the read-only GITHUB_TOKEN can't write the PR body (403).
@@ -82,6 +83,9 @@ jobs:
 
   changes:
     name: Detect Changed Areas
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: private-channel-runner-1
     outputs:
       rust_checks: ${{ steps.filter.outputs.rust_checks }}
@@ -152,10 +156,15 @@ jobs:
   build-artifacts:
     name: Build Shared Artifacts
     needs: changes
-    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true'
+    if: >-
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (needs.changes.outputs.integration == 'true' || needs.changes.outputs.core_indexer == 'true')
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
@@ -188,10 +197,15 @@ jobs:
   check:
     name: Check
     needs: changes
-    if: needs.changes.outputs.rust_checks == 'true'
+    if: >-
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (needs.changes.outputs.rust_checks == 'true')
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
@@ -219,10 +233,15 @@ jobs:
   fmt:
     name: Format
     needs: changes
-    if: needs.changes.outputs.rust_checks == 'true'
+    if: >-
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (needs.changes.outputs.rust_checks == 'true')
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
@@ -253,10 +272,15 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
-    if: needs.changes.outputs.rust_checks == 'true'
+    if: >-
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (needs.changes.outputs.rust_checks == 'true')
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
@@ -284,10 +308,15 @@ jobs:
   integration-tests:
     name: Rust Integration Tests + E2E Coverage
     needs: [changes, build-artifacts]
-    if: needs.changes.outputs.integration == 'true'
+    if: >-
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (needs.changes.outputs.integration == 'true')
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
@@ -355,10 +384,15 @@ jobs:
   unit-tests:
     name: Core + Indexer Unit Coverage
     needs: [changes, build-artifacts]
-    if: needs.changes.outputs.core_indexer == 'true'
+    if: >-
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      (needs.changes.outputs.core_indexer == 'true')
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment
@@ -460,11 +494,16 @@ jobs:
     # running when integration-tests fails or is skipped.
     needs: [changes, build-artifacts, integration-tests]
     if: >-
-      !cancelled() && needs.changes.outputs.trident == 'true' &&
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository) &&
+      needs.changes.outputs.trident == 'true' &&
       needs.build-artifacts.result == 'success'
     runs-on: private-channel-runner-1
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup environment
         uses: ./.github/actions/setup-environment

@@ -27,6 +27,7 @@ pub mod get_pending_db_transactions;
 pub mod get_pending_remint_transactions;
 pub mod get_release_signatures;
 pub mod get_remint_signatures;
+pub mod get_resync_blockers;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
 pub mod get_stalled_withdrawals_with_signatures;
@@ -42,6 +43,7 @@ pub mod live_lock;
 pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
+pub mod resync_state;
 pub mod sender_lock;
 pub mod set_pending_remint;
 pub mod sync_mint_status;
@@ -84,12 +86,35 @@ impl Storage {
         drop_tables::drop_tables(self).await
     }
 
-    /// Drop every table on the live-state lock's own session, so it cannot outlive the lock.
-    pub async fn drop_tables_fenced(
+    /// Delete `program`'s rows and set the marker and resync halt, on the lock's own session.
+    pub async fn wipe_program_fenced(
         &self,
         lock: &live_lock::LiveLockGuard,
+        program: crate::config::ProgramType,
     ) -> Result<(), StorageError> {
-        drop_tables::drop_tables_fenced(self, lock).await
+        drop_tables::wipe_program_fenced(self, lock, program).await
+    }
+
+    /// The program whose resync deleted rows and has not finished rebuilding them, if any.
+    pub async fn get_unfinished_resync(&self) -> Result<Option<String>, StorageError> {
+        resync_state::get_unfinished_resync(self).await
+    }
+
+    /// Refuse to start a worker on a database an unfinished resync left incomplete.
+    pub async fn ensure_no_unfinished_resync(&self) -> Result<(), StorageError> {
+        match self.get_unfinished_resync().await? {
+            Some(program) => Err(StorageError::UnfinishedResync { program }),
+            None => Ok(()),
+        }
+    }
+
+    /// Clear the marker and this resync's halt on the lock's own session, after a rebuild completes.
+    pub async fn clear_unfinished_resync_fenced(
+        &self,
+        lock: &live_lock::LiveLockGuard,
+        program: crate::config::ProgramType,
+    ) -> Result<(), StorageError> {
+        resync_state::clear_unfinished_resync_fenced(self, lock, program).await
     }
 
     /// Insert a new transaction
@@ -283,6 +308,14 @@ impl Storage {
     /// Clear the halt so both operators' fetchers resume (manual/runbook use).
     pub async fn clear_reconciliation_halt(&self) -> Result<(), StorageError> {
         reconciliation_halt::clear_reconciliation_halt(self).await
+    }
+
+    /// What a resync of `own` rows must check before wiping them.
+    pub async fn get_resync_blockers(
+        &self,
+        own: TransactionType,
+    ) -> Result<ResyncBlockers, StorageError> {
+        get_resync_blockers::get_resync_blockers(self, own).await
     }
 
     /// `transactions.id` for every `deposit` row whose mint was not in
