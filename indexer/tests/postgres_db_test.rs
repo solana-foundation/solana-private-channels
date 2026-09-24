@@ -20,7 +20,8 @@ use private_channel_indexer::{
             apply_lock_session_keepalives, apply_lock_session_lock_timeout,
             probe_advisory_lock_held, release_advisory_lock,
         },
-        DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
+        DbTransaction, PostgresDb, RemintClaim, RequeueOutcome, Storage, TransactionStatus,
+        TransactionType,
     },
     PostgresConfig,
 };
@@ -2523,6 +2524,108 @@ async fn completing_a_manual_review_row_blocked_on_a_row_lock_fails_instead_of_w
     Ok(())
 }
 
+/// Completion first: a row completed on release evidence has nothing left to refund,
+/// so a remint claim against it must be refused and must leave the journal untouched,
+/// supersedes included, or the sender would broadcast a MintTo for a paid withdrawal.
+#[tokio::test]
+async fn remint_claim_on_a_completed_row_is_refused_and_writes_nothing(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _container) = start_postgres().await?;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim-after-completion",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let dead_attempt = "remint-dead".to_string();
+    assert_eq!(
+        storage
+            .claim_remint_attempt(id, dead_attempt.clone(), 100, None, &[])
+            .await?,
+        RemintClaim::Claimed
+    );
+
+    // Whichever writer completed it, the claim must see the row has moved.
+    sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        storage
+            .claim_remint_attempt(
+                id,
+                "remint-after-completion".to_string(),
+                200,
+                None,
+                std::slice::from_ref(&dead_attempt),
+            )
+            .await?,
+        RemintClaim::RowMoved,
+        "a claim on a completed row must not authorize a broadcast"
+    );
+    let journal: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT signature, superseded FROM pending_remint_signatures WHERE transaction_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        journal,
+        vec![(dead_attempt, false)],
+        "a refused claim must neither journal its attempt nor retire the old one"
+    );
+    assert_eq!(status_of(&pool, id).await, "completed");
+    Ok(())
+}
+
+/// Claim first: a completion that read the row before the claim must not land after
+/// it, because the claimed MintTo is about to broadcast. The claim bumps the row's
+/// version, so the completion's pinned `updated_at` no longer matches.
+#[tokio::test]
+async fn completion_read_before_a_remint_claim_does_not_apply(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _container) = start_postgres().await?;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "completion-after-claim",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let read_before_claim = updated_at_of(&pool, id).await;
+
+    assert_eq!(
+        storage
+            .claim_remint_attempt(id, "remint-sig".to_string(), 100, None, &[])
+            .await?,
+        RemintClaim::Claimed
+    );
+
+    assert!(
+        !storage
+            .try_complete_stalled_withdrawal(
+                id,
+                read_before_claim,
+                TransactionStatus::PendingRemint,
+                Some("sig-release-landed".to_string()),
+            )
+            .await?,
+        "a completion pinned before the claim must not complete a row being reminted"
+    );
+    assert_eq!(status_of(&pool, id).await, "pending_remint");
+    Ok(())
+}
+
 /// A constraint violation means the server answered, so it must not read as lock loss.
 #[tokio::test]
 async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
@@ -2560,10 +2663,11 @@ async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
         .expect("the lock must be free");
 
     // The signature column is globally unique, so re-using one is a plain 23505 from a live backend.
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(first, "shared-signature".to_string(), 10, None, &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
     let err = storage
         .claim_remint_attempt(second, "shared-signature".to_string(), 20, None, &[])
@@ -2575,10 +2679,11 @@ async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
         "an application error must not cancel the operator; got {err}"
     );
     // The session is still healthy, so the next fenced write still works.
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(second, "distinct-signature".to_string(), 20, None, &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
     Ok(())
 }
@@ -2709,10 +2814,14 @@ async fn fenced_write_blocked_on_a_row_lock_does_not_cancel_the_operator(
 #[tokio::test]
 async fn blockhash_slot_round_trips_and_stays_null_when_absent(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _container) = start_postgres().await?;
+    let (pool, storage, _container) = start_postgres().await?;
 
     let txn = make_db_transaction("slot_round_trip", TransactionType::Withdrawal);
     let id = storage.insert_db_transaction(&txn).await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
 
     storage
         .insert_release_signature(id, "sig-with-slot".to_string(), 1_000, Some(400))
@@ -2733,10 +2842,11 @@ async fn blockhash_slot_round_trips_and_stays_null_when_absent(
         "a write with no slot must stay NULL, never default to 0"
     );
 
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(id, "remint-sig".to_string(), 2_000, Some(1_500), &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
     let remints = storage.get_remint_signatures(id).await?;
     assert_eq!(remints.len(), 1);

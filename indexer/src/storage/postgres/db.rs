@@ -11,7 +11,7 @@ use crate::{
         MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
-    storage::common::storage::RequeueOutcome,
+    storage::common::storage::{RemintClaim, RequeueOutcome},
     storage::postgres::lock_connection::LockConnection,
     PostgresConfig,
 };
@@ -2574,7 +2574,11 @@ impl PostgresDb {
     /// cleared. `ON CONFLICT DO NOTHING` does not abort the surrounding
     /// transaction, so a lost claim still retires the attempts it proved dead.
     ///
-    /// Returns true when the caller owns the attempt and may broadcast.
+    /// The claim also writes the parent row, so it cannot interleave with a
+    /// completion of that row. A plain `WHERE EXISTS` check would not do: both
+    /// sides could read `pending_remint` and commit. The write takes the row lock
+    /// and its trigger bumps `updated_at`, so a completion pinned on the old
+    /// version no longer matches once a claim commits.
     pub async fn claim_remint_attempt_internal(
         &self,
         transaction_id: i64,
@@ -2582,12 +2586,29 @@ impl PostgresDb {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
-    ) -> Result<bool, sqlx::Error> {
-        // Both statements are sender-owned, so the transaction moves whole and never mixes fenced work.
+    ) -> Result<RemintClaim, sqlx::Error> {
+        // All statements are sender-owned, so the transaction moves whole and never mixes fenced work.
         let superseded_signatures = superseded_signatures.to_vec();
         self.run_sender_owned(move |conn| {
             Box::pin(async move {
                 let mut tx = conn.begin().await?;
+
+                let parent = sqlx::query(
+                    r#"
+                    UPDATE transactions
+                    SET status = status
+                    WHERE id = $1
+                      AND status = 'pending_remint'
+                      AND transaction_type = 'withdrawal'
+                    "#,
+                )
+                .bind(transaction_id)
+                .execute(&mut *tx)
+                .await?;
+                if parent.rows_affected() == 0 {
+                    tx.rollback().await?;
+                    return Ok(RemintClaim::RowMoved);
+                }
 
                 sqlx::query(
                     r#"
@@ -2619,7 +2640,11 @@ impl PostgresDb {
                 .await?;
 
                 tx.commit().await?;
-                Ok(claimed.rows_affected() == 1)
+                Ok(if claimed.rows_affected() == 1 {
+                    RemintClaim::Claimed
+                } else {
+                    RemintClaim::HeldElsewhere
+                })
             })
         })
         .await

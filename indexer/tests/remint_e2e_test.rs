@@ -11,7 +11,7 @@
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use private_channel_indexer::{
-    storage::{common::amount::TokenAmount, PostgresDb, Storage, TransactionStatus},
+    storage::{common::amount::TokenAmount, PostgresDb, RemintClaim, Storage, TransactionStatus},
     PostgresConfig,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -570,6 +570,10 @@ async fn test_concurrent_remint_claims_exactly_one_wins() -> Result<(), Box<dyn 
 
     let tx_id =
         insert_withdrawal(&pool, &Pubkey::new_unique(), &Pubkey::new_unique(), 5_000).await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await?;
 
     let sig_a = Signature::new_unique().to_string();
     let sig_b = Signature::new_unique().to_string();
@@ -592,8 +596,12 @@ async fn test_concurrent_remint_claims_exactly_one_wins() -> Result<(), Box<dyn 
     let won_b = won_b.expect("racer b not panic").expect("claim b ok");
 
     assert!(
-        won_a ^ won_b,
-        "exactly one racer may own the live remint claim (a={won_a} b={won_b})"
+        matches!(
+            (won_a, won_b),
+            (RemintClaim::Claimed, RemintClaim::HeldElsewhere)
+                | (RemintClaim::HeldElsewhere, RemintClaim::Claimed)
+        ),
+        "exactly one racer may own the live remint claim (a={won_a:?} b={won_b:?})"
     );
 
     // Only the winner's attempt is persisted, so the loser has nothing to broadcast.
@@ -617,13 +625,18 @@ async fn test_concurrent_supersede_of_same_dead_attempt_exactly_one_wins(
 
     let tx_id =
         insert_withdrawal(&pool, &Pubkey::new_unique(), &Pubkey::new_unique(), 5_000).await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await?;
 
     // A first attempt takes the slot; both racers later prove it dead.
     let dead = Signature::new_unique().to_string();
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(tx_id, dead.clone(), 100, None, &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
 
     let observed = vec![dead.clone()];
@@ -649,8 +662,12 @@ async fn test_concurrent_supersede_of_same_dead_attempt_exactly_one_wins(
     let won_b = won_b.expect("racer b not panic").expect("claim b ok");
 
     assert!(
-        won_a ^ won_b,
-        "exactly one racer may retire the dead attempt and reclaim (a={won_a} b={won_b})"
+        matches!(
+            (won_a, won_b),
+            (RemintClaim::Claimed, RemintClaim::HeldElsewhere)
+                | (RemintClaim::HeldElsewhere, RemintClaim::Claimed)
+        ),
+        "exactly one racer may retire the dead attempt and reclaim (a={won_a:?} b={won_b:?})"
     );
 
     // History is preserved: the dead attempt is still classifiable in case it
@@ -679,26 +696,32 @@ async fn test_claim_without_naming_the_live_attempt_is_refused(
 
     let tx_id =
         insert_withdrawal(&pool, &Pubkey::new_unique(), &Pubkey::new_unique(), 5_000).await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(tx_id)
+        .execute(&pool)
+        .await?;
 
     let first = Signature::new_unique().to_string();
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(tx_id, first.clone(), 100, None, &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
 
     // Nothing named: the live attempt stands and the claim is refused.
-    assert!(
-        !storage
+    assert_eq!(
+        storage
             .claim_remint_attempt(tx_id, Signature::new_unique().to_string(), 200, None, &[])
             .await?,
+        RemintClaim::HeldElsewhere,
         "a claim that supersedes nothing must not displace a live attempt"
     );
     assert_eq!(storage.get_remint_signatures(tx_id).await?.len(), 1);
 
     // Naming the proven-dead attempt retires it and the slot is reclaimed.
     let second = Signature::new_unique().to_string();
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(
                 tx_id,
@@ -708,12 +731,13 @@ async fn test_claim_without_naming_the_live_attempt_is_refused(
                 std::slice::from_ref(&first)
             )
             .await?,
+        RemintClaim::Claimed,
         "a proven-dead attempt must be supersedable"
     );
 
     // Naming the same now-superseded attempt again wins nothing.
-    assert!(
-        !storage
+    assert_eq!(
+        storage
             .claim_remint_attempt(
                 tx_id,
                 Signature::new_unique().to_string(),
@@ -722,6 +746,7 @@ async fn test_claim_without_naming_the_live_attempt_is_refused(
                 &[first]
             )
             .await?,
+        RemintClaim::HeldElsewhere,
         "a second supersede of an already-retired attempt must not take the slot"
     );
 

@@ -3,7 +3,7 @@ use crate::storage::common::models::{
     DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
     MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
 };
-use crate::storage::common::storage::RequeueOutcome;
+use crate::storage::common::storage::{RemintClaim, RequeueOutcome};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -67,6 +67,10 @@ pub struct MockStorage {
     /// to represent the other operator's row that the partial unique index
     /// arbitrates against. The real arbiter is covered against Postgres.
     pub foreign_remint_claims: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// Transactions whose row left `pending_remint` behind the sender's back, so a
+    /// claim finds nothing to refund. Kept apart from `pending_transactions` because
+    /// most remint tests never seed a row.
+    pub moved_remint_parents: Arc<Mutex<std::collections::HashSet<i64>>>,
     /// Mirrors the durable `transactions.release_signatures` column: the full
     /// attempt list written on an SMT-confirmed completion. COALESCE-guarded.
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
@@ -1318,7 +1322,7 @@ impl MockStorage {
 
     /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
     /// attempts, then take the one live slot the partial unique index allows.
-    /// `Ok(false)` means another sender already owns it, so nothing is written.
+    /// A moved parent writes nothing at all, supersedes included.
     pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
@@ -1326,8 +1330,16 @@ impl MockStorage {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
-    ) -> Result<bool, StorageError> {
+    ) -> Result<RemintClaim, StorageError> {
         self.check_should_fail("claim_remint_attempt")?;
+        if self
+            .moved_remint_parents
+            .lock()
+            .unwrap()
+            .contains(&transaction_id)
+        {
+            return Ok(RemintClaim::RowMoved);
+        }
         let mut map = self.remint_signatures.lock().unwrap();
         let mut superseded = self.superseded_remint_signatures.lock().unwrap();
 
@@ -1354,7 +1366,7 @@ impl MockStorage {
                 .unwrap()
                 .contains(&transaction_id)
         {
-            return Ok(false);
+            return Ok(RemintClaim::HeldElsewhere);
         }
 
         map.entry(transaction_id).or_default().push(StoredSig {
@@ -1362,7 +1374,7 @@ impl MockStorage {
             last_valid_block_height,
             blockhash_slot,
         });
-        Ok(true)
+        Ok(RemintClaim::Claimed)
     }
 
     pub async fn get_remint_signatures(

@@ -1116,7 +1116,7 @@ mod tests {
     use super::*;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;
-    use crate::storage::common::storage::mock::MockStorage;
+    use crate::storage::common::storage::{mock::MockStorage, RemintClaim};
     use solana_commitment_config::CommitmentConfig;
 
     fn make_deposit_row(id: i64) -> DbTransaction {
@@ -2278,10 +2278,11 @@ mod tests {
         );
         mock.pending_transactions.lock().unwrap().push(row.clone());
         mock.pending_remint_transactions.lock().unwrap().push(row);
-        assert!(
+        assert_eq!(
             mock.claim_remint_attempt(1, Signature::new_unique().to_string(), 100, None, &[])
                 .await
                 .unwrap(),
+            RemintClaim::Claimed,
             "the previous process owns the refund claim"
         );
         let storage = Storage::Mock(mock.clone());

@@ -13,6 +13,7 @@
 
 use solana_commitment_config::CommitmentLevel;
 use {
+    chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
         config::{
             OperatorConfig, PostgresConfig, PrivateChannelIndexerConfig, ProgramType, StorageType,
@@ -23,13 +24,24 @@ use {
         operator::{
             self, acquire_sender_lock, run_sender, sender_lock_key, utils::TransactionBuilder,
         },
-        storage::{PostgresDb, Storage},
+        storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
     },
     private_channel_metrics::MetricLabel,
-    std::{sync::Arc, time::Duration},
+    solana_sdk::{pubkey::Pubkey, signature::Signature},
+    sqlx::PgPool,
+    std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    },
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,
-    tokio::{sync::mpsc, task::JoinHandle},
+    tokio::{
+        sync::{mpsc, Notify},
+        task::JoinHandle,
+    },
     tokio_util::sync::CancellationToken,
 };
 
@@ -133,6 +145,10 @@ fn lock_lost_total(program_type: ProgramType) -> f64 {
         })
         .sum()
 }
+
+/// Held by every test that moves or asserts the withdraw lock-lost counter, since the
+/// registry is process-global and the graceful test asserts it exactly.
+static WITHDRAW_LOCK_LOST_METRIC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Kill whichever backend holds `key`, standing in for a failover or an idle-session reap.
 async fn terminate_advisory_lock_holder(url: &str, key: i64) {
@@ -282,6 +298,7 @@ async fn terminated_backend_kills_the_sender_and_frees_the_lock() {
 /// I3. Every deploy takes this path, so it must unlock explicitly and not look like a loss.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graceful_cancellation_releases_the_lock_without_a_lost_signal() {
+    let _metrics_guard = WITHDRAW_LOCK_LOST_METRIC.lock().await;
     let (url, _container) = start_postgres().await;
     connect(&url).await.init_schema().await.unwrap();
 
@@ -315,16 +332,17 @@ async fn graceful_cancellation_releases_the_lock_without_a_lost_signal() {
     );
 }
 
-/// A withdraw operator whose RPC endpoints refuse every connection, so anything past
-/// the startup lock checks surfaces as an RPC failure instead.
+/// A withdraw operator on `url`. Pass a refusing `rpc_url` so anything past the
+/// startup lock checks surfaces as an RPC failure instead.
 fn withdraw_operator_configs(
     url: &str,
+    rpc_url: &str,
     source_rpc_url: Option<String>,
 ) -> (PrivateChannelIndexerConfig, OperatorConfig) {
     let common = PrivateChannelIndexerConfig {
         program_type: ProgramType::Withdraw,
         storage_type: StorageType::Postgres,
-        rpc_url: "http://127.0.0.1:1".to_string(),
+        rpc_url: rpc_url.to_string(),
         source_rpc_url,
         fallback_rpc_url: None,
         postgres: PostgresConfig {
@@ -367,8 +385,9 @@ async fn second_operator_is_refused_before_its_boot_preflight() {
         .expect("lock query")
         .expect("the lock must be free");
 
+    let refusing_rpc = "http://127.0.0.1:1";
     let (common, operator_config) =
-        withdraw_operator_configs(&url, Some("http://127.0.0.1:1".to_string()));
+        withdraw_operator_configs(&url, refusing_rpc, Some(refusing_rpc.to_string()));
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         operator::run(connect(&url).await, common, operator_config, None),
@@ -394,7 +413,7 @@ async fn failed_startup_releases_the_sender_lock() {
     let (url, _container) = start_postgres().await;
 
     // No source_rpc_url is a withdraw refuse-to-start.
-    let (common, operator_config) = withdraw_operator_configs(&url, None);
+    let (common, operator_config) = withdraw_operator_configs(&url, "http://127.0.0.1:1", None);
     let result = operator::run(connect(&url).await, common, operator_config, None).await;
     assert!(
         matches!(result, Err(OperatorError::RpcError(_))),
@@ -404,5 +423,117 @@ async fn failed_startup_releases_the_sender_lock() {
     assert!(
         wait_for_lock_available(&url, Duration::from_secs(15), ProgramType::Withdraw).await,
         "a failed startup must leave the lock free for the restart"
+    );
+}
+
+/// A lock lost mid pre-flight means a replacement may already own the pending_remint
+/// rows. The pre-flight swallows its own errors, so the operator must still refuse to
+/// start rather than spawn a sender that no longer holds the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_lost_during_the_boot_preflight_refuses_to_start() {
+    let _metrics_guard = WITHDRAW_LOCK_LOST_METRIC.lock().await;
+    let (url, _container) = start_postgres().await;
+    let db = PostgresDb::new(&PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 2,
+    })
+    .await
+    .unwrap();
+    db.init_schema().await.unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    // A pending_remint row whose release landed, so the pre-flight tries to complete it.
+    let recipient = Pubkey::new_unique().to_string();
+    let mut withdrawal = DbTransactionBuilder::new(
+        Signature::new_unique().to_string(),
+        1,
+        Pubkey::new_unique().to_string(),
+        10_000u64,
+    )
+    .initiator(recipient.clone())
+    .recipient(recipient)
+    .transaction_type(TransactionType::Withdrawal)
+    .build();
+    withdrawal.withdrawal_nonce = Some(0);
+    let transaction_id = db.insert_transaction_internal(&withdrawal).await.unwrap();
+    sqlx::query("UPDATE transactions SET status = 'processing' WHERE id = $1")
+        .bind(transaction_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    db.set_pending_remint_internal(
+        transaction_id,
+        vec![Signature::new_unique().to_string()],
+        vec![0],
+        Utc::now() + ChronoDuration::minutes(10),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Hold the finality answer until the lock's backend is dead, so the completion
+    // that follows it has to run on a lost session.
+    let status_requested = Arc::new(Notify::new());
+    let lock_killed = Arc::new(AtomicBool::new(false));
+    let mut rpc = mockito::Server::new_async().await;
+    let _statuses = {
+        let status_requested = status_requested.clone();
+        let lock_killed = lock_killed.clone();
+        rpc.mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                status_requested.notify_one();
+                while !lock_killed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                r#"{"jsonrpc":"2.0","result":{"context":{"slot":200},"value":[{"slot":100,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}]},"id":1}"#.into()
+            })
+            .create_async()
+            .await
+    };
+    let killer = {
+        let url = url.clone();
+        let lock_killed = lock_killed.clone();
+        tokio::spawn(async move {
+            status_requested.notified().await;
+            terminate_advisory_lock_holder(&url, sender_lock_key(ProgramType::Withdraw)).await;
+            lock_killed.store(true, Ordering::SeqCst);
+        })
+    };
+
+    let (common, operator_config) = withdraw_operator_configs(
+        &url,
+        &rpc.url(),
+        Some("http://127.0.0.1:1".to_string()),
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        operator::run(connect(&url).await, common, operator_config, None),
+    )
+    .await
+    .expect("an operator that lost its lock at boot must return");
+    killer.await.expect("killer task panicked");
+
+    assert!(
+        matches!(
+            result,
+            Err(OperatorError::SenderLockLostAtBoot {
+                program_type: ProgramType::Withdraw
+            })
+        ),
+        "an operator that lost its lock during the pre-flight must refuse to start; got {result:?}"
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+            .bind(transaction_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "pending_remint",
+        "a completion on the lost session must not apply"
     );
 }
