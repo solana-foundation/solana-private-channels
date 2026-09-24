@@ -1,7 +1,8 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
     DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-    MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
+    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, StoredSig, TransactionStatus,
+    TransactionType,
 };
 use crate::storage::common::storage::RequeueOutcome;
 use bigdecimal::BigDecimal;
@@ -1027,6 +1028,38 @@ impl MockStorage {
             }
         }
         Ok(false)
+    }
+
+    /// Mirror `get_released_withdrawals_internal`: processing withdrawals with a journal,
+    /// no refund claimed or landed, keyed forward from `after_id`.
+    pub async fn get_released_withdrawals(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ReleasedWithdrawal>, StorageError> {
+        self.check_should_fail("get_released_withdrawals")?;
+        let journal = self.release_signatures.lock().unwrap();
+        let claimed = self.remint_signatures.lock().unwrap();
+        let pending = self.pending_transactions.lock().unwrap();
+        let mut matched: Vec<ReleasedWithdrawal> = pending
+            .iter()
+            .filter(|t| t.transaction_type == TransactionType::Withdrawal)
+            .filter(|t| t.status == TransactionStatus::Processing)
+            .filter(|t| t.landed_remint_signature.is_none())
+            .filter(|t| claimed.get(&t.id).is_none_or(|sigs| sigs.is_empty()))
+            .filter(|t| t.id > after_id)
+            .filter_map(|t| {
+                let sigs = journal.get(&t.id).filter(|sigs| !sigs.is_empty())?;
+                Some(ReleasedWithdrawal {
+                    id: t.id,
+                    updated_at: t.updated_at,
+                    signatures: sigs.iter().map(|s| s.signature.clone()).collect(),
+                })
+            })
+            .collect();
+        matched.sort_by_key(|r| r.id);
+        matched.truncate(limit as usize);
+        Ok(matched)
     }
 
     /// Mirror `get_stalled_withdrawals_with_signatures_internal`, including the

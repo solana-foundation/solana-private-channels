@@ -5,6 +5,7 @@ use crate::operator::RpcClientWithRetry;
 use private_channel_escrow_program_client::{
     programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, Instance, WithdrawalBitmap,
 };
+use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 
 const INSTANCE_SEED: &[u8] = b"instance";
@@ -140,9 +141,14 @@ pub async fn fetch_bitmap_generation(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
 ) -> Result<u64, OperatorError> {
-    Ok(fetch_consumed_nonces(rpc_client, bitmap_pda, None)
-        .await?
-        .generation)
+    Ok(fetch_consumed_nonces(
+        rpc_client,
+        bitmap_pda,
+        None,
+        rpc_client.rpc_client.commitment(),
+    )
+    .await?
+    .generation)
 }
 
 /// Read the authoritative consumed-nonce set for the current generation.
@@ -154,21 +160,21 @@ pub async fn fetch_bitmap_generation(
 /// fresh. A backend that cannot serve there errors instead of returning an older
 /// snapshot, which is what stops a clear bit on a lagging node from reading as
 /// proof that a release never happened.
+///
+/// `commitment` is explicit because a slot bound gives freshness, not durability:
+/// a release proof must read at finalized so a fork-only bit never counts.
 pub async fn fetch_consumed_nonces(
     rpc_client: &RpcClientWithRetry,
     bitmap_pda: &Pubkey,
     min_context_slot: Option<u64>,
+    commitment: CommitmentConfig,
 ) -> Result<BitmapState, OperatorError> {
     // Named as a bitmap failure rather than a generic transport one because
     // callers branch on it. An unreadable bitmap leaves a withdrawal row alone
     // for the recovery worker, where an error they do not recognise marks the
     // row permanently failed for what was only a read that did not answer.
     let response = rpc_client
-        .get_account_with_context_min_slot(
-            bitmap_pda,
-            rpc_client.rpc_client.commitment(),
-            min_context_slot,
-        )
+        .get_account_with_context_min_slot(bitmap_pda, commitment, min_context_slot)
         .await
         .map_err(|e| ProgramError::BitmapUnavailable {
             reason: format!("get_account_info({bitmap_pda}): {e}"),
@@ -423,7 +429,9 @@ mod tests {
             CommitmentConfig::confirmed(),
         );
 
-        let err = fetch_consumed_nonces(&rpc, &pk(9), None).await.unwrap_err();
+        let err = fetch_consumed_nonces(&rpc, &pk(9), None, CommitmentConfig::finalized())
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -432,5 +440,60 @@ mod tests {
             ),
             "an unreadable bitmap must be distinguishable from any other failure: {err:?}"
         );
+    }
+
+    /// The read runs at the commitment the caller asks for, not the client's, so a release
+    /// proof can demand finality from a client configured for confirmed.
+    #[tokio::test]
+    async fn fetch_consumed_nonces_sends_requested_commitment() {
+        use crate::operator::utils::rpc_util::RetryConfig;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use solana_commitment_config::CommitmentConfig;
+
+        for (requested, label) in [
+            (CommitmentConfig::finalized(), "finalized"),
+            (CommitmentConfig::confirmed(), "confirmed"),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "context": {"slot": 1},
+                    "value": {
+                        "owner": pk(1).to_string(),
+                        "lamports": 1u64,
+                        "data": [STANDARD.encode(bitmap_account_bytes(3, &[], 255)), "base64"],
+                        "executable": false,
+                        "rentEpoch": 0
+                    }
+                }
+            });
+            let read = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(format!(
+                    r#""commitment"\s*:\s*"{label}""#
+                )))
+                .with_status(200)
+                .with_body(body.to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let rpc = RpcClientWithRetry::with_retry_config(
+                server.url(),
+                RetryConfig {
+                    max_attempts: 1,
+                    base_delay: std::time::Duration::from_millis(1),
+                    max_delay: std::time::Duration::from_millis(1),
+                },
+                CommitmentConfig::processed(),
+            );
+
+            let bitmap = fetch_consumed_nonces(&rpc, &pk(9), None, requested)
+                .await
+                .unwrap_or_else(|e| panic!("{label} read must be served: {e:?}"));
+            assert_eq!(bitmap.generation, 3);
+            read.assert_async().await;
+        }
     }
 }

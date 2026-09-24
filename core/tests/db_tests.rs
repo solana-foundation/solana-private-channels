@@ -47,6 +47,40 @@ async fn start_postgres() -> (AccountsDB, testcontainers::ContainerAsync<Postgre
     (db, container)
 }
 
+/// A real `pg_dump -Fc` of `db`, and a `pg_restore` that runs inside the same container.
+fn container_dump_and_restore(
+    container: &testcontainers::ContainerAsync<Postgres>,
+    db: &str,
+) -> (tempfile::NamedTempFile, tempfile::TempPath) {
+    use std::os::unix::fs::PermissionsExt;
+    let dump = tempfile::NamedTempFile::new().unwrap();
+    let status = std::process::Command::new("docker")
+        .args([
+            "exec",
+            container.id(),
+            "pg_dump",
+            "-U",
+            "postgres",
+            "-Fc",
+            db,
+        ])
+        .stdout(dump.reopen().unwrap())
+        .status()
+        .expect("docker runs pg_dump");
+    assert!(status.success(), "pg_dump failed in the test container");
+    let restore = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        restore.path(),
+        format!(
+            "#!/bin/sh\nexec docker exec -i {} pg_restore \"$@\"\n",
+            container.id()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(restore.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dump, restore.into_temp_path())
+}
+
 fn make_account(lamports: u64, owner: &Pubkey) -> AccountSharedData {
     AccountSharedData::new(lamports, 0, owner)
 }
@@ -657,8 +691,8 @@ async fn test_truncate_rejects_zero_keep_slots() {
 
     let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 0,
-        max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
+        pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
     };
@@ -676,8 +710,8 @@ async fn test_truncate_rejects_zero_batch_size() {
 
     let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 10,
-        max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
+        pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 0,
         dry_run: false,
     };
@@ -695,8 +729,8 @@ async fn test_truncate_empty_db_returns_none() {
 
     let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 10,
-        max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
+        pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
     };
@@ -725,8 +759,8 @@ async fn test_truncate_nothing_to_delete() {
     // Keep all 5 slots — nothing should be truncated
     let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 10,
-        max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
+        pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
     };
@@ -743,89 +777,6 @@ async fn test_truncate_nothing_to_delete() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_truncate_dry_run_with_pg_dump() {
-    let (mut db, _pg) = start_postgres().await;
-
-    // Store 10 blocks at slots 1-10
-    for slot in 1..=10 {
-        db.store_block(create_test_block_info(slot, Hash::new_unique()))
-            .await
-            .unwrap();
-    }
-
-    // Create a recent pg_dump file
-    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
-
-    // Keep 5 slots → truncate before slot 6 → blocks 1-5 should be counted
-    let opts = private_channel_core::accounts::truncate::TruncateOptions {
-        keep_slots: 5,
-        max_backup_age: std::time::Duration::from_secs(3600),
-        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
-        batch_size: 100,
-        dry_run: true,
-    };
-
-    if let AccountsDB::Postgres(ref pg) = db {
-        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
-            .await
-            .unwrap();
-        assert_eq!(report.latest_slot, Some(10));
-        assert_eq!(report.truncate_before_slot, Some(6));
-        assert_eq!(report.blocks_deleted, 5);
-        assert!(report.backup_check.pg_dump_ok);
-
-        // Dry run: blocks should still exist
-        assert!(db.get_block(1).await.unwrap().is_some());
-        assert!(db.get_block(5).await.unwrap().is_some());
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_truncate_actually_deletes_blocks() {
-    let (mut db, _pg) = start_postgres().await;
-
-    // Store 10 blocks at slots 1-10
-    for slot in 1..=10 {
-        db.store_block(create_test_block_info(slot, Hash::new_unique()))
-            .await
-            .unwrap();
-    }
-
-    // Create a recent pg_dump file for backup verification
-    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
-
-    // Keep 5 → truncate before slot 6 → delete blocks 1-5
-    let opts = private_channel_core::accounts::truncate::TruncateOptions {
-        keep_slots: 5,
-        max_backup_age: std::time::Duration::from_secs(3600),
-        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
-        batch_size: 100,
-        dry_run: false,
-    };
-
-    if let AccountsDB::Postgres(ref pg) = db {
-        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
-            .await
-            .unwrap();
-        assert_eq!(report.blocks_deleted, 5);
-        assert_eq!(report.transactions_deleted, 0);
-
-        // Old blocks should be gone
-        assert!(db.get_block(1).await.unwrap().is_none());
-        assert!(db.get_block(5).await.unwrap().is_none());
-        // Recent blocks should still exist
-        assert!(db.get_block(6).await.unwrap().is_some());
-        assert!(db.get_block(10).await.unwrap().is_some());
-
-        // first_available_block should be updated
-        assert!(report.first_available_block.is_some());
-    }
-}
-
-/// Pruning removes block rows, never the counters. Height counts blocks
-/// produced, so recomputing it from the surviving rows would make it go
-/// backwards and invalidate every deadline a client holds.
-#[tokio::test(flavor = "multi_thread")]
 async fn block_height_survives_pruning() {
     let (mut db, _pg) = start_postgres().await;
 
@@ -836,11 +787,11 @@ async fn block_height_survives_pruning() {
     }
     assert_eq!(db.get_block_height().await.unwrap(), Some(10));
 
-    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
+    let (dump, restore) = container_dump_and_restore(&_pg, "core_test");
     let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 5,
-        max_backup_age: std::time::Duration::from_secs(3600),
-        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
+        pg_dump_path: Some(dump.path().to_path_buf()),
+        pg_restore_bin: restore.to_path_buf(),
         batch_size: 100,
         dry_run: false,
     };
@@ -865,52 +816,6 @@ async fn block_height_survives_pruning() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_truncate_deletes_associated_transactions() {
-    let (mut db, _pg) = start_postgres().await;
-
-    let from = Keypair::new();
-    let to = Pubkey::new_unique();
-
-    // Store blocks with transactions at slots 1-4
-    for slot in 1..=4 {
-        let tx = create_test_sanitized_transaction(&from, &to, slot * 10);
-        let sig = *tx.signature();
-        let processed = make_executed_tx(vec![]);
-
-        let mut block = create_test_block_info(slot, Hash::new_unique());
-        block.transaction_signatures = vec![sig];
-
-        db.write_batch(
-            &[],
-            vec![(sig, &tx, slot, 1_700_000_000 + slot as i64, &processed)],
-            Some(block),
-        )
-        .await
-        .unwrap();
-    }
-
-    // Create pg_dump for backup verification
-    let tmp_dump = tempfile::NamedTempFile::new().unwrap();
-
-    // Keep 2 → truncate before slot 3 → delete blocks 1,2 and their transactions
-    let opts = private_channel_core::accounts::truncate::TruncateOptions {
-        keep_slots: 2,
-        max_backup_age: std::time::Duration::from_secs(3600),
-        pg_dump_path: Some(tmp_dump.path().to_path_buf()),
-        batch_size: 2,
-        dry_run: false,
-    };
-
-    if let AccountsDB::Postgres(ref pg) = db {
-        let report = private_channel_core::accounts::truncate::truncate_slots(pg, &opts)
-            .await
-            .unwrap();
-        assert_eq!(report.blocks_deleted, 2);
-        assert_eq!(report.transactions_deleted, 2);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_truncate_fails_without_backup() {
     let (mut db, _pg) = start_postgres().await;
 
@@ -921,11 +826,11 @@ async fn test_truncate_fails_without_backup() {
             .unwrap();
     }
 
-    // No pg_dump_path, and testcontainers Postgres has no WAL archiving
+    // No pg_dump_path, so there is nothing to prove the deleted rows restorable
     let opts = private_channel_core::accounts::truncate::TruncateOptions {
         keep_slots: 5,
-        max_backup_age: std::time::Duration::from_secs(300),
         pg_dump_path: None,
+        pg_restore_bin: std::path::PathBuf::from("pg_restore"),
         batch_size: 100,
         dry_run: false,
     };

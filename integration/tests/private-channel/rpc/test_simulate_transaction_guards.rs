@@ -32,10 +32,6 @@ use {
         transaction::Transaction,
     },
     solana_system_interface::instruction as system_instruction,
-    std::{
-        collections::LinkedList,
-        sync::{Arc, RwLock},
-    },
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,
 };
@@ -62,7 +58,6 @@ async fn build_module(admin_keys: Vec<Pubkey>) -> (RpcModule<()>, ContainerAsync
     let read_deps = ReadDeps {
         accounts_db: db,
         admin_keys,
-        live_blockhashes: Arc::new(RwLock::new(LinkedList::new())),
         max_blockhashes: 150,
         simulation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS),
     };
