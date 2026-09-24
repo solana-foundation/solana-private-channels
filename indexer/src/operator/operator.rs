@@ -103,6 +103,8 @@ pub async fn run(
         ));
     }
 
+    reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
+
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require
     // an independent, same-cluster, reachable fallback before starting.
     validate_withdraw_fallback(
@@ -567,6 +569,23 @@ async fn run_withdraw_preflight(
             Ok(())
         }
     }
+}
+
+/// Escrow mints land on the channel, and nothing proves a fallback serves the channel. A
+/// wrong-chain fallback's honest absence would read as Dead and re-mint a landed deposit.
+/// Without one, a pruned primary degrades to Uncertain instead.
+fn reject_escrow_fallback(
+    program_type: crate::config::ProgramType,
+    fallback_url: Option<&str>,
+) -> Result<(), OperatorError> {
+    if program_type == crate::config::ProgramType::Escrow && fallback_url.is_some() {
+        return Err(OperatorError::RpcError(
+            "fallback_rpc_url is not supported for the escrow operator: its finality checks \
+             must come from the channel rpc_url alone"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Withdraw-only gate for the Solana fallback. A missing fallback only warns: the on-chain
@@ -1178,6 +1197,29 @@ mod tests {
         assert!(
             result.is_ok(),
             "escrow must not require a fallback: {result:?}"
+        );
+    }
+
+    /// Nothing proves an escrow fallback serves the channel, so configuring one refuses.
+    #[test]
+    fn escrow_fallback_refuses_start() {
+        let result = reject_escrow_fallback(
+            crate::config::ProgramType::Escrow,
+            Some("https://archival.example"),
+        );
+        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+    }
+
+    /// The escrow refusal must not catch the withdraw operator, whose fallback is supported.
+    #[test]
+    fn withdraw_fallback_not_rejected_by_escrow_gate() {
+        let result = reject_escrow_fallback(
+            crate::config::ProgramType::Withdraw,
+            Some("https://archival.example"),
+        );
+        assert!(
+            result.is_ok(),
+            "withdraw fallback must pass the escrow gate: {result:?}"
         );
     }
 }

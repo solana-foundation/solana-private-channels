@@ -62,8 +62,8 @@ use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solana_transaction_status::UiTransactionEncoding;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::ID as TOKEN_PROGRAM_ID;
-use sqlx::PgPool;
-use std::{sync::Arc, time::Duration};
+use sqlx::{PgPool, Row};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use test_utils::{
     mock_rpc::{MockRpcServer, Reply},
     validator_helper::{start_test_validator, start_test_validator_no_geyser},
@@ -85,6 +85,8 @@ const RESYNC_TIMEOUT_SECS: u64 = 180;
 /// -32004 near the finalized edge; each retry re-runs the whole resync (including
 /// consumed-set enumeration), so channel scripts enqueue this many copies.
 const RESYNC_ATTEMPTS: usize = 4;
+/// Channel mint authority the reconcile harness enumerates; scripted mints are signed by it.
+const CHANNEL_AUTHORITY: Pubkey = Pubkey::new_from_array([7u8; 32]);
 /// Per-user SPL balance minted at setup, large enough to fund deposits.
 const USER_BALANCE: u64 = 1_000_000;
 /// Deposit amount used by single-deposit scenarios.
@@ -300,6 +302,112 @@ fn channel_sig_entry(landed: &Signature, memo: &str) -> Value {
     })
 }
 
+/// A spl-token `MintTo` a scripted channel tx executes under its signer.
+struct ScriptedMintTo {
+    mint: Pubkey,
+    recipient_ata: Pubkey,
+    amount: u64,
+}
+
+/// `getTransaction` result for a successful channel tx signed only by `signer`, with
+/// `mentioned` as a non-signing account key, one Memo instruction carrying `memo` and,
+/// when given, a `MintTo` under `signer`.
+fn channel_transaction(
+    signer: &Pubkey,
+    mentioned: &Pubkey,
+    memo: &str,
+    mint_to: Option<&ScriptedMintTo>,
+) -> Value {
+    let mut account_keys = vec![
+        signer.to_string(),
+        mentioned.to_string(),
+        spl_memo::id().to_string(),
+    ];
+    let mut instructions = vec![json!({
+        "programIdIndex": 2,
+        "accounts": [],
+        "data": bs58::encode(memo).into_string(),
+    })];
+    if let Some(mint_to) = mint_to {
+        account_keys.extend([
+            mint_to.mint.to_string(),
+            mint_to.recipient_ata.to_string(),
+            TOKEN_PROGRAM_ID.to_string(),
+        ]);
+        let data = spl_token::instruction::mint_to(
+            &TOKEN_PROGRAM_ID,
+            &mint_to.mint,
+            &mint_to.recipient_ata,
+            signer,
+            &[],
+            mint_to.amount,
+        )
+        .expect("build MintTo")
+        .data;
+        instructions.push(json!({
+            "programIdIndex": 5,
+            "accounts": [3, 4, 0],
+            "data": bs58::encode(data).into_string(),
+        }));
+    }
+    let balances = vec![0u64; account_keys.len()];
+
+    json!({
+        "slot": 100u64,
+        "blockTime": 1_700_000_000i64,
+        "transaction": {
+            "signatures": [Signature::new_unique().to_string()],
+            "message": {
+                "header": {
+                    "numRequiredSignatures": 1,
+                    "numReadonlySignedAccounts": 0,
+                    "numReadonlyUnsignedAccounts": account_keys.len() - 1,
+                },
+                "accountKeys": account_keys,
+                "recentBlockhash": "11111111111111111111111111111111",
+                "instructions": instructions,
+            },
+        },
+        "meta": {
+            "err": null,
+            "status": {"Ok": null},
+            "fee": 5000u64,
+            "preBalances": balances,
+            "postBalances": balances,
+        },
+    })
+}
+
+/// The mint the operator would have landed for `key`: its mint and amount into the
+/// deposit recipient's or, for a remint, the withdrawal initiator's spl-token ATA.
+fn landed_mint_to(key: &RowKey, kind: ConsumedMintKind) -> ScriptedMintTo {
+    let owner = match kind {
+        ConsumedMintKind::Deposit => &key.recipient,
+        ConsumedMintKind::Remint => &key.initiator,
+    };
+    let owner = Pubkey::from_str(owner).expect("row owner is a pubkey");
+    let mint = Pubkey::from_str(&key.mint).expect("row mint is a pubkey");
+    ScriptedMintTo {
+        mint,
+        recipient_ata: get_associated_token_address_with_program_id(
+            &owner,
+            &mint,
+            &TOKEN_PROGRAM_ID,
+        ),
+        amount: key.amount,
+    }
+}
+
+/// The channel tx the authority landed for `key`: its memo and matching `MintTo`.
+fn authority_signed_mint(key: &RowKey, kind: ConsumedMintKind) -> Value {
+    channel_transaction(
+        &CHANNEL_AUTHORITY,
+        &Pubkey::new_unique(),
+        &memo_for(&key.source_event_id(), kind),
+        Some(&landed_mint_to(key, kind)),
+    )
+}
+
 /// A non-idempotency filler entry (null memo) used only to pad a full page.
 fn channel_filler_entry() -> Value {
     json!({
@@ -321,18 +429,27 @@ fn memo_for(id: &SourceEventId, kind: ConsumedMintKind) -> String {
 }
 
 /// Enqueue one `getSignaturesForAddress` page that makes the channel report each
-/// `(id, kind, landed)` as an already-serviced mint. Reused by every reconcile
-/// case so per-test wire boilerplate stays a single line.
+/// `(key, kind, landed)` as an already-serviced mint, and the matching signed mint
+/// for each fetch. Reused by every reconcile case so per-test wire boilerplate stays
+/// a single line.
 fn script_channel_consumed(
     mock: &MockRpcServer,
-    entries: &[(SourceEventId, ConsumedMintKind, Signature)],
+    entries: &[(&RowKey, ConsumedMintKind, Signature)],
 ) {
     for _ in 0..RESYNC_ATTEMPTS {
         let page: Vec<Value> = entries
             .iter()
-            .map(|(id, kind, landed)| channel_sig_entry(landed, &memo_for(id, *kind)))
+            .map(|(key, kind, landed)| {
+                channel_sig_entry(landed, &memo_for(&key.source_event_id(), *kind))
+            })
             .collect();
         mock.enqueue("getSignaturesForAddress", Reply::result(Value::Array(page)));
+        for (key, kind, _) in entries {
+            mock.enqueue(
+                "getTransaction",
+                Reply::result(authority_signed_mint(key, *kind)),
+            );
+        }
     }
 }
 
@@ -359,7 +476,7 @@ fn script_channel_empty_supply(mock: &MockRpcServer) {
 /// page of fillers so the `before` cursor advances, then page 2 carries the memo.
 fn script_channel_consumed_on_page2(
     mock: &MockRpcServer,
-    id: &SourceEventId,
+    key: &RowKey,
     kind: ConsumedMintKind,
     landed: &Signature,
 ) {
@@ -374,7 +491,14 @@ fn script_channel_consumed_on_page2(
         );
         mock.enqueue(
             "getSignaturesForAddress",
-            Reply::result(json!([channel_sig_entry(landed, &memo_for(id, kind))])),
+            Reply::result(json!([channel_sig_entry(
+                landed,
+                &memo_for(&key.source_event_id(), kind)
+            )])),
+        );
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(authority_signed_mint(key, kind)),
         );
     }
 }
@@ -382,13 +506,17 @@ fn script_channel_consumed_on_page2(
 // ── DB assertion helpers (fresh pool: drop_tables invalidates old caches) ────
 
 /// Natural key of a rebuilt row, used to script the exact consumed-set memo the
-/// reconcile will look up.
+/// reconcile will look up, plus the fields a matching channel mint must pay.
 #[derive(Clone, Debug)]
 struct RowKey {
     signature: String,
     instruction_index: i32,
     inner_index: Option<i32>,
     transaction_type: String,
+    initiator: String,
+    recipient: String,
+    mint: String,
+    amount: u64,
 }
 
 impl RowKey {
@@ -411,22 +539,29 @@ async fn fresh_pool(db_url: &str) -> PgPool {
 
 async fn all_row_keys(db_url: &str) -> Vec<RowKey> {
     let pool = fresh_pool(db_url).await;
-    let rows: Vec<(String, i32, Option<i32>, String)> = sqlx::query_as(
-        "SELECT signature, instruction_index, inner_index, transaction_type::text \
+    let rows = sqlx::query(
+        "SELECT signature, instruction_index, inner_index, \
+         transaction_type::text AS transaction_type, initiator, recipient, mint, \
+         amount::text AS amount \
          FROM transactions ORDER BY id",
     )
     .fetch_all(&pool)
     .await
     .expect("query row keys");
-    rows.into_iter()
-        .map(
-            |(signature, instruction_index, inner_index, transaction_type)| RowKey {
-                signature,
-                instruction_index,
-                inner_index,
-                transaction_type,
-            },
-        )
+    rows.iter()
+        .map(|row| RowKey {
+            signature: row.get("signature"),
+            instruction_index: row.get("instruction_index"),
+            inner_index: row.get("inner_index"),
+            transaction_type: row.get("transaction_type"),
+            initiator: row.get("initiator"),
+            recipient: row.get("recipient"),
+            mint: row.get("mint"),
+            amount: row
+                .get::<String, _>("amount")
+                .parse()
+                .expect("row amount fits u64"),
+        })
         .collect()
 }
 
@@ -588,7 +723,7 @@ impl Harness {
             self.program_type,
             self.instance,
             self.channel_url.clone(),
-            Pubkey::new_unique(),
+            CHANNEL_AUTHORITY,
         );
         run_resync(&service, self.genesis).await
     }
@@ -754,8 +889,7 @@ async fn resync_does_not_remint_serviced_deposit() -> Result<(), Box<dyn std::er
     let dep = deposits[0].clone();
 
     let landed = Signature::new_unique();
-    let id = dep.source_event_id();
-    script_channel_consumed(&mock, &[(id, ConsumedMintKind::Deposit, landed)]);
+    script_channel_consumed(&mock, &[(&dep, ConsumedMintKind::Deposit, landed)]);
     h.run().await.expect("reconciling resync should succeed");
 
     let st = status_of(&db_url, &dep).await;
@@ -883,16 +1017,8 @@ async fn resync_mixed_batch_classifies_each() -> Result<(), Box<dyn std::error::
     script_channel_consumed(
         &mock,
         &[
-            (
-                deposits[0].source_event_id(),
-                ConsumedMintKind::Deposit,
-                landed0,
-            ),
-            (
-                deposits[1].source_event_id(),
-                ConsumedMintKind::Deposit,
-                landed1,
-            ),
+            (&deposits[0], ConsumedMintKind::Deposit, landed0),
+            (&deposits[1], ConsumedMintKind::Deposit, landed1),
         ],
     );
     h.run().await.expect("resync should succeed");
@@ -954,8 +1080,7 @@ async fn resync_matches_serviced_mint_beyond_first_rpc_page(
     let dep = deposits[0].clone();
 
     let landed = Signature::new_unique();
-    let id = dep.source_event_id();
-    script_channel_consumed_on_page2(&mock, &id, ConsumedMintKind::Deposit, &landed);
+    script_channel_consumed_on_page2(&mock, &dep, ConsumedMintKind::Deposit, &landed);
     h.run().await.expect("resync should succeed");
 
     let st = status_of(&db_url, &dep).await;
@@ -1040,14 +1165,7 @@ async fn resync_distinguishes_deposits_by_inner_index() -> Result<(), Box<dyn st
 
     // Service only the first.
     let landed = Signature::new_unique();
-    script_channel_consumed(
-        &mock,
-        &[(
-            deposits[0].source_event_id(),
-            ConsumedMintKind::Deposit,
-            landed,
-        )],
-    );
+    script_channel_consumed(&mock, &[(&deposits[0], ConsumedMintKind::Deposit, landed)]);
     h.run().await.expect("resync should succeed");
 
     assert_eq!(status_of(&db_url, &deposits[0]).await.status, "completed");
@@ -1100,16 +1218,15 @@ async fn resync_rerun_is_idempotent() -> Result<(), Box<dyn std::error::Error>> 
     let keys = h.discover().await;
     let dep = keys_of_type(&keys, "deposit")[0].clone();
     let landed = Signature::new_unique();
-    let id = dep.source_event_id();
 
     // Run 1.
-    script_channel_consumed(&mock, &[(id.clone(), ConsumedMintKind::Deposit, landed)]);
+    script_channel_consumed(&mock, &[(&dep, ConsumedMintKind::Deposit, landed)]);
     h.run().await.expect("first reconciling resync");
     let count_1 = row_count(&db_url).await;
     let st_1 = status_of(&db_url, &dep).await;
 
     // Run 2 (same scripted consumed-set).
-    script_channel_consumed(&mock, &[(id, ConsumedMintKind::Deposit, landed)]);
+    script_channel_consumed(&mock, &[(&dep, ConsumedMintKind::Deposit, landed)]);
     h.run().await.expect("second reconciling resync");
     let count_2 = row_count(&db_url).await;
     let st_2 = status_of(&db_url, &dep).await;
@@ -1225,7 +1342,8 @@ async fn resync_preserves_startup_reconciliation_pass() -> Result<(), Box<dyn st
 
 /// IT-R8: channel mints that do not match this deposit's source event must never
 /// mark it completed: (a) a valid memo for a DIFFERENT source event, (b) a
-/// non-idempotency memo, (c) a wrong-prefix memo. The deposit stays pending.
+/// non-idempotency memo, (c) a wrong-prefix memo, (d) this deposit's memo on a user
+/// tx that only names the authority as an account. The deposit stays pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn resync_ignores_foreign_event_and_nonidempotency_memos(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1267,8 +1385,15 @@ async fn resync_ignores_foreign_event_and_nonidempotency_memos(
     // (a) Valid current-scheme memo, but for a DIFFERENT source event -> wrong id.
     let foreign_id = SourceEventId::new("some-other-source-event", 7, None);
     let foreign_memo = mint_idempotency_memo(&foreign_id);
-    // (b) non-idempotency memo, (c) wrong-prefix memo. Enqueue one page per
-    // possible resync attempt (transient-block retries re-enumerate the channel).
+    let foreign_mint_to = ScriptedMintTo {
+        mint: Pubkey::new_unique(),
+        recipient_ata: Pubkey::new_unique(),
+        amount: DEPOSIT_AMOUNT,
+    };
+    let attacker = Pubkey::new_unique();
+    let forged_memo = mint_idempotency_memo(&dep.source_event_id());
+    // (b) non-idempotency memo, (c) wrong-prefix memo, (d) forged memo. Enqueue one
+    // page per possible resync attempt (transient-block retries re-enumerate the channel).
     for _ in 0..RESYNC_ATTEMPTS {
         let page = json!([
             channel_sig_entry(&Signature::new_unique(), &foreign_memo),
@@ -1277,17 +1402,230 @@ async fn resync_ignores_foreign_event_and_nonidempotency_memos(
                 &Signature::new_unique(),
                 &format!("private_channel:not-idempotency:{}", foreign_id.as_str())
             ),
+            channel_sig_entry(&Signature::new_unique(), &forged_memo),
         ]);
         mock.enqueue("getSignaturesForAddress", Reply::result(page));
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(channel_transaction(
+                &CHANNEL_AUTHORITY,
+                &Pubkey::new_unique(),
+                &foreign_memo,
+                Some(&foreign_mint_to),
+            )),
+        );
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(channel_transaction(
+                &attacker,
+                &CHANNEL_AUTHORITY,
+                &forged_memo,
+                None,
+            )),
+        );
     }
     h.run().await.expect("resync should succeed");
 
     let st = status_of(&db_url, &dep).await;
     assert_eq!(
         st.status, "pending",
-        "no foreign-event/non-idempotency memo may mark this deposit completed"
+        "no foreign-event/non-idempotency/unsigned memo may mark this deposit completed"
     );
     assert!(st.counterpart_signature.is_none());
+
+    mock.shutdown().await;
+    Ok(())
+}
+
+/// IT-R13: an authority-signed mint carrying this deposit's memo but paying a
+/// different amount contradicts the source event. The pre-drop validation pass
+/// aborts the resync and the live database is left exactly as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_aborts_on_signed_mint_that_does_not_pay_the_deposit_db_intact(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("resync_mismatched_mint").await?;
+
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    do_deposit(
+        &client,
+        &env.users[0],
+        env.instance,
+        env.mint,
+        DEPOSIT_AMOUNT,
+    )
+    .await?;
+
+    // Headroom so every event's block is confirmed-available and inside the range.
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
+
+    let mock = MockRpcServer::start().await;
+    let h = Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: validator.rpc_url(),
+        program_type: ProgramType::Escrow,
+        instance: Some(env.instance),
+        channel_url: mock.url(),
+        genesis,
+    };
+
+    let keys = h.discover().await;
+    let dep = keys_of_type(&keys, "deposit")[0].clone();
+    let memo = mint_idempotency_memo(&dep.source_event_id());
+    let overpaying_mint_to = ScriptedMintTo {
+        amount: dep.amount + 1,
+        ..landed_mint_to(&dep, ConsumedMintKind::Deposit)
+    };
+    for _ in 0..RESYNC_ATTEMPTS {
+        mock.enqueue(
+            "getSignaturesForAddress",
+            Reply::result(json!([channel_sig_entry(&Signature::new_unique(), &memo)])),
+        );
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(channel_transaction(
+                &CHANNEL_AUTHORITY,
+                &Pubkey::new_unique(),
+                &memo,
+                Some(&overpaying_mint_to),
+            )),
+        );
+    }
+    // Only the live table holds this row; any drop and rebuild would erase it.
+    let sentinel_signature = "resync_mismatch_sentinel";
+    seed_pending_deposit(&db_url, sentinel_signature).await;
+    let rows_before = row_count(&db_url).await;
+
+    let result = h.run().await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::ConsumedMintMismatch { .. }
+            ))
+        ),
+        "a signed mint that does not pay this deposit must abort the resync: {result:?}"
+    );
+
+    assert_eq!(
+        row_count(&db_url).await,
+        rows_before,
+        "no row may be dropped"
+    );
+    let pool = fresh_pool(&db_url).await;
+    let sentinel: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+            .bind(sentinel_signature)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(sentinel, 1, "the live table must never have been dropped");
+    let st = status_of(&db_url, &dep).await;
+    assert_eq!(
+        st.status, "pending",
+        "the deposit keeps its pre-resync state"
+    );
+    assert!(st.counterpart_signature.is_none());
+
+    mock.shutdown().await;
+    Ok(())
+}
+
+/// IT-R14: an authority-signed mint that pays this deposit exactly but carries the
+/// remint marker for its id is contradictory evidence. Left `pending` it would be
+/// minted again, so the pre-drop validation aborts and the live database is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_aborts_on_remint_marker_for_a_deposit_db_intact(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("resync_kind_mismatch").await?;
+
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    do_deposit(
+        &client,
+        &env.users[0],
+        env.instance,
+        env.mint,
+        DEPOSIT_AMOUNT,
+    )
+    .await?;
+
+    // Headroom so every event's block is confirmed-available and inside the range.
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
+
+    let mock = MockRpcServer::start().await;
+    let h = Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: validator.rpc_url(),
+        program_type: ProgramType::Escrow,
+        instance: Some(env.instance),
+        channel_url: mock.url(),
+        genesis,
+    };
+
+    let keys = h.discover().await;
+    let dep = keys_of_type(&keys, "deposit")[0].clone();
+    let remint_memo = remint_idempotency_memo(&dep.source_event_id());
+    let deposit_mint_to = landed_mint_to(&dep, ConsumedMintKind::Deposit);
+    for _ in 0..RESYNC_ATTEMPTS {
+        mock.enqueue(
+            "getSignaturesForAddress",
+            Reply::result(json!([channel_sig_entry(
+                &Signature::new_unique(),
+                &remint_memo
+            )])),
+        );
+        mock.enqueue(
+            "getTransaction",
+            Reply::result(channel_transaction(
+                &CHANNEL_AUTHORITY,
+                &Pubkey::new_unique(),
+                &remint_memo,
+                Some(&deposit_mint_to),
+            )),
+        );
+    }
+
+    // Only the live table holds this row; any drop and rebuild would erase it.
+    let sentinel_signature = "resync_kind_mismatch_sentinel";
+    seed_pending_deposit(&db_url, sentinel_signature).await;
+    let rows_before = row_count(&db_url).await;
+
+    let result = h.run().await;
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Reconciliation(
+                ReconciliationError::ConsumedMintMismatch { .. }
+            ))
+        ),
+        "a remint marker naming a deposit must abort the resync: {result:?}"
+    );
+
+    assert_eq!(
+        row_count(&db_url).await,
+        rows_before,
+        "no row may be dropped"
+    );
+    let pool = fresh_pool(&db_url).await;
+    let sentinel: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE signature = $1")
+            .bind(sentinel_signature)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(sentinel, 1, "the live table must never have been dropped");
+    assert_eq!(status_of(&db_url, &dep).await.status, "pending");
 
     mock.shutdown().await;
     Ok(())
@@ -1338,8 +1676,7 @@ async fn resync_reclassifies_failed_reminted_withdrawal() -> Result<(), Box<dyn 
     let wd = withdrawals[0].clone();
 
     let landed = Signature::new_unique();
-    let id = wd.source_event_id();
-    script_channel_consumed(&mock, &[(id, ConsumedMintKind::Remint, landed)]);
+    script_channel_consumed(&mock, &[(&wd, ConsumedMintKind::Remint, landed)]);
     h.run().await.expect("resync should succeed");
 
     let st = status_of(&db_url, &wd).await;
@@ -1483,18 +1820,25 @@ async fn resync_aborts_on_legacy_scheme_memo_db_intact() -> Result<(), Box<dyn s
 
     let mock = MockRpcServer::start().await;
     // Legacy serial-id memo: prefix present, value is a bare number (not a digest).
-    let legacy = json!([channel_sig_entry(
-        &Signature::new_unique(),
-        "private_channel:mint-idempotency:42"
-    )]);
+    let legacy_memo = "private_channel:mint-idempotency:42";
+    let legacy = json!([channel_sig_entry(&Signature::new_unique(), legacy_memo)]);
     mock.enqueue("getSignaturesForAddress", Reply::result(legacy));
+    mock.enqueue(
+        "getTransaction",
+        Reply::result(channel_transaction(
+            &CHANNEL_AUTHORITY,
+            &Pubkey::new_unique(),
+            legacy_memo,
+            None,
+        )),
+    );
     let service = make_channel_resync_service(
         validator.rpc_url(),
         storage,
         ProgramType::Escrow,
         Some(Pubkey::new_unique()),
         mock.url(),
-        Pubkey::new_unique(),
+        CHANNEL_AUTHORITY,
     );
 
     let result = service.run(current_slot).await;

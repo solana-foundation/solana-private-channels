@@ -2,12 +2,13 @@ name: Rust Checks
 
 on:
   push:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
   pull_request:
     branches:
       [
         main,
         hardening/pre-release-audit,
+        hardening/apex-scan-2,
         cantina-audit,
         ottersec-audit,
         feature/smt-to-bitmap-migration,

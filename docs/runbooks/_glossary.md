@@ -99,17 +99,19 @@ the deposit ones do not.
 ## Idempotency memo (deposit-side)
 
 Every deposit mint carries a deterministic memo:
-`private_channel:mint-idempotency:<transaction_id>`
-(`indexer/src/operator/constants.rs::MINT_IDEMPOTENCY_MEMO_PREFIX`).
-Before sending, the operator scans the recipient ATA's recent signatures
-on the private channel chain (`find_existing_mint_signature_with_memo`) and
-short-circuits to `Completed` if a memo'd signature is already
-finalized.
+`private_channel:mint-idempotency:<source_event_id>`
+(`indexer/src/operator/constants.rs::MINT_IDEMPOTENCY_MEMO_PREFIX`), where
+the id is derived from the source deposit's on-chain coordinates (see
+`_verify_onchain_mint.md` Step 3). Resync reads it to rebuild serviced rows,
+and the verify-on-chain procedure searches for it.
 
-This is the primary fence against double-minting on retry. It works only
-within the RPC's signature lookback window - older history is invisible
-to the scan, which is why the verify-on-chain procedure escalates as
-`AMBIGUOUS` when `processed_at` predates the window.
+It is not the live fence against double-minting. That is the write-ahead
+journal: each mint signature is stored before broadcast and re-checked on
+the channel before a re-picked deposit is minted again. The journal is
+deleted once the row is terminal, so re-arming a terminal row relies on
+the verify-on-chain procedure alone. That procedure's scan only sees the
+RPC's signature lookback window, which is why it escalates as `AMBIGUOUS`
+when `processed_at` predates the window.
 
 Withdrawals have an analogous fence: the `pending_remint` recovery
 checks finality of stashed signatures before reminting.

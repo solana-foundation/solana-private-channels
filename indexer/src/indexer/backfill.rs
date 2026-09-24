@@ -545,6 +545,15 @@ impl BackfillService {
     }
 
     /// Fill the resolved range `(from_slot, to_slot]` over the instruction channel.
+    /// A rebuild range that ignores the durable checkpoint: `(first_slot - 1, last produced
+    /// block at or below tip]`, in `run_range`'s bounds. Resolved once, so every pass over
+    /// it covers the same slots.
+    pub async fn fixed_range(&self, first_slot: u64, tip: u64) -> Result<(u64, u64), IndexerError> {
+        let from_slot = first_slot.saturating_sub(1);
+        let to_slot = last_produced_at_or_below(&self.rpc_poller, from_slot, tip).await?;
+        Ok((from_slot, to_slot))
+    }
+
     pub async fn run_range(
         &self,
         from_slot: u64,
@@ -1465,6 +1474,30 @@ mod tests {
                 UiTransactionEncoding::Json,
                 CommitmentLevel::Finalized,
             ))
+        }
+
+        /// A rebuild range ignores the durable checkpoint: it starts one below the first
+        /// slot and ends at the last produced block at or below the tip, so two passes
+        /// over it cover the same slots.
+        #[tokio::test]
+        async fn fixed_range_ignores_the_checkpoint() {
+            let first_slot = 10;
+            let tip = 50;
+            let mut server = Server::new_async().await;
+            let _blocks = mock_get_blocks(&mut server, first_slot - 1, tip, &[20, 40]);
+            let mock = MockStorage::new();
+            mock.set_checkpoint("escrow", 45);
+            let service = BackfillService::new(
+                Arc::new(Storage::Mock(mock)),
+                make_poller(&server.url()),
+                ProgramType::Escrow,
+                make_config(&server.url(), u64::MAX),
+                None,
+            );
+
+            let range = service.fixed_range(first_slot, tip).await.unwrap();
+
+            assert_eq!(range, (first_slot - 1, 40));
         }
 
         fn mock_get_slot(server: &mut Server, slot: u64) -> mockito::Mock {

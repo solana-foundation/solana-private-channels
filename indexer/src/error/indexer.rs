@@ -123,6 +123,21 @@ pub enum ReconciliationError {
     #[error("consumed-set unavailable, resync aborted before drop: {reason}")]
     ConsumedSetUnavailable { reason: String },
 
+    /// An authority-signed channel mint names this source event but does not pay it: a
+    /// different kind, mint, recipient or amount. Contradictory evidence, so resync
+    /// aborts before any destruction rather than guess which side is right.
+    #[error(
+        "channel mint {channel_signature} names source event {source_event_id} (source tx \
+         {source_signature}) but does not pay it ({reason}); resync aborted before drop, see \
+         docs/runbooks/resync_consumed_mint_mismatch.md"
+    )]
+    ConsumedMintMismatch {
+        source_event_id: String,
+        source_signature: String,
+        channel_signature: String,
+        reason: String,
+    },
+
     /// A rebuild drops the table the halt flag lives in, so it would clear a halt
     /// that is still unresolved and destroy the ledger evidence behind it. Resolve
     /// the halt and clear the flag first, then resync.
