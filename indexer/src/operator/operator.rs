@@ -1326,7 +1326,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run(Arc::new(Storage::Mock(mock.clone())), common_config, config, None),
+            run(
+                Arc::new(Storage::Mock(mock.clone())),
+                common_config,
+                config,
+                None,
+            ),
         )
         .await
         .expect("a withdraw operator without an instance must refuse, not start");

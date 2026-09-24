@@ -13,7 +13,9 @@ use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_keychain::SolanaSigner;
 use solana_sdk::instruction::InstructionError;
-use solana_sdk::{message::Message, pubkey::Pubkey, signature::Signature, transaction::Transaction};
+use solana_sdk::{
+    message::Message, pubkey::Pubkey, signature::Signature, transaction::Transaction,
+};
 use tracing::{debug, warn};
 
 pub const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
@@ -277,7 +279,9 @@ pub async fn classify_failure(
                     "escrow_error_origin_unproven",
                 ])
                 .inc();
-            warn!("Custom error {code} on {signature} has no provable origin; retrying the release");
+            warn!(
+                "Custom error {code} on {signature} has no provable origin; retrying the release"
+            );
             ConfirmationResult::Retry
         }
     }

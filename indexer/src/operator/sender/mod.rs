@@ -604,7 +604,7 @@ mod tests {
         InFlightTx, InstructionWithSigners, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
-        ExtraErrorCheckPolicy, RetryPolicy, TransactionKind,
+        ExtraErrorCheckPolicy, RetryPolicy, SourceEventId, TransactionKind, WithdrawalRemintInfo,
     };
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
@@ -911,9 +911,10 @@ mod tests {
     }
 
     /// A transfer hook's 13 is not the escrow's generation refusal. Parking it for a
-    /// rotation would resend a release the hook rejects forever, at no cost to its budget.
+    /// rotation would resend a release the hook rejects forever, at no cost to its budget;
+    /// the burn is compensated instead, through the proof-gated remint.
     #[tokio::test]
-    async fn rotation_retry_drain_does_not_repark_a_release_a_hook_refused() {
+    async fn rotation_retry_drain_remints_a_release_a_hook_refused() {
         let mut server = mockito::Server::new_async().await;
         let send = mock_generation_refusal(&mut server, Pubkey::new_unique()).await;
 
@@ -921,9 +922,22 @@ mod tests {
         let mock = mock_with_parked_row(QUEUED_ROW);
         let mut state = sender_state_with_storage(&server.url(), mock.clone());
         state.instance_pda = Some(Pubkey::new_unique());
+        state.remint_cache.insert(
+            nonce,
+            WithdrawalRemintInfo {
+                transaction_id: QUEUED_ROW,
+                source_event_id: SourceEventId::new("burn-70", 0, None),
+                trace_id: "trace-70".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1_000,
+            },
+        );
         state.rotation_retry_queue.push(queued_release(nonce));
 
-        let (storage_tx, _storage_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
         drain_rotation_retry_queue(&mut state, &storage_tx).await;
 
         send.assert_async().await;
@@ -936,6 +950,20 @@ mod tests {
             Some(TransactionStatus::Parked),
             "a release a hook refused must not be parked again"
         );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the burn must be queued for compensation"
+        );
+        assert_eq!(state.pending_remints[0].ctx.withdrawal_nonce, Some(nonce));
+        while let Ok(update) = storage_rx.try_recv() {
+            assert_ne!(
+                update.status,
+                TransactionStatus::ManualReview,
+                "a hook refusal must not strand the burn in manual review: {:?}",
+                update.error_message
+            );
+        }
     }
 
     /// A lost rotation releases the drain's only hold, and each tick then pays a fee per entry for a certain refusal.

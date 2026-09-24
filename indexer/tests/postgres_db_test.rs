@@ -166,7 +166,10 @@ async fn init_schema_keeps_the_nonce_trigger() -> Result<(), Box<dyn std::error:
     storage.init_schema().await?;
     let (after,): (i64,) = sqlx::query_as(trigger_oid_sql).fetch_one(&pool).await?;
 
-    assert_eq!(before, after, "init_schema must not recreate the nonce trigger");
+    assert_eq!(
+        before, after,
+        "init_schema must not recreate the nonce trigger"
+    );
     Ok(())
 }
 
