@@ -2393,7 +2393,7 @@ impl PostgresDb {
             WHERE id = $1
               AND status = 'processing'
               AND updated_at = $2
-              -- Last gate before any value moves, so a halt also stops rows claimed earlier.
+              -- Last gate before any value moves. A claim whose statement read no halt counts as before it, so only its one send can follow.
               AND NOT EXISTS (
                   SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
               )
