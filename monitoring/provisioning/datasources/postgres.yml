@@ -7,9 +7,12 @@ datasources:
     access: proxy
     url: ${POSTGRES_INDEXER_HOST}:5432
     database: ${POSTGRES_INDEXER_DB}
-    user: ${POSTGRES_USER}
+    # A login that holds SELECT on the transaction_monitoring view and nothing
+    # else. Anyone with a Grafana session can run arbitrary SQL through this
+    # datasource, so it must not be the cluster's owner.
+    user: private_channel_grafana
     secureJsonData:
-      password: ${POSTGRES_PASSWORD}
+      password: ${POSTGRES_GRAFANA_PASSWORD}
     jsonData:
       database: ${POSTGRES_INDEXER_DB}
       sslmode: disable

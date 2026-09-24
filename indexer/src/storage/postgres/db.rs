@@ -1032,6 +1032,36 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Grafana's dashboards only count withdrawals by status and over time.
+        // The rest of `transactions` — signature, initiator, recipient, mint,
+        // amount, memo, withdrawal_nonce — identifies participants, so the
+        // datasource reads this and holds no grant on the table behind it. A
+        // view runs with its owner's rights, so that grant is not needed.
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE VIEW transaction_monitoring AS
+            SELECT status, transaction_type, created_at FROM transactions
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // The grant lives here because only the owner of the view can issue it.
+        // Skipped when the role is absent, as it is in tests and in single-login
+        // dev setups.
+        sqlx::query(
+            r#"
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'private_channel_grafana') THEN
+                    GRANT SELECT ON transaction_monitoring TO private_channel_grafana;
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database schema initialized");
         Ok(())
     }

@@ -17,7 +17,6 @@ maps to a specific sender-side site:
 
 | `error_message` | Source | Trigger |
 |---|---|---|
-| starts with `Failed idempotency lookup for transaction_id` | `sender/mint.rs` | `getSignaturesForAddress` RPC failed during pre-send memo scan. |
 | `Mint initialization failed` | `sender/transaction.rs` | Log-only marker, **no webhook**: this message is only built on the defensive `MintNotInitialized`-without-`transaction_id` branch, and with no id there is no row to write a status to. A failing just-in-time `InitializeMint` no longer lands here at all: transient init failures (RPC outage, send error, unconfirmable init) re-arm the deposit to `pending` under the requeue cap instead, and only the recovery worker may escalate one. The *post-JIT* mint failure case (mint exists but unusable) is in [`deposit_manual_review.md`](deposit_manual_review.md) § Path D; the cap-exhausted case is § Path G. |
 | `Unexpected mint error` | `sender/transaction.rs` | `MintNotInitialized` confirmation result on a non-Mint tx (defensive; should never fire). |
 | `Confirmation failed - transaction status unknown, unsafe to retry` | `sender/transaction.rs` | RPC polling timed out for a non-idempotent send; mint may or may not have landed. |
@@ -62,19 +61,17 @@ File via the Tier 3 process: `Failed` was wrong, which means either:
 
 #### `NOT_LANDED` - mint genuinely did not happen
 
-Re-arm the row to `pending`. The idempotency memo is a safety net even
-if a previous attempt did broadcast: the operator's pre-send memo scan
-short-circuits to `Completed` if it finds a memo'd signature.
+Re-arm the row to `pending`. **The `NOT_LANDED` verdict is what makes this
+safe.** The operator does not scan for the memo before minting, and a
+`failed` row is terminal, so the recovery sweep may already have deleted
+its persisted broadcast signatures (`pending_release_signatures`).
 
-Re-arming is additionally guarded by the pre-mint signature gate: a
-non-terminal row keeps its persisted broadcast signatures
-(`pending_release_signatures` is only GC'd once the row is terminal), and
-the deposit processor re-classifies them on the channel before building a
-new mint. A signature that turns out to have landed completes the row
-instead of re-minting; an unverifiable one is left `processing` for the
-recovery sweep, which re-checks it on the channel and is the sole owner of
-the quarantine decision (see
-[`deposit_manual_review.md`](deposit_manual_review.md) Path E).
+If those signatures are still there, the pre-mint gate re-classifies them
+on the channel before building a new mint: a landed one completes the row
+instead of re-minting, and an unverifiable one is left `processing` for
+the recovery sweep, which owns the quarantine decision (see
+[`deposit_manual_review.md`](deposit_manual_review.md) Path E). Do not
+count on them being there.
 
 ```sql
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
@@ -98,9 +95,9 @@ Stop. [Escalate](_escalation.md) (Tier 2). Do not act.
   window, engineering must do an out-of-band audit via archived block
   history before any recovery action.
 
-Re-arming to `pending` in the `AMBIGUOUS` case relies on the operator's
-own idempotency check; that check uses the same lookback window and will
-be just as blind. Do not lean on it alone for an old `processed_at`.
+Do not re-arm to `pending` in the `AMBIGUOUS` case: nothing in the
+operator re-checks a terminal row's earlier mint, so a landed one would be
+minted again.
 
 ## Cross-link — when ManualReview is the right runbook
 
@@ -109,15 +106,6 @@ If you expected `Mint initialization failed` here but the row is in
 [`deposit_manual_review.md`](deposit_manual_review.md) § Path D —
 that's the path for a successful (or unnecessary) JIT followed by a
 structural mint problem (wrong authority, corrupt data).
-
-## Special case - `Failed idempotency lookup`
-
-This trigger fires when the operator's pre-send memo scan itself
-errored (RPC down at attempt time). The mint was **not** sent
-afterwards. On-chain verification will most likely return `NOT_LANDED`
-and Step 2's re-arm path applies. The retry is safe because the next
-attempt will run the memo scan again (and will detect any prior
-landed mint).
 
 ## Not an alert - `deposit_ownership_lost` metric
 

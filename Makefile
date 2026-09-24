@@ -23,6 +23,7 @@ OBS_SERVICES := cadvisor prometheus grafana
 .PHONY: install-buildkit-cache check-buildkit-cache
 .PHONY: check-env-local check-env-devnet
 .PHONY: docker-build docker-up docker-rebuild docker-restart docker-down docker-clean docker-logs docker-ps
+.PHONY: docker-migrate docker-devnet-migrate
 .PHONY: docker-devnet-build docker-devnet-up docker-devnet-rebuild docker-devnet-restart docker-devnet-down docker-devnet-clean docker-devnet-logs docker-devnet-ps
 
 all: build
@@ -448,27 +449,29 @@ profile:
 #############
 # Observability
 #############
-obs-up: check-buildkit-cache
+obs-up: check-env-local check-buildkit-cache
 	@echo "Starting observability stack (docker-compose.yml)..."
-	@docker compose -f docker-compose.yml up -d $(OBS_SERVICES)
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) up -d --wait $(OBS_SERVICES)
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_LOCAL)
 
 obs-down:
 	@echo "Stopping observability stack (docker-compose.yml)..."
-	@docker compose -f docker-compose.yml stop $(OBS_SERVICES)
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) stop $(OBS_SERVICES)
 
 obs-logs:
-	@docker compose -f docker-compose.yml logs -f --tail=200 $(OBS_SERVICES)
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) logs -f --tail=200 $(OBS_SERVICES)
 
-obs-devnet-up: check-buildkit-cache
+obs-devnet-up: check-env-devnet check-buildkit-cache
 	@echo "Starting observability stack (docker-compose.devnet.yml)..."
-	@docker compose -f docker-compose.devnet.yml up -d $(OBS_SERVICES)
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --wait $(OBS_SERVICES)
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_DEVNET)
 
 obs-devnet-down:
 	@echo "Stopping observability stack (docker-compose.devnet.yml)..."
-	@docker compose -f docker-compose.devnet.yml stop $(OBS_SERVICES)
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) stop $(OBS_SERVICES)
 
 obs-devnet-logs:
-	@docker compose -f docker-compose.devnet.yml logs -f --tail=200 $(OBS_SERVICES)
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) logs -f --tail=200 $(OBS_SERVICES)
 
 #############
 # BuildKit cache GC
@@ -546,6 +549,12 @@ COMPOSE_DEVNET   := docker-compose.devnet.yml
 # $(wildcard) drops the flag when `.env` is absent; compose errors on missing files.
 ENV_FILES_LOCAL  ?= --env-file versions.env --env-file .env.local $(if $(wildcard .env),--env-file .env)
 ENV_FILES_DEVNET ?= --env-file versions.env --env-file .env.devnet $(if $(wildcard .env),--env-file .env)
+# The same chain as bare paths, for the tools that take filenames rather than
+# compose flags: the required-secret check and the migration script. Derived from
+# the variables above so an ENV_FILES_* override reaches every surface, instead
+# of validating one set of files while compose is handed another.
+ENV_PATHS_LOCAL  := $(filter-out --env-file,$(ENV_FILES_LOCAL))
+ENV_PATHS_DEVNET := $(filter-out --env-file,$(ENV_FILES_DEVNET))
 # Optional compose profile, e.g. `make docker-up PROFILE=auth`; expands to nothing when unset.
 PROFILE_FLAG = $(if $(PROFILE),--profile $(PROFILE))
 
@@ -559,10 +568,10 @@ check-env-contract:
 # including the gitignored `.env` so it validates what compose actually resolves.
 # Depends on check-env-contract so a drifted key set is caught before boot.
 check-env-local: check-env-contract
-	@./scripts/check-required-env.sh versions.env .env.local $(wildcard .env)
+	@./scripts/check-required-env.sh $(ENV_PATHS_LOCAL)
 
 check-env-devnet: check-env-contract
-	@./scripts/check-required-env.sh versions.env .env.devnet $(wildcard .env)
+	@./scripts/check-required-env.sh $(ENV_PATHS_DEVNET)
 
 # --- Local stack (local validator) ---
 
@@ -572,7 +581,10 @@ docker-build: check-docker check-buildkit-cache
 
 docker-up: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d --wait postgres-primary postgres-indexer
+	@./scripts/migrate-stack.sh --scope=databases $(ENV_PATHS_LOCAL)
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_LOCAL)
 
 # Like docker-up but preserves the local validator ledger across restarts so
 # on-chain state stays consistent with Postgres rows. Caveat: after changing
@@ -580,11 +592,17 @@ docker-up: check-env-local check-docker check-buildkit-cache
 # will keep running stale bytecode.
 docker-up-persist: check-env-local check-docker check-buildkit-cache
 	@echo "Starting full stack with validator persistence ($(COMPOSE_LOCAL))..."
+	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d --wait postgres-primary postgres-indexer
+	@./scripts/migrate-stack.sh --scope=databases $(ENV_PATHS_LOCAL)
 	@VALIDATOR_RESET_FLAG= docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_LOCAL)
 
 docker-rebuild: check-env-local check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting full stack ($(COMPOSE_LOCAL))..."
+	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d --build --wait postgres-primary postgres-indexer
+	@./scripts/migrate-stack.sh --scope=databases $(ENV_PATHS_LOCAL)
 	@docker compose -f $(COMPOSE_LOCAL) $(ENV_FILES_LOCAL) $(PROFILE_FLAG) up -d --build
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_LOCAL)
 
 docker-restart: check-docker
 	@echo "Restarting full stack ($(COMPOSE_LOCAL))..."
@@ -612,11 +630,30 @@ docker-devnet-build: check-docker check-buildkit-cache
 
 docker-devnet-up: check-env-devnet check-docker check-buildkit-cache
 	@echo "Starting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --wait postgres-primary postgres-indexer
+	@./scripts/migrate-stack.sh --scope=databases $(ENV_PATHS_DEVNET)
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_DEVNET)
+
+# Upgrading a stack whose volumes predate a release that added database roles or
+# changed the Grafana password needs these applied by hand: Postgres runs its
+# init scripts only on an empty data directory, and Grafana sets the admin
+# password only when it first creates the user. Idempotent, so it is safe to run
+# whenever. The Ansible deploy does the equivalent on every run.
+docker-migrate: check-env-local check-docker
+	@echo "Applying migrations to the running local stack..."
+	@./scripts/migrate-stack.sh $(ENV_PATHS_LOCAL)
+
+docker-devnet-migrate: check-env-devnet check-docker
+	@echo "Applying migrations to the running devnet stack..."
+	@./scripts/migrate-stack.sh $(ENV_PATHS_DEVNET)
 
 docker-devnet-rebuild: check-env-devnet check-docker check-buildkit-cache
 	@echo "Rebuilding and (re)starting devnet stack ($(COMPOSE_DEVNET))..."
+	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --build --wait postgres-primary postgres-indexer
+	@./scripts/migrate-stack.sh --scope=databases $(ENV_PATHS_DEVNET)
 	@docker compose -f $(COMPOSE_DEVNET) $(ENV_FILES_DEVNET) up -d --build
+	@./scripts/migrate-stack.sh --scope=grafana $(ENV_PATHS_DEVNET)
 
 docker-devnet-restart: check-docker
 	@echo "Restarting devnet stack ($(COMPOSE_DEVNET))..."

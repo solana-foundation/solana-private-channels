@@ -39,13 +39,9 @@ async fn main() {
 
     info!("Connected to database");
 
-    // Create tables and indexes if they don't exist yet.
-    db::init_schema(&pool)
-        .await
-        .expect("failed to initialize schema");
-
-    info!("Schema initialized");
-
+    // The schema is `auth-admin migrate`'s to create, connecting as its owner.
+    // This login holds no DDL rights, and holding the owner's credential here
+    // would put schema and grant control inside the process serving requests.
     let pool_status = PoolStatus::new_healthy();
     let auth_throttle = Arc::new(AuthThrottle::new(
         config.auth_rate_limit_per_second,

@@ -141,6 +141,11 @@ The runbooks call this out at every relevant site.
   channel mint carries a legacy-scheme idempotency memo. Log-discovered, not
   paged; the resync fails closed before dropping anything, so the database is
   intact.
+- [`resync_consumed_mint_mismatch.md`](resync_consumed_mint_mismatch.md) - a
+  resync aborting because an authority-signed channel mint names a source event
+  but does not pay it, or one event was minted twice. Log-discovered, not paged;
+  fails closed before dropping anything, but keep the operators stopped until
+  the affected rows are quarantined.
 - [`resync_bitmap_advanced.md`](resync_bitmap_advanced.md) - a withdraw resync
   refusing because the escrow's withdrawal bitmap has already issued nonces.
   Log-discovered, not paged; fails closed before dropping anything, so the

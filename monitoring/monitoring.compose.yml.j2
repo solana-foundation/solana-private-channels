@@ -42,7 +42,7 @@ services:
       - {{ monitoring_dir }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prom-data:/prometheus
     ports:
-      - "{{ monitoring_prometheus_port }}:9090"
+      - "{{ monitoring_bind_address }}{{ monitoring_prometheus_port }}:9090"
     networks: [private-channel]
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
@@ -78,8 +78,10 @@ services:
       # Postgres datasource (for the Postgres dashboard's direct-DB queries).
       - POSTGRES_INDEXER_HOST=postgres-indexer
       - POSTGRES_INDEXER_DB={{ postgres_indexer_db }}
-      - POSTGRES_USER={{ postgres_user }}
-      - POSTGRES_PASSWORD={{ postgres_password }}
+      # SELECT on the transaction_monitoring view and nothing else. A Grafana
+      # session can issue arbitrary SQL through this datasource, so the cluster
+      # owner has no business here.
+      - POSTGRES_GRAFANA_PASSWORD={{ postgres_grafana_password }}
     volumes:
       # Single mount per side mirrors the bind-mount layout in
       # docker-compose.yml so both deploy paths see identical provisioning.
@@ -88,7 +90,7 @@ services:
       - {{ monitoring_dir }}/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "{{ monitoring_grafana_port }}:3000"
+      - "{{ monitoring_bind_address }}{{ monitoring_grafana_port }}:3000"
     networks: [private-channel]
     depends_on: [prometheus]
     healthcheck:
@@ -107,7 +109,7 @@ services:
       - {{ monitoring_dir }}/blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
     command: ["--config.file=/etc/blackbox_exporter/config.yml"]
     ports:
-      - "{{ monitoring_blackbox_port }}:9115"
+      - "{{ monitoring_bind_address }}{{ monitoring_blackbox_port }}:9115"
     networks: [private-channel]
 
   # cAdvisor — per-container CPU/mem/IO. Mounts the Docker socket and host cgroup paths.
@@ -125,7 +127,7 @@ services:
       - /var/lib/docker:/var/lib/docker:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     ports:
-      - "{{ monitoring_cadvisor_port }}:8080"
+      - "{{ monitoring_bind_address }}{{ monitoring_cadvisor_port }}:8080"
     networks: [private-channel]
 
   # node_exporter — host CPU/mem/disk/net.
@@ -144,7 +146,7 @@ services:
       - --path.rootfs=/rootfs
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
     ports:
-      - "{{ monitoring_node_exporter_port }}:9100"
+      - "{{ monitoring_bind_address }}{{ monitoring_node_exporter_port }}:9100"
     networks: [private-channel]
 
   # postgres_exporter for both primary and replica. Two instances differ only
@@ -154,9 +156,11 @@ services:
     container_name: private-channel-mon-pgexp-primary
     restart: unless-stopped
     environment:
-      - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
+      # pg_monitor only. This container is long-lived on the same network as the
+      # auth tables, so the bootstrap superuser has no business being here.
+      - DATA_SOURCE_NAME=postgresql://private_channel_monitoring:{{ postgres_monitoring_password }}@postgres-primary:5432/{{ postgres_db }}?sslmode=disable
     ports:
-      - "{{ monitoring_postgres_exporter_port }}:9187"
+      - "{{ monitoring_bind_address }}{{ monitoring_postgres_exporter_port }}:9187"
     networks: [private-channel]
 
   postgres-exporter-indexer:
@@ -164,9 +168,11 @@ services:
     container_name: private-channel-mon-pgexp-indexer
     restart: unless-stopped
     environment:
-      - DATA_SOURCE_NAME=postgresql://{{ postgres_user }}:{{ postgres_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
+      # The indexer cluster's own superuser. Not the primary's: this container
+      # can reach postgres-primary too.
+      - DATA_SOURCE_NAME=postgresql://{{ postgres_indexer_user }}:{{ postgres_indexer_password }}@postgres-indexer:5432/{{ postgres_indexer_db }}?sslmode=disable
     ports:
       # Distinct from monitoring_postgres_exporter_port so primary + indexer
       # exporters don't collide on the host. Defined in vars/<env>.yml.
-      - "{{ monitoring_postgres_exporter_indexer_port }}:9187"
+      - "{{ monitoring_bind_address }}{{ monitoring_postgres_exporter_indexer_port }}:9187"
     networks: [private-channel]

@@ -312,7 +312,7 @@ make integration-test
 
 ### Docker stack
 
-The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: `POSTGRES_PASSWORD` and `POSTGRES_REPLICATION_PASSWORD` MUST be set (and `JWT_SECRET` if you enable auth) or the stack fails to start. Generate strong values with `openssl rand -hex 32`. Put secrets in the gitignored `.env` (loaded last, overrides the templates) rather than the tracked `.env.local`.
+The Makefile wraps the full compose stack so you don't have to remember the `--env-file` chain. Precondition: copy the env template once (`cp .env.example .env.local`) and fill in the required secrets. No defaults are shipped: the nine `POSTGRES_*` passwords and `GF_ADMIN_PASSWORD` MUST all be set, and the nine database passwords MUST each differ from one another (`JWT_SECRET` too if you enable auth), or the stack refuses to start and names what is missing or shared. See [`docs/ENV_CONTRACT.md`](docs/ENV_CONTRACT.md#required-secrets-fail-closed) for the list. Generate each with `openssl rand -hex 32`. Put secrets in the gitignored `.env` (loaded last, overrides the templates) rather than the tracked `.env.local`.
 
 **Run `make build-localnet` once before the first `make docker-up`.** It generates an operator keypair and patches the real `PRIVATE_CHANNEL_ADMIN_KEYS` / `ADMIN_PRIVATE_KEY` and program IDs into `.env.local`, replacing the template placeholders. Skipping it leaves `PRIVATE_CHANNEL_ADMIN_KEYS=your_admin_public_key`, which the write-node rejects at startup (`Invalid admin key … Invalid Base58 string`).
 

@@ -9,7 +9,7 @@ program_type = "escrow"
 # RPC endpoint URL for transaction submission
 rpc_url = "http://localhost:8899"
 # Archival Solana fallback for rpc_url (re-checks a Dead finality verdict). REQUIRED for the withdraw
-# operator (independent, same-cluster, reachable) or it refuses to start; optional for escrow. Env: COMMON_FALLBACK_RPC_URL
+# operator (independent, same-cluster, reachable) or it refuses to start; the escrow operator refuses to start if set. Env: COMMON_FALLBACK_RPC_URL
 # fallback_rpc_url = "https://your-archival-endpoint"
 
 # Solana custody RPC. Required for escrow: the reconciliation solvency check reads custody from it.

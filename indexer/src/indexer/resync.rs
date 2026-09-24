@@ -134,6 +134,55 @@ impl ResyncService {
         Ok(Some(Arc::new(set)))
     }
 
+    /// Replay `(from_slot, to_slot]` through the rebuild's own event conversion without
+    /// writing anything, and fail with `ConsumedMintMismatch` on the first channel mint
+    /// that names a rebuilt event but does not pay it. The live database is untouched.
+    async fn validate_before_drop(
+        &self,
+        backfill_service: &BackfillService,
+        from_slot: u64,
+        to_slot: u64,
+        consumed: Arc<ConsumedSet>,
+    ) -> Result<(), IndexerError> {
+        info!(
+            "Validating the consumed-set against source slots {}..={} before any destruction...",
+            from_slot + 1,
+            to_slot
+        );
+        let (instruction_tx, instruction_rx) = mpsc::channel(1000);
+        // Validation sends no checkpoints; the receiver only keeps the type satisfied.
+        let (checkpoint_tx, _checkpoint_rx) = mpsc::channel(1);
+        let mut validator = TransactionProcessor::new(self.storage.clone(), checkpoint_tx)
+            .with_consumed_set(consumed)
+            .validate_only();
+        if let Some(instance_id) = self.escrow_instance_id {
+            validator = validator.with_escrow_instance_id(instance_id);
+        }
+        let validator_handle = tokio::spawn(async move { validator.start(instruction_rx).await });
+
+        // run_range consumes the sender, so the validator sees the channel close when it ends.
+        let fill = backfill_service
+            .run_range(from_slot, to_slot, instruction_tx)
+            .await;
+
+        // A mismatch stops the validator, which in turn fails the fill's sends, so the
+        // validator's verdict is the one to report.
+        match validator_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("Consumed-set validation failed; aborting resync before drop: {e}");
+                return Err(e);
+            }
+            Err(e) => {
+                error!("Consumed-set validation task panicked: {e:?}");
+                return Err(IndexerError::ShutdownChannelSend);
+            }
+        }
+        fill?;
+        info!("Consumed-set validated against every rebuilt event");
+        Ok(())
+    }
+
     /// Refuse a withdraw rebuild unless the chain has issued no nonce at all. The rebuild
     /// restarts the nonce sequence at 0, so rebuilt rows would reuse nonces the chain has
     /// spent. Renumbering is not offered because it rewrites which withdrawal a nonce names.
@@ -333,6 +382,32 @@ impl ResyncService {
         // guard, all inside build_consumed_set, which returns Err on any of them.
         let consumed = self.build_consumed_set().await?;
 
+        let backfill_service = BackfillService::new(
+            self.storage.clone(),
+            self.rpc_poller.clone(),
+            self.program_type,
+            BackfillConfig {
+                enabled: true,
+                exit_after_backfill: false,
+                rpc_url: self.backfill_config_base.rpc_url.clone(),
+                batch_size: self.backfill_config_base.batch_size,
+                max_gap_slots: u64::MAX, // No limit for full resync
+                start_slot: Some(genesis_slot),
+            },
+            self.escrow_instance_id,
+        );
+        // One fixed range for both passes, so the rebuild covers exactly what was validated.
+        let (from_slot, to_slot) = backfill_service
+            .fixed_range(genesis_slot, current_slot)
+            .await?;
+
+        // Pre-flight 6: every channel mint that names a rebuilt event must pay it. Needs
+        // the rebuilt rows, so it replays the source history once without writing.
+        if let Some(consumed) = &consumed {
+            self.validate_before_drop(&backfill_service, from_slot, to_slot, consumed.clone())
+                .await?;
+        }
+
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
         // Two different failures are covered here. A session that died takes the drop with
         // it, because the drop runs on that session. A loss verdict that was wrong leaves
@@ -364,25 +439,7 @@ impl ResyncService {
         })?;
         info!("Database schema recreated successfully");
 
-        // Step 3: Create BackfillService with genesis_slot configuration
-        let backfill_config = BackfillConfig {
-            enabled: true,
-            exit_after_backfill: false,
-            rpc_url: self.backfill_config_base.rpc_url.clone(),
-            batch_size: self.backfill_config_base.batch_size,
-            max_gap_slots: u64::MAX, // No limit for full resync
-            start_slot: Some(genesis_slot),
-        };
-
-        let backfill_service = BackfillService::new(
-            self.storage.clone(),
-            self.rpc_poller.clone(),
-            self.program_type,
-            backfill_config,
-            self.escrow_instance_id,
-        );
-
-        // Step 4: Setup processing pipeline
+        // Step 3: Setup processing pipeline
         // Create channels for instruction flow and checkpoint updates
         let (instruction_tx, instruction_rx) = mpsc::channel(1000);
         let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
@@ -428,7 +485,7 @@ impl ResyncService {
         // leaves no gap for a later run to detect.
         let rebuild = async move {
             backfill_service
-                .run(instruction_tx.clone())
+                .run_range(from_slot, to_slot, instruction_tx.clone())
                 .await
                 .map_err(|e| {
                     error!(

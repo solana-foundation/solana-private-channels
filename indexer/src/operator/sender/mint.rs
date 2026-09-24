@@ -1,11 +1,10 @@
 use crate::operator::utils::instruction_util::{
-    InitializeMintBuilder, MintToBuilderWithTxnId, TransactionBuilder,
+    mint_idempotency_memo, remint_idempotency_memo, InitializeMintBuilder, TransactionBuilder,
 };
 use crate::operator::utils::transaction_util::{check_transaction_status, ConfirmationResult};
 use crate::operator::{
     sign_and_send_transaction, RpcClientWithRetry, SignerUtil, SourceEventId,
-    MINT_IDEMPOTENCY_MEMO_PREFIX, MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
-    REMINT_IDEMPOTENCY_MEMO_PREFIX,
+    MINT_IDEMPOTENCY_MEMO_PREFIX, REMINT_IDEMPOTENCY_MEMO_PREFIX,
 };
 use serde_json::Value;
 use solana_commitment_config::CommitmentConfig;
@@ -20,14 +19,15 @@ use solana_transaction_status::{
 };
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
 use super::types::{InstructionWithSigners, SenderState};
 
-#[derive(Clone, Copy, Debug)]
-struct ExpectedMintInstruction {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MintToFields {
     mint: Pubkey,
     recipient_ata: Pubkey,
     mint_authority: Pubkey,
@@ -421,17 +421,29 @@ pub enum ConsumedMintKind {
     Remint,
 }
 
+/// A channel mint the authority signed, with the `MintTo` fields it executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumedMint {
+    pub signature: Signature,
+    pub kind: ConsumedMintKind,
+    pub mint: Pubkey,
+    pub recipient_ata: Pubkey,
+    pub token_program: Pubkey,
+    pub amount: u64,
+}
+
 /// Set of source events the PrivateChannel has already serviced, keyed by their durable
 /// source-event-id. Built once, before a resync wipe, so the rebuild can reconcile each
 /// row to its terminal state.
-pub type ConsumedSet = HashMap<SourceEventId, (Signature, ConsumedMintKind)>;
+pub type ConsumedSet = HashMap<SourceEventId, ConsumedMint>;
 
 /// Enumerate every idempotency-memo'd mint the `authority` has confirmed on the channel
-/// into a `ConsumedSet`.
+/// into a `ConsumedSet`. Transactions the authority did not sign are skipped.
 ///
-/// Fails closed on any RPC/pagination error, and on an idempotency-prefixed memo that
-/// doesn't parse to a current source-event-id (a serviced mint resync can't reconcile —
-/// proceeding would re-mint it).
+/// Fails closed on any RPC/pagination error, and on an authority-signed tx that cannot be
+/// authenticated: more than one marker, a legacy source-event-id, no exact Memo
+/// instruction, or not exactly one `MintTo` by the authority. Also fails on two distinct
+/// successful mints for one source event.
 pub async fn enumerate_consumed_mints(
     rpc: &RpcClientWithRetry,
     authority: &Pubkey,
@@ -454,30 +466,96 @@ pub async fn enumerate_consumed_mints(
         };
 
         // A memo field can carry several "; "-joined entries, each possibly length-prefixed.
+        let mut markers = Vec::new();
         for piece in memo.split("; ") {
             let value = strip_memo_length_prefix(piece);
-            let (kind, encoded) =
-                if let Some(rest) = value.strip_prefix(MINT_IDEMPOTENCY_MEMO_PREFIX) {
-                    (ConsumedMintKind::Deposit, rest)
-                } else if let Some(rest) = value.strip_prefix(REMINT_IDEMPOTENCY_MEMO_PREFIX) {
-                    (ConsumedMintKind::Remint, rest)
-                } else {
-                    continue;
-                };
+            if let Some(rest) = value.strip_prefix(MINT_IDEMPOTENCY_MEMO_PREFIX) {
+                markers.push((ConsumedMintKind::Deposit, rest));
+            } else if let Some(rest) = value.strip_prefix(REMINT_IDEMPOTENCY_MEMO_PREFIX) {
+                markers.push((ConsumedMintKind::Remint, rest));
+            }
+        }
+        if markers.is_empty() {
+            continue;
+        }
 
-            let Some(source_event_id) = SourceEventId::from_encoded(encoded) else {
+        let signature = Signature::from_str(&status.signature)
+            .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
+        let transaction = rpc
+            .get_transaction(&signature)
+            .await
+            .map_err(|e| format!("consumed-set enumeration failed fetching {signature}: {e}"))?;
+        // History lists every tx that mentions the authority, not only ones it signed.
+        if !transaction_succeeded(&transaction) || !transaction_signed_by(&transaction, authority) {
+            continue;
+        }
+
+        let &[(kind, encoded)] = markers.as_slice() else {
+            return Err(format!(
+                "channel mint {signature} is signed by the authority but carries {} idempotency \
+                 markers; one mint cannot service them all",
+                markers.len()
+            ));
+        };
+
+        let Some(source_event_id) = SourceEventId::from_encoded(encoded) else {
+            return Err(format!(
+                "channel mint {} carries an idempotency memo that does not parse to a \
+                 current-scheme source-event-id (legacy memo scheme); resync cannot reconcile \
+                 across the memo cutover - see docs/runbooks/mint_memo_cutover.md",
+                status.signature
+            ));
+        };
+
+        let expected_memo = match kind {
+            ConsumedMintKind::Deposit => mint_idempotency_memo(&source_event_id),
+            ConsumedMintKind::Remint => remint_idempotency_memo(&source_event_id),
+        };
+        if !transaction_has_memo(&transaction, &expected_memo) {
+            return Err(format!(
+                "channel mint {signature} is signed by the authority but has no Memo \
+                 instruction equal to {expected_memo}; cannot authenticate it"
+            ));
+        }
+
+        let mint_tos = transaction_mint_tos(&transaction);
+        let [mint_to] = mint_tos[..] else {
+            return Err(format!(
+                "channel mint {signature} is signed by the authority but has {} MintTo \
+                 instructions, expected one",
+                mint_tos.len()
+            ));
+        };
+        if mint_to.mint_authority != *authority {
+            return Err(format!(
+                "channel mint {signature} mints under {} instead of the authority {authority}",
+                mint_to.mint_authority
+            ));
+        }
+
+        // The operator re-signs only after proving the earlier attempt dead, so two
+        // successful mints for one event are a double issuance, never a harmless resend.
+        match set.entry(source_event_id) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(ConsumedMint {
+                    signature,
+                    kind,
+                    mint: mint_to.mint,
+                    recipient_ata: mint_to.recipient_ata,
+                    token_program: mint_to.token_program,
+                    amount: mint_to.amount,
+                });
+            }
+            Entry::Occupied(occupied) if occupied.get().signature == signature => {}
+            Entry::Occupied(occupied) => {
                 return Err(format!(
-                    "channel mint {} carries an idempotency memo that does not parse to a \
-                     current-scheme source-event-id (legacy memo scheme); resync cannot reconcile \
-                     across the memo cutover - see docs/runbooks/mint_memo_cutover.md",
-                    status.signature
+                    "source event {} has two successful channel mints signed by the \
+                     authority, {} and {signature}; one event may be minted once, see \
+                     docs/runbooks/resync_consumed_mint_mismatch.md",
+                    occupied.key(),
+                    occupied.get().signature
                 ));
-            };
-
-            let signature = Signature::from_str(&status.signature)
-                .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
-            // First (newest) confirmed mint for an id wins; a re-send would tie anyway.
-            set.entry(source_event_id).or_insert((signature, kind));
+            }
         }
     }
     Ok(set)
@@ -499,99 +577,6 @@ fn strip_memo_length_prefix(memo: &str) -> &str {
     }
 }
 
-/// Cleanup mint builder cache when transaction completes or fails
-/// Check recent ATA signatures for an already-confirmed mint carrying the given memo.
-/// Any RPC failure (including `-32601`) is returned as `Err` — callers decide.
-pub async fn find_existing_mint_signature_with_memo(
-    rpc_client: &RpcClientWithRetry,
-    builder_with_txn_id: &MintToBuilderWithTxnId,
-    expected_memo: &str,
-) -> Result<Option<Signature>, String> {
-    let transaction_id = builder_with_txn_id.txn_id;
-    let Some(expected_mint) = expected_mint_instruction(transaction_id, builder_with_txn_id) else {
-        return Ok(None);
-    };
-
-    let signatures = match rpc_client
-        .get_signatures_for_address(
-            &expected_mint.recipient_ata,
-            MINT_IDEMPOTENCY_SIGNATURE_LOOKBACK_LIMIT,
-        )
-        .await
-    {
-        Ok(signatures) => signatures,
-        Err(e) => {
-            return Err(format!(
-                "Failed idempotency lookup for transaction_id {} on {}: {}",
-                transaction_id, expected_mint.recipient_ata, e
-            ));
-        }
-    };
-
-    for signature_status in signatures {
-        if signature_status.err.is_some() {
-            continue;
-        }
-
-        let memo = match signature_status.memo.as_deref() {
-            Some(memo) if memo_matches(memo, expected_memo) => memo,
-            _ => continue,
-        };
-
-        let signature = match Signature::from_str(&signature_status.signature) {
-            Ok(signature) => signature,
-            Err(e) => {
-                warn!(
-                    "Skipping invalid signature returned by RPC during idempotency check: {} ({})",
-                    signature_status.signature, e
-                );
-                continue;
-            }
-        };
-
-        let transaction = match rpc_client.get_transaction(&signature).await {
-            Ok(transaction) => transaction,
-            Err(e) => {
-                return Err(format!(
-                    "Failed to fetch transaction {} for idempotency confirmation: {}",
-                    signature, e
-                ));
-            }
-        };
-
-        if transaction_matches_expected_mint(&transaction, expected_memo, &expected_mint) {
-            info!(
-                "Skipping resend for transaction_id {}: found existing confirmed mint {} with memo {}",
-                transaction_id, signature, memo
-            );
-            return Ok(Some(signature));
-        }
-    }
-
-    Ok(None)
-}
-
-fn expected_mint_instruction(
-    transaction_id: i64,
-    builder_with_txn_id: &MintToBuilderWithTxnId,
-) -> Option<ExpectedMintInstruction> {
-    let (mint, recipient_ata, mint_authority, token_program, amount) =
-        builder_with_txn_id.builder.try_as_expected_mint().or_else(|| {
-            warn!(
-                "Cannot run mint idempotency check for transaction_id {}: builder fields incomplete",
-                transaction_id
-            );
-            None
-        })?;
-    Some(ExpectedMintInstruction {
-        mint,
-        recipient_ata,
-        mint_authority,
-        token_program,
-        amount,
-    })
-}
-
 fn transaction_succeeded(
     transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
 ) -> bool {
@@ -602,40 +587,58 @@ fn transaction_succeeded(
         .is_some_and(|meta| meta.err.is_none())
 }
 
-fn transaction_matches_expected_mint(
+fn transaction_signed_by(
     transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
-    expected_memo: &str,
-    expected_mint: &ExpectedMintInstruction,
+    signer: &Pubkey,
 ) -> bool {
-    if !transaction_succeeded(transaction) {
-        return false;
-    }
-
     let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
         return false;
     };
 
     match &ui_transaction.message {
-        UiMessage::Parsed(parsed_message) => {
-            parsed_message_has_signer(parsed_message, &expected_mint.mint_authority)
-                && parsed_message
-                    .instructions
-                    .iter()
-                    .any(|instruction| instruction_has_memo(instruction, expected_memo))
-                && parsed_message
-                    .instructions
-                    .iter()
-                    .any(|instruction| instruction_has_expected_mint(instruction, expected_mint))
-        }
-        UiMessage::Raw(raw_message) => {
-            raw_message_has_signer(raw_message, &expected_mint.mint_authority)
-                && raw_message.instructions.iter().any(|instruction| {
-                    raw_instruction_has_memo(raw_message, instruction, expected_memo)
-                })
-                && raw_message.instructions.iter().any(|instruction| {
-                    raw_instruction_has_expected_mint(raw_message, instruction, expected_mint)
-                })
-        }
+        UiMessage::Parsed(parsed_message) => parsed_message_has_signer(parsed_message, signer),
+        UiMessage::Raw(raw_message) => raw_message_has_signer(raw_message, signer),
+    }
+}
+
+fn transaction_has_memo(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+    expected_memo: &str,
+) -> bool {
+    let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
+        return false;
+    };
+
+    match &ui_transaction.message {
+        UiMessage::Parsed(parsed_message) => parsed_message
+            .instructions
+            .iter()
+            .any(|instruction| instruction_has_memo(instruction, expected_memo)),
+        UiMessage::Raw(raw_message) => raw_message
+            .instructions
+            .iter()
+            .any(|instruction| raw_instruction_has_memo(raw_message, instruction, expected_memo)),
+    }
+}
+
+fn transaction_mint_tos(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+) -> Vec<MintToFields> {
+    let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
+        return Vec::new();
+    };
+
+    match &ui_transaction.message {
+        UiMessage::Parsed(parsed_message) => parsed_message
+            .instructions
+            .iter()
+            .filter_map(decode_mint_to)
+            .collect(),
+        UiMessage::Raw(raw_message) => raw_message
+            .instructions
+            .iter()
+            .filter_map(|instruction| decode_raw_mint_to(raw_message, instruction))
+            .collect(),
     }
 }
 
@@ -690,167 +693,79 @@ fn instruction_has_memo(instruction: &UiInstruction, expected_memo: &str) -> boo
     }
 }
 
-fn instruction_has_expected_mint(
-    instruction: &UiInstruction,
-    expected_mint: &ExpectedMintInstruction,
-) -> bool {
+/// Fields of a `mintTo` or `mintToChecked` from spl-token or token-2022, or `None`.
+fn decode_mint_to(instruction: &UiInstruction) -> Option<MintToFields> {
     match instruction {
-        UiInstruction::Compiled(_) => false,
+        UiInstruction::Compiled(_) => None,
         UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed_instruction)) => {
-            parsed_instruction_has_expected_mint(parsed_instruction, expected_mint)
+            decode_parsed_mint_to(parsed_instruction)
         }
         UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(partially_decoded)) => {
-            partially_decoded_instruction_has_expected_mint(partially_decoded, expected_mint)
+            decode_partially_decoded_mint_to(partially_decoded)
         }
     }
 }
 
-fn parsed_instruction_has_expected_mint(
-    parsed_instruction: &ParsedInstruction,
-    expected_mint: &ExpectedMintInstruction,
-) -> bool {
-    if parse_pubkey(&parsed_instruction.program_id) != Some(expected_mint.token_program) {
-        return false;
+fn decode_parsed_mint_to(parsed_instruction: &ParsedInstruction) -> Option<MintToFields> {
+    let token_program = parse_pubkey(&parsed_instruction.program_id)?;
+    if token_program != spl_token::id() && token_program != spl_token_2022::id() {
+        return None;
     }
 
-    let Some(instruction_type) = parsed_instruction
+    let instruction_type = parsed_instruction
         .parsed
         .get("type")
-        .and_then(Value::as_str)
-    else {
-        return false;
-    };
-
-    if instruction_type != "mintTo" && instruction_type != "mintToChecked" {
-        return false;
-    }
-
-    let Some(info) = parsed_instruction.parsed.get("info") else {
-        return false;
-    };
-
-    if parse_pubkey_field(info, "mint") != Some(expected_mint.mint)
-        || parse_pubkey_field(info, "account") != Some(expected_mint.recipient_ata)
-        || parse_pubkey_field(info, "mintAuthority") != Some(expected_mint.mint_authority)
-    {
-        return false;
-    }
-
+        .and_then(Value::as_str)?;
+    let info = parsed_instruction.parsed.get("info")?;
     let amount = match instruction_type {
-        "mintTo" => parse_u64_field(info, "amount"),
-        "mintToChecked" => info
-            .get("tokenAmount")
-            .and_then(|token_amount| parse_u64_field(token_amount, "amount")),
-        _ => None,
+        "mintTo" => parse_u64_field(info, "amount")?,
+        "mintToChecked" => parse_u64_field(info.get("tokenAmount")?, "amount")?,
+        _ => return None,
     };
 
-    amount == Some(expected_mint.amount)
+    Some(MintToFields {
+        mint: parse_pubkey_field(info, "mint")?,
+        recipient_ata: parse_pubkey_field(info, "account")?,
+        mint_authority: parse_pubkey_field(info, "mintAuthority")?,
+        token_program,
+        amount,
+    })
 }
 
-fn accounts_and_amount_match(
-    program_id: &Pubkey,
-    mint: &Pubkey,
-    recipient_ata: &Pubkey,
-    mint_authority: &Pubkey,
-    instruction_data: &[u8],
-    expected: &ExpectedMintInstruction,
-) -> bool {
-    *program_id == expected.token_program
-        && *mint == expected.mint
-        && *recipient_ata == expected.recipient_ata
-        && *mint_authority == expected.mint_authority
-        && parse_token_instruction_mint_amount(program_id, instruction_data)
-            == Some(expected.amount)
-}
-
-fn partially_decoded_instruction_has_expected_mint(
+fn decode_partially_decoded_mint_to(
     partially_decoded: &UiPartiallyDecodedInstruction,
-    expected_mint: &ExpectedMintInstruction,
-) -> bool {
-    let Some(program_id) = parse_pubkey(&partially_decoded.program_id) else {
-        return false;
-    };
-    let Some(mint) = partially_decoded
-        .accounts
-        .first()
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Some(recipient_ata) = partially_decoded
-        .accounts
-        .get(1)
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Some(mint_authority) = partially_decoded
-        .accounts
-        .get(2)
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Ok(data) = bs58::decode(&partially_decoded.data).into_vec() else {
-        return false;
-    };
-    accounts_and_amount_match(
-        &program_id,
-        &mint,
-        &recipient_ata,
-        &mint_authority,
-        &data,
-        expected_mint,
-    )
+) -> Option<MintToFields> {
+    let token_program = parse_pubkey(&partially_decoded.program_id)?;
+    let data = bs58::decode(&partially_decoded.data).into_vec().ok()?;
+
+    Some(MintToFields {
+        mint: parse_pubkey(partially_decoded.accounts.first()?)?,
+        recipient_ata: parse_pubkey(partially_decoded.accounts.get(1)?)?,
+        mint_authority: parse_pubkey(partially_decoded.accounts.get(2)?)?,
+        amount: parse_token_instruction_mint_amount(&token_program, &data)?,
+        token_program,
+    })
 }
 
-fn raw_instruction_has_expected_mint(
+/// Raw-message counterpart of `decode_mint_to`.
+fn decode_raw_mint_to(
     raw_message: &UiRawMessage,
     instruction: &UiCompiledInstruction,
-    expected_mint: &ExpectedMintInstruction,
-) -> bool {
-    let Some(program_id) = raw_message
-        .account_keys
-        .get(instruction.program_id_index as usize)
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Some(mint) = instruction
-        .accounts
-        .first()
-        .and_then(|i| raw_message.account_keys.get(*i as usize))
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Some(recipient_ata) = instruction
-        .accounts
-        .get(1)
-        .and_then(|i| raw_message.account_keys.get(*i as usize))
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Some(mint_authority) = instruction
-        .accounts
-        .get(2)
-        .and_then(|i| raw_message.account_keys.get(*i as usize))
-        .and_then(|a| parse_pubkey(a))
-    else {
-        return false;
-    };
-    let Ok(data) = bs58::decode(&instruction.data).into_vec() else {
-        return false;
-    };
-    accounts_and_amount_match(
-        &program_id,
-        &mint,
-        &recipient_ata,
-        &mint_authority,
-        &data,
-        expected_mint,
-    )
+) -> Option<MintToFields> {
+    let keys = &raw_message.account_keys;
+    let token_program = parse_pubkey(keys.get(instruction.program_id_index as usize)?)?;
+    let mint = parse_pubkey(keys.get(*instruction.accounts.first()? as usize)?)?;
+    let recipient_ata = parse_pubkey(keys.get(*instruction.accounts.get(1)? as usize)?)?;
+    let mint_authority = parse_pubkey(keys.get(*instruction.accounts.get(2)? as usize)?)?;
+    let data = bs58::decode(&instruction.data).into_vec().ok()?;
+
+    Some(MintToFields {
+        mint,
+        recipient_ata,
+        mint_authority,
+        amount: parse_token_instruction_mint_amount(&token_program, &data)?,
+        token_program,
+    })
 }
 
 fn parse_pubkey(value: &str) -> Option<Pubkey> {
@@ -901,12 +816,7 @@ fn is_memo_program_id(program_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn memo_matches(returned_memo: &str, expected_memo: &str) -> bool {
-    returned_memo
-        .split("; ")
-        .any(|memo| strip_memo_length_prefix(memo) == expected_memo)
-}
-
+/// Cleanup mint builder cache when transaction completes or fails
 pub(super) fn cleanup_mint_builder(state: &mut SenderState, transaction_id: Option<i64>) {
     if let Some(txn_id) = transaction_id {
         state.mint_builders.remove(&txn_id);
@@ -1034,15 +944,184 @@ mod tests {
 }
 
 #[cfg(test)]
+mod mint_to_decode_tests {
+    use super::{decode_mint_to, decode_raw_mint_to, MintToFields};
+    use serde_json::json;
+    use solana_sdk::pubkey::Pubkey;
+    use solana_transaction_status::{UiCompiledInstruction, UiInstruction, UiRawMessage};
+
+    const AMOUNT: u64 = 1_000;
+    const DECIMALS: u8 = 6;
+
+    fn expected_fields(token_program: Pubkey) -> MintToFields {
+        MintToFields {
+            token_program,
+            mint: Pubkey::new_unique(),
+            recipient_ata: Pubkey::new_unique(),
+            mint_authority: Pubkey::new_unique(),
+            amount: AMOUNT,
+        }
+    }
+
+    #[test]
+    fn decodes_parsed_mint_to() {
+        let expected = expected_fields(spl_token::id());
+        let instruction: UiInstruction = serde_json::from_value(json!({
+            "program": "spl-token",
+            "programId": expected.token_program.to_string(),
+            "parsed": {
+                "type": "mintTo",
+                "info": {
+                    "mint": expected.mint.to_string(),
+                    "account": expected.recipient_ata.to_string(),
+                    "mintAuthority": expected.mint_authority.to_string(),
+                    "amount": AMOUNT.to_string(),
+                },
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(decode_mint_to(&instruction), Some(expected));
+    }
+
+    #[test]
+    fn decodes_parsed_mint_to_checked() {
+        let expected = expected_fields(spl_token_2022::id());
+        let instruction: UiInstruction = serde_json::from_value(json!({
+            "program": "spl-token-2022",
+            "programId": expected.token_program.to_string(),
+            "parsed": {
+                "type": "mintToChecked",
+                "info": {
+                    "mint": expected.mint.to_string(),
+                    "account": expected.recipient_ata.to_string(),
+                    "mintAuthority": expected.mint_authority.to_string(),
+                    "tokenAmount": {
+                        "amount": AMOUNT.to_string(),
+                        "decimals": DECIMALS,
+                        "uiAmountString": "0.001",
+                    },
+                },
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(decode_mint_to(&instruction), Some(expected));
+    }
+
+    #[test]
+    fn decodes_partially_decoded_mint_to() {
+        let expected = expected_fields(spl_token::id());
+        let data = spl_token::instruction::mint_to(
+            &expected.token_program,
+            &expected.mint,
+            &expected.recipient_ata,
+            &expected.mint_authority,
+            &[],
+            AMOUNT,
+        )
+        .unwrap()
+        .data;
+        let instruction: UiInstruction = serde_json::from_value(json!({
+            "programId": expected.token_program.to_string(),
+            "accounts": [
+                expected.mint.to_string(),
+                expected.recipient_ata.to_string(),
+                expected.mint_authority.to_string(),
+            ],
+            "data": bs58::encode(data).into_string(),
+        }))
+        .unwrap();
+
+        assert_eq!(decode_mint_to(&instruction), Some(expected));
+    }
+
+    #[test]
+    fn decodes_raw_mint_to_checked() {
+        let expected = expected_fields(spl_token_2022::id());
+        let data = spl_token_2022::instruction::mint_to_checked(
+            &expected.token_program,
+            &expected.mint,
+            &expected.recipient_ata,
+            &expected.mint_authority,
+            &[],
+            AMOUNT,
+            DECIMALS,
+        )
+        .unwrap()
+        .data;
+        let raw_message: UiRawMessage = serde_json::from_value(json!({
+            "header": {
+                "numRequiredSignatures": 1,
+                "numReadonlySignedAccounts": 0,
+                "numReadonlyUnsignedAccounts": 2,
+            },
+            "accountKeys": [
+                expected.mint_authority.to_string(),
+                expected.recipient_ata.to_string(),
+                expected.mint.to_string(),
+                expected.token_program.to_string(),
+            ],
+            "recentBlockhash": "11111111111111111111111111111111",
+            "instructions": [{
+                "programIdIndex": 3,
+                "accounts": [2, 1, 0],
+                "data": bs58::encode(data).into_string(),
+            }],
+        }))
+        .unwrap();
+        let instruction: &UiCompiledInstruction = &raw_message.instructions[0];
+
+        assert_eq!(
+            decode_raw_mint_to(&raw_message, instruction),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn rejects_non_mint_token_instruction() {
+        let expected = expected_fields(spl_token::id());
+        let data = spl_token::instruction::transfer(
+            &expected.token_program,
+            &expected.mint,
+            &expected.recipient_ata,
+            &expected.mint_authority,
+            &[],
+            AMOUNT,
+        )
+        .unwrap()
+        .data;
+        let instruction: UiInstruction = serde_json::from_value(json!({
+            "programId": expected.token_program.to_string(),
+            "accounts": [
+                expected.mint.to_string(),
+                expected.recipient_ata.to_string(),
+                expected.mint_authority.to_string(),
+            ],
+            "data": bs58::encode(data).into_string(),
+        }))
+        .unwrap();
+
+        assert_eq!(decode_mint_to(&instruction), None);
+    }
+}
+
+#[cfg(test)]
 mod consumed_set_tests {
-    use super::{enumerate_consumed_mints, ConsumedMintKind};
-    use crate::operator::instruction_util::{mint_idempotency_memo, SourceEventId};
+    use super::{
+        enumerate_consumed_mints, ConsumedMint, ConsumedMintKind, ConsumedSet, MintToFields,
+    };
+    use crate::operator::instruction_util::{
+        mint_idempotency_memo, remint_idempotency_memo, SourceEventId,
+    };
     use crate::operator::{RetryConfig, RpcClientWithRetry};
+    use serde_json::{json, Value};
     use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::Signature;
 
     const PAGE_LIMIT: usize = 2;
+    const AMOUNT: u64 = 1_000;
 
     fn fast_rpc(url: &str) -> RpcClientWithRetry {
         RpcClientWithRetry::with_retry_config(
@@ -1062,6 +1141,158 @@ mod consumed_set_tests {
         )
     }
 
+    /// A `MintTo` of `AMOUNT` signed by `mint_authority` into fresh mint and ATA keys.
+    fn mint_to_by(mint_authority: &Pubkey) -> MintToFields {
+        MintToFields {
+            mint: Pubkey::new_unique(),
+            recipient_ata: Pubkey::new_unique(),
+            mint_authority: *mint_authority,
+            token_program: spl_token::id(),
+            amount: AMOUNT,
+        }
+    }
+
+    /// Raw-message `getTransaction` reply for a tx signed only by `signer`, with `mentioned`
+    /// as a non-signing account key, one Memo instruction carrying `memo` and one `MintTo`
+    /// per `mint_tos` entry. `meta_err` is the JSON error, or `Value::Null` for success.
+    fn transaction_reply(
+        signer: &Pubkey,
+        mentioned: &Pubkey,
+        memo: &str,
+        mint_tos: &[MintToFields],
+        meta_err: Value,
+    ) -> String {
+        let mut account_keys = vec![
+            signer.to_string(),
+            mentioned.to_string(),
+            spl_memo::id().to_string(),
+        ];
+        let mut instructions = vec![json!({
+            "programIdIndex": 2,
+            "accounts": [],
+            "data": bs58::encode(memo).into_string(),
+        })];
+        for mint_to in mint_tos {
+            let base = account_keys.len() as u8;
+            account_keys.extend([
+                mint_to.mint.to_string(),
+                mint_to.recipient_ata.to_string(),
+                mint_to.mint_authority.to_string(),
+                mint_to.token_program.to_string(),
+            ]);
+            let data = spl_token::instruction::mint_to(
+                &mint_to.token_program,
+                &mint_to.mint,
+                &mint_to.recipient_ata,
+                &mint_to.mint_authority,
+                &[],
+                mint_to.amount,
+            )
+            .unwrap()
+            .data;
+            instructions.push(json!({
+                "programIdIndex": base + 3,
+                "accounts": [base, base + 1, base + 2],
+                "data": bs58::encode(data).into_string(),
+            }));
+        }
+        let balances = vec![0u64; account_keys.len()];
+        let status = if meta_err.is_null() {
+            json!({"Ok": null})
+        } else {
+            json!({"Err": meta_err})
+        };
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "slot": 1,
+                "blockTime": null,
+                "transaction": {
+                    "signatures": [Signature::new_unique().to_string()],
+                    "message": {
+                        "header": {
+                            "numRequiredSignatures": 1,
+                            "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": account_keys.len() - 1,
+                        },
+                        "accountKeys": account_keys,
+                        "recentBlockhash": "11111111111111111111111111111111",
+                        "instructions": instructions,
+                    },
+                },
+                "meta": {
+                    "err": meta_err,
+                    "status": status,
+                    "fee": 5000,
+                    "preBalances": balances,
+                    "postBalances": balances,
+                },
+            },
+        })
+        .to_string()
+    }
+
+    /// Parsed-message (`jsonParsed`, as production fetches) `getTransaction` reply for a
+    /// successful tx signed only by `signer`, with `mentioned` as a non-signing account key,
+    /// one Memo instruction carrying `memo` and one `mintTo` per `mint_tos` entry.
+    fn parsed_transaction_reply(
+        signer: &Pubkey,
+        mentioned: &Pubkey,
+        memo: &str,
+        mint_tos: &[MintToFields],
+    ) -> String {
+        let mut instructions = vec![json!({
+            "program": "spl-memo",
+            "programId": spl_memo::id().to_string(),
+            "parsed": memo,
+        })];
+        for mint_to in mint_tos {
+            instructions.push(json!({
+                "program": "spl-token",
+                "programId": mint_to.token_program.to_string(),
+                "parsed": {
+                    "type": "mintTo",
+                    "info": {
+                        "mint": mint_to.mint.to_string(),
+                        "account": mint_to.recipient_ata.to_string(),
+                        "mintAuthority": mint_to.mint_authority.to_string(),
+                        "amount": mint_to.amount.to_string(),
+                    },
+                },
+            }));
+        }
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "result": {
+                "slot": 1,
+                "blockTime": null,
+                "transaction": {
+                    "signatures": [Signature::new_unique().to_string()],
+                    "message": {
+                        "accountKeys": [
+                            {"pubkey": signer.to_string(), "writable": true, "signer": true, "source": "transaction"},
+                            {"pubkey": mentioned.to_string(), "writable": true, "signer": false, "source": "transaction"},
+                        ],
+                        "recentBlockhash": "11111111111111111111111111111111",
+                        "instructions": instructions,
+                    },
+                },
+                "meta": {
+                    "err": null,
+                    "status": {"Ok": null},
+                    "fee": 5000,
+                    "preBalances": [0, 0],
+                    "postBalances": [0, 0],
+                },
+            },
+        })
+        .to_string()
+    }
+
     /// A serviced mint that sits on the second page (reached via the `before` cursor)
     /// must still be collected, guarding the bounded-lookback blind spot.
     #[tokio::test]
@@ -1075,6 +1306,8 @@ mod consumed_set_tests {
 
         let id1 = SourceEventId::new("evt-page1", 0, None);
         let id2 = SourceEventId::new("evt-page2", 0, None);
+        let memo1 = mint_idempotency_memo(&id1);
+        let memo2 = mint_idempotency_memo(&id2);
 
         // Page 1: full page (== PAGE_LIMIT) so the cursor advances to page1_b.
         let _p1 = server
@@ -1087,7 +1320,7 @@ mod consumed_set_tests {
             .with_header("content-type", "application/json")
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","result":[{},{}],"id":0}}"#,
-                sig_entry(&page1_a, &mint_idempotency_memo(&id1)),
+                sig_entry(&page1_a, &memo1),
                 sig_entry(&page1_b, "unrelated-memo"),
             ))
             .create_async()
@@ -1104,7 +1337,42 @@ mod consumed_set_tests {
             .with_header("content-type", "application/json")
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
-                sig_entry(&page2_a, &mint_idempotency_memo(&id2)),
+                sig_entry(&page2_a, &memo2),
+            ))
+            .create_async()
+            .await;
+
+        let _tx1 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getTransaction""#.into()),
+                mockito::Matcher::Regex(page1_a.clone()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                &memo1,
+                &[mint_to_by(&authority)],
+                Value::Null,
+            ))
+            .create_async()
+            .await;
+        let _tx2 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getTransaction""#.into()),
+                mockito::Matcher::Regex(page2_a.clone()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                &memo2,
+                &[mint_to_by(&authority)],
+                Value::Null,
             ))
             .create_async()
             .await;
@@ -1116,11 +1384,11 @@ mod consumed_set_tests {
 
         assert_eq!(set.len(), 2, "both pages' deposit mints must be collected");
         assert_eq!(
-            set.get(&id1).map(|(_, k)| *k),
+            set.get(&id1).map(|consumed| consumed.kind),
             Some(ConsumedMintKind::Deposit)
         );
         assert_eq!(
-            set.get(&id2).map(|(_, k)| *k),
+            set.get(&id2).map(|consumed| consumed.kind),
             Some(ConsumedMintKind::Deposit)
         );
     }
@@ -1155,6 +1423,9 @@ mod consumed_set_tests {
     #[tokio::test]
     async fn enumerate_legacy_scheme_memo_is_err() {
         let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        // Legacy serial-id memo: prefix present, value is a bare number.
+        let legacy_memo = "private_channel:mint-idempotency:42";
         let _m = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -1164,21 +1435,568 @@ mod consumed_set_tests {
             .with_header("content-type", "application/json")
             .with_body(format!(
                 r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
-                // Legacy serial-id memo: prefix present, value is a bare number.
-                sig_entry(
-                    &Signature::new_unique().to_string(),
-                    "private_channel:mint-idempotency:42"
-                ),
+                sig_entry(&Signature::new_unique().to_string(), legacy_memo),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                legacy_memo,
+                &[mint_to_by(&authority)],
+                Value::Null,
             ))
             .create_async()
             .await;
 
         let rpc = fast_rpc(&server.url());
-        let result = enumerate_consumed_mints(&rpc, &Pubkey::new_unique(), PAGE_LIMIT).await;
+        let result = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT).await;
         let err = result.expect_err("legacy-scheme memo must abort enumeration");
         assert!(
             err.contains("cutover"),
             "error should name the memo cutover: {err}"
         );
+    }
+
+    /// A user tx that only names the authority as an account (e.g. a transfer recipient)
+    /// must not count as a mint, nor abort enumeration with a legacy-looking memo. Its
+    /// two memo pieces must cost one fetch, not one each.
+    #[tokio::test]
+    async fn enumerate_skips_memo_the_authority_did_not_sign() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        let victim_id = SourceEventId::new("evt-victim", 0, None);
+        let forged_memo = format!(
+            "{}; private_channel:mint-idempotency:42",
+            mint_idempotency_memo(&victim_id)
+        );
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                // One short page, so pagination stops after it.
+                sig_entry(&Signature::new_unique().to_string(), &forged_memo),
+            ))
+            .create_async()
+            .await;
+        let tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &attacker,
+                &authority,
+                &forged_memo,
+                &[],
+                Value::Null,
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("unsigned memos must be skipped, not abort enumeration");
+        assert!(
+            set.is_empty(),
+            "an unsigned memo must not mark a deposit minted"
+        );
+        tx.assert_async().await;
+    }
+
+    /// Production fetches `jsonParsed`, so the parsed signer check must accept a mint the
+    /// authority signed.
+    #[tokio::test]
+    async fn enumerate_collects_parsed_memo_the_authority_signed() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let source_event_id = SourceEventId::new("evt-parsed", 0, None);
+        let memo = mint_idempotency_memo(&source_event_id);
+        let mint_to = mint_to_by(&authority);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(&landed.to_string(), &memo),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(parsed_transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                &memo,
+                &[mint_to],
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("enumeration should succeed");
+        assert_eq!(
+            set.get(&source_event_id),
+            Some(&ConsumedMint {
+                signature: landed,
+                kind: ConsumedMintKind::Deposit,
+                mint: mint_to.mint,
+                recipient_ata: mint_to.recipient_ata,
+                token_program: mint_to.token_program,
+                amount: mint_to.amount,
+            })
+        );
+    }
+
+    /// Serves one history page holding `landed` with `history_memo`, answers its fetch
+    /// with `reply`, and enumerates the authority's history.
+    async fn enumerate_one(
+        authority: &Pubkey,
+        landed: &Signature,
+        history_memo: &str,
+        reply: String,
+    ) -> Result<ConsumedSet, String> {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(&landed.to_string(), history_memo),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(reply)
+            .create_async()
+            .await;
+
+        enumerate_consumed_mints(&fast_rpc(&server.url()), authority, PAGE_LIMIT).await
+    }
+
+    /// Serves one full history page holding `newer` then `older`, both carrying `memo`,
+    /// answers each fetch with its own reply, then an empty page, and enumerates.
+    async fn enumerate_two(
+        authority: &Pubkey,
+        memo: &str,
+        (newer, newer_reply): (&Signature, String),
+        (older, older_reply): (&Signature, String),
+    ) -> Result<ConsumedSet, String> {
+        let mut server = mockito::Server::new_async().await;
+        let _page1 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(r#""before"\s*:\s*null"#.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{},{}],"id":0}}"#,
+                sig_entry(&newer.to_string(), memo),
+                sig_entry(&older.to_string(), memo),
+            ))
+            .create_async()
+            .await;
+        let _page2 = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(format!(r#""before"\s*:\s*"{older}""#)),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"jsonrpc":"2.0","result":[],"id":0}"#)
+            .create_async()
+            .await;
+        let _newer_tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getTransaction""#.into()),
+                mockito::Matcher::Regex(newer.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(newer_reply)
+            .create_async()
+            .await;
+        let _older_tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getTransaction""#.into()),
+                mockito::Matcher::Regex(older.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(older_reply)
+            .create_async()
+            .await;
+
+        enumerate_consumed_mints(&fast_rpc(&server.url()), authority, PAGE_LIMIT).await
+    }
+
+    /// Two signed mints for one event that disagree: keeping only the newest would hide
+    /// the older one from validation, so enumeration aborts.
+    #[tokio::test]
+    async fn enumerate_aborts_on_conflicting_mints_for_one_event() {
+        let authority = Pubkey::new_unique();
+        let newer = Signature::new_unique();
+        let older = Signature::new_unique();
+        let memo = mint_idempotency_memo(&SourceEventId::new("evt-conflict", 0, None));
+        let paying = mint_to_by(&authority);
+        let underpaying = MintToFields {
+            amount: AMOUNT / 2,
+            ..paying
+        };
+
+        let err = enumerate_two(
+            &authority,
+            &memo,
+            (
+                &newer,
+                transaction_reply(
+                    &authority,
+                    &Pubkey::new_unique(),
+                    &memo,
+                    &[paying],
+                    Value::Null,
+                ),
+            ),
+            (
+                &older,
+                transaction_reply(
+                    &authority,
+                    &Pubkey::new_unique(),
+                    &memo,
+                    &[underpaying],
+                    Value::Null,
+                ),
+            ),
+        )
+        .await
+        .expect_err("two signed mints for one event must abort enumeration");
+        for signature in [newer, older] {
+            assert!(
+                err.contains(&signature.to_string()),
+                "error should name {signature}: {err}"
+            );
+        }
+    }
+
+    /// Two successful signed mints for one event are a double issuance even when both
+    /// pay the right amount.
+    #[tokio::test]
+    async fn enumerate_aborts_on_double_mint_of_one_event() {
+        let authority = Pubkey::new_unique();
+        let newer = Signature::new_unique();
+        let older = Signature::new_unique();
+        let memo = mint_idempotency_memo(&SourceEventId::new("evt-double", 0, None));
+        let paying = mint_to_by(&authority);
+
+        let result = enumerate_two(
+            &authority,
+            &memo,
+            (
+                &newer,
+                transaction_reply(
+                    &authority,
+                    &Pubkey::new_unique(),
+                    &memo,
+                    &[paying],
+                    Value::Null,
+                ),
+            ),
+            (
+                &older,
+                transaction_reply(
+                    &authority,
+                    &Pubkey::new_unique(),
+                    &memo,
+                    &[paying],
+                    Value::Null,
+                ),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a double mint of one event must abort enumeration: {result:?}"
+        );
+    }
+
+    /// A signed tx carrying the marker but no `MintTo` proves nothing was minted.
+    #[tokio::test]
+    async fn enumerate_aborts_when_signed_tx_has_no_mint_to() {
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let memo = mint_idempotency_memo(&SourceEventId::new("evt-no-mint", 0, None));
+        let reply = transaction_reply(&authority, &Pubkey::new_unique(), &memo, &[], Value::Null);
+
+        let err = enumerate_one(&authority, &landed, &memo, reply)
+            .await
+            .expect_err("a signed tx without a MintTo must abort enumeration");
+        assert!(
+            err.contains(&landed.to_string()),
+            "error should name the tx: {err}"
+        );
+    }
+
+    /// Two `MintTo`s leave the marker bound to neither, so the tx cannot be trusted.
+    #[tokio::test]
+    async fn enumerate_aborts_when_signed_tx_has_two_mint_tos() {
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let memo = mint_idempotency_memo(&SourceEventId::new("evt-two-mints", 0, None));
+        let reply = transaction_reply(
+            &authority,
+            &Pubkey::new_unique(),
+            &memo,
+            &[mint_to_by(&authority), mint_to_by(&authority)],
+            Value::Null,
+        );
+
+        let err = enumerate_one(&authority, &landed, &memo, reply)
+            .await
+            .expect_err("a signed tx with two MintTos must abort enumeration");
+        assert!(
+            err.contains(&landed.to_string()),
+            "error should name the tx: {err}"
+        );
+    }
+
+    /// A `MintTo` under another mint authority is not the operator's mint.
+    #[tokio::test]
+    async fn enumerate_aborts_when_mint_to_is_not_by_the_authority() {
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let memo = mint_idempotency_memo(&SourceEventId::new("evt-foreign-mint", 0, None));
+        let reply = transaction_reply(
+            &authority,
+            &Pubkey::new_unique(),
+            &memo,
+            &[mint_to_by(&Pubkey::new_unique())],
+            Value::Null,
+        );
+
+        let err = enumerate_one(&authority, &landed, &memo, reply)
+            .await
+            .expect_err("a MintTo by another authority must abort enumeration");
+        assert!(
+            err.contains(&landed.to_string()),
+            "error should name the tx: {err}"
+        );
+    }
+
+    /// One `MintTo` cannot service two source events, so two markers in one tx abort.
+    #[tokio::test]
+    async fn enumerate_aborts_when_signed_tx_carries_two_markers() {
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let first_memo = mint_idempotency_memo(&SourceEventId::new("evt-first", 0, None));
+        let second_memo = mint_idempotency_memo(&SourceEventId::new("evt-second", 0, None));
+        let history_memo = format!("{first_memo}; {second_memo}");
+        let reply = transaction_reply(
+            &authority,
+            &Pubkey::new_unique(),
+            &first_memo,
+            &[mint_to_by(&authority)],
+            Value::Null,
+        );
+
+        let err = enumerate_one(&authority, &landed, &history_memo, reply)
+            .await
+            .expect_err("a signed tx with two markers must abort enumeration");
+        assert!(
+            err.contains(&landed.to_string()),
+            "error should name the tx: {err}"
+        );
+    }
+
+    /// A signed tx whose Memo instructions lack the exact marker the history reports
+    /// cannot be authenticated, so enumeration aborts.
+    #[tokio::test]
+    async fn enumerate_aborts_when_signed_tx_lacks_exact_memo() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let source_event_id = SourceEventId::new("evt-memo-mismatch", 0, None);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(
+                    &landed.to_string(),
+                    &mint_idempotency_memo(&source_event_id)
+                ),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                "unrelated-memo",
+                &[mint_to_by(&authority)],
+                Value::Null,
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let err = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect_err("a signed tx without the exact memo must abort enumeration");
+        assert!(
+            err.contains(&landed.to_string()),
+            "error should name the tx: {err}"
+        );
+    }
+
+    /// A forged remint memo on a user tx that only names the authority must not count.
+    #[tokio::test]
+    async fn enumerate_skips_remint_memo_the_authority_did_not_sign() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let attacker = Pubkey::new_unique();
+        let victim_id = SourceEventId::new("evt-victim-remint", 0, None);
+        let forged_memo = remint_idempotency_memo(&victim_id);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(&Signature::new_unique().to_string(), &forged_memo),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(parsed_transaction_reply(
+                &attacker,
+                &authority,
+                &forged_memo,
+                &[],
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("unsigned memos must be skipped, not abort enumeration");
+        assert!(
+            set.is_empty(),
+            "an unsigned remint memo must not mark a withdrawal reminted"
+        );
+    }
+
+    /// A tx whose fetched meta failed must not count, even if the authority signed it and
+    /// the history entry reported no error.
+    #[tokio::test]
+    async fn enumerate_skips_failed_transaction() {
+        let mut server = mockito::Server::new_async().await;
+        let authority = Pubkey::new_unique();
+        let source_event_id = SourceEventId::new("evt-failed", 0, None);
+        let memo = mint_idempotency_memo(&source_event_id);
+
+        let _m = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                sig_entry(&Signature::new_unique().to_string(), &memo),
+            ))
+            .create_async()
+            .await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(transaction_reply(
+                &authority,
+                &Pubkey::new_unique(),
+                &memo,
+                &[mint_to_by(&authority)],
+                json!({"InstructionError": [0, {"Custom": 1}]}),
+            ))
+            .create_async()
+            .await;
+
+        let rpc = fast_rpc(&server.url());
+        let set = enumerate_consumed_mints(&rpc, &authority, PAGE_LIMIT)
+            .await
+            .expect("a failed tx must be skipped, not abort enumeration");
+        assert!(set.is_empty(), "a failed tx must not mark a deposit minted");
     }
 }

@@ -2,7 +2,7 @@ use crate::metrics;
 use crate::{
     channel_utils::send_guaranteed,
     config::ProgramType,
-    error::{IndexerError, StorageError},
+    error::{IndexerError, ReconciliationError, StorageError},
     indexer::{
         checkpoint::{CheckpointMsg, CheckpointUpdate},
         datasource::common::{
@@ -10,7 +10,7 @@ use crate::{
             types::{InstructionWithMetadata, ProcessorMessage, ProgramInstruction},
         },
     },
-    operator::{instruction_util::SourceEventId, ConsumedMintKind, ConsumedSet},
+    operator::{instruction_util::SourceEventId, ConsumedMint, ConsumedMintKind, ConsumedSet},
     storage::{
         common::{
             amount::TokenAmount,
@@ -24,7 +24,9 @@ use crate::{
 };
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -90,6 +92,9 @@ pub struct TransactionProcessor {
     // already-serviced deposit/remint into its terminal status instead of `pending`.
     // `None` on every normal/backfill/live path, so the hot path is unchanged.
     consumed: Option<Arc<ConsumedSet>>,
+    // Resync's pre-drop pass: derive rows and check them against `consumed`, but write
+    // nothing and send no checkpoint, so the live database is left as it was.
+    validate_only: bool,
 }
 
 impl TransactionProcessor {
@@ -102,6 +107,7 @@ impl TransactionProcessor {
             configured_escrow_instance_id: None,
             retry: WriteRetryPolicy::default(),
             consumed: None,
+            validate_only: false,
         }
     }
 
@@ -126,40 +132,74 @@ impl TransactionProcessor {
         self
     }
 
+    /// Check every derived row against the consumed-set and write nothing. A mismatch
+    /// ends the run with `ConsumedMintMismatch`.
+    pub fn validate_only(mut self) -> Self {
+        self.validate_only = true;
+        self
+    }
+
+    /// Fail on the first row whose consumed-set entry does not pay it.
+    fn validate_against_consumed(
+        &self,
+        transactions: &[DbTransaction],
+    ) -> Result<(), IndexerError> {
+        let Some(consumed) = self.consumed.as_ref() else {
+            return Ok(());
+        };
+        for transaction in transactions {
+            if let Some(consumed_mint) = consumed.get(&SourceEventId::from_row(transaction)) {
+                check_consumed_mint(consumed_mint, transaction)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Rewrite a serviced deposit/remint row to its terminal status from the consumed-set
     /// so the rebuilt table never contains a serviceable `pending` row for an event the
-    /// channel already minted. No-op when no consumed-set is configured.
+    /// channel already minted. A recorded mint that does not pay this row goes to
+    /// `ManualReview`. No-op when no consumed-set is configured.
     fn reconcile_against_consumed(&self, slot: u64, transactions: &mut [DbTransaction]) {
         let Some(consumed) = self.consumed.as_ref() else {
             return;
         };
-        let (mut completed, mut reminted, mut pending) = (0u64, 0u64, 0u64);
+        let (mut completed, mut reminted, mut quarantined, mut pending) = (0u64, 0u64, 0u64, 0u64);
         for transaction in transactions.iter_mut() {
             let id = SourceEventId::from_row(transaction);
-            match consumed.get(&id) {
-                Some((signature, ConsumedMintKind::Deposit))
-                    if transaction.transaction_type == TransactionType::Deposit =>
-                {
+            let Some(consumed_mint) = consumed.get(&id) else {
+                pending += 1;
+                continue;
+            };
+            // Same event id but a different kind, mint, recipient or amount: the channel
+            // mint does not prove this row was paid, and `pending` could pay it twice.
+            if let Err(mismatch) = check_consumed_mint(consumed_mint, transaction) {
+                error!(
+                    slot,
+                    "{mismatch}; quarantining the rebuilt row to manual_review"
+                );
+                transaction.status = TransactionStatus::ManualReview;
+                quarantined += 1;
+                continue;
+            }
+            match consumed_mint.kind {
+                ConsumedMintKind::Deposit => {
                     transaction.status = TransactionStatus::Completed;
-                    transaction.counterpart_signature = Some(signature.to_string());
+                    transaction.counterpart_signature = Some(consumed_mint.signature.to_string());
                     completed += 1;
                 }
-                Some((signature, ConsumedMintKind::Remint))
-                    if transaction.transaction_type == TransactionType::Withdrawal =>
-                {
+                ConsumedMintKind::Remint => {
                     transaction.status = TransactionStatus::FailedReminted;
-                    transaction.landed_remint_signature = Some(signature.to_string());
+                    transaction.landed_remint_signature = Some(consumed_mint.signature.to_string());
                     reminted += 1;
                 }
-                // Not serviced (or a kind/type mismatch we refuse to act on): stays pending.
-                _ => pending += 1,
             }
         }
-        if completed + reminted > 0 {
+        if completed + reminted + quarantined > 0 {
             info!(
                 slot,
                 completed_from_chain = completed,
                 failed_reminted_from_chain = reminted,
+                quarantined,
                 pending,
                 "Resync reconcile-in-place applied"
             );
@@ -191,6 +231,8 @@ impl TransactionProcessor {
                         h.record_progress();
                     }
                 }
+                // Validation writes no checkpoints, so there is no gate to re-arm.
+                ProcessorMessage::Regate { .. } if self.validate_only => {}
                 ProcessorMessage::Regate {
                     program_type,
                     from,
@@ -271,6 +313,10 @@ impl TransactionProcessor {
             if let Some(release) = release_opt {
                 observed_releases.push(release);
             }
+        }
+
+        if self.validate_only {
+            return self.validate_against_consumed(&transactions);
         }
 
         // Reconcile rebuilt rows against already-serviced channel mints (resync only).
@@ -506,6 +552,74 @@ struct MintStatusChange {
     /// The withdrawal gate, carried separately because the two are independent
     /// on chain.
     withdrawals_blocked: bool,
+}
+
+/// Check that `consumed_mint` paid this row: a marker of the row's kind, the row's mint and
+/// amount, into the ATA of the deposit recipient or, for a remint, the withdrawal
+/// initiator. Unparseable row keys never match. Shared by the pre-drop validation pass
+/// and the rebuild.
+fn check_consumed_mint(
+    consumed_mint: &ConsumedMint,
+    transaction: &DbTransaction,
+) -> Result<(), ReconciliationError> {
+    let reason = match (consumed_mint.kind, transaction.transaction_type) {
+        (ConsumedMintKind::Deposit, TransactionType::Deposit) => {
+            field_differences(consumed_mint, transaction, &transaction.recipient)
+        }
+        (ConsumedMintKind::Remint, TransactionType::Withdrawal) => {
+            field_differences(consumed_mint, transaction, &transaction.initiator)
+        }
+        (kind, transaction_type) => Some(format!(
+            "kind: channel {kind:?} marker, row {transaction_type:?}"
+        )),
+    };
+
+    match reason {
+        None => Ok(()),
+        Some(reason) => Err(ReconciliationError::ConsumedMintMismatch {
+            source_event_id: SourceEventId::from_row(transaction).to_string(),
+            source_signature: transaction.signature.clone(),
+            channel_signature: consumed_mint.signature.to_string(),
+            reason,
+        }),
+    }
+}
+
+/// Each field where `consumed_mint` differs from the row paid into `owner`'s ATA, as
+/// `field: channel X, row Y`, or `None` when they all agree.
+fn field_differences(
+    consumed_mint: &ConsumedMint,
+    transaction: &DbTransaction,
+    owner: &str,
+) -> Option<String> {
+    let (Ok(owner), Ok(mint)) = (Pubkey::from_str(owner), Pubkey::from_str(&transaction.mint))
+    else {
+        return Some(format!(
+            "row owner {owner} or mint {} is not a pubkey",
+            transaction.mint
+        ));
+    };
+    let expected_ata =
+        get_associated_token_address_with_program_id(&owner, &mint, &consumed_mint.token_program);
+
+    let mut differences = Vec::new();
+    if consumed_mint.mint != mint {
+        differences.push(format!("mint: channel {}, row {mint}", consumed_mint.mint));
+    }
+    if consumed_mint.recipient_ata != expected_ata {
+        differences.push(format!(
+            "recipient ATA: channel {}, row {expected_ata}",
+            consumed_mint.recipient_ata
+        ));
+    }
+    if consumed_mint.amount != transaction.amount.value() {
+        differences.push(format!(
+            "amount: channel {}, row {}",
+            consumed_mint.amount,
+            transaction.amount.value()
+        ));
+    }
+    (!differences.is_empty()).then(|| differences.join("; "))
 }
 
 /// Convert an instruction to a `(DbMint, MintStatusChange, DbTransaction,
@@ -1784,6 +1898,32 @@ mod tests {
     const RECONCILE_SLOT: u64 = 800;
     const SERVICED_DEPOSIT_SIG: &str = "serviced-deposit-sig";
     const SERVICED_WITHDRAW_SIG: &str = "serviced-withdraw-sig";
+    /// Amounts the deposit (event) and withdraw fixtures carry.
+    const DEPOSIT_EVENT_AMOUNT: u64 = 990;
+    const WITHDRAW_AMOUNT: u64 = 500;
+
+    /// The channel mint the operator would have landed for a fixture row: `amount` of
+    /// the fixture mint into `owner`'s spl-token ATA.
+    fn landed_mint(
+        signature: Signature,
+        kind: ConsumedMintKind,
+        owner: Pubkey,
+        amount: u64,
+    ) -> ConsumedMint {
+        let mint = make_pubkey(2);
+        ConsumedMint {
+            signature,
+            kind,
+            mint,
+            recipient_ata: get_associated_token_address_with_program_id(
+                &owner,
+                &mint,
+                &spl_token::id(),
+            ),
+            token_program: spl_token::id(),
+            amount,
+        }
+    }
 
     fn make_processor_with_consumed(
         escrow_instance_id: Pubkey,
@@ -1815,7 +1955,12 @@ mod tests {
         let mut consumed = ConsumedSet::new();
         consumed.insert(
             deposit_event_id(SERVICED_DEPOSIT_SIG),
-            (mint_sig, ConsumedMintKind::Deposit),
+            landed_mint(
+                mint_sig,
+                ConsumedMintKind::Deposit,
+                make_pubkey(1),
+                DEPOSIT_EVENT_AMOUNT,
+            ),
         );
         let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
         processor.buffer(make_deposit_instruction(
@@ -1844,7 +1989,12 @@ mod tests {
         let mut consumed = ConsumedSet::new();
         consumed.insert(
             deposit_event_id("some-other-deposit"),
-            (Signature::new_unique(), ConsumedMintKind::Deposit),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Deposit,
+                make_pubkey(1),
+                DEPOSIT_EVENT_AMOUNT,
+            ),
         );
         let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
         processor.buffer(make_deposit_instruction(
@@ -1870,7 +2020,15 @@ mod tests {
         let remint_sig = Signature::new_unique();
         let mut consumed = ConsumedSet::new();
         let id = SourceEventId::new(SERVICED_WITHDRAW_SIG, 0, None);
-        consumed.insert(id, (remint_sig, ConsumedMintKind::Remint));
+        consumed.insert(
+            id,
+            landed_mint(
+                remint_sig,
+                ConsumedMintKind::Remint,
+                make_pubkey(1),
+                WITHDRAW_AMOUNT,
+            ),
+        );
         let (mut processor, _rx, mock) = make_processor_with_consumed(Pubkey::default(), consumed);
         processor.buffer(make_withdraw_instruction(
             RECONCILE_SLOT,
@@ -1890,14 +2048,19 @@ mod tests {
         );
     }
 
-    /// A deposit id present in the set but tagged as a remint (kind/type mismatch) is
-    /// not acted on: the deposit stays `pending` rather than being wrongly completed.
+    /// A recorded mint whose amount differs from the rebuilt deposit is quarantined, not
+    /// completed: the channel mint does not prove this deposit was issued.
     #[tokio::test]
-    async fn resync_reconcile_ignores_kind_type_mismatch() {
+    async fn resync_reconcile_quarantines_deposit_with_wrong_amount() {
         let mut consumed = ConsumedSet::new();
         consumed.insert(
             deposit_event_id(SERVICED_DEPOSIT_SIG),
-            (Signature::new_unique(), ConsumedMintKind::Remint),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Deposit,
+                make_pubkey(1),
+                DEPOSIT_EVENT_AMOUNT + 1,
+            ),
         );
         let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
         processor.buffer(make_deposit_instruction(
@@ -1911,7 +2074,244 @@ mod tests {
             .unwrap();
 
         let inserted = mock.inserted_transactions.lock().unwrap();
-        assert_eq!(inserted[0][0].status, TransactionStatus::Pending);
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::ManualReview);
+        assert!(row.counterpart_signature.is_none());
+    }
+
+    /// A recorded mint into another owner's ATA is quarantined, not completed.
+    #[tokio::test]
+    async fn resync_reconcile_quarantines_deposit_with_wrong_recipient() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Deposit,
+                make_pubkey(99),
+                DEPOSIT_EVENT_AMOUNT,
+            ),
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::ManualReview);
+        assert!(row.counterpart_signature.is_none());
+    }
+
+    /// A recorded mint of another token is quarantined, not completed.
+    #[tokio::test]
+    async fn resync_reconcile_quarantines_deposit_with_wrong_mint() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            ConsumedMint {
+                mint: make_pubkey(98),
+                ..landed_mint(
+                    Signature::new_unique(),
+                    ConsumedMintKind::Deposit,
+                    make_pubkey(1),
+                    DEPOSIT_EVENT_AMOUNT,
+                )
+            },
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::ManualReview);
+        assert!(row.counterpart_signature.is_none());
+    }
+
+    /// A recorded remint whose amount differs from the rebuilt withdrawal is quarantined,
+    /// not marked reminted.
+    #[tokio::test]
+    async fn resync_reconcile_quarantines_remint_with_wrong_amount() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            SourceEventId::new(SERVICED_WITHDRAW_SIG, 0, None),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Remint,
+                make_pubkey(1),
+                WITHDRAW_AMOUNT + 1,
+            ),
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(Pubkey::default(), consumed);
+        processor.buffer(make_withdraw_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_WITHDRAW_SIG.to_string()),
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::ManualReview);
+        assert!(row.landed_remint_signature.is_none());
+    }
+
+    /// A deposit id tagged as a remint is contradictory evidence of an authority-signed
+    /// mint. Resync dropped the signature journal, so `pending` would let the gate mint
+    /// again; the row is quarantined instead.
+    #[tokio::test]
+    async fn resync_reconcile_quarantines_kind_type_mismatch() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Remint,
+                make_pubkey(1),
+                DEPOSIT_EVENT_AMOUNT,
+            ),
+        );
+        let (mut processor, _rx, mock) = make_processor_with_consumed(deposit_instance(), consumed);
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let inserted = mock.inserted_transactions.lock().unwrap();
+        let row = &inserted[0][0];
+        assert_eq!(row.status, TransactionStatus::ManualReview);
+        assert!(row.counterpart_signature.is_none());
+    }
+
+    /// The pre-drop validation pass derives rows exactly as the rebuild does but must
+    /// leave the live database untouched: no rows, no checkpoint.
+    #[tokio::test]
+    async fn validate_only_writes_nothing() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Deposit,
+                make_pubkey(1),
+                DEPOSIT_EVENT_AMOUNT,
+            ),
+        );
+        let (processor, mut checkpoint_rx, mock) =
+            make_processor_with_consumed(deposit_instance(), consumed);
+        let mut processor = processor.validate_only();
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+
+        processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        assert!(mock.inserted_transactions.lock().unwrap().is_empty());
+        assert!(
+            checkpoint_rx.try_recv().is_err(),
+            "no checkpoint may be sent"
+        );
+    }
+
+    /// Contradictory channel evidence aborts the validation pass, which is what lets
+    /// resync refuse before it drops anything.
+    #[tokio::test]
+    async fn validate_only_rejects_mismatch() {
+        let mut consumed = ConsumedSet::new();
+        consumed.insert(
+            deposit_event_id(SERVICED_DEPOSIT_SIG),
+            landed_mint(
+                Signature::new_unique(),
+                ConsumedMintKind::Deposit,
+                make_pubkey(1),
+                DEPOSIT_EVENT_AMOUNT + 1,
+            ),
+        );
+        let (processor, _checkpoint_rx, mock) =
+            make_processor_with_consumed(deposit_instance(), consumed);
+        let mut processor = processor.validate_only();
+        processor.buffer(make_deposit_instruction(
+            RECONCILE_SLOT,
+            Some(SERVICED_DEPOSIT_SIG.to_string()),
+            None,
+        ));
+
+        let result = processor
+            .finalize_and_checkpoint(RECONCILE_SLOT, ProgramType::Escrow)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::ConsumedMintMismatch { .. }
+                ))
+            ),
+            "a mismatch must abort validation: {result:?}"
+        );
+        assert!(mock.inserted_transactions.lock().unwrap().is_empty());
+    }
+
+    /// The mismatch error names the source event, the channel mint and both sides of the
+    /// field that differs, so the aborted resync says exactly what contradicted what.
+    #[test]
+    fn check_consumed_mint_reports_both_sides() {
+        let channel_signature = Signature::new_unique();
+        let row = DbTransactionBuilder::new(
+            SERVICED_DEPOSIT_SIG.to_string(),
+            RECONCILE_SLOT,
+            make_pubkey(2).to_string(),
+            DEPOSIT_EVENT_AMOUNT,
+        )
+        .initiator(make_pubkey(1).to_string())
+        .recipient(make_pubkey(1).to_string())
+        .transaction_type(TransactionType::Deposit)
+        .build();
+        let consumed_mint = landed_mint(
+            channel_signature,
+            ConsumedMintKind::Deposit,
+            make_pubkey(1),
+            DEPOSIT_EVENT_AMOUNT + 1,
+        );
+
+        let err = check_consumed_mint(&consumed_mint, &row)
+            .expect_err("an amount mismatch must be reported")
+            .to_string();
+        for expected in [
+            SourceEventId::from_row(&row).as_str().to_string(),
+            SERVICED_DEPOSIT_SIG.to_string(),
+            channel_signature.to_string(),
+            DEPOSIT_EVENT_AMOUNT.to_string(),
+            (DEPOSIT_EVENT_AMOUNT + 1).to_string(),
+        ] {
+            assert!(err.contains(&expected), "error must name {expected}: {err}");
+        }
     }
 
     /// Regression contract: with no consumed-set configured, a deposit that *would*

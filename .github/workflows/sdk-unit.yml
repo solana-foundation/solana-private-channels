@@ -7,7 +7,7 @@ concurrency:
 on:
   workflow_call:
   push:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
     paths:
       - "private-channel-escrow-program/clients/typescript/**"
       - "private-channel-withdraw-program/clients/typescript/**"
@@ -20,7 +20,7 @@ on:
       - "private-channel-withdraw-program/package.json"
 
   pull_request:
-    branches: [main, hardening/pre-release-audit]
+    branches: [main, hardening/pre-release-audit, hardening/apex-scan-2]
     paths:
       - "private-channel-escrow-program/clients/typescript/**"
       - "private-channel-withdraw-program/clients/typescript/**"
