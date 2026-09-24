@@ -226,69 +226,6 @@ async fn init_schema_widens_legacy_bigint_amount_column() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// A database whose `observed_releases.amount` is still BIGINT is widened to NUMERIC once.
-/// Rows the old code capped at `i64::MAX` lose their amount so the row's own figure is used,
-/// while later NUMERIC values, including an exact `i64::MAX`, are never touched again.
-#[tokio::test(flavor = "multi_thread")]
-async fn init_schema_widens_observed_release_amount_once() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (pool, storage, _pg) = start_postgres().await?;
-    sqlx::query("ALTER TABLE observed_releases ALTER COLUMN amount TYPE BIGINT")
-        .execute(&pool)
-        .await?;
-    sqlx::query(
-        "INSERT INTO observed_releases (withdrawal_nonce, signature, slot, amount)
-         VALUES (1, 'capped', 10, 9223372036854775807), (2, 'normal', 10, 750)",
-    )
-    .execute(&pool)
-    .await?;
-
-    storage.init_schema().await?;
-
-    let (data_type,): (String,) = sqlx::query_as(
-        "SELECT data_type::text FROM information_schema.columns
-         WHERE table_name = 'observed_releases' AND column_name = 'amount'",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(data_type, "numeric", "amount must be widened to NUMERIC");
-    let capped = storage.get_observed_release(1).await?.expect("row kept");
-    assert_eq!(
-        capped.amount, None,
-        "a capped amount falls back to the row figure"
-    );
-    let normal = storage.get_observed_release(2).await?.expect("row kept");
-    assert_eq!(normal.amount, Some(TokenAmount(750)));
-
-    // Values only NUMERIC can hold round-trip, and a second boot changes nothing.
-    storage
-        .insert_observed_releases_batch(&[
-            DbObservedRelease {
-                withdrawal_nonce: 3,
-                signature: "max".to_string(),
-                slot: 11,
-                amount: Some(TokenAmount(u64::MAX)),
-            },
-            DbObservedRelease {
-                withdrawal_nonce: 4,
-                signature: "exact".to_string(),
-                slot: 11,
-                amount: Some(TokenAmount(i64::MAX as u64)),
-            },
-        ])
-        .await?;
-    storage.init_schema().await?;
-    let max = storage.get_observed_release(3).await?.expect("row kept");
-    assert_eq!(max.amount, Some(TokenAmount(u64::MAX)));
-    let exact = storage.get_observed_release(4).await?.expect("row kept");
-    assert_eq!(
-        exact.amount,
-        Some(TokenAmount(i64::MAX as u64)),
-        "a NUMERIC value is never mistaken for a capped one"
-    );
-    Ok(())
-}
-
 // ── 2. Single transaction insert ─────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
