@@ -489,3 +489,94 @@ async fn a_failed_startup_frees_the_lease_before_returning() {
         "a failed startup must leave no worker still committing blocks"
     );
 }
+
+/// Poll `isBlockhashValid` on the write node until it gives `expected`. A hash already
+/// handed out must never read false; only the writer's catching-up error is retried.
+/// An expired hash can still read true until dedup takes in the block that evicts it.
+async fn await_blockhash_validity(
+    client: &RpcClient,
+    hash: &solana_sdk::hash::Hash,
+    expected: bool,
+) {
+    let commitment = solana_commitment_config::CommitmentConfig::processed();
+    for _ in 0..50 {
+        match client.is_blockhash_valid(hash, commitment).await {
+            Ok(valid) if valid == expected => return,
+            Ok(false) => panic!("the write node reported the live blockhash {hash} as invalid"),
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("catching up") => {}
+            Err(e) => panic!("isBlockhashValid: {e}"),
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the write node never reported {hash} as valid={expected}");
+}
+
+/// The hash a read node hands out must be live on the writer that admits it, and a read
+/// node itself must refuse to answer rather than say `false`.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_node_validates_the_read_nodes_latest_blockhash() {
+    let (_pg, url) = start_postgres().await;
+    let mut conn = PgConnection::connect(&url).await.expect("connect");
+
+    let write_port = get_free_port();
+    let mut write_config = write_node_config(url.clone(), write_port);
+    write_config.mode = NodeMode::Write;
+    write_config.max_blockhashes = 5;
+    let writer = run_node(write_config)
+        .await
+        .expect("the write node must start");
+    await_first_block_in_db(&mut conn).await;
+
+    let read_port = get_free_port();
+    let mut read_config = write_node_config(url, read_port);
+    read_config.mode = NodeMode::Read;
+    read_config.max_blockhashes = 5;
+    let reader = run_node(read_config)
+        .await
+        .expect("the read node must start");
+    await_first_block(read_port).await;
+
+    let read_client = RpcClient::new(format!("http://127.0.0.1:{read_port}"));
+    let write_client = RpcClient::new(format!("http://127.0.0.1:{write_port}"));
+    let commitment = solana_commitment_config::CommitmentConfig::processed();
+
+    let (old_hash, last_valid) = read_client
+        .get_latest_blockhash_with_commitment(commitment)
+        .await
+        .expect("getLatestBlockhash on the read node");
+    await_blockhash_validity(&write_client, &old_hash, true).await;
+    assert!(
+        read_client
+            .is_blockhash_valid(&old_hash, commitment)
+            .await
+            .is_err(),
+        "a read node must return an error, never false"
+    );
+
+    // Heartbeat blocks alone carry the height past the deadline the client was given.
+    let mut passed = false;
+    for _ in 0..200 {
+        if read_client
+            .get_block_height()
+            .await
+            .expect("getBlockHeight")
+            > last_valid
+        {
+            passed = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(passed, "block height never passed {last_valid}");
+
+    await_blockhash_validity(&write_client, &old_hash, false).await;
+    let (new_hash, _) = read_client
+        .get_latest_blockhash_with_commitment(commitment)
+        .await
+        .expect("getLatestBlockhash on the read node");
+    await_blockhash_validity(&write_client, &new_hash, true).await;
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+}

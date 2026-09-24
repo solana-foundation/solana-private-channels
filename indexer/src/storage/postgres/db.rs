@@ -8,7 +8,8 @@ use crate::{
     error::StorageError,
     storage::common::models::{
         DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-        MintInFlightAmount, MintStatusAtSlot, StoredSig, TransactionStatus, TransactionType,
+        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, StoredSig, TransactionStatus,
+        TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::{RemintClaim, RequeueOutcome},
@@ -192,6 +193,17 @@ async fn complete_stalled_withdrawal(
     Ok(result.rows_affected() == 1)
 }
 
+/// Advisory key that serializes `init_schema` across processes. Distinct from every other key.
+pub const SCHEMA_INIT_LOCK_KEY: i64 = 0x53_43_48_45_4D_41_5F_49; // "SCHEMA_I"
+/// Lock waits before init gives up, each capped by the lock session's lock_timeout.
+const SCHEMA_INIT_LOCK_ATTEMPTS: u32 = 3;
+
+fn is_lock_timeout(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == "55P03")
+}
+
 // Returns true when the URL parses and its password is absent or empty (a blanked secret).
 // Kept in sync with the identical guard in core's accounts/postgres.rs.
 fn database_url_password_is_blank(database_url: &str) -> bool {
@@ -315,7 +327,39 @@ impl PostgresDb {
         }
     }
 
+    /// Every indexer and operator runs this at boot against the same database, and its
+    /// DDL is not safe to run concurrently, so inits take turns on an advisory lock.
+    /// The lock lives on its own connection, so closing it releases the lock on any exit.
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
+        let mut lock_conn =
+            <PgConnection as sqlx::Connection>::connect_with(&self.pool.connect_options()).await?;
+        apply_lock_session_keepalives(&mut lock_conn).await;
+        apply_lock_session_lock_timeout(&mut lock_conn).await;
+        // Each wait is capped by lock_timeout, so a wedged holder fails boot instead of hanging it.
+        let mut attempt = 1;
+        loop {
+            match sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(SCHEMA_INIT_LOCK_KEY)
+                .execute(&mut lock_conn)
+                .await
+            {
+                Ok(_) => break,
+                Err(e) if attempt < SCHEMA_INIT_LOCK_ATTEMPTS && is_lock_timeout(&e) => {
+                    warn!("Schema init lock still held by another session, retrying (attempt {attempt}/{SCHEMA_INIT_LOCK_ATTEMPTS})");
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let result = self.init_schema_locked().await;
+        // A failed close means the session is already gone, and the lock with it.
+        if let Err(e) = sqlx::Connection::close(lock_conn).await {
+            warn!("Schema init lock session did not close cleanly: {e}");
+        }
+        result
+    }
+
+    async fn init_schema_locked(&self) -> Result<(), sqlx::Error> {
         // Ensure pgcrypto is available for gen_random_uuid()
         sqlx::query(r#"CREATE EXTENSION IF NOT EXISTS "pgcrypto""#)
             .execute(&self.pool)
@@ -2470,6 +2514,38 @@ impl PostgresDb {
             "#,
         )
         .bind(transaction_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Processing withdrawals with at least one journaled release signature, for the
+    /// promotion pass. Keyset paging on `id`, like the stalled-withdrawal sweep, so rows
+    /// that are not final yet cannot starve the ones behind them. A row with a refund
+    /// claimed or landed is left to recovery, which checks the bitmap first.
+    pub async fn get_released_withdrawals_internal(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ReleasedWithdrawal>, sqlx::Error> {
+        sqlx::query_as::<_, ReleasedWithdrawal>(
+            r#"
+            SELECT t.id, t.updated_at, array_agg(p.signature ORDER BY p.id) AS signatures
+            FROM transactions t
+            JOIN pending_release_signatures p ON p.transaction_id = t.id
+            WHERE t.transaction_type = 'withdrawal'
+              AND t.status = 'processing'
+              AND t.landed_remint_signature IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_remint_signatures r WHERE r.transaction_id = t.id
+              )
+              AND t.id > $1
+            GROUP BY t.id, t.updated_at
+            ORDER BY t.id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
     }

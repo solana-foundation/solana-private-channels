@@ -8,7 +8,7 @@ use {
         },
         nodes::node::{DEFAULT_BLOCKTIME_MS, DEFAULT_MAX_BLOCKHASHES},
     },
-    std::{path::PathBuf, time::Duration},
+    std::path::PathBuf,
     tracing::{error, info, warn},
 };
 
@@ -46,17 +46,18 @@ struct TruncateArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     keep_slots: u64,
 
-    /// Maximum allowed backup age before truncation is blocked
-    #[arg(
-        long,
-        default_value_t = 24,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    max_backup_age_hours: u64,
+    /// Deprecated and ignored: the dump is now proven to cover every deleted row,
+    /// which makes its age irrelevant. Still accepted so existing scripts parse.
+    #[arg(long, hide = true)]
+    max_backup_age_hours: Option<u64>,
 
-    /// Optional pg_dump artifact path (file or directory)
+    /// A `pg_dump -Fc` file of this database, proven to hold every row to be deleted
     #[arg(long)]
-    pg_dump_path: Option<PathBuf>,
+    pg_dump_path: PathBuf,
+
+    /// The pg_restore used to read the dump; at least the server's major version
+    #[arg(long, default_value = "pg_restore")]
+    pg_restore_bin: PathBuf,
 
     /// Number of block rows to process per truncation batch
     #[arg(long, default_value_t = 1000)]
@@ -132,15 +133,15 @@ async fn run(args: Args) -> Result<()> {
                     truncate_args.blocktime_ms
                 );
             }
+            if truncate_args.max_backup_age_hours.is_some() {
+                warn!(
+                    "--max-backup-age-hours is deprecated and ignored; the dump itself is verified"
+                );
+            }
             let options = TruncateOptions {
                 keep_slots: truncate_args.keep_slots,
-                max_backup_age: Duration::from_secs(
-                    truncate_args
-                        .max_backup_age_hours
-                        .saturating_mul(60)
-                        .saturating_mul(60),
-                ),
-                pg_dump_path: truncate_args.pg_dump_path,
+                pg_dump_path: Some(truncate_args.pg_dump_path),
+                pg_restore_bin: truncate_args.pg_restore_bin,
                 batch_size: truncate_args.batch_size,
                 dry_run: truncate_args.dry_run,
             };
@@ -161,21 +162,17 @@ fn print_report(report: &TruncateReport, dry_run: bool) {
         transactions_deleted = report.transactions_deleted,
         account_history_rows_deleted = report.account_history_rows_deleted,
         first_available_block = ?report.first_available_block,
-        wal_archive_ok = report.backup_check.wal_archive_ok,
         pg_dump_ok = report.backup_check.pg_dump_ok,
+        pg_dump_sha256 = ?report.backup_check.sha256,
         "Truncation summary"
     );
 
     println!("mode: {}", if dry_run { "dry_run" } else { "apply" });
     println!("latest_slot: {:?}", report.latest_slot);
     println!("truncate_before_slot: {:?}", report.truncate_before_slot);
-    println!("wal_archive_ok: {}", report.backup_check.wal_archive_ok);
-    println!(
-        "wal_archive_reason: {}",
-        report.backup_check.wal_archive_reason
-    );
     println!("pg_dump_ok: {}", report.backup_check.pg_dump_ok);
     println!("pg_dump_reason: {}", report.backup_check.pg_dump_reason);
+    println!("pg_dump_sha256: {:?}", report.backup_check.sha256);
     println!("blocks_deleted: {}", report.blocks_deleted);
     println!("transactions_deleted: {}", report.transactions_deleted);
     println!(
@@ -183,4 +180,37 @@ fn print_report(report: &TruncateReport, dry_run: bool) {
         report.account_history_rows_deleted
     );
     println!("first_available_block: {:?}", report.first_available_block);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const URL: &str = "--accountsdb-connection-url=postgres://x";
+
+    /// Scripts that still pass the old age flag keep parsing; a dump is now required.
+    #[test]
+    fn admin_accepts_deprecated_max_backup_age() {
+        let args = Args::try_parse_from([
+            "admin",
+            URL,
+            "truncate",
+            "--keep-slots",
+            "1",
+            "--pg-dump-path",
+            "x",
+            "--max-backup-age-hours",
+            "24",
+        ])
+        .expect("the deprecated flag must still parse");
+        let Command::Truncate(truncate) = args.command;
+        assert_eq!(truncate.max_backup_age_hours, Some(24));
+        assert_eq!(truncate.pg_restore_bin, PathBuf::from("pg_restore"));
+
+        let missing_dump = Args::try_parse_from(["admin", URL, "truncate", "--keep-slots", "1"]);
+        assert!(
+            missing_dump.is_err(),
+            "a truncation without a dump must not parse"
+        );
+    }
 }

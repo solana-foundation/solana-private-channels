@@ -140,6 +140,15 @@ pub struct StoredSig {
     pub blockhash_slot: Option<i64>,
 }
 
+/// A processing withdrawal and its journaled release signatures, oldest attempt first.
+/// `updated_at` is the CAS token for completing it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ReleasedWithdrawal {
+    pub id: i64,
+    pub updated_at: DateTime<Utc>,
+    pub signatures: Vec<String>,
+}
+
 /// Durable reconciliation-halt state. Its presence (a single row) is the
 /// cross-process, restart-surviving signal that freezes both operators'
 /// fetchers after a proven insolvency; absence means not halted.

@@ -642,7 +642,6 @@ mod tests {
         ReadDeps {
             accounts_db,
             admin_keys: vec![],
-            live_blockhashes: Arc::new(std::sync::RwLock::new(Default::default())),
             max_blockhashes: 150,
             simulation_permits: tokio::sync::Semaphore::new(permits),
         }

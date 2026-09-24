@@ -266,9 +266,16 @@ impl ResyncService {
 
         // Bound to that slot, so a load balancer routing this read to an older backend
         // returns an error rather than a staler bitmap.
-        let bitmap = fetch_consumed_nonces(&rpc, &bitmap_pda, Some(ref_slot))
-            .await
-            .map_err(|e| unverified(e.to_string()))?;
+        // The client's commitment on purpose: here a set bit blocks the drop, so the
+        // fresher view is the safe one.
+        let bitmap = fetch_consumed_nonces(
+            &rpc,
+            &bitmap_pda,
+            Some(ref_slot),
+            rpc.rpc_client.commitment(),
+        )
+        .await
+        .map_err(|e| unverified(e.to_string()))?;
 
         if bitmap.generation != 0 || !bitmap.consumed.is_empty() {
             error!(

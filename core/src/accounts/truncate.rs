@@ -1,13 +1,17 @@
 use {
-    super::{postgres::PostgresAccountsDB, traits::BlockInfo},
+    super::{
+        pg_dump_proof::{check_transaction_cap, prove_dump, LiveLedger},
+        postgres::PostgresAccountsDB,
+        redis_coherence::read_deployment_id,
+        traits::BlockInfo,
+    },
     crate::accounts::address_index_watermark::ADDRESS_SIGNATURES_FLUSHED_SLOT_KEY,
     anyhow::{anyhow, Context, Result},
+    sha2::{Digest, Sha256},
     sqlx::{Connection, Executor, PgConnection, PgPool, Postgres, QueryBuilder, Row},
     std::{
-        collections::HashSet,
-        fs,
+        collections::{HashMap, HashSet},
         path::{Path, PathBuf},
-        time::{Duration, SystemTime},
     },
     tracing::error,
 };
@@ -29,8 +33,10 @@ const MAX_BIND_PARAMS: usize = 60_000;
 #[derive(Debug, Clone)]
 pub struct TruncateOptions {
     pub keep_slots: u64,
-    pub max_backup_age: Duration,
+    /// A `pg_dump -Fc` of this database. Without one nothing is deleted.
     pub pg_dump_path: Option<PathBuf>,
+    /// The `pg_restore` that reads the dump; at least the server's major version.
+    pub pg_restore_bin: PathBuf,
     pub batch_size: usize,
     pub dry_run: bool,
 }
@@ -48,23 +54,23 @@ pub struct TruncateReport {
 
 #[derive(Debug, Clone, Default)]
 pub struct BackupCheckResult {
-    pub wal_archive_ok: bool,
-    pub wal_archive_reason: String,
     pub pg_dump_ok: bool,
     pub pg_dump_reason: String,
+    /// SHA-256 of the dump bytes that were proven, to match against the kept backup.
+    pub sha256: Option<String>,
 }
 
 impl BackupCheckResult {
+    /// Only a verified dump counts. WAL recency and file age prove nothing restorable.
     pub fn has_valid_backup(&self) -> bool {
-        self.wal_archive_ok || self.pg_dump_ok
+        self.pg_dump_ok
     }
 
     fn skipped() -> Self {
         Self {
-            wal_archive_ok: false,
-            wal_archive_reason: "Skipped: no rows eligible for truncation".to_string(),
             pg_dump_ok: false,
             pg_dump_reason: "Skipped: no rows eligible for truncation".to_string(),
+            sha256: None,
         }
     }
 }
@@ -104,7 +110,7 @@ pub async fn truncate_slots(
         ));
     }
 
-    let result = truncate_slots_inner(pool.as_ref(), options).await;
+    let result = truncate_slots_inner(db, &mut lock_conn, options).await;
 
     // Read the answer rather than discarding it: false means this session did not
     // hold the lock, which is the bug above and must not pass unnoticed.
@@ -134,7 +140,12 @@ pub async fn truncate_slots(
     result
 }
 
-async fn truncate_slots_inner(pool: &PgPool, options: &TruncateOptions) -> Result<TruncateReport> {
+async fn truncate_slots_inner(
+    db: &PostgresAccountsDB,
+    lock_conn: &mut PgConnection,
+    options: &TruncateOptions,
+) -> Result<TruncateReport> {
+    let pool = db.pool.as_ref();
     let latest_slot = query_latest_slot(pool).await?;
 
     let Some(latest_slot) = latest_slot else {
@@ -170,18 +181,33 @@ async fn truncate_slots_inner(pool: &PgPool, options: &TruncateOptions) -> Resul
         return Ok(report);
     }
 
-    let backup_check = verify_backup_readiness(
-        pool,
-        options.pg_dump_path.as_deref(),
-        options.max_backup_age,
-    )
-    .await;
-    report.backup_check = backup_check;
+    // Taken after T is fixed: rows written during the proof land at or above T and are
+    // never deleted. Blocks land in slot order, so nothing new can appear below T.
+    let transactions = live_doomed_transactions(pool, truncate_before_slot).await?;
+    let live = LiveLedger {
+        deployment_id: read_deployment_id(db).await?,
+        truncate_before_slot,
+        live_min_slot: report.first_available_block.unwrap_or(0),
+        live_block_count: blocks_to_delete,
+        account_history_count: has_account_history.then_some(account_history_rows_to_delete),
+        account_history_min_slot: if has_account_history {
+            min_account_history_slot(pool).await?
+        } else {
+            0
+        },
+        transactions,
+    };
+    let dump_path = options.pg_dump_path.clone();
+    let pg_restore_bin = options.pg_restore_bin.clone();
+    report.backup_check = tokio::task::spawn_blocking(move || {
+        verify_backup(dump_path.as_deref(), &pg_restore_bin, &live)
+    })
+    .await
+    .context("Backup verification task failed")?;
 
     if !report.backup_check.has_valid_backup() {
         return Err(anyhow!(
-            "Backup verification failed. WAL: {}. pg_dump: {}",
-            report.backup_check.wal_archive_reason,
+            "Backup verification failed. pg_dump: {}",
             report.backup_check.pg_dump_reason
         ));
     }
@@ -195,13 +221,17 @@ async fn truncate_slots_inner(pool: &PgPool, options: &TruncateOptions) -> Resul
         return Ok(report);
     }
 
+    // The proof can take long on an idle lock session; a dropped session frees the lock.
+    ensure_lock_held(lock_conn).await?;
+
     let (blocks_deleted, transactions_deleted) =
         process_block_batches(pool, truncate_before_slot, options.batch_size, false).await?;
     report.blocks_deleted = blocks_deleted;
     report.transactions_deleted = transactions_deleted;
 
     let account_history_rows_deleted = if has_account_history {
-        truncate_account_history_rows(pool, truncate_before_slot).await?
+        truncate_account_history_rows(pool, truncate_before_slot, account_history_rows_to_delete)
+            .await?
     } else {
         0
     };
@@ -373,13 +403,61 @@ async fn count_account_history_rows_before(
     Ok(count as u64)
 }
 
-async fn truncate_account_history_rows(pool: &PgPool, truncate_before_slot: u64) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM account_history WHERE slot < $1")
-        .bind(truncate_before_slot as i64)
-        .execute(pool)
+async fn min_account_history_slot(pool: &PgPool) -> Result<u64> {
+    let min = sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(slot) FROM account_history")
+        .fetch_one(pool)
         .await
-        .context("Failed deleting old account_history rows")?;
-    Ok(result.rows_affected())
+        .context("Failed to query the oldest account_history slot")?;
+    Ok(min.unwrap_or(0).max(0) as u64)
+}
+
+/// Delete exactly the rows the dump was proven to hold. No writer of this table is
+/// visible here, so a different count rolls back instead of deleting unproven rows.
+async fn truncate_account_history_rows(
+    pool: &PgPool,
+    truncate_before_slot: u64,
+    proven: u64,
+) -> Result<u64> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("Failed to begin account_history deletion")?;
+    let deleted = sqlx::query("DELETE FROM account_history WHERE slot < $1")
+        .bind(truncate_before_slot as i64)
+        .execute(&mut *tx)
+        .await
+        .context("Failed deleting old account_history rows")?
+        .rows_affected();
+    if deleted != proven {
+        return Err(anyhow!(
+            "account_history deletion would remove {deleted} rows but the dump proved {proven}; \
+             rolled back"
+        ));
+    }
+    tx.commit()
+        .await
+        .context("Failed to commit account_history deletion")?;
+    Ok(deleted)
+}
+
+/// Abort unless this session still holds the truncation lock.
+async fn ensure_lock_held(lock_conn: &mut PgConnection) -> Result<()> {
+    let held = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+         AND pid = pg_backend_pid() AND granted AND classid::bigint = $1 \
+         AND objid::bigint = $2 AND objsubid = 1)",
+    )
+    .bind(TRUNCATE_ADVISORY_LOCK_ID >> 32)
+    .bind(TRUNCATE_ADVISORY_LOCK_ID & 0xFFFF_FFFF)
+    .fetch_one(lock_conn)
+    .await
+    .context("Failed to re-check the truncation lock before deleting")?;
+    if !held {
+        return Err(anyhow!(
+            "The truncation lock was lost before deleting; nothing was deleted"
+        ));
+    }
+    Ok(())
 }
 
 /// Write the advertised ledger floor, the oldest slot this node still retains.
@@ -436,128 +514,95 @@ async fn run_vacuum(pool: &PgPool, table_names: &[&str]) -> Result<()> {
     Ok(())
 }
 
-async fn verify_backup_readiness(
-    pool: &PgPool,
+/// Build the backup verdict. Any failure, including no dump at all, refuses deletion.
+fn verify_backup(
     pg_dump_path: Option<&Path>,
-    max_backup_age: Duration,
+    pg_restore_bin: &Path,
+    live: &LiveLedger,
 ) -> BackupCheckResult {
-    let (wal_archive_ok, wal_archive_reason) =
-        match check_wal_archive_recency(pool, max_backup_age).await {
-            Ok(message) => (true, message),
-            Err(e) => (false, e.to_string()),
-        };
-
-    let (pg_dump_ok, pg_dump_reason) = check_pg_dump_recency(pg_dump_path, max_backup_age);
-
-    BackupCheckResult {
-        wal_archive_ok,
-        wal_archive_reason,
-        pg_dump_ok,
-        pg_dump_reason,
-    }
-}
-
-async fn check_wal_archive_recency(pool: &PgPool, max_backup_age: Duration) -> Result<String> {
-    let archive_mode = sqlx::query_scalar::<_, String>(
-        "SELECT setting FROM pg_settings WHERE name = 'archive_mode'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("Unable to read archive_mode from pg_settings")?;
-
-    if archive_mode != "on" && archive_mode != "always" {
-        return Err(anyhow!(
-            "archive_mode is '{}' (expected 'on' or 'always')",
-            archive_mode
-        ));
-    }
-
-    let archive_command = sqlx::query_scalar::<_, String>(
-        "SELECT setting FROM pg_settings WHERE name = 'archive_command'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("Unable to read archive_command from pg_settings")?;
-
-    if is_noop_archive_command(&archive_command) {
-        return Err(anyhow!(
-            "archive_command '{}' is a no-op and does not provide recoverable WAL archives",
-            archive_command
-        ));
-    }
-
-    let age_seconds = sqlx::query_scalar::<_, Option<f64>>(
-        "SELECT EXTRACT(EPOCH FROM (NOW() - last_archived_time)) FROM pg_stat_archiver",
-    )
-    .fetch_one(pool)
-    .await
-    .context("Unable to read last_archived_time from pg_stat_archiver")?;
-
-    let age_seconds = age_seconds.context("No archived WAL segment found in pg_stat_archiver")?;
-    if age_seconds > max_backup_age.as_secs_f64() {
-        return Err(anyhow!(
-            "Latest archived WAL segment is {:.0} seconds old (max allowed: {:.0})",
-            age_seconds,
-            max_backup_age.as_secs_f64()
-        ));
-    }
-
-    Ok(format!(
-        "WAL archiving healthy; latest archived segment age {:.0} seconds",
-        age_seconds
-    ))
-}
-
-fn check_pg_dump_recency(pg_dump_path: Option<&Path>, max_backup_age: Duration) -> (bool, String) {
     let Some(path) = pg_dump_path else {
-        return (false, "No pg_dump path supplied".to_string());
+        return BackupCheckResult {
+            pg_dump_ok: false,
+            pg_dump_reason: "No pg_dump path supplied".to_string(),
+            sha256: None,
+        };
     };
-
-    if !path.is_file() {
-        return (
-            false,
-            format!("pg_dump path '{}' is not a file", path.display()),
-        );
-    }
-
-    let modified = match fs::metadata(path).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                false,
-                format!(
-                    "Unable to read modified time for '{}': {}",
-                    path.display(),
-                    e
-                ),
-            )
-        }
-    };
-
-    let age = SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or(Duration::from_secs(0));
-
-    if age > max_backup_age {
-        return (
-            false,
-            format!(
-                "pg_dump artifact '{}' is {} seconds old (max allowed: {})",
-                path.display(),
-                age.as_secs(),
-                max_backup_age.as_secs()
+    match prove_dump(pg_restore_bin, path, live) {
+        Ok(sha256) => BackupCheckResult {
+            pg_dump_ok: true,
+            pg_dump_reason: format!(
+                "pg_dump '{}' restores every row this run deletes",
+                path.display()
             ),
-        );
+            sha256: Some(sha256),
+        },
+        Err(e) => BackupCheckResult {
+            pg_dump_ok: false,
+            pg_dump_reason: format!("{e:#}"),
+            sha256: None,
+        },
     }
+}
 
-    (
-        true,
-        format!(
-            "Recent pg_dump artifact '{}' found (age {} seconds)",
-            path.display(),
-            age.as_secs()
-        ),
-    )
+/// Blocks, then transaction rows, read per query when collecting what truncation deletes.
+const LIVE_SCAN_BLOCKS: i64 = 1_000;
+const LIVE_SCAN_TRANSACTIONS: usize = 1_000;
+
+/// The transaction rows truncation deletes (named by a block below the cut, and present),
+/// as signature to SHA-256 of data. Rows are immutable once written, so a hash is stable.
+async fn live_doomed_transactions(
+    pool: &PgPool,
+    truncate_before_slot: u64,
+) -> Result<HashMap<[u8; 64], [u8; 32]>> {
+    let mut transactions = HashMap::new();
+    let mut after_slot = -1_i64;
+    loop {
+        let blocks = sqlx::query(
+            "SELECT slot, data FROM blocks WHERE slot < $1 AND slot > $2 ORDER BY slot LIMIT $3",
+        )
+        .bind(truncate_before_slot as i64)
+        .bind(after_slot)
+        .bind(LIVE_SCAN_BLOCKS)
+        .fetch_all(pool)
+        .await
+        .context("Failed to fetch blocks for the dump proof")?;
+        let Some(last) = blocks.last() else {
+            break;
+        };
+        after_slot = last.get("slot");
+
+        let mut named = Vec::new();
+        for row in blocks {
+            let slot: i64 = row.get("slot");
+            let block: BlockInfo = bincode::deserialize(row.get::<&[u8], _>("data"))
+                .with_context(|| format!("Failed to deserialize block at slot {slot}"))?;
+            named.extend(
+                block
+                    .transaction_signatures
+                    .iter()
+                    .map(|s| s.as_ref().to_vec()),
+            );
+        }
+        for chunk in named.chunks(LIVE_SCAN_TRANSACTIONS) {
+            let rows =
+                sqlx::query("SELECT signature, data FROM transactions WHERE signature = ANY($1)")
+                    .bind(chunk)
+                    .fetch_all(pool)
+                    .await
+                    .context("Failed to fetch transactions for the dump proof")?;
+            for row in rows {
+                let key: [u8; 64] = row
+                    .get::<&[u8], _>("signature")
+                    .try_into()
+                    .map_err(|_| anyhow!("a live transaction signature is not 64 bytes"))?;
+                transactions
+                    .entry(key)
+                    .or_insert_with(|| Sha256::digest(row.get::<&[u8], _>("data")).into());
+            }
+            check_transaction_cap(transactions.len())?;
+        }
+    }
+    Ok(transactions)
 }
 
 async fn count_blocks_before(pool: &PgPool, truncate_before_slot: u64) -> Result<u64> {
@@ -607,11 +652,6 @@ async fn query_first_available_slot(pool: &PgPool) -> Result<Option<u64>> {
     Ok(first_available_slot.map(|slot| slot as u64))
 }
 
-fn is_noop_archive_command(command: &str) -> bool {
-    let normalized = command.trim().trim_matches('\'').trim_matches('"');
-    normalized.is_empty() || normalized == "/bin/true" || normalized == "true" || normalized == ":"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,91 +672,28 @@ mod tests {
     }
 
     #[test]
-    fn noop_archive_command_detection_is_strict() {
-        assert!(is_noop_archive_command("/bin/true"));
-        assert!(is_noop_archive_command(" true "));
-        assert!(is_noop_archive_command("':'"));
-        assert!(is_noop_archive_command(""));
-        assert!(is_noop_archive_command("  "));
-        assert!(is_noop_archive_command(":"));
-        assert!(is_noop_archive_command("\"true\""));
-        assert!(is_noop_archive_command("'/bin/true'"));
-        assert!(!is_noop_archive_command("cp %p /backups/%f"));
-        assert!(!is_noop_archive_command("wal-g wal-push %p"));
-    }
-
-    #[test]
-    fn backup_check_result_has_valid_backup() {
-        // Neither ok
-        let check = BackupCheckResult::default();
-        assert!(!check.has_valid_backup());
-
-        // WAL ok only
-        let check = BackupCheckResult {
-            wal_archive_ok: true,
-            ..Default::default()
-        };
-        assert!(check.has_valid_backup());
-
-        // pg_dump ok only
-        let check = BackupCheckResult {
-            pg_dump_ok: true,
-            ..Default::default()
-        };
-        assert!(check.has_valid_backup());
-
-        // Both ok
-        let check = BackupCheckResult {
-            wal_archive_ok: true,
-            pg_dump_ok: true,
-            ..Default::default()
-        };
-        assert!(check.has_valid_backup());
-    }
-
-    #[test]
     fn backup_check_result_skipped() {
         let check = BackupCheckResult::skipped();
         assert!(!check.has_valid_backup());
-        assert!(check.wal_archive_reason.contains("Skipped"));
         assert!(check.pg_dump_reason.contains("Skipped"));
+        assert_eq!(check.sha256, None);
     }
 
+    /// No dump means no proof, whatever else the database looks like.
     #[test]
-    fn check_pg_dump_no_path() {
-        let (ok, reason) = check_pg_dump_recency(None, Duration::from_secs(60));
-        assert!(!ok);
-        assert!(reason.contains("No pg_dump path"));
-    }
-
-    #[test]
-    fn check_pg_dump_nonexistent_file() {
-        let path = PathBuf::from("/nonexistent/backup.sql");
-        let (ok, reason) = check_pg_dump_recency(Some(&path), Duration::from_secs(60));
-        assert!(!ok);
-        assert!(reason.contains("is not a file"));
-    }
-
-    #[test]
-    fn check_pg_dump_recent_file() {
-        // Create a temp file — its mtime is "now", so it's recent
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let (ok, reason) = check_pg_dump_recency(Some(tmp.path()), Duration::from_secs(3600));
-        assert!(ok, "Expected recent file to pass, got: {}", reason);
-        assert!(reason.contains("Recent pg_dump"));
-    }
-
-    #[test]
-    fn truncate_options_fields() {
-        let opts = TruncateOptions {
-            keep_slots: 100,
-            max_backup_age: Duration::from_secs(300),
-            pg_dump_path: Some(PathBuf::from("/tmp/backup.sql")),
-            batch_size: 500,
-            dry_run: true,
+    fn gate_requires_pg_dump() {
+        let live = LiveLedger {
+            deployment_id: vec![1],
+            truncate_before_slot: 10,
+            live_min_slot: 0,
+            live_block_count: 10,
+            account_history_count: None,
+            account_history_min_slot: 0,
+            transactions: Default::default(),
         };
-        assert_eq!(opts.keep_slots, 100);
-        assert!(opts.dry_run);
+        let check = verify_backup(None, Path::new("pg_restore"), &live);
+        assert!(!check.has_valid_backup());
+        assert!(check.pg_dump_reason.contains("No pg_dump path"));
     }
 
     #[test]
@@ -749,18 +726,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_pg_dump_stale_file() {
-        // A fresh temp file with max_backup_age=0 will always be "too old"
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let (ok, reason) = check_pg_dump_recency(Some(tmp.path()), Duration::from_secs(0));
-        assert!(!ok);
-        assert!(reason.contains("seconds old"));
-    }
-
     // --- Integration tests requiring Postgres ---
 
-    use crate::test_helpers::{start_test_postgres_raw, start_test_postgres_with_url};
+    use crate::test_helpers::{
+        container_pg_dump, container_pg_restore_bin, executable_script, start_test_postgres_raw,
+        start_test_postgres_with_url,
+    };
+    use std::time::Duration;
 
     async fn store_test_blocks(db: &PostgresAccountsDB, slots: &[u64]) {
         let pool = db.pool.clone();
@@ -821,16 +793,21 @@ mod tests {
             .map(|slot| slot as u64)
     }
 
-    /// Make one block undeserializable so the batch loop aborts at a known slot.
-    async fn corrupt_block_data(pool: &PgPool, slot: u64) {
-        let updated = sqlx::query("UPDATE blocks SET data = $2 WHERE slot = $1")
-            .bind(slot as i64)
-            .bind(b"not-a-block".to_vec())
-            .execute(pool)
-            .await
-            .unwrap()
-            .rows_affected();
-        assert_eq!(updated, 1, "expected to corrupt exactly one block");
+    /// Make deleting one block fail so the batch loop aborts at a known slot. A corrupt
+    /// block would not do: the proof decodes every doomed block before anything is deleted.
+    async fn pin_block(pool: &PgPool, slot: u64) {
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION refuse_pinned_delete() RETURNS trigger AS $$
+             BEGIN
+                 IF OLD.slot = {slot} THEN RAISE EXCEPTION 'slot {slot} is pinned'; END IF;
+                 RETURN OLD;
+             END $$ LANGUAGE plpgsql;
+             CREATE TRIGGER pin_block BEFORE DELETE ON blocks
+                 FOR EACH ROW EXECUTE FUNCTION refuse_pinned_delete();"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     /// Run one truncation against a pool of its own and prove the lock is gone
@@ -891,8 +868,9 @@ mod tests {
             writer_epoch: None,
         };
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let report = truncate_slots(&starved, &apply_opts(5, 100, tmp.path()))
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        let report = truncate_slots(&starved, &apply_opts(5, 100, dump.path(), &restore))
             .await
             .expect("truncation must not starve itself of connections");
         assert_eq!(report.blocks_deleted, 15);
@@ -947,15 +925,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_release_does_not_return_a_locked_connection_to_the_pool() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
 
         let shadowed = PostgresAccountsDB {
             pool: Arc::new(pool_whose_release_fails(&url).await),
             read_only: false,
             writer_epoch: None,
         };
-        let outcome = truncate_slots(&shadowed, &apply_opts(10, 3, tmp.path())).await;
+        let outcome = truncate_slots(&shadowed, &apply_opts(10, 3, dump.path(), &restore)).await;
         assert!(
             outcome.is_err(),
             "a release that raises must fail the run, got {outcome:?}"
@@ -973,11 +952,16 @@ mod tests {
         panic!("a connection that could not release its lock must not be pooled still holding it");
     }
 
-    fn apply_opts(keep_slots: u64, batch_size: usize, backup: &Path) -> TruncateOptions {
+    fn apply_opts(
+        keep_slots: u64,
+        batch_size: usize,
+        backup: &Path,
+        pg_restore_bin: &Path,
+    ) -> TruncateOptions {
         TruncateOptions {
             keep_slots,
-            max_backup_age: Duration::from_secs(3600),
             pg_dump_path: Some(backup.to_path_buf()),
+            pg_restore_bin: pg_restore_bin.to_path_buf(),
             batch_size,
             dry_run: false,
         }
@@ -1000,16 +984,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn truncate_floor_matches_min_slot_across_batch_sizes() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let restore = container_pg_restore_bin(&_pg);
 
         for batch_size in [1_usize, 3, 1000] {
             reset_ledger(&db.pool).await;
             store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+            let dump = container_pg_dump(&_pg, "pg_test");
 
-            let report =
-                truncate_on_fresh_pool(&url, &apply_opts(5, batch_size, tmp.path()), &db.pool)
-                    .await
-                    .unwrap();
+            let report = truncate_on_fresh_pool(
+                &url,
+                &apply_opts(5, batch_size, dump.path(), &restore),
+                &db.pool,
+            )
+            .await
+            .unwrap();
 
             let floor = read_floor_metadata(&db.pool).await;
             let min_slot = min_block_slot(&db.pool).await;
@@ -1036,27 +1024,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn aborted_run_leaves_floor_at_retained_minimum() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
         let seeded: Vec<u64> = (0..=15).chain(20..=30).collect();
         store_test_blocks(&db, &seeded).await;
+        // One dump serves both runs: blocks the first run deletes are below the live minimum.
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
 
         // First run establishes the metadata key; without it the reader falls back
         // to MIN(slot) and the stale-floor window cannot be observed at all.
-        let first = truncate_on_fresh_pool(&url, &apply_opts(21, 100, tmp.path()), &db.pool)
-            .await
-            .unwrap();
+        let first =
+            truncate_on_fresh_pool(&url, &apply_opts(21, 100, dump.path(), &restore), &db.pool)
+                .await
+                .unwrap();
         assert_eq!(first.truncate_before_slot, Some(10));
         assert_eq!(read_floor_metadata(&db.pool).await, Some(10));
 
-        corrupt_block_data(&db.pool, 20).await;
+        pin_block(&db.pool, 20).await;
 
         // Batches of 3 delete slots 10-12 and 13-15, then abort on slot 20.
-        let aborted = truncate_on_fresh_pool(&url, &apply_opts(5, 3, tmp.path()), &db.pool).await;
-        assert!(aborted.is_err(), "run must abort on the corrupt block");
+        let aborted =
+            truncate_on_fresh_pool(&url, &apply_opts(5, 3, dump.path(), &restore), &db.pool).await;
+        assert!(aborted.is_err(), "run must abort on the pinned block");
         assert!(aborted
             .unwrap_err()
             .to_string()
-            .contains("Failed to deserialize block at slot 20"));
+            .contains("Failed to delete old blocks"));
 
         assert_eq!(min_block_slot(&db.pool).await, Some(20));
         assert_eq!(
@@ -1074,17 +1066,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dry_run_never_writes_floor_even_when_key_exists() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
 
-        truncate_on_fresh_pool(&url, &apply_opts(10, 3, tmp.path()), &db.pool)
+        truncate_on_fresh_pool(&url, &apply_opts(10, 3, dump.path(), &restore), &db.pool)
             .await
             .unwrap();
         let floor_before = read_floor_metadata(&db.pool).await;
         let blocks_before = min_block_slot(&db.pool).await;
         assert_eq!(floor_before, Some(10));
 
-        let mut dry = apply_opts(2, 3, tmp.path());
+        let mut dry = apply_opts(2, 3, dump.path(), &restore);
         dry.dry_run = true;
         let report = truncate_on_fresh_pool(&url, &dry, &db.pool).await.unwrap();
         assert!(
@@ -1105,8 +1098,8 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         let opts = TruncateOptions {
             keep_slots: 0,
-            max_backup_age: Duration::from_secs(3600),
             pg_dump_path: None,
+            pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 100,
             dry_run: false,
         };
@@ -1120,8 +1113,8 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         let opts = TruncateOptions {
             keep_slots: 10,
-            max_backup_age: Duration::from_secs(3600),
             pg_dump_path: None,
+            pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 0,
             dry_run: false,
         };
@@ -1135,8 +1128,8 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         let opts = TruncateOptions {
             keep_slots: 10,
-            max_backup_age: Duration::from_secs(3600),
             pg_dump_path: None,
+            pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 100,
             dry_run: false,
         };
@@ -1144,7 +1137,7 @@ mod tests {
         assert_eq!(report.latest_slot, None);
         assert_eq!(report.blocks_deleted, 0);
         assert!(!report.backup_check.has_valid_backup());
-        assert!(report.backup_check.wal_archive_reason.contains("Skipped"));
+        assert!(report.backup_check.pg_dump_reason.contains("Skipped"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1154,15 +1147,15 @@ mod tests {
         store_test_blocks(&db, &[0, 1, 2, 3, 4]).await;
         let opts = TruncateOptions {
             keep_slots: 10,
-            max_backup_age: Duration::from_secs(3600),
             pg_dump_path: None,
+            pg_restore_bin: PathBuf::from("pg_restore"),
             batch_size: 100,
             dry_run: false,
         };
         let report = truncate_slots(&db, &opts).await.unwrap();
         assert_eq!(report.latest_slot, Some(4));
         assert_eq!(report.blocks_deleted, 0);
-        assert!(report.backup_check.wal_archive_reason.contains("Skipped"));
+        assert!(report.backup_check.pg_dump_reason.contains("Skipped"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1172,8 +1165,8 @@ mod tests {
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
         let opts = TruncateOptions {
             keep_slots: 5,
-            max_backup_age: Duration::from_secs(3600),
-            pg_dump_path: None, // no pg_dump
+            pg_dump_path: None,
+            pg_restore_bin: PathBuf::from("pg_restore"), // no pg_dump
             batch_size: 100,
             dry_run: false,
         };
@@ -1190,11 +1183,12 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
         let opts = TruncateOptions {
             keep_slots: 5,
-            max_backup_age: Duration::from_secs(3600),
-            pg_dump_path: Some(tmp.path().to_path_buf()),
+            pg_dump_path: Some(dump.path().to_path_buf()),
+            pg_restore_bin: restore.to_path_buf(),
             batch_size: 100,
             dry_run: true,
         };
@@ -1217,11 +1211,12 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
         let opts = TruncateOptions {
             keep_slots: 5,
-            max_backup_age: Duration::from_secs(3600),
-            pg_dump_path: Some(tmp.path().to_path_buf()),
+            pg_dump_path: Some(dump.path().to_path_buf()),
+            pg_restore_bin: restore.to_path_buf(),
             batch_size: 100,
             dry_run: false,
         };
@@ -1248,11 +1243,12 @@ mod tests {
         let (db, _pg) = start_test_postgres_raw().await;
         store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
         let opts = TruncateOptions {
             keep_slots: 5,
-            max_backup_age: Duration::from_secs(3600),
-            pg_dump_path: Some(tmp.path().to_path_buf()),
+            pg_dump_path: Some(dump.path().to_path_buf()),
+            pg_restore_bin: restore.to_path_buf(),
             batch_size: 3, // small batch to exercise the batching loop
             dry_run: false,
         };
@@ -1265,5 +1261,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 5);
+    }
+
+    /// The account_history delete must match the proven count exactly, or nothing goes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_history_delete_rolls_back_on_count_mismatch() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        let pool = db.pool.as_ref();
+        sqlx::query("CREATE TABLE account_history (slot BIGINT NOT NULL, data BYTEA NOT NULL)")
+            .execute(pool)
+            .await
+            .unwrap();
+        for slot in 0..5_i64 {
+            sqlx::query("INSERT INTO account_history (slot, data) VALUES ($1, '\\x00')")
+                .bind(slot)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        let err = truncate_account_history_rows(pool, 3, 2).await.unwrap_err();
+        assert!(err.to_string().contains("rolled back"), "{err}");
+        let left = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM account_history")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 5);
+        assert_eq!(truncate_account_history_rows(pool, 3, 3).await.unwrap(), 3);
+    }
+
+    /// A lock session that dies during the proof frees the lock for a second truncation,
+    /// so the run must stop before its first delete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lock_lost_before_delete_aborts() {
+        let (db, _pg) = start_test_postgres_raw().await;
+        store_test_blocks(&db, &(0..20).collect::<Vec<_>>()).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        // Kills the lock session while the proof runs, then restores as usual.
+        let restore = executable_script(&format!(
+            "#!/bin/sh\n\
+             docker exec {id} psql -U postgres -d pg_test -qAtc \
+             \"SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory'\" \
+             >/dev/null\n\
+             exec docker exec -i {id} pg_restore \"$@\"\n",
+            id = _pg.id()
+        ));
+
+        let result = truncate_slots(&db, &apply_opts(5, 100, dump.path(), &restore)).await;
+
+        assert!(result.is_err(), "a lost lock must stop the run");
+        assert_eq!(
+            min_block_slot(&db.pool).await,
+            Some(0),
+            "nothing may be deleted"
+        );
     }
 }

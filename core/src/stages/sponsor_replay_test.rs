@@ -96,6 +96,7 @@ async fn sponsor_cannot_replay_spl_transfer_under_varied_first_signature() {
         initial_dedup_cache: HashMap::new(),
         metrics: Arc::new(NoopMetrics),
         heartbeat: StageHeartbeat::new(),
+        blockhash_progress: Arc::default(),
     })
     .await;
 

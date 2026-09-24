@@ -24,6 +24,7 @@ pub mod get_tip;
 pub mod get_transaction;
 pub mod get_transaction_count;
 pub mod owner_change;
+pub mod pg_dump_proof;
 pub mod postgres;
 pub mod precompiles;
 pub mod redis;

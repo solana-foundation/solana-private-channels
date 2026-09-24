@@ -504,11 +504,8 @@ async fn lock_lost_during_the_boot_preflight_refuses_to_start() {
         })
     };
 
-    let (common, operator_config) = withdraw_operator_configs(
-        &url,
-        &rpc.url(),
-        Some("http://127.0.0.1:1".to_string()),
-    );
+    let (common, operator_config) =
+        withdraw_operator_configs(&url, &rpc.url(), Some("http://127.0.0.1:1".to_string()));
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         operator::run(connect(&url).await, common, operator_config, None),
@@ -526,12 +523,11 @@ async fn lock_lost_during_the_boot_preflight_refuses_to_start() {
         ),
         "an operator that lost its lock during the pre-flight must refuse to start; got {result:?}"
     );
-    let status: String =
-        sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
-            .bind(transaction_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let status: String = sqlx::query_scalar("SELECT status::text FROM transactions WHERE id = $1")
+        .bind(transaction_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         status, "pending_remint",
         "a completion on the lost session must not apply"
