@@ -429,6 +429,7 @@ async fn check_invariants(
             }
         };
 
+    let mut ledger_missing = None;
     let covered = match wait_for_ledger(storage, custody.slot, cancellation_token).await {
         LedgerWait::Covered => {
             *liability_dark_ticks = 0;
@@ -436,6 +437,12 @@ async fn check_invariants(
         }
         LedgerWait::Unknown => {
             *liability_dark_ticks += 1;
+            false
+        }
+        // Lag stays alert-only, but a checkpoint that cannot be read at all is a missing input.
+        LedgerWait::Unreadable => {
+            *liability_dark_ticks += 1;
+            ledger_missing = Some("escrow checkpoint unreadable".to_string());
             false
         }
         // Never counted: the caller skips input accounting once cancelled.
@@ -465,7 +472,7 @@ async fn check_invariants(
     )
     .await;
 
-    Ok(match supply_missing {
+    Ok(match supply_missing.or(ledger_missing) {
         Some(reason) => TickInputs::Missing(reason),
         None => TickInputs::Complete,
     })
@@ -488,6 +495,8 @@ async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<Vec<(Pubkey, Pubkey
 enum LedgerWait {
     Covered,
     Unknown,
+    /// Every checkpoint read failed, so the ledger is unknown and the input is missing.
+    Unreadable,
     Cancelled,
 }
 
@@ -503,10 +512,14 @@ async fn wait_for_ledger(
     let key = program_key(ProgramType::Escrow);
     let started = tokio::time::Instant::now();
     let mut last: Option<u64> = None;
+    let mut read_once = false;
     loop {
         match storage.get_committed_checkpoint(&key).await {
             Ok(Some(committed)) if committed >= slot => return LedgerWait::Covered,
-            Ok(Some(committed)) => last = Some(committed),
+            Ok(Some(committed)) => {
+                read_once = true;
+                last = Some(committed);
+            }
             // No escrow indexer has ever committed, so waiting cannot help.
             Ok(None) => {
                 warn!(
@@ -519,6 +532,14 @@ async fn wait_for_ledger(
             Err(e) => warn!("Checkpoint read failed while waiting for the ledger: {}", e),
         }
         if started.elapsed() >= LEDGER_CATCHUP_TIMEOUT {
+            if !read_once {
+                warn!(
+                    slot,
+                    "Checkpoint never read within the wait; ledger input unreadable this tick"
+                );
+                count_unknown_ledger("checkpoint_unreadable");
+                return LedgerWait::Unreadable;
+            }
             warn!(
                 checkpoint = ?last,
                 slot,
@@ -3023,13 +3044,16 @@ mod tests {
             ..Default::default()
         };
         let mut halted = false;
+        let mut input_dark = 0;
 
-        let res = run_tick(
+        let res = run_tick_full(
             &env,
             &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
             &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
         )
         .await;
 
@@ -3037,6 +3061,7 @@ mod tests {
         assert_eq!(counters.liability.get(&mint).copied(), Some(2), "held");
         assert_eq!(counters.supply.get(&mint).copied(), Some(1));
         assert!(!halted);
+        assert_eq!(input_dark, 1, "an unreadable checkpoint is a missing input");
     }
 
     #[tokio::test]
@@ -3061,6 +3086,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(counters.liability.get(&mint).copied(), Some(1));
+        assert_eq!(
+            input_dark, 0,
+            "a read that recovers within the wait is not missing"
+        );
     }
 
     #[tokio::test]
@@ -3073,13 +3102,16 @@ mod tests {
             .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
         let mut counters = BreachCounters::default();
         let mut halted = false;
+        let mut input_dark = 0;
 
-        run_tick(
+        run_tick_full(
             &env,
             &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
             &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
         )
         .await
         .unwrap();

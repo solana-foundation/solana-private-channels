@@ -482,7 +482,7 @@ pub fn init_labels(program_type: &str) {
         }
     }
 
-    for reason in &["no_checkpoint", "catchup_timeout"] {
+    for reason in &["no_checkpoint", "catchup_timeout", "checkpoint_unreadable"] {
         OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN.with_label_values(&[program_type, reason]);
     }
     // An armed liability check reports zero, so the series has to exist before the first
