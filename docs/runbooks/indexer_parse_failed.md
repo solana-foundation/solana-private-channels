@@ -134,7 +134,7 @@ Solana runtime enforces every rule these check, so no user transaction can trigg
 | `malformed_tx` | an RPC block holds a successful transaction with a bad signature, an account key that will not parse, an index outside its key list, loaded addresses that do not match its lookups, or (escrow only) `innerInstructions: null`; the checkpoint is held | critical, act now |
 | `empty_block_unconfirmed` | an escrow block came back with no transactions and its `transactionDetails: "signatures"` view listed some or named another blockhash; the checkpoint is held | critical, act now |
 | `malformed_tx_stream` | the geyser stream delivered the same kind of malformed transaction, or one without the program the filter asked for, or one with `inner_instructions_none`; the gap-fill re-reads the slot over RPC | warning, act this week |
-| `chain_break_stream` | a geyser block's parent was not the last block forwarded, so a finalized block was dropped; the stream re-armed the gap-fill, which reads the hole over RPC | warning if rare, act if it climbs |
+| `chain_break_stream` | a geyser block's parent was not the last block forwarded. A parent past it means a finalized block was dropped, and the stream re-armed the gap-fill to read the hole over RPC. A parent at or before it with another hash means a block from another fork, which was dropped, and the stream reconnected so RPC reads that slot | warning if rare, act if it climbs |
 
 The two critical labels behave like `parse_failed`: the fallback was already tried if set,
 retrying the same endpoint re-reads the same bytes, and the fix is repointing the datasource
@@ -145,6 +145,7 @@ Slot <N> transaction <SIG> is malformed: <reason>; refusing to checkpoint past u
 Slot <N> came back with no transactions and could not be confirmed empty: <reason>; refusing to checkpoint past unknown contents
 Slot <N> transaction <SIG> is malformed: <reason>; refusing to complete the slot
 Yellowstone block <N> leaves a hole (<reason>); re-arming the gap-fill up to slot <P>
+Yellowstone block <N> is on another fork: <reason>
 ```
 
 The two stream labels lose no data. A steady `chain_break_stream` means the geyser provider

@@ -787,51 +787,67 @@ async fn connect_and_stream(
 
                     // The stream carries every finalized block, so a parent that is neither the
                     // last forwarded block nor inside the gap-fill range means one was dropped.
-                    if let Err(reason) = check_block_link(
+                    match check_block_link(
                         last_forwarded.as_ref(),
                         gate_target,
                         block.parent_slot,
                         &block.parent_blockhash,
                     ) {
-                        metrics::INDEXER_RPC_ERRORS
-                            .with_label_values(&[program_type.as_label(), "chain_break_stream"])
-                            .inc();
-                        // Re-arm on this stream so RPC fills the hole before this block's
-                        // SlotComplete can pass it; without RPC repair, fail loudly instead.
-                        #[cfg(feature = "datasource-rpc")]
-                        let rearmed = match gap_ctx {
-                            Some(ctx) => {
-                                warn!(
-                                    "Yellowstone block {} leaves a hole ({reason}); re-arming the gap-fill up to slot {}",
-                                    block.slot, block.parent_slot
-                                );
-                                let armed_target = arm_reconnect_gap(
-                                    block.parent_slot,
-                                    startup_floor,
-                                    ctx,
-                                    &tx,
-                                    &cancellation_token,
-                                    RECONNECT_GAP_RETRY_BACKOFF,
-                                    backfill_handle,
-                                )
-                                .await
-                                .map_err(DataSourceError::Rpc)?;
-                                let Some(target) = armed_target else {
-                                    break;
-                                };
-                                gate_target = Some(gate_target.map_or(target, |t| t.max(target)));
-                                true
-                            }
-                            None => false,
-                        };
-                        #[cfg(not(feature = "datasource-rpc"))]
-                        let rearmed = false;
-                        if !rearmed {
-                            error!("Yellowstone block {} leaves a hole: {reason}", block.slot);
+                        Ok(()) => {}
+                        // Re-filling up to the parent cannot vet this block, since the parent is
+                        // already forwarded. Drop it and reconnect so RPC reads the slot instead.
+                        Err(LinkBreak::Fork(reason)) => {
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "chain_break_stream"])
+                                .inc();
+                            error!("Yellowstone block {} is on another fork: {reason}", block.slot);
                             return Err(DataSourceRpcError::Protocol {
-                                reason: format!("block {} leaves a hole: {reason}", block.slot),
+                                reason: format!("block {} is on another fork: {reason}", block.slot),
                             }
                             .into());
+                        }
+                        Err(LinkBreak::Hole(reason)) => {
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "chain_break_stream"])
+                                .inc();
+                            // Re-arm on this stream so RPC fills the hole before this block's
+                            // SlotComplete can pass it; without RPC repair, fail loudly instead.
+                            #[cfg(feature = "datasource-rpc")]
+                            let rearmed = match gap_ctx {
+                                Some(ctx) => {
+                                    warn!(
+                                        "Yellowstone block {} leaves a hole ({reason}); re-arming the gap-fill up to slot {}",
+                                        block.slot, block.parent_slot
+                                    );
+                                    let armed_target = arm_reconnect_gap(
+                                        block.parent_slot,
+                                        startup_floor,
+                                        ctx,
+                                        &tx,
+                                        &cancellation_token,
+                                        RECONNECT_GAP_RETRY_BACKOFF,
+                                        backfill_handle,
+                                    )
+                                    .await
+                                    .map_err(DataSourceError::Rpc)?;
+                                    let Some(target) = armed_target else {
+                                        break;
+                                    };
+                                    gate_target =
+                                        Some(gate_target.map_or(target, |t| t.max(target)));
+                                    true
+                                }
+                                None => false,
+                            };
+                            #[cfg(not(feature = "datasource-rpc"))]
+                            let rearmed = false;
+                            if !rearmed {
+                                error!("Yellowstone block {} leaves a hole: {reason}", block.slot);
+                                return Err(DataSourceRpcError::Protocol {
+                                    reason: format!("block {} leaves a hole: {reason}", block.slot),
+                                }
+                                .into());
+                            }
                         }
                     }
 
@@ -2338,25 +2354,38 @@ mod tests {
     /// the range the reconnect gap-fill owns. Anything else means a finalized block was dropped.
     #[test]
     fn check_block_link_table() {
-        // (name, last forwarded, gate target, parent slot, parent hash, accepted)
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Ok,
+            Hole,
+            Fork,
+        }
+        // (name, last forwarded, gate target, parent slot, parent hash, outcome)
         type Case<'a> = (
             &'a str,
             Option<&'a ForwardedBlock>,
             Option<u64>,
             u64,
             &'a str,
-            bool,
+            Want,
         );
         let last = forwarded(101);
         let cases: Vec<Case> = vec![
-            ("next block", Some(&last), Some(90), 101, "hash101", true),
+            (
+                "next block",
+                Some(&last),
+                Some(90),
+                101,
+                "hash101",
+                Want::Ok,
+            ),
             (
                 "block 102 dropped",
                 Some(&last),
                 Some(90),
                 102,
                 "hash102",
-                false,
+                Want::Hole,
             ),
             (
                 "same slot, other fork",
@@ -2364,7 +2393,15 @@ mod tests {
                 Some(90),
                 101,
                 "fork",
-                false,
+                Want::Fork,
+            ),
+            (
+                "older parent than the last forwarded block",
+                Some(&last),
+                Some(90),
+                100,
+                "hash100",
+                Want::Fork,
             ),
             (
                 "late block inside the gap-fill range",
@@ -2372,7 +2409,7 @@ mod tests {
                 Some(110),
                 95,
                 "any",
-                true,
+                Want::Ok,
             ),
             (
                 "first block inside the gap-fill range",
@@ -2380,7 +2417,7 @@ mod tests {
                 Some(110),
                 110,
                 "any",
-                true,
+                Want::Ok,
             ),
             (
                 "first block past the gap-fill range",
@@ -2388,24 +2425,32 @@ mod tests {
                 Some(110),
                 111,
                 "any",
-                false,
+                Want::Hole,
             ),
-            ("no repair wired, first block", None, None, 500, "any", true),
+            (
+                "no repair wired, first block",
+                None,
+                None,
+                500,
+                "any",
+                Want::Ok,
+            ),
             (
                 "no repair wired, later gap",
                 Some(&last),
                 None,
                 102,
                 "hash102",
-                false,
+                Want::Hole,
             ),
         ];
-        for (name, last, target, parent_slot, parent_hash, ok) in cases {
-            assert_eq!(
-                check_block_link(last, target, parent_slot, parent_hash).is_ok(),
-                ok,
-                "{name}"
-            );
+        for (name, last, target, parent_slot, parent_hash, want) in cases {
+            let got = match check_block_link(last, target, parent_slot, parent_hash) {
+                Ok(()) => Want::Ok,
+                Err(LinkBreak::Hole(_)) => Want::Hole,
+                Err(LinkBreak::Fork(_)) => Want::Fork,
+            };
+            assert_eq!(got, want, "{name}");
         }
     }
 
@@ -3046,6 +3091,15 @@ struct ForwardedBlock {
     blockhash: String,
 }
 
+/// Why a live block cannot be forwarded as it is.
+#[derive(Debug)]
+enum LinkBreak {
+    /// Blocks between the last forwarded one and this parent never arrived; RPC can fill them.
+    Hole(String),
+    /// The parent contradicts a block already forwarded, so this block belongs to another fork.
+    Fork(String),
+}
+
 /// Proves a live block leaves no hole: its parent is inside the range the reconnect gap-fill
 /// owns, or it is exactly the last block this connection forwarded.
 fn check_block_link(
@@ -3053,19 +3107,23 @@ fn check_block_link(
     gate_target: Option<u64>,
     parent_slot: u64,
     parent_blockhash: &str,
-) -> Result<(), String> {
+) -> Result<(), LinkBreak> {
     if gate_target.is_some_and(|target| parent_slot <= target) {
         return Ok(());
     }
     match (last, gate_target) {
         (Some(prev), _) if prev.slot == parent_slot && prev.blockhash == parent_blockhash => Ok(()),
-        (Some(prev), _) => Err(format!(
-            "parent {parent_slot} ({parent_blockhash}) is not the last forwarded block {} ({})",
+        (Some(prev), _) if parent_slot > prev.slot => Err(LinkBreak::Hole(format!(
+            "parent {parent_slot} is past the last forwarded block {}",
+            prev.slot
+        ))),
+        (Some(prev), _) => Err(LinkBreak::Fork(format!(
+            "parent {parent_slot} ({parent_blockhash}) contradicts the last forwarded block {} ({})",
             prev.slot, prev.blockhash
-        )),
-        (None, Some(target)) => Err(format!(
+        ))),
+        (None, Some(target)) => Err(LinkBreak::Hole(format!(
             "parent {parent_slot} is past the gap-fill target {target}"
-        )),
+        ))),
         // Without RPC repair there is nothing to link the first block to.
         (None, None) => Ok(()),
     }

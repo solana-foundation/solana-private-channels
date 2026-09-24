@@ -44,6 +44,15 @@ pub fn block_after(
     }
 }
 
+/// A block that names `parent_slot` but a different parent hash, as a block from another fork would.
+pub fn fork_block(slot: u64, parent_slot: u64) -> SubscribeUpdate {
+    let mut update = block_after(slot, parent_slot, vec![]);
+    if let Some(UpdateOneof::Block(block)) = update.update_oneof.as_mut() {
+        block.parent_blockhash = format!("fork{parent_slot}");
+    }
+    update
+}
+
 /// A stable per-slot blockhash, so a block's parent link names its parent's hash.
 pub fn block_hash(slot: u64) -> String {
     format!("hash{slot}")
