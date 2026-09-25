@@ -24,7 +24,7 @@ use private_channel_auth::{
     jwt::JwtConfig,
     password::PasswordWorker,
     serve::{serve, Limits},
-    throttle::AuthThrottle,
+    throttle::{AuthThrottle, CHALLENGES_PER_USER_PER_MINUTE},
     AppState,
 };
 
@@ -51,7 +51,8 @@ async fn start_postgres() -> (String, testcontainers::ContainerAsync<Postgres>) 
 /// Start the auth Axum app on a random port and return its address.
 ///
 /// Rate limits are set high enough not to interfere. Tests that exercise
-/// throttling call `start_throttled_app` with the limits they need.
+/// throttling call `start_throttled_app` with the limits they need. The
+/// per-user challenge limit is fixed at `CHALLENGES_PER_USER_PER_MINUTE`.
 async fn start_app(db_url: &str) -> SocketAddr {
     let generous = NonZeroU32::new(10_000).unwrap();
     start_throttled_app(db_url, generous, generous, generous).await
@@ -1223,6 +1224,86 @@ async fn test_login_over_budget_ip_is_shed() {
     );
 }
 
+/// A challenge costs the caller no signature, so each account gets a fixed
+/// issuance budget. It is keyed by account, so a second account behind the same
+/// address keeps its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn challenge_issuance_over_budget_is_shed() {
+    let (db_url, _container) = start_postgres().await;
+    let addr = start_app(&db_url).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "spammer", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+    let spammer_login: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "spammer", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let spammer_token = spammer_login["token"].as_str().unwrap();
+
+    client
+        .post(format!("{}/auth/register", base_url(addr)))
+        .json(&json!({ "username": "neighbour", "password": "password123" }))
+        .send()
+        .await
+        .unwrap();
+    let neighbour_login: Value = client
+        .post(format!("{}/auth/login", base_url(addr)))
+        .json(&json!({ "username": "neighbour", "password": "password123" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let neighbour_token = neighbour_login["token"].as_str().unwrap();
+
+    let challenge_url = format!("{}/auth/challenge-wallet", base_url(addr));
+    let pubkey = Keypair::new().pubkey().to_string();
+
+    for _ in 0..CHALLENGES_PER_USER_PER_MINUTE {
+        let res = client
+            .post(&challenge_url)
+            .bearer_auth(spammer_token)
+            .json(&json!({ "pubkey": pubkey }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "the budget must be served");
+    }
+
+    let over_budget = client
+        .post(&challenge_url)
+        .bearer_auth(spammer_token)
+        .json(&json!({ "pubkey": pubkey }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(over_budget.status(), 429, "past the budget must be shed");
+
+    let neighbour = client
+        .post(&challenge_url)
+        .bearer_auth(neighbour_token)
+        .json(&json!({ "pubkey": pubkey }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        neighbour.status(),
+        200,
+        "another account must keep its own budget"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cleanup_stale_challenges() {
     let (db_url, _container) = start_postgres().await;
@@ -1235,8 +1316,14 @@ async fn test_cleanup_stale_challenges() {
 
     db::init_schema(&pool).await.expect("failed to init schema");
 
-    // Insert a user so we have a valid user_id to reference.
-    let user = db::insert_user(&pool, "cleanupuser", "fakehash")
+    // One user per challenge: each user holds at most one.
+    let expired_user = db::insert_user(&pool, "expireduser", "fakehash")
+        .await
+        .expect("failed to insert user");
+    let used_user = db::insert_user(&pool, "useduser", "fakehash")
+        .await
+        .expect("failed to insert user");
+    let valid_user = db::insert_user(&pool, "validuser", "fakehash")
         .await
         .expect("failed to insert user");
 
@@ -1248,7 +1335,7 @@ async fn test_cleanup_stale_challenges() {
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(user.id)
+    .bind(expired_user.id)
     .bind(Uuid::new_v4())
     .execute(&pool)
     .await
@@ -1262,7 +1349,7 @@ async fn test_cleanup_stale_challenges() {
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(user.id)
+    .bind(used_user.id)
     .bind(Uuid::new_v4())
     .execute(&pool)
     .await
@@ -1277,7 +1364,7 @@ async fn test_cleanup_stale_challenges() {
         "#,
     )
     .bind(Uuid::new_v4())
-    .bind(user.id)
+    .bind(valid_user.id)
     .bind(valid_nonce)
     .execute(&pool)
     .await
@@ -1297,6 +1384,66 @@ async fn test_cleanup_stale_challenges() {
             .expect("count query failed");
 
     assert_eq!(remaining.0, 1, "valid challenge must not be deleted");
+}
+
+/// A user holds one challenge at a time, so issuing another replaces it and the
+/// table cannot grow past one row per user.
+#[tokio::test(flavor = "multi_thread")]
+async fn reissuing_a_challenge_replaces_the_previous_one() {
+    let (db_url, _container) = start_postgres().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+
+    db::init_schema(&pool).await.expect("failed to init schema");
+
+    let user = db::insert_user(&pool, "reissueuser", "fakehash")
+        .await
+        .expect("failed to insert user");
+
+    let replaced_nonce = Uuid::new_v4();
+    let latest_nonce = Uuid::new_v4();
+    db::insert_challenge(&pool, user.id, replaced_nonce)
+        .await
+        .expect("failed to issue the first challenge");
+    db::insert_challenge(&pool, user.id, latest_nonce)
+        .await
+        .expect("failed to issue the second challenge");
+
+    let stored: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM private_channel_auth.challenges WHERE user_id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count query failed");
+    assert_eq!(stored.0, 1, "a user must hold one challenge at a time");
+
+    let replaced = db::consume_challenge(&pool, user.id, replaced_nonce)
+        .await
+        .expect("consume failed");
+    assert!(replaced.is_none(), "a replaced nonce must not verify");
+
+    let latest = db::consume_challenge(&pool, user.id, latest_nonce)
+        .await
+        .expect("consume failed");
+    assert!(latest.is_some(), "the latest nonce must verify");
+
+    // Reissuing over a spent challenge must hand out a usable one, or a user
+    // could never link a second wallet.
+    let after_spent_nonce = Uuid::new_v4();
+    db::insert_challenge(&pool, user.id, after_spent_nonce)
+        .await
+        .expect("failed to issue over a spent challenge");
+    let after_spent = db::consume_challenge(&pool, user.id, after_spent_nonce)
+        .await
+        .expect("consume failed");
+    assert!(
+        after_spent.is_some(),
+        "a challenge issued after a spent one must verify"
+    );
 }
 
 /// Helper: register a user, log in, verify a wallet, and return the token and pubkey.
@@ -1530,6 +1677,10 @@ async fn auth_runtime_login_cannot_forge_roles_or_audit_rows() {
     db::insert_challenge(&runtime_pool, registered.id, Uuid::new_v4())
         .await
         .expect("issuing a challenge must work");
+    // The second one takes the upsert's update path, which needs its own grant.
+    db::insert_challenge(&runtime_pool, registered.id, Uuid::new_v4())
+        .await
+        .expect("reissuing a challenge must work");
     let wallet = db::insert_verified_wallet(&runtime_pool, registered.id, "wallet-pubkey")
         .await
         .expect("verifying a wallet must work");

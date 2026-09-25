@@ -9,21 +9,28 @@ use axum::{
     response::Response,
 };
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
+use uuid::Uuid;
 
 use crate::{error::AppError, serve::client_key, AppState};
 
 /// `retain_recent` only reclaims replenished keys, so sweep often.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Wallet challenges one account may request per minute. Enough to retry a
+/// rejected wallet prompt, well short of a write flood.
+pub const CHALLENGES_PER_USER_PER_MINUTE: u32 = 5;
+
 type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 type UsernameRateLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+type UserRateLimiter = RateLimiter<Uuid, DefaultKeyedStateStore<Uuid>, DefaultClock>;
 
-/// Rate limiters for the unauthenticated credential routes. Per-IP stops one
-/// host flooding the service; per-username stops guesses against one account
-/// spread across many hosts.
+/// Per-IP stops one host flooding the credential routes; per-username stops
+/// guesses against one account spread across many hosts. Per-user caps wallet
+/// challenges, which need a token but no signature.
 pub struct AuthThrottle {
     pub per_ip: IpRateLimiter,
     pub per_username: UsernameRateLimiter,
+    pub per_user: UserRateLimiter,
 }
 
 impl AuthThrottle {
@@ -35,6 +42,9 @@ impl AuthThrottle {
         Self {
             per_ip: RateLimiter::keyed(Quota::per_second(ip_per_second).allow_burst(ip_burst)),
             per_username: RateLimiter::keyed(Quota::per_minute(username_per_minute)),
+            per_user: RateLimiter::keyed(Quota::per_minute(
+                NonZeroU32::new(CHALLENGES_PER_USER_PER_MINUTE).unwrap(),
+            )),
         }
     }
 }
@@ -47,6 +57,7 @@ pub fn spawn_pruner(throttle: Arc<AuthThrottle>) {
             ticker.tick().await;
             throttle.per_ip.retain_recent();
             throttle.per_username.retain_recent();
+            throttle.per_user.retain_recent();
         }
     });
 }
