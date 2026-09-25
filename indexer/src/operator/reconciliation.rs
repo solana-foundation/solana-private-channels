@@ -13,6 +13,7 @@ use crate::metrics::{
 };
 use crate::operator::escrow_sweep::{
     channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply, EscrowCustody,
+    SUPPLY_REREAD_BUDGET,
 };
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
@@ -738,8 +739,10 @@ async fn load_halt_inputs(
     };
     let mut supply = HashMap::new();
     let mut missing = None;
+    let mut rereads = SUPPLY_REREAD_BUDGET;
     for mint in mints {
-        let reason = match fetch_fresh_channel_supply(channel_rpc, mint, anchor).await {
+        let reason = match fetch_fresh_channel_supply(channel_rpc, mint, anchor, &mut rereads).await
+        {
             Ok((s, slot)) if slot >= anchor => {
                 supply.insert(*mint, s);
                 continue;
@@ -1015,9 +1018,16 @@ async fn freeze_pipelines(
             Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
         }
     }
-    // The latch never clears, so it waits for a flag that is really set.
-    if let (Some(h), Some(_)) = (health, in_force) {
-        h.force_unhealthy(reason.to_string());
+    // The latch never clears, so it waits for a flag that is really set, and only carries this
+    // reason when this kind is in force. An insolvency found in force is latched by the fetcher.
+    if let Some(h) = health {
+        match (kind, in_force) {
+            (HaltKind::Insolvency, Some(_)) => h.force_unhealthy(reason.to_string()),
+            (HaltKind::Outage, Some(HaltKind::Outage)) => {
+                h.force_unhealthy_provisional(reason.to_string())
+            }
+            _ => {}
+        }
     }
     in_force
 }
@@ -4471,6 +4481,40 @@ mod tests {
                 HealthOutcome::ForcedUnhealthy { .. }
             ));
         }
+    }
+
+    /// An outage write that finds an insolvency in force leaves the outage text off /health,
+    /// and a later insolvency replaces an outage latch.
+    #[tokio::test]
+    async fn freeze_pipelines_latches_only_the_kind_in_force() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        let reason = |h: &HealthState| match h.check() {
+            HealthOutcome::ForcedUnhealthy { reason } => Some(reason),
+            _ => None,
+        };
+
+        let mock = MockStorage::new();
+        mock.set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        let storage = Arc::new(Storage::Mock(mock));
+        let health = HealthState::new(HealthConfig::operator());
+        let in_force =
+            freeze_pipelines(&storage, &Some(health.clone()), "outage", HaltKind::Outage).await;
+        assert_eq!(in_force, Some(HaltKind::Insolvency));
+        assert_eq!(reason(&health), None, "the outage text must not be latched");
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let health = HealthState::new(HealthConfig::operator());
+        freeze_pipelines(&storage, &Some(health.clone()), "outage", HaltKind::Outage).await;
+        freeze_pipelines(
+            &storage,
+            &Some(health.clone()),
+            "insolvent",
+            HaltKind::Insolvency,
+        )
+        .await;
+        assert_eq!(reason(&health).as_deref(), Some("insolvent"));
     }
 
     /// The flag write is retried within the tick, and a write that never lands is reported.

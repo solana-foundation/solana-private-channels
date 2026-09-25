@@ -68,7 +68,8 @@ Channel supply is only used when it is fresh. Each tick first finds the channel'
 newest block and requires its block time to be under 120 s old, then accepts a
 supply read only if it was answered at or after that block. A read that answers
 behind is re-read up to three times with a short backoff, so a backend a few
-slots behind the others does not darken the tick. A channel node that is frozen
+slots behind the others does not darken the tick. One tick spends at most six
+re-reads across all mints, so many stale mints still go dark within seconds. A channel node that is frozen
 or a read replica that stays behind therefore gives no supply reading for that
 tick instead of an old one. Custody reads send Solana's newest block as
 `minContextSlot`, so a lagging Solana backend refuses and the read is retried
@@ -109,7 +110,9 @@ the flag while the input is still unreadable halts again on the next tick. If th
 flag write itself fails, the operator retries it within the tick and again on
 later ticks until it lands. `/health` is only forced to 503 once the flag has
 landed, because that latch lasts until a restart; until then the webhook, the
-`input_dark_ticks` gauge and its alert are what page. The halt webhook fires once
+`input_dark_ticks` gauge and its alert are what page. An outage reason on
+`/health` is replaced by the insolvency reason if a breach later upgrades the
+halt, so `/health` never shows an outage while an insolvency is in force. The halt webhook fires once
 per incident, not on every retry: once for the outage, and once for each mint
 whose breach confirms while the flag write is still failing.
 

@@ -443,19 +443,25 @@ pub async fn fetch_channel_supply_at(
 /// Extra reads a channel supply answer behind the anchor gets before it counts as stale.
 pub const SUPPLY_REREADS: u32 = 3;
 
+/// Rereads one tick may spend across all mints, so many stale mints darken it in bounded time.
+pub const SUPPLY_REREAD_BUDGET: u32 = 2 * SUPPLY_REREADS;
+
 /// Channel supply for `mint`, re-read with the client's backoff while it answers behind
-/// `anchor`, since the node ignores `minContextSlot`. The last answer is returned either way.
+/// `anchor`, since the node ignores `minContextSlot`. Each reread spends one of the tick's
+/// `budget`. The last answer is returned either way.
 pub async fn fetch_fresh_channel_supply(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
     anchor: u64,
+    budget: &mut u32,
 ) -> Result<(u64, u64), EscrowSweepError> {
     let retry = &channel_rpc.retry_config;
     let mut read = fetch_channel_supply_at(channel_rpc, mint).await?;
     for attempt in 0..SUPPLY_REREADS {
-        if read.1 >= anchor {
+        if read.1 >= anchor || *budget == 0 {
             break;
         }
+        *budget -= 1;
         tokio::time::sleep((retry.base_delay * 2_u32.pow(attempt)).min(retry.max_delay)).await;
         read = fetch_channel_supply_at(channel_rpc, mint).await?;
     }
@@ -1647,6 +1653,7 @@ pub(crate) mod tests {
             &retrying_client(&server.url(), 1),
             &Pubkey::new_unique(),
             10,
+            &mut SUPPLY_REREAD_BUDGET.clone(),
         )
         .await
         .unwrap();
@@ -1665,11 +1672,34 @@ pub(crate) mod tests {
             &retrying_client(&server.url(), 1),
             &Pubkey::new_unique(),
             10,
+            &mut SUPPLY_REREAD_BUDGET.clone(),
         )
         .await
         .unwrap();
 
         assert_eq!(got, (7, 8));
         assert_eq!(calls.load(Ordering::SeqCst), 1 + SUPPLY_REREADS as usize);
+    }
+
+    /// One tick shares a reread budget, so many stale mints add a bounded delay, not one per mint.
+    #[tokio::test]
+    async fn fresh_supply_rereads_share_one_budget_per_tick() {
+        let mut server = mockito::Server::new_async().await;
+        let calls = mock_supply_slots(&mut server, vec![8]).await;
+        let client = retrying_client(&server.url(), 1);
+        let mut budget = SUPPLY_REREAD_BUDGET;
+
+        for _ in 0..4 {
+            let got = fetch_fresh_channel_supply(&client, &Pubkey::new_unique(), 10, &mut budget)
+                .await
+                .unwrap();
+            assert_eq!(got, (7, 8));
+        }
+
+        assert_eq!(budget, 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4 + SUPPLY_REREAD_BUDGET as usize
+        );
     }
 }

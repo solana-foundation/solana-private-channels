@@ -58,8 +58,13 @@ pub async fn run_fetcher(
         match storage.is_reconciliation_halted().await {
             Ok(Some(halt)) => {
                 warn!(reason = %halt.reason, "Reconciliation halt active; skipping fetch");
+                // An outage latch stays replaceable so a later insolvency upgrade shows on /health.
                 if let Some(h) = &health {
-                    h.force_unhealthy(halt.reason.clone());
+                    if halt.insolvency {
+                        h.force_unhealthy(halt.reason.clone());
+                    } else {
+                        h.force_unhealthy_provisional(halt.reason.clone());
+                    }
                 }
                 tokio::time::sleep(config.db_poll_interval).await;
                 continue;
@@ -271,6 +276,46 @@ mod tests {
             !health_state.is_healthy(),
             "halted fetcher must force itself unhealthy"
         );
+
+        token.cancel();
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    /// /health follows an outage halt that the DB later upgrades to an insolvency.
+    #[tokio::test]
+    async fn fetcher_health_follows_an_insolvency_upgrade() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        let mock = MockStorage::new();
+        mock.set_outage_halt("inputs unavailable").await.unwrap();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let (tx, _rx) = mpsc::channel(10);
+        let token = CancellationToken::new();
+        let health = HealthState::new(HealthConfig::operator());
+        let token_clone = token.clone();
+        let health_clone = Some(health.clone());
+        let handle = tokio::spawn(async move {
+            run_fetcher(
+                storage,
+                tx,
+                test_config(),
+                ProgramType::Escrow,
+                token_clone,
+                health_clone,
+            )
+            .await
+        });
+        let reason = |h: &HealthState| match h.check() {
+            HealthOutcome::ForcedUnhealthy { reason } => Some(reason),
+            _ => None,
+        };
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(reason(&health).as_deref(), Some("inputs unavailable"));
+        mock.set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(reason(&health).as_deref(), Some("mint X insolvent"));
 
         token.cancel();
         assert!(handle.await.unwrap().is_ok());
