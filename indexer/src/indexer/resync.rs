@@ -31,9 +31,22 @@ const RESYNC_LOCK_ROLE: &str = "resync";
 
 /// Why a resync must not wipe its rows yet, or `None` when it may. Only own-program rows count
 /// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent.
-fn wipe_blocker(program: ProgramType, blockers: &ResyncBlockers) -> Option<ReconciliationError> {
+fn wipe_blocker(
+    program: ProgramType,
+    blockers: &ResyncBlockers,
+    genesis_slot: u64,
+) -> Option<ReconciliationError> {
     if blockers.unsettled_work {
         return Some(ReconciliationError::UnsettledWork);
+    }
+    // The wipe deletes every own row but the rebuild replays only from genesis.
+    if let Some(earliest_slot) = blockers.earliest_slot {
+        if i128::from(genesis_slot) > i128::from(earliest_slot) {
+            return Some(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot,
+                earliest_slot,
+            });
+        }
     }
     if program != ProgramType::Withdraw {
         return None;
@@ -407,13 +420,13 @@ impl ResyncService {
             ));
         }
 
-        // Pre-flight 2: nothing this resync deletes may still be in flight, and a withdraw
-        // resync needs local proof no nonce was spent. Local reads, so they run before any RPC.
+        // Pre-flight 2: nothing this resync deletes may be in flight or below genesis, and a
+        // withdraw resync needs local proof no nonce was spent. Local reads, so before any RPC.
         let blockers = self
             .storage
             .get_resync_blockers(self.program_type.owned_transaction_type())
             .await?;
-        if let Some(refusal) = wipe_blocker(self.program_type, &blockers) {
+        if let Some(refusal) = wipe_blocker(self.program_type, &blockers, genesis_slot) {
             error!(?blockers, "Refusing to resync: {}", refusal);
             return Err(refusal.into());
         }
@@ -822,7 +835,8 @@ mod tests {
                 id: n as i64 + 1,
                 signature: solana_sdk::signature::Signature::new_unique().to_string(),
                 trace_id: format!("trace-{n}"),
-                slot: 1,
+                // The genesis these tests resync from, so the pre-genesis guard stays out of their way.
+                slot: 100,
                 initiator: Pubkey::new_unique().to_string(),
                 recipient: Pubkey::new_unique().to_string(),
                 mint: Pubkey::new_unique().to_string(),
@@ -1165,7 +1179,8 @@ mod tests {
 
     // ── pre-wipe gate ────────────────────────────────────────────────
 
-    /// Escrow never touches nonces, so only in-flight work blocks it; withdraw also needs proof no nonce is spent.
+    /// Escrow never touches nonces, so only in-flight work or pre-genesis rows block it; withdraw
+    /// also needs proof no nonce is spent.
     #[test]
     fn wipe_blocker_matrix() {
         use crate::storage::common::models::ResyncBlockers;
@@ -1185,6 +1200,11 @@ mod tests {
             unsettled_work: true,
             failed_withdrawals: true,
             observed_releases: true,
+            earliest_slot: Some(1),
+        };
+        let rows_from = |slot| ResyncBlockers {
+            earliest_slot: Some(slot),
+            ..Default::default()
         };
 
         let label = |r: Option<ReconciliationError>| match r {
@@ -1196,6 +1216,10 @@ mod tests {
                 "failed"
             }
             Some(ReconciliationError::ReleaseEvidenceRecorded { .. }) => "observed",
+            Some(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            }) => "genesis",
             Some(other) => panic!("unexpected verdict {other:?}"),
         };
 
@@ -1218,10 +1242,24 @@ mod tests {
                 },
                 "failed",
             ),
+            (ProgramType::Escrow, rows_from(99), "genesis"),
+            (ProgramType::Escrow, rows_from(100), "none"),
+            (ProgramType::Escrow, rows_from(101), "none"),
+            (ProgramType::Withdraw, rows_from(99), "genesis"),
+            (ProgramType::Withdraw, rows_from(100), "none"),
+            (
+                ProgramType::Escrow,
+                ResyncBlockers {
+                    unsettled_work: true,
+                    earliest_slot: Some(99),
+                    ..Default::default()
+                },
+                "unsettled",
+            ),
         ];
         for (program, blockers, expected) in cases {
             assert_eq!(
-                label(wipe_blocker(program, &blockers)),
+                label(wipe_blocker(program, &blockers, 100)),
                 expected,
                 "{program:?} with {blockers:?}"
             );
@@ -1287,6 +1325,54 @@ mod tests {
                 ..
             })) => {}
             other => panic!("a failed withdrawal must block a withdraw resync, got: {other:?}"),
+        }
+        untouched.assert();
+        assert_db_intact(&mock);
+    }
+
+    /// Rows below the genesis would be wiped and never rebuilt, so both programs refuse locally.
+    #[tokio::test]
+    async fn genesis_above_earliest_row_refuses_before_any_rpc_and_wipe() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Pending,
+        );
+        mock.pending_transactions.lock().unwrap()[0].slot = 99;
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            })) => {}
+            other => panic!("a deposit below genesis must block an escrow resync, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert_eq!(mock.pending_transactions.lock().unwrap().len(), 1);
+
+        let mut server = mockito::Server::new_async().await;
+        let untouched = server.mock("POST", "/").expect(0).create();
+        let (mock, storage) = populated_storage();
+        seed_row(
+            &mock,
+            2,
+            TransactionType::Withdrawal,
+            TransactionStatus::Pending,
+        );
+        mock.pending_transactions.lock().unwrap()[0].slot = 99;
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            })) => {}
+            other => {
+                panic!("a withdrawal below genesis must block a withdraw resync, got: {other:?}")
+            }
         }
         untouched.assert();
         assert_db_intact(&mock);

@@ -86,10 +86,13 @@ checkpoint and the tip is actually fetched.
 
 ### 2c. The skip is genuinely intended
 
-If the skipped range is known-empty or its history is deliberately being abandoned, the
-supported path is a destructive resync of that program, which deletes its rows and its
-checkpoint and rebuilds them from a chosen genesis slot under fail-closed channel
-reconciliation. The other program's rows and checkpoint are left untouched:
+If the skipped range is known-empty, the supported path is a destructive resync of that
+program, which deletes its rows and its checkpoint and rebuilds them from a chosen genesis
+slot under fail-closed channel reconciliation. The other program's rows and checkpoint are
+left untouched. Indexed history cannot be abandoned this way: the genesis slot must be at
+or below the program's earliest row, because the delete takes every row and the rebuild
+replays only from genesis. Find that slot with
+`SELECT MIN(slot) FROM transactions WHERE transaction_type = '<deposit|withdrawal>'`:
 
 ```bash
 # Stop every indexer and operator on this database first; resync refuses otherwise.
@@ -110,9 +113,8 @@ the operator until those rows settle, then stop it). See
 A withdraw resync additionally needs `common.escrow_instance_id` and `--escrow-rpc-url`
 (a Solana RPC), and refuses unless the escrow's withdrawal bitmap is at generation 0 with
 no set bits and the database holds no `completed` or `failed` withdrawal and no observed
-release. For an escrow resync, choose a genesis slot at or below the instance's first
-deposit: withdrawals are kept, so a later genesis leaves deposits missing and startup
-reconciliation reports the shortfall.
+release. Both programs refuse a genesis slot above their earliest row, before deleting
+anything: those rows would be gone for good, and a pending one would strand its funds.
 
 Stop the streamer too and restart it after the resync: rebuilt rows get new ids, so a
 running streamer would re-emit them. If the resync dies part way, workers refuse to start

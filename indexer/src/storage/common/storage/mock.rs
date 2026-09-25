@@ -607,6 +607,11 @@ impl MockStorage {
             unsettled_work,
             failed_withdrawals,
             observed_releases: !self.observed_releases.lock().unwrap().is_empty(),
+            earliest_slot: rows
+                .iter()
+                .filter(|t| t.transaction_type == own)
+                .map(|t| t.slot)
+                .min(),
         })
     }
 

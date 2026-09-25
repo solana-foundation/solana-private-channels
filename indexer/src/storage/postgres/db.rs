@@ -3185,9 +3185,13 @@ impl PostgresDb {
         &self,
         own: TransactionType,
     ) -> Result<ResyncBlockers, sqlx::Error> {
-        let (unsettled_work, failed_withdrawals, observed_releases): (bool, bool, bool) =
-            sqlx::query_as(&format!(
-                "SELECT
+        let (unsettled_work, failed_withdrawals, observed_releases, earliest_slot): (
+            bool,
+            bool,
+            bool,
+            Option<i64>,
+        ) = sqlx::query_as(&format!(
+            "SELECT
                    EXISTS (
                      SELECT 1 FROM transactions t
                      WHERE t.transaction_type = $1
@@ -3199,15 +3203,17 @@ impl PostgresDb {
                                                 WHERE j.transaction_id = t.id))))),
                    EXISTS (SELECT 1 FROM transactions
                            WHERE transaction_type = 'withdrawal' AND status = 'failed'),
-                   EXISTS (SELECT 1 FROM observed_releases)"
-            ))
-            .bind(own)
-            .fetch_one(&self.pool)
-            .await?;
+                   EXISTS (SELECT 1 FROM observed_releases),
+                   (SELECT MIN(slot) FROM transactions WHERE transaction_type = $1)"
+        ))
+        .bind(own)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(ResyncBlockers {
             unsettled_work,
             failed_withdrawals,
             observed_releases,
+            earliest_slot,
         })
     }
 

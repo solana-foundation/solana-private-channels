@@ -99,7 +99,8 @@ them afterwards: the next run resolves its floor from that higher checkpoint. Th
 with `StartSlotAheadOfCheckpoint` instead. A configured `start_slot` may set the floor only
 on a database that has never been indexed, where there is no checkpoint to skip past. If a
 skip is genuinely intended, drop the checkpoint with a destructive resync rather than
-raising the start slot.
+raising the start slot. That resync still refuses a genesis above the program's earliest
+row, so it can skip only slots that hold none of its rows.
 
 ### Resync and the live-state lock
 
@@ -141,6 +142,9 @@ if anything fails. It is guarded these ways.
    indexers and operators refuse to start, and operators built before the marker stop
    fetching because of the halt, until the same program's resync is rerun to completion.
    A resync refuses under any halt except its own next to its own marker.
+7. **The genesis slot may not drop indexed rows.** The delete takes every row of the
+   program but the rebuild replays only from the genesis slot, so a genesis above the
+   program's earliest row refuses before anything is deleted.
 
 The delete runs in one transaction on the lock session and is capped at 300s. Measured at
 roughly 30k deposit rows a second with one journal each (6s for 200k rows, 30s for 1M), so

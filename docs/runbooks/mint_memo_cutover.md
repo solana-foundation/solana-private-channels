@@ -92,6 +92,12 @@ use the slot after it as the resync genesis.
 This is safe precisely because the deposits before that point were already
 serviced: they are not in the rebuilt window, so they cannot be replayed.
 
+Resync refuses this genesis if the program still holds a row below it, since the
+delete would drop that row and the rebuild would never replay it. Check with
+`SELECT MIN(slot) FROM transactions WHERE transaction_type = '<deposit|withdrawal>'`.
+If the earliest row is below the cutover there is no supported resync; escalate
+rather than deleting rows by hand.
+
 ### 4. Resync
 
 Run the resync with the chosen genesis slot and the channel RPC configured, so

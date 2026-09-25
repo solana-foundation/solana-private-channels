@@ -192,6 +192,19 @@ pub enum ReconciliationError {
          delete. See docs/runbooks/resync_bitmap_advanced.md"
     )]
     ReleaseEvidenceRecorded { what: &'static str },
+
+    /// The wipe deletes every row of the program but the rebuild only replays from genesis,
+    /// so rows below it would be lost, with their pending funds.
+    #[error(
+        "genesis slot {genesis_slot} is above this program's earliest row at slot \
+         {earliest_slot}; the wipe would delete rows the rebuild never replays. Aborted \
+         before any delete, the database is intact. Rerun with --genesis-slot \
+         {earliest_slot} or lower"
+    )]
+    GenesisAboveExistingRows {
+        genesis_slot: u64,
+        earliest_slot: i64,
+    },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

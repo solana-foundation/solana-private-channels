@@ -37,7 +37,7 @@ use private_channel_indexer::{
         BackfillConfig, IndexerConfig, OperatorConfig, PrivateChannelIndexerConfig, ProgramType,
         ReconciliationConfig, RpcPollingConfig, StorageType,
     },
-    error::{IndexerError, OperatorError, ReconciliationError, StorageError},
+    error::{DataSourceError, IndexerError, OperatorError, ReconciliationError, StorageError},
     indexer::{
         datasource::rpc_polling::rpc::RpcPoller,
         reconciliation::run_startup_reconciliation,
@@ -627,6 +627,10 @@ async fn seed_pending_deposit(db_url: &str, signature: &str) {
     seed_tx(db_url, signature, "deposit", "pending").await;
 }
 
+/// Slot of every seeded row: above any slot a test validator reaches, so a seed never sits
+/// below the genesis a test resyncs from.
+const SEED_SLOT: i64 = 1_000_000_000;
+
 /// Insert one row of `ty` in `status`; a withdrawal takes its nonce from the sequence.
 async fn seed_tx(db_url: &str, signature: &str, ty: &str, status: &str) -> i64 {
     let pool = fresh_pool(db_url).await;
@@ -634,13 +638,14 @@ async fn seed_tx(db_url: &str, signature: &str, ty: &str, status: &str) -> i64 {
         "INSERT INTO transactions
          (signature, slot, initiator, recipient, mint, amount,
           transaction_type, status, created_at, updated_at)
-         VALUES ($1, 1, 'seed', 'seed', 'seed_mint', 100,
+         VALUES ($1, $4, 'seed', 'seed', 'seed_mint', 100,
                  $2::transaction_type, $3::transaction_status, NOW(), NOW())
          RETURNING id",
     )
     .bind(signature)
     .bind(ty)
     .bind(status)
+    .bind(SEED_SLOT)
     .fetch_one(&pool)
     .await
     .expect("seed transaction")
@@ -987,17 +992,19 @@ async fn test_resync_rejects_future_genesis_slot() -> Result<(), Box<dyn std::er
     seed_pending_deposit(&db_url, "resync_future_seed").await;
 
     let service = make_resync_service(rpc_url, storage);
-    let result = service.run(u64::MAX).await;
+    // Ahead of the tip but at the seed, so only the tip check can refuse it.
+    let result = service.run(SEED_SLOT as u64).await;
 
     assert!(
-        result.is_err(),
-        "ResyncService::run with a future genesis_slot must return Err"
+        matches!(
+            result,
+            Err(IndexerError::DataSource(DataSourceError::InvalidConfig { .. }))
+        ),
+        "ResyncService::run with a future genesis_slot must refuse at the tip check, got: {result:?}"
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("genesis_slot")
-            || err_msg.contains("current_slot")
-            || err_msg.contains("ahead"),
+        err_msg.contains("ahead"),
         "Error should mention slot context, got: {err_msg}"
     );
 
@@ -2366,6 +2373,7 @@ enum Refusal {
     Unsettled,
     ReleaseEvidence,
     OtherMarker,
+    GenesisAboveRows,
 }
 
 /// The unsafe state a refusal case starts from, so each case carries its own setup.
@@ -2379,12 +2387,15 @@ enum Seed {
     Observed,
     /// Escrow data plus another program's unfinished resync.
     OtherMarker,
+    /// One row of this type in this status at this slot.
+    TxAt(&'static str, &'static str, i64),
 }
 
 struct RefusalCase {
     name: &'static str,
     program: ProgramType,
     seed: Seed,
+    genesis: u64,
     expected: Refusal,
 }
 
@@ -2408,6 +2419,14 @@ async fn seed_refusal(db_url: &str, seed: Seed) {
             )
             .await;
         }
+        Seed::TxAt(ty, status, slot) => {
+            let id = seed_tx(db_url, "row", ty, status).await;
+            seed_sql(
+                db_url,
+                &format!("UPDATE transactions SET slot = {slot} WHERE id = {id}"),
+            )
+            .await;
+        }
     }
 }
 
@@ -2421,55 +2440,85 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
             name: "withdraw: processing withdrawal",
             program: ProgramType::Withdraw,
             seed: Seed::Tx("withdrawal", "processing"),
+            genesis: 0,
             expected: Refusal::Unsettled,
         },
         RefusalCase {
             name: "withdraw: journaled pending withdrawal",
             program: ProgramType::Withdraw,
             seed: Seed::JournaledTx("withdrawal", "pending"),
+            genesis: 0,
             expected: Refusal::Unsettled,
         },
         RefusalCase {
             name: "withdraw: pending remint",
             program: ProgramType::Withdraw,
             seed: Seed::Tx("withdrawal", "pending_remint"),
+            genesis: 0,
             expected: Refusal::Unsettled,
         },
         RefusalCase {
             name: "escrow: processing deposit",
             program: ProgramType::Escrow,
             seed: Seed::Tx("deposit", "processing"),
+            genesis: 0,
             expected: Refusal::Unsettled,
         },
         RefusalCase {
             name: "escrow: journaled pending deposit",
             program: ProgramType::Escrow,
             seed: Seed::JournaledTx("deposit", "pending"),
+            genesis: 0,
             expected: Refusal::Unsettled,
         },
         RefusalCase {
             name: "withdraw: failed withdrawal",
             program: ProgramType::Withdraw,
             seed: Seed::Tx("withdrawal", "failed"),
+            genesis: 0,
             expected: Refusal::ReleaseEvidence,
         },
         RefusalCase {
             name: "withdraw: observed release",
             program: ProgramType::Withdraw,
             seed: Seed::Observed,
+            genesis: 0,
             expected: Refusal::ReleaseEvidence,
         },
         RefusalCase {
             name: "escrow: withdraw resync unfinished",
             program: ProgramType::Escrow,
             seed: Seed::OtherMarker,
+            genesis: 0,
             expected: Refusal::OtherMarker,
+        },
+        RefusalCase {
+            name: "escrow: pending deposit below genesis",
+            program: ProgramType::Escrow,
+            seed: Seed::TxAt("deposit", "pending", 100),
+            genesis: 101,
+            expected: Refusal::GenesisAboveRows,
+        },
+        RefusalCase {
+            name: "escrow: completed deposit below genesis",
+            program: ProgramType::Escrow,
+            seed: Seed::TxAt("deposit", "completed", 100),
+            genesis: 101,
+            expected: Refusal::GenesisAboveRows,
+        },
+        RefusalCase {
+            name: "withdraw: pending withdrawal below genesis",
+            program: ProgramType::Withdraw,
+            seed: Seed::TxAt("withdrawal", "pending", 100),
+            genesis: 101,
+            expected: Refusal::GenesisAboveRows,
         },
     ];
     for RefusalCase {
         name: case,
         program,
         seed,
+        genesis,
         expected,
     } in cases
     {
@@ -2484,7 +2533,7 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
         let before = marker(&db_url).await;
 
         let result = dead_rpc_service(new_storage(&db_url).await, program)
-            .run(0)
+            .run(genesis)
             .await;
         let got = match &result {
             Err(IndexerError::Reconciliation(ReconciliationError::UnsettledWork)) => {
@@ -2498,6 +2547,10 @@ async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn s
             {
                 Refusal::OtherMarker
             }
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 101,
+                earliest_slot: 100,
+            })) => Refusal::GenesisAboveRows,
             other => panic!("{case}: expected {expected:?}, got {other:?}"),
         };
         assert_eq!(got, expected, "{case}");
