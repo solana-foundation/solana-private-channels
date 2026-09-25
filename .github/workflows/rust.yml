@@ -150,7 +150,10 @@ jobs:
               - '.github/actions/setup-environment/**'
               - 'private-channel-escrow-program/**'
             dvp_precompile:
-              # Anything that can change what the DvP provenance check answers.
+              # Anything that can change the DvP provenance check or its answer.
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
               - 'core/precompiles/dvp_swap_program.so'
               - 'scripts/verify-dvp-precompile.sh'
               - 'dvp-swap-program/clients/**'
