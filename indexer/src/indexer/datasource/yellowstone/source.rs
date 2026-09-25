@@ -790,6 +790,7 @@ async fn connect_and_stream(
                     match check_block_link(
                         last_forwarded.as_ref(),
                         gate_target,
+                        block.slot,
                         block.parent_slot,
                         &block.parent_blockhash,
                     ) {
@@ -2360,95 +2361,148 @@ mod tests {
             Hole,
             Fork,
         }
-        // (name, last forwarded, gate target, parent slot, parent hash, outcome)
+        use Want::{Fork, Hole, Ok};
+        // (name, last forwarded, gate target, block slot, parent slot, parent hash, outcome)
         type Case<'a> = (
             &'a str,
             Option<&'a ForwardedBlock>,
             Option<u64>,
             u64,
+            u64,
             &'a str,
             Want,
         );
         let last = forwarded(101);
+        let last_late = forwarded(108);
+        let after_rearm = forwarded(111);
+        let armed_on = forwarded(200);
+        let past_range = forwarded(120);
         let cases: Vec<Case> = vec![
-            (
-                "next block",
-                Some(&last),
-                Some(90),
-                101,
-                "hash101",
-                Want::Ok,
-            ),
+            ("next block", Some(&last), Some(90), 102, 101, "hash101", Ok),
             (
                 "block 102 dropped",
                 Some(&last),
                 Some(90),
+                103,
                 102,
                 "hash102",
-                Want::Hole,
+                Hole,
             ),
             (
                 "same slot, other fork",
                 Some(&last),
                 Some(90),
+                102,
                 101,
                 "fork",
-                Want::Fork,
+                Fork,
             ),
             (
                 "older parent than the last forwarded block",
                 Some(&last),
                 Some(90),
+                102,
                 100,
                 "hash100",
-                Want::Fork,
+                Fork,
             ),
             (
                 "late block inside the gap-fill range",
                 Some(&last),
                 Some(110),
+                96,
                 95,
                 "any",
-                Want::Ok,
+                Ok,
             ),
             (
                 "first block inside the gap-fill range",
                 None,
                 Some(110),
+                111,
                 110,
                 "any",
-                Want::Ok,
+                Ok,
             ),
             (
                 "first block past the gap-fill range",
                 None,
                 Some(110),
+                112,
                 111,
                 "any",
-                Want::Hole,
+                Hole,
             ),
             (
                 "no repair wired, first block",
                 None,
                 None,
+                501,
                 500,
                 "any",
-                Want::Ok,
+                Ok,
             ),
             (
                 "no repair wired, later gap",
                 Some(&last),
                 None,
+                103,
                 102,
                 "hash102",
-                Want::Hole,
+                Hole,
+            ),
+            // A sibling of a forwarded block names the same covered parent but contradicts it.
+            (
+                "sibling of the block forwarded after a re-arm",
+                Some(&after_rearm),
+                Some(110),
+                111,
+                110,
+                "hash110",
+                Fork,
+            ),
+            (
+                "block after the arming block names an older parent",
+                Some(&armed_on),
+                Some(200),
+                201,
+                199,
+                "hash199",
+                Fork,
+            ),
+            (
+                "covered parent past the last forwarded block",
+                Some(&last_late),
+                Some(110),
+                111,
+                110,
+                "hash110",
+                Ok,
+            ),
+            (
+                "block inside the range skips the forwarded one",
+                Some(&last_late),
+                Some(110),
+                109,
+                105,
+                "hash105",
+                Fork,
+            ),
+            (
+                "late block outside the gap-fill range",
+                Some(&past_range),
+                Some(110),
+                115,
+                114,
+                "hash114",
+                Fork,
             ),
         ];
-        for (name, last, target, parent_slot, parent_hash, want) in cases {
-            let got = match check_block_link(last, target, parent_slot, parent_hash) {
-                Ok(()) => Want::Ok,
-                Err(LinkBreak::Hole(_)) => Want::Hole,
-                Err(LinkBreak::Fork(_)) => Want::Fork,
+        for (name, last, target, slot, parent_slot, parent_hash, want) in cases {
+            let got = match check_block_link(last, target, slot, parent_slot, parent_hash) {
+                std::result::Result::Ok(()) => Ok,
+                Err(LinkBreak::Hole(_)) => Hole,
+                Err(LinkBreak::Fork(_)) => Fork,
             };
             assert_eq!(got, want, "{name}");
         }
@@ -2515,49 +2569,79 @@ mod tests {
         }
 
         type Corrupt = fn(&mut Info);
-        let cases: Vec<(&str, Corrupt)> = vec![
-            ("31-byte loaded address", |info| {
+        // (case, the rule the error must name, corruption)
+        let cases: Vec<(&str, &str, Corrupt)> = vec![
+            ("31-byte loaded address", "invalid loaded address", |info| {
                 one_lookup(info, 1);
                 meta(info).loaded_writable_addresses = vec![vec![1u8; 31]];
             }),
-            ("loaded address without a lookup", |info| {
-                meta(info).loaded_writable_addresses = vec![vec![1u8; 32]];
+            (
+                "loaded address without a lookup",
+                "lookups load (0, 0)",
+                |info| {
+                    meta(info).loaded_writable_addresses = vec![vec![1u8; 32]];
+                },
+            ),
+            (
+                "lookup without its loaded address",
+                "lookups load (1, 0)",
+                |info| one_lookup(info, 1),
+            ),
+            ("empty signature", "signature is 0 bytes", |info| {
+                info.signature = vec![]
             }),
-            ("lookup without its loaded address", |info| {
-                one_lookup(info, 1)
-            }),
-            ("empty signature", |info| info.signature = vec![]),
-            ("signature differs from the embedded one", |info| {
-                info.signature = vec![1u8; 64]
-            }),
-            ("top-level program index out of range", |info| {
-                message(info).instructions[0].program_id_index = 40
-            }),
-            ("top-level account index out of range", |info| {
-                message(info).instructions[0].accounts = vec![40]
-            }),
-            // 256 + 5 would truncate onto our program at key 5.
-            ("inner program index past u8", |info| {
-                meta(info).inner_instructions = vec![inner_set(0, 261)]
-            }),
-            ("inner set names no top-level instruction", |info| {
-                meta(info).inner_instructions = vec![inner_set(3, 0)]
-            }),
-            ("delivered without our program", |info| {
-                message(info).account_keys[WITHDRAW_PROGRAM_KEY_INDEX as usize] = vec![99u8; 32]
-            }),
-            ("inner instructions marked unavailable", |info| {
-                meta(info).inner_instructions_none = true
-            }),
+            (
+                "signature differs from the embedded one",
+                "does not match the transaction's first signature",
+                |info| info.signature = vec![1u8; 64],
+            ),
+            (
+                "top-level program index out of range",
+                "program index 40 is outside",
+                |info| message(info).instructions[0].program_id_index = 40,
+            ),
+            (
+                "top-level account index out of range",
+                "account index 40 is outside",
+                |info| message(info).instructions[0].accounts = vec![40],
+            ),
+            // With 262 keys index 261 is inside the key list; narrowed to u8 it would wrap to 5.
+            (
+                "inner program index past u8",
+                "does not fit in a u8",
+                |info| {
+                    let keys = &mut message(info).account_keys;
+                    keys.resize(262, vec![200u8; 32]);
+                    meta(info).inner_instructions = vec![inner_set(0, 261)];
+                },
+            ),
+            (
+                "inner set names no top-level instruction",
+                "names no top-level instruction",
+                |info| meta(info).inner_instructions = vec![inner_set(3, 0)],
+            ),
+            (
+                "delivered without our program",
+                "does not name our program",
+                |info| {
+                    message(info).account_keys[WITHDRAW_PROGRAM_KEY_INDEX as usize] = vec![99u8; 32]
+                },
+            ),
+            (
+                "inner instructions marked unavailable",
+                "marked unavailable",
+                |info| meta(info).inner_instructions_none = true,
+            ),
         ];
 
-        for (name, corrupt) in cases {
+        for (name, rule, corrupt) in cases {
             let mut info = withdraw_tx_update(vec![4u8; 64], &program_id, 1)
                 .transaction
                 .unwrap();
             corrupt(&mut info);
             let (res, msgs) = run_block_with(info, &program_id, ProgramType::Withdraw, None).await;
-            assert!(res.is_err(), "{name}: the block must fail");
+            let err = res.expect_err(name).to_string();
+            assert!(err.contains(rule), "{name}: {err}");
             assert!(
                 msgs.is_empty(),
                 "{name}: nothing may be sent, got {}",
@@ -3100,33 +3184,45 @@ enum LinkBreak {
     Fork(String),
 }
 
-/// Proves a live block leaves no hole: its parent is inside the range the reconnect gap-fill
-/// owns, or it is exactly the last block this connection forwarded.
+/// Proves a live block leaves no hole and contradicts nothing forwarded: its parent is the last
+/// forwarded block, or a slot the reconnect gap-fill covers that no forwarded block sits past.
 fn check_block_link(
     last: Option<&ForwardedBlock>,
     gate_target: Option<u64>,
+    slot: u64,
     parent_slot: u64,
     parent_blockhash: &str,
 ) -> Result<(), LinkBreak> {
-    if gate_target.is_some_and(|target| parent_slot <= target) {
+    let covered = |s: u64| gate_target.is_some_and(|target| s <= target);
+    let Some(prev) = last else {
+        // Without RPC repair there is nothing to link the first block to.
+        return match gate_target {
+            Some(target) if parent_slot > target => Err(LinkBreak::Hole(format!(
+                "parent {parent_slot} is past the gap-fill target {target}"
+            ))),
+            _ => Ok(()),
+        };
+    };
+    if prev.slot == parent_slot && prev.blockhash == parent_blockhash {
         return Ok(());
     }
-    match (last, gate_target) {
-        (Some(prev), _) if prev.slot == parent_slot && prev.blockhash == parent_blockhash => Ok(()),
-        (Some(prev), _) if parent_slot > prev.slot => Err(LinkBreak::Hole(format!(
+    if parent_slot > prev.slot {
+        if covered(parent_slot) {
+            return Ok(());
+        }
+        return Err(LinkBreak::Hole(format!(
             "parent {parent_slot} is past the last forwarded block {}",
             prev.slot
-        ))),
-        (Some(prev), _) => Err(LinkBreak::Fork(format!(
-            "parent {parent_slot} ({parent_blockhash}) contradicts the last forwarded block {} ({})",
-            prev.slot, prev.blockhash
-        ))),
-        (None, Some(target)) => Err(LinkBreak::Hole(format!(
-            "parent {parent_slot} is past the gap-fill target {target}"
-        ))),
-        // Without RPC repair there is nothing to link the first block to.
-        (None, None) => Ok(()),
+        )));
     }
+    // A block below the last forwarded one, inside the range RPC re-reads, is a late delivery.
+    if slot < prev.slot && covered(slot) {
+        return Ok(());
+    }
+    Err(LinkBreak::Fork(format!(
+        "block {slot} names parent {parent_slot} ({parent_blockhash}), which contradicts the last forwarded block {} ({})",
+        prev.slot, prev.blockhash
+    )))
 }
 
 /// Runs the shared structural checks on one delivered transaction and returns its full key

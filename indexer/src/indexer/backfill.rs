@@ -121,6 +121,7 @@ async fn last_produced_at_or_below(
 async fn fetch_blocks_with_retry(
     rpc_poller: &RpcPoller,
     slots: &[u64],
+    prev_block: Option<u64>,
     retry_count: usize,
 ) -> Result<Vec<(u64, BlockFetch)>, IndexerError> {
     if retry_count > 0 {
@@ -135,7 +136,10 @@ async fn fetch_blocks_with_retry(
     // error fires before any slot here has been processed, so a retry cannot
     // double-send instructions for the slots that did resolve.
     let mut fetched = Vec::with_capacity(slots.len());
-    for (slot, result) in rpc_poller.get_blocks_batch(slots.to_vec()).await {
+    for (slot, result) in rpc_poller
+        .get_blocks_batch(slots.to_vec(), prev_block)
+        .await
+    {
         match result {
             Ok(block) => fetched.push((slot, block)),
             Err(source) => return Err(BackfillError::SlotFetchFailed { slot, source }.into()),
@@ -195,11 +199,13 @@ pub async fn fill_slot_range(
         .set(gap as f64);
 
     let all_batches = calculate_batches(from_slot, to_slot, batch_size);
+    // Last block completed, which the next chunk's first block must name exactly.
+    let mut last_block: Option<u64> = None;
 
     for slots in all_batches {
         let mut retry_count = 0;
         let blocks = loop {
-            match fetch_blocks_with_retry(rpc_poller, &slots, retry_count).await {
+            match fetch_blocks_with_retry(rpc_poller, &slots, last_block, retry_count).await {
                 Ok(blocks) => break blocks,
                 Err(e) => {
                     retry_count += 1;
@@ -286,6 +292,7 @@ pub async fn fill_slot_range(
                         .await
                         .map_err(BackfillError::ChannelSend)?;
                     }
+                    last_block = Some(slot);
                     processed_count += 1;
                 }
                 BlockFetch::Skipped => {
@@ -1421,6 +1428,32 @@ mod tests {
             for msg in &messages {
                 assert!(matches!(msg, ProcessorMessage::SlotComplete { .. }));
             }
+        }
+
+        /// Chunks of one slot put every link across a chunk boundary. Block 101 names parent 55
+        /// after block 100 completed, so the fill must stop before completing 101.
+        #[tokio::test]
+        async fn fill_slot_range_contradicting_block_in_the_next_chunk_aborts() {
+            let mut server = Server::new_async().await;
+            let _c = chain(&mut server, 100, 101, &[(100, 99), (101, 55)]);
+            let _first = mock_get_blocks(&mut server, 100, 100, &[100]);
+            let _second = mock_get_blocks(&mut server, 101, 101, &[101]);
+
+            let poller = poller(&server);
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, None, 99, 101, 1, ProgramType::Withdraw, None, &tx).await;
+
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("101"), "the error must name slot 101: {msg}");
+            drop(tx);
+            let completed: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|m| match m {
+                    ProcessorMessage::SlotComplete { slot, .. } => Some(slot),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(completed, vec![100]);
         }
 
         /// A batch where a later block's parent link proves slot N holds a block the

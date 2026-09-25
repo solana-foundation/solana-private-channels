@@ -187,6 +187,8 @@ impl DataSource for RpcPollingSource {
                 "Starting RPC polling from slot {} for program {:?}",
                 current_slot, program_type
             );
+            // Last block completed, which the next poll's first block must name exactly.
+            let mut last_block: Option<u64> = None;
 
             loop {
                 // Check for cancellation
@@ -224,7 +226,7 @@ impl DataSource for RpcPollingSource {
                 }
 
                 // Fetch blocks in batch
-                let blocks = poller.get_blocks_batch(slots.clone()).await;
+                let blocks = poller.get_blocks_batch(slots.clone(), last_block).await;
 
                 // Parse and send instructions from each block
                 for (slot, block_result) in blocks {
@@ -288,6 +290,7 @@ impl DataSource for RpcPollingSource {
                                 }
                             };
 
+                            last_block = Some(slot);
                             if !instructions_with_meta.is_empty() {
                                 info!(
                                     "Slot {}: found {} {:?} instructions",
@@ -1006,9 +1009,11 @@ mod tests {
         let mut primary = Server::new_async().await;
         let _slot = mock_get_slot(&mut primary, 101);
         let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
-        let _bad = mock_get_block_malformed_withdraw(&mut primary, 100);
+        // A second fetch means the first attempt ran to its end and the source retried.
+        let bad = mock_get_block_malformed_withdraw(&mut primary, 100).expect_at_least(2);
 
-        let messages = poll_slot_100(&primary, None, ProgramType::Withdraw).await;
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Withdraw, |_| bad.matched()).await;
         assert!(
             !completed(&messages, 100),
             "a malformed slot must not complete"
@@ -1016,7 +1021,10 @@ mod tests {
 
         let mut fallback = Server::new_async().await;
         let m_fallback = mock_get_block_complete_withdraw(&mut fallback, 100, 1);
-        let messages = poll_slot_100(&primary, Some(&fallback), ProgramType::Withdraw).await;
+        let messages = poll_slot_100(&primary, Some(&fallback), ProgramType::Withdraw, |m| {
+            completed(m, 100)
+        })
+        .await;
         m_fallback.assert();
         assert!(
             completed(&messages, 100),
@@ -1051,11 +1059,13 @@ mod tests {
             .create()
     }
 
-    /// Polls slot 100 with `program_type` for a short window and returns every message sent.
+    /// Polls from slot 100 with `program_type` until `done` holds, or 10 s pass, and returns
+    /// every message sent. Waiting on a condition instead of a fixed sleep keeps slow CI green.
     async fn poll_slot_100(
         primary: &Server,
         fallback: Option<&Server>,
         program_type: ProgramType,
+        done: impl Fn(&[ProcessorMessage]) -> bool,
     ) -> Vec<ProcessorMessage> {
         let mut source = RpcPollingSource::new(
             primary.url(),
@@ -1072,10 +1082,19 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
         let handle = source.start(tx, cancel.clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut messages = vec![];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(&messages) && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(message)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                messages.push(message);
+            }
+        }
         cancel.cancel();
         let _ = handle.await;
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        messages.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        messages
     }
 
     fn completed(messages: &[ProcessorMessage], slot: u64) -> bool {
@@ -1099,9 +1118,10 @@ mod tests {
             "TestBlockHash100",
             vec![test_sig("dropped")],
         )
-        .expect_at_least(1);
+        .expect_at_least(2);
 
-        let messages = poll_slot_100(&primary, None, ProgramType::Escrow).await;
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Escrow, |_| confirm.matched()).await;
 
         confirm.assert();
         assert!(
@@ -1130,7 +1150,10 @@ mod tests {
         );
         let m_fallback = mock_get_block_with_deposit(&mut fallback, 100, 99, 500);
 
-        let messages = poll_slot_100(&primary, Some(&fallback), ProgramType::Escrow).await;
+        let messages = poll_slot_100(&primary, Some(&fallback), ProgramType::Escrow, |m| {
+            completed(m, 100)
+        })
+        .await;
 
         m_fallback.assert();
         assert!(
@@ -1156,7 +1179,8 @@ mod tests {
         let confirm = mock_get_block_signatures(&mut primary, 100, "TestBlockHash100", vec![])
             .expect_at_least(1);
 
-        let messages = poll_slot_100(&primary, None, ProgramType::Escrow).await;
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Escrow, |m| completed(m, 100)).await;
 
         confirm.assert();
         assert!(completed(&messages, 100));
@@ -1173,10 +1197,33 @@ mod tests {
         let confirm =
             mock_get_block_signatures(&mut primary, 100, "TestBlockHash100", vec![]).expect(0);
 
-        let messages = poll_slot_100(&primary, None, ProgramType::Withdraw).await;
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Withdraw, |m| completed(m, 100)).await;
 
         confirm.assert();
         assert!(completed(&messages, 100));
+    }
+
+    /// One slot per poll puts every link across a batch boundary. Block 101 names parent 55
+    /// after block 100 completed, so it contradicts the chain and must never complete.
+    #[tokio::test]
+    async fn a_contradicting_block_in_the_next_poll_never_completes() {
+        use crate::test_utils::rpc_mocks::mock_get_block_at;
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 102);
+        let _first = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _second = mock_get_blocks(&mut primary, 101, 101, &[101]);
+        let _b100 = mock_get_block_at(&mut primary, 100, 99);
+        let b101 = mock_get_block_at(&mut primary, 101, 55).expect_at_least(2);
+
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Withdraw, |_| b101.matched()).await;
+
+        assert!(completed(&messages, 100), "block 100 links to the anchor");
+        assert!(
+            !completed(&messages, 101),
+            "block 101 contradicts the block completed before it"
+        );
     }
 
     /// Primary and fallback both return missing meta; the fallback is consulted

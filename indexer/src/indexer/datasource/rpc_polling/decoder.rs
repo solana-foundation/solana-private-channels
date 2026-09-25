@@ -736,52 +736,77 @@ mod tests {
     fn malformed_transaction_fails_the_slot() {
         type Corrupt =
             fn(&mut crate::indexer::datasource::rpc_polling::types::RpcTransactionWithMeta);
-        let cases: Vec<(&str, Corrupt)> = vec![
-            ("no signature", |tx| tx.transaction.signatures.clear()),
-            ("63-byte signature", |tx| {
+        // (case, the rule the reason must name, corruption)
+        let cases: Vec<(&str, &str, Corrupt)> = vec![
+            ("no signature", "has no signature", |tx| {
+                tx.transaction.signatures.clear()
+            }),
+            ("63-byte signature", "signature is 63 bytes", |tx| {
                 tx.transaction.signatures = vec![bs58::encode([1u8; 63]).into_string()]
             }),
-            ("non-base58 signature", |tx| {
+            ("non-base58 signature", "not base58", |tx| {
                 tx.transaction.signatures = vec!["0OIl".to_string()]
             }),
-            ("bad account key", |tx| {
+            ("bad account key", "invalid account key", |tx| {
                 tx.transaction.message.account_keys[0] = "not a key".to_string()
             }),
-            ("loaded addresses without a lookup", |tx| {
-                tx.meta.as_mut().unwrap().loaded_addresses = Some(UiLoadedAddresses {
-                    writable: vec![test_pubkey(50).to_string()],
-                    readonly: vec![],
-                })
-            }),
-            ("lookup without its loaded address", |tx| {
-                declare_lookups(tx, 0, 1)
-            }),
-            ("top-level program index out of range", |tx| {
-                tx.transaction.message.instructions[0].program_id_index = 9
-            }),
-            ("top-level account index out of range", |tx| {
-                tx.transaction.message.instructions[0].accounts = vec![9]
-            }),
-            ("inner set names no top-level instruction", |tx| {
-                tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-                    index: 3,
-                    instructions: vec![],
-                }])
-            }),
-            ("inner program index out of range", |tx| {
-                tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-                    index: 0,
-                    instructions: vec![inner(9, "x", 2)],
-                }])
-            }),
-            ("inner account index out of range", |tx| {
-                let mut ix = inner(0, "x", 2);
-                ix.instruction.accounts = vec![9];
-                tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-                    index: 0,
-                    instructions: vec![ix],
-                }])
-            }),
+            (
+                "loaded addresses without a lookup",
+                "lookups load (0, 0)",
+                |tx| {
+                    tx.meta.as_mut().unwrap().loaded_addresses = Some(UiLoadedAddresses {
+                        writable: vec![test_pubkey(50).to_string()],
+                        readonly: vec![],
+                    })
+                },
+            ),
+            (
+                "lookup without its loaded address",
+                "lookups load (0, 1)",
+                |tx| declare_lookups(tx, 0, 1),
+            ),
+            (
+                "top-level program index out of range",
+                "program index 9 is outside",
+                |tx| tx.transaction.message.instructions[0].program_id_index = 9,
+            ),
+            (
+                "top-level account index out of range",
+                "account index 9 is outside",
+                |tx| tx.transaction.message.instructions[0].accounts = vec![9],
+            ),
+            (
+                "inner set names no top-level instruction",
+                "names no top-level instruction",
+                |tx| {
+                    tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+                        index: 3,
+                        instructions: vec![],
+                    }])
+                },
+            ),
+            (
+                "inner program index out of range",
+                "program index 9 is outside",
+                |tx| {
+                    tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+                        index: 0,
+                        instructions: vec![inner(9, "x", 2)],
+                    }])
+                },
+            ),
+            (
+                "inner account index out of range",
+                "account index 9 is outside",
+                |tx| {
+                    let mut ix = inner(0, "x", 2);
+                    ix.instruction.accounts = vec![9];
+                    tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
+                        index: 0,
+                        instructions: vec![ix],
+                    }])
+                },
+            ),
         ];
 
         // One transaction of ours and one that never names our program.
@@ -789,7 +814,7 @@ mod tests {
         let foreign =
             create_account_keys_with_program("DifferentProgram1111111111111111111111111111", 0);
         for keys in [ours, foreign] {
-            for (name, corrupt) in &cases {
+            for (name, rule, corrupt) in &cases {
                 let mut tx = create_successful_transaction(
                     "sig1".to_string(),
                     keys.clone(),
@@ -797,7 +822,7 @@ mod tests {
                 );
                 corrupt(&mut tx);
                 let reason = malformed_reason(tx);
-                assert!(!reason.is_empty(), "{name}");
+                assert!(reason.contains(rule), "{name}: {reason}");
             }
         }
     }

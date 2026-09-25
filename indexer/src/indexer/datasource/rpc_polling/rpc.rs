@@ -212,9 +212,13 @@ impl RpcPoller {
     /// must stay well below the node's getBlocks range cap. Results are emitted in
     /// the caller's order because both consumers stop at the first unresolved slot,
     /// which is what makes the ungated max-checkpoint safe.
+    ///
+    /// `prev_block` is the last block the caller completed before `slots`. Every slot between
+    /// it and the batch is then proven skipped, so the first block must name it exactly.
     pub async fn get_blocks_batch(
         &self,
         slots: Vec<u64>,
+        prev_block: Option<u64>,
     ) -> Vec<(u64, Result<BlockFetch, DataSourceRpcError>)> {
         let (Some(&start), Some(&end)) = (slots.first(), slots.last()) else {
             return vec![];
@@ -233,7 +237,7 @@ impl RpcPoller {
             }
         };
 
-        let mut verdicts = self.classify_range(start, end, produced).await;
+        let mut verdicts = self.classify_range(start, end, produced, prev_block).await;
         slots
             .into_iter()
             .map(|slot| {
@@ -253,12 +257,15 @@ impl RpcPoller {
         start: u64,
         end: u64,
         produced: Vec<u64>,
+        prev_block: Option<u64>,
     ) -> HashMap<u64, Result<BlockFetch, DataSourceRpcError>> {
         // Slot 0 has no predecessor to anchor on. Saturating to 0 here would put an
         // in-range slot inside the already-proven region and wave genesis through.
-        let anchor = match start.checked_sub(1) {
-            Some(anchor) => Proven::Anchor(anchor),
-            None => Proven::Unanchored,
+        let anchor = match (start.checked_sub(1), prev_block) {
+            // A block completed just before the batch binds the next parent exactly.
+            (Some(before), Some(prev)) if prev <= before => Proven::Block(prev),
+            (Some(before), _) => Proven::Anchor(before),
+            (None, _) => Proven::Unanchored,
         };
 
         // Normalise the listing: the walk needs ascending, in-range, distinct slots.
@@ -622,7 +629,7 @@ mod tests {
         let witness = no_witness_lookup(&mut server);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .get_blocks_batch(vec![100, 101, 102, 103, 104], None)
             .await;
 
         assert_eq!(
@@ -650,7 +657,9 @@ mod tests {
         // parent is 9, the last block before the anchor.
         let _c = chain(&mut server, 11, 13, &[(12, 9), (13, 12)]);
 
-        let results = poller(&server).get_blocks_batch(vec![11, 12, 13]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![11, 12, 13], None)
+            .await;
 
         assert_eq!(
             tags(&results),
@@ -665,7 +674,9 @@ mod tests {
         let mut server = Server::new_async().await;
         let _c = chain(&mut server, 11, 13, &[(13, 12)]);
 
-        let results = poller(&server).get_blocks_batch(vec![11, 12, 13]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![11, 12, 13], None)
+            .await;
 
         // 13's parent contradicts what the batch proved, so 13 itself is not served either.
         assert_eq!(
@@ -690,7 +701,7 @@ mod tests {
         let _w = mock_get_blocks_with_limit(&mut server, 3, &[3]);
         let _b = mock_get_block_at(&mut server, 3, 0);
 
-        let results = poller(&server).get_blocks_batch(vec![0, 1, 2]).await;
+        let results = poller(&server).get_blocks_batch(vec![0, 1, 2], None).await;
 
         assert_eq!(
             tags(&results),
@@ -709,7 +720,9 @@ mod tests {
         let _w = mock_get_blocks_with_limit(&mut server, 103, &[103]);
         let _b = mock_get_block_at(&mut server, 103, 101);
 
-        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102], None)
+            .await;
 
         // 101 contradicts 100, so it is never handed over, and 102 cannot be proven off it.
         assert_eq!(
@@ -718,13 +731,60 @@ mod tests {
         );
     }
 
+    /// A batch that starts right after a block the consumer completed must name that block
+    /// exactly; the batch-start anchor alone would accept any earlier parent.
+    #[tokio::test]
+    async fn a_block_after_the_previous_batch_must_name_its_last_block() {
+        let mut server = Server::new_async().await;
+        let _c = chain(&mut server, 100, 101, &[(100, 99), (101, 55)]);
+        let _first = mock_get_blocks(&mut server, 100, 100, &[100]);
+        let _second = mock_get_blocks(&mut server, 101, 101, &[101]);
+        let poller = poller(&server);
+
+        let first = poller.get_blocks_batch(vec![100], None).await;
+        assert_eq!(tags(&first), vec![(100, "present")]);
+
+        let second = poller.get_blocks_batch(vec![101], Some(100)).await;
+        assert_eq!(tags(&second), vec![(101, "unavailable")]);
+    }
+
+    /// The carried block still binds the next one across slots proven skipped in between.
+    #[tokio::test]
+    async fn a_carried_block_binds_the_next_block_across_skipped_slots() {
+        // 101 produced nothing, so 102 must name 100.
+        let mut linked = Server::new_async().await;
+        let _l = chain(&mut linked, 102, 102, &[(102, 100)]);
+        let results = poller(&linked).get_blocks_batch(vec![102], Some(100)).await;
+        assert_eq!(tags(&results), vec![(102, "present")]);
+
+        // Anchoring on 101 would accept 99; the carried block 100 does not.
+        let mut contradicting = Server::new_async().await;
+        let _c = chain(&mut contradicting, 102, 102, &[(102, 99)]);
+        let results = poller(&contradicting)
+            .get_blocks_batch(vec![102], Some(100))
+            .await;
+        assert_eq!(tags(&results), vec![(102, "unavailable")]);
+    }
+
+    /// A carried block that is not below the batch cannot vouch for it, so the batch-start
+    /// anchor applies, as it does for a re-read from an earlier slot.
+    #[tokio::test]
+    async fn a_carried_block_inside_the_batch_is_ignored() {
+        let mut server = Server::new_async().await;
+        let _c = chain(&mut server, 101, 101, &[(101, 100)]);
+        let results = poller(&server).get_blocks_batch(vec![101], Some(101)).await;
+        assert_eq!(tags(&results), vec![(101, "present")]);
+    }
+
     /// A contradiction on the last producer of the batch still withholds that block.
     #[tokio::test]
     async fn broken_link_on_the_last_producer_is_unavailable() {
         let mut server = Server::new_async().await;
         let _c = chain(&mut server, 100, 102, &[(100, 99), (101, 100), (102, 55)]);
 
-        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102], None)
+            .await;
 
         assert_eq!(
             tags(&results),
@@ -738,7 +798,9 @@ mod tests {
         let mut server = Server::new_async().await;
         let _c = chain(&mut server, 100, 102, &[(100, 99), (101, 55), (102, 101)]);
 
-        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102], None)
+            .await;
 
         assert_eq!(
             tags(&results),
@@ -752,7 +814,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let _c = chain(&mut server, 0, 1, &[(0, 0), (1, 0)]);
 
-        let results = poller(&server).get_blocks_batch(vec![0, 1]).await;
+        let results = poller(&server).get_blocks_batch(vec![0, 1], None).await;
 
         assert_eq!(tags(&results), vec![(0, "present"), (1, "present")]);
     }
@@ -766,7 +828,7 @@ mod tests {
         let _c = chain(&mut server, 100, 104, &[(100, 99), (104, 102)]);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .get_blocks_batch(vec![100, 101, 102, 103, 104], None)
             .await;
 
         assert_eq!(
@@ -793,7 +855,7 @@ mod tests {
         let _b104 = mock_get_block_at(&mut server, 104, 102);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .get_blocks_batch(vec![100, 101, 102, 103, 104], None)
             .await;
 
         let tagged = tags(&results);
@@ -816,7 +878,7 @@ mod tests {
         let _b104 = mock_get_block_at(&mut server, 104, 102);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .get_blocks_batch(vec![100, 101, 102, 103, 104], None)
             .await;
 
         let tagged = tags(&results);
@@ -837,7 +899,7 @@ mod tests {
         let _wb = mock_get_block_at(&mut server, 105, 100);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103])
+            .get_blocks_batch(vec![100, 101, 102, 103], None)
             .await;
 
         assert_eq!(
@@ -861,7 +923,7 @@ mod tests {
         let _w = mock_get_blocks_with_limit(&mut server, 104, &[]);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103])
+            .get_blocks_batch(vec![100, 101, 102, 103], None)
             .await;
 
         assert_eq!(
@@ -880,7 +942,7 @@ mod tests {
         let _wb = mock_get_block_absent(&mut server, 105, -32009);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103])
+            .get_blocks_batch(vec![100, 101, 102, 103], None)
             .await;
 
         assert_eq!(
@@ -900,7 +962,7 @@ mod tests {
         let _wb = mock_get_block_at(&mut server, 105, 102);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103])
+            .get_blocks_batch(vec![100, 101, 102, 103], None)
             .await;
 
         assert_eq!(
@@ -924,7 +986,7 @@ mod tests {
         let _wb = mock_get_block_at(&mut server, 106, 99);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .get_blocks_batch(vec![100, 101, 102, 103, 104], None)
             .await;
 
         assert!(
@@ -944,7 +1006,7 @@ mod tests {
         let _wb = mock_get_block_at(&mut server, 106, 102);
 
         let results = poller(&server)
-            .get_blocks_batch(vec![100, 101, 102, 103, 104])
+            .get_blocks_batch(vec![100, 101, 102, 103, 104], None)
             .await;
 
         assert!(
@@ -968,7 +1030,9 @@ mod tests {
             .expect(0)
             .create();
 
-        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102], None)
+            .await;
 
         assert_eq!(
             tags(&results),
@@ -984,7 +1048,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let _c = chain(&mut server, 0, 1, &[(0, 0), (1, 0)]);
 
-        let results = poller(&server).get_blocks_batch(vec![0, 1]).await;
+        let results = poller(&server).get_blocks_batch(vec![0, 1], None).await;
 
         assert_eq!(tags(&results), vec![(0, "present"), (1, "present")]);
     }
@@ -998,7 +1062,9 @@ mod tests {
         let _w = no_witness_lookup(&mut server);
 
         let requested = vec![100, 101, 102, 103, 104];
-        let results = poller(&server).get_blocks_batch(requested.clone()).await;
+        let results = poller(&server)
+            .get_blocks_batch(requested.clone(), None)
+            .await;
 
         let returned: Vec<u64> = results.iter().map(|(slot, _)| *slot).collect();
         assert_eq!(returned, requested);
@@ -1021,7 +1087,9 @@ mod tests {
         let _b100 = mock_get_block_at(&mut server, 100, 99);
         let _b102 = mock_get_block_at(&mut server, 102, 100);
 
-        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102], None)
+            .await;
 
         assert_eq!(
             tags(&results),
@@ -1064,7 +1132,7 @@ mod tests {
             UiTransactionEncoding::Json,
             CommitmentLevel::Confirmed,
         );
-        let results = poller.get_blocks_batch(vec![100]).await;
+        let results = poller.get_blocks_batch(vec![100], None).await;
 
         enumerate.assert();
         fetch.assert();
@@ -1168,7 +1236,7 @@ mod tests {
         let mut server = Server::new_async().await;
         let untouched = server.mock("POST", "/").expect(0).create();
 
-        let results = poller(&server).get_blocks_batch(vec![]).await;
+        let results = poller(&server).get_blocks_batch(vec![], None).await;
 
         assert!(results.is_empty());
         untouched.assert();
@@ -1181,7 +1249,9 @@ mod tests {
         let mut server = Server::new_async().await;
         let _c = chain(&mut server, 100, 102, &[(100, 99), (102, 100)]);
 
-        let results = poller(&server).get_blocks_batch(vec![100, 101, 102]).await;
+        let results = poller(&server)
+            .get_blocks_batch(vec![100, 101, 102], None)
+            .await;
 
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].0, 100);

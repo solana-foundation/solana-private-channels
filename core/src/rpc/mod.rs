@@ -809,6 +809,26 @@ mod tests {
         assert_eq!(err.code(), crate::rpc::error::SLOT_SKIPPED_CODE);
     }
 
+    /// A block whose listed transaction has no row was partly pruned, by a truncation racing
+    /// the read or a cached block outliving its rows. Serving the rest would drop that
+    /// transaction silently, so it errors instead, with a code no client reads as skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_block_with_a_missing_transaction_row_is_rpc_error() {
+        let (mut db, _pg) = start_pg().await;
+        let mut block = make_block_info(42, Hash::new_unique());
+        block.transaction_signatures = vec![solana_sdk::signature::Signature::new_unique()];
+        block.transaction_recent_blockhashes = vec![Hash::new_unique()];
+        block.transaction_message_hashes = vec![Hash::new_unique()];
+        db.store_block(block).await.unwrap();
+
+        let deps = make_read_deps(db);
+        let err = get_block_impl::get_block_impl(&deps, 42, None)
+            .await
+            .expect_err("a block missing one of its transactions must not be served");
+        assert_eq!(err.code(), error::JSON_RPC_SERVER_ERROR);
+        assert!(err.message().contains("42"), "{}", err.message());
+    }
+
     /// `getBlockTime` reads the same row, so it inherits the same split: an
     /// unreadable store errors while a pruned slot is still a null.
     #[tokio::test(flavor = "multi_thread")]
