@@ -145,7 +145,8 @@ COPY auth ./auth
 # include_bytes! in core). The cache-mounted target/ isn't reliably available to the next
 # build, so swap the symlink for the real .so. rm first — otherwise cp follows the symlink
 # and writes to the wrong place. (dvp_swap_program.so is a committed vendored binary, not built
-# here, so it needs no swap.)
+# here, so it needs no swap. It is reproducible with solana-verify and its hash is pinned by a
+# core test; see dvp-swap-program/README.md.)
 RUN rm -f core/precompiles/private_channel_withdraw_program.so \
     && cp /out/deploy/private_channel_withdraw_program.so core/precompiles/private_channel_withdraw_program.so
 
