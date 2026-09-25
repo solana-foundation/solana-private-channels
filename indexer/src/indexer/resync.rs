@@ -9,7 +9,9 @@ use crate::{
         enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda, ConsumedSet,
         RetryConfig, RpcClientWithRetry, CONSUMED_SET_PAGE_SIZE,
     },
+    storage::common::models::ResyncBlockers,
     storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
+    storage::common::storage::resync_state::resync_halt_reason,
     storage::Storage,
 };
 use solana_commitment_config::CommitmentConfig;
@@ -26,6 +28,41 @@ const MAX_BITMAP_RPC_TIP_LAG_SECS: i64 = 120;
 
 /// Metric label for the live-state lock this service holds.
 const RESYNC_LOCK_ROLE: &str = "resync";
+
+/// Why a resync must not wipe its rows yet, or `None` when it may. Only own-program rows count
+/// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent.
+fn wipe_blocker(
+    program: ProgramType,
+    blockers: &ResyncBlockers,
+    genesis_slot: u64,
+) -> Option<ReconciliationError> {
+    if blockers.unsettled_work {
+        return Some(ReconciliationError::UnsettledWork);
+    }
+    // The wipe deletes every own row but the rebuild replays only from genesis.
+    if let Some(earliest_slot) = blockers.earliest_slot {
+        if i128::from(genesis_slot) > i128::from(earliest_slot) {
+            return Some(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot,
+                earliest_slot,
+            });
+        }
+    }
+    if program != ProgramType::Withdraw {
+        return None;
+    }
+    if blockers.failed_withdrawals {
+        return Some(ReconciliationError::ReleaseEvidenceRecorded {
+            what: "failed withdrawals",
+        });
+    }
+    if blockers.observed_releases {
+        return Some(ReconciliationError::ReleaseEvidenceRecorded {
+            what: "observed releases",
+        });
+    }
+    None
+}
 
 /// How to reach the PrivateChannel and whose mints to enumerate for the consumed-set.
 #[derive(Clone, Debug)]
@@ -332,19 +369,39 @@ impl ResyncService {
         // matches what both workers do at startup.
         self.storage.init_schema().await?;
 
+        // Pre-flight 0a: a resync that deleted rows and died left a marker. Only the same
+        // program may finish it, or the other program's half-built rows would look complete.
+        let own_key = crate::indexer::checkpoint::program_key(self.program_type);
+        let unfinished = self.storage.get_unfinished_resync().await?;
+        if let Some(program) = unfinished.clone() {
+            if program != own_key {
+                error!(
+                    unfinished = %program,
+                    "Refusing to resync: another program's resync has not finished"
+                );
+                return Err(StorageError::UnfinishedResync { program }.into());
+            }
+            warn!("Finishing an earlier {own_key} resync that did not complete");
+        }
+
         // Pre-flight 0b: a reconciliation halt means custody and the ledger already
-        // disagree. The rebuild drops the table the flag lives in, so running now would
-        // clear an unresolved halt and destroy the evidence behind it.
+        // disagree. Rebuilding now would hide the evidence behind an unresolved halt. The
+        // one exception is the halt our own interrupted wipe set, next to our own marker.
+        let own_rerun_halt = resync_halt_reason(self.program_type);
         if let Some(halt) = self.storage.is_reconciliation_halted().await? {
-            error!(
-                "Refusing to resync a halted database; halt reason: {}",
-                halt.reason
-            );
-            return Err(IndexerError::Reconciliation(
-                ReconciliationError::ReconciliationHalted {
-                    reason: halt.reason,
-                },
-            ));
+            if halt.reason == own_rerun_halt && unfinished.as_deref() == Some(own_key.as_str()) {
+                warn!("Keeping the halt this {own_key} resync set until its rebuild completes");
+            } else {
+                error!(
+                    "Refusing to resync a halted database; halt reason: {}",
+                    halt.reason
+                );
+                return Err(IndexerError::Reconciliation(
+                    ReconciliationError::ReconciliationHalted {
+                        reason: halt.reason,
+                    },
+                ));
+            }
         }
 
         // Pre-flight 1: an escrow rebuild needs its instance scope. The processor filters
@@ -363,7 +420,18 @@ impl ResyncService {
             ));
         }
 
-        // Pre-flight 2: a withdraw rebuild restarts the nonce sequence, so the chain must
+        // Pre-flight 2: nothing this resync deletes may be in flight or below genesis, and a
+        // withdraw resync needs local proof no nonce was spent. Local reads, so before any RPC.
+        let blockers = self
+            .storage
+            .get_resync_blockers(self.program_type.owned_transaction_type())
+            .await?;
+        if let Some(refusal) = wipe_blocker(self.program_type, &blockers, genesis_slot) {
+            error!(?blockers, "Refusing to resync: {}", refusal);
+            return Err(refusal.into());
+        }
+
+        // Pre-flight 2b: a withdraw rebuild restarts the nonce sequence, so the chain must
         // not have issued any nonce yet. Refuses on an unreadable bitmap as well.
         self.refuse_if_bitmap_advanced().await?;
 
@@ -416,37 +484,23 @@ impl ResyncService {
         }
 
         // ---- Destruction: only now, with a complete consumed-set in hand. ----
-        // Two different failures are covered here. A session that died takes the drop with
-        // it, because the drop runs on that session. A loss verdict that was wrong leaves
-        // the session alive and still holding the lock, so only this check can stop it,
-        // and stop it is what we want: the rebuild below watches the same token and would
-        // abort immediately after, leaving the tables dropped and nothing put back.
+        // A loss verdict that was wrong leaves the session alive and holding the lock, so
+        // only this check stops the wipe; a dead session takes the wipe with it anyway.
         live_lock.ensure_held().await.inspect_err(|e| {
-            error!("Refusing to drop tables: {}", e);
+            error!("Refusing to delete rows: {}", e);
         })?;
 
-        // Step 1: Drop existing tables, on the session holding the lock. Through the pool
-        // the drop would keep running after the lock session died and the lock was freed,
-        // which is exactly when a worker is free to start.
-        info!("Dropping existing database tables...");
+        // Step 1: delete this program's rows and set the unfinished-resync marker in one
+        // transaction on the lock session, so a worker can never start on the half-built rows.
         self.storage
-            .drop_tables_fenced(&live_lock)
+            .wipe_program_fenced(&live_lock, self.program_type)
             .await
             .map_err(|e| {
-                error!("Failed to drop database tables during resync: {}", e);
+                error!("Failed to delete this program's rows during resync: {}", e);
                 e
             })?;
-        info!("Database tables dropped successfully");
 
-        // Step 2: Recreate schema
-        info!("Recreating database schema...");
-        self.storage.init_schema().await.map_err(|e| {
-            error!("Failed to recreate database schema during resync: {}", e);
-            e
-        })?;
-        info!("Database schema recreated successfully");
-
-        // Step 3: Setup processing pipeline
+        // Step 2: Setup processing pipeline
         // Create channels for instruction flow and checkpoint updates
         let (instruction_tx, instruction_rx) = mpsc::channel(1000);
         let (checkpoint_tx, checkpoint_rx) = mpsc::channel(1000);
@@ -560,6 +614,18 @@ impl ResyncService {
             }
             result = rebuild => result?,
         }
+
+        // Only a completed rebuild clears the marker and its halt, and only while this session
+        // still holds the lock.
+        self.storage
+            .clear_unfinished_resync_fenced(&live_lock, self.program_type)
+            .await
+            .inspect_err(|e| {
+                error!(
+                    "Rebuild finished but the resync marker was not cleared: {}",
+                    e
+                )
+            })?;
 
         info!(
             "Resync complete for {:?}. Processed {} slots (from {} to {})",
@@ -751,23 +817,34 @@ mod tests {
     }
 
     fn seed_completed_withdrawal(mock: &MockStorage, nonce: u64) {
+        seed_row(
+            mock,
+            nonce,
+            TransactionType::Withdrawal,
+            TransactionStatus::Completed,
+        );
+    }
+
+    /// Push one row of `ty` in `status`; `n` doubles as its nonce and makes its id unique.
+    fn seed_row(mock: &MockStorage, n: u64, ty: TransactionType, status: TransactionStatus) {
         let now = chrono::Utc::now();
         mock.pending_transactions
             .lock()
             .unwrap()
             .push(DbTransaction {
-                id: nonce as i64 + 1,
+                id: n as i64 + 1,
                 signature: solana_sdk::signature::Signature::new_unique().to_string(),
-                trace_id: format!("trace-{nonce}"),
-                slot: 1,
+                trace_id: format!("trace-{n}"),
+                // The genesis these tests resync from, so the pre-genesis guard stays out of their way.
+                slot: 100,
                 initiator: Pubkey::new_unique().to_string(),
                 recipient: Pubkey::new_unique().to_string(),
                 mint: Pubkey::new_unique().to_string(),
                 amount: TokenAmount(1_000),
                 memo: None,
-                transaction_type: TransactionType::Withdrawal,
-                withdrawal_nonce: Some(nonce as i64),
-                status: TransactionStatus::Completed,
+                transaction_type: ty,
+                withdrawal_nonce: (ty == TransactionType::Withdrawal).then_some(n as i64),
+                status,
                 created_at: now,
                 updated_at: now,
                 processed_at: None,
@@ -785,7 +862,11 @@ mod tests {
     }
 
     fn assert_db_intact(mock: &MockStorage) {
-        assert_eq!(mock.calls("drop_tables"), 0, "drop_tables must not run");
+        assert_eq!(mock.calls("wipe_program"), 0, "the wipe must not run");
+        assert!(
+            mock.unfinished_resync.lock().unwrap().is_none(),
+            "a refused resync must not leave a marker"
+        );
         // The schema is created up front so the halt flag is readable on a database
         // that was never indexed, so exactly one idempotent call is expected here. A
         // second one would mean the rebuild ran.
@@ -1066,7 +1147,7 @@ mod tests {
         }
         match storage.as_ref() {
             Storage::Mock(mock) => assert_eq!(
-                mock.calls("drop_tables"),
+                mock.calls("wipe_program"),
                 0,
                 "the refusal must land before any destruction"
             ),
@@ -1088,11 +1169,357 @@ mod tests {
         }
         match storage.as_ref() {
             Storage::Mock(mock) => assert_eq!(
-                mock.calls("drop_tables"),
+                mock.calls("wipe_program"),
                 0,
                 "the refusal must land before any destruction"
             ),
             _ => unreachable!(),
+        }
+    }
+
+    // ── pre-wipe gate ────────────────────────────────────────────────
+
+    /// Escrow never touches nonces, so only in-flight work or pre-genesis rows block it; withdraw
+    /// also needs proof no nonce is spent.
+    #[test]
+    fn wipe_blocker_matrix() {
+        use crate::storage::common::models::ResyncBlockers;
+        let unsettled = ResyncBlockers {
+            unsettled_work: true,
+            ..Default::default()
+        };
+        let failed = ResyncBlockers {
+            failed_withdrawals: true,
+            ..Default::default()
+        };
+        let observed = ResyncBlockers {
+            observed_releases: true,
+            ..Default::default()
+        };
+        let all = ResyncBlockers {
+            unsettled_work: true,
+            failed_withdrawals: true,
+            observed_releases: true,
+            earliest_slot: Some(1),
+        };
+        let rows_from = |slot| ResyncBlockers {
+            earliest_slot: Some(slot),
+            ..Default::default()
+        };
+
+        let label = |r: Option<ReconciliationError>| match r {
+            None => "none",
+            Some(ReconciliationError::UnsettledWork) => "unsettled",
+            Some(ReconciliationError::ReleaseEvidenceRecorded { what })
+                if what.contains("failed") =>
+            {
+                "failed"
+            }
+            Some(ReconciliationError::ReleaseEvidenceRecorded { .. }) => "observed",
+            Some(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            }) => "genesis",
+            Some(other) => panic!("unexpected verdict {other:?}"),
+        };
+
+        let cases = [
+            (ProgramType::Escrow, ResyncBlockers::default(), "none"),
+            (ProgramType::Escrow, unsettled, "unsettled"),
+            (ProgramType::Escrow, failed, "none"),
+            (ProgramType::Escrow, observed, "none"),
+            (ProgramType::Withdraw, ResyncBlockers::default(), "none"),
+            (ProgramType::Withdraw, unsettled, "unsettled"),
+            (ProgramType::Withdraw, failed, "failed"),
+            (ProgramType::Withdraw, observed, "observed"),
+            (ProgramType::Withdraw, all, "unsettled"),
+            (
+                ProgramType::Withdraw,
+                ResyncBlockers {
+                    failed_withdrawals: true,
+                    observed_releases: true,
+                    ..Default::default()
+                },
+                "failed",
+            ),
+            (ProgramType::Escrow, rows_from(99), "genesis"),
+            (ProgramType::Escrow, rows_from(100), "none"),
+            (ProgramType::Escrow, rows_from(101), "none"),
+            (ProgramType::Withdraw, rows_from(99), "genesis"),
+            (ProgramType::Withdraw, rows_from(100), "none"),
+            (
+                ProgramType::Escrow,
+                ResyncBlockers {
+                    unsettled_work: true,
+                    earliest_slot: Some(99),
+                    ..Default::default()
+                },
+                "unsettled",
+            ),
+        ];
+        for (program, blockers, expected) in cases {
+            assert_eq!(
+                label(wipe_blocker(program, &blockers, 100)),
+                expected,
+                "{program:?} with {blockers:?}"
+            );
+        }
+    }
+
+    /// Escrow service with a scope set and every RPC on a dead port, so any network step errors.
+    fn escrow_service(storage: Arc<Storage>) -> ResyncService {
+        let rpc_poller = Arc::new(RpcPoller::new(
+            "http://127.0.0.1:1".to_string(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+        ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Escrow,
+            backfill_config,
+            Some(Pubkey::new_unique()),
+        )
+    }
+
+    /// The gate is local, so it must refuse before the bitmap read, the tip fetch and the wipe.
+    #[tokio::test]
+    async fn gate_runs_before_any_rpc_and_wipe() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Processing,
+        );
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Reconciliation(ReconciliationError::UnsettledWork)) => {}
+            other => panic!("an in-flight deposit must block an escrow resync, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert_eq!(mock.pending_transactions.lock().unwrap().len(), 1);
+
+        let mut server = mockito::Server::new_async().await;
+        let untouched = server.mock("POST", "/").expect(0).create();
+        let (mock, storage) = populated_storage();
+        seed_row(
+            &mock,
+            2,
+            TransactionType::Withdrawal,
+            TransactionStatus::Failed,
+        );
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::ReleaseEvidenceRecorded {
+                ..
+            })) => {}
+            other => panic!("a failed withdrawal must block a withdraw resync, got: {other:?}"),
+        }
+        untouched.assert();
+        assert_db_intact(&mock);
+    }
+
+    /// Rows below the genesis would be wiped and never rebuilt, so both programs refuse locally.
+    #[tokio::test]
+    async fn genesis_above_earliest_row_refuses_before_any_rpc_and_wipe() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Pending,
+        );
+        mock.pending_transactions.lock().unwrap()[0].slot = 99;
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            })) => {}
+            other => panic!("a deposit below genesis must block an escrow resync, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert_eq!(mock.pending_transactions.lock().unwrap().len(), 1);
+
+        let mut server = mockito::Server::new_async().await;
+        let untouched = server.mock("POST", "/").expect(0).create();
+        let (mock, storage) = populated_storage();
+        seed_row(
+            &mock,
+            2,
+            TransactionType::Withdrawal,
+            TransactionStatus::Pending,
+        );
+        mock.pending_transactions.lock().unwrap()[0].slot = 99;
+        let service = withdraw_service(storage, Some(Pubkey::new_unique()), Some(server.url()));
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            })) => {}
+            other => {
+                panic!("a withdrawal below genesis must block a withdraw resync, got: {other:?}")
+            }
+        }
+        untouched.assert();
+        assert_db_intact(&mock);
+    }
+
+    /// An interrupted wipe already deleted the rows, so its marker keeps their slot and a
+    /// rerun from a later genesis is refused the same way.
+    #[tokio::test]
+    async fn rerun_after_interrupted_wipe_refuses_genesis_above_deleted_rows() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Completed,
+        );
+        mock.pending_transactions.lock().unwrap()[0].slot = 99;
+        mock.wipe_program(ProgramType::Escrow).unwrap();
+        assert!(mock.pending_transactions.lock().unwrap().is_empty());
+
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            })) => {}
+            other => panic!("a rerun must not skip rows its first wipe deleted, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 1);
+        assert_eq!(
+            mock.unfinished_resync.lock().unwrap().as_deref(),
+            Some("escrow")
+        );
+    }
+
+    /// Another program's unfinished resync owns the database; only that program may finish it.
+    #[tokio::test]
+    async fn other_program_marker_refuses_before_any_rpc() {
+        let mock = MockStorage::new();
+        *mock.unfinished_resync.lock().unwrap() = Some("withdraw".to_string());
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Pending,
+        );
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Storage(StorageError::UnfinishedResync { program })) => {
+                assert_eq!(program, "withdraw")
+            }
+            other => panic!("a withdraw marker must refuse an escrow resync, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert_eq!(
+            mock.unfinished_resync.lock().unwrap().as_deref(),
+            Some("withdraw")
+        );
+    }
+
+    /// A marker left by this same program is a rerun, so the resync goes on to its RPC steps.
+    #[tokio::test]
+    async fn same_program_marker_proceeds() {
+        let mock = MockStorage::new();
+        *mock.unfinished_resync.lock().unwrap() = Some("escrow".to_string());
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::DataSource(_)) => {}
+            other => panic!("a same-program rerun must reach the tip fetch, got: {other:?}"),
+        }
+    }
+
+    /// A rerun finds the halt its own interrupted wipe set, next to its own marker, and goes on.
+    #[tokio::test]
+    async fn own_resync_halt_with_matching_marker_proceeds() {
+        use crate::storage::common::storage::resync_state::resync_halt_reason;
+        let mock = MockStorage::new();
+        *mock.unfinished_resync.lock().unwrap() = Some("escrow".to_string());
+        mock.set_reconciliation_halt(&resync_halt_reason(ProgramType::Escrow))
+            .await
+            .unwrap();
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::DataSource(_)) => {}
+            other => panic!("a rerun under its own halt must reach the tip fetch, got: {other:?}"),
+        }
+    }
+
+    /// Without the matching marker a resync-reason halt is just a halt, so it refuses.
+    #[tokio::test]
+    async fn resync_halt_without_matching_marker_refuses() {
+        use crate::storage::common::storage::resync_state::resync_halt_reason;
+        for marker in [None, Some("withdraw")] {
+            let mock = MockStorage::new();
+            *mock.unfinished_resync.lock().unwrap() = marker.map(str::to_string);
+            mock.set_reconciliation_halt(&resync_halt_reason(ProgramType::Escrow))
+                .await
+                .unwrap();
+            let result = escrow_service(Arc::new(Storage::Mock(mock.clone())))
+                .run(100)
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::ReconciliationHalted { .. }
+                    )) | Err(IndexerError::Storage(StorageError::UnfinishedResync { .. }))
+                ),
+                "marker {marker:?}: must refuse, got: {result:?}"
+            );
+            if marker.is_none() {
+                assert!(matches!(
+                    result,
+                    Err(IndexerError::Reconciliation(
+                        ReconciliationError::ReconciliationHalted { .. }
+                    ))
+                ));
+            }
+            assert_eq!(mock.calls("wipe_program"), 0);
+        }
+    }
+
+    /// A halt of another program's resync is foreign to this one, even with its own marker set.
+    #[tokio::test]
+    async fn other_program_resync_halt_refuses() {
+        use crate::storage::common::storage::resync_state::resync_halt_reason;
+        let mock = MockStorage::new();
+        *mock.unfinished_resync.lock().unwrap() = Some("escrow".to_string());
+        mock.set_reconciliation_halt(&resync_halt_reason(ProgramType::Withdraw))
+            .await
+            .unwrap();
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Reconciliation(ReconciliationError::ReconciliationHalted {
+                ..
+            })) => {}
+            other => panic!("another program's resync halt must refuse, got: {other:?}"),
         }
     }
 }

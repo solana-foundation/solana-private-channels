@@ -138,12 +138,11 @@ pub enum ReconciliationError {
         reason: String,
     },
 
-    /// A rebuild drops the table the halt flag lives in, so it would clear a halt
-    /// that is still unresolved and destroy the ledger evidence behind it. Resolve
-    /// the halt and clear the flag first, then resync.
+    /// A halt means custody and the ledger disagree; rebuilding under it would bury the
+    /// evidence of why. Resolve the halt and clear the flag first, then resync.
     #[error(
-        "reconciliation halt is set ({reason}); resync would erase it, so resolve and clear \
-         the halt first (see the reconciliation halt runbook)"
+        "reconciliation halt is set ({reason}); a rebuild would hide the evidence behind it, \
+         so resolve and clear the halt first (see the reconciliation halt runbook)"
     )]
     ReconciliationHalted { reason: String },
 
@@ -175,6 +174,37 @@ pub enum ReconciliationError {
          docs/runbooks/resync_bitmap_advanced.md"
     )]
     WithdrawalBitmapUnverified { reason: String },
+
+    /// A row this resync would delete may still have a send in flight, and deleting its
+    /// journal would let the rebuilt row be sent again.
+    #[error(
+        "rows this resync would rebuild are still processing, pending remint, in manual \
+         review, or have unsettled broadcast journals; run the operator until they settle, \
+         stop it, then retry. See docs/runbooks/live_state_lock_runbook.md"
+    )]
+    UnsettledWork,
+
+    /// A withdraw resync restarts the nonce sequence, which is unsafe once any release may
+    /// have landed.
+    #[error(
+        "the database records {what}, so a release may already have spent a nonce; a \
+         withdraw resync would restart the nonce sequence under it. Aborted before any \
+         delete. See docs/runbooks/resync_bitmap_advanced.md"
+    )]
+    ReleaseEvidenceRecorded { what: &'static str },
+
+    /// The wipe deletes every row of the program but the rebuild only replays from genesis,
+    /// so rows below it would be lost, with their pending funds.
+    #[error(
+        "genesis slot {genesis_slot} is above this program's earliest row at slot \
+         {earliest_slot}; the wipe would delete rows the rebuild never replays. Aborted \
+         before any delete, the database is intact. Rerun with --genesis-slot \
+         {earliest_slot} or lower"
+    )]
+    GenesisAboveExistingRows {
+        genesis_slot: u64,
+        earliest_slot: i64,
+    },
 }
 
 /// Errors from data sources (RPC polling, Yellowstone, backfill operations)

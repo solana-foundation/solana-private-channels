@@ -84,18 +84,8 @@ fn common_config(postgres: PostgresConfig) -> PrivateChannelIndexerConfig {
     }
 }
 
-/// I9. An operator starting during a resync would mint and release against tables
-/// the resync is about to drop, so it must refuse before it touches anything.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operator_refuses_to_start_during_a_resync() {
-    let (url, _container) = start_postgres("live_lock_operator").await;
-    let _resync = hold_as_resync(&url).await;
-
-    let postgres = PostgresConfig {
-        database_url: url.clone(),
-        max_connections: 5,
-    };
-    let operator_config = OperatorConfig {
+fn operator_config() -> OperatorConfig {
+    OperatorConfig {
         db_poll_interval: Duration::from_secs(60),
         batch_size: 10,
         retry_max_attempts: 1,
@@ -108,12 +98,62 @@ async fn operator_refuses_to_start_during_a_resync() {
         reconciliation_webhook_url: Some("http://127.0.0.1:1/hook".to_string()),
         feepayer_monitor_interval: Duration::from_secs(60),
         confirmation_poll_interval_ms: DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
-    };
+    }
+}
 
+fn indexer_config() -> IndexerConfig {
+    IndexerConfig {
+        datasource_type: DatasourceType::RpcPolling,
+        rpc_polling: Some(RpcPollingConfig {
+            poll_interval_ms: 1_000,
+            error_retry_interval_ms: 1_000,
+            batch_size: 10,
+            from_slot: None,
+            encoding: solana_transaction_status::UiTransactionEncoding::Json,
+            commitment: CommitmentLevel::Finalized,
+        }),
+        yellowstone: None,
+        backfill: BackfillConfig {
+            enabled: false,
+            exit_after_backfill: false,
+            rpc_url: DEAD_RPC.to_string(),
+            batch_size: 10,
+            max_gap_slots: 1_000,
+            start_slot: None,
+        },
+        reconciliation: ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        },
+    }
+}
+
+/// Leave the marker a resync writes when it deletes rows, as if it died before rebuilding them.
+async fn seed_unfinished_resync(url: &str, program: &str) {
+    connect(url).await.init_schema().await.expect("schema");
+    let pool = sqlx::PgPool::connect(url).await.expect("pool");
+    sqlx::query("INSERT INTO resync_state (program_type) VALUES ($1)")
+        .bind(program)
+        .execute(&pool)
+        .await
+        .expect("seed the unfinished-resync marker");
+}
+
+/// I9. An operator starting during a resync would mint and release against tables
+/// the resync is about to drop, so it must refuse before it touches anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_refuses_to_start_during_a_resync() {
+    let (url, _container) = start_postgres("live_lock_operator").await;
+    let _resync = hold_as_resync(&url).await;
+
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
     let result = operator::run(
         connect(&url).await,
         common_config(postgres),
-        operator_config,
+        operator_config(),
         None,
     )
     .await;
@@ -140,32 +180,8 @@ async fn indexer_refuses_to_start_during_a_resync() {
         database_url: url.clone(),
         max_connections: 5,
     };
-    let indexer_config = IndexerConfig {
-        datasource_type: DatasourceType::RpcPolling,
-        rpc_polling: Some(RpcPollingConfig {
-            poll_interval_ms: 1_000,
-            error_retry_interval_ms: 1_000,
-            batch_size: 10,
-            from_slot: None,
-            encoding: solana_transaction_status::UiTransactionEncoding::Json,
-            commitment: CommitmentLevel::Finalized,
-        }),
-        yellowstone: None,
-        backfill: BackfillConfig {
-            enabled: false,
-            exit_after_backfill: false,
-            rpc_url: DEAD_RPC.to_string(),
-            batch_size: 10,
-            max_gap_slots: 1_000,
-            start_slot: None,
-        },
-        reconciliation: ReconciliationConfig {
-            mismatch_threshold_raw: 0,
-            ..Default::default()
-        },
-    };
-
-    let result = private_channel_indexer::run(common_config(postgres), indexer_config, None).await;
+    let result =
+        private_channel_indexer::run(common_config(postgres), indexer_config(), None).await;
 
     assert!(
         matches!(
@@ -175,5 +191,55 @@ async fn indexer_refuses_to_start_during_a_resync() {
             }))
         ),
         "the indexer must refuse to start under a resync, got: {result:?}"
+    );
+}
+
+/// I11. A resync that deleted rows and died no longer holds the lock, so only the marker
+/// stops an operator from minting or releasing against the half-built rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_refuses_to_start_after_an_unfinished_resync() {
+    let (url, _container) = start_postgres("unfinished_resync_operator").await;
+    seed_unfinished_resync(&url, "escrow").await;
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+
+    let result = operator::run(
+        connect(&url).await,
+        common_config(postgres),
+        operator_config(),
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(OperatorError::Storage(StorageError::UnfinishedResync { program })) if program == "escrow"
+        ),
+        "the operator must refuse to start after an unfinished resync, got: {result:?}"
+    );
+}
+
+/// I12. Same for the indexer, which would otherwise index on top of the half-built rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexer_refuses_to_start_after_an_unfinished_resync() {
+    let (url, _container) = start_postgres("unfinished_resync_indexer").await;
+    seed_unfinished_resync(&url, "withdraw").await;
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+
+    let result =
+        private_channel_indexer::run(common_config(postgres), indexer_config(), None).await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(IndexerError::Storage(StorageError::UnfinishedResync { program })) if program == "withdraw"
+        ),
+        "the indexer must refuse to start after an unfinished resync, got: {result:?}"
     );
 }

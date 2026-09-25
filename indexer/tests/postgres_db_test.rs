@@ -16,6 +16,7 @@ use private_channel_indexer::{
         common::amount::TokenAmount,
         common::models::{DbMint, DbMintStatus, DbObservedRelease, MintStatusAtSlot, StoredSig},
         common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
+        common::storage::resync_state::resync_halt_reason,
         common::storage::sender_lock::SenderLockGuard,
         postgres::db::{
             apply_lock_session_keepalives, apply_lock_session_lock_timeout,
@@ -186,7 +187,8 @@ async fn drop_tables_then_reinit() -> Result<(), Box<dyn std::error::Error>> {
     // Tables gone
     let count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM information_schema.tables
-         WHERE table_schema = 'public' AND table_name IN ('transactions', 'indexer_state', 'mints')",
+         WHERE table_schema = 'public'
+           AND table_name IN ('transactions', 'indexer_state', 'mints', 'resync_state')",
     )
     .fetch_one(&pool)
     .await?;
@@ -3429,32 +3431,743 @@ async fn merged_schema_drops_owed_rotation_target_and_is_idempotent(
     Ok(())
 }
 
-// ── Fenced drop ───────────────────────────────────────────────────────────────
+// ── Fenced resync wipe ────────────────────────────────────────────────────────
 //
-// The drop has to run on the session that holds the lock. Issued through the pool
-// it can outlive the lock: Postgres frees a session lock the moment its backend
-// dies, so a worker can start while the drop is still running.
+// The wipe runs on the session that holds the lock, so it cannot outlive the lock, and
+// deletes only the resyncing program's rows.
 
-/// Does `transactions` still exist? Stands in for the whole schema, since the drop
-/// is all-or-nothing.
-async fn transactions_table_exists(pool: &PgPool) -> bool {
-    sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass('transactions')::text")
-        .fetch_one(pool)
-        .await
-        .expect("regclass lookup")
-        .is_some()
+/// Deposit + withdrawal sides fully populated, with journals and both checkpoints.
+async fn seed_both_sides(
+    pool: &PgPool,
+    storage: &Storage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dep = seed_with_status(
+        pool,
+        storage,
+        "dep-done",
+        TransactionType::Deposit,
+        "completed",
+    )
+    .await?;
+    seed_journal(pool, "pending_release_signatures", dep, "dep-done-attempt").await?;
+    seed_with_status(
+        pool,
+        storage,
+        "dep-new",
+        TransactionType::Deposit,
+        "pending",
+    )
+    .await?;
+    seed_with_status(
+        pool,
+        storage,
+        "wd-paid",
+        TransactionType::Withdrawal,
+        "completed",
+    )
+    .await?;
+    seed_with_status(
+        pool,
+        storage,
+        "wd-reminted",
+        TransactionType::Withdrawal,
+        "failed_reminted",
+    )
+    .await?;
+    let live = seed_with_status(
+        pool,
+        storage,
+        "wd-live",
+        TransactionType::Withdrawal,
+        "processing",
+    )
+    .await?;
+    seed_journal(pool, "pending_release_signatures", live, "wd-live-attempt").await?;
+    let remint = seed_with_status(
+        pool,
+        storage,
+        "wd-remint",
+        TransactionType::Withdrawal,
+        "pending_remint",
+    )
+    .await?;
+    seed_journal(
+        pool,
+        "pending_remint_signatures",
+        remint,
+        "wd-remint-attempt",
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO observed_releases (withdrawal_nonce, signature, slot) VALUES (0, 'obs-0', 5)",
+    )
+    .execute(pool)
+    .await?;
+    storage
+        .upsert_mints_batch(&[DbMint::new("mint_addr".to_string(), 6, "token".to_string())])
+        .await?;
+    storage
+        .insert_mint_statuses_batch(&[mk_status("mint_addr", "allowed", 1, "allow-sig")])
+        .await?;
+    storage.update_committed_checkpoint("escrow", 111).await?;
+    storage.update_committed_checkpoint("withdraw", 222).await?;
+    Ok(())
 }
 
-/// I12. The fenced drop must still do its job while the lock is genuinely held.
+/// Journal one broadcast attempt for `tx_id` in `table`.
+async fn seed_journal(
+    pool: &PgPool,
+    table: &str,
+    tx_id: i64,
+    sig: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(&format!(
+        "INSERT INTO {table} (transaction_id, signature, last_valid_block_height) VALUES ($1, $2, 1)"
+    ))
+    .bind(tx_id)
+    .bind(sig)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Everything a resync of the other program must leave alone, as comparable text.
+async fn side_fingerprint(pool: &PgPool, ty: &str) -> Vec<String> {
+    let mut out: Vec<String> = sqlx::query_scalar(
+        "SELECT t.signature || '|' || t.status::text || '|' || COALESCE(t.withdrawal_nonce::text, '-')
+                || '|' || COALESCE((SELECT string_agg(signature, ',' ORDER BY signature)
+                                    FROM pending_release_signatures WHERE transaction_id = t.id), '-')
+                || '|' || COALESCE((SELECT string_agg(signature, ',' ORDER BY signature)
+                                    FROM pending_remint_signatures WHERE transaction_id = t.id), '-')
+         FROM transactions t WHERE t.transaction_type::text = $1 ORDER BY t.signature",
+    )
+    .bind(ty)
+    .fetch_all(pool)
+    .await
+    .expect("rows");
+    let program = if ty == "deposit" {
+        "escrow"
+    } else {
+        "withdraw"
+    };
+    let checkpoint: Option<i64> =
+        sqlx::query_scalar("SELECT last_committed_slot FROM indexer_state WHERE program_type = $1")
+            .bind(program)
+            .fetch_optional(pool)
+            .await
+            .expect("checkpoint")
+            .flatten();
+    out.push(format!("checkpoint={checkpoint:?}"));
+    if ty == "deposit" {
+        let mints: Vec<String> = sqlx::query_scalar("SELECT mint_address FROM mints ORDER BY 1")
+            .fetch_all(pool)
+            .await
+            .expect("mints");
+        out.push(format!("mints={mints:?}"));
+    } else {
+        let seq: i64 = sqlx::query_scalar("SELECT last_value FROM withdrawal_nonce_seq")
+            .fetch_one(pool)
+            .await
+            .expect("seq");
+        let observed: Vec<i64> =
+            sqlx::query_scalar("SELECT withdrawal_nonce FROM observed_releases ORDER BY 1")
+                .fetch_all(pool)
+                .await
+                .expect("observed");
+        out.push(format!("seq={seq} observed={observed:?}"));
+    }
+    out
+}
+
+async fn marker(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT program_type FROM resync_state")
+        .fetch_optional(pool)
+        .await
+        .expect("marker read")
+}
+
+/// The active halt's reason, or `None` when no halt is set.
+async fn active_halt(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT reason FROM reconciliation_halt WHERE id = TRUE AND halted")
+        .fetch_optional(pool)
+        .await
+        .expect("halt read")
+}
+
+/// A fenced statement that waited out the lock_timeout, reported as the query's own error.
+fn is_lock_timeout(result: &Result<(), StorageError>) -> bool {
+    matches!(result, Err(StorageError::QueryFailed(sqlx::Error::Database(db))) if db.code().as_deref() == Some("55P03"))
+}
+
+async fn history_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM mint_status_history")
+        .fetch_one(pool)
+        .await
+        .expect("history count")
+}
+
+/// P1. Only the resync's own rows can block it; the other program's work survives the wipe untouched.
 #[tokio::test(flavor = "multi_thread")]
-async fn fenced_drop_removes_the_tables_while_the_lock_is_held(
+async fn resync_blockers_sql_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let statuses = [
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+        "failed_reminted",
+        "manual_review",
+        "pending_remint",
+        "parked",
+    ];
+    let journals = [
+        None,
+        Some("pending_release_signatures"),
+        Some("pending_remint_signatures"),
+    ];
+    for ty in [TransactionType::Deposit, TransactionType::Withdrawal] {
+        for status in statuses {
+            for journal in journals {
+                sqlx::query("TRUNCATE transactions, observed_releases CASCADE")
+                    .execute(&pool)
+                    .await?;
+                let id = seed_with_status(&pool, &storage, "row", ty, status).await?;
+                if let Some(table) = journal {
+                    seed_journal(&pool, table, id, "attempt").await?;
+                }
+                let terminal = matches!(status, "completed" | "failed" | "failed_reminted");
+                let in_flight = matches!(status, "processing" | "pending_remint" | "manual_review");
+                let expected_unsettled = in_flight || (!terminal && journal.is_some());
+                let case = format!("{ty:?} {status} journal={journal:?}");
+                let own = storage.get_resync_blockers(ty).await?;
+                assert_eq!(own.unsettled_work, expected_unsettled, "own view: {case}");
+                assert_eq!(
+                    own.failed_withdrawals,
+                    ty == TransactionType::Withdrawal && status == "failed",
+                    "{case}"
+                );
+                assert!(!own.observed_releases, "{case}");
+                let other = if ty == TransactionType::Deposit {
+                    TransactionType::Withdrawal
+                } else {
+                    TransactionType::Deposit
+                };
+                assert!(
+                    !storage.get_resync_blockers(other).await?.unsettled_work,
+                    "the other program's rows must never block: {case}"
+                );
+            }
+        }
+    }
+    sqlx::query("TRUNCATE transactions CASCADE")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO observed_releases (withdrawal_nonce, signature, slot) VALUES (3, 'o', 1)",
+    )
+    .execute(&pool)
+    .await?;
+    assert!(
+        storage
+            .get_resync_blockers(TransactionType::Withdrawal)
+            .await?
+            .observed_releases
+    );
+    Ok(())
+}
+
+/// P1b. The earliest slot is the lowest row of the resync's own type, whatever its status.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let earliest = |ty| {
+        let storage = &storage;
+        async move {
+            storage
+                .get_resync_blockers(ty)
+                .await
+                .map(|b| b.earliest_slot)
+        }
+    };
+    assert_eq!(
+        earliest(TransactionType::Deposit).await?,
+        None,
+        "empty table"
+    );
+
+    for (sig, ty, status, slot) in [
+        ("dep_late", TransactionType::Deposit, "pending", 500),
+        ("dep_early", TransactionType::Deposit, "completed", 100),
+        (
+            "wd_early",
+            TransactionType::Withdrawal,
+            "failed_reminted",
+            7,
+        ),
+    ] {
+        let id = seed_with_status(&pool, &storage, sig, ty, status).await?;
+        sqlx::query("UPDATE transactions SET slot = $2 WHERE id = $1")
+            .bind(id)
+            .bind(slot)
+            .execute(&pool)
+            .await?;
+    }
+    assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
+    assert_eq!(earliest(TransactionType::Withdrawal).await?, Some(7));
+
+    sqlx::query("DELETE FROM transactions WHERE transaction_type = 'withdrawal'")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        earliest(TransactionType::Withdrawal).await?,
+        None,
+        "the other program's rows never count"
+    );
+    assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
+    Ok(())
+}
+
+/// P1c. An interrupted wipe keeps the lowest slot it deleted until the resync completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, _pg) = start_postgres().await?;
-    storage.init_schema().await?;
-    assert!(
-        transactions_table_exists(&pool).await,
-        "the schema must exist before the drop"
+    let seed = |sig: &'static str, ty, slot: i64| {
+        let (pool, storage) = (&pool, &storage);
+        async move {
+            let id = seed_with_status(pool, storage, sig, ty, "completed").await?;
+            sqlx::query("UPDATE transactions SET slot = $2 WHERE id = $1")
+                .bind(id)
+                .bind(slot)
+                .execute(pool)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    };
+    let earliest = |ty| {
+        let storage = &storage;
+        async move {
+            storage
+                .get_resync_blockers(ty)
+                .await
+                .map(|b| b.earliest_slot)
+        }
+    };
+    seed("dep_early", TransactionType::Deposit, 100).await?;
+    seed("dep_late", TransactionType::Deposit, 500).await?;
+    seed("wd", TransactionType::Withdrawal, 7).await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p1c_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    assert_eq!(
+        earliest(TransactionType::Deposit).await?,
+        Some(100),
+        "the deleted rows still bound a rerun"
     );
+    assert_eq!(earliest(TransactionType::Withdrawal).await?, Some(7));
+
+    // A partial rebuild above the bound, wiped again by the rerun, must not raise it.
+    seed("dep_rebuilt", TransactionType::Deposit, 300).await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
+
+    seed("dep_lower", TransactionType::Deposit, 50).await?;
+    assert_eq!(earliest(TransactionType::Deposit).await?, Some(50));
+
+    storage
+        .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    sqlx::query("DELETE FROM transactions WHERE transaction_type = 'deposit'")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        earliest(TransactionType::Deposit).await?,
+        None,
+        "a completed resync drops the bound with its marker"
+    );
+    Ok(())
+}
+
+/// P2. An escrow resync deletes only escrow rows; every withdrawal, nonce and journal survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn escrow_wipe_keeps_withdrawal_side() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    seed_both_sides(&pool, &storage).await?;
+    let withdrawals = side_fingerprint(&pool, "withdrawal").await;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p2_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+
+    assert_eq!(side_fingerprint(&pool, "withdrawal").await, withdrawals);
+    assert_eq!(
+        side_fingerprint(&pool, "deposit").await,
+        vec![
+            "checkpoint=None".to_string(),
+            "mints=[\"mint_addr\"]".to_string()
+        ],
+        "deposits, their journals and the escrow checkpoint go; mints stay"
+    );
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_release_signatures WHERE signature = 'dep-done-attempt'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(orphans, 0, "deposit journals go with their rows");
+    assert_eq!(history_rows(&pool).await, 1, "mint history is kept");
+    assert_eq!(marker(&pool).await.as_deref(), Some("escrow"));
+    assert_eq!(
+        active_halt(&pool).await,
+        Some(resync_halt_reason(ProgramType::Escrow)),
+        "the resync halt commits with the marker so older operators stop too"
+    );
+    match storage.ensure_no_unfinished_resync().await {
+        Err(private_channel_indexer::error::StorageError::UnfinishedResync { program }) => {
+            assert_eq!(program, "escrow")
+        }
+        other => panic!("workers must refuse an unfinished resync, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// A resync halt written over a cleared outage row must not be replaceable by a later outage halt.
+#[tokio::test(flavor = "multi_thread")]
+async fn outage_halt_never_replaces_a_resync_halt() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    assert!(storage.set_outage_halt("inputs unavailable").await?);
+    storage.clear_reconciliation_halt().await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "resync_kind",
+        Duration::ZERO,
+    )
+    .await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+
+    assert!(
+        !storage.set_outage_halt("inputs unavailable").await?,
+        "an outage halt must not overwrite the resync halt"
+    );
+    assert_eq!(
+        active_halt(&pool).await,
+        Some(resync_halt_reason(ProgramType::Escrow))
+    );
+    Ok(())
+}
+
+/// P3. A withdraw resync deletes only withdrawals and restarts nonces at 0; escrow data survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn withdraw_wipe_keeps_escrow_side() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    seed_both_sides(&pool, &storage).await?;
+    let deposits = side_fingerprint(&pool, "deposit").await;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p3_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Withdraw)
+        .await?;
+
+    assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'withdrawal'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(left, 0);
+    let journals: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM pending_remint_signatures)
+              + (SELECT COUNT(*) FROM pending_release_signatures WHERE signature LIKE 'wd-%')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(journals, 0, "withdrawal journals go with their rows");
+    let next: i64 = sqlx::query_scalar("SELECT nextval('withdrawal_nonce_seq')")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(next, 0, "the rebuild numbers withdrawals from 0 again");
+    let checkpoint: Option<i64> = sqlx::query_scalar(
+        "SELECT last_committed_slot FROM indexer_state WHERE program_type = 'withdraw'",
+    )
+    .fetch_optional(&pool)
+    .await?
+    .flatten();
+    assert_eq!(checkpoint, None);
+    assert_eq!(marker(&pool).await.as_deref(), Some("withdraw"));
+    assert_eq!(
+        active_halt(&pool).await,
+        Some(resync_halt_reason(ProgramType::Withdraw))
+    );
+    Ok(())
+}
+
+/// P4. A wipe that cannot finish rolls back whole: nothing is deleted and no marker is left.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocked_wipe_leaves_no_marker_and_no_deletes() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    seed_both_sides(&pool, &storage).await?;
+    let deposits = side_fingerprint(&pool, "deposit").await;
+    let withdrawals = side_fingerprint(&pool, "withdrawal").await;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p4_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    // A row lock on a deposit makes the delete wait until the session's lock_timeout fires.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT 1 FROM transactions WHERE signature = 'dep-new' FOR UPDATE")
+        .execute(&mut blocker)
+        .await?;
+
+    let started = std::time::Instant::now();
+    let blocked = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
+    let elapsed = started.elapsed();
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+
+    assert!(
+        is_lock_timeout(&blocked),
+        "a wipe queued behind a row lock must fail with lock_timeout, got {blocked:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the session's lock_timeout must fire, not the client cap; took {elapsed:?}"
+    );
+    assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
+    assert_eq!(side_fingerprint(&pool, "withdrawal").await, withdrawals);
+    assert_eq!(
+        marker(&pool).await,
+        None,
+        "a rolled-back wipe must not leave a marker"
+    );
+    assert_eq!(active_halt(&pool).await, None, "nor a halt");
+    Ok(())
+}
+
+/// P4b. A withdraw wipe that fails after resetting the nonce sequence must leave the sequence
+/// where it was, or the next withdrawal would reuse a nonce the kept rows still hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_withdraw_wipe_keeps_the_nonce_sequence() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    seed_both_sides(&pool, &storage).await?;
+    let withdrawals = side_fingerprint(&pool, "withdrawal").await;
+    let highest: i64 = sqlx::query_scalar(
+        "SELECT MAX(withdrawal_nonce) FROM transactions WHERE transaction_type = 'withdrawal'",
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p4b_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    // The checkpoint delete comes after the reset; a row lock makes it hit lock_timeout.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT 1 FROM indexer_state WHERE program_type = 'withdraw' FOR UPDATE")
+        .execute(&mut blocker)
+        .await?;
+    let blocked = storage
+        .wipe_program_fenced(&guard, ProgramType::Withdraw)
+        .await;
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+
+    assert!(
+        is_lock_timeout(&blocked),
+        "the wipe must fail with lock_timeout, got {blocked:?}"
+    );
+    assert_eq!(side_fingerprint(&pool, "withdrawal").await, withdrawals);
+    assert_eq!(marker(&pool).await, None);
+    assert_eq!(active_halt(&pool).await, None);
+    let next: i64 = sqlx::query_scalar("SELECT nextval('withdrawal_nonce_seq')")
+        .fetch_one(&pool)
+        .await?;
+    assert!(
+        next > highest,
+        "the rolled-back wipe reset the sequence: next {next}, highest kept nonce {highest}"
+    );
+    Ok(())
+}
+
+/// P5. The wipe itself refuses to run under another program's unfinished resync.
+#[tokio::test(flavor = "multi_thread")]
+async fn wipe_refuses_under_other_program_marker() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    seed_both_sides(&pool, &storage).await?;
+    sqlx::query("INSERT INTO resync_state (program_type) VALUES ('withdraw')")
+        .execute(&pool)
+        .await?;
+    let deposits = side_fingerprint(&pool, "deposit").await;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p5_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    let refused = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
+    assert!(
+        matches!(&refused, Err(StorageError::DatabaseError { message }) if message.contains("another program")),
+        "the refusal must carry its own message, got {refused:?}"
+    );
+    assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
+    assert_eq!(marker(&pool).await.as_deref(), Some("withdraw"));
+    assert_eq!(active_halt(&pool).await, None);
+    Ok(())
+}
+
+/// P5b. The wipe must not overwrite a halt someone else set; that halt is evidence to keep.
+#[tokio::test(flavor = "multi_thread")]
+async fn wipe_refuses_over_a_foreign_halt() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    seed_both_sides(&pool, &storage).await?;
+    storage
+        .set_reconciliation_halt("supply above custody")
+        .await?;
+    let deposits = side_fingerprint(&pool, "deposit").await;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p5b_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    let refused = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
+    assert!(
+        matches!(&refused, Err(StorageError::DatabaseError { message }) if message.contains("reconciliation halt")),
+        "the refusal must carry its own message, got {refused:?}"
+    );
+    assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
+    assert_eq!(marker(&pool).await, None);
+    assert_eq!(
+        active_halt(&pool).await.as_deref(),
+        Some("supply above custody")
+    );
+    Ok(())
+}
+
+/// P6. A completed rebuild clears the marker and its own halt together, but never a halt
+/// someone else set in the meantime.
+#[tokio::test(flavor = "multi_thread")]
+async fn success_clear_removes_marker_and_own_halt_only() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p6_resync",
+        Duration::ZERO,
+    )
+    .await?;
+
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    storage
+        .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    assert_eq!(marker(&pool).await, None);
+    assert_eq!(active_halt(&pool).await, None);
+    storage.ensure_no_unfinished_resync().await?;
+
+    // An older operator's reconciliation replaces the reason; that halt must survive the clear.
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    storage
+        .set_reconciliation_halt("supply above custody")
+        .await?;
+    storage
+        .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    assert_eq!(marker(&pool).await, None);
+    assert_eq!(
+        active_halt(&pool).await.as_deref(),
+        Some("supply above custody")
+    );
+    Ok(())
+}
+
+/// P6b. Only a session still holding the lock may clear; after a loss nothing changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_clear_is_fenced() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p6b_resync",
+        Duration::ZERO,
+    )
+    .await?;
+
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+    let cleared = storage
+        .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)
+        .await;
+    assert!(
+        matches!(cleared, Err(StorageError::LiveStateLockLost)),
+        "a dead session is a lost lock, got {cleared:?}"
+    );
+    assert_eq!(marker(&pool).await.as_deref(), Some("escrow"));
+    assert_eq!(
+        active_halt(&pool).await,
+        Some(resync_halt_reason(ProgramType::Escrow))
+    );
+    Ok(())
+}
+
+/// I12. The fenced wipe must still do its job while the lock is genuinely held.
+#[tokio::test(flavor = "multi_thread")]
+async fn fenced_wipe_deletes_own_rows_while_the_lock_is_held(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    seed_both_sides(&pool, &storage).await?;
 
     let guard = take_live_lock(
         &storage,
@@ -3463,23 +4176,30 @@ async fn fenced_drop_removes_the_tables_while_the_lock_is_held(
         Duration::ZERO,
     )
     .await?;
-    storage.drop_tables_fenced(&guard).await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
 
-    assert!(
-        !transactions_table_exists(&pool).await,
-        "a fenced drop under a held lock must remove the schema"
+    let deposits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE transaction_type = 'deposit'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        deposits, 0,
+        "a fenced wipe under a held lock must delete its rows"
     );
     Ok(())
 }
 
 /// I13. Once the lock session is gone the lock is free, so a resync must not be able
-/// to keep dropping: any worker may now be starting.
+/// to keep deleting: any worker may now be starting.
 #[tokio::test(flavor = "multi_thread")]
-async fn fenced_drop_refuses_once_the_lock_session_is_gone(
+async fn fenced_wipe_refuses_once_the_lock_session_is_gone(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, container) = start_postgres().await?;
     let url = container_url(&container).await;
-    storage.init_schema().await?;
+    seed_both_sides(&pool, &storage).await?;
+    let deposits = side_fingerprint(&pool, "deposit").await;
 
     let guard = take_live_lock(
         &storage,
@@ -3490,27 +4210,26 @@ async fn fenced_drop_refuses_once_the_lock_session_is_gone(
     .await?;
     terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
 
+    let refused = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
     assert!(
-        storage.drop_tables_fenced(&guard).await.is_err(),
-        "a drop must not run on a session that no longer holds the lock"
+        matches!(refused, Err(StorageError::LiveStateLockLost)),
+        "a wipe must not run on a session that no longer holds the lock, got {refused:?}"
     );
-    assert!(
-        transactions_table_exists(&pool).await,
-        "the refused drop must leave the schema standing"
-    );
+    assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
+    assert_eq!(marker(&pool).await, None);
     Ok(())
 }
 
-/// I14. The finding this test exists for: a loss verdict can be a false positive, and the
-/// heartbeat deliberately parks the session open afterwards. So the server still reports
-/// the lock as held and a probe alone says "go ahead". Acting on that drops every table
-/// and then refuses to rebuild, because the rebuild watches the same token. The guard has
-/// to refuse on our own verdict, not just on the server's answer.
+/// I14. A loss verdict can be a false positive while the parked session still holds the
+/// lock, so the guard has to refuse on our own verdict, not just on the server's answer.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_false_loss_verdict_refuses_the_drop() -> Result<(), Box<dyn std::error::Error>> {
+async fn a_false_loss_verdict_refuses_the_wipe() -> Result<(), Box<dyn std::error::Error>> {
     let (pool, storage, container) = start_postgres().await?;
     let url = container_url(&container).await;
-    storage.init_schema().await?;
+    seed_both_sides(&pool, &storage).await?;
+    let deposits = side_fingerprint(&pool, "deposit").await;
 
     let lost = CancellationToken::new();
     let guard = storage
@@ -3532,16 +4251,17 @@ async fn a_false_loss_verdict_refuses_the_drop() -> Result<(), Box<dyn std::erro
     );
     assert!(
         guard.ensure_held().await.is_err(),
-        "a lock we can no longer vouch for must fail the check that guards the drop"
+        "a lock we can no longer vouch for must fail the check that guards the wipe"
     );
+    let refused = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
     assert!(
-        storage.drop_tables_fenced(&guard).await.is_err(),
-        "the drop must be refused even though the server still reports the lock held"
+        matches!(refused, Err(StorageError::LiveStateLockLost)),
+        "the wipe must be refused even though the server still reports the lock held, got {refused:?}"
     );
-    assert!(
-        transactions_table_exists(&pool).await,
-        "a refused drop must leave the database intact"
-    );
+    assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
+    assert_eq!(marker(&pool).await, None);
     Ok(())
 }
 
@@ -3564,53 +4284,6 @@ async fn the_lock_session_bounds_its_lock_waits() -> Result<(), Box<dyn std::err
     assert_eq!(
         lock_timeout, "10s",
         "the lock session must bound how long it waits for another session's lock"
-    );
-    Ok(())
-}
-
-/// I16. The same bound, observed through the fenced drop itself: a competing table lock
-/// must make it fail rather than hang. The elapsed time is what says which bound fired,
-/// since the client-side cap is minutes away.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_fenced_drop_blocked_on_a_table_lock_fails_rather_than_hanging(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (pool, storage, container) = start_postgres().await?;
-    let url = container_url(&container).await;
-    storage.init_schema().await?;
-
-    let guard = take_live_lock(
-        &storage,
-        LiveLockMode::Exclusive,
-        "i16_resync",
-        Duration::ZERO,
-    )
-    .await?;
-
-    // A plain read is enough: it takes ACCESS SHARE, which the drop's ACCESS EXCLUSIVE
-    // has to wait out.
-    let mut blocker = pg_connect(&url).await;
-    sqlx::query("BEGIN").execute(&mut blocker).await?;
-    sqlx::query("SELECT 1 FROM transactions LIMIT 1")
-        .execute(&mut blocker)
-        .await?;
-
-    let started = std::time::Instant::now();
-    let blocked = storage.drop_tables_fenced(&guard).await;
-    let elapsed = started.elapsed();
-
-    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
-
-    assert!(
-        blocked.is_err(),
-        "a drop queued behind another session's lock must fail, got {blocked:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(60),
-        "it must be the session's lock_timeout that fired, not the client cap; took {elapsed:?}"
-    );
-    assert!(
-        transactions_table_exists(&pool).await,
-        "a drop that never ran must leave the schema standing"
     );
     Ok(())
 }

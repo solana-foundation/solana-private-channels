@@ -89,6 +89,17 @@ pub async fn execute_user_withdrawal(
     mint: Pubkey,
     total_deposited: u64,
 ) -> Result<UserTransaction, String> {
+    execute_user_withdrawal_to(client, user, mint, total_deposited, user.pubkey()).await
+}
+
+/// Withdraw to `destination`, which may differ from the user (and may have no token account).
+pub async fn execute_user_withdrawal_to(
+    client: &RpcClient,
+    user: &solana_sdk::signer::keypair::Keypair,
+    mint: Pubkey,
+    total_deposited: u64,
+    destination: Pubkey,
+) -> Result<UserTransaction, String> {
     let user_ata =
         get_associated_token_address_with_program_id(&user.pubkey(), &mint, &TOKEN_PROGRAM_ID);
 
@@ -101,7 +112,7 @@ pub async fn execute_user_withdrawal(
     }
     .instruction(WithdrawFundsInstructionArgs {
         amount: total_deposited,
-        destination: Some(user.pubkey()),
+        destination: Some(destination),
     });
 
     let signature =

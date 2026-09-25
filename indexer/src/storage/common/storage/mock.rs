@@ -1,8 +1,8 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
     DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, StoredSig, TransactionStatus,
-    TransactionType,
+    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, StoredSig,
+    TransactionStatus, TransactionType,
 };
 use crate::storage::common::storage::{RemintClaim, RequeueOutcome};
 use bigdecimal::BigDecimal;
@@ -79,6 +79,10 @@ pub struct MockStorage {
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
     /// Mirrors the single-row `reconciliation_halt` table; `None` = not halted.
     pub reconciliation_halt: Arc<Mutex<Option<HaltInfo>>>,
+    /// Mirrors the single-row `resync_state` table: the program whose resync has not finished.
+    pub unfinished_resync: Arc<Mutex<Option<String>>>,
+    /// Mirrors `resync_state.earliest_slot`: the lowest slot an unfinished wipe deleted.
+    pub resync_earliest_slot: Arc<Mutex<Option<i64>>>,
 }
 
 impl MockStorage {
@@ -181,6 +185,63 @@ impl MockStorage {
         self.pending_transactions.lock().unwrap().clear();
         self.mints.lock().unwrap().clear();
         self.committed_checkpoints.lock().unwrap().clear();
+        Ok(())
+    }
+
+    /// Same rules as the Postgres wipe: own-type rows, own checkpoint, marker and halt.
+    pub fn wipe_program(&self, program: crate::config::ProgramType) -> Result<(), StorageError> {
+        self.check_should_fail("wipe_program")?;
+        let key = crate::indexer::checkpoint::program_key(program);
+        let mut marker = self.unfinished_resync.lock().unwrap();
+        if marker.as_ref().is_some_and(|owner| *owner != key) {
+            return Err(StorageError::DatabaseError {
+                message: format!("an unfinished resync of another program owns this database; refusing to wipe {key}"),
+            });
+        }
+        let reason = crate::storage::common::storage::resync_state::resync_halt_reason(program);
+        let mut halt = self.reconciliation_halt.lock().unwrap();
+        if halt.as_ref().is_some_and(|h| h.reason != reason) {
+            return Err(StorageError::DatabaseError {
+                message: format!("a reconciliation halt is already set; refusing to wipe {key}"),
+            });
+        }
+        *halt = Some(HaltInfo {
+            reason,
+            halted_at: Utc::now(),
+            insolvency: true,
+        });
+        *marker = Some(key.clone());
+        let own = program.owned_transaction_type();
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let deleted = rows
+            .iter()
+            .filter(|t| t.transaction_type == own)
+            .map(|t| t.slot);
+        let mut bound = self.resync_earliest_slot.lock().unwrap();
+        *bound = bound.iter().copied().chain(deleted).min();
+        rows.retain(|t| t.transaction_type != own);
+        self.committed_checkpoints.lock().unwrap().remove(&key);
+        Ok(())
+    }
+
+    pub fn get_unfinished_resync(&self) -> Result<Option<String>, StorageError> {
+        self.check_should_fail("get_unfinished_resync")?;
+        Ok(self.unfinished_resync.lock().unwrap().clone())
+    }
+
+    /// Clears the marker and only this resync's own halt, like the Postgres clear.
+    pub fn clear_unfinished_resync(
+        &self,
+        program: crate::config::ProgramType,
+    ) -> Result<(), StorageError> {
+        self.check_should_fail("clear_unfinished_resync")?;
+        *self.unfinished_resync.lock().unwrap() = None;
+        *self.resync_earliest_slot.lock().unwrap() = None;
+        let reason = crate::storage::common::storage::resync_state::resync_halt_reason(program);
+        let mut halt = self.reconciliation_halt.lock().unwrap();
+        if halt.as_ref().is_some_and(|h| h.reason == reason) {
+            *halt = None;
+        }
         Ok(())
     }
 
@@ -557,6 +618,62 @@ impl MockStorage {
             insolvency: false,
         });
         Ok(true)
+    }
+
+    /// Same rules as the Postgres query: own-type in-flight rows, failed withdrawals, observed releases.
+    pub fn get_resync_blockers(
+        &self,
+        own: TransactionType,
+    ) -> Result<ResyncBlockers, StorageError> {
+        self.check_should_fail("get_resync_blockers")?;
+        // Taken before the rows, in the same lock order as `wipe_program`.
+        let own_program = match own {
+            TransactionType::Deposit => crate::config::ProgramType::Escrow,
+            TransactionType::Withdrawal => crate::config::ProgramType::Withdraw,
+        };
+        let marker_bound = match self.unfinished_resync.lock().unwrap().as_deref() {
+            Some(key) if key == crate::indexer::checkpoint::program_key(own_program) => {
+                *self.resync_earliest_slot.lock().unwrap()
+            }
+            _ => None,
+        };
+        let journaled = |id: i64| {
+            let has = |map: &Arc<Mutex<ReleaseSignatureMap>>| {
+                map.lock()
+                    .unwrap()
+                    .get(&id)
+                    .is_some_and(|sigs| !sigs.is_empty())
+            };
+            has(&self.release_signatures) || has(&self.remint_signatures)
+        };
+        let rows = self.pending_transactions.lock().unwrap();
+        let unsettled_work = rows.iter().any(|t| {
+            t.transaction_type == own
+                && match t.status {
+                    TransactionStatus::Processing
+                    | TransactionStatus::PendingRemint
+                    | TransactionStatus::ManualReview => true,
+                    TransactionStatus::Completed
+                    | TransactionStatus::Failed
+                    | TransactionStatus::FailedReminted => false,
+                    TransactionStatus::Pending | TransactionStatus::Parked => journaled(t.id),
+                }
+        });
+        let failed_withdrawals = rows.iter().any(|t| {
+            t.transaction_type == TransactionType::Withdrawal
+                && t.status == TransactionStatus::Failed
+        });
+        Ok(ResyncBlockers {
+            unsettled_work,
+            failed_withdrawals,
+            observed_releases: !self.observed_releases.lock().unwrap().is_empty(),
+            earliest_slot: rows
+                .iter()
+                .filter(|t| t.transaction_type == own)
+                .map(|t| t.slot)
+                .chain(marker_bound)
+                .min(),
+        })
     }
 
     pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {

@@ -17,7 +17,7 @@ cutover - drain the operator and follow the cutover runbook
 
 The error surfaces as `ReconciliationError::ConsumedSetUnavailable`.
 
-**Nothing has been destroyed.** The consumed-set is built before the resync drops
+**Nothing has been destroyed.** The consumed-set is built before the resync deletes
 any state, so the abort leaves the database exactly as it was. There is no data
 loss to recover from and no rush.
 
@@ -91,6 +91,12 @@ use the slot after it as the resync genesis.
 
 This is safe precisely because the deposits before that point were already
 serviced: they are not in the rebuilt window, so they cannot be replayed.
+
+Resync refuses this genesis if the program still holds a row below it, since the
+delete would drop that row and the rebuild would never replay it. Check with
+`SELECT MIN(slot) FROM transactions WHERE transaction_type = '<deposit|withdrawal>'`.
+If the earliest row is below the cutover there is no supported resync; escalate
+rather than deleting rows by hand.
 
 ### 4. Resync
 

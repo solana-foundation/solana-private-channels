@@ -513,6 +513,10 @@ pub async fn run(
         .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
 
     under_live_lock(&live_lock_lost, storage.init_schema()).await?;
+    // A resync that deleted rows and died no longer holds the lock; its marker is what stops us.
+    under_live_lock(&live_lock_lost, storage.ensure_no_unfinished_resync())
+        .await
+        .inspect_err(|e| error!("Indexer refusing to start: {}", e))?;
     info!("Storage initialized");
 
     // 2. Validate the escrow reconciliation wiring before doing any work.
