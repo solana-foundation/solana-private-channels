@@ -2368,92 +2368,117 @@ enum Refusal {
     OtherMarker,
 }
 
+/// The unsafe state a refusal case starts from, so each case carries its own setup.
+#[derive(Debug, Clone, Copy)]
+enum Seed {
+    /// One row of this type in this status.
+    Tx(&'static str, &'static str),
+    /// One row of this type in this status, with a broadcast attempt journaled for it.
+    JournaledTx(&'static str, &'static str),
+    /// An observed release and no withdrawal row.
+    Observed,
+    /// Escrow data plus another program's unfinished resync.
+    OtherMarker,
+}
+
+struct RefusalCase {
+    name: &'static str,
+    program: ProgramType,
+    seed: Seed,
+    expected: Refusal,
+}
+
+async fn seed_refusal(db_url: &str, seed: Seed) {
+    match seed {
+        Seed::Tx(ty, status) => {
+            seed_tx(db_url, "row", ty, status).await;
+        }
+        Seed::JournaledTx(ty, status) => {
+            let id = seed_tx(db_url, "row", ty, status).await;
+            seed_journal(db_url, "pending_release_signatures", id, "row-attempt").await;
+        }
+        Seed::Observed => {
+            seed_sql(db_url, "INSERT INTO observed_releases (withdrawal_nonce, signature, slot) VALUES (4, 'o', 1)").await;
+        }
+        Seed::OtherMarker => {
+            seed_escrow_side(db_url).await;
+            seed_sql(
+                db_url,
+                "INSERT INTO resync_state (program_type) VALUES ('withdraw')",
+            )
+            .await;
+        }
+    }
+}
+
 /// IT-G1: each unsafe state refuses before any RPC, and leaves both programs' data and
 /// the marker exactly as they were.
 #[tokio::test(flavor = "multi_thread")]
 async fn resync_refuses_unsafe_database_before_any_rpc() -> Result<(), Box<dyn std::error::Error>> {
     let (db_url, _storage, _container) = start_postgres_for_resync("resync_gates").await?;
-    let cases: [(&str, ProgramType, Refusal); 8] = [
-        (
-            "withdraw: processing withdrawal",
-            ProgramType::Withdraw,
-            Refusal::Unsettled,
-        ),
-        (
-            "withdraw: journaled pending withdrawal",
-            ProgramType::Withdraw,
-            Refusal::Unsettled,
-        ),
-        (
-            "withdraw: pending remint",
-            ProgramType::Withdraw,
-            Refusal::Unsettled,
-        ),
-        (
-            "escrow: processing deposit",
-            ProgramType::Escrow,
-            Refusal::Unsettled,
-        ),
-        (
-            "escrow: journaled pending deposit",
-            ProgramType::Escrow,
-            Refusal::Unsettled,
-        ),
-        (
-            "withdraw: failed withdrawal",
-            ProgramType::Withdraw,
-            Refusal::ReleaseEvidence,
-        ),
-        (
-            "withdraw: observed release",
-            ProgramType::Withdraw,
-            Refusal::ReleaseEvidence,
-        ),
-        (
-            "escrow: withdraw resync unfinished",
-            ProgramType::Escrow,
-            Refusal::OtherMarker,
-        ),
+    let cases = [
+        RefusalCase {
+            name: "withdraw: processing withdrawal",
+            program: ProgramType::Withdraw,
+            seed: Seed::Tx("withdrawal", "processing"),
+            expected: Refusal::Unsettled,
+        },
+        RefusalCase {
+            name: "withdraw: journaled pending withdrawal",
+            program: ProgramType::Withdraw,
+            seed: Seed::JournaledTx("withdrawal", "pending"),
+            expected: Refusal::Unsettled,
+        },
+        RefusalCase {
+            name: "withdraw: pending remint",
+            program: ProgramType::Withdraw,
+            seed: Seed::Tx("withdrawal", "pending_remint"),
+            expected: Refusal::Unsettled,
+        },
+        RefusalCase {
+            name: "escrow: processing deposit",
+            program: ProgramType::Escrow,
+            seed: Seed::Tx("deposit", "processing"),
+            expected: Refusal::Unsettled,
+        },
+        RefusalCase {
+            name: "escrow: journaled pending deposit",
+            program: ProgramType::Escrow,
+            seed: Seed::JournaledTx("deposit", "pending"),
+            expected: Refusal::Unsettled,
+        },
+        RefusalCase {
+            name: "withdraw: failed withdrawal",
+            program: ProgramType::Withdraw,
+            seed: Seed::Tx("withdrawal", "failed"),
+            expected: Refusal::ReleaseEvidence,
+        },
+        RefusalCase {
+            name: "withdraw: observed release",
+            program: ProgramType::Withdraw,
+            seed: Seed::Observed,
+            expected: Refusal::ReleaseEvidence,
+        },
+        RefusalCase {
+            name: "escrow: withdraw resync unfinished",
+            program: ProgramType::Escrow,
+            seed: Seed::OtherMarker,
+            expected: Refusal::OtherMarker,
+        },
     ];
-    for (i, (case, program, expected)) in cases.into_iter().enumerate() {
+    for RefusalCase {
+        name: case,
+        program,
+        seed,
+        expected,
+    } in cases
+    {
         seed_sql(
             &db_url,
             "TRUNCATE transactions, observed_releases, resync_state, indexer_state, mints CASCADE",
         )
         .await;
-        match i {
-            0 => {
-                seed_tx(&db_url, "w", "withdrawal", "processing").await;
-            }
-            1 => {
-                let id = seed_tx(&db_url, "w", "withdrawal", "pending").await;
-                seed_journal(&db_url, "pending_release_signatures", id, "w-attempt").await;
-            }
-            2 => {
-                seed_tx(&db_url, "w", "withdrawal", "pending_remint").await;
-            }
-            3 => {
-                seed_tx(&db_url, "d", "deposit", "processing").await;
-            }
-            4 => {
-                let id = seed_tx(&db_url, "d", "deposit", "pending").await;
-                seed_journal(&db_url, "pending_release_signatures", id, "d-attempt").await;
-            }
-            5 => {
-                seed_tx(&db_url, "w", "withdrawal", "failed").await;
-            }
-            6 => {
-                seed_sql(&db_url, "INSERT INTO observed_releases (withdrawal_nonce, signature, slot) VALUES (4, 'o', 1)").await;
-            }
-            _ => {
-                seed_escrow_side(&db_url).await;
-                seed_sql(
-                    &db_url,
-                    "INSERT INTO resync_state (program_type) VALUES ('withdraw')",
-                )
-                .await;
-            }
-        }
+        seed_refusal(&db_url, seed).await;
         let deposits = side_fingerprint(&db_url, "deposit").await;
         let withdrawals = side_fingerprint(&db_url, "withdrawal").await;
         let before = marker(&db_url).await;
@@ -3295,6 +3320,165 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
         supply_before + DEPOSIT_AMOUNT,
         "only the new deposit is minted"
     );
+    Ok(())
+}
+
+/// Withdrawal nonces in chain order, and the nonce the sequence hands out next.
+async fn withdrawal_nonces(db_url: &str) -> (Vec<(String, Option<i64>)>, i64) {
+    let pool = fresh_pool(db_url).await;
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT signature, withdrawal_nonce FROM transactions \
+         WHERE transaction_type = 'withdrawal' ORDER BY slot, instruction_index",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read withdrawal nonces");
+    // Read without nextval so checking the sequence does not move it.
+    let (last, called): (i64, bool) =
+        sqlx::query_as("SELECT last_value, is_called FROM withdrawal_nonce_seq")
+            .fetch_one(&pool)
+            .await
+            .expect("read the nonce sequence");
+    (rows, if called { last + 1 } else { last })
+}
+
+/// E2E-3b (94, withdraw): a withdraw resync killed after rebuilding a reminted withdrawal leaves
+/// a partial failed_reminted row behind; the rerun passes every gate and renumbers from 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_interrupted_withdraw_resync_reruns_cleanly() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (validator, faucet) = start_test_validator_no_geyser().await;
+    let rpc_url = validator.rpc_url();
+    let client = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("e2e_interrupted_withdraw").await?;
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    let user = &env.users[0];
+
+    // Slot gaps between withdrawals, so the kill lands after the first row and before the last.
+    let mut withdrawals = Vec::new();
+    for _ in 0..3 {
+        let w = helpers::execute_user_withdrawal(&client, user, env.mint, WITHDRAW_AMOUNT)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        wait_for_finalized_slot(&rpc_url, client.get_slot().await? + MIN_FILL_SLOTS).await;
+        withdrawals.push(w.signature);
+    }
+
+    let mock = MockRpcServer::start().await;
+    let h = Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: rpc_url.clone(),
+        program_type: ProgramType::Withdraw,
+        instance: Some(env.instance),
+        channel_url: mock.url(),
+        genesis,
+    };
+    let keys = h.discover().await;
+    let reminted = keys
+        .iter()
+        .find(|k| k.signature == withdrawals[0])
+        .expect("the first withdrawal was indexed")
+        .clone();
+    script_channel_consumed(
+        &mock,
+        &[(&reminted, ConsumedMintKind::Remint, Signature::new_unique())],
+    );
+
+    // One slot per round trip and a fast heartbeat, so the kill lands while the fill runs.
+    let service = ResyncService::new(
+        new_storage(&db_url).await,
+        Arc::new(RpcPoller::new(
+            rpc_url.clone(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        )),
+        ProgramType::Withdraw,
+        BackfillConfig {
+            enabled: true,
+            exit_after_backfill: true,
+            rpc_url: rpc_url.clone(),
+            batch_size: 1,
+            max_gap_slots: u64::MAX,
+            start_slot: None,
+        },
+        Some(env.instance),
+    )
+    .with_channel_reconcile(ChannelReconcileConfig {
+        channel_rpc_url: mock.url(),
+        authority: CHANNEL_AUTHORITY,
+    })
+    .with_withdrawal_bitmap_rpc(rpc_url.clone())
+    .with_lock_heartbeat_interval(Duration::from_millis(5));
+    let killer_url = db_url.clone();
+    let reminted_signature = reminted.signature.clone();
+    let killer = tokio::spawn(async move {
+        let pool = fresh_pool(&killer_url).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            // Kill once the marker is set and the reminted row exists; return the withdrawal count.
+            let rows: Option<i64> = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM transactions WHERE transaction_type = 'withdrawal' \
+                 AND EXISTS (SELECT 1 FROM resync_state) \
+                 HAVING bool_or(signature = $1)",
+            )
+            .bind(&reminted_signature)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            if let Some(rows) = rows {
+                terminate_live_lock_holder(&pool).await;
+                return Some(rows);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let aborted = service.run(genesis).await;
+    let rows_at_kill = killer
+        .await?
+        .expect("the rebuild never wrote the reminted row");
+    assert!(
+        matches!(
+            aborted,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "a lock lost mid-rebuild must abort, got {aborted:?}"
+    );
+    assert!(
+        rows_at_kill < 3,
+        "the kill must land mid-rebuild, saw {rows_at_kill} rows"
+    );
+    assert_eq!(marker(&db_url).await.as_deref(), Some("withdraw"));
+    assert_eq!(
+        active_halt(&db_url).await,
+        Some(resync_halt_reason(ProgramType::Withdraw))
+    );
+
+    // The rerun has to pass wipe_blocker and the bitmap check over the partial rows.
+    h.run()
+        .await
+        .expect("a same-program rerun must finish the interrupted withdraw resync");
+    assert_eq!(marker(&db_url).await, None);
+    assert_eq!(active_halt(&db_url).await, None);
+    let (rows, next) = withdrawal_nonces(&db_url).await;
+    let expected: Vec<(String, Option<i64>)> = withdrawals
+        .iter()
+        .enumerate()
+        .map(|(n, sig)| (sig.clone(), Some(n as i64)))
+        .collect();
+    assert_eq!(rows, expected, "nonces restart at 0 in chain order");
+    assert_eq!(next, 3, "the next withdrawal takes nonce 3");
+    assert_eq!(
+        status_of(&db_url, &reminted).await.status,
+        "failed_reminted"
+    );
+    assert_eq!(pending_count(&db_url).await, 2);
+
+    mock.shutdown().await;
     Ok(())
 }
 

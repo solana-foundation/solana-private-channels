@@ -121,6 +121,25 @@ status. Work any `manual_review` row to a conclusion. Then stop every worker and
 is no override. Rows of the other program never block it: the resync leaves them, and
 their journals, untouched.
 
+## Symptom 5b: resync fails while deleting rows or clearing its marker
+
+The delete and the final marker clear run on the lock session. A failure there keeps
+its own cause instead of reading as a lost lock:
+
+- `Database error: an unfinished resync of another program owns this database` or
+  `Database error: a reconciliation halt is already set`: the delete refused before
+  changing anything. Handle it as Symptom 4 or Symptom 3.
+- `Query execution failed: ... canceling statement due to lock timeout`: another
+  session held a row lock the delete needed for longer than the lock session's
+  `lock_timeout` (10s). Nothing was committed. Find the holder in `pg_locks` and rerun.
+- `fenced work did not finish within 300s ... and was abandoned`: the delete ran past its
+  cap, roughly the time to delete about 10M rows with their journals. Rerun once. If it
+  times out again, the program has too many rows for one resync; escalate, since raising
+  the cap is a code change.
+
+Only `live-state lock ownership could not be proven` means the session or the lock was
+lost; that is Symptom 6.
+
 ## Symptom 6: `live-state-lock-lost` alert
 
 `private_channel_live_state_lock_lost_total` increased. A role could not prove it

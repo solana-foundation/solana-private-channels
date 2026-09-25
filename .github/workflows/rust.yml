@@ -28,6 +28,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Skipped jobs report Success, so without this a fork PR would look green with nothing run.
+  fork-gate:
+    name: Fork PR Gate
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a maintainer to run CI
+        run: |
+          echo "::error::Fork PR: CI did not run. A maintainer must push this branch to the repo to run it."
+          exit 1
+
   # Private-runner jobs skip fork PRs: that runner only runs code from this repo's branches.
   init-coverage-table:
     name: Initialize Coverage Table

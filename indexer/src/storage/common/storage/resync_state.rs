@@ -31,7 +31,9 @@ pub async fn clear_unfinished_resync_fenced(
     match storage {
         Storage::Postgres(_) => {
             lock.run_fenced(move |conn| {
-                Box::pin(PostgresDb::clear_unfinished_resync_on(conn, program))
+                Box::pin(
+                    async move { Ok(PostgresDb::clear_unfinished_resync_on(conn, program).await?) },
+                )
             })
             .await
         }

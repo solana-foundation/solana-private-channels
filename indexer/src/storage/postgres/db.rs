@@ -1090,7 +1090,7 @@ impl PostgresDb {
     pub async fn wipe_program_on(
         conn: &mut PgConnection,
         program: ProgramType,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), StorageError> {
         let key = program_key(program);
         info!(program = %key, "Deleting this program's rows for the rebuild...");
         let mut tx = conn.begin().await?;
@@ -1106,9 +1106,11 @@ impl PostgresDb {
         .await?
         .rows_affected();
         if claimed != 1 {
-            return Err(sqlx::Error::Protocol(format!(
-                "an unfinished resync of another program owns this database; refusing to wipe {key}"
-            )));
+            return Err(StorageError::DatabaseError {
+                message: format!(
+                    "an unfinished resync of another program owns this database; refusing to wipe {key}"
+                ),
+            });
         }
 
         // Operators that predate the marker still honour the halt and stop fetching value work.
@@ -1126,9 +1128,9 @@ impl PostgresDb {
         .await?
         .rows_affected();
         if halted != 1 {
-            return Err(sqlx::Error::Protocol(format!(
-                "a reconciliation halt is already set; refusing to wipe {key}"
-            )));
+            return Err(StorageError::DatabaseError {
+                message: format!("a reconciliation halt is already set; refusing to wipe {key}"),
+            });
         }
 
         // Journals go with their rows through ON DELETE CASCADE.

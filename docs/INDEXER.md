@@ -118,7 +118,7 @@ if anything fails. It is guarded these ways.
    it for the entire rebuild. Postgres enforces the separation: workers coexist freely,
    resync refuses to start while any worker is up, and a worker refuses to start while
    a resync runs. Ownership is re-proved on a heartbeat, and once more synchronously
-   immediately before the tables are dropped. A role that cannot prove it still owns
+   immediately before the rows are deleted. A role that cannot prove it still owns
    the lock stops itself. A probe that goes unanswered is not treated as proof: the
    server may simply be slow, and the session still holds the lock while we retry, so
    the timeout is tolerated for 30s. An answer of "not held", or a dead session, is
@@ -141,6 +141,13 @@ if anything fails. It is guarded these ways.
    indexers and operators refuse to start, and operators built before the marker stop
    fetching because of the halt, until the same program's resync is rerun to completion.
    A resync refuses under any halt except its own next to its own marker.
+
+The delete runs in one transaction on the lock session and is capped at 300s. Measured at
+roughly 30k deposit rows a second with one journal each (6s for 200k rows, 30s for 1M), so
+the cap covers about 5M rows with room to spare. A delete past the cap is abandoned and
+reports `fenced work did not finish`; waits on another session's row locks are cut sooner,
+at the lock session's 10s `lock_timeout`. Failures there keep their own cause, and only
+`live-state lock ownership could not be proven` means the lock was lost.
 
 The lock session sets its own TCP keepalives, so a holder whose host vanishes is reaped
 by Postgres in under two minutes instead of the OS default of roughly two hours. Without

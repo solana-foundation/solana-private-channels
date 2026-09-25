@@ -18,6 +18,13 @@ pub enum StorageError {
     #[error("live-state lock ownership could not be proven")]
     LiveStateLockLost,
 
+    /// Work on the live-state lock session ran past its cap and was abandoned.
+    #[error(
+        "fenced work did not finish within {secs}s on the live-state lock session and was \
+         abandoned; rerun it (see docs/runbooks/live_state_lock_runbook.md)"
+    )]
+    FencedWorkTimedOut { secs: u64 },
+
     /// A resync deleted rows and did not finish rebuilding them, so the database is incomplete.
     #[error(
         "an unfinished {program} resync owns this database; rerun resync for {program} \

@@ -3137,6 +3137,11 @@ async fn active_halt(pool: &PgPool) -> Option<String> {
         .expect("halt read")
 }
 
+/// A fenced statement that waited out the lock_timeout, reported as the query's own error.
+fn is_lock_timeout(result: &Result<(), StorageError>) -> bool {
+    matches!(result, Err(StorageError::QueryFailed(sqlx::Error::Database(db))) if db.code().as_deref() == Some("55P03"))
+}
+
 async fn history_rows(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM mint_status_history")
         .fetch_one(pool)
@@ -3345,8 +3350,8 @@ async fn blocked_wipe_leaves_no_marker_and_no_deletes() -> Result<(), Box<dyn st
     sqlx::query("ROLLBACK").execute(&mut blocker).await?;
 
     assert!(
-        blocked.is_err(),
-        "a wipe queued behind a row lock must fail, got {blocked:?}"
+        is_lock_timeout(&blocked),
+        "a wipe queued behind a row lock must fail with lock_timeout, got {blocked:?}"
     );
     assert!(
         elapsed < Duration::from_secs(60),
@@ -3395,7 +3400,10 @@ async fn failed_withdraw_wipe_keeps_the_nonce_sequence() -> Result<(), Box<dyn s
         .await;
     sqlx::query("ROLLBACK").execute(&mut blocker).await?;
 
-    assert!(blocked.is_err(), "the wipe must fail, got {blocked:?}");
+    assert!(
+        is_lock_timeout(&blocked),
+        "the wipe must fail with lock_timeout, got {blocked:?}"
+    );
     assert_eq!(side_fingerprint(&pool, "withdrawal").await, withdrawals);
     assert_eq!(marker(&pool).await, None);
     assert_eq!(active_halt(&pool).await, None);
@@ -3426,10 +3434,13 @@ async fn wipe_refuses_under_other_program_marker() -> Result<(), Box<dyn std::er
         Duration::ZERO,
     )
     .await?;
-    assert!(storage
+    let refused = storage
         .wipe_program_fenced(&guard, ProgramType::Escrow)
-        .await
-        .is_err());
+        .await;
+    assert!(
+        matches!(&refused, Err(StorageError::DatabaseError { message }) if message.contains("another program")),
+        "the refusal must carry its own message, got {refused:?}"
+    );
     assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
     assert_eq!(marker(&pool).await.as_deref(), Some("withdraw"));
     assert_eq!(active_halt(&pool).await, None);
@@ -3453,10 +3464,13 @@ async fn wipe_refuses_over_a_foreign_halt() -> Result<(), Box<dyn std::error::Er
         Duration::ZERO,
     )
     .await?;
-    assert!(storage
+    let refused = storage
         .wipe_program_fenced(&guard, ProgramType::Escrow)
-        .await
-        .is_err());
+        .await;
+    assert!(
+        matches!(&refused, Err(StorageError::DatabaseError { message }) if message.contains("reconciliation halt")),
+        "the refusal must carry its own message, got {refused:?}"
+    );
     assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
     assert_eq!(marker(&pool).await, None);
     assert_eq!(
@@ -3525,10 +3539,13 @@ async fn marker_clear_is_fenced() -> Result<(), Box<dyn std::error::Error>> {
         .wipe_program_fenced(&guard, ProgramType::Escrow)
         .await?;
     terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
-    assert!(storage
+    let cleared = storage
         .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)
-        .await
-        .is_err());
+        .await;
+    assert!(
+        matches!(cleared, Err(StorageError::LiveStateLockLost)),
+        "a dead session is a lost lock, got {cleared:?}"
+    );
     assert_eq!(marker(&pool).await.as_deref(), Some("escrow"));
     assert_eq!(
         active_halt(&pool).await,
@@ -3585,12 +3602,12 @@ async fn fenced_wipe_refuses_once_the_lock_session_is_gone(
     .await?;
     terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
 
+    let refused = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
     assert!(
-        storage
-            .wipe_program_fenced(&guard, ProgramType::Escrow)
-            .await
-            .is_err(),
-        "a wipe must not run on a session that no longer holds the lock"
+        matches!(refused, Err(StorageError::LiveStateLockLost)),
+        "a wipe must not run on a session that no longer holds the lock, got {refused:?}"
     );
     assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
     assert_eq!(marker(&pool).await, None);
@@ -3628,12 +3645,12 @@ async fn a_false_loss_verdict_refuses_the_wipe() -> Result<(), Box<dyn std::erro
         guard.ensure_held().await.is_err(),
         "a lock we can no longer vouch for must fail the check that guards the wipe"
     );
+    let refused = storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await;
     assert!(
-        storage
-            .wipe_program_fenced(&guard, ProgramType::Escrow)
-            .await
-            .is_err(),
-        "the wipe must be refused even though the server still reports the lock held"
+        matches!(refused, Err(StorageError::LiveStateLockLost)),
+        "the wipe must be refused even though the server still reports the lock held, got {refused:?}"
     );
     assert_eq!(side_fingerprint(&pool, "deposit").await, deposits);
     assert_eq!(marker(&pool).await, None);
