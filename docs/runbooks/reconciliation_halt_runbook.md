@@ -95,16 +95,18 @@ Any tick that reads everything resets the count. A lagging escrow checkpoint is
 not a dark tick; it stays on the liability-dark alert described above. A
 checkpoint that cannot be read at all during the wait is a dark tick.
 
-This halt sets the flag, forces `/health` to 503 and posts a webhook with
-`halt_reason` and `dark_ticks`, but it does **not** quarantine withdrawals: nothing
-is proven wrong, and the flag alone already blocks every send. Typical causes are
+This halt sets the flag, forces `/health` to 503 once the flag has been written, and
+posts a webhook with `halt_reason` and `dark_ticks`, but it does **not** quarantine
+withdrawals: nothing is proven wrong, and the flag alone already blocks every send. Typical causes are
 a Solana RPC or DB outage, a channel node that is down, frozen or more than 120 s
 behind, more than 120 s of clock skew either way between the channel write node
 and the operator, or an unreadable `mints` row. Restore the input first. Clearing
 the flag while the input is still unreadable halts again on the next tick. If the
 flag write itself fails, the operator retries it within the tick and again on
-later ticks until it lands. The halt webhook fires once per incident, not on
-every retry.
+later ticks until it lands. `/health` is only forced to 503 once the flag has
+landed, because that latch lasts until a restart; until then the webhook, the
+`input_dark_ticks` gauge and its alert are what page. The halt webhook fires once
+per incident, not on every retry.
 
 An inputs-dark halt never replaces an insolvency halt: if the flag already holds
 an insolvency, it is left as it is, reason included. The other way round, a

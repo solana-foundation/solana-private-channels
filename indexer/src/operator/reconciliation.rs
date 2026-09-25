@@ -973,7 +973,8 @@ async fn freeze_pipelines(
             Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
         }
     }
-    if let Some(h) = health {
+    // The latch never clears, so it waits for a flag that is really set.
+    if let (Some(h), Some(_)) = (health, in_force) {
         h.force_unhealthy(reason.to_string());
     }
     in_force
@@ -3981,6 +3982,33 @@ mod tests {
         alert.assert_async().await;
     }
 
+    /// One tick like `run_tick_full`, but with a health handle so the forced-unhealthy latch shows.
+    async fn tick_with_health(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        health: &Arc<HealthState>,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        input_dark: &mut u32,
+    ) {
+        let _ = perform_reconciliation_check(
+            &env.storage,
+            config,
+            &fast_rpc(env.custody.url()),
+            &fast_rpc(env.channel.url()),
+            test_instance(),
+            &test_webhook_client(),
+            &Some(health.clone()),
+            &mut None,
+            counters,
+            halted,
+            &mut 0,
+            input_dark,
+            &CancellationToken::new(),
+        )
+        .await;
+    }
+
     /// A breach confirmed while an outage halt holds still quarantines, pages as an insolvency,
     /// and replaces the stored reason, so clearing the outage cannot release a drained mint.
     #[tokio::test]
@@ -4073,6 +4101,50 @@ mod tests {
             0,
             "no outage page over an insolvency"
         );
+    }
+
+    /// Health is forced unhealthy only once the flag has landed, since that latch never clears.
+    #[tokio::test]
+    async fn health_is_forced_only_once_the_halt_flag_lands() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome};
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Envelope, true).await;
+        env.mock.set_should_fail("set_outage_halt", true);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let health = HealthState::new(HealthConfig::operator());
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS + 1 {
+            tick_with_health(
+                &env,
+                &config,
+                &health,
+                &mut counters,
+                &mut halted,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert!(
+            !matches!(health.check(), HealthOutcome::ForcedUnhealthy { .. }),
+            "an unwritten halt must not latch health"
+        );
+
+        env.mock.set_should_fail("set_outage_halt", false);
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        tick_with_health(
+            &env,
+            &config,
+            &health,
+            &mut counters,
+            &mut halted,
+            &mut input_dark,
+        )
+        .await;
+        assert!(matches!(
+            health.check(),
+            HealthOutcome::ForcedUnhealthy { .. }
+        ));
     }
 
     /// With no mints there is no supply to read, so an unreachable channel is not a dark tick.
