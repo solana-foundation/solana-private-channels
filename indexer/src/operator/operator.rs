@@ -6,7 +6,9 @@ use crate::operator::{
     DbTransactionWriter, RetryConfig, RpcClientWithRetry,
 };
 use crate::shutdown_utils::{shutdown_operator, stop_signal, StopReason};
-use crate::storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL};
+use crate::storage::common::storage::live_lock::{
+    under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
+};
 use crate::storage::Storage;
 use crate::PrivateChannelIndexerConfig;
 use private_channel_metrics::{HealthState, MetricLabel};
@@ -97,10 +99,9 @@ pub async fn run(
 
     // Moved here from the binary so it runs under the lock, never against tables a
     // resync is dropping.
-    storage.init_schema().await?;
+    under_live_lock(&live_lock_lost, storage.init_schema()).await?;
     // A resync that deleted rows and died no longer holds the lock; its marker is what stops us.
-    storage
-        .ensure_no_unfinished_resync()
+    under_live_lock(&live_lock_lost, storage.ensure_no_unfinished_resync())
         .await
         .inspect_err(|e| error!("Operator refusing to start: {}", e))?;
 
@@ -139,12 +140,16 @@ pub async fn run(
 
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require
     // an independent, same-cluster, reachable fallback before starting.
-    validate_withdraw_fallback(
-        common_config.program_type,
-        &rpc_client,
-        fallback_rpc_client.as_deref(),
-        &common_config.rpc_url,
-        normalized_fallback_url,
+    // Also the last lock check before the storage writer starts, for every program type.
+    under_live_lock(
+        &live_lock_lost,
+        validate_withdraw_fallback(
+            common_config.program_type,
+            &rpc_client,
+            fallback_rpc_client.as_deref(),
+            &common_config.rpc_url,
+            normalized_fallback_url,
+        ),
     )
     .await?;
 
@@ -189,13 +194,16 @@ pub async fn run(
     // database never recorded, is repaired in place and startup continues.
     if program_type == crate::config::ProgramType::Withdraw {
         // The main rpc_client is the chain where the instance and releases live.
-        let preflight = run_withdraw_preflight(
-            &storage,
-            &rpc_client,
-            fallback_rpc_client.as_deref(),
-            escrow_instance,
-            &storage_tx,
-            &cancellation_token,
+        let preflight = under_live_lock(
+            &live_lock_lost,
+            run_withdraw_preflight(
+                &storage,
+                &rpc_client,
+                fallback_rpc_client.as_deref(),
+                escrow_instance,
+                &storage_tx,
+                &cancellation_token,
+            ),
         )
         .await
         // Only a lost sender lock cancels the token this early. Its fenced writes
@@ -209,22 +217,21 @@ pub async fn run(
         });
 
         if let Err(e) = preflight {
-            error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
-            // Drop the sole storage_tx so the writer's recv() returns None and
-            // the task exits, then await it so the reconcile's queued
-            // ManualReview alerts are flushed before we return. The writer
-            // watches only its channel, not the cancellation token, so without
-            // this drop the await would block forever. No storage_tx clones
-            // exist yet: the processor/sender/recovery senders are created
-            // after this block.
-            cancellation_token.cancel();
-            drop(storage_tx);
-            if let Err(join_err) = storage_writer_handle.await {
+            // A separate line so a lost lock is not read as a bitmap or RPC failure.
+            if live_lock_lost.is_cancelled() {
                 error!(
-                    "Storage writer join error during refuse-to-start: {}",
-                    join_err
+                    "Live-state lock lost during the withdraw boot pre-flight; refusing to start"
                 );
+            } else {
+                error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
             }
+            stop_boot_writer(
+                &live_lock_lost,
+                &cancellation_token,
+                storage_tx,
+                storage_writer_handle,
+            )
+            .await;
             return Err(e);
         }
     }
@@ -726,6 +733,31 @@ async fn stop_without_draining(cancellation_token: &CancellationToken, workers: 
     crate::shutdown_utils::abort_and_await_writers(workers).await;
 }
 
+/// Stop the storage writer when boot refuses to start.
+///
+/// It normally drains so queued ManualReview updates land. After a lost live-state lock a
+/// resync may own these rows, so it is aborted and awaited instead, like the running path.
+async fn stop_boot_writer(
+    lock_lost: &CancellationToken,
+    cancellation_token: &CancellationToken,
+    storage_tx: mpsc::Sender<sender::TransactionStatusUpdate>,
+    writer: tokio::task::JoinHandle<()>,
+) {
+    // The writer exits only when its channel closes, and this is the only sender so far.
+    drop(storage_tx);
+    if lock_lost.is_cancelled() {
+        stop_without_draining(cancellation_token, &[writer.abort_handle()]).await;
+        return;
+    }
+    cancellation_token.cancel();
+    if let Err(join_err) = writer.await {
+        error!(
+            "Storage writer join error during refuse-to-start: {}",
+            join_err
+        );
+    }
+}
+
 fn critical_exit(program_type_label: &str, task_name: &str) {
     error!(
         task = task_name,
@@ -769,6 +801,80 @@ mod tests {
                 "a worker that was only signalled, not aborted, could still write"
             );
         }
+    }
+
+    /// A real storage writer on a mock, with one ManualReview update already queued.
+    fn boot_writer() -> (
+        MockStorage,
+        mpsc::Sender<sender::TransactionStatusUpdate>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mock = MockStorage::new();
+        let (storage_tx, storage_rx) = mpsc::channel(8);
+        // No webhook, so a ManualReview update is only a status write.
+        let writer = DbTransactionWriter::new(
+            Arc::new(Storage::Mock(mock.clone())),
+            storage_rx,
+            None,
+            crate::config::ProgramType::Withdraw,
+        );
+        storage_tx
+            .try_send(sender::TransactionStatusUpdate {
+                transaction_id: 1,
+                trace_id: None,
+                status: TransactionStatus::ManualReview,
+                counterpart_signature: None,
+                processed_at: None,
+                error_message: Some("boot reconcile".to_string()),
+                remint_signature: None,
+                remint_attempted: false,
+            })
+            .expect("queue the update");
+        let handle = tokio::spawn(async move {
+            let _ = writer.start().await;
+        });
+        (mock, storage_tx, handle)
+    }
+
+    /// A refused boot with the lock still held must flush what the preflight queued.
+    #[tokio::test]
+    async fn refused_boot_drains_the_writer_while_the_lock_is_held() {
+        let (mock, storage_tx, handle) = boot_writer();
+        let writer = handle.abort_handle();
+        let cancellation_token = CancellationToken::new();
+
+        stop_boot_writer(
+            &CancellationToken::new(),
+            &cancellation_token,
+            storage_tx,
+            handle,
+        )
+        .await;
+
+        assert_eq!(mock.calls("update_transaction_status"), 1);
+        assert!(writer.is_finished());
+        assert!(cancellation_token.is_cancelled());
+    }
+
+    /// Once the lock is lost a resync may own these rows, so nothing queued may land, and
+    /// the writer must be stopped before we return and free the lock.
+    #[tokio::test]
+    async fn refused_boot_aborts_the_writer_once_the_lock_is_lost() {
+        let (mock, storage_tx, handle) = boot_writer();
+        let writer = handle.abort_handle();
+        let cancellation_token = CancellationToken::new();
+        let lock_lost = CancellationToken::new();
+        lock_lost.cancel();
+
+        stop_boot_writer(&lock_lost, &cancellation_token, storage_tx, handle).await;
+
+        assert_eq!(
+            mock.calls("update_transaction_status"),
+            0,
+            "a queued update must not land after the lock is lost"
+        );
+        assert!(writer.is_finished());
+        assert!(cancellation_token.is_cancelled());
     }
 
     use crate::config::{PostgresConfig, ProgramType, StorageType};
