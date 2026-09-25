@@ -295,12 +295,11 @@ fn role_owns(program_type: ProgramType, row: &DbTransaction) -> bool {
 /// rows quarantined on a transient one clear themselves once the chain catches
 /// up. That asymmetry is the whole reason this is safe to run unattended.
 ///
-/// `budget` bounds the sweep in wall-clock time. The periodic worker passes
-/// `None` and runs to exhaustion: it blocks nothing, and only an exhaustive
-/// sweep guarantees a row is never permanently hidden behind rows that can
-/// never clear. The boot pre-flight passes `Some`, because it holds up startup
-/// and every row costs an RPC round trip that retries five times against a
-/// degraded endpoint.
+/// `budget` bounds the sweep's reads and RPC calls in wall-clock time, because
+/// every row costs an RPC round trip that retries five times against a degraded
+/// endpoint, and the boot pre-flight holds up startup on it. A completion already
+/// sent is never cut off; the storage layer bounds it instead, so the budget can
+/// be overrun by at most one bounded write.
 pub(crate) async fn reconcile_landed_withdrawals(
     storage: &Storage,
     finality: &RecoveryFinality<'_>,
@@ -309,40 +308,14 @@ pub(crate) async fn reconcile_landed_withdrawals(
     cursor: &mut i64,
     cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
-    // The ceiling has to wrap the whole sweep, not gate entry to each row. A
+    // The deadline bounds every read and RPC call, not just entry to each row: a
     // single classification retries five times, so a deadline consulted only
     // between rows is overrun by whatever is already in flight when it passes.
-    // Dropping the future mid-flight is safe: the sole write is one CAS
-    // statement, so it either committed or it did not.
-    match tokio::time::timeout(
-        budget,
-        reconcile_sweep(storage, finality, from_status, cursor, cancellation_token),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            // The cursor keeps its position, so the next sweep resumes here
-            // instead of rescanning the prefix that just used up the budget.
-            warn!(
-                resume_after_id = *cursor,
-                ?from_status,
-                "Reconcile sweep hit its time budget; remainder deferred to the next sweep"
-            );
-            Ok(())
-        }
-    }
-}
+    // It never bounds the completion CAS. Dropping that future does not cancel a
+    // statement Postgres already has, which could then commit after the sender
+    // has loaded the row into its refund queue.
+    let deadline = tokio::time::Instant::now() + budget;
 
-/// The sweep itself. Split out so the caller can impose a hard wall-clock
-/// ceiling on it as a whole.
-async fn reconcile_sweep(
-    storage: &Storage,
-    finality: &RecoveryFinality<'_>,
-    from_status: TransactionStatus,
-    cursor: &mut i64,
-    cancellation_token: &CancellationToken,
-) -> Result<(), OperatorError> {
     let outcome_label = match from_status {
         TransactionStatus::ManualReview => "manual_review_cleared",
         TransactionStatus::PendingRemint => "pending_remint_cleared",
@@ -365,9 +338,20 @@ async fn reconcile_sweep(
     // that bound from turning into a permanent blind spot.
     let mut scanned = 0usize;
     loop {
-        let batch = storage
-            .get_stalled_withdrawals_with_signatures(from_status, *cursor, RECOVERY_BATCH_LIMIT)
-            .await?;
+        let Ok(batch) = tokio::time::timeout_at(
+            deadline,
+            storage.get_stalled_withdrawals_with_signatures(
+                from_status,
+                *cursor,
+                RECOVERY_BATCH_LIMIT,
+            ),
+        )
+        .await
+        else {
+            log_budget_spent(*cursor, from_status);
+            return Ok(());
+        };
+        let batch = batch?;
         if batch.is_empty() {
             break;
         }
@@ -396,11 +380,19 @@ async fn reconcile_sweep(
             let Some(pending) = row_pending_sigs(&row) else {
                 continue;
             };
-            let SigFinality::Landed(signature) =
-                classify_signatures(&finality.solana(), &pending).await
+            let Ok(verdict) = tokio::time::timeout_at(
+                deadline,
+                classify_signatures(&finality.solana(), &pending),
+            )
+            .await
             else {
+                log_budget_spent(*cursor, from_status);
+                return Ok(());
+            };
+            let SigFinality::Landed(signature) = verdict else {
                 continue;
             };
+            // Outside the deadline on purpose; see the top of this function.
             promote_stalled_row(storage, &row, from_status, outcome_label, signature).await;
         }
 
@@ -424,6 +416,16 @@ async fn reconcile_sweep(
         );
     }
     Ok(())
+}
+
+/// The cursor keeps its position, so the next sweep resumes here instead of
+/// rescanning the prefix that just used up the budget.
+fn log_budget_spent(cursor: i64, from_status: TransactionStatus) {
+    warn!(
+        resume_after_id = cursor,
+        ?from_status,
+        "Reconcile sweep hit its time budget; remainder deferred to the next sweep"
+    );
 }
 
 /// Parse a stalled row's stored signatures into `PendingSig`s. Corrupt or
@@ -1114,7 +1116,7 @@ mod tests {
     use super::*;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;
-    use crate::storage::common::storage::mock::MockStorage;
+    use crate::storage::common::storage::{mock::MockStorage, RemintClaim};
     use solana_commitment_config::CommitmentConfig;
 
     fn make_deposit_row(id: i64) -> DbTransaction {
@@ -2068,7 +2070,7 @@ mod tests {
 
         // The ceiling must hold even though a classification is mid-retry when it
         // passes: a deadline consulted only between rows would overshoot by the
-        // whole in-flight retry chain, which is what the wrapping timeout stops.
+        // whole in-flight retry chain, which is what bounding each call stops.
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the boot sweep must return on its budget even mid-retry, took {:?}",
@@ -2080,6 +2082,49 @@ mod tests {
                 .iter()
                 .all(|t| t.status == TransactionStatus::PendingRemint),
             "giving up on time must never promote a row"
+        );
+    }
+
+    /// A completion already sent to Postgres keeps running if its future is dropped,
+    /// and could commit after the sender has loaded the row into its refund queue.
+    /// So the budget may stop the sweep between rows, never inside a write.
+    #[tokio::test]
+    #[serial_test::serial(manual_review_cleared_metric)]
+    async fn reconcile_budget_never_abandons_a_completion_in_flight() {
+        let mut server = mockito::Server::new_async().await;
+        let _status = mock_finalized_status(&mut server);
+
+        let transaction_id = 1;
+        let mock = MockStorage::new();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(stalled_withdrawal(
+                transaction_id,
+                TransactionStatus::PendingRemint,
+                &[Signature::new_unique().to_string()],
+            ));
+        let budget = Duration::from_millis(100);
+        mock.set_delay("try_complete_stalled_withdrawal", budget * 3);
+        let storage = Storage::Mock(mock.clone());
+        let client = make_rpc_client(&server.url());
+
+        reconcile_landed_withdrawals(
+            &storage,
+            &RecoveryFinality::new(&client, None),
+            TransactionStatus::PendingRemint,
+            budget,
+            &mut 0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let after = mock.pending_transactions.lock().unwrap();
+        assert_eq!(
+            after[0].status,
+            TransactionStatus::Completed,
+            "a completion started inside the budget must finish before the sweep returns"
         );
     }
 
@@ -2233,10 +2278,11 @@ mod tests {
         );
         mock.pending_transactions.lock().unwrap().push(row.clone());
         mock.pending_remint_transactions.lock().unwrap().push(row);
-        assert!(
+        assert_eq!(
             mock.claim_remint_attempt(1, Signature::new_unique().to_string(), 100, None, &[])
                 .await
                 .unwrap(),
+            RemintClaim::Claimed,
             "the previous process owns the refund claim"
         );
         let storage = Storage::Mock(mock.clone());

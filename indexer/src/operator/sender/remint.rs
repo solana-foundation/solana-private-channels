@@ -19,7 +19,7 @@ use crate::{
         ConfirmationResult, ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, RpcClientWithRetry,
         SignerUtil, TransactionStatusUpdate,
     },
-    storage::TransactionStatus,
+    storage::{common::storage::RemintClaim, TransactionStatus},
 };
 use chrono::Utc;
 use private_channel_metrics::MetricLabel;
@@ -50,6 +50,9 @@ enum RemintAttempt {
     DeferInFlight(String),
     /// Cannot reconcile and cannot proceed safely; escalate to ManualReview.
     Failed(String),
+    /// The row left `pending_remint` before the claim, so it is not ours to
+    /// refund or to write. Drop the entry.
+    Abandoned,
 }
 
 /// Remint burned PrivateChannel tokens back to the user after a permanent withdrawal failure.
@@ -196,8 +199,16 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(RemintClaim::Claimed) => {}
+        Ok(RemintClaim::RowMoved) => {
+            // Whoever moved it owns it now; a status write here could only clobber theirs.
+            error!(
+                "Remint abandoned for transaction {} (trace {}): row is no longer pending_remint; refusing to broadcast",
+                info.transaction_id, info.trace_id
+            );
+            return RemintAttempt::Abandoned;
+        }
+        Ok(RemintClaim::HeldElsewhere) => {
             // Nothing else can hold the claim, so a second sender is running.
             // Emit no status: ManualReview here would move the row off
             // pending_remint and permanently block the winner's remint record,
@@ -260,7 +271,8 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
 /// Result of executing a matured PendingRemint entry.
 /// Boxed variants keep the enum small (PendingRemint is ~300 bytes).
 pub enum DeferredRemintOutcome {
-    /// Terminal: a FailedReminted or ManualReview status was already emitted.
+    /// Terminal: nothing left to do for this entry. Usually a FailedReminted or
+    /// ManualReview status was emitted; an abandoned entry emits none.
     Resolved,
     /// Failed before broadcast with no live sig: caller re-queues via the capped
     /// escalation path, which ends in ManualReview once the retry budget is spent.
@@ -360,6 +372,7 @@ pub async fn execute_deferred_remint(
         RemintAttempt::DeferInFlight(reason) => {
             DeferredRemintOutcome::DeferInFlight(Box::new(entry), reason)
         }
+        RemintAttempt::Abandoned => DeferredRemintOutcome::Resolved,
         RemintAttempt::Failed(remint_error) => {
             error!("Remint also failed: {}", remint_error);
             let combined = format!("{} | remint failed: {}", entry.original_error, remint_error);
@@ -2946,6 +2959,52 @@ mod tests {
         assert!(
             storage_rx.try_recv().is_err(),
             "a lost claim must leave the row for the winner to resolve"
+        );
+        no_send.assert_async().await;
+    }
+
+    /// A row completed from under the queue has nothing left to refund. The entry
+    /// must not broadcast, must not write over whoever moved the row, and must be
+    /// dropped rather than requeued, or it would retry the claim forever.
+    #[tokio::test]
+    async fn execute_deferred_remint_drops_the_entry_when_the_row_left_pending_remint() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let transaction_id = 713;
+        mock.moved_remint_parents
+            .lock()
+            .unwrap()
+            .insert(transaction_id);
+
+        let _blockhash = mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let no_send = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let entry = make_matured_remint(transaction_id, 74);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::Resolved),
+            "a moved row must drop the entry, not requeue it"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the row belongs to whoever moved it, so no status may be written"
         );
         no_send.assert_async().await;
     }
