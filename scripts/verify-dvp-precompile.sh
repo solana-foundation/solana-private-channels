@@ -26,13 +26,14 @@ if ! command -v solana-verify >/dev/null 2>&1; then
   exit 1
 fi
 
-client_id="$(grep -o 'pubkey!("[^"]*")' "$CLIENT_PROGRAMS" | cut -d'"' -f2)"
+# `|| true` so a missing match reaches the error below instead of exiting silently.
+client_id="$(grep -o 'pubkey!("[^"]*")' "$CLIENT_PROGRAMS" | cut -d'"' -f2 || true)"
 if [ "$client_id" != "$PROGRAM_ID" ]; then
   echo "ERROR: $CLIENT_PROGRAMS targets '$client_id', expected $PROGRAM_ID" >&2
   exit 1
 fi
 
-pinned="$(grep -A1 'const DVP_SWAP_PROGRAM_SHA256' "$PIN_FILE" | grep -o '[0-9a-f]\{64\}')"
+pinned="$(grep -A1 'const DVP_SWAP_PROGRAM_SHA256' "$PIN_FILE" | grep -o '[0-9a-f]\{64\}' || true)"
 if [ -z "$pinned" ]; then
   echo "ERROR: could not read DVP_SWAP_PROGRAM_SHA256 from $PIN_FILE" >&2
   exit 1

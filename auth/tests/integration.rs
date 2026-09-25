@@ -1268,9 +1268,16 @@ async fn challenge_issuance_over_budget_is_shed() {
     let neighbour_token = neighbour_login["token"].as_str().unwrap();
 
     let challenge_url = format!("{}/auth/challenge-wallet", base_url(addr));
-    let pubkey = Keypair::new().pubkey().to_string();
+    let keypair = Keypair::new();
+    let pubkey = keypair.pubkey().to_string();
 
-    for _ in 0..CHALLENGES_PER_USER_PER_MINUTE {
+    // Sent until shed. The last in-budget request sits exactly on the quota
+    // boundary, where the limiter can shed one early, so the count is bounded
+    // rather than exact.
+    let mut served = 0;
+    let mut shed = false;
+    let mut last_served = Value::Null;
+    for _ in 0..=CHALLENGES_PER_USER_PER_MINUTE {
         let res = client
             .post(&challenge_url)
             .bearer_auth(spammer_token)
@@ -1278,17 +1285,39 @@ async fn challenge_issuance_over_budget_is_shed() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 200, "the budget must be served");
+        if res.status() == 429 {
+            shed = true;
+            break;
+        }
+        assert_eq!(res.status(), 200, "an in-budget challenge must be served");
+        served += 1;
+        last_served = res.json().await.unwrap();
     }
+    assert!(shed, "past the budget must be shed");
+    assert!(
+        (CHALLENGES_PER_USER_PER_MINUTE - 1..=CHALLENGES_PER_USER_PER_MINUTE).contains(&served),
+        "served {served} of a {CHALLENGES_PER_USER_PER_MINUTE} budget"
+    );
 
-    let over_budget = client
-        .post(&challenge_url)
+    // Shed before the database: had it reached the upsert, it would have
+    // replaced the last served nonce and this verify would fail.
+    let signature = keypair.sign_message(last_served["message"].as_str().unwrap().as_bytes());
+    let verified = client
+        .post(format!("{}/auth/verify-wallet", base_url(addr)))
         .bearer_auth(spammer_token)
-        .json(&json!({ "pubkey": pubkey }))
+        .json(&json!({
+            "pubkey": pubkey,
+            "nonce": last_served["nonce"],
+            "signature": signature.to_string(),
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(over_budget.status(), 429, "past the budget must be shed");
+    assert_eq!(
+        verified.status(),
+        200,
+        "a shed request must not replace the outstanding challenge"
+    );
 
     let neighbour = client
         .post(&challenge_url)
