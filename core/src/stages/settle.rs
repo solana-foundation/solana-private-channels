@@ -37,7 +37,7 @@ use {
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{
-        sync::{mpsc, OwnedSemaphorePermit},
+        sync::{mpsc, oneshot, OwnedSemaphorePermit},
         time::Instant,
     },
     tokio_util::sync::CancellationToken,
@@ -520,6 +520,9 @@ pub struct SettleArgs {
     /// The slot last published to the DB, read by isBlockhashValid for its context.
     pub settled_slot: Arc<AtomicU64>,
     pub blockhash_progress: Arc<BlockhashProgress>,
+    /// Told whether the startup warm-up left the cache aligned, so an AIO read
+    /// path trusts Redis only after this settler has purged and stamped it.
+    pub cache_aligned: Option<oneshot::Sender<bool>>,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -540,6 +543,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
         writer_epoch,
         settled_slot,
         blockhash_progress,
+        cache_aligned,
     } = args;
     let handle = tokio::spawn(async move {
         #[allow(clippy::too_many_arguments)]
@@ -560,6 +564,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             writer_epoch: Option<u64>,
             settled_slot: Arc<AtomicU64>,
             blockhash_progress: Arc<BlockhashProgress>,
+            cache_aligned: Option<oneshot::Sender<bool>>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -661,6 +666,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             // Align the cache with Postgres before the first dual-write. Failing
             // to verify it means the cache cannot be trusted, so run Postgres-only
             // rather than write a second ledger into it.
+            let mut aligned = false;
             redis_db = match redis_db {
                 Some(redis) => {
                     match warm_redis_cache(
@@ -676,6 +682,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             if purged {
                                 metrics.redis_cache_purged();
                             }
+                            aligned = true;
                             Some(redis)
                         }
                         Err(e) => {
@@ -701,6 +708,10 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                 }
                 None => None,
             };
+            // A dropped receiver means the node already gave up waiting.
+            if let Some(tx) = cache_aligned {
+                let _ = tx.send(aligned);
+            }
 
             let mut processing_results: Vec<BufferedResult> = Vec::new();
             // Settled bytes and address rows since the last block; gate the recv arm below.
@@ -1065,6 +1076,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             writer_epoch,
             settled_slot,
             blockhash_progress,
+            cache_aligned,
         )
         .await
         {
@@ -2160,6 +2172,7 @@ mod tests {
             writer_epoch,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
         (
@@ -2834,6 +2847,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -2892,6 +2906,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::clone(&settled_slot),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -2949,6 +2964,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::clone(&progress),
+            cache_aligned: None,
         })
         .await;
 
@@ -3459,6 +3475,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -5129,6 +5146,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -5183,6 +5201,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -5245,6 +5264,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -5274,6 +5294,104 @@ mod tests {
             address_signatures_rx.try_recv().is_ok(),
             "a committed block's address rows must still be shipped"
         );
+    }
+
+    /// Run a settler until its warm-up signal arrives, stop it, and return the signal.
+    async fn cache_aligned_signal(
+        accountsdb_connection_url: String,
+        redis_cache_url: Option<String>,
+    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+        let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
+        let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::channel(TEST_BLOCKHASH_SINK);
+        let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
+        let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel();
+        let shutdown = CancellationToken::new();
+        let worker = start_settle_worker(SettleArgs {
+            execution_results_rx: exec_rx,
+            settled_accounts_tx: SettledInbox::new(),
+            settled_blockhashes_tx,
+            address_signatures_tx,
+            accountsdb_connection_url,
+            redis_cache_url,
+            redis_block_ttl_secs: 0,
+            blocktime_ms: 100,
+            perf_sample_period_secs: 3600,
+            shutdown_token: shutdown.clone(),
+            metrics: Arc::new(NoopMetrics),
+            cache_mirror_cooldown: CACHE_MIRROR_COOLDOWN,
+            heartbeat: crate::health::StageHeartbeat::new(),
+            writer_epoch: None,
+            settled_slot: Arc::default(),
+            blockhash_progress: Arc::default(),
+            cache_aligned: Some(aligned_tx),
+        })
+        .await;
+        let signal = tokio::time::timeout(Duration::from_secs(60), aligned_rx)
+            .await
+            .expect("the settler must signal or drop the sender");
+        drop(exec_tx);
+        shutdown.cancel();
+        // Awaited so a later case never races this settler's writes.
+        let _ = tokio::time::timeout(Duration::from_secs(30), worker.handle).await;
+        signal
+    }
+
+    /// Aligned caches report true (a stale key already purged); an unreachable Redis false.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_signals_cache_aligned_on_every_outcome() {
+        use testcontainers::{runners::AsyncRunner, ImageExt};
+        let (_db, pg) = start_test_postgres().await;
+        let url = postgres_container_url(&pg, "test_db").await;
+        let redis = testcontainers_modules::redis::Redis::default()
+            .with_tag("7.0")
+            .start()
+            .await
+            .unwrap();
+        let redis_url = format!(
+            "redis://{}:{}",
+            redis.get_host().await.unwrap(),
+            redis.get_host_port_ipv4(6379).await.unwrap()
+        );
+        let mut conn = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache_aligned_signal(url.clone(), Some(redis_url.clone())).await,
+            Ok(true),
+            "an empty cache aligns"
+        );
+
+        // Stamped for this ledger but with a tip Postgres never had.
+        let stale_key = format!("account:{}", Pubkey::new_unique());
+        let _: () = conn.set(&stale_key, vec![1u8, 2, 3]).await.unwrap();
+        let _: () = conn.set("latest_slot", 4242u64).await.unwrap();
+        assert_eq!(
+            cache_aligned_signal(url.clone(), Some(redis_url.clone())).await,
+            Ok(true),
+            "a stale cache is purged, then aligned"
+        );
+        let exists: bool = conn.exists(&stale_key).await.unwrap();
+        assert!(!exists, "the stale key is gone before the signal");
+
+        assert_eq!(
+            cache_aligned_signal(url, Some("redis://127.0.0.1:1".to_string())).await,
+            Ok(false),
+            "an unreachable cache is not aligned"
+        );
+    }
+
+    /// A settler that dies before warm-up drops the sender, so the node never waits forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_drops_the_signal_when_it_dies_before_warmup() {
+        let signal = cache_aligned_signal(
+            "postgres://test@127.0.0.1:1/test".to_string(),
+            Some("redis://127.0.0.1:1".to_string()),
+        )
+        .await;
+        assert!(signal.is_err(), "got {signal:?}");
     }
 
     /// Build a one-transaction execution output writing a fresh account. The
@@ -5376,6 +5494,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -7132,6 +7251,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -7233,6 +7353,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -7530,6 +7651,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -7597,6 +7719,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -8144,6 +8267,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 
@@ -8239,6 +8363,7 @@ mod tests {
             writer_epoch: None,
             settled_slot: Arc::default(),
             blockhash_progress: Arc::default(),
+            cache_aligned: None,
         })
         .await;
 

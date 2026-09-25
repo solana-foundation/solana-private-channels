@@ -122,6 +122,12 @@ impl AccountsDB {
         super::get_latest_blockhash::get_latest_blockhash(self).await
     }
 
+    pub async fn get_blockhash_snapshot(
+        &self,
+    ) -> Result<super::get_latest_blockhash::BlockhashSnapshot> {
+        super::get_latest_blockhash::get_blockhash_snapshot(self).await
+    }
+
     pub async fn get_transaction_count(&self) -> Result<u64> {
         super::get_transaction_count::get_transaction_count(self).await
     }
@@ -1741,6 +1747,69 @@ mod tests {
         AccountsDB::Postgres(handle)
     }
 
+    fn epoch_of(db: &AccountsDB) -> u64 {
+        let AccountsDB::Postgres(ref pg) = db else {
+            panic!("expected Postgres variant")
+        };
+        pg.writer_epoch.expect("a claimed handle holds an epoch")
+    }
+
+    /// A restore rolls the epoch row back. The replacement's bump from the restored
+    /// value must not hand out the epoch the old writer still holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_epoch_is_not_reissued() {
+        let (db, _pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref pg) = db else {
+            unreachable!()
+        };
+        let pool = pg.pool.clone();
+        let mut old = claim_epoch(&db).await;
+        old.write_batch(
+            &[],
+            vec![],
+            Some(create_test_block_info(1, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+
+        // The restore: the pre-bump epoch comes back and block 1 is gone.
+        sqlx::query("UPDATE metadata SET value = $2 WHERE key = $1")
+            .bind(super::super::writer_epoch::WRITER_EPOCH_KEY)
+            .bind(&super::super::counter::encode(0)[..])
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM blocks WHERE slot = 1")
+            .execute(pool.as_ref())
+            .await
+            .unwrap();
+
+        let mut new = claim_epoch(&db).await;
+        new.write_batch(
+            &[],
+            vec![],
+            Some(create_test_block_info(1, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+        assert_ne!(epoch_of(&new), epoch_of(&old));
+
+        let result = old
+            .write_batch(
+                &[],
+                vec![],
+                Some(create_test_block_info(2, Hash::new_unique())),
+            )
+            .await;
+        assert_eq!(
+            result.err(),
+            Some(super::super::write_batch::WriteBatchError::Fenced {
+                held: epoch_of(&old),
+                current: Some(epoch_of(&new))
+            })
+        );
+    }
+
     /// A writer whose epoch was superseded is refused before it writes anything.
     /// The parent is right on purpose, so only the epoch can refuse it.
     #[tokio::test(flavor = "multi_thread")]
@@ -1786,8 +1855,8 @@ mod tests {
         assert_eq!(
             result.err(),
             Some(super::super::write_batch::WriteBatchError::Fenced {
-                held: 1,
-                current: Some(2)
+                held: epoch_of(&superseded),
+                current: Some(epoch_of(&current))
             })
         );
         assert!(db.get_block(3).await.unwrap().is_none());

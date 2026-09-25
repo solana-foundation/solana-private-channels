@@ -30,6 +30,7 @@ pub mod get_release_signatures;
 pub mod get_released_withdrawals;
 pub mod get_remint_signatures;
 pub mod get_resync_blockers;
+pub mod get_serviced_rows;
 pub mod get_stale_parked_transactions;
 pub mod get_stale_processing_transactions;
 pub mod get_stalled_withdrawals_with_signatures;
@@ -323,6 +324,16 @@ impl Storage {
         own: TransactionType,
     ) -> Result<ResyncBlockers, StorageError> {
         get_resync_blockers::get_resync_blockers(self, own).await
+    }
+
+    /// Up to `limit` serviced `own` rows with an id above `after_id`, in id order.
+    pub async fn get_serviced_rows(
+        &self,
+        own: TransactionType,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ServicedRow>, StorageError> {
+        get_serviced_rows::get_serviced_rows(self, own, after_id, limit).await
     }
 
     /// `transactions.id` for every `deposit` row whose mint was not in

@@ -210,6 +210,42 @@ async fn wait_for_verified_cache(
     }
 }
 
+/// The read path's accounts handle. With `cache_aligned` set (Aio), Redis is used only
+/// once this node's settler reports it aligned; otherwise reads go to Postgres, since
+/// that settler is not mirroring and a leftover stamp would be trusted wrongly.
+async fn read_accounts_db(
+    accountsdb_connection_url: &str,
+    redis_cache_url: Option<&str>,
+    cache_aligned: Option<tokio::sync::oneshot::Receiver<bool>>,
+) -> Result<AccountsDB, Box<dyn std::error::Error>> {
+    let Some(redis_url) = redis_cache_url else {
+        return Ok(AccountsDB::new(accountsdb_connection_url, true).await?);
+    };
+    if let Some(aligned) = cache_aligned {
+        let aligned = aligned
+            .await
+            .map_err(|_| "the settler stopped before aligning the Redis cache")?;
+        if !aligned {
+            warn!("Redis cache is not aligned, serving reads from Postgres");
+            return Ok(AccountsDB::new(accountsdb_connection_url, true).await?);
+        }
+    }
+    // Redis in front of Postgres. Postgres stays reachable so a key missing from
+    // the cache resolves against the source of truth instead of reading as an absence.
+    let postgres = PostgresAccountsDB::new(accountsdb_connection_url, true)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e))?;
+    let redis = RedisAccountsDB::new(redis_url, postgres)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?;
+    // Only a write node aligns the cache, so wait for one to publish a stamp rather
+    // than serving whatever is there. An empty cache verifies immediately. Foreign
+    // state verifies only once a write node purges it.
+    wait_for_verified_cache(&redis).await?;
+    info!("Read path caching through Redis with Postgres fallback");
+    Ok(AccountsDB::Redis(redis))
+}
+
 pub async fn run_node(config: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
     // Validate configuration
     if config.blocktime_ms == 0 {
@@ -300,6 +336,9 @@ async fn start_services(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Heartbeat registry — populated for stages that actually run, consumed by /health.
     let mut heartbeats = crate::health::HeartbeatRegistry::new();
+
+    // Set only for Aio with Redis; the read path waits on it below.
+    let mut cache_aligned_rx = None;
 
     // Only create write pipeline for Write and Aio modes
     let write_deps = if matches!(config.mode, NodeMode::Write | NodeMode::Aio) {
@@ -437,6 +476,14 @@ async fn start_services(
         const ADDR_SIG_FLUSH_CHUNK: usize = 5000;
         let (addr_sig_tx, addr_sig_rx) = mpsc::channel(ADDR_SIG_QUEUE_CAPACITY);
 
+        // Only an AIO read path trusts a cache its own settler aligns.
+        let cache_aligned = if config.mode == NodeMode::Aio && config.redis_cache_url.is_some() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            cache_aligned_rx = Some(rx);
+            Some(tx)
+        } else {
+            None
+        };
         let settle = start_settle_worker(crate::stages::SettleArgs {
             execution_results_rx,
             settled_accounts_tx: settled_inbox,
@@ -454,6 +501,7 @@ async fn start_services(
             writer_epoch: Some(writer_epoch),
             settled_slot: Arc::clone(&settled_slot),
             blockhash_progress: Arc::clone(&blockhash_progress),
+            cache_aligned,
         })
         .await;
         workers.push(settle);
@@ -484,30 +532,12 @@ async fn start_services(
 
     let read_deps = match config.mode {
         NodeMode::Read | NodeMode::Aio => {
-            let accounts_db = match config.redis_cache_url {
-                // Redis in front of Postgres. Postgres stays reachable so a
-                // key missing from the cache resolves against the source of
-                // truth instead of reading as an absence.
-                Some(ref redis_url) => {
-                    let postgres = PostgresAccountsDB::new(&config.accountsdb_connection_url, true)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e)
-                        })?;
-                    let redis = RedisAccountsDB::new(redis_url, postgres)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to create RedisAccountsDB: {}", e))?;
-                    // Only a write node aligns the cache, so wait for one to
-                    // publish a stamp rather than serving whatever is there. An
-                    // empty cache verifies immediately. Foreign state verifies
-                    // only once a write node purges it, which in Aio is the
-                    // settler alongside this one.
-                    wait_for_verified_cache(&redis).await?;
-                    info!("Read path caching through Redis with Postgres fallback");
-                    AccountsDB::Redis(redis)
-                }
-                None => AccountsDB::new(&config.accountsdb_connection_url, true).await?,
-            };
+            let accounts_db = read_accounts_db(
+                &config.accountsdb_connection_url,
+                config.redis_cache_url.as_deref(),
+                cache_aligned_rx,
+            )
+            .await?;
             // Read nodes don't repair: the write node owns the address_signatures
             // index and repairs it on the primary; the read-only replica receives
             // it via replication (repair would write, which fails on a standby).
@@ -676,6 +706,35 @@ mod tests {
             writer_lease: None,
             ingress_tx: None,
         }
+    }
+
+    /// An AIO read path whose settler could not align the cache reads Postgres, even
+    /// with a live stamp for this deployment still in Redis.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aio_reads_postgres_when_the_cache_is_not_aligned() {
+        let (postgres, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
+        let (_stamped, redis) = crate::test_helpers::start_stamped_redis(postgres).await;
+        let redis_url = format!(
+            "redis://{}:{}",
+            redis.get_host().await.unwrap(),
+            redis.get_host_port_ipv4(6379).await.unwrap()
+        );
+
+        let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel();
+        aligned_tx.send(false).unwrap();
+        let db = read_accounts_db(&url, Some(&redis_url), Some(aligned_rx))
+            .await
+            .unwrap();
+        assert!(matches!(db, AccountsDB::Postgres(_)));
+
+        let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(aligned_tx);
+        assert!(
+            read_accounts_db(&url, Some(&redis_url), Some(aligned_rx))
+                .await
+                .is_err(),
+            "a settler that died before warm-up fails the node"
+        );
     }
 
     /// A handle whose output was already taken must leave the drain list. Tokio

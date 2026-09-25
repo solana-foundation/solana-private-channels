@@ -172,6 +172,15 @@ pub struct ResyncBlockers {
     pub earliest_slot: Option<i64>,
 }
 
+/// A row the channel has already serviced, identified by its source event coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ServicedRow {
+    pub id: i64,
+    pub signature: String,
+    pub instruction_index: i32,
+    pub inner_index: Option<i32>,
+}
+
 /// Per-mint sum of every in-flight (unsettled) transaction amount. This bounds
 /// the maximum transient balance swing reconciliation may observe, so a gap
 /// larger than it cannot be explained by pending work alone.

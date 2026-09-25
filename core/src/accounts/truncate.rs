@@ -1316,4 +1316,145 @@ mod tests {
             "nothing may be deleted"
         );
     }
+
+    /// One block per slot, each with one indexed transfer to `address`; signatures in slot order.
+    async fn write_address_history(
+        db: &PostgresAccountsDB,
+        address: &solana_sdk::pubkey::Pubkey,
+        slots: std::ops::Range<u64>,
+    ) -> Vec<solana_sdk::signature::Signature> {
+        use crate::accounts::AccountsDB;
+        use crate::test_helpers::{
+            create_test_block_info, create_test_sanitized_transaction,
+            flush_address_signatures_sync, no_accounts_deltas,
+        };
+        use solana_svm::{
+            account_loader::LoadedTransaction,
+            transaction_execution_result::{ExecutedTransaction, TransactionExecutionDetails},
+            transaction_processing_result::ProcessedTransaction,
+        };
+        let mut accounts_db = AccountsDB::Postgres(db.clone());
+        let mut signatures = Vec::new();
+        for slot in slots {
+            let tx = create_test_sanitized_transaction(
+                &solana_sdk::signature::Keypair::new(),
+                address,
+                1,
+            );
+            let sig = *tx.signature();
+            let processed = ProcessedTransaction::Executed(Box::new(ExecutedTransaction {
+                loaded_transaction: LoadedTransaction::default(),
+                execution_details: TransactionExecutionDetails {
+                    status: Ok(()),
+                    log_messages: None,
+                    inner_instructions: None,
+                    return_data: None,
+                    executed_units: 0,
+                    accounts_deltas: Some(no_accounts_deltas()),
+                },
+                programs_modified_by_tx: HashMap::new(),
+            }));
+            let block = BlockInfo {
+                transaction_signatures: vec![sig],
+                ..create_test_block_info(slot, solana_sdk::hash::Hash::new_unique())
+            };
+            let rows = accounts_db
+                .write_batch(
+                    &[],
+                    vec![(sig, &tx, slot, 1_700_000_000, &processed)],
+                    Some(block),
+                )
+                .await
+                .unwrap();
+            flush_address_signatures_sync(&accounts_db, &rows).await;
+            signatures.push(sig);
+        }
+        signatures
+    }
+
+    /// History reads after keeping slots 7 to 9 of 0..10: pruned rows end history, never error.
+    async fn assert_history_ends_at_the_floor(
+        db: &PostgresAccountsDB,
+        address: &solana_sdk::pubkey::Pubkey,
+        sigs: &[solana_sdk::signature::Signature],
+    ) {
+        use crate::accounts::AccountsDB;
+        let db = AccountsDB::Postgres(db.clone());
+        let read = |limit, before, until, ranges: Option<Vec<(i64, i64)>>| {
+            let db = db.clone();
+            async move {
+                db.get_signatures_for_address(address, limit, before, until, ranges.as_deref())
+                    .await
+                    .expect("history read must not fail on pruned rows")
+                    .into_iter()
+                    .map(|r| r.signature)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let names = |idx: &[usize]| idx.iter().map(|&i| sigs[i].to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            read(10, None, None, None).await,
+            names(&[9, 8, 7]),
+            "no cursor"
+        );
+        assert_eq!(
+            read(2, None, None, None).await,
+            names(&[9, 8]),
+            "first page"
+        );
+        assert_eq!(
+            read(2, Some(&sigs[8]), None, None).await,
+            names(&[7]),
+            "next page"
+        );
+        assert!(
+            read(10, Some(&sigs[3]), None, None).await.is_empty(),
+            "before a pruned row"
+        );
+        assert_eq!(
+            read(10, None, Some(&sigs[3]), None).await,
+            names(&[9, 8, 7]),
+            "until a pruned row"
+        );
+        assert_eq!(
+            read(10, None, None, Some(vec![(5, 8)])).await,
+            names(&[8, 7]),
+            "scope spanning the floor"
+        );
+    }
+
+    /// Regression: truncation leaves index rows behind, and a read reaching them failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_survives_truncation() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let address = solana_sdk::pubkey::Pubkey::new_unique();
+        let sigs = write_address_history(&db, &address, 0..10).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        truncate_on_fresh_pool(&url, &apply_opts(3, 4, dump.path(), &restore), &db.pool)
+            .await
+            .unwrap();
+        assert_eq!(read_floor_metadata(&db.pool).await, Some(7));
+
+        assert_history_ends_at_the_floor(&db, &address, &sigs).await;
+    }
+
+    /// Without the metadata key the floor falls back to the oldest retained block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn history_floor_without_metadata_is_min_slot() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        let address = solana_sdk::pubkey::Pubkey::new_unique();
+        let sigs = write_address_history(&db, &address, 0..10).await;
+        let dump = container_pg_dump(&_pg, "pg_test");
+        let restore = container_pg_restore_bin(&_pg);
+        truncate_on_fresh_pool(&url, &apply_opts(3, 4, dump.path(), &restore), &db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM metadata WHERE key = 'first_available_block'")
+            .execute(db.pool.as_ref())
+            .await
+            .unwrap();
+
+        assert_history_ends_at_the_floor(&db, &address, &sigs).await;
+    }
 }

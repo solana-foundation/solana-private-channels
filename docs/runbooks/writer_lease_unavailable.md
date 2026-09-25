@@ -40,16 +40,19 @@ backend lives as long as its TCP connection. There is no lease expiry and no TTL
 
 Beside the lock, each write node claims a writer epoch at startup: the
 `writer_epoch` row in `metadata`, an 8-byte little-endian counter it raises by
-one. Every batch locks that row and commits only if it still holds the value its
-node claimed, and every idle slot write checks it too. So a node that lost its
-lock without noticing is stopped by its next commit once a replacement starts,
-not only by the ownership probe.
+a random step of 1 to 2^40, not by one. Epochs are only ever compared for
+equality, so the jump changes nothing for readers, and a database restore that
+rolls the row back cannot make the next node reissue the epoch an old writer
+still holds, except by a 1 in 2^40 chance. Every batch locks that row and
+commits only if it still holds the value its node claimed, and every idle slot
+write checks it too. So a node that lost its lock without noticing is stopped by
+its next commit once a replacement starts, not only by the ownership probe.
 
-Raising that row by one stops the live writer on its next batch or idle tick,
+Raising that row stops the live writer on its next batch or idle tick,
 with `Refusing to commit: this node holds writer epoch N` in its log. Do not do
 it by hand unless you mean to stop the writer; a restarted node claims a new
 epoch on its own. **Never delete the row**: the next node would count again from
-1, an epoch an old writer may still hold.
+0, and an epoch an old writer may still hold becomes reachable again.
 
 ## Why it is usually not stuck
 

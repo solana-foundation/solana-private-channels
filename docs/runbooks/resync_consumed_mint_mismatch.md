@@ -98,3 +98,63 @@ take every row of that source transaction out of reach:
    ```
 
 Resync stays blocked until engineering resolves the contradiction.
+
+## Related refusals: incomplete channel history
+
+Two more `ConsumedSetUnavailable` refusals mean the channel history the
+consumed-set was built from cannot be shown complete. Both fire before the
+wipe, so the database is untouched.
+
+**A serviced row is missing from the channel history:**
+
+```
+consumed-set unavailable, resync aborted before drop: <n> serviced Deposit row(s)
+are missing from the channel history, first <signature>; the channel index may
+lag, rerun once it catches up
+```
+
+Every `completed` deposit (escrow resync) or `failed_reminted` withdrawal
+(withdraw resync) must appear in the authority's channel history. A missing one
+would be rebuilt `pending` and paid again. The usual cause is lag: the channel
+writes its address index after each block commits, and a read replica can trail
+the primary. Wait, then rerun. If it keeps refusing, check that the write node has
+been up since its last crash (it rebuilds missing index rows at startup) and that
+the configured authority is the one that minted the named row.
+
+**The channel history was pruned:**
+
+```
+consumed-set unavailable, resync aborted before drop: channel history is pruned
+below slot <floor>, so the consumed-set may miss serviced mints
+```
+
+or `channel first available block unreadable: ...`. Once the channel has been
+truncated, its mint history is incomplete and a resync cannot prove what was
+already paid. Resync is not supported on a truncated channel. Escalate
+(Tier 2); do not truncate a channel you may need to resync.
+
+### Resyncing an empty database
+
+With no rows, the missing-row check has nothing to compare, and the pruning check
+does not cover lag. Before resyncing an empty database, or rerunning a resync that
+was interrupted after its wipe, confirm all three:
+
+1. The write node has been up since its last crash, so its startup index repair
+   has run.
+2. The read replica has replayed up to the primary: `pg_last_wal_replay_lsn()` on
+   the replica is at or past `pg_current_wal_lsn()` read on the primary just before.
+3. On the primary, the `address_signatures_flushed_slot` metadata value is at or
+   above the slot of the newest block that holds transactions.
+
+Waiting a fixed time is not a substitute: a crashed write node leaves index rows
+missing until it restarts, and replica lag has no bound.
+
+### Release gate
+
+Core hides history below `getFirstAvailableBlock` instead of failing on it. An
+indexer that predates the checks above would read that shorter history as
+complete and could re-mint pruned deposits. So:
+
+- deploy core with this behaviour only after every indexer runs a version with
+  both checks;
+- never roll the indexer back below that version while core has it.

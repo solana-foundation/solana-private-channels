@@ -134,6 +134,11 @@ Outcomes:
 - No match BUT `processed_at` predates the oldest signature returned →
   output `AMBIGUOUS` (the original mint may have rotated out of the RPC's
   history window). [Escalate](_escalation.md) (Tier 2).
+- No match, `processed_at` is older than `getFirstAvailableBlock`, and the
+  history is empty or starts at that block: output `AMBIGUOUS`. Truncation
+  pruned that history, and pruned entries are simply not returned, so a
+  short history here is not evidence the mint never landed.
+  [Escalate](_escalation.md) (Tier 2).
 - RPC unreachable → output `AMBIGUOUS`.
 
 ## Idempotency safety net

@@ -10,28 +10,11 @@ pub async fn get_latest_blockhash_impl(
     read_deps: &ReadDeps,
     _config: Option<RpcContextConfig>,
 ) -> RpcResult<Response<RpcBlockhash>> {
-    // The context is a slot, as Solana reports it; the deadline below is a
-    // height. They are different counters now, so both are read.
-    let slot = read_deps
+    // Slot, height and hash come from one read, so the deadline always belongs to
+    // the hash. The context is a slot, as Solana reports it; the deadline is a height.
+    let snapshot = read_deps
         .accounts_db
-        .get_current_slot()
-        .await
-        .map_err(|e| custom_error(JSON_RPC_SERVER_ERROR, format!("Failed to get slot: {}", e)))?
-        .unwrap_or(0);
-    let block_height = read_deps
-        .accounts_db
-        .get_block_height()
-        .await
-        .map_err(|e| {
-            custom_error(
-                JSON_RPC_SERVER_ERROR,
-                format!("Failed to get block height: {}", e),
-            )
-        })?
-        .unwrap_or(0);
-    let blockhash = read_deps
-        .accounts_db
-        .get_latest_blockhash()
+        .get_blockhash_snapshot()
         .await
         .map_err(|e| {
             custom_error(
@@ -39,6 +22,9 @@ pub async fn get_latest_blockhash_impl(
                 format!("Failed to get blockhash: {}", e),
             )
         })?;
+    let slot = snapshot.slot.unwrap_or(0);
+    let block_height = snapshot.block_height.unwrap_or(0);
+    let blockhash = snapshot.blockhash;
 
     // The window holds max_blockhashes entries and evicts one per produced block,
     // so a hash minted here is live for that many heights and the last of them is

@@ -1,8 +1,8 @@
 use crate::error::StorageError;
 use crate::storage::common::models::{
     DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, StoredSig,
-    TransactionStatus, TransactionType,
+    MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
+    StoredSig, TransactionStatus, TransactionType,
 };
 use crate::storage::common::storage::{RemintClaim, RequeueOutcome};
 use bigdecimal::BigDecimal;
@@ -646,6 +646,36 @@ impl MockStorage {
                 .chain(marker_bound)
                 .min(),
         })
+    }
+
+    /// Same selection and paging as the Postgres query.
+    pub fn get_serviced_rows(
+        &self,
+        own: TransactionType,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ServicedRow>, StorageError> {
+        self.check_should_fail("get_serviced_rows")?;
+        let status = match own {
+            TransactionType::Deposit => TransactionStatus::Completed,
+            TransactionType::Withdrawal => TransactionStatus::FailedReminted,
+        };
+        let mut rows: Vec<ServicedRow> = self
+            .pending_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.transaction_type == own && t.status == status && t.id > after_id)
+            .map(|t| ServicedRow {
+                id: t.id,
+                signature: t.signature.clone(),
+                instruction_index: t.instruction_index,
+                inner_index: t.inner_index,
+            })
+            .collect();
+        rows.sort_by_key(|r| r.id);
+        rows.truncate(usize::try_from(limit).unwrap_or(0));
+        Ok(rows)
     }
 
     pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {
