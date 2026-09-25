@@ -895,19 +895,24 @@ mod tests {
             }
         }
 
+        let started = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
-        let guard = SetOnDrop(stopped.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (writer_started, guard) = (started.clone(), SetOnDrop(stopped.clone()));
         // A writer stuck mid-drain, standing in for a slow write or webhook call.
         let handle = tokio::spawn(async move {
             let _guard = guard;
+            writer_started.store(true, Ordering::SeqCst);
+            let _ = started_tx.send(());
             std::future::pending::<()>().await;
         });
         let (storage_tx, _storage_rx) = mpsc::channel(1);
         let cancellation_token = CancellationToken::new();
         let lock_lost = CancellationToken::new();
         let canceller = lock_lost.clone();
+        // Lose the lock only once the writer is really draining.
         tokio::spawn(async move {
-            tokio::task::yield_now().await;
+            let _ = started_rx.await;
             canceller.cancel();
         });
 
@@ -918,6 +923,10 @@ mod tests {
         .await
         .expect("the drain must stop once the lock is lost");
 
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the writer must have been draining when the lock went"
+        );
         assert!(
             stopped.load(Ordering::SeqCst),
             "the writer must be aborted and stopped"
