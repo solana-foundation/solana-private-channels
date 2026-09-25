@@ -1070,6 +1070,10 @@ impl PostgresDb {
         )
         .execute(&self.pool)
         .await?;
+        // Lowest slot any interrupted wipe deleted, so a rerun cannot pick a genesis above it.
+        sqlx::query("ALTER TABLE resync_state ADD COLUMN IF NOT EXISTS earliest_slot BIGINT")
+            .execute(&self.pool)
+            .await?;
 
         info!("Database schema initialized");
         Ok(())
@@ -1096,12 +1100,16 @@ impl PostgresDb {
         let mut tx = conn.begin().await?;
 
         // The marker commits with the deletes, so an ambiguous COMMIT cannot leave one without the other.
+        // It keeps the lowest slot ever deleted, since a rerun no longer sees those rows.
         let claimed = sqlx::query(
-            "INSERT INTO resync_state (program_type) VALUES ($1)
-             ON CONFLICT (id) DO UPDATE SET program_type = resync_state.program_type
+            "INSERT INTO resync_state (program_type, earliest_slot)
+             VALUES ($1, (SELECT MIN(slot) FROM transactions WHERE transaction_type = $2))
+             ON CONFLICT (id) DO UPDATE
+             SET earliest_slot = LEAST(resync_state.earliest_slot, EXCLUDED.earliest_slot)
              WHERE resync_state.program_type = EXCLUDED.program_type",
         )
         .bind(&key)
+        .bind(program.owned_transaction_type())
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -3204,9 +3212,14 @@ impl PostgresDb {
                    EXISTS (SELECT 1 FROM transactions
                            WHERE transaction_type = 'withdrawal' AND status = 'failed'),
                    EXISTS (SELECT 1 FROM observed_releases),
-                   (SELECT MIN(slot) FROM transactions WHERE transaction_type = $1)"
+                   LEAST((SELECT MIN(slot) FROM transactions WHERE transaction_type = $1),
+                         (SELECT earliest_slot FROM resync_state WHERE program_type = $2))"
         ))
         .bind(own)
+        .bind(program_key(match own {
+            TransactionType::Deposit => ProgramType::Escrow,
+            TransactionType::Withdrawal => ProgramType::Withdraw,
+        }))
         .fetch_one(&self.pool)
         .await?;
         Ok(ResyncBlockers {

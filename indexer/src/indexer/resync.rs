@@ -1378,6 +1378,38 @@ mod tests {
         assert_db_intact(&mock);
     }
 
+    /// An interrupted wipe already deleted the rows, so its marker keeps their slot and a
+    /// rerun from a later genesis is refused the same way.
+    #[tokio::test]
+    async fn rerun_after_interrupted_wipe_refuses_genesis_above_deleted_rows() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Completed,
+        );
+        mock.pending_transactions.lock().unwrap()[0].slot = 99;
+        mock.wipe_program(ProgramType::Escrow).unwrap();
+        assert!(mock.pending_transactions.lock().unwrap().is_empty());
+
+        match escrow_service(Arc::new(Storage::Mock(mock.clone())))
+            .run(100)
+            .await
+        {
+            Err(IndexerError::Reconciliation(ReconciliationError::GenesisAboveExistingRows {
+                genesis_slot: 100,
+                earliest_slot: 99,
+            })) => {}
+            other => panic!("a rerun must not skip rows its first wipe deleted, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 1);
+        assert_eq!(
+            mock.unfinished_resync.lock().unwrap().as_deref(),
+            Some("escrow")
+        );
+    }
+
     /// Another program's unfinished resync owns the database; only that program may finish it.
     #[tokio::test]
     async fn other_program_marker_refuses_before_any_rpc() {

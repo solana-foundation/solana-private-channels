@@ -167,8 +167,8 @@ pub struct ResyncBlockers {
     pub failed_withdrawals: bool,
     /// The escrow indexer recorded a release, so some nonce is already spent.
     pub observed_releases: bool,
-    /// Lowest slot among the resync's own rows. The wipe deletes all of them, but the
-    /// rebuild replays only from genesis.
+    /// Lowest slot among the resync's own rows, or deleted by its unfinished wipe. The wipe
+    /// deletes all of them, but the rebuild replays only from genesis.
     pub earliest_slot: Option<i64>,
 }
 

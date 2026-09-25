@@ -73,6 +73,8 @@ pub struct MockStorage {
     pub reconciliation_halt: Arc<Mutex<Option<HaltInfo>>>,
     /// Mirrors the single-row `resync_state` table: the program whose resync has not finished.
     pub unfinished_resync: Arc<Mutex<Option<String>>>,
+    /// Mirrors `resync_state.earliest_slot`: the lowest slot an unfinished wipe deleted.
+    pub resync_earliest_slot: Arc<Mutex<Option<i64>>>,
 }
 
 impl MockStorage {
@@ -193,10 +195,14 @@ impl MockStorage {
         });
         *marker = Some(key.clone());
         let own = program.owned_transaction_type();
-        self.pending_transactions
-            .lock()
-            .unwrap()
-            .retain(|t| t.transaction_type != own);
+        let mut rows = self.pending_transactions.lock().unwrap();
+        let deleted = rows
+            .iter()
+            .filter(|t| t.transaction_type == own)
+            .map(|t| t.slot);
+        let mut bound = self.resync_earliest_slot.lock().unwrap();
+        *bound = bound.iter().copied().chain(deleted).min();
+        rows.retain(|t| t.transaction_type != own);
         self.committed_checkpoints.lock().unwrap().remove(&key);
         Ok(())
     }
@@ -213,6 +219,7 @@ impl MockStorage {
     ) -> Result<(), StorageError> {
         self.check_should_fail("clear_unfinished_resync")?;
         *self.unfinished_resync.lock().unwrap() = None;
+        *self.resync_earliest_slot.lock().unwrap() = None;
         let reason = crate::storage::common::storage::resync_state::resync_halt_reason(program);
         let mut halt = self.reconciliation_halt.lock().unwrap();
         if halt.as_ref().is_some_and(|h| h.reason == reason) {
@@ -577,6 +584,17 @@ impl MockStorage {
         own: TransactionType,
     ) -> Result<ResyncBlockers, StorageError> {
         self.check_should_fail("get_resync_blockers")?;
+        // Taken before the rows, in the same lock order as `wipe_program`.
+        let own_program = match own {
+            TransactionType::Deposit => crate::config::ProgramType::Escrow,
+            TransactionType::Withdrawal => crate::config::ProgramType::Withdraw,
+        };
+        let marker_bound = match self.unfinished_resync.lock().unwrap().as_deref() {
+            Some(key) if key == crate::indexer::checkpoint::program_key(own_program) => {
+                *self.resync_earliest_slot.lock().unwrap()
+            }
+            _ => None,
+        };
         let journaled = |id: i64| {
             let has = |map: &Arc<Mutex<ReleaseSignatureMap>>| {
                 map.lock()
@@ -611,6 +629,7 @@ impl MockStorage {
                 .iter()
                 .filter(|t| t.transaction_type == own)
                 .map(|t| t.slot)
+                .chain(marker_bound)
                 .min(),
         })
     }

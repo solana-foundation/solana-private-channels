@@ -3270,6 +3270,77 @@ async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// P1c. An interrupted wipe keeps the lowest slot it deleted until the resync completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_blockers_remember_rows_an_unfinished_wipe_deleted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let seed = |sig: &'static str, ty, slot: i64| {
+        let (pool, storage) = (&pool, &storage);
+        async move {
+            let id = seed_with_status(pool, storage, sig, ty, "completed").await?;
+            sqlx::query("UPDATE transactions SET slot = $2 WHERE id = $1")
+                .bind(id)
+                .bind(slot)
+                .execute(pool)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    };
+    let earliest = |ty| {
+        let storage = &storage;
+        async move {
+            storage
+                .get_resync_blockers(ty)
+                .await
+                .map(|b| b.earliest_slot)
+        }
+    };
+    seed("dep_early", TransactionType::Deposit, 100).await?;
+    seed("dep_late", TransactionType::Deposit, 500).await?;
+    seed("wd", TransactionType::Withdrawal, 7).await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "p1c_resync",
+        Duration::ZERO,
+    )
+    .await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    assert_eq!(
+        earliest(TransactionType::Deposit).await?,
+        Some(100),
+        "the deleted rows still bound a rerun"
+    );
+    assert_eq!(earliest(TransactionType::Withdrawal).await?, Some(7));
+
+    // A partial rebuild above the bound, wiped again by the rerun, must not raise it.
+    seed("dep_rebuilt", TransactionType::Deposit, 300).await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    assert_eq!(earliest(TransactionType::Deposit).await?, Some(100));
+
+    seed("dep_lower", TransactionType::Deposit, 50).await?;
+    assert_eq!(earliest(TransactionType::Deposit).await?, Some(50));
+
+    storage
+        .clear_unfinished_resync_fenced(&guard, ProgramType::Escrow)
+        .await?;
+    sqlx::query("DELETE FROM transactions WHERE transaction_type = 'deposit'")
+        .execute(&pool)
+        .await?;
+    assert_eq!(
+        earliest(TransactionType::Deposit).await?,
+        None,
+        "a completed resync drops the bound with its marker"
+    );
+    Ok(())
+}
+
 /// P2. An escrow resync deletes only escrow rows; every withdrawal, nonce and journal survives.
 #[tokio::test(flavor = "multi_thread")]
 async fn escrow_wipe_keeps_withdrawal_side() -> Result<(), Box<dyn std::error::Error>> {
