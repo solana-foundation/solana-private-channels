@@ -106,7 +106,8 @@ flag write itself fails, the operator retries it within the tick and again on
 later ticks until it lands. `/health` is only forced to 503 once the flag has
 landed, because that latch lasts until a restart; until then the webhook, the
 `input_dark_ticks` gauge and its alert are what page. The halt webhook fires once
-per incident, not on every retry.
+per incident, not on every retry: once for the outage, and once for each mint
+whose breach confirms while the flag write is still failing.
 
 An inputs-dark halt never replaces an insolvency halt: if the flag already holds
 an insolvency, it is left as it is, reason included. The other way round, a
@@ -120,7 +121,11 @@ flag then would let withdrawals of that mint go out.
 
 When there are more than 100 mints, custody is read in batches of 100 that can
 answer at different slots. Each mint is compared with the ledger at the slot its
-own batch answered at, so this never makes a tick dark.
+own batch answered at, and a liability halt reason names that slot. Custody is
+held to the same freshness rule as channel supply: each tick finds Solana's
+newest finalized block, requires it to be under 120 s old, and a custody batch
+answered below it is a failed custody read, so a lagging RPC backend makes the
+tick dark instead of checking an old balance.
 
 ### Where the halt is enforced
 

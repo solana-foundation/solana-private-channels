@@ -172,8 +172,12 @@ pub async fn fetch_escrow_custody(
         });
     }
 
-    // Each mint is compared with the ledger at its own slot, so chunks need not agree on one.
-    let (balances, slots) = read_custody_once(rpc_client, escrow_instance_id, mints)
+    // Each mint is compared with the ledger at its own slot, so chunks need not agree on one,
+    // but each must be at or past a recent block so a lagging backend cannot hide a drain.
+    let anchor = newest_block_anchor(rpc_client, "Solana")
+        .await
+        .map_err(SweepFailure::Read)?;
+    let (balances, slots) = read_custody_once(rpc_client, escrow_instance_id, mints, anchor)
         .await
         .map_err(SweepFailure::Read)?;
     let slot = slots.values().copied().max().unwrap_or_default();
@@ -188,11 +192,13 @@ fn read_failure(reason: String) -> SweepFailure {
     SweepFailure::Read(EscrowSweepError { reason })
 }
 
-/// One pass over every ATA. Returns the balances plus the slot each mint was read at.
+/// One pass over every ATA. Returns the balances plus the slot each mint was read at, refusing
+/// any chunk answered below `anchor`.
 async fn read_custody_once(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
     mints: &[(Pubkey, Pubkey)],
+    anchor: u64,
 ) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), EscrowSweepError> {
     let mut balances = HashMap::new();
     let mut slots = HashMap::new();
@@ -233,6 +239,14 @@ async fn read_custody_once(
                     "Escrow ATA read returned {} accounts for {} keys",
                     response.value.len(),
                     chunk.len()
+                ),
+            });
+        }
+        if response.context.slot < anchor {
+            return Err(EscrowSweepError {
+                reason: format!(
+                    "Escrow ATA read answered at slot {}, behind the Solana block {anchor}",
+                    response.context.slot
                 ),
             });
         }
@@ -425,7 +439,7 @@ pub async fn fetch_channel_supply_at(
     Ok((mint_state.supply, slot))
 }
 
-/// Oldest the channel's newest block may be, and how far its time may run ahead of ours, before
+/// Oldest a chain's newest block may be, and how far its time may run ahead of ours, before
 /// its reads count as unknown. Far above heartbeat, replica lag and clock skew, far below the halt window.
 pub const CHANNEL_MAX_AGE_SECS: i64 = 120;
 
@@ -436,54 +450,58 @@ const ANCHOR_WINDOWS: [u64; 3] = [64, 4_096, 262_144];
 /// `minContextSlot`, so a supply read answered at or after this slot is what proves freshness;
 /// a frozen node, a lagging replica or an older load-balanced backend all fail it.
 pub async fn channel_anchor(channel_rpc: &RpcClientWithRetry) -> Result<u64, EscrowSweepError> {
+    newest_block_anchor(channel_rpc, "channel").await
+}
+
+/// `chain`'s newest finalized block slot, proven younger than `CHANNEL_MAX_AGE_SECS`.
+async fn newest_block_anchor(
+    rpc: &RpcClientWithRetry,
+    chain: &str,
+) -> Result<u64, EscrowSweepError> {
     let fail = |reason: String| EscrowSweepError { reason };
-    // Finalized like the supply read, so a node that honors commitment compares like with like.
+    // Finalized like the reads it anchors, so a node that honors commitment compares like with like.
     let finalized = CommitmentConfig::finalized();
-    let tip = channel_rpc
+    let tip = rpc
         .with_retry("get_slot", RetryPolicy::Idempotent, || async {
-            channel_rpc
-                .rpc_client
-                .get_slot_with_commitment(finalized)
-                .await
+            rpc.rpc_client.get_slot_with_commitment(finalized).await
         })
         .await
-        .map_err(|e| fail(format!("Failed to read the channel slot: {e}")))?;
+        .map_err(|e| fail(format!("Failed to read the {chain} slot: {e}")))?;
 
     // Idle slots carry no block, so look back for the newest one that does.
     let mut block = None;
     for window in ANCHOR_WINDOWS {
         let start = tip.saturating_sub(window);
-        let blocks = channel_rpc
+        let blocks = rpc
             .with_retry("get_blocks", RetryPolicy::Idempotent, || async {
-                channel_rpc
-                    .rpc_client
+                rpc.rpc_client
                     .get_blocks_with_commitment(start, Some(tip), finalized)
                     .await
             })
             .await
-            .map_err(|e| fail(format!("Failed to list channel blocks: {e}")))?;
+            .map_err(|e| fail(format!("Failed to list {chain} blocks: {e}")))?;
         if let Some(newest) = blocks.into_iter().max() {
             block = Some(newest);
             break;
         }
     }
     let block =
-        block.ok_or_else(|| fail(format!("no channel block found at or below slot {tip}")))?;
+        block.ok_or_else(|| fail(format!("no {chain} block found at or below slot {tip}")))?;
 
-    let block_time = channel_rpc
+    let block_time = rpc
         .get_block_time(block)
         .await
-        .map_err(|e| fail(format!("channel block {block} has no time: {e}")))?;
+        .map_err(|e| fail(format!("{chain} block {block} has no time: {e}")))?;
     let age = chrono::Utc::now().timestamp().saturating_sub(block_time);
     if age > CHANNEL_MAX_AGE_SECS {
         return Err(fail(format!(
-            "channel's newest block {block} is {age}s old, past the {CHANNEL_MAX_AGE_SECS}s limit"
+            "{chain}'s newest block {block} is {age}s old, past the {CHANNEL_MAX_AGE_SECS}s limit"
         )));
     }
     // A clock far ahead of ours would hide a frozen node for as long as it is ahead.
     if age < -CHANNEL_MAX_AGE_SECS {
         return Err(fail(format!(
-            "channel's newest block {block} is stamped {}s ahead of our clock, past the {CHANNEL_MAX_AGE_SECS}s limit",
+            "{chain}'s newest block {block} is stamped {}s ahead of our clock, past the {CHANNEL_MAX_AGE_SECS}s limit",
             -age
         )));
     }
@@ -1150,6 +1168,7 @@ pub(crate) mod tests {
             ),
         ]);
         let requested = Arc::new(Mutex::new(Vec::new()));
+        mock_channel_clock(&mut server, 42, vec![42], Some(1)).await;
         mock_multiple_accounts(&mut server, accounts, vec![42], requested.clone()).await;
         let mints = [
             (absent, spl_token::id()),
@@ -1192,6 +1211,7 @@ pub(crate) mod tests {
         ];
         for (label, account) in cases {
             let mut server = mockito::Server::new_async().await;
+            mock_channel_clock(&mut server, 1, vec![1], Some(1)).await;
             mock_multiple_accounts(
                 &mut server,
                 HashMap::from([(key, account)]),
@@ -1226,6 +1246,7 @@ pub(crate) mod tests {
 
         let mut agreeing = mockito::Server::new_async().await;
         let requested = Arc::new(Mutex::new(Vec::new()));
+        mock_channel_clock(&mut agreeing, 7, vec![7], Some(1)).await;
         mock_multiple_accounts(&mut agreeing, accounts.clone(), vec![7], requested.clone()).await;
         let snapshot = fetch_escrow_custody(&client(&agreeing.url()), instance, &mints)
             .await
@@ -1238,6 +1259,7 @@ pub(crate) mod tests {
         // Chunks answering at different slots are kept, each mint tagged with its own slot.
         let mut split = mockito::Server::new_async().await;
         let alternating = (0..20).map(|n| 10 + n % 2).collect();
+        mock_channel_clock(&mut split, 10, vec![10], Some(1)).await;
         mock_multiple_accounts(
             &mut split,
             accounts,
@@ -1252,6 +1274,61 @@ pub(crate) mod tests {
         assert_eq!(custody.slots[&held], 11);
         assert_eq!(custody.slot, 11, "the highest slot read");
         assert_eq!(custody.balances[&held], 9);
+    }
+
+    /// A chunk answered below the chain's newest recent block is stale and fails the read,
+    /// whether it is the only chunk or one of several.
+    #[tokio::test]
+    async fn custody_rejects_a_chunk_behind_the_chain_anchor() {
+        let instance = Pubkey::new_unique();
+        let many: Vec<(Pubkey, Pubkey)> = (0..101)
+            .map(|_| (Pubkey::new_unique(), spl_token::id()))
+            .collect();
+        let one = vec![many[0]];
+        for (label, mints, slots) in [
+            ("one lagging chunk of two", &many, vec![50, 40]),
+            ("a single lagging chunk", &one, vec![40]),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            mock_channel_clock(&mut server, 50, vec![50], Some(1)).await;
+            mock_multiple_accounts(
+                &mut server,
+                HashMap::new(),
+                slots,
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+
+            let result = fetch_escrow_custody(&fast_client(&server.url()), instance, mints).await;
+
+            assert!(
+                matches!(result, Err(SweepFailure::Read(_))),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    /// Custody is only as fresh as the chain it is read from: an old newest block fails the read.
+    #[tokio::test]
+    async fn custody_requires_a_recent_chain_block() {
+        let mut server = mockito::Server::new_async().await;
+        mock_channel_clock(&mut server, 50, vec![50], Some(CHANNEL_MAX_AGE_SECS + 1)).await;
+        mock_multiple_accounts(
+            &mut server,
+            HashMap::new(),
+            vec![50],
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+
+        let result = fetch_escrow_custody(
+            &fast_client(&server.url()),
+            Pubkey::new_unique(),
+            &[(Pubkey::new_unique(), spl_token::id())],
+        )
+        .await;
+
+        assert!(matches!(result, Err(SweepFailure::Read(_))), "{result:?}");
     }
 
     /// With no mints there is nothing to read, but the snapshot still needs a slot to pin the ledger.

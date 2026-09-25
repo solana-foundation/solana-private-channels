@@ -66,8 +66,10 @@ const LEDGER_CATCHUP_POLL_MS: u64 = 5;
 struct BreachCounters {
     supply: HashMap<Pubkey, u32>,
     liability: HashMap<Pubkey, u32>,
-    /// The most severe halt the current incident has paged for, so a failing write never re-pages.
-    announced: Option<HaltKind>,
+    /// The current incident paged its outage, so a failing write never re-pages it.
+    announced_outage: bool,
+    /// Mints the current incident paged an insolvency for; each distinct shortfall pages once.
+    announced_mints: HashSet<Pubkey>,
     /// An insolvency halt is in force; only that suppresses a new breach trip.
     insolvency_halted: bool,
 }
@@ -82,6 +84,12 @@ enum HaltKind {
 }
 
 impl BreachCounters {
+    /// End the incident's paging, so the next one pages again.
+    fn clear_announced(&mut self) {
+        self.announced_outage = false;
+        self.announced_mints.clear();
+    }
+
     /// Whether any mint has reached the breach count that trips a halt.
     fn any_confirmed(&self) -> bool {
         self.supply
@@ -353,7 +361,7 @@ async fn perform_reconciliation_check(
     .await;
     // An incident whose flag never landed ends once nothing would trip it, so the next one pages.
     if !*halted && *input_dark_ticks < INPUT_DARK_HALT_TICKS && !breach_counters.any_confirmed() {
-        breach_counters.announced = None;
+        breach_counters.clear_announced();
     }
     result.map(|_| ())
 }
@@ -393,7 +401,7 @@ async fn track_input_state(
                 // The write found an insolvency halt already set, which has paged on its own.
                 if in_force == Some(HaltKind::Insolvency) {
                     breach_counters.insolvency_halted = true;
-                } else if breach_counters.announced.is_none() {
+                } else if !breach_counters.announced_outage {
                     match send_inputs_dark_halt_alert(
                         &config.reconciliation_webhook_url,
                         *input_dark_ticks,
@@ -402,7 +410,7 @@ async fn track_input_state(
                     )
                     .await
                     {
-                        Ok(()) => breach_counters.announced = Some(HaltKind::Outage),
+                        Ok(()) => breach_counters.announced_outage = true,
                         Err(e) => error!("Failed to send inputs-dark halt webhook: {}", e),
                     }
                 }
@@ -446,7 +454,7 @@ async fn check_invariants(
     if let Ok(flag) = storage.is_reconciliation_halted().await {
         // A flag cleared after it landed ends the incident, so a re-trip pages again.
         if *halted && flag.is_none() {
-            breach_counters.announced = None;
+            breach_counters.clear_announced();
         }
         breach_counters.insolvency_halted = flag.as_ref().is_some_and(|flag| flag.insolvency);
         *halted = flag.is_some();
@@ -506,6 +514,7 @@ async fn check_invariants(
         webhook_client,
         &custody.balances,
         custody.slot,
+        &custody.slots,
         &mints,
         &supply,
         &envelope,
@@ -761,6 +770,7 @@ fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
 /// Halt path: per mint, advance each invariant's own counter and freeze the pipelines once
 /// (durable flag + quarantine + forced-unhealthy + webhook) on the `HALT_CONFIRM_TICKS`-th breach of either.
 /// `liabilities` is `None` when the ledger could not be pinned to `slot`; that arm then holds.
+/// `slots` holds each mint's custody slot; a mint without one was read at `slot`.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_and_maybe_halt(
     storage: &Arc<Storage>,
@@ -769,6 +779,7 @@ async fn evaluate_and_maybe_halt(
     webhook_client: &WebhookClient,
     custody: &HashMap<Pubkey, u64>,
     slot: u64,
+    slots: &HashMap<Pubkey, u64>,
     mints: &HashSet<Pubkey>,
     supply: &HashMap<Pubkey, u64>,
     envelope: &HashMap<Pubkey, u64>,
@@ -779,7 +790,8 @@ async fn evaluate_and_maybe_halt(
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
     let mut next_counters = BreachCounters {
-        announced: breach_counters.announced,
+        announced_outage: breach_counters.announced_outage,
+        announced_mints: std::mem::take(&mut breach_counters.announced_mints),
         insolvency_halted: breach_counters.insolvency_halted,
         ..Default::default()
     };
@@ -835,7 +847,7 @@ async fn evaluate_and_maybe_halt(
             breach.supply_gap,
             c.saturating_add(breach.supply_gap),
             &reason,
-            &mut next_counters.announced,
+            &mut next_counters.announced_mints,
         )
         .await
         {
@@ -875,6 +887,7 @@ async fn evaluate_and_maybe_halt(
 
         let count = breach_counters.liability.get(&mint).copied().unwrap_or(0) + 1;
         next_counters.liability.insert(mint, count);
+        let mint_slot = slots.get(&mint).copied().unwrap_or(slot);
 
         // An outage halt does not suppress this: a proven breach must still quarantine and page.
         if count < HALT_CONFIRM_TICKS || next_counters.insolvency_halted {
@@ -883,7 +896,7 @@ async fn evaluate_and_maybe_halt(
                 gap = breach.gap,
                 liabilities = breach.liabilities,
                 tolerance = breach.tolerance,
-                slot,
+                slot = mint_slot,
                 consecutive_ticks = count,
                 "Custody short of ledger liabilities; halt pending confirmation"
             );
@@ -893,7 +906,7 @@ async fn evaluate_and_maybe_halt(
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of ledger liabilities {} by {}, \
              tolerance {} at slot {} over {} consecutive finalized ticks",
-            mint, c, breach.liabilities, breach.gap, breach.tolerance, slot, count
+            mint, c, breach.liabilities, breach.gap, breach.tolerance, mint_slot, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
         if trip_halt(
@@ -906,7 +919,7 @@ async fn evaluate_and_maybe_halt(
             breach.gap,
             breach.liabilities,
             &reason,
-            &mut next_counters.announced,
+            &mut next_counters.announced_mints,
         )
         .await
         {
@@ -933,13 +946,13 @@ async fn trip_halt(
     gap: u64,
     db_balance: u64,
     reason: &str,
-    announced: &mut Option<HaltKind>,
+    announced: &mut HashSet<Pubkey>,
 ) -> bool {
     let persisted = freeze_pipelines(storage, health, reason, HaltKind::Insolvency)
         .await
         .is_some();
     // An outage page does not cover this: an upgrade to insolvency pages again.
-    if *announced == Some(HaltKind::Insolvency) {
+    if announced.contains(mint) {
         return persisted;
     }
     // Payload carries real custody and the amount the escrow should hold (supply it
@@ -951,7 +964,9 @@ async fn trip_halt(
         delta_bps: insolvency_delta_bps(custody, gap),
     };
     match send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await {
-        Ok(()) => *announced = Some(HaltKind::Insolvency),
+        Ok(()) => {
+            announced.insert(*mint);
+        }
         Err(e) => error!("Failed to send reconciliation halt webhook: {}", e),
     }
     persisted
@@ -1583,6 +1598,7 @@ mod tests {
             &test_webhook_client(),
             &custody,
             1,
+            &HashMap::new(),
             &db_mints,
             &supply,
             &envelope,
@@ -1617,6 +1633,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1660,6 +1677,7 @@ mod tests {
                 &webhook,
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 supply,
                 &envelope,
@@ -1696,6 +1714,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1714,6 +1733,7 @@ mod tests {
             &test_webhook_client(),
             &custody,
             1,
+            &HashMap::new(),
             &db_mints,
             &supply,
             &envelope,
@@ -1742,6 +1762,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1763,6 +1784,7 @@ mod tests {
             &test_webhook_client(),
             &custody,
             1,
+            &HashMap::new(),
             &db_mints,
             &supply,
             &envelope,
@@ -1805,6 +1827,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1850,6 +1873,7 @@ mod tests {
                 &webhook,
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 supply,
                 &envelope,
@@ -1894,6 +1918,7 @@ mod tests {
                 &webhook,
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1956,6 +1981,7 @@ mod tests {
             &test_webhook_client(),
             custody,
             1,
+            &HashMap::new(),
             mints,
             supply,
             envelope,
@@ -2006,6 +2032,39 @@ mod tests {
         assert!(!reason.contains("supply by"), "{reason}");
         assert!(reason.contains(&mint.to_string()), "{reason}");
         assert_eq!(counters.liability.get(&mint).copied(), Some(3));
+    }
+
+    /// A liability halt names the slot the breaching mint's custody was read at, not the highest.
+    #[tokio::test]
+    async fn liability_halt_reason_names_the_mints_own_slot() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, HALT_CONFIRM_TICKS - 1)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+
+        evaluate_and_maybe_halt(
+            &storage,
+            &recon_config_zero_tolerance(),
+            &None,
+            &test_webhook_client(),
+            &custody,
+            11,
+            &HashMap::from([(mint, 10)]),
+            &mints,
+            &supply,
+            &envelope,
+            Some(&liabilities),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        assert!(halted);
+        let reason = halt_reason(&storage).await;
+        assert!(reason.contains("at slot 10 "), "{reason}");
     }
 
     #[tokio::test]
@@ -2434,8 +2493,9 @@ mod tests {
     }
 
     /// Mock escrow custody: `getMultipleAccounts` answers the test instance's SPL ATA for
-    /// `mint` with `amount`, and any other requested key as absent.
+    /// `mint` with `amount` at slot 1, and any other requested key as absent.
     async fn mock_custody_sweep(server: &mut mockito::Server, mint: Pubkey, amount: u64) {
+        crate::operator::escrow_sweep::tests::mock_channel_clock(server, 1, vec![1], Some(1)).await;
         use base64::Engine as _;
         use spl_token::solana_program::program_option::COption;
         use spl_token::solana_program::program_pack::Pack;
@@ -3935,6 +3995,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -3952,6 +4013,100 @@ mod tests {
             "the write is retried on every confirmed tick"
         );
         assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
+    }
+
+    /// Two mints confirming while the flag write fails each page once, not only the first.
+    #[tokio::test]
+    async fn each_mint_confirming_under_a_failing_write_pages_once() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_reconciliation_halt", true);
+        let storage = Arc::new(Storage::Mock(mock));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut custody, mut mints, mut supply, mut envelope, _) = breach_maps();
+        let (custody_b, mints_b, supply_b, envelope_b, _) = breach_maps();
+        custody.extend(custody_b);
+        mints.extend(mints_b);
+        supply.extend(supply_b);
+        envelope.extend(envelope_b);
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        for _ in 0..HALT_CONFIRM_TICKS + 2 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &HashMap::new(),
+                &mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert_eq!(alerts.load(Ordering::SeqCst), 2, "one page per mint");
+    }
+
+    /// An insolvency page for an unwritten flag does not silence a later inputs-dark page.
+    #[tokio::test]
+    async fn an_insolvency_page_does_not_silence_an_inputs_dark_page() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_reconciliation_halt", true);
+        mock.set_should_fail("set_outage_halt", true);
+        let storage = Arc::new(Storage::Mock(mock));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, mints, supply, envelope, _) = breach_maps();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..HALT_CONFIRM_TICKS {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &HashMap::new(),
+                &mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+        assert_eq!(alerts.load(Ordering::SeqCst), 1);
+
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            track_input_state(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                Some("custody unreadable".to_string()),
+                &mut input_dark,
+                &mut halted,
+                &mut counters,
+            )
+            .await;
+        }
+
+        assert_eq!(alerts.load(Ordering::SeqCst), 2, "the outage pages too");
     }
 
     /// An existing halt is never overwritten or re-announced by a dark streak.
@@ -4091,6 +4246,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
