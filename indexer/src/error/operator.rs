@@ -36,6 +36,9 @@ pub enum OperatorError {
     #[error("RPC error: {0}")]
     RpcError(String),
 
+    #[error("Invalid config: {0}")]
+    InvalidConfig(String),
+
     #[error("Webhook error: {0}")]
     WebhookError(String),
 

@@ -37,6 +37,41 @@ pub async fn run(
     );
     info!("Retry max attempts: {}", config.retry_max_attempts);
 
+    // Config checks first: a misconfigured operator must not take the lock or migrate
+    // the schema before refusing.
+
+    // The withdraw operator's compensating remint MintTo must broadcast on the source
+    // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
+    // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
+    // to the wrong chain and never restoring the burned balance. Fail closed at startup.
+    if common_config.program_type == crate::config::ProgramType::Withdraw
+        && common_config.source_rpc_url.is_none()
+    {
+        return Err(OperatorError::InvalidConfig(
+            "source_rpc_url required for Withdraw operator: remints must target the source \
+             PrivateChannel, not the Solana destination"
+                .to_string(),
+        ));
+    }
+
+    // Both roles are bound to one instance: withdraw derives the bitmap and ReleaseFunds
+    // accounts from it, escrow reconciles its custody. Refuse before the fetcher can claim
+    // a row the pipeline could never finish.
+    let Some(escrow_instance) = common_config.escrow_instance_id else {
+        return Err(OperatorError::InvalidConfig(
+            "escrow_instance_id required for every operator: withdraw releases and escrow \
+             reconciliation are bound to the instance"
+                .to_string(),
+        ));
+    };
+
+    // Empty means unset (env renders "") and maps to None.
+    let normalized_fallback_url = common_config
+        .fallback_rpc_url
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
+
     let cancellation_token = CancellationToken::new();
 
     // Take the live-state lock before touching the schema or any row. A resync
@@ -74,11 +109,7 @@ pub async fn run(
     ));
 
     // Optional destination fallback for recovery and the boot pre-flight to
-    // re-check a Dead verdict. Empty means unset (env renders "") and maps to None.
-    let normalized_fallback_url = common_config
-        .fallback_rpc_url
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    // re-check a Dead verdict.
     let fallback_rpc_client = normalized_fallback_url.map(|url| {
         Arc::new(RpcClientWithRetry::with_retry_config(
             url.to_string(),
@@ -88,33 +119,6 @@ pub async fn run(
             },
         ))
     });
-
-    // The withdraw operator's compensating remint MintTo must broadcast on the source
-    // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
-    // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
-    // to the wrong chain and never restoring the burned balance. Fail closed at startup.
-    if common_config.program_type == crate::config::ProgramType::Withdraw
-        && common_config.source_rpc_url.is_none()
-    {
-        return Err(OperatorError::RpcError(
-            "source_rpc_url required for Withdraw operator: remints must target the source \
-             PrivateChannel, not the Solana destination"
-                .to_string(),
-        ));
-    }
-
-    // Both roles are bound to one instance: withdraw derives the bitmap and ReleaseFunds
-    // accounts from it, escrow reconciles its custody. Refuse before the fetcher can claim
-    // a row the pipeline could never finish.
-    let Some(escrow_instance) = common_config.escrow_instance_id else {
-        return Err(OperatorError::RpcError(
-            "escrow_instance_id required for every operator: withdraw releases and escrow \
-             reconciliation are bound to the instance"
-                .to_string(),
-        ));
-    };
-
-    reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
 
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require
     // an independent, same-cluster, reachable fallback before starting.
@@ -616,7 +620,7 @@ fn reject_escrow_fallback(
     fallback_url: Option<&str>,
 ) -> Result<(), OperatorError> {
     if program_type == crate::config::ProgramType::Escrow && fallback_url.is_some() {
-        return Err(OperatorError::RpcError(
+        return Err(OperatorError::InvalidConfig(
             "fallback_rpc_url is not supported for the escrow operator: its finality checks \
              must come from the channel rpc_url alone"
                 .to_string(),
@@ -1245,7 +1249,7 @@ mod tests {
             crate::config::ProgramType::Escrow,
             Some("https://archival.example"),
         );
-        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+        assert!(matches!(result, Err(OperatorError::InvalidConfig(_))));
     }
 
     /// The escrow refusal must not catch the withdraw operator, whose fallback is supported.
@@ -1262,7 +1266,7 @@ mod tests {
     }
 
     /// Without the escrow instance no ReleaseFunds can be built, so the withdraw operator
-    /// must refuse before the fetcher claims a row whose burn has already landed.
+    /// must refuse before it takes the lock, migrates the schema or claims a burned row.
     #[tokio::test]
     async fn withdraw_operator_without_instance_refuses_before_claiming() {
         let mock = MockStorage::new();
@@ -1337,8 +1341,16 @@ mod tests {
         .expect("a withdraw operator without an instance must refuse, not start");
 
         assert!(
-            matches!(&result, Err(OperatorError::RpcError(msg)) if msg.contains("escrow_instance_id")),
+            matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("escrow_instance_id")),
             "missing instance must refuse to start: {result:?}"
+        );
+        assert!(
+            !mock
+                .call_order
+                .lock()
+                .unwrap()
+                .contains(&"init_schema".to_string()),
+            "config must be checked before the schema is touched"
         );
         assert_eq!(
             mock.pending_transactions.lock().unwrap()[0].status,
