@@ -520,8 +520,24 @@ impl MockStorage {
         *self.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
             reason: reason.to_string(),
             halted_at: Utc::now(),
+            insolvency: true,
         });
         Ok(())
+    }
+
+    pub async fn set_outage_halt(&self, reason: &str) -> Result<bool, StorageError> {
+        self.check_should_fail("set_outage_halt")?;
+        let mut halt = self.reconciliation_halt.lock().unwrap();
+        // Mirror the conditional upsert: an active insolvency halt is kept.
+        if halt.as_ref().is_some_and(|h| h.insolvency) {
+            return Ok(false);
+        }
+        *halt = Some(HaltInfo {
+            reason: reason.to_string(),
+            halted_at: Utc::now(),
+            insolvency: false,
+        });
+        Ok(true)
     }
 
     pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {

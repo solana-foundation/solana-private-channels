@@ -3738,6 +3738,7 @@ mod tests {
                 *halting.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
                     reason: "test halt".to_string(),
                     halted_at: Utc::now(),
+                    insolvency: true,
                 });
                 serde_json::json!({
                     "jsonrpc": "2.0",

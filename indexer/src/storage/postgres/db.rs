@@ -1013,9 +1013,17 @@ impl PostgresDb {
                 id          BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
                 halted      BOOLEAN NOT NULL,
                 reason      TEXT NOT NULL,
-                halted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                halted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                insolvency  BOOLEAN NOT NULL DEFAULT TRUE
             );
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Every halt written before this column was an insolvency halt, hence the default.
+        sqlx::query(
+            "ALTER TABLE reconciliation_halt ADD COLUMN IF NOT EXISTS insolvency BOOLEAN NOT NULL DEFAULT TRUE",
         )
         .execute(&self.pool)
         .await?;
@@ -2986,10 +2994,10 @@ impl PostgresDb {
     pub async fn set_reconciliation_halt_internal(&self, reason: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO reconciliation_halt (id, halted, reason, halted_at)
-            VALUES (TRUE, TRUE, $1, NOW())
+            INSERT INTO reconciliation_halt (id, halted, reason, halted_at, insolvency)
+            VALUES (TRUE, TRUE, $1, NOW(), TRUE)
             ON CONFLICT (id) DO UPDATE
-            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW()
+            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW(), insolvency = TRUE
             "#,
         )
         .bind(reason)
@@ -2998,12 +3006,30 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Set the halt for unreadable reconciliation inputs. An active insolvency halt is kept, so
+    /// its reason survives; returns false in that case, when the flag was already set.
+    pub async fn set_outage_halt_internal(&self, reason: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO reconciliation_halt (id, halted, reason, halted_at, insolvency)
+            VALUES (TRUE, TRUE, $1, NOW(), FALSE)
+            ON CONFLICT (id) DO UPDATE
+            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW(), insolvency = FALSE
+            WHERE NOT (reconciliation_halt.halted AND reconciliation_halt.insolvency)
+            "#,
+        )
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Return the halt reason/timestamp when the flag is set, else `None`.
     /// A row with `halted = FALSE` (cleared) also reads as not halted.
     pub async fn is_reconciliation_halted_internal(&self) -> Result<Option<HaltInfo>, sqlx::Error> {
         sqlx::query_as::<_, HaltInfo>(
             r#"
-            SELECT reason, halted_at
+            SELECT reason, halted_at, insolvency
             FROM reconciliation_halt
             WHERE id = TRUE AND halted = TRUE
             "#,

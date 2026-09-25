@@ -732,6 +732,55 @@ async fn reconciliation_halt_round_trips() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// An outage halt never replaces an insolvency halt, while an insolvency replaces an outage.
+/// A row written without the kind column reads as an insolvency, as every older halt was.
+#[tokio::test(flavor = "multi_thread")]
+async fn outage_halt_never_replaces_an_insolvency_halt() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    storage.set_reconciliation_halt("mint X insolvent").await?;
+    assert!(
+        !storage.set_outage_halt("inputs unavailable").await?,
+        "the outage write must report that an insolvency holds"
+    );
+    let info = storage
+        .is_reconciliation_halted()
+        .await?
+        .expect("still halted");
+    assert_eq!(info.reason, "mint X insolvent");
+    assert!(info.insolvency);
+
+    storage.clear_reconciliation_halt().await?;
+    assert!(storage.set_outage_halt("inputs unavailable").await?);
+    let info = storage
+        .is_reconciliation_halted()
+        .await?
+        .expect("outage set");
+    assert_eq!(info.reason, "inputs unavailable");
+    assert!(!info.insolvency);
+
+    storage.set_reconciliation_halt("mint Y insolvent").await?;
+    let info = storage.is_reconciliation_halted().await?.expect("upgraded");
+    assert_eq!(info.reason, "mint Y insolvent");
+    assert!(info.insolvency, "an insolvency replaces an outage halt");
+
+    sqlx::query("DELETE FROM reconciliation_halt")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO reconciliation_halt (id, halted, reason) VALUES (TRUE, TRUE, 'legacy')",
+    )
+    .execute(&pool)
+    .await?;
+    let info = storage
+        .is_reconciliation_halted()
+        .await?
+        .expect("legacy row");
+    assert!(info.insolvency, "an older halt row defaults to insolvency");
+
+    Ok(())
+}
+
 /// The envelope query sums only in-flight statuses, grouped per mint; terminal
 /// rows are excluded.
 #[tokio::test(flavor = "multi_thread")]

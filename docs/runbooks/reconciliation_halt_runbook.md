@@ -106,6 +106,16 @@ flag write itself fails, the operator retries it within the tick and again on
 later ticks until it lands. The halt webhook fires once per incident, not on
 every retry.
 
+An inputs-dark halt never replaces an insolvency halt: if the flag already holds
+an insolvency, it is left as it is, reason included. The other way round, a
+breach that confirms while an inputs-dark halt holds still trips as an
+insolvency: it replaces the reason, quarantines active withdrawals and posts the
+insolvency webhook. Before clearing an inputs-dark halt, check that no breach is
+building: look for `halt pending confirmation` warnings and a nonzero
+`private_channel_operator_reconciliation_liability_shortfall_raw`. A breach still
+counting toward its third tick has not quarantined anything yet, so clearing the
+flag then would let withdrawals of that mint go out.
+
 ### Where the halt is enforced
 
 The halt flag is read at the top of the shared fetcher loop, so it freezes

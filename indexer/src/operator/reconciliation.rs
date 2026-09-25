@@ -66,8 +66,19 @@ const LEDGER_CATCHUP_POLL_MS: u64 = 5;
 struct BreachCounters {
     supply: HashMap<Pubkey, u32>,
     liability: HashMap<Pubkey, u32>,
-    /// The current incident has paged, so a flag write that keeps failing retries without re-paging.
-    announced: bool,
+    /// The most severe halt the current incident has paged for, so a failing write never re-pages.
+    announced: Option<HaltKind>,
+    /// An insolvency halt is in force; only that suppresses a new breach trip.
+    insolvency_halted: bool,
+}
+
+/// Why the pipelines are frozen. An insolvency outranks an outage and is never replaced by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaltKind {
+    /// Reconciliation inputs were unreadable; nothing is proven wrong.
+    Outage,
+    /// A breach was confirmed; active withdrawals need a human.
+    Insolvency,
 }
 
 impl BreachCounters {
@@ -123,12 +134,10 @@ pub async fn run_reconciliation(
 
     // Seed the set-once guard from the durable flag so a restart into an active
     // halt does not re-quarantine or re-webhook; it stays frozen until cleared.
-    let mut halted = storage
-        .is_reconciliation_halted()
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+    // A failed read seeds "not halted"; the flag write itself never lets an outage replace an insolvency.
+    let seeded = storage.is_reconciliation_halted().await.ok().flatten();
+    let mut halted = seeded.is_some();
+    breach_counters.insolvency_halted = seeded.is_some_and(|flag| flag.insolvency);
 
     loop {
         // Check for cancellation
@@ -339,12 +348,12 @@ async fn perform_reconciliation_check(
         missing,
         input_dark_ticks,
         halted,
-        &mut breach_counters.announced,
+        breach_counters,
     )
     .await;
     // An incident whose flag never landed ends once nothing would trip it, so the next one pages.
     if !*halted && *input_dark_ticks < INPUT_DARK_HALT_TICKS && !breach_counters.any_confirmed() {
-        breach_counters.announced = false;
+        breach_counters.announced = None;
     }
     result.map(|_| ())
 }
@@ -361,7 +370,7 @@ async fn track_input_state(
     missing: Option<String>,
     input_dark_ticks: &mut u32,
     halted: &mut bool,
-    announced: &mut bool,
+    breach_counters: &mut BreachCounters,
 ) {
     match missing {
         None => *input_dark_ticks = 0,
@@ -378,9 +387,13 @@ async fn track_input_state(
                     input_dark_ticks, reason
                 );
                 error!(reason = %halt_reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-                // No quarantine: nothing is proven wrong, and the flag alone blocks every send.
-                *halted = freeze_pipelines(storage, health, &halt_reason, false).await;
-                if !*announced {
+                let in_force =
+                    freeze_pipelines(storage, health, &halt_reason, HaltKind::Outage).await;
+                *halted = in_force.is_some();
+                // The write found an insolvency halt already set, which has paged on its own.
+                if in_force == Some(HaltKind::Insolvency) {
+                    breach_counters.insolvency_halted = true;
+                } else if breach_counters.announced.is_none() {
                     match send_inputs_dark_halt_alert(
                         &config.reconciliation_webhook_url,
                         *input_dark_ticks,
@@ -389,7 +402,7 @@ async fn track_input_state(
                     )
                     .await
                     {
-                        Ok(()) => *announced = true,
+                        Ok(()) => breach_counters.announced = Some(HaltKind::Outage),
                         Err(e) => error!("Failed to send inputs-dark halt webhook: {}", e),
                     }
                 }
@@ -433,8 +446,9 @@ async fn check_invariants(
     if let Ok(flag) = storage.is_reconciliation_halted().await {
         // A flag cleared after it landed ends the incident, so a re-trip pages again.
         if *halted && flag.is_none() {
-            breach_counters.announced = false;
+            breach_counters.announced = None;
         }
+        breach_counters.insolvency_halted = flag.as_ref().is_some_and(|flag| flag.insolvency);
         *halted = flag.is_some();
     }
 
@@ -739,6 +753,7 @@ async fn evaluate_and_maybe_halt(
     // disappears) resets to zero rather than lingering.
     let mut next_counters = BreachCounters {
         announced: breach_counters.announced,
+        insolvency_halted: breach_counters.insolvency_halted,
         ..Default::default()
     };
     for &mint in mints {
@@ -763,7 +778,8 @@ async fn evaluate_and_maybe_halt(
         let count = breach_counters.supply.get(&mint).copied().unwrap_or(0) + 1;
         next_counters.supply.insert(mint, count);
 
-        if count < HALT_CONFIRM_TICKS || *halted {
+        // An outage halt does not suppress this: a proven breach must still quarantine and page.
+        if count < HALT_CONFIRM_TICKS || next_counters.insolvency_halted {
             warn!(
                 mint = %mint,
                 supply_gap = breach.supply_gap,
@@ -782,7 +798,7 @@ async fn evaluate_and_maybe_halt(
             mint, c, breach.supply_gap, breach.envelope, breach.tolerance, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-        *halted = trip_halt(
+        if trip_halt(
             storage,
             health,
             webhook_client,
@@ -794,7 +810,11 @@ async fn evaluate_and_maybe_halt(
             &reason,
             &mut next_counters.announced,
         )
-        .await;
+        .await
+        {
+            *halted = true;
+            next_counters.insolvency_halted = true;
+        }
     }
 
     for &mint in mints {
@@ -829,7 +849,8 @@ async fn evaluate_and_maybe_halt(
         let count = breach_counters.liability.get(&mint).copied().unwrap_or(0) + 1;
         next_counters.liability.insert(mint, count);
 
-        if count < HALT_CONFIRM_TICKS || *halted {
+        // An outage halt does not suppress this: a proven breach must still quarantine and page.
+        if count < HALT_CONFIRM_TICKS || next_counters.insolvency_halted {
             warn!(
                 mint = %mint,
                 gap = breach.gap,
@@ -848,7 +869,7 @@ async fn evaluate_and_maybe_halt(
             mint, c, breach.liabilities, breach.gap, breach.tolerance, slot, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-        *halted = trip_halt(
+        if trip_halt(
             storage,
             health,
             webhook_client,
@@ -860,7 +881,11 @@ async fn evaluate_and_maybe_halt(
             &reason,
             &mut next_counters.announced,
         )
-        .await;
+        .await
+        {
+            *halted = true;
+            next_counters.insolvency_halted = true;
+        }
     }
 
     *breach_counters = next_counters;
@@ -881,10 +906,13 @@ async fn trip_halt(
     gap: u64,
     db_balance: u64,
     reason: &str,
-    announced: &mut bool,
+    announced: &mut Option<HaltKind>,
 ) -> bool {
-    let persisted = freeze_pipelines(storage, health, reason, true).await;
-    if *announced {
+    let persisted = freeze_pipelines(storage, health, reason, HaltKind::Insolvency)
+        .await
+        .is_some();
+    // An outage page does not cover this: an upgrade to insolvency pages again.
+    if *announced == Some(HaltKind::Insolvency) {
         return persisted;
     }
     // Payload carries real custody and the amount the escrow should hold (supply it
@@ -896,26 +924,40 @@ async fn trip_halt(
         delta_bps: insolvency_delta_bps(custody, gap),
     };
     match send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await {
-        Ok(()) => *announced = true,
+        Ok(()) => *announced = Some(HaltKind::Insolvency),
         Err(e) => error!("Failed to send reconciliation halt webhook: {}", e),
     }
     persisted
 }
 
-/// The levers every halt pulls: the durable flag, optional quarantine, forced-unhealthy; returns
-/// whether the flag landed. Quarantine is for a proven insolvency, where each active withdrawal
-/// needs a human; an outage halt skips it because the flag already blocks every send.
+/// The levers every halt pulls: the durable flag, quarantine for an insolvency, forced-unhealthy.
+/// Returns the kind of halt now in force, or `None` when the flag never landed. An outage skips
+/// quarantine because nothing is proven wrong and the flag already blocks every send.
 async fn freeze_pipelines(
     storage: &Arc<Storage>,
     health: &Option<Arc<HealthState>>,
     reason: &str,
-    quarantine: bool,
-) -> bool {
-    let mut persisted = false;
+    kind: HaltKind,
+) -> Option<HaltKind> {
+    let mut in_force = None;
     for attempt in 1..=HALT_WRITE_ATTEMPTS {
-        match storage.set_reconciliation_halt(reason).await {
-            Ok(()) => {
-                persisted = true;
+        let written = match kind {
+            HaltKind::Insolvency => storage
+                .set_reconciliation_halt(reason)
+                .await
+                .map(|()| HaltKind::Insolvency),
+            // The outage write leaves an insolvency halt in place and says so.
+            HaltKind::Outage => storage.set_outage_halt(reason).await.map(|written| {
+                if written {
+                    HaltKind::Outage
+                } else {
+                    HaltKind::Insolvency
+                }
+            }),
+        };
+        match written {
+            Ok(held) => {
+                in_force = Some(held);
                 break;
             }
             Err(e) => error!(
@@ -924,7 +966,7 @@ async fn freeze_pipelines(
             ),
         }
     }
-    if quarantine {
+    if kind == HaltKind::Insolvency {
         // Unbounded on purpose: an insolvency halt is not nonce-scoped.
         match storage.quarantine_active_withdrawals(None, None).await {
             Ok(n) => info!(rows = n, "Quarantined active withdrawals on halt"),
@@ -934,7 +976,7 @@ async fn freeze_pipelines(
     if let Some(h) = health {
         h.force_unhealthy(reason.to_string());
     }
-    persisted
+    in_force
 }
 
 /// Posts the inputs-dark halt as `{ halt_reason, dark_ticks, timestamp }`, retrying
@@ -2238,7 +2280,11 @@ mod tests {
             ..recon_config_zero_tolerance()
         };
         let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
-        let mut counters = BreachCounters::default();
+        // The insolvency halt is in force, as the tick's resync would have found it.
+        let mut counters = BreachCounters {
+            insolvency_halted: true,
+            ..Default::default()
+        };
         let mut halted = true;
 
         for _ in 0..3 {
@@ -3698,7 +3744,7 @@ mod tests {
         let (mut env, _) = dark_env().await;
         set_input_failing(&mut env, Input::Ledger, true).await;
         env.mock.set_should_fail("is_reconciliation_halted", true);
-        env.mock.set_should_fail("set_reconciliation_halt", true);
+        env.mock.set_should_fail("set_outage_halt", true);
         let config = recon_config_zero_tolerance();
         let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
         for _ in 0..INPUT_DARK_HALT_TICKS {
@@ -3716,7 +3762,7 @@ mod tests {
         assert!(!halted, "an unwritten flag must not latch the guard");
         assert!(env.mock.reconciliation_halt.lock().unwrap().is_none());
 
-        env.mock.set_should_fail("set_reconciliation_halt", false);
+        env.mock.set_should_fail("set_outage_halt", false);
         let _ = run_tick_full(
             &env,
             &config,
@@ -3778,7 +3824,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (mut env, _) = dark_env().await;
         set_input_failing(&mut env, Input::Ledger, true).await;
-        env.mock.set_should_fail("set_reconciliation_halt", true);
+        env.mock.set_should_fail("set_outage_halt", true);
         let (hook, alerts) = counting_halt_hook().await;
         let config = OperatorConfig {
             reconciliation_webhook_url: Some(hook.url()),
@@ -3790,13 +3836,13 @@ mod tests {
         }
         assert!(!halted, "an unwritten flag must not latch the guard");
         assert_eq!(
-            env.mock.calls("set_reconciliation_halt"),
+            env.mock.calls("set_outage_halt"),
             3 * HALT_WRITE_ATTEMPTS as usize,
             "the write is retried on every dark tick past the limit"
         );
         assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
 
-        env.mock.set_should_fail("set_reconciliation_halt", false);
+        env.mock.set_should_fail("set_outage_halt", false);
         one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
         assert!(halted, "the guard latches once the write lands");
         assert_eq!(
@@ -3820,7 +3866,7 @@ mod tests {
     async fn an_unwritten_halt_rearms_its_alert_once_the_inputs_recover() {
         use std::sync::atomic::Ordering;
         let (mut env, _) = dark_env().await;
-        env.mock.set_should_fail("set_reconciliation_halt", true);
+        env.mock.set_should_fail("set_outage_halt", true);
         let (hook, alerts) = counting_halt_hook().await;
         let config = OperatorConfig {
             reconciliation_webhook_url: Some(hook.url()),
@@ -3935,6 +3981,100 @@ mod tests {
         alert.assert_async().await;
     }
 
+    /// A breach confirmed while an outage halt holds still quarantines, pages as an insolvency,
+    /// and replaces the stored reason, so clearing the outage cannot release a drained mint.
+    #[tokio::test]
+    async fn a_breach_during_an_outage_halt_still_trips_as_insolvency() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock, 1, 1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        storage
+            .set_outage_halt("reconciliation halt: required inputs unavailable")
+            .await
+            .unwrap();
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, db_mints, supply, envelope, mint) = breach_maps();
+        let mut counters = BreachCounters::default();
+        // The outage halt is in force, as the tick's resync would have found it.
+        let mut halted = true;
+
+        for _ in 0..HALT_CONFIRM_TICKS + 2 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &db_mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        let halt = storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halted");
+        assert!(halt.insolvency, "the breach upgrades the halt");
+        assert!(halt.reason.contains(&mint.to_string()), "{}", halt.reason);
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            crate::storage::common::models::TransactionStatus::ManualReview,
+            "an insolvency quarantines active withdrawals"
+        );
+        assert_eq!(alerts.load(Ordering::SeqCst), 1, "the upgrade pages once");
+    }
+
+    /// A dark streak never replaces an insolvency halt, even when the guard could not read the
+    /// flag and so believes nothing is halted.
+    #[tokio::test]
+    async fn a_dark_streak_never_replaces_an_insolvency_halt() {
+        use std::sync::atomic::Ordering;
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Envelope, true).await;
+        env.storage
+            .set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        env.mock.set_should_fail("is_reconciliation_halted", true);
+        let (hook, alerts) = counting_halt_hook().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS + 1 {
+            one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        }
+
+        let halt = env
+            .mock
+            .reconciliation_halt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("halted");
+        assert_eq!(halt.reason, "mint X insolvent");
+        assert!(halt.insolvency);
+        assert!(halted, "the guard learns a halt is in force");
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            0,
+            "no outage page over an insolvency"
+        );
+    }
+
     /// With no mints there is no supply to read, so an unreachable channel is not a dark tick.
     #[tokio::test]
     async fn no_mints_needs_no_channel() {
@@ -4027,24 +4167,24 @@ mod tests {
     async fn freeze_pipelines_quarantines_only_when_asked() {
         use crate::storage::common::models::TransactionStatus;
         use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
-        for (quarantine, expected) in [
-            (true, TransactionStatus::ManualReview),
-            (false, TransactionStatus::Pending),
+        for (kind, expected) in [
+            (HaltKind::Insolvency, TransactionStatus::ManualReview),
+            (HaltKind::Outage, TransactionStatus::Pending),
         ] {
             let mock = MockStorage::new();
             seed_pending_withdrawal(&mock, 1, 1);
             let storage = Arc::new(Storage::Mock(mock.clone()));
             let health = HealthState::new(HealthConfig::operator());
 
-            let persisted =
-                freeze_pipelines(&storage, &Some(health.clone()), "test freeze", quarantine).await;
+            let in_force =
+                freeze_pipelines(&storage, &Some(health.clone()), "test freeze", kind).await;
 
-            assert!(persisted);
+            assert_eq!(in_force, Some(kind));
             assert!(storage.is_reconciliation_halted().await.unwrap().is_some());
             assert_eq!(
                 mock.pending_transactions.lock().unwrap()[0].status,
                 expected,
-                "quarantine={quarantine}"
+                "{kind:?}"
             );
             assert!(matches!(
                 health.check(),
@@ -4061,9 +4201,10 @@ mod tests {
             mock.set_fail_times("set_reconciliation_halt", failures);
             let storage = Arc::new(Storage::Mock(mock.clone()));
 
-            let persisted = freeze_pipelines(&storage, &None, "test freeze", false).await;
+            let in_force =
+                freeze_pipelines(&storage, &None, "test freeze", HaltKind::Insolvency).await;
 
-            assert_eq!(persisted, expected, "{failures} failed writes");
+            assert_eq!(in_force.is_some(), expected, "{failures} failed writes");
             assert_eq!(mock.reconciliation_halt.lock().unwrap().is_some(), expected);
         }
     }

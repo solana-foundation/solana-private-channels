@@ -156,6 +156,8 @@ pub struct ReleasedWithdrawal {
 pub struct HaltInfo {
     pub reason: String,
     pub halted_at: DateTime<Utc>,
+    /// A proven insolvency; false for a halt set because reconciliation inputs were unreadable.
+    pub insolvency: bool,
 }
 
 /// Per-mint sum of every in-flight (unsettled) transaction amount. This bounds

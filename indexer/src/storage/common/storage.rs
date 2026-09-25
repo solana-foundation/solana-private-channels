@@ -277,6 +277,11 @@ impl Storage {
         reconciliation_halt::set_reconciliation_halt(self, reason).await
     }
 
+    /// Set the halt for unreadable inputs; an active insolvency halt is left in place.
+    pub async fn set_outage_halt(&self, reason: &str) -> Result<bool, StorageError> {
+        reconciliation_halt::set_outage_halt(self, reason).await
+    }
+
     /// Return the halt info when the flag is set, else `None` (not halted).
     pub async fn is_reconciliation_halted(&self) -> Result<Option<HaltInfo>, StorageError> {
         reconciliation_halt::is_reconciliation_halted(self).await
