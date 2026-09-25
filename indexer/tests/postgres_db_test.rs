@@ -21,7 +21,8 @@ use private_channel_indexer::{
             apply_lock_session_keepalives, apply_lock_session_lock_timeout,
             probe_advisory_lock_held, release_advisory_lock, SCHEMA_INIT_LOCK_KEY,
         },
-        DbTransaction, PostgresDb, RequeueOutcome, Storage, TransactionStatus, TransactionType,
+        DbTransaction, PostgresDb, RemintClaim, RequeueOutcome, Storage, TransactionStatus,
+        TransactionType,
     },
     PostgresConfig,
 };
@@ -302,6 +303,87 @@ async fn init_schema_widens_legacy_bigint_amount_column() -> Result<(), Box<dyn 
         .fetch_one(&pool)
         .await?;
     assert_eq!(got, big);
+    Ok(())
+}
+
+/// An older database still has `observed_releases.amount BIGINT`, which cannot hold a
+/// release past i64::MAX. init_schema must widen it in place without touching the
+/// amounts already recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_widens_legacy_bigint_observed_release_amount(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let container = Postgres::default()
+        .with_db_name("db_test")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await?;
+    let host = container.get_host().await?;
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgres://postgres:password@{}:{}/db_test", host, port);
+    let pool = PgPool::connect(&db_url).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE observed_releases (
+            withdrawal_nonce BIGINT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            slot BIGINT NOT NULL,
+            amount BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    let legacy_nonce: u64 = 1;
+    let legacy_amount: u64 = 500;
+    sqlx::query(
+        "INSERT INTO observed_releases (withdrawal_nonce, signature, slot, amount)
+         VALUES ($1, 'legacy_release', 100, $2)",
+    )
+    .bind(legacy_nonce as i64)
+    .bind(legacy_amount as i64)
+    .execute(&pool)
+    .await?;
+
+    let storage = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: db_url,
+            max_connections: 5,
+        })
+        .await?,
+    );
+    storage.init_schema().await?;
+
+    let (data_type,): (String,) = sqlx::query_as(
+        "SELECT data_type::text FROM information_schema.columns
+         WHERE table_name = 'observed_releases' AND column_name = 'amount'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(data_type, "numeric", "amount must be widened to NUMERIC");
+
+    let legacy = storage
+        .get_observed_release(legacy_nonce)
+        .await?
+        .ok_or("legacy release missing after widening")?;
+    assert_eq!(legacy.amount, Some(TokenAmount(legacy_amount)));
+
+    let large_nonce: u64 = 2;
+    storage
+        .insert_observed_releases_batch(&[DbObservedRelease {
+            withdrawal_nonce: large_nonce as i64,
+            signature: "large_release".to_string(),
+            slot: 101,
+            amount: Some(TokenAmount(u64::MAX)),
+        }])
+        .await?;
+    let large = storage
+        .get_observed_release(large_nonce)
+        .await?
+        .ok_or("large release missing")?;
+    assert_eq!(large.amount, Some(TokenAmount(u64::MAX)));
     Ok(())
 }
 
@@ -2361,6 +2443,268 @@ async fn fenced_write_on_a_killed_session_fails_and_does_not_apply(
     Ok(())
 }
 
+/// A booting operator whose lock dies mid-preflight must not complete a pending_remint
+/// row, because the replacement holding the lock may already be reminting it. A
+/// manual_review row has no owner, so its completion must not depend on the lock.
+#[tokio::test]
+async fn completing_a_pending_remint_after_the_lock_is_lost_does_not_apply(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let pending_remint = storage
+        .insert_db_transaction(&make_db_transaction(
+            "boot-pending-remint",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    let manual_review = storage
+        .insert_db_transaction(&make_db_transaction(
+            "boot-manual-review",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    for (id, status) in [
+        (pending_remint, "pending_remint"),
+        (manual_review, "manual_review"),
+    ] {
+        sqlx::query("UPDATE transactions SET status = $2::transaction_status WHERE id = $1")
+            .bind(id)
+            .bind(status)
+            .execute(&pool)
+            .await?;
+    }
+
+    let key = sender_lock_key(ProgramType::Withdraw);
+    let _guard = storage
+        .try_acquire_sender_lock(
+            key,
+            "withdraw",
+            CancellationToken::new(),
+            Duration::from_secs(3600),
+        )
+        .await?
+        .expect("the lock must be free");
+
+    let mut killer = pg_connect(&url).await;
+    let pid: i32 = sqlx::query_scalar(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+         AND granted AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(key)
+    .fetch_one(&mut killer)
+    .await?;
+    let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(pid)
+        .fetch_one(&mut killer)
+        .await?;
+
+    // The replacement takes over the lock before the old preflight gets to write.
+    let replacement = Storage::Postgres(
+        PostgresDb::new(&PostgresConfig {
+            database_url: url.clone(),
+            max_connections: 2,
+        })
+        .await?,
+    );
+    let _replacement_guard = replacement
+        .try_acquire_sender_lock(key, "withdraw", CancellationToken::new(), Duration::ZERO)
+        .await?
+        .expect("a killed holder must leave the lock free");
+
+    let result = storage
+        .try_complete_stalled_withdrawal(
+            pending_remint,
+            updated_at_of(&pool, pending_remint).await,
+            TransactionStatus::PendingRemint,
+            Some("sig-release-landed".to_string()),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "completing a pending_remint row without the lock must fail, got {result:?}"
+    );
+    assert_eq!(status_of(&pool, pending_remint).await, "pending_remint");
+
+    assert!(
+        storage
+            .try_complete_stalled_withdrawal(
+                manual_review,
+                updated_at_of(&pool, manual_review).await,
+                TransactionStatus::ManualReview,
+                Some("sig-release-landed".to_string()),
+            )
+            .await?,
+        "a manual_review row must still complete without the lock"
+    );
+    assert_eq!(status_of(&pool, manual_review).await, "completed");
+    Ok(())
+}
+
+/// The reconcile sweep awaits every completion to its outcome, so a manual_review
+/// completion stuck behind someone else's row lock must fail on its own rather than
+/// wait forever and wedge recovery, or boot while it holds the sender lock.
+#[tokio::test]
+async fn completing_a_manual_review_row_blocked_on_a_row_lock_fails_instead_of_waiting(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, container) = start_postgres().await?;
+    let url = container_url(&container).await;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "blocked-manual-review",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'manual_review' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let updated_at = updated_at_of(&pool, id).await;
+
+    // An open transaction holding the row, e.g. an operator investigating it by hand.
+    let mut blocker = pg_connect(&url).await;
+    sqlx::query("BEGIN").execute(&mut blocker).await?;
+    sqlx::query("SELECT id FROM transactions WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut blocker)
+        .await?;
+
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(15),
+        storage.try_complete_stalled_withdrawal(
+            id,
+            updated_at,
+            TransactionStatus::ManualReview,
+            Some("sig-release-landed".to_string()),
+        ),
+    )
+    .await
+    .expect("a blocked completion must give up on its own, not wait for the row lock");
+    assert!(
+        blocked.is_err(),
+        "a completion that could not take the row lock must fail, got {blocked:?}"
+    );
+    assert_eq!(status_of(&pool, id).await, "manual_review");
+
+    sqlx::query("ROLLBACK").execute(&mut blocker).await?;
+    assert!(
+        storage
+            .try_complete_stalled_withdrawal(
+                id,
+                updated_at,
+                TransactionStatus::ManualReview,
+                Some("sig-release-landed".to_string()),
+            )
+            .await?,
+        "once the lock is gone the completion must apply"
+    );
+    assert_eq!(status_of(&pool, id).await, "completed");
+    Ok(())
+}
+
+/// Completion first: a row completed on release evidence has nothing left to refund,
+/// so a remint claim against it must be refused and must leave the journal untouched,
+/// supersedes included, or the sender would broadcast a MintTo for a paid withdrawal.
+#[tokio::test]
+async fn remint_claim_on_a_completed_row_is_refused_and_writes_nothing(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _container) = start_postgres().await?;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim-after-completion",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let dead_attempt = "remint-dead".to_string();
+    assert_eq!(
+        storage
+            .claim_remint_attempt(id, dead_attempt.clone(), 100, None, &[])
+            .await?,
+        RemintClaim::Claimed
+    );
+
+    // Whichever writer completed it, the claim must see the row has moved.
+    sqlx::query("UPDATE transactions SET status = 'completed' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        storage
+            .claim_remint_attempt(
+                id,
+                "remint-after-completion".to_string(),
+                200,
+                None,
+                std::slice::from_ref(&dead_attempt),
+            )
+            .await?,
+        RemintClaim::RowMoved,
+        "a claim on a completed row must not authorize a broadcast"
+    );
+    let journal: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT signature, superseded FROM pending_remint_signatures WHERE transaction_id = $1",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        journal,
+        vec![(dead_attempt, false)],
+        "a refused claim must neither journal its attempt nor retire the old one"
+    );
+    assert_eq!(status_of(&pool, id).await, "completed");
+    Ok(())
+}
+
+/// Claim first: a completion that read the row before the claim must not land after
+/// it, because the claimed MintTo is about to broadcast. The claim bumps the row's
+/// version, so the completion's pinned `updated_at` no longer matches.
+#[tokio::test]
+async fn completion_read_before_a_remint_claim_does_not_apply(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _container) = start_postgres().await?;
+
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "completion-after-claim",
+            TransactionType::Withdrawal,
+        ))
+        .await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    let read_before_claim = updated_at_of(&pool, id).await;
+
+    assert_eq!(
+        storage
+            .claim_remint_attempt(id, "remint-sig".to_string(), 100, None, &[])
+            .await?,
+        RemintClaim::Claimed
+    );
+
+    assert!(
+        !storage
+            .try_complete_stalled_withdrawal(
+                id,
+                read_before_claim,
+                TransactionStatus::PendingRemint,
+                Some("sig-release-landed".to_string()),
+            )
+            .await?,
+        "a completion pinned before the claim must not complete a row being reminted"
+    );
+    assert_eq!(status_of(&pool, id).await, "pending_remint");
+    Ok(())
+}
+
 /// A constraint violation means the server answered, so it must not read as lock loss.
 #[tokio::test]
 async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
@@ -2398,10 +2742,11 @@ async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
         .expect("the lock must be free");
 
     // The signature column is globally unique, so re-using one is a plain 23505 from a live backend.
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(first, "shared-signature".to_string(), 10, None, &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
     let err = storage
         .claim_remint_attempt(second, "shared-signature".to_string(), 20, None, &[])
@@ -2413,10 +2758,11 @@ async fn database_error_on_a_fenced_write_does_not_cancel_the_operator(
         "an application error must not cancel the operator; got {err}"
     );
     // The session is still healthy, so the next fenced write still works.
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(second, "distinct-signature".to_string(), 20, None, &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
     Ok(())
 }
@@ -2547,10 +2893,14 @@ async fn fenced_write_blocked_on_a_row_lock_does_not_cancel_the_operator(
 #[tokio::test]
 async fn blockhash_slot_round_trips_and_stays_null_when_absent(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_pool, storage, _container) = start_postgres().await?;
+    let (pool, storage, _container) = start_postgres().await?;
 
     let txn = make_db_transaction("slot_round_trip", TransactionType::Withdrawal);
     let id = storage.insert_db_transaction(&txn).await?;
+    sqlx::query("UPDATE transactions SET status = 'pending_remint' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await?;
 
     storage
         .insert_release_signature(id, "sig-with-slot".to_string(), 1_000, Some(400))
@@ -2571,10 +2921,11 @@ async fn blockhash_slot_round_trips_and_stays_null_when_absent(
         "a write with no slot must stay NULL, never default to 0"
     );
 
-    assert!(
+    assert_eq!(
         storage
             .claim_remint_attempt(id, "remint-sig".to_string(), 2_000, Some(1_500), &[])
-            .await?
+            .await?,
+        RemintClaim::Claimed
     );
     let remints = storage.get_remint_signatures(id).await?;
     assert_eq!(remints.len(), 1);

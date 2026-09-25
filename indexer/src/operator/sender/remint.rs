@@ -19,7 +19,7 @@ use crate::{
         ConfirmationResult, ExtraErrorCheckPolicy, MintToBuilder, RetryPolicy, RpcClientWithRetry,
         SignerUtil, TransactionStatusUpdate,
     },
-    storage::TransactionStatus,
+    storage::{common::storage::RemintClaim, TransactionStatus},
 };
 use chrono::Utc;
 use private_channel_metrics::MetricLabel;
@@ -50,6 +50,9 @@ enum RemintAttempt {
     DeferInFlight(String),
     /// Cannot reconcile and cannot proceed safely; escalate to ManualReview.
     Failed(String),
+    /// The row left `pending_remint` before the claim, so it is not ours to
+    /// refund or to write. Drop the entry.
+    Abandoned,
 }
 
 /// Remint burned PrivateChannel tokens back to the user after a permanent withdrawal failure.
@@ -196,8 +199,16 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
         )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(RemintClaim::Claimed) => {}
+        Ok(RemintClaim::RowMoved) => {
+            // Whoever moved it owns it now; a status write here could only clobber theirs.
+            error!(
+                "Remint abandoned for transaction {} (trace {}): row is no longer pending_remint; refusing to broadcast",
+                info.transaction_id, info.trace_id
+            );
+            return RemintAttempt::Abandoned;
+        }
+        Ok(RemintClaim::HeldElsewhere) => {
             // Nothing else can hold the claim, so a second sender is running.
             // Emit no status: ManualReview here would move the row off
             // pending_remint and permanently block the winner's remint record,
@@ -261,7 +272,8 @@ async fn attempt_remint(state: &SenderState, info: &WithdrawalRemintInfo) -> Rem
 /// Result of executing a matured PendingRemint entry.
 /// Boxed variants keep the enum small (PendingRemint is ~300 bytes).
 pub enum DeferredRemintOutcome {
-    /// Terminal: a FailedReminted or ManualReview status was already emitted.
+    /// Terminal: nothing left to do for this entry. Usually a FailedReminted or
+    /// ManualReview status was emitted; an abandoned entry emits none.
     Resolved,
     /// Failed before broadcast with no live sig: caller re-queues via the capped
     /// escalation path, which ends in ManualReview once the retry budget is spent.
@@ -361,6 +373,7 @@ pub async fn execute_deferred_remint(
         RemintAttempt::DeferInFlight(reason) => {
             DeferredRemintOutcome::DeferInFlight(Box::new(entry), reason)
         }
+        RemintAttempt::Abandoned => DeferredRemintOutcome::Resolved,
         RemintAttempt::Failed(remint_error) => {
             error!("Remint also failed: {}", remint_error);
             let combined = format!("{} | remint failed: {}", entry.original_error, remint_error);
@@ -482,7 +495,13 @@ enum EndpointVerdict {
 
 /// Resolve an absence-based `Dead`: `Dead` only when the endpoint proves it retains the
 /// attempt's slot range, else `Uncertain`. A floor at or below the bottom of that range
-/// proves retention. Assumes a single consistent archival endpoint, not a split pool.
+/// proves retention.
+///
+/// Sound on one endpoint whose state only moves forward, such as a lagging replica: height
+/// is read before status and the floor after, so no answer comes from an older state than
+/// the one before it. The channel's read cache keeps this, since it serves getBlockHeight
+/// from Postgres, the store that answers a status miss. Not sound behind a load balancer
+/// whose backends can disagree.
 ///
 /// The bottom of the range is the slot the attempt's blockhash was read at, journaled
 /// with the broadcast. An attempt journaled before that column existed carries none, and
@@ -633,6 +652,11 @@ pub(crate) async fn classify_against(rpc: &RpcClientWithRetry, sigs: &[PendingSi
 async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> EndpointVerdict {
     let flat: Vec<Signature> = sigs.iter().map(|p| p.signature).collect();
 
+    // Height before status: on an endpoint whose state only moves forward, the status
+    // then comes from a state at least as new, so a null is never paired with an expiry
+    // its own view had not reached. Held as a Result so an outage only matters below.
+    let block_height = rpc.get_block_height().await;
+
     let response = match rpc.get_signature_statuses_with_history(&flat).await {
         Ok(r) => r,
         Err(e) => {
@@ -660,10 +684,10 @@ async fn classify_endpoint(rpc: &RpcClientWithRetry, sigs: &[PendingSig]) -> End
         return EndpointVerdict::Landed(flat[index]);
     }
 
-    // Fetch block height only for the lvbh check on null-status sigs, so a
+    // Block height is needed only for the lvbh check on null-status sigs, so a
     // transient getBlockHeight outage isn't treated as uncertainty otherwise.
     let current_height = if response.value.iter().any(|s| s.is_none()) {
-        match rpc.get_block_height().await {
+        match block_height {
             Ok(h) => h,
             Err(e) => {
                 return EndpointVerdict::Uncertain(format!("block height RPC failed: {}", e));
@@ -1289,6 +1313,7 @@ mod tests {
 
     use solana_sdk::pubkey::Pubkey;
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::Once;
     use tokio::sync::{mpsc, Semaphore};
@@ -2939,6 +2964,52 @@ mod tests {
         no_send.assert_async().await;
     }
 
+    /// A row completed from under the queue has nothing left to refund. The entry
+    /// must not broadcast, must not write over whoever moved the row, and must be
+    /// dropped rather than requeued, or it would retry the claim forever.
+    #[tokio::test]
+    async fn execute_deferred_remint_drops_the_entry_when_the_row_left_pending_remint() {
+        ensure_test_signer();
+        let mut rpc_server = mockito::Server::new_async().await;
+        let (state, mock) = make_sender_state_with_rpc(&rpc_server.url());
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let transaction_id = 713;
+        mock.moved_remint_parents
+            .lock()
+            .unwrap()
+            .insert(transaction_id);
+
+        let _blockhash = mock_rpc(
+            &mut rpc_server,
+            "getLatestBlockhash",
+            r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":{"blockhash":"11111111111111111111111111111111","lastValidBlockHeight":1000}},"id":0}"#,
+        )
+        .await;
+        let no_send = rpc_server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"sendTransaction""#.into(),
+            ))
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let entry = make_matured_remint(transaction_id, 74);
+        let outcome = execute_deferred_remint(&state, entry, &storage_tx).await;
+
+        assert!(
+            matches!(outcome, DeferredRemintOutcome::Resolved),
+            "a moved row must drop the entry, not requeue it"
+        );
+        assert!(
+            storage_rx.try_recv().is_err(),
+            "the row belongs to whoever moved it, so no status may be written"
+        );
+        no_send.assert_async().await;
+    }
+
     /// A matured entry for `transaction_id`, already past its deadline so the
     /// queue processes it on the first pass.
     fn make_matured_remint(transaction_id: i64, nonce: u64) -> PendingRemint {
@@ -3996,5 +4067,90 @@ mod tests {
         );
         assert_eq!(state.pending_remints.len(), 1);
         assert_eq!(state.pending_remints[0].finality_check_attempts, 1);
+    }
+
+    /// One endpoint is not one snapshot: the channel read node serves a replica that can
+    /// lag and catch up between two calls. A status read on the lagging state paired with
+    /// a height read on the caught-up one proves a landed mint dead, and the deposit is
+    /// minted twice. Reading height first means status never comes from an older state.
+    #[tokio::test]
+    async fn classify_replica_catching_up_between_calls_is_not_dead() {
+        let last_valid_block_height = 1150;
+        let blockhash_slot = 1000;
+        let lagging_height = 1005;
+        let caught_up_height = 1300;
+        let landed_sig = Signature::new_unique();
+
+        // The first request of any method sees the lagging replica; every later one sees
+        // it caught up, with the mint finalized.
+        let requests_seen = Arc::new(AtomicUsize::new(0));
+        let mut server = mockito::Server::new_async().await;
+        let status_requests = requests_seen.clone();
+        let _status = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignatureStatuses""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                let status = if status_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    "null"
+                } else {
+                    r#"{"slot":1010,"confirmations":null,"err":null,"status":{"Ok":null},"confirmationStatus":"finalized"}"#
+                };
+                format!(
+                    r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1300}},"value":[{status}]}},"id":1}}"#
+                )
+                .into_bytes()
+            })
+            .create();
+        let height_requests = requests_seen.clone();
+        let _height = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getBlockHeight""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                let height = if height_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    lagging_height
+                } else {
+                    caught_up_height
+                };
+                format!(r#"{{"jsonrpc":"2.0","result":{height},"id":1}}"#).into_bytes()
+            })
+            .create();
+        // Floor below the blockhash slot: coverage would let an absence stand as Dead.
+        let _floor = mock_rpc(
+            &mut server,
+            "getFirstAvailableBlock",
+            r#"{"jsonrpc":"2.0","result":400,"id":1}"#,
+        )
+        .await;
+
+        let client = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let sigs = vec![PendingSig {
+            signature: landed_sig,
+            last_valid_block_height,
+            blockhash_slot: Some(blockhash_slot),
+        }];
+
+        match classify_signatures(&FinalityRpc::channel(&client, None), &sigs).await {
+            SigFinality::Landed(signature) => assert_eq!(signature, landed_sig),
+            SigFinality::Dead => panic!("a landed mint was proven dead and would be re-minted"),
+            SigFinality::Live(reason) | SigFinality::Uncertain(reason) => {
+                panic!("expected Landed, got an unresolved verdict: {reason}")
+            }
+        }
     }
 }

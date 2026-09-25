@@ -49,4 +49,9 @@ pub enum OperatorError {
 
     #[error("Another {program_type:?} sender already holds the singleton lock; refusing to start")]
     SenderAlreadyRunning { program_type: crate::ProgramType },
+
+    #[error(
+        "The {program_type:?} sender lock was lost during the boot pre-flight; refusing to start"
+    )]
+    SenderLockLostAtBoot { program_type: crate::ProgramType },
 }

@@ -12,7 +12,7 @@ use crate::{
         TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
-    storage::common::storage::RequeueOutcome,
+    storage::common::storage::{RemintClaim, RequeueOutcome},
     storage::postgres::lock_connection::LockConnection,
     PostgresConfig,
 };
@@ -158,6 +158,41 @@ pub async fn release_advisory_lock(conn: &mut PgConnection, key: i64) -> Result<
     Ok(())
 }
 
+/// Server-side bounds on an unfenced stalled completion, matching the sender lock session's.
+const UNFENCED_COMPLETION_LOCK_TIMEOUT_MS: &str = "3000";
+const UNFENCED_COMPLETION_STATEMENT_TIMEOUT_MS: &str = "5000";
+
+/// The CAS behind `try_complete_stalled_withdrawal_internal`, on whichever session the caller picked.
+async fn complete_stalled_withdrawal(
+    conn: &mut PgConnection,
+    transaction_id: i64,
+    expected_updated_at: chrono::DateTime<chrono::Utc>,
+    from_status: TransactionStatus,
+    counterpart_signature: Option<String>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE transactions
+        SET status = 'completed',
+            counterpart_signature = COALESCE($4, counterpart_signature),
+            processed_at = NOW()
+        WHERE id = $1
+          AND updated_at = $2
+          AND status = $3
+          AND status IN ('manual_review', 'pending_remint')
+          AND transaction_type = 'withdrawal'
+        "#,
+    )
+    .bind(transaction_id)
+    .bind(expected_updated_at)
+    .bind(from_status)
+    .bind(counterpart_signature)
+    .execute(conn)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 /// Advisory key that serializes `init_schema` across processes. Distinct from every other key.
 pub const SCHEMA_INIT_LOCK_KEY: i64 = 0x53_43_48_45_4D_41_5F_49; // "SCHEMA_I"
 /// Lock waits before init gives up, each capped by the lock session's lock_timeout.
@@ -275,8 +310,10 @@ impl PostgresDb {
     /// ownership; without one it behaves exactly as an unfenced pool write.
     ///
     /// Only ops whose sole production caller is the sender may use this. Routing
-    /// recovery, the processor or the boot pre-flight through here would make a
-    /// dead sender's rows uncleanable, which is the opposite of the intent.
+    /// recovery or the processor through here would make a dead sender's rows
+    /// uncleanable, which is the opposite of the intent. The one exception is the
+    /// boot pre-flight completing a `pending_remint` row: it runs under the lock,
+    /// and a process that loses it exits, so the next boot clears the row.
     async fn run_sender_owned<T, F>(&self, f: F) -> Result<T, sqlx::Error>
     where
         F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
@@ -893,7 +930,7 @@ impl PostgresDb {
                 withdrawal_nonce BIGINT PRIMARY KEY,
                 signature TEXT NOT NULL,
                 slot BIGINT NOT NULL,
-                amount BIGINT,
+                amount NUMERIC(20,0),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -903,9 +940,28 @@ impl PostgresDb {
 
         // Nullable on purpose: rows written before this column fall back to the withdrawal
         // row's own amount, so the upgrade needs no backfill.
-        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount BIGINT")
+        sqlx::query("ALTER TABLE observed_releases ADD COLUMN IF NOT EXISTS amount NUMERIC(20,0)")
             .execute(&self.pool)
             .await?;
+
+        // Widen a legacy BIGINT amount to NUMERIC(20,0) so a release past i64::MAX is
+        // recorded in full. Lossless, and a no-op once already NUMERIC.
+        sqlx::query(
+            r#"
+            DO $$ BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'observed_releases'
+                      AND column_name = 'amount'
+                      AND data_type = 'bigint'
+                ) THEN
+                    ALTER TABLE observed_releases ALTER COLUMN amount TYPE NUMERIC(20,0);
+                END IF;
+            END $$;
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Write-ahead log for compensating remint MintTo signatures. Separate
         // from pending_release_signatures because these land on the source
@@ -2140,6 +2196,10 @@ impl PostgresDb {
     /// guard is what stops this from resurrecting a terminal row or stealing a
     /// `processing` row from a live sender, and it belongs in the SQL rather
     /// than resting on every present and future caller binding the right value.
+    ///
+    /// A `pending_remint` row belongs to the sender, which may be reminting it, so
+    /// completing one runs on the sender lock session and fails once the lock is
+    /// gone. `manual_review` has no owner and stays on the pool.
     pub async fn try_complete_stalled_withdrawal_internal(
         &self,
         transaction_id: i64,
@@ -2147,27 +2207,43 @@ impl PostgresDb {
         from_status: TransactionStatus,
         counterpart_signature: Option<String>,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE transactions
-            SET status = 'completed',
-                counterpart_signature = COALESCE($4, counterpart_signature),
-                processed_at = NOW()
-            WHERE id = $1
-              AND updated_at = $2
-              AND status = $3
-              AND status IN ('manual_review', 'pending_remint')
-              AND transaction_type = 'withdrawal'
-            "#,
-        )
-        .bind(transaction_id)
-        .bind(expected_updated_at)
-        .bind(from_status)
-        .bind(counterpart_signature)
-        .execute(&self.pool)
-        .await?;
+        if from_status == TransactionStatus::PendingRemint {
+            return self
+                .run_sender_owned(move |conn| {
+                    Box::pin(complete_stalled_withdrawal(
+                        conn,
+                        transaction_id,
+                        expected_updated_at,
+                        from_status,
+                        counterpart_signature,
+                    ))
+                })
+                .await;
+        }
 
-        Ok(result.rows_affected() == 1)
+        // The caller awaits this to its outcome rather than timing it out, since a
+        // dropped future leaves the statement running. So bound it in Postgres:
+        // a row lock someone else holds fails it instead of wedging the sweep.
+        // Transaction-local, so the pooled connection keeps its defaults.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+            .bind(UNFENCED_COMPLETION_LOCK_TIMEOUT_MS)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(UNFENCED_COMPLETION_STATEMENT_TIMEOUT_MS)
+            .execute(&mut *tx)
+            .await?;
+        let completed = complete_stalled_withdrawal(
+            &mut tx,
+            transaction_id,
+            expected_updated_at,
+            from_status,
+            counterpart_signature,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(completed)
     }
 
     /// Transitions a withdrawal to PendingRemint status, storing the withdrawal
@@ -2573,7 +2649,11 @@ impl PostgresDb {
     /// cleared. `ON CONFLICT DO NOTHING` does not abort the surrounding
     /// transaction, so a lost claim still retires the attempts it proved dead.
     ///
-    /// Returns true when the caller owns the attempt and may broadcast.
+    /// The claim also writes the parent row, so it cannot interleave with a
+    /// completion of that row. A plain `WHERE EXISTS` check would not do: both
+    /// sides could read `pending_remint` and commit. The write takes the row lock
+    /// and its trigger bumps `updated_at`, so a completion pinned on the old
+    /// version no longer matches once a claim commits.
     pub async fn claim_remint_attempt_internal(
         &self,
         transaction_id: i64,
@@ -2581,12 +2661,29 @@ impl PostgresDb {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
-    ) -> Result<bool, sqlx::Error> {
-        // Both statements are sender-owned, so the transaction moves whole and never mixes fenced work.
+    ) -> Result<RemintClaim, sqlx::Error> {
+        // All statements are sender-owned, so the transaction moves whole and never mixes fenced work.
         let superseded_signatures = superseded_signatures.to_vec();
         self.run_sender_owned(move |conn| {
             Box::pin(async move {
                 let mut tx = conn.begin().await?;
+
+                let parent = sqlx::query(
+                    r#"
+                    UPDATE transactions
+                    SET status = status
+                    WHERE id = $1
+                      AND status = 'pending_remint'
+                      AND transaction_type = 'withdrawal'
+                    "#,
+                )
+                .bind(transaction_id)
+                .execute(&mut *tx)
+                .await?;
+                if parent.rows_affected() == 0 {
+                    tx.rollback().await?;
+                    return Ok(RemintClaim::RowMoved);
+                }
 
                 sqlx::query(
                     r#"
@@ -2618,7 +2715,11 @@ impl PostgresDb {
                 .await?;
 
                 tx.commit().await?;
-                Ok(claimed.rows_affected() == 1)
+                Ok(if claimed.rows_affected() == 1 {
+                    RemintClaim::Claimed
+                } else {
+                    RemintClaim::HeldElsewhere
+                })
             })
         })
         .await

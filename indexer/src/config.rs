@@ -153,7 +153,9 @@ pub struct PrivateChannelIndexerConfig {
     pub program_type: ProgramType,
     /// Storage type
     pub storage_type: StorageType,
-    /// RPC endpoint URL (destination chain for operators)
+    /// RPC endpoint URL (destination chain for operators). For an operator it must be one
+    /// node, not a load-balanced pool: finality proofs assume every answer comes from one
+    /// state that only moves forward.
     pub rpc_url: String,
     /// Optional archival fallback RPC for `rpc_url`, used by the operator to
     /// re-check a `Dead` verdict and by the poller for missing-block failover.

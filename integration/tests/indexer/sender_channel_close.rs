@@ -28,7 +28,10 @@ use {
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         operator::run_sender,
-        storage::{common::storage::mock::MockStorage, Storage},
+        storage::{
+            common::storage::{mock::MockStorage, sender_lock::SenderLockGuard},
+            Storage,
+        },
     },
     std::{sync::Arc, time::Duration},
     tokio::sync::mpsc,
@@ -92,7 +95,7 @@ async fn run_sender_exits_on_processor_channel_close() {
             /* retry_max_attempts */ 3,
             DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
             /* source_rpc_client */ None,
-            /* sender_lock_heartbeat_interval */ Duration::from_secs(5),
+            SenderLockGuard::Noop,
         ),
     )
     .await
