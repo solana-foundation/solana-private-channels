@@ -670,9 +670,8 @@ pub(super) async fn send_and_confirm(
                 state.release_leases.insert(nonce, lease);
             }
             SignatureClaim::Lost | SignatureClaim::Failed => {
-                // Nothing was broadcast, so this nonce is not in flight and must not
-                // keep holding the rotation barrier. The row stays Processing for the
-                // recovery worker either way.
+                // This attempt was not broadcast, but an earlier one may still land. The row stays
+                // Processing, so the owed-nonce gate holds the rotation until recovery settles it.
                 state.in_flight_withdrawals.remove(&nonce);
                 return;
             }
@@ -3772,6 +3771,13 @@ mod tests {
             row_status(&mock, txn_id),
             Some(crate::storage::common::models::TransactionStatus::Processing),
             "a row with a broadcast attempt stays Processing so recovery can classify it"
+        );
+        // The in-memory barrier is released; the Processing row keeps the rotation held.
+        assert!(!state.in_flight_withdrawals.contains(&nonce));
+        assert_eq!(
+            state.pending_signatures.get(&nonce).map(Vec::len),
+            Some(1),
+            "the pre-halt attempt stays stashed"
         );
     }
 
