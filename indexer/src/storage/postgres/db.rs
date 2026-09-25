@@ -5,13 +5,16 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::{
+    config::ProgramType,
     error::StorageError,
+    indexer::checkpoint::program_key,
     storage::common::models::{
         DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, StoredSig, TransactionStatus,
-        TransactionType,
+        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, StoredSig,
+        TransactionStatus, TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
+    storage::common::storage::resync_state::resync_halt_reason,
     storage::common::storage::{RemintClaim, RequeueOutcome},
     storage::postgres::lock_connection::LockConnection,
     PostgresConfig,
@@ -215,11 +218,10 @@ fn database_url_password_is_blank(database_url: &str) -> bool {
     }
 }
 
-/// Everything a rebuild removes, in dependency order. One list so the pooled and the
-/// fenced path cannot drift apart. `observed_releases` goes with the rest because the
-/// nonce sequence does: a resync reassigns nonces from zero, so a surviving row would
-/// name a different withdrawal than the one it was written for.
-const DROP_STATEMENTS: [&str; 10] = [
+/// A full reset of every table, in dependency order. Only the pooled `drop_tables` uses it;
+/// resync deletes its own program's rows instead (see `wipe_program_on`).
+const DROP_STATEMENTS: [&str; 11] = [
+    "DROP TABLE IF EXISTS resync_state CASCADE",
     "DROP TABLE IF EXISTS pending_release_signatures CASCADE",
     "DROP TABLE IF EXISTS observed_releases CASCADE",
     "DROP TABLE IF EXISTS pending_remint_signatures CASCADE",
@@ -231,6 +233,12 @@ const DROP_STATEMENTS: [&str; 10] = [
     "DROP TYPE IF EXISTS transaction_status CASCADE",
     "DROP TYPE IF EXISTS transaction_type CASCADE",
 ];
+
+/// Statuses whose outcome is settled, so their broadcast journals prove nothing is in flight.
+const TERMINAL_STATUSES: &str = "('completed', 'failed', 'failed_reminted')";
+
+/// Statuses that can still have a broadcast in flight whether or not a journal survives.
+const UNSETTLED_STATUSES: &str = "('processing', 'pending_remint', 'manual_review')";
 
 /// A withdrawal counts as paid out when the escrow indexer recorded its release at or below
 /// the bound. `r` is the aggregate's join, which carries that bound.
@@ -1106,6 +1114,23 @@ impl PostgresDb {
         .execute(&self.pool)
         .await?;
 
+        // Set while a resync has deleted rows it has not rebuilt yet; workers refuse to start on it.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS resync_state (
+                id           BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+                program_type TEXT NOT NULL,
+                started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Lowest slot any interrupted wipe deleted, so a rerun cannot pick a genesis above it.
+        sqlx::query("ALTER TABLE resync_state ADD COLUMN IF NOT EXISTS earliest_slot BIGINT")
+            .execute(&self.pool)
+            .await?;
+
         info!("Database schema initialized");
         Ok(())
     }
@@ -1119,20 +1144,108 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Drop everything on `conn` rather than through the pool.
-    ///
-    /// Called with the session that holds the live-state lock, which is what keeps the
-    /// drop and the lock inseparable: the lock dies exactly when this session does, so a
-    /// statement issued here cannot outlive it. One transaction, so a session lost part
-    /// way rolls back rather than leaving a half-dropped schema behind.
-    pub async fn drop_tables_on(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
-        info!("Dropping database tables...");
+    /// Delete `program`'s rows on `conn`, the session holding the live-state lock, so the
+    /// delete cannot outlive the lock. Scoped to one program because a resync rebuilds only
+    /// that program; the other's rows, nonces, journals and checkpoint must survive it.
+    pub async fn wipe_program_on(
+        conn: &mut PgConnection,
+        program: ProgramType,
+    ) -> Result<(), StorageError> {
+        let key = program_key(program);
+        info!(program = %key, "Deleting this program's rows for the rebuild...");
         let mut tx = conn.begin().await?;
-        for statement in DROP_STATEMENTS {
-            sqlx::query(statement).execute(&mut *tx).await?;
+
+        // The marker commits with the deletes, so an ambiguous COMMIT cannot leave one without the other.
+        // It keeps the lowest slot ever deleted, since a rerun no longer sees those rows.
+        let claimed = sqlx::query(
+            "INSERT INTO resync_state (program_type, earliest_slot)
+             VALUES ($1, (SELECT MIN(slot) FROM transactions WHERE transaction_type = $2))
+             ON CONFLICT (id) DO UPDATE
+             SET earliest_slot = LEAST(resync_state.earliest_slot, EXCLUDED.earliest_slot)
+             WHERE resync_state.program_type = EXCLUDED.program_type",
+        )
+        .bind(&key)
+        .bind(program.owned_transaction_type())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if claimed != 1 {
+            return Err(StorageError::DatabaseError {
+                message: format!(
+                    "an unfinished resync of another program owns this database; refusing to wipe {key}"
+                ),
+            });
         }
+
+        // Operators that predate the marker still honour the halt and stop fetching value work.
+        // A halt someone else set is evidence, so it is never overwritten.
+        let halted = sqlx::query(
+            "INSERT INTO reconciliation_halt (id, halted, reason, halted_at)
+             VALUES (TRUE, TRUE, $1, NOW())
+             ON CONFLICT (id) DO UPDATE
+             SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW()
+             WHERE NOT reconciliation_halt.halted
+                OR reconciliation_halt.reason = EXCLUDED.reason",
+        )
+        .bind(resync_halt_reason(program))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if halted != 1 {
+            return Err(StorageError::DatabaseError {
+                message: format!("a reconciliation halt is already set; refusing to wipe {key}"),
+            });
+        }
+
+        // Journals go with their rows through ON DELETE CASCADE.
+        sqlx::query("DELETE FROM transactions WHERE transaction_type = $1")
+            .bind(program.owned_transaction_type())
+            .execute(&mut *tx)
+            .await?;
+        // `mints` is kept: withdrawals survive an escrow resync, and reconciliation only sees
+        // mints listed there. The rebuild upserts rows and replays status changes after genesis.
+        if program == ProgramType::Withdraw {
+            // Every withdrawal row is gone, so nonces restart at 0. RESTART is transactional,
+            // unlike setval, so a wipe that rolls back leaves the sequence where it was.
+            sqlx::query("ALTER SEQUENCE withdrawal_nonce_seq RESTART WITH 0")
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM indexer_state WHERE program_type = $1")
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+
         tx.commit().await?;
-        info!("Database tables dropped successfully");
+        info!(program = %key, "Program rows deleted");
+        Ok(())
+    }
+
+    /// The program whose resync deleted rows and has not finished rebuilding them, if any.
+    pub async fn get_unfinished_resync_internal(&self) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT program_type FROM resync_state WHERE id = TRUE")
+            .fetch_optional(&self.pool)
+            .await
+    }
+
+    /// Clear the marker and this resync's own halt in one transaction on `conn`, the session
+    /// holding the live-state lock. A halt with any other reason was set by someone else and stays.
+    pub async fn clear_unfinished_resync_on(
+        conn: &mut PgConnection,
+        program: ProgramType,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = conn.begin().await?;
+        sqlx::query("DELETE FROM resync_state")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE reconciliation_halt SET halted = FALSE, halted_at = NOW()
+             WHERE id = TRUE AND halted AND reason = $1",
+        )
+        .bind(resync_halt_reason(program))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2626,13 +2739,11 @@ impl PostgresDb {
     /// gate re-verifies those signatures before it would broadcast again, so
     /// deleting them early would let a landed mint be re-issued.
     pub async fn gc_stale_release_signatures_internal(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM pending_release_signatures
-            WHERE transaction_id IN (SELECT id FROM transactions
-                                     WHERE status IN ('completed', 'failed', 'failed_reminted'))
-            "#,
-        )
+        let result = sqlx::query(&format!(
+            "DELETE FROM pending_release_signatures
+             WHERE transaction_id IN (SELECT id FROM transactions
+                                      WHERE status IN {TERMINAL_STATUSES})"
+        ))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -3175,6 +3286,48 @@ impl PostgresDb {
         Ok(match bounds {
             (Some(lowest), Some(highest)) => Some((lowest, highest)),
             _ => None,
+        })
+    }
+
+    /// Read what a resync of `own` rows must check before wiping them, in one statement.
+    pub async fn get_resync_blockers_internal(
+        &self,
+        own: TransactionType,
+    ) -> Result<ResyncBlockers, sqlx::Error> {
+        let (unsettled_work, failed_withdrawals, observed_releases, earliest_slot): (
+            bool,
+            bool,
+            bool,
+            Option<i64>,
+        ) = sqlx::query_as(&format!(
+            "SELECT
+                   EXISTS (
+                     SELECT 1 FROM transactions t
+                     WHERE t.transaction_type = $1
+                       AND (t.status IN {UNSETTLED_STATUSES}
+                            OR (t.status NOT IN {TERMINAL_STATUSES}
+                                AND (EXISTS (SELECT 1 FROM pending_release_signatures j
+                                             WHERE j.transaction_id = t.id)
+                                     OR EXISTS (SELECT 1 FROM pending_remint_signatures j
+                                                WHERE j.transaction_id = t.id))))),
+                   EXISTS (SELECT 1 FROM transactions
+                           WHERE transaction_type = 'withdrawal' AND status = 'failed'),
+                   EXISTS (SELECT 1 FROM observed_releases),
+                   LEAST((SELECT MIN(slot) FROM transactions WHERE transaction_type = $1),
+                         (SELECT earliest_slot FROM resync_state WHERE program_type = $2))"
+        ))
+        .bind(own)
+        .bind(program_key(match own {
+            TransactionType::Deposit => ProgramType::Escrow,
+            TransactionType::Withdrawal => ProgramType::Withdraw,
+        }))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ResyncBlockers {
+            unsettled_work,
+            failed_withdrawals,
+            observed_releases,
+            earliest_slot,
         })
     }
 

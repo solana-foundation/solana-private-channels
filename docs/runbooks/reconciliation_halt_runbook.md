@@ -96,6 +96,23 @@ A `halted = TRUE` row is an active halt. `reason` carries the offending mint,
 which check tripped, and the exact custody / gap / envelope or liabilities /
 tolerance numbers.
 
+### A halt set by an unfinished resync
+
+If `reason` reads `unfinished <program> resync: rerun resync for <program>; do not
+clear this halt by hand`, this is **not** an insolvency halt. A resync deleted that
+program's rows and died before rebuilding them; it sets this halt in the same
+transaction as its `resync_state` marker so that operators built before the marker
+also stop value work against the half-built rows. No webhook fires and no rows are
+quarantined.
+
+**Do not clear it by hand.** Re-run `resync` for the named program until it
+completes: the rerun recognises its own halt next to its own marker, rebuilds, and
+clears both in one transaction on the lock session. Clearing it early lets an
+operator mint or release against rows that are not rebuilt yet. See Symptom 4 of
+[`live_state_lock_runbook.md`](live_state_lock_runbook.md). If the reason has since
+been replaced by an insolvency reason, work that halt as below first; the resync
+refuses under any halt that is not its own.
+
 ## Investigate before clearing
 
 Do **not** clear the flag until you have confirmed real backing. For the mint in
@@ -163,7 +180,8 @@ rotates on its own.
 
 Once you have verified that custody genuinely backs the minted supply (e.g. the
 gap was a transient the reads have since settled, or the discrepancy has been
-reconciled on-chain), clear the flag:
+reconciled on-chain), clear the flag. Never do this for a halt whose reason names an
+unfinished resync (see above):
 
 ```sql
 UPDATE reconciliation_halt SET halted = FALSE, halted_at = NOW() WHERE id = TRUE;

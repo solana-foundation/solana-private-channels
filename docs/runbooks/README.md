@@ -25,7 +25,8 @@ dispatch table below routes by webhook + `transaction_type`.
 > **`live-state-lock-lost`** alert fires when an indexer, operator or resync
 > cannot prove it still owns the live-state lock, which is what keeps live
 > workers and a destructive resync off the same database. The same runbook
-> covers the two refusals that lock produces at startup; see
+> covers the refusals that lock produces at startup, a worker refusing because a
+> resync did not finish, and a resync refusing while work is still in flight; see
 > [`live_state_lock_runbook.md`](live_state_lock_runbook.md).
 >
 > **Two halts have no dedicated alert.** The **withdrawal bitmap boot
@@ -141,16 +142,17 @@ The runbooks call this out at every relevant site.
   `chain_break_stream`: provider data a real validator cannot produce.
 - [`mint_memo_cutover.md`](mint_memo_cutover.md) - a resync aborting because a
   channel mint carries a legacy-scheme idempotency memo. Log-discovered, not
-  paged; the resync fails closed before dropping anything, so the database is
+  paged; the resync fails closed before deleting anything, so the database is
   intact.
 - [`resync_consumed_mint_mismatch.md`](resync_consumed_mint_mismatch.md) - a
   resync aborting because an authority-signed channel mint names a source event
   but does not pay it, or one event was minted twice. Log-discovered, not paged;
-  fails closed before dropping anything, but keep the operators stopped until
+  fails closed before deleting anything, but keep the operators stopped until
   the affected rows are quarantined.
 - [`resync_bitmap_advanced.md`](resync_bitmap_advanced.md) - a withdraw resync
-  refusing because the escrow's withdrawal bitmap has already issued nonces.
-  Log-discovered, not paged; fails closed before dropping anything, so the
+  refusing because the escrow's withdrawal bitmap has already issued nonces, or the
+  database records a completed or failed withdrawal or an observed release.
+  Log-discovered, not paged; fails closed before deleting anything, so the
   database is intact. The supported path is a fresh instance, not a resync.
 
 ## Drills

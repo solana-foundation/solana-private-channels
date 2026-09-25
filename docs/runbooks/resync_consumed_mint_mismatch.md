@@ -32,7 +32,7 @@ Handle it the same way, inspecting both signatures.
 
 **Nothing has been destroyed.** The resync replays the source history without
 writing and checks every channel mint against the event it names before it
-drops anything. The database is exactly as it was.
+deletes anything. The database is exactly as it was.
 
 ## What it means
 

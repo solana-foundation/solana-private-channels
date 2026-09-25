@@ -14,7 +14,10 @@ use crate::{
     storage::postgres::lock_connection::{ProbeOutcome, PROBE_TIMEOUT},
 };
 use futures::future::BoxFuture;
-use sqlx::{Connection, PgConnection};
+use sqlx::{
+    postgres::{PgDatabaseError, PgSeverity},
+    Connection, PgConnection,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -75,10 +78,9 @@ impl LiveLockMode {
     }
 }
 
-/// Cap on one piece of fenced work. Sized for the table drop, which is the only fenced
-/// caller: a catalog update and an unlink rather than a scan, so minutes are already far
-/// beyond any healthy run. Waiting on somebody else's table lock is bounded separately and
-/// much sooner by the session's `lock_timeout`.
+/// Cap on one piece of fenced work: the resync wipe (a delete that grows with the rows) or the
+/// marker clear. Deletes run at roughly 30k rows a second, so this covers millions of rows; lock
+/// waits are bounded much sooner by the session's `lock_timeout`.
 const FENCED_WORK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Every reason a live-state lock can be declared lost. Shared so the emitting code
@@ -217,7 +219,7 @@ impl LiveLockGuard {
     /// the instant it ran, which is not enough for anything destructive.
     pub(crate) async fn run_fenced<T, F>(&self, f: F) -> Result<T, StorageError>
     where
-        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
+        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, StorageError>>,
     {
         match self {
             Self::Postgres(handle) => handle.run_fenced(f).await,
@@ -259,7 +261,7 @@ impl LiveLockHandle {
 
     async fn run_fenced<T, F>(&self, f: F) -> Result<T, StorageError>
     where
-        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, sqlx::Error>>,
+        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T, StorageError>>,
     {
         self.vouched_for()?;
         let mut guard = self.session.conn.lock().await;
@@ -269,18 +271,34 @@ impl LiveLockHandle {
         // Bounded so the mutex cannot be held forever. The heartbeat probes through the
         // same mutex and reads a busy one as "in use, still alive", so unbounded work
         // here would leave it tolerating a wedged session for as long as that lasted.
-        let outcome = match tokio::time::timeout(FENCED_WORK_TIMEOUT, f(conn)).await {
-            Ok(result) => result,
-            Err(_) => Err(sqlx::Error::Protocol(
-                "fenced work timed out on the live-state lock session".into(),
-            )),
+        let failure = match tokio::time::timeout(FENCED_WORK_TIMEOUT, f(conn)).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(e)) => Some(e),
+            Err(_) => None,
         };
-        // Any failure here is a lost lock as far as the caller is concerned. The session
-        // is the lock, so a statement it could not run is one we could not fence.
-        outcome.map_err(|e| {
-            error!("Fenced work on the live-state lock session failed: {e}");
-            StorageError::LiveStateLockLost
-        })
+        let reported = fenced_failure(failure);
+        error!("Fenced work on the live-state lock session failed: {reported}");
+        Err(reported)
+    }
+}
+
+/// What a failed piece of fenced work reports; `None` means it ran past the cap.
+fn fenced_failure(failure: Option<StorageError>) -> StorageError {
+    match failure {
+        None => StorageError::FencedWorkTimedOut {
+            secs: FENCED_WORK_TIMEOUT.as_secs(),
+        },
+        // An ERROR ends only the statement: the session and lock survive, so keep the cause.
+        Some(StorageError::QueryFailed(sqlx::Error::Database(db)))
+            if db
+                .try_downcast_ref::<PgDatabaseError>()
+                .is_some_and(|pg| pg.severity() == PgSeverity::Error) =>
+        {
+            StorageError::QueryFailed(sqlx::Error::Database(db))
+        }
+        // A FATAL answer or any other driver error may mean the session, and the lock, is gone.
+        Some(StorageError::QueryFailed(_)) => StorageError::LiveStateLockLost,
+        Some(e) => e,
     }
 }
 
@@ -435,6 +453,51 @@ mod tests {
             LiveLockMode::Exclusive.acquire_sql(),
             "SELECT pg_try_advisory_lock($1)"
         );
+    }
+
+    /// Only a failure that may have lost the session reads as a lost lock; others keep their cause.
+    #[test]
+    fn fenced_failures_keep_their_cause() {
+        let io = || sqlx::Error::Io(std::io::Error::other("connection reset"));
+        let refusal = || StorageError::DatabaseError {
+            message: "refusing to wipe escrow".to_string(),
+        };
+        let cases: [(&str, Option<StorageError>, &str); 6] = [
+            (
+                "cap ran out",
+                None,
+                "fenced work did not finish within 300s",
+            ),
+            (
+                "io",
+                Some(io().into()),
+                "live-state lock ownership could not be proven",
+            ),
+            (
+                "protocol",
+                Some(sqlx::Error::Protocol("desync".into()).into()),
+                "live-state lock ownership could not be proven",
+            ),
+            (
+                "pool closed",
+                Some(sqlx::Error::PoolClosed.into()),
+                "live-state lock ownership could not be proven",
+            ),
+            (
+                "typed refusal",
+                Some(refusal()),
+                "Database error: refusing to wipe escrow",
+            ),
+            (
+                "lock already lost",
+                Some(StorageError::LiveStateLockLost),
+                "live-state lock ownership could not be proven",
+            ),
+        ];
+        for (case, failure, expected) in cases {
+            let reported = fenced_failure(failure).to_string();
+            assert!(reported.starts_with(expected), "{case}: {reported}");
+        }
     }
 
     /// The key must never collide with another advisory user on the same database.
