@@ -70,6 +70,11 @@ use crate::{error::StorageError, storage::postgres::db::PostgresDb};
 #[cfg(any(test, feature = "test-mock-storage"))]
 pub mod mock;
 
+// Only the test-only mock variant is large, so production builds never pay for it.
+#[cfg_attr(
+    any(test, feature = "test-mock-storage"),
+    allow(clippy::large_enum_variant)
+)]
 #[derive(Clone)]
 pub enum Storage {
     Postgres(PostgresDb),
