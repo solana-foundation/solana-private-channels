@@ -255,6 +255,18 @@ pub enum BackfillError {
         reason: String,
     },
 
+    #[error("Slot {slot} transaction {signature} is malformed, so the slot's contents are unknown: {reason}")]
+    Malformed {
+        slot: u64,
+        signature: String,
+        reason: String,
+    },
+
+    #[error(
+        "Slot {slot} came back with no transactions and could not be confirmed empty: {reason}"
+    )]
+    EmptyUnconfirmed { slot: u64, reason: String },
+
     #[error("Slot {slot} is unavailable: a block exists here that this endpoint will not serve, so its contents are unknown")]
     SlotUnavailable { slot: u64 },
 

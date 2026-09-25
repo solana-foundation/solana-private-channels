@@ -33,11 +33,13 @@ use {
 
 #[path = "yellowstone_helpers.rs"]
 mod yellowstone_helpers;
-use yellowstone_helpers::{block, escrow_deposit_tx_info, unknown_discriminator_tx_info};
+use yellowstone_helpers::{
+    block, block_after, escrow_deposit_tx_info, unknown_discriminator_tx_info,
+};
 
 /// Feeds:
 ///   1. block(200, [deposit with meta.inner_instructions])
-///   2. block(202, [unknown-discriminator escrow tx])
+///   2. block_after(202, 200, [unknown-discriminator escrow tx])
 ///
 /// Asserts:
 ///   - The deposit instruction surfaces on the processor channel (inner
@@ -61,7 +63,8 @@ async fn yellowstone_handles_inner_instructions_and_unknown_discriminator() {
     );
     server.enqueue(
         UpdateMatcher,
-        Update::ok(block(202, vec![unknown_discriminator_tx_info()])),
+        // 201 produced no block, so 202's parent is 200.
+        Update::ok(block_after(202, 200, vec![unknown_discriminator_tx_info()])),
     );
 
     let (tx, mut rx) = mpsc::channel::<ProcessorMessage>(64);

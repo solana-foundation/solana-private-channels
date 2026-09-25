@@ -1311,8 +1311,8 @@ mod tests {
         use crate::storage::common::storage::mock::MockStorage;
         use crate::test_utils::rpc_mocks::{
             chain, deposit_fixture_instance, mock_get_block_at, mock_get_block_error,
-            mock_get_block_with_deposit, mock_get_blocks, mock_get_blocks_with_limit,
-            mock_get_slot,
+            mock_get_block_signatures, mock_get_block_with_deposit, mock_get_blocks,
+            mock_get_blocks_with_limit, mock_get_slot,
         };
         use mockito::Server;
         use solana_commitment_config::CommitmentLevel;
@@ -1604,6 +1604,9 @@ mod tests {
             let _first = mock_get_blocks(&mut server, 101, 102, &[101, 102]);
             let _b1 = mock_get_block_at(&mut server, 101, 100);
             let _b2 = mock_get_block_at(&mut server, 102, 101);
+            // Escrow confirms each empty block through its signatures view.
+            let _c1 = mock_get_block_signatures(&mut server, 101, "TestBlockHash101", vec![]);
+            let _c2 = mock_get_block_signatures(&mut server, 102, "TestBlockHash102", vec![]);
             let _second = mock_get_blocks(&mut server, 103, 103, &[103]);
             let _b3 = mock_get_block_error(&mut server, 103, -32600, "Invalid request");
             let (mock, storage) = seeded_storage(100);
