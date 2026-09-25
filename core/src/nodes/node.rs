@@ -210,9 +210,9 @@ async fn wait_for_verified_cache(
     }
 }
 
-/// The read path's accounts handle. With `cache_aligned` set (Aio), Redis is used only
-/// once this node's settler reports it aligned; otherwise reads go to Postgres, since
-/// that settler is not mirroring and a leftover stamp would be trusted wrongly.
+/// The read path's accounts handle. With `cache_aligned` set (Aio) and the cache not
+/// aligned, a leftover stamp is cleared first so reads miss to Postgres until the
+/// settler recovers and restamps it; if that clear fails, reads use Postgres only.
 async fn read_accounts_db(
     accountsdb_connection_url: &str,
     redis_cache_url: Option<&str>,
@@ -226,8 +226,30 @@ async fn read_accounts_db(
             .await
             .map_err(|_| "the settler stopped before aligning the Redis cache")?;
         if !aligned {
-            warn!("Redis cache is not aligned, serving reads from Postgres");
-            return Ok(AccountsDB::new(accountsdb_connection_url, true).await?);
+            let postgres = PostgresAccountsDB::new(accountsdb_connection_url, true)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e))?;
+            let cleared = match RedisAccountsDB::new(redis_url, postgres.clone()).await {
+                Ok(redis) => crate::accounts::redis_coherence::clear_deployment_id(&redis)
+                    .await
+                    .map(|()| redis),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            };
+            return Ok(match cleared {
+                Ok(redis) => {
+                    warn!(
+                        "Redis cache is not aligned, reads miss to Postgres until it is restamped"
+                    );
+                    AccountsDB::Redis(redis)
+                }
+                Err(e) => {
+                    warn!(
+                        "Redis cache is not aligned ({:#}), serving reads from Postgres",
+                        e
+                    );
+                    AccountsDB::Postgres(postgres)
+                }
+            });
         }
     }
     // Redis in front of Postgres. Postgres stays reachable so a key missing from
@@ -708,12 +730,25 @@ mod tests {
         }
     }
 
-    /// An AIO read path whose settler could not align the cache reads Postgres, even
-    /// with a live stamp for this deployment still in Redis.
+    /// An AIO read path whose settler could not align the cache never serves a stale
+    /// key under a leftover stamp, and uses the cache again once it is restamped.
     #[tokio::test(flavor = "multi_thread")]
     async fn aio_reads_postgres_when_the_cache_is_not_aligned() {
+        use solana_sdk::account::{AccountSharedData, ReadableAccount};
         let (postgres, _pg, url) = crate::test_helpers::start_test_postgres_with_url().await;
-        let (_stamped, redis) = crate::test_helpers::start_stamped_redis(postgres).await;
+        let deployment_id = crate::accounts::redis_coherence::read_deployment_id(&postgres)
+            .await
+            .unwrap();
+        let pubkey = solana_sdk::pubkey::Pubkey::new_unique();
+        let owner = solana_sdk::pubkey::Pubkey::new_unique();
+        AccountsDB::Postgres(postgres.clone())
+            .set_account(pubkey, AccountSharedData::new(1_000, 0, &owner))
+            .await;
+        let (stamped, redis) = crate::test_helpers::start_stamped_redis(postgres).await;
+        let mut cache = AccountsDB::Redis(stamped.clone());
+        cache
+            .set_account(pubkey, AccountSharedData::new(5, 0, &owner))
+            .await;
         let redis_url = format!(
             "redis://{}:{}",
             redis.get_host().await.unwrap(),
@@ -725,7 +760,28 @@ mod tests {
         let db = read_accounts_db(&url, Some(&redis_url), Some(aligned_rx))
             .await
             .unwrap();
-        assert!(matches!(db, AccountsDB::Postgres(_)));
+        let lamports = |db: AccountsDB| async move {
+            let account = db.get_account_shared_data(&pubkey).await.unwrap();
+            account.unwrap().lamports()
+        };
+        assert_eq!(
+            lamports(db.clone()).await,
+            1_000,
+            "the stale key must not be served"
+        );
+
+        // What a settler that recovered the cache does: purge, rewrite, restamp.
+        cache
+            .set_account(pubkey, AccountSharedData::new(7, 0, &owner))
+            .await;
+        crate::accounts::redis_coherence::stamp_deployment_id(&stamped, &deployment_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            lamports(db.clone()).await,
+            7,
+            "a restamped cache is used again"
+        );
 
         let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel::<bool>();
         drop(aligned_tx);
