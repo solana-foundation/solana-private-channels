@@ -610,7 +610,7 @@ mod tests {
             "err": null,
             "logMessages": null,
             "innerInstructions": null,
-            "loadedAddresses": null
+            "loadedAddresses": { "writable": [], "readonly": [] }
         });
         server
             .mock("POST", "/")
@@ -968,6 +968,81 @@ mod tests {
         );
     }
 
+    /// A primary whose meta omits `err` cannot prove the WithdrawFunds succeeded, so the
+    /// slot must go to the fallback exactly like `meta: null`. Accepting the primary would
+    /// index a withdrawal whose burn may have failed, and never contact the fallback.
+    #[tokio::test]
+    async fn missing_err_recovers_from_fallback() {
+        let mut primary = Server::new_async().await;
+        let mut fallback = Server::new_async().await;
+        let slot = 100;
+
+        let _m_slot = mock_get_slot(&mut primary, 101);
+        let _m_enum = mock_get_blocks(&mut primary, slot, slot, &[slot]);
+        let meta_without_err = json!({
+            "logMessages": null,
+            "innerInstructions": null,
+            "loadedAddresses": { "writable": [], "readonly": [] }
+        });
+        let _m_primary = primary
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": "TestBlockHash11111111111111111111111111111",
+                        "parentSlot": slot - 1,
+                        "transactions": [withdraw_block_transaction(meta_without_err)]
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create();
+        let m_fallback = mock_get_block_complete_withdraw(&mut fallback, slot, 1);
+
+        let mut source = RpcPollingSource::new(
+            primary.url(),
+            Some(slot),
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_commitment_config::CommitmentLevel::Finalized,
+            ProgramType::Withdraw,
+            None,
+            Some(fallback.url()),
+        );
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+
+        let mut saw_slot_complete = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
+        while tokio::time::Instant::now() < deadline && !saw_slot_complete {
+            if let Ok(Some(ProcessorMessage::SlotComplete {
+                slot: completed, ..
+            })) = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                saw_slot_complete = completed == slot;
+            }
+        }
+        cancel.cancel();
+        let _ = handle.await;
+
+        m_fallback.assert();
+        assert!(
+            saw_slot_complete,
+            "SlotComplete{{slot:{slot}}} must be emitted after fallback recovery"
+        );
+    }
+
     /// getBlock returns the withdraw transaction with a signature that is not 64 bytes, a shape
     /// no validator produces.
     fn mock_get_block_malformed_withdraw(server: &mut Server, slot: u64) -> mockito::Mock {
@@ -975,7 +1050,7 @@ mod tests {
             "err": null,
             "logMessages": null,
             "innerInstructions": null,
-            "loadedAddresses": null
+            "loadedAddresses": { "writable": [], "readonly": [] }
         });
         let mut transaction = withdraw_block_transaction(meta);
         transaction["transaction"]["signatures"] = json!([bs58::encode([1u8; 63]).into_string()]);

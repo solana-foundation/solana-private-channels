@@ -122,7 +122,7 @@ fn successful_meta() -> serde_json::Value {
         "err": null,
         "logMessages": null,
         "innerInstructions": null,
-        "loadedAddresses": null
+        "loadedAddresses": { "writable": [], "readonly": [] }
     })
 }
 

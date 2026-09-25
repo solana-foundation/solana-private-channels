@@ -24,9 +24,11 @@ pub mod pubkey {
 pub mod rpc_blocks {
     use crate::indexer::datasource::common::types::CompiledInstruction;
     use crate::indexer::datasource::rpc_polling::types::{
-        EncodedMessage, EncodedTransaction, RpcBlock, RpcTransactionWithMeta, TransactionMeta,
+        EncodedMessage, EncodedTransaction, Reported, RpcBlock, RpcTransactionWithMeta,
+        TransactionMeta,
     };
     use crate::test_utils::pubkey;
+    use solana_transaction_status::UiLoadedAddresses;
 
     /// Create an empty test block with default values
     pub fn create_test_block() -> RpcBlock {
@@ -46,18 +48,26 @@ pub mod rpc_blocks {
     ) -> RpcTransactionWithMeta {
         let meta = if is_failed {
             Some(TransactionMeta {
-                err: Some(serde_json::json!({"InstructionError": [0, "Custom(1)"]})),
+                err: Reported::Present(Some(
+                    serde_json::json!({"InstructionError": [0, "Custom(1)"]}),
+                )),
                 log_messages: None,
-                inner_instructions: None,
-                loaded_addresses: None,
+                inner_instructions: Reported::Present(None),
+                loaded_addresses: Some(UiLoadedAddresses {
+                    writable: vec![],
+                    readonly: vec![],
+                }),
             })
         } else {
             // A Solana node that records CPIs returns an empty list, not null.
             Some(TransactionMeta {
-                err: None,
+                err: Reported::Present(None),
                 log_messages: None,
-                inner_instructions: Some(vec![]),
-                loaded_addresses: None,
+                inner_instructions: Reported::Present(Some(vec![])),
+                loaded_addresses: Some(UiLoadedAddresses {
+                    writable: vec![],
+                    readonly: vec![],
+                }),
             })
         };
 
@@ -120,7 +130,7 @@ pub mod rpc_blocks {
     ) -> RpcTransactionWithMeta {
         let mut tx = create_successful_transaction(signature, account_keys, instructions);
         if let Some(meta) = tx.meta.as_mut() {
-            meta.inner_instructions = None;
+            meta.inner_instructions = Reported::Present(None);
         }
         tx
     }
@@ -371,7 +381,7 @@ pub mod rpc_mocks {
                             "meta": {
                                 "err": null,
                                 "logMessages": null,
-                                "loadedAddresses": null,
+                                "loadedAddresses": { "writable": [], "readonly": [] },
                                 "innerInstructions": [{
                                     "index": 0,
                                     "instructions": [{

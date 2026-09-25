@@ -556,10 +556,11 @@ async fn ttl_does_not_condemn_the_cache() -> Result<()> {
         cached_slot > expiring_slot && cached_slot <= node_slot,
         "the mirror must have followed blocks past the expired one: {expiring_slot} -> {cached_slot}, node at {node_slot}"
     );
-    // At most one block can have been mirrored between the two reads.
+    // getBlockHeight is served from Postgres, and at most one block can have
+    // committed between the two reads.
     assert!(
         cached_height <= node_height && node_height - cached_height <= 1,
-        "the cached height must be the height the node serves: cached {cached_height}, node {node_height}"
+        "the cached height must follow the Postgres height: cached {cached_height}, node {node_height}"
     );
 
     // An expired entry is a miss that falls through, never lost history.

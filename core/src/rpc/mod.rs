@@ -39,8 +39,11 @@ pub use {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{traits::BlockInfo, AccountsDB};
-    use crate::test_helpers::{create_test_sanitized_transaction, flush_address_signatures_sync};
+    use crate::accounts::{traits::BlockInfo, write_batch::write_batch_redis, AccountsDB};
+    use crate::test_helpers::{
+        create_test_sanitized_transaction, flush_address_signatures_sync, start_stamped_redis,
+        start_test_postgres_raw,
+    };
     use solana_account_decoder::MAX_BASE58_BYTES;
     use solana_account_decoder_client_types::{UiAccountEncoding, UiDataSliceConfig};
     use solana_client::rpc_config::RpcAccountInfoConfig;
@@ -225,6 +228,59 @@ mod tests {
         let height = rpc.get_block_height(None).await.unwrap();
         assert_eq!(height, 300);
         assert!(height > last_valid_block_height);
+    }
+
+    /// With the cache on, a status miss is answered by Postgres, which can lag the
+    /// cache. A cached height could then pass a deadline the store answering the null
+    /// has not reached, so getBlockHeight reads Postgres. getLatestBlockhash keeps the
+    /// cached height: its deadline must pair with the cached hash, or it comes out low.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_height_reads_postgres_while_blockhash_deadline_reads_the_cache() {
+        let postgres_height = 5;
+        let cached_height = 10;
+        let cached_blockhash = Hash::new_unique();
+        let (postgres_db, _pg) = start_test_postgres_raw().await;
+        let (mut redis_db, _redis) = start_stamped_redis(postgres_db.clone()).await;
+        AccountsDB::Postgres(postgres_db)
+            .write_batch(
+                &[],
+                vec![],
+                Some(make_sparse_block_info(
+                    50,
+                    postgres_height,
+                    Hash::new_unique(),
+                )),
+            )
+            .await
+            .unwrap();
+        write_batch_redis(
+            &mut redis_db,
+            &[],
+            vec![],
+            Some(make_sparse_block_info(100, cached_height, cached_blockhash)),
+        )
+        .await
+        .unwrap();
+        let deps = make_read_deps(AccountsDB::Redis(redis_db));
+
+        let height = get_block_height_impl::get_block_height_impl(&deps, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            height, postgres_height,
+            "getBlockHeight must not run ahead of the store that answers a status miss"
+        );
+
+        let latest = get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(latest.blockhash, cached_blockhash.to_string());
+        assert_eq!(
+            latest.last_valid_block_height,
+            cached_height + TEST_MAX_BLOCKHASHES - 1,
+            "the deadline must pair with the cached hash"
+        );
     }
 
     // ── get_block_time ────────────────────────────────────────────────────

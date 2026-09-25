@@ -17,7 +17,7 @@ use crate::indexer::datasource::common::tx_validation::{
 use crate::indexer::datasource::common::types::CompiledInstruction;
 use crate::indexer::datasource::common::types::*;
 use crate::indexer::datasource::rpc_polling::types::{
-    InnerInstructions, RpcBlock, RpcTransactionWithMeta,
+    InnerInstructions, Reported, RpcBlock, RpcTransactionWithMeta,
 };
 use solana_sdk::pubkey::Pubkey;
 use tracing::{debug, error};
@@ -48,6 +48,12 @@ pub struct UndecodableInstruction {
 pub enum SlotRejection {
     /// A transaction carries no `meta`, so it cannot be proven successful or in scope.
     MissingMeta { signature: String },
+    /// A transaction's meta omits a key the decoder reads, so a missing `err` cannot be
+    /// told apart from a success.
+    MissingMetaField {
+        signature: String,
+        field: &'static str,
+    },
     /// An instruction the indexer supports would not decode.
     Undecodable(UndecodableInstruction),
     /// A successful transaction breaks a rule the runtime enforces, so the provider corrupted it.
@@ -58,10 +64,11 @@ pub enum SlotRejection {
 
 impl SlotRejection {
     /// Label for `INDEXER_RPC_ERRORS`, kept distinct because each condition has its own
-    /// alert and runbook.
+    /// alert and runbook. A missing meta key shares `missing_meta`: both are an
+    /// endpoint serving incomplete meta.
     pub fn metric_label(&self) -> &'static str {
         match self {
-            Self::MissingMeta { .. } => "missing_meta",
+            Self::MissingMeta { .. } | Self::MissingMetaField { .. } => "missing_meta",
             Self::Undecodable(_) => "parse_failed",
             Self::Malformed { .. } => "malformed_tx",
             Self::EmptyUnconfirmed { .. } => "empty_block_unconfirmed",
@@ -73,6 +80,9 @@ impl std::fmt::Display for SlotRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingMeta { signature } => write!(f, "transaction {signature} is missing meta"),
+            Self::MissingMetaField { signature, field } => {
+                write!(f, "transaction {signature} meta is missing `{field}`")
+            }
             Self::Undecodable(failure) => write!(
                 f,
                 "transaction {} instruction {} (inner {:?}) will not decode: {}",
@@ -114,10 +124,39 @@ fn first_missing_meta(block: &RpcBlock) -> Option<String> {
     None
 }
 
+/// Returns the signature and key of the first transaction whose meta omits a key the
+/// decoder reads, or nulls `loadedAddresses`, which a node never sends null. Callers MUST
+/// fail closed on `Some(_)`, since a missing `err` would otherwise pass for a success.
+fn first_missing_meta_field(block: &RpcBlock) -> Option<(String, &'static str)> {
+    for (index, tx_with_meta) in block.transactions.iter().enumerate() {
+        let Some(meta) = &tx_with_meta.meta else {
+            continue;
+        };
+        let missing_field = if matches!(meta.err, Reported::Missing) {
+            "err"
+        } else if matches!(meta.inner_instructions, Reported::Missing) {
+            "innerInstructions"
+        } else if meta.loaded_addresses.is_none() {
+            "loadedAddresses"
+        } else {
+            continue;
+        };
+        let signature = tx_with_meta
+            .transaction
+            .signatures
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("tx#{index}"));
+        return Some((signature, missing_field));
+    }
+    None
+}
+
 /// Parse a block and extract program-specific instructions with metadata.
 ///
-/// Precondition: every transaction in `block` must carry `meta`. Errs when a supported
-/// instruction will not decode, leaving the slot's contents unknown.
+/// Precondition: every transaction in `block` must carry `meta` with every key the
+/// decoder reads. Errs when a supported instruction will not decode, leaving the slot's
+/// contents unknown.
 fn parse_block(
     block: &RpcBlock,
     slot: u64,
@@ -175,6 +214,10 @@ pub fn decode_slot(
 ) -> Result<Vec<InstructionWithMetadata>, SlotRejection> {
     if let Some(signature) = first_missing_meta(block) {
         return Err(SlotRejection::MissingMeta { signature });
+    }
+
+    if let Some((signature, field)) = first_missing_meta_field(block) {
+        return Err(SlotRejection::MissingMetaField { signature, field });
     }
 
     parse_block(block, slot, program_type, escrow_instance_id)
@@ -256,7 +299,7 @@ fn validate_transaction(
             &instruction.accounts,
         )?;
     }
-    let inner_sets = meta.and_then(|meta| meta.inner_instructions.as_deref());
+    let inner_sets = meta.and_then(|meta| meta.inner_instructions.present().map(Vec::as_slice));
     for inner_set in inner_sets.unwrap_or_default() {
         check_inner_set_index(inner_set.index.into(), tx.message.instructions.len())?;
         for inner in &inner_set.instructions {
@@ -294,11 +337,11 @@ where
     };
 
     for (tx_position, tx_with_meta) in block.transactions.iter().enumerate() {
-        // Skip failed transactions
+        // Only an explicit `err: null` is a success; a failed or unreported one is skipped.
         if tx_with_meta
             .meta
             .as_ref()
-            .is_some_and(|meta| meta.err.is_some())
+            .is_some_and(|meta| !matches!(meta.err, Reported::Present(None)))
         {
             continue;
         }
@@ -332,7 +375,7 @@ where
         let inner_instructions = tx_with_meta
             .meta
             .as_ref()
-            .and_then(|meta| meta.inner_instructions.as_deref());
+            .and_then(|meta| meta.inner_instructions.present().map(Vec::as_slice));
         if require_inner_instructions && inner_instructions.is_none() {
             return Err(malformed(
                 "innerInstructions is null, so a CPI into our program would be invisible"
@@ -779,20 +822,22 @@ mod tests {
                 "inner set names no top-level instruction",
                 "names no top-level instruction",
                 |tx| {
-                    tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-                        index: 3,
-                        instructions: vec![],
-                    }])
+                    tx.meta.as_mut().unwrap().inner_instructions =
+                        Reported::Present(Some(vec![InnerInstructions {
+                            index: 3,
+                            instructions: vec![],
+                        }]))
                 },
             ),
             (
                 "inner program index out of range",
                 "program index 9 is outside",
                 |tx| {
-                    tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-                        index: 0,
-                        instructions: vec![inner(9, "x", 2)],
-                    }])
+                    tx.meta.as_mut().unwrap().inner_instructions =
+                        Reported::Present(Some(vec![InnerInstructions {
+                            index: 0,
+                            instructions: vec![inner(9, "x", 2)],
+                        }]))
                 },
             ),
             (
@@ -801,10 +846,11 @@ mod tests {
                 |tx| {
                     let mut ix = inner(0, "x", 2);
                     ix.instruction.accounts = vec![9];
-                    tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-                        index: 0,
-                        instructions: vec![ix],
-                    }])
+                    tx.meta.as_mut().unwrap().inner_instructions =
+                        Reported::Present(Some(vec![InnerInstructions {
+                            index: 0,
+                            instructions: vec![ix],
+                        }]))
                 },
             ),
         ];
@@ -855,7 +901,7 @@ mod tests {
                 with_foreign_program(create_account_keys_with_program(program, 0)),
                 vec![create_instruction(1, vec![], "foreign".to_string())],
             );
-            tx.meta.as_mut().unwrap().inner_instructions = None;
+            tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(None);
             let mut block = create_test_block();
             block.transactions.push(tx);
             block
@@ -1132,6 +1178,156 @@ mod tests {
         assert_eq!(first_missing_meta(&block), Some(test_sig("sig_no_meta")));
     }
 
+    /// Omitting `err` is not a success: a failed WithdrawFunds read as one would release
+    /// escrow for a burn that never happened. Every other meta key the decoder reads is
+    /// held to the same rule, so omitting any of them must reject the slot, never yield
+    /// a row. Explicit nulls stay valid where a node may send them.
+    #[test]
+    fn decode_slot_rejects_meta_missing_a_required_key() {
+        let slot = 100;
+        let signature = &test_sig("sig_withdraw");
+        // WithdrawFunds: discriminator 0, then borsh amount (u64 LE) + None destination.
+        let mut withdraw_data = vec![0u8];
+        withdraw_data.extend_from_slice(&1000u64.to_le_bytes());
+        withdraw_data.push(0);
+        let mut account_keys = vec![PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID.to_string()];
+        for seed in 1u8..=5 {
+            account_keys.push(test_pubkey(seed).to_string());
+        }
+        let complete_block = json!({
+            "blockhash": "TestBlockHash11111111111111111111111111111",
+            "parentSlot": slot - 1,
+            "transactions": [{
+                "transaction": {
+                    "signatures": [signature],
+                    "message": {
+                        "accountKeys": account_keys,
+                        "instructions": [{
+                            "programIdIndex": 0,
+                            "accounts": [1, 2, 3, 4, 5],
+                            "data": bs58::encode(withdraw_data).into_string()
+                        }]
+                    }
+                },
+                "meta": {
+                    "err": null,
+                    "logMessages": null,
+                    "innerInstructions": null,
+                    "loadedAddresses": { "writable": [], "readonly": [] }
+                }
+            }]
+        });
+
+        let block: RpcBlock = serde_json::from_value(complete_block.clone())
+            .expect("the complete block deserializes");
+        let rows =
+            decode_slot(&block, slot, ProgramType::Withdraw, None).expect("complete meta decodes");
+        assert_eq!(rows.len(), 1, "the fixture holds one valid WithdrawFunds");
+
+        for required_key in ["err", "innerInstructions", "loadedAddresses"] {
+            let mut stripped_block = complete_block.clone();
+            stripped_block["transactions"][0]["meta"]
+                .as_object_mut()
+                .expect("meta is an object")
+                .remove(required_key);
+            let block: RpcBlock = serde_json::from_value(stripped_block)
+                .expect("a meta missing a key still deserializes");
+
+            let rejection = decode_slot(&block, slot, ProgramType::Withdraw, None)
+                .expect_err("a meta missing a required key must reject the slot");
+
+            assert_eq!(rejection.metric_label(), "missing_meta");
+            let message = rejection.to_string();
+            assert!(
+                message.contains(signature) && message.contains(&format!("`{required_key}`")),
+                "rejection must name the transaction and the missing key: {message}"
+            );
+        }
+    }
+
+    /// A null `loadedAddresses` hides every key a lookup table supplied, so a CPI to our
+    /// ALT-loaded program resolves to nothing and would drop silently while the slot
+    /// completes. Unlike `innerInstructions`, a node never sends it null, so reject it.
+    #[test]
+    fn decode_slot_rejects_null_loaded_addresses() {
+        let slot = 100;
+        let signature = &test_sig("sig_alt_withdraw");
+        // WithdrawFunds: discriminator 0, then borsh amount (u64 LE) + None destination.
+        let mut withdraw_data = vec![0u8];
+        withdraw_data.extend_from_slice(&1000u64.to_le_bytes());
+        withdraw_data.push(0);
+        // Static keys: a foreign program at 0, the withdraw accounts at 1..=5. Our program
+        // is only in the lookup table, so its full-list index is 6.
+        let mut account_keys = vec![test_pubkey(100).to_string()];
+        for seed in 1u8..=5 {
+            account_keys.push(test_pubkey(seed).to_string());
+        }
+        let loaded_block = json!({
+            "blockhash": "TestBlockHash11111111111111111111111111111",
+            "parentSlot": slot - 1,
+            "transactions": [{
+                "transaction": {
+                    "signatures": [signature],
+                    "message": {
+                        "accountKeys": account_keys,
+                        "instructions": [{
+                            "programIdIndex": 0,
+                            "accounts": [],
+                            "data": ""
+                        }],
+                        "addressTableLookups": [{
+                            "accountKey": test_pubkey(77).to_string(),
+                            "writableIndexes": [0],
+                            "readonlyIndexes": []
+                        }]
+                    }
+                },
+                "meta": {
+                    "err": null,
+                    "logMessages": null,
+                    "loadedAddresses": {
+                        "writable": [PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID],
+                        "readonly": []
+                    },
+                    "innerInstructions": [{
+                        "index": 0,
+                        "instructions": [{
+                            "programIdIndex": 6,
+                            "accounts": [1, 2, 3, 4, 5],
+                            "data": bs58::encode(withdraw_data).into_string(),
+                            "stackHeight": 2
+                        }]
+                    }]
+                }
+            }]
+        });
+
+        let block: RpcBlock =
+            serde_json::from_value(loaded_block.clone()).expect("the loaded block deserializes");
+        let rows = decode_slot(&block, slot, ProgramType::Withdraw, None)
+            .expect("a CPI to the ALT-loaded program decodes");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the fixture holds one ALT-loaded WithdrawFunds"
+        );
+
+        let mut null_block = loaded_block;
+        null_block["transactions"][0]["meta"]["loadedAddresses"] = serde_json::Value::Null;
+        let block: RpcBlock =
+            serde_json::from_value(null_block).expect("a null loadedAddresses deserializes");
+
+        let rejection = decode_slot(&block, slot, ProgramType::Withdraw, None)
+            .expect_err("a null loadedAddresses must reject the slot, not drop the row");
+
+        assert_eq!(rejection.metric_label(), "missing_meta");
+        let message = rejection.to_string();
+        assert!(
+            message.contains(signature) && message.contains("`loadedAddresses`"),
+            "rejection must name the transaction and the missing key: {message}"
+        );
+    }
+
     // ============================================================================
     // CPI (inner instruction) Tests
     // ============================================================================
@@ -1158,13 +1354,14 @@ mod tests {
 
         let mut tx =
             create_successful_transaction("sig_cpi".to_string(), account_keys, vec![foreign]);
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![
-                inner(1, "skip", 2),             // foreign inner, filtered out
-                inner(0, "cpi_deposit_data", 2), // our program, indexed
-            ],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    inner(1, "skip", 2),             // foreign inner, filtered out
+                    inner(0, "cpi_deposit_data", 2), // our program, indexed
+                ],
+            }]));
         block.transactions.push(tx);
 
         let result = parse_block_for_program(
@@ -1203,7 +1400,7 @@ mod tests {
             account_keys,
             vec![foreign_0, foreign_1],
         );
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![
+        tx.meta.as_mut().unwrap().inner_instructions = Reported::Present(Some(vec![
             InnerInstructions {
                 index: 0,
                 instructions: vec![inner(0, "deposit_a", 2)],
@@ -1212,7 +1409,7 @@ mod tests {
                 index: 1,
                 instructions: vec![inner(0, "deposit_b", 2)],
             },
-        ]);
+        ]));
         block.transactions.push(tx);
 
         let result = parse_block_for_program(
@@ -1245,19 +1442,20 @@ mod tests {
         // Discriminator 7 (ReleaseFunds) is excluded; 6 (Deposit) is indexed.
         let release_data = bs58::encode([7u8]).into_string();
         let deposit_data = bs58::encode([6u8]).into_string();
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![
-                InnerInstruction {
-                    instruction: create_instruction(0, vec![], release_data),
-                    stack_height: Some(2),
-                },
-                InnerInstruction {
-                    instruction: create_instruction(0, vec![], deposit_data.clone()),
-                    stack_height: Some(2),
-                },
-            ],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    InnerInstruction {
+                        instruction: create_instruction(0, vec![], release_data),
+                        stack_height: Some(2),
+                    },
+                    InnerInstruction {
+                        instruction: create_instruction(0, vec![], deposit_data.clone()),
+                        stack_height: Some(2),
+                    },
+                ],
+            }]));
         block.transactions.push(tx);
 
         let result = parse_block_for_program(
@@ -1302,17 +1500,18 @@ mod tests {
         let top = create_instruction(0, vec![], "top".to_string());
         let mut tx = create_successful_transaction("sig_alt".to_string(), account_keys, vec![top]);
         // Inner account[0] = 3 points past the 2 static keys into the readonly loaded slot (static 0,1 + writable 2 + readonly 3).
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: 1, // our program (CPI'd)
-                    accounts: vec![3],
-                    data: "inner".to_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 1, // our program (CPI'd)
+                        accounts: vec![3],
+                        data: "inner".to_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
         tx.meta.as_mut().unwrap().loaded_addresses = Some(UiLoadedAddresses {
             writable: vec![loaded_writable.clone()],
             readonly: vec![loaded_readonly.clone()],
@@ -1353,17 +1552,18 @@ mod tests {
             readonly: vec![],
         });
         declare_lookups(&mut tx, 1, 0);
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: 1, // points into loaded addresses
-                    accounts: vec![],
-                    data: "cpi".to_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 1, // points into loaded addresses
+                        accounts: vec![],
+                        data: "cpi".to_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
         block.transactions.push(tx);
 
         let result = parse_block_for_program(
@@ -1482,10 +1682,11 @@ mod tests {
         //   [1]   event 300 height 3   (A's subtree)
         //   [2] deposit B   height 2
         //   [3]   event 480 height 3   (B's subtree)
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![deposit(), event(300), deposit(), event(480)],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![deposit(), event(300), deposit(), event(480)],
+            }]));
 
         let mut block = create_test_block();
         block.transactions.push(tx);
@@ -1538,17 +1739,18 @@ mod tests {
         });
         declare_lookups(&mut tx, 1, 0);
         // The deposit's event self-CPI, emitted by the ALT-loaded escrow program.
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: 12, // escrow via ALT
-                    accounts: vec![],
-                    data: bs58::encode(deposit_event_bytes(555)).into_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![InnerInstruction {
+                    instruction: CompiledInstruction {
+                        program_id_index: 12, // escrow via ALT
+                        accounts: vec![],
+                        data: bs58::encode(deposit_event_bytes(555)).into_string(),
+                    },
+                    stack_height: Some(2),
+                }],
+            }]));
 
         let mut block = create_test_block();
         block.transactions.push(tx);
@@ -1620,20 +1822,21 @@ mod tests {
         //   [6]     event 222  h6
         //   [7] deposit D3     h2   (1 hop)   -> event 333
         //   [8]   event 333    h3
-        tx.meta.as_mut().unwrap().inner_instructions = Some(vec![InnerInstructions {
-            index: 0,
-            instructions: vec![
-                foreign(2),
-                deposit(3),
-                event(111, 4),
-                foreign(3),
-                foreign(4),
-                deposit(5),
-                event(222, 6),
-                deposit(2),
-                event(333, 3),
-            ],
-        }]);
+        tx.meta.as_mut().unwrap().inner_instructions =
+            Reported::Present(Some(vec![InnerInstructions {
+                index: 0,
+                instructions: vec![
+                    foreign(2),
+                    deposit(3),
+                    event(111, 4),
+                    foreign(3),
+                    foreign(4),
+                    deposit(5),
+                    event(222, 6),
+                    deposit(2),
+                    event(333, 3),
+                ],
+            }]));
 
         let mut block = create_test_block();
         block.transactions.push(tx);
