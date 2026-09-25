@@ -392,7 +392,7 @@ mod tests {
     }
 
     // ====================================================================
-    // parse_program_error
+    // classify_failure
     // ====================================================================
 
     /// This map is the single point where an on-chain error code becomes a
