@@ -143,11 +143,14 @@ async fn mock_get_slot(rpc: &mut MockitoServer, slot: u64) -> mockito::Mock {
         .await
 }
 
-fn empty_block_json() -> serde_json::Value {
+/// An empty block chained onto `slot - 1`. It also answers the signatures view, so the
+/// escrow gap-fill can confirm it empty.
+fn empty_block_json(slot: u64) -> serde_json::Value {
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
-        "parentSlot": 0,
-        "transactions": []
+        "parentSlot": slot - 1,
+        "transactions": [],
+        "signatures": []
     })
 }
 
@@ -157,7 +160,7 @@ async fn mock_block_ok(rpc: &mut MockitoServer, slot: u64) -> mockito::Mock {
             json!({"method": "getBlock", "params": [slot]}),
         ))
         .with_status(200)
-        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string())
+        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1}).to_string())
         .create_async()
         .await
 }

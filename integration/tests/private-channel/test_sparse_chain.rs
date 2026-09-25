@@ -220,7 +220,9 @@ async fn the_indexer_walks_a_sparse_chain() -> Result<()> {
         UiTransactionEncoding::Json,
         CommitmentLevel::Finalized,
     );
-    let verdicts = poller.get_blocks_batch((0..=last_producer).collect()).await;
+    let verdicts = poller
+        .get_blocks_batch((0..=last_producer).collect(), None)
+        .await;
 
     assert_eq!(verdicts.len() as u64, last_producer + 1);
     let mut skipped = 0usize;

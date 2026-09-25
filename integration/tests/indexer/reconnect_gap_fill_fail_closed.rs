@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "yellowstone_helpers.rs"]
 mod yellowstone_helpers;
-use yellowstone_helpers::empty_block;
+use yellowstone_helpers::{bad_program_index_tx_info, block, block_after, empty_block, fork_block};
 
 const CHECKPOINT: u64 = 100;
 const TIP: u64 = 103;
@@ -62,11 +62,14 @@ async fn start_postgres() -> (testcontainers::ContainerAsync<Postgres>, Arc<Stor
     (pg, Arc::new(storage))
 }
 
-fn empty_block_json() -> serde_json::Value {
+/// An empty block chained onto `slot - 1`. It also answers the signatures view, so the
+/// escrow gap-fill can confirm it empty.
+fn empty_block_json(slot: u64) -> serde_json::Value {
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
-        "parentSlot": 0,
-        "transactions": []
+        "parentSlot": slot - 1,
+        "transactions": [],
+        "signatures": []
     })
 }
 
@@ -77,7 +80,7 @@ async fn mock_block_ok(server: &mut MockitoServer, slot: u64) -> mockito::Mock {
             json!({"method": "getBlock", "params": [slot]}),
         ))
         .with_status(200)
-        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(), "id": 1}).to_string())
+        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(slot), "id": 1}).to_string())
         .create_async()
         .await
 }
@@ -483,6 +486,234 @@ async fn cold_start_gap_gates_checkpoint_on_first_connection() {
     // Heal the boundary; the fill closes (CHECKPOINT, TIP] and the gate hands off.
     let _healed = mock_block_ok(&mut rpc, CHECKPOINT).await;
     wait_for_checkpoint(&storage, "escrow", TIP, 30).await;
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), processor_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer_handle).await;
+    ys.shutdown().await;
+}
+
+/// A live stream that drops one finalized block while it keeps delivering later ones must
+/// not carry the checkpoint over the hole: the stream re-arms the gap-fill on the same
+/// connection, and the checkpoint passes the hole only after RPC has read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_live_block_holds_the_checkpoint_until_rpc_reads_it() {
+    init_tracing();
+    let (_pg, storage) = start_postgres().await;
+    storage
+        .update_committed_checkpoint("escrow", CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
+
+    // The stream drops HOLE; RPC cannot serve it either until it heals below.
+    const HOLE: u64 = CHECKPOINT + 2;
+    let mut rpc = MockitoServer::new_async().await;
+    let _b100 = mock_block_ok(&mut rpc, CHECKPOINT).await;
+    let _b101 = mock_block_ok(&mut rpc, CHECKPOINT + 1).await;
+    // The fill replays from the durable checkpoint minus one, which is 100 or 101 by then.
+    let _from_100 = mock_produced_slots(&mut rpc, CHECKPOINT, HOLE, &[100, 101, 102]).await;
+    let _from_101 = mock_produced_slots(&mut rpc, CHECKPOINT + 1, HOLE, &[101, 102]).await;
+    let pruned = mock_block_pruned(&mut rpc, HOLE, 1).await;
+
+    let ys = MockYellowstoneServer::start().await;
+    let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
+    let cancel = CancellationToken::new();
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
+    let handle = source
+        .start(tx.clone(), cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    wait_for_subscribes(&ys, 1, 10).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT)));
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT + 1)));
+    wait_for_checkpoint(&storage, "escrow", CHECKPOINT + 1, 15).await;
+    // HOLE never arrives; the next block names it as its parent.
+    ys.enqueue(
+        UpdateMatcher,
+        Update::ok(block_after(HOLE + 1, HOLE, vec![])),
+    );
+
+    wait_until_matched(&pruned, 20, "the re-armed gap-fill asks RPC for the hole").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        let checkpoint = storage
+            .get_committed_checkpoint("escrow")
+            .await
+            .expect("read checkpoint");
+        assert!(
+            checkpoint < Some(HOLE),
+            "checkpoint {checkpoint:?} passed the unread hole at {HOLE}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        ys.call_count("subscribe"),
+        1,
+        "the hole is repaired on the same stream, without a reconnect"
+    );
+
+    // Heal the hole; the fill reads it, and the next live block moves the checkpoint on.
+    let _healed = mock_block_ok(&mut rpc, HOLE).await;
+    wait_for_checkpoint(&storage, "escrow", HOLE, 30).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(HOLE + 2)));
+    wait_for_checkpoint(&storage, "escrow", HOLE + 2, 15).await;
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), processor_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer_handle).await;
+    ys.shutdown().await;
+}
+
+/// A live block whose parent hash contradicts the block just forwarded is on another fork.
+/// Re-filling up to that parent cannot vet it, so the stream drops the block and reconnects,
+/// and the checkpoint passes its slot only after RPC has read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forked_live_block_is_dropped_and_read_over_rpc() {
+    init_tracing();
+    let (_pg, storage) = start_postgres().await;
+    storage
+        .update_committed_checkpoint("escrow", CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
+
+    const FORK: u64 = CHECKPOINT + 2;
+    const RESUME: u64 = CHECKPOINT + 3;
+    let mut rpc = MockitoServer::new_async().await;
+    let _b99 = mock_block_ok(&mut rpc, CHECKPOINT - 1).await;
+    let _b100 = mock_block_ok(&mut rpc, CHECKPOINT).await;
+    let _b101 = mock_block_ok(&mut rpc, CHECKPOINT + 1).await;
+    // Hit twice, by the full read and by the empty-block confirm.
+    let fork_over_rpc = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlock", "params": [FORK]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(FORK), "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _b103 = mock_block_ok(&mut rpc, RESUME).await;
+    // The fill replays from the durable checkpoint minus one, which is 99, 100 or 101 by then.
+    let _from_99 =
+        mock_produced_slots(&mut rpc, CHECKPOINT - 1, RESUME, &[99, 100, 101, 102, 103]).await;
+    let _from_100 = mock_produced_slots(&mut rpc, CHECKPOINT, RESUME, &[100, 101, 102, 103]).await;
+    let _from_101 = mock_produced_slots(&mut rpc, CHECKPOINT + 1, RESUME, &[101, 102, 103]).await;
+
+    let ys = MockYellowstoneServer::start().await;
+    let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
+    let cancel = CancellationToken::new();
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
+    let handle = source
+        .start(tx.clone(), cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    wait_for_subscribes(&ys, 1, 10).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT)));
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT + 1)));
+    wait_for_checkpoint(&storage, "escrow", CHECKPOINT + 1, 15).await;
+    // Names the right parent slot but another parent hash.
+    ys.enqueue(UpdateMatcher, Update::ok(fork_block(FORK, CHECKPOINT + 1)));
+
+    // The forked block kills the stream without completing its slot.
+    wait_for_subscribes(&ys, 2, 15).await;
+    let checkpoint = storage
+        .get_committed_checkpoint("escrow")
+        .await
+        .expect("read checkpoint");
+    assert!(
+        checkpoint < Some(FORK),
+        "checkpoint {checkpoint:?} passed the forked block at {FORK}"
+    );
+
+    // The next connection re-arms from the durable checkpoint and RPC reads the fork's slot.
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(RESUME)));
+    wait_for_checkpoint(&storage, "escrow", RESUME, 30).await;
+    assert!(
+        fork_over_rpc.matched_async().await,
+        "the forked slot must be read over RPC before the checkpoint passes it"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), processor_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer_handle).await;
+    ys.shutdown().await;
+}
+
+/// A malformed transaction on the stream withholds its slot, and the reconnect gap-fill
+/// reads that slot over RPC, so the checkpoint still moves past it with nothing lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_stream_block_is_read_over_rpc() {
+    init_tracing();
+    let (_pg, storage) = start_postgres().await;
+    storage
+        .update_committed_checkpoint("escrow", CHECKPOINT)
+        .await
+        .expect("seed checkpoint");
+
+    const BAD: u64 = CHECKPOINT + 1;
+    const RESUME: u64 = CHECKPOINT + 2;
+    let mut rpc = MockitoServer::new_async().await;
+    let _b100 = mock_block_ok(&mut rpc, CHECKPOINT).await;
+    // Hit twice, by the full read and by the empty-block confirm.
+    let bad_over_rpc = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getBlock", "params": [BAD]}),
+        ))
+        .with_status(200)
+        .with_body(json!({"jsonrpc": "2.0", "result": empty_block_json(BAD), "id": 1}).to_string())
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _b102 = mock_block_ok(&mut rpc, RESUME).await;
+    let _from_99 =
+        mock_produced_slots(&mut rpc, CHECKPOINT - 1, RESUME, &[99, 100, 101, 102]).await;
+    let _from_100 = mock_produced_slots(&mut rpc, CHECKPOINT, RESUME, &[100, 101, 102]).await;
+    let _b99 = mock_block_ok(&mut rpc, CHECKPOINT - 1).await;
+
+    let ys = MockYellowstoneServer::start().await;
+    let (tx, processor_handle, writer_handle) = spawn_pipeline(storage.clone());
+    let cancel = CancellationToken::new();
+    let mut source = make_source(ys.url(), &rpc, storage.clone());
+    let handle = source
+        .start(tx.clone(), cancel.clone())
+        .await
+        .expect("yellowstone source start");
+
+    wait_for_subscribes(&ys, 1, 10).await;
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(CHECKPOINT)));
+    ys.enqueue(
+        UpdateMatcher,
+        Update::ok(block(BAD, vec![bad_program_index_tx_info()])),
+    );
+
+    // The malformed block kills the stream without completing its slot, so across the
+    // reconnect backoff the durable checkpoint stays below it.
+    wait_for_subscribes(&ys, 2, 15).await;
+    assert_eq!(
+        storage
+            .get_committed_checkpoint("escrow")
+            .await
+            .expect("read checkpoint"),
+        Some(CHECKPOINT),
+        "the malformed slot must not be checkpointed"
+    );
+    ys.enqueue(UpdateMatcher, Update::ok(empty_block(RESUME)));
+
+    wait_for_checkpoint(&storage, "escrow", RESUME, 30).await;
+    assert!(
+        bad_over_rpc.matched_async().await,
+        "the withheld slot must be read over RPC before the checkpoint passes it"
+    );
 
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;

@@ -353,13 +353,16 @@ fn deposit_block_json(slot: u64, instance: Pubkey, mint: Pubkey, amount: u64) ->
 
     let ix_data = bs58::encode(deposit_ix_bytes(amount, None)).into_string();
     let event_data = bs58::encode(deposit_event_bytes(amount)).into_string();
+    // A real 64-byte signature, unique per slot.
+    let mut signature = [0u8; 64];
+    signature[..8].copy_from_slice(&slot.to_le_bytes());
 
     json!({
         "blockhash": "TestBlockHash11111111111111111111111111111",
         "parentSlot": slot - 1,
         "transactions": [{
             "transaction": {
-                "signatures": [format!("mocked_deposit_sig_{slot}")],
+                "signatures": [bs58::encode(signature).into_string()],
                 "message": {
                     "accountKeys": account_keys,
                     "instructions": [{
@@ -435,10 +438,12 @@ async fn mock_fill_range_carrying(
     for slot in MOCK_START_SLOT..=MOCK_TIP {
         let block = match &carrying {
             Some((carried_slot, block)) if *carried_slot == slot => block.clone(),
+            // Also answers the signatures view, so the escrow fill can confirm it empty.
             _ => json!({
                 "blockhash": "TestBlockHash11111111111111111111111111111",
                 "parentSlot": slot - 1,
-                "transactions": []
+                "transactions": [],
+                "signatures": []
             }),
         };
         mocks.push(

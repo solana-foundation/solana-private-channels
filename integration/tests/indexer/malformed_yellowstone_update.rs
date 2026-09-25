@@ -16,8 +16,9 @@
 //!    `connect_and_stream` propagates as `Err(DataSourceError::Rpc)` and the
 //!    source reconnects. This is the fail-closed guarantee: the slot is never
 //!    checkpointed, so reconnect gap-fill replays it idempotently.
-//! 3. A block whose tx references an out-of-bounds or foreign program id -> the
-//!    tx is soft-skipped, but the block STILL completes its slot (no reconnect).
+//! 3. A block whose tx references an out-of-bounds program index, or that the
+//!    program filter delivered without naming the program -> the same fail-closed
+//!    path as (2): the provider corrupted it, so the slot is left for gap-fill.
 
 use private_channel_indexer::config::ProgramType;
 use private_channel_indexer::indexer::datasource::common::datasource::DataSource;
@@ -33,7 +34,8 @@ use tokio_util::sync::CancellationToken;
 #[path = "yellowstone_helpers.rs"]
 mod yellowstone_helpers;
 use yellowstone_helpers::{
-    bad_program_index_tx_info, block, empty_block, missing_message_tx_info, wrong_program_tx_info,
+    bad_program_index_tx_info, block, block_after, empty_block, missing_message_tx_info,
+    wrong_program_tx_info,
 };
 
 struct TestHarness {
@@ -230,70 +232,70 @@ async fn missing_message_kills_stream_and_reconnects() {
     tear_down(h).await;
 }
 
-/// Case (b2): a block whose tx has a `program_id_index` past the `account_keys`
-/// array hits the source's bounds-check skip. The tx is dropped, but the block
-/// STILL completes its slot; the stream stays healthy (no reconnect).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn out_of_bounds_program_id_index_is_skipped_but_slot_completes() {
-    let mut h = spin_up().await;
+/// Enqueues `good`, then `bad`, and asserts `bad` kills the stream without ever
+/// completing its slot, while the block after the reconnect still completes.
+async fn assert_block_fails_closed(
+    h: &mut TestHarness,
+    good: u64,
+    bad: yellowstone_grpc_proto::geyser::SubscribeUpdate,
+    bad_slot: u64,
+) {
+    h.server
+        .enqueue(UpdateMatcher, Update::ok(empty_block(good)));
+    h.server.enqueue(UpdateMatcher, Update::ok(bad));
 
-    h.server.enqueue(UpdateMatcher, Update::ok(empty_block(40)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if h.server.call_count("subscribe") >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the malformed block must kill the stream and reconnect");
+
+    // Chained to `good`: the gap at `bad_slot` belongs to the gap-fill, which is not wired here.
     h.server.enqueue(
         UpdateMatcher,
-        Update::ok(block(41, vec![bad_program_index_tx_info()])),
+        Update::ok(block_after(bad_slot + 1, good, vec![])),
     );
-    h.server.enqueue(UpdateMatcher, Update::ok(empty_block(42)));
+    let slots = drain_slots(&mut h.rx, Duration::from_secs(8)).await;
+    assert!(slots.contains(&good), "slot {good} completes: {slots:?}");
+    assert!(
+        slots.contains(&(bad_slot + 1)),
+        "the post-reconnect block completes: {slots:?}"
+    );
+    assert!(
+        !slots.contains(&bad_slot),
+        "the malformed slot {bad_slot} must never complete: {slots:?}"
+    );
+}
 
-    let slots = drain_slots(&mut h.rx, Duration::from_secs(4)).await;
-    assert_eq!(
-        slots,
-        vec![40, 41, 42],
-        "the out-of-bounds tx is soft-skipped, yet its block still completes slot 41"
-    );
-    assert_eq!(
-        h.server.call_count("subscribe"),
-        1,
-        "defensive skip is a soft filter (no reconnect)"
-    );
-
+/// Case (b2): a tx whose `program_id_index` is past the `account_keys` array was
+/// corrupted by the provider, so its slot must not complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_of_bounds_program_id_index_fails_the_slot() {
+    let mut h = spin_up().await;
+    let bad = block_after(41, 40, vec![bad_program_index_tx_info()]);
+    assert_block_fails_closed(&mut h, 40, bad, 41).await;
     tear_down(h).await;
 }
 
-/// Case (c): a block whose tx targets an unrelated program is filtered out by
-/// the client-side program check. The tx is dropped, the block still completes
-/// its slot, and the stream stays alive.
+/// Case (c): the program filter only delivers transactions naming our program, so a
+/// delivered tx without it lost keys and its slot must not complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_program_id_is_skipped_but_slot_completes() {
+async fn delivered_tx_without_our_program_fails_the_slot() {
     let mut h = spin_up().await;
 
     // An unrelated program ID - use the system program (11...11).
     let wrong_program = solana_sdk::pubkey::Pubkey::default();
-
-    h.server.enqueue(UpdateMatcher, Update::ok(empty_block(30)));
-    h.server.enqueue(
-        UpdateMatcher,
-        Update::ok(block(31, vec![wrong_program_tx_info(wrong_program)])),
-    );
-    h.server.enqueue(UpdateMatcher, Update::ok(empty_block(32)));
-
-    let slots = drain_slots(&mut h.rx, Duration::from_secs(4)).await;
-    assert_eq!(
-        slots,
-        vec![30, 31, 32],
-        "the wrong-program tx is soft-skipped, yet its block still completes slot 31"
-    );
-    assert_eq!(
-        h.server.call_count("subscribe"),
-        1,
-        "wrong program id is a soft filter (no reconnect)"
-    );
-
-    // Sanity: confirm the escrow program ID is what the source was configured
-    // for - the filtered tx legitimately did not match.
     assert_ne!(
         wrong_program,
         solana_sdk::pubkey::Pubkey::from_str(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).unwrap()
     );
 
+    let bad = block_after(31, 30, vec![wrong_program_tx_info(wrong_program)]);
+    assert_block_fails_closed(&mut h, 30, bad, 31).await;
     tear_down(h).await;
 }

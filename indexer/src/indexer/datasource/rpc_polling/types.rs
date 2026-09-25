@@ -10,6 +10,13 @@ pub struct RpcBlock {
     pub transactions: Vec<RpcTransactionWithMeta>,
 }
 
+/// A `getBlock` answer in the signatures view, which lists signatures instead of `transactions`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SignaturesBlock {
+    pub blockhash: String,
+    pub signatures: Vec<String>,
+}
+
 /// Outcome of fetching one slot's block. The domain has three states:
 /// a proven-empty slot is safe to checkpoint past, but a slot the endpoint
 /// cannot serve has unknown contents and must never
@@ -43,6 +50,9 @@ pub struct EncodedMessage {
     #[serde(rename = "accountKeys")]
     pub account_keys: Vec<String>,
     pub instructions: Vec<CompiledInstruction>,
+    /// ALT lookups of a v0 message; absent for legacy and v1, which load no addresses.
+    #[serde(rename = "addressTableLookups", default)]
+    pub address_table_lookups: Option<Vec<solana_transaction_status::UiAddressTableLookup>>,
 }
 
 /// A meta key the node must always send, which may still be null. Plain `Option` reads
@@ -58,6 +68,16 @@ pub enum Reported<T> {
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Reported<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Option::<T>::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+impl<T> Reported<T> {
+    /// The value when the key was sent non-null; a missing key and a null both give `None`.
+    pub fn present(&self) -> Option<&T> {
+        match self {
+            Self::Present(Some(value)) => Some(value),
+            Self::Present(None) | Self::Missing => None,
+        }
     }
 }
 

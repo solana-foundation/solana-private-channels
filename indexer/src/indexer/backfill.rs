@@ -8,8 +8,8 @@ use crate::{
         datasource::{
             common::types::{InstructionSender, ProcessorMessage},
             rpc_polling::{
-                decoder, decoder::SlotRejection, refetch_slot_via_fallback, rpc::RpcPoller,
-                rpc::MAX_LOOKAHEAD_SLOTS, types::BlockFetch,
+                decode_fetched_block, decoder::SlotRejection, refetch_slot_via_fallback,
+                rpc::RpcPoller, rpc::MAX_LOOKAHEAD_SLOTS, types::BlockFetch,
             },
         },
     },
@@ -121,6 +121,7 @@ async fn last_produced_at_or_below(
 async fn fetch_blocks_with_retry(
     rpc_poller: &RpcPoller,
     slots: &[u64],
+    prev_block: Option<u64>,
     retry_count: usize,
 ) -> Result<Vec<(u64, BlockFetch)>, IndexerError> {
     if retry_count > 0 {
@@ -135,7 +136,10 @@ async fn fetch_blocks_with_retry(
     // error fires before any slot here has been processed, so a retry cannot
     // double-send instructions for the slots that did resolve.
     let mut fetched = Vec::with_capacity(slots.len());
-    for (slot, result) in rpc_poller.get_blocks_batch(slots.to_vec()).await {
+    for (slot, result) in rpc_poller
+        .get_blocks_batch(slots.to_vec(), prev_block)
+        .await
+    {
         match result {
             Ok(block) => fetched.push((slot, block)),
             Err(source) => return Err(BackfillError::SlotFetchFailed { slot, source }.into()),
@@ -165,6 +169,15 @@ fn rejected_slot_error(slot: u64, rejection: SlotRejection) -> IndexerError {
             reason: failure.source.to_string(),
         }
         .into(),
+        SlotRejection::Malformed { signature, reason } => BackfillError::Malformed {
+            slot,
+            signature,
+            reason,
+        }
+        .into(),
+        SlotRejection::EmptyUnconfirmed { reason } => {
+            BackfillError::EmptyUnconfirmed { slot, reason }.into()
+        }
     }
 }
 
@@ -192,11 +205,13 @@ pub async fn fill_slot_range(
         .set(gap as f64);
 
     let all_batches = calculate_batches(from_slot, to_slot, batch_size);
+    // Last block completed, which the next chunk's first block must name exactly.
+    let mut last_block: Option<u64> = None;
 
     for slots in all_batches {
         let mut retry_count = 0;
         let blocks = loop {
-            match fetch_blocks_with_retry(rpc_poller, &slots, retry_count).await {
+            match fetch_blocks_with_retry(rpc_poller, &slots, last_block, retry_count).await {
                 Ok(blocks) => break blocks,
                 Err(e) => {
                     retry_count += 1;
@@ -225,12 +240,15 @@ pub async fn fill_slot_range(
                     // re-fetch, then abort before the SlotComplete send so the checkpoint
                     // never advances past it. Re-parsing the primary's bytes fails the same
                     // way, so only a fuller endpoint or a code fix clears it.
-                    let instructions_with_meta = match decoder::decode_slot(
+                    let instructions_with_meta = match decode_fetched_block(
+                        rpc_poller,
                         &block,
                         slot,
                         program_type,
                         escrow_instance_id.as_ref(),
-                    ) {
+                    )
+                    .await
+                    {
                         Ok(instructions) => instructions,
                         Err(rejection) => {
                             let recovered = match fallback_poller {
@@ -280,6 +298,7 @@ pub async fn fill_slot_range(
                         .await
                         .map_err(BackfillError::ChannelSend)?;
                     }
+                    last_block = Some(slot);
                     processed_count += 1;
                 }
                 BlockFetch::Skipped => {
@@ -956,7 +975,8 @@ mod tests {
         use crate::indexer::datasource::rpc_polling::rpc::RpcPoller;
         use crate::test_utils::escrow_fixtures::{deposit_event_bytes, deposit_ix_bytes};
         use crate::test_utils::rpc_mocks::{
-            chain, mock_get_block_at, mock_get_blocks, mock_get_blocks_with_limit,
+            chain, mock_get_block_at, mock_get_block_signatures, mock_get_blocks,
+            mock_get_blocks_with_limit,
         };
         use mockito::Server;
         use serde_json::json;
@@ -1009,7 +1029,7 @@ mod tests {
                             "parentSlot": slot - 1,
                             "transactions": [{
                                 "transaction": {
-                                    "signatures": ["sig_missing_meta"],
+                                    "signatures": [crate::test_utils::pubkey::test_sig("sig_missing_meta")],
                                     "message": { "accountKeys": [], "instructions": [] }
                                 },
                                 "meta": null
@@ -1042,7 +1062,7 @@ mod tests {
                             "parentSlot": slot - 1,
                             "transactions": [{
                                 "transaction": {
-                                    "signatures": ["sig_undecodable"],
+                                    "signatures": [crate::test_utils::pubkey::test_sig("sig_undecodable")],
                                     "message": {
                                         "accountKeys": [PRIVATE_CHANNEL_ESCROW_PROGRAM_ID],
                                         "instructions": [{
@@ -1055,7 +1075,7 @@ mod tests {
                                 "meta": {
                                     "err": null,
                                     "logMessages": null,
-                                    "innerInstructions": null,
+                                    "innerInstructions": [],
                                     "loadedAddresses": { "writable": [], "readonly": [] }
                                 }
                             }]
@@ -1091,7 +1111,7 @@ mod tests {
                             "parentSlot": slot - 1,
                             "transactions": [{
                                 "transaction": {
-                                    "signatures": ["sig_decodable"],
+                                    "signatures": [crate::test_utils::pubkey::test_sig("sig_decodable")],
                                     "message": {
                                         "accountKeys": account_keys,
                                         "instructions": [{
@@ -1135,6 +1155,8 @@ mod tests {
             let _blocks = mock_get_blocks(&mut primary, 101, 102, &[101, 102]);
             let _m1 = mock_get_block_undecodable_deposit(&mut primary, 101);
             let _m2 = mock_get_block_at(&mut primary, 102, 101);
+            // Escrow confirms the empty block 102 through its signatures view.
+            let _c2 = mock_get_block_signatures(&mut primary, 102, "TestBlockHash102", vec![]);
             let m_fallback = mock_get_block_decodable_deposit(&mut fallback, 101);
 
             let primary_poller = poller(&primary);
@@ -1178,6 +1200,137 @@ mod tests {
                 .filter(|message| matches!(message, ProcessorMessage::Instruction(_)))
                 .count();
             assert_eq!(indexed, 1, "the fallback block's Deposit must be indexed");
+        }
+
+        /// A malformed transaction aborts the fill before its slot's SlotComplete.
+        #[tokio::test]
+        async fn fill_slot_range_malformed_transaction_aborts_before_slot_complete() {
+            let mut server = Server::new_async().await;
+            let _blocks = mock_get_blocks(&mut server, 101, 101, &[101]);
+            let _bad = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "method": "getBlock",
+                    "params": [101]
+                })))
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "blockhash": "TestBlockHash101",
+                            "parentSlot": 100,
+                            "transactions": [{
+                                "transaction": {
+                                    "signatures": [],
+                                    "message": {
+                                        "accountKeys": [PRIVATE_CHANNEL_ESCROW_PROGRAM_ID],
+                                        "instructions": []
+                                    }
+                                },
+                                "meta": {
+                                    "err": null,
+                                    "innerInstructions": [],
+                                    "loadedAddresses": { "writable": [], "readonly": [] }
+                                }
+                            }]
+                        },
+                        "id": 1
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result = fill_slot_range(
+                &poller(&server),
+                None,
+                100,
+                101,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+            )
+            .await;
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains("malformed"), "unexpected error: {message}");
+            drop(tx);
+            assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                .all(|m| !matches!(m, ProcessorMessage::SlotComplete { .. })));
+        }
+
+        /// An escrow block served empty while its signatures view lists a transaction aborts
+        /// the fill before its SlotComplete, or is recovered from a fallback serving it in full.
+        #[tokio::test]
+        async fn fill_slot_range_unconfirmed_empty_escrow_block() {
+            use crate::test_utils::pubkey::test_sig;
+
+            let mut primary = Server::new_async().await;
+            let _blocks = mock_get_blocks(&mut primary, 101, 101, &[101]);
+            let _full = mock_get_block_at(&mut primary, 101, 100);
+            let _confirm = mock_get_block_signatures(
+                &mut primary,
+                101,
+                "TestBlockHash101",
+                vec![test_sig("dropped")],
+            );
+            let primary_poller = poller(&primary);
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result = fill_slot_range(
+                &primary_poller,
+                None,
+                100,
+                101,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+            )
+            .await;
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("101"),
+                "the error names the slot: {message}"
+            );
+            drop(tx);
+            assert!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .all(|m| !matches!(m, ProcessorMessage::SlotComplete { .. })),
+                "an unproven empty block must not complete"
+            );
+
+            let mut fallback = Server::new_async().await;
+            let m_fallback = crate::test_utils::rpc_mocks::mock_get_block_with_deposit(
+                &mut fallback,
+                101,
+                100,
+                700,
+            );
+            let fallback_poller = poller(&fallback);
+            let (tx, mut rx) = mpsc::channel(64);
+            fill_slot_range(
+                &primary_poller,
+                Some(&fallback_poller),
+                100,
+                101,
+                10,
+                ProgramType::Escrow,
+                None,
+                &tx,
+            )
+            .await
+            .expect("the fallback's full block clears the slot");
+            m_fallback.assert();
+            drop(tx);
+            let messages: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            assert!(messages
+                .iter()
+                .any(|m| matches!(m, ProcessorMessage::Instruction(_))));
+            assert!(messages
+                .iter()
+                .any(|m| matches!(m, ProcessorMessage::SlotComplete { slot: 101, .. })));
         }
 
         /// A batch where slot N holds an instruction the indexer supports but cannot decode
@@ -1285,6 +1438,32 @@ mod tests {
             for msg in &messages {
                 assert!(matches!(msg, ProcessorMessage::SlotComplete { .. }));
             }
+        }
+
+        /// Chunks of one slot put every link across a chunk boundary. Block 101 names parent 55
+        /// after block 100 completed, so the fill must stop before completing 101.
+        #[tokio::test]
+        async fn fill_slot_range_contradicting_block_in_the_next_chunk_aborts() {
+            let mut server = Server::new_async().await;
+            let _c = chain(&mut server, 100, 101, &[(100, 99), (101, 55)]);
+            let _first = mock_get_blocks(&mut server, 100, 100, &[100]);
+            let _second = mock_get_blocks(&mut server, 101, 101, &[101]);
+
+            let poller = poller(&server);
+            let (tx, mut rx) = mpsc::channel(64);
+            let result =
+                fill_slot_range(&poller, None, 99, 101, 1, ProgramType::Withdraw, None, &tx).await;
+
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("101"), "the error must name slot 101: {msg}");
+            drop(tx);
+            let completed: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|m| match m {
+                    ProcessorMessage::SlotComplete { slot, .. } => Some(slot),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(completed, vec![100]);
         }
 
         /// A batch where a later block's parent link proves slot N holds a block the
@@ -1529,7 +1708,9 @@ mod tests {
                         "result": {
                             "blockhash": "TestBlockHash111111111111111111111111111",
                             "parentSlot": slot - 1,
-                            "transactions": []
+                            "transactions": [],
+                            // Also answers the signatures view, so an escrow consumer can confirm it empty.
+                            "signatures": []
                         },
                         "id": 1
                     })

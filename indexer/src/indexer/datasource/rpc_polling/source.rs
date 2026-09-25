@@ -103,7 +103,36 @@ pub(crate) async fn refetch_slot_via_fallback(
         _ => return None,
     };
 
-    decoder::decode_slot(&block, slot, program_type, escrow_instance_id).ok()
+    decode_fetched_block(fallback, &block, slot, program_type, escrow_instance_id)
+        .await
+        .ok()
+}
+
+/// Decodes a fetched block. An escrow block with no transactions is first confirmed through
+/// its signatures view, because an empty list is not proof the slot held nothing.
+/// Withdraw skips this: the channel node builds both views from one list, so it proves nothing.
+pub(crate) async fn decode_fetched_block(
+    poller: &RpcPoller,
+    block: &super::types::RpcBlock,
+    slot: u64,
+    program_type: ProgramType,
+    escrow_instance_id: Option<&solana_sdk::pubkey::Pubkey>,
+) -> Result<Vec<InstructionWithMetadata>, decoder::SlotRejection> {
+    if program_type == ProgramType::Escrow && block.transactions.is_empty() {
+        let confirmed = poller
+            .confirm_empty_block(slot, &block.blockhash)
+            .await
+            .map_err(|e| decoder::SlotRejection::EmptyUnconfirmed {
+                reason: e.to_string(),
+            })?;
+        if !confirmed {
+            return Err(decoder::SlotRejection::EmptyUnconfirmed {
+                reason: "its signatures view lists transactions or names another blockhash"
+                    .to_string(),
+            });
+        }
+    }
+    decoder::decode_slot(block, slot, program_type, escrow_instance_id)
 }
 
 #[async_trait]
@@ -158,6 +187,8 @@ impl DataSource for RpcPollingSource {
                 "Starting RPC polling from slot {} for program {:?}",
                 current_slot, program_type
             );
+            // Last block completed, which the next poll's first block must name exactly.
+            let mut last_block: Option<u64> = None;
 
             loop {
                 // Check for cancellation
@@ -195,7 +226,7 @@ impl DataSource for RpcPollingSource {
                 }
 
                 // Fetch blocks in batch
-                let blocks = poller.get_blocks_batch(slots.clone()).await;
+                let blocks = poller.get_blocks_batch(slots.clone(), last_block).await;
 
                 // Parse and send instructions from each block
                 for (slot, block_result) in blocks {
@@ -206,12 +237,15 @@ impl DataSource for RpcPollingSource {
                             // one fallback re-fetch; if that is unconfigured, unavailable or
                             // also rejected, fail closed like an unavailable block: no
                             // SlotComplete, no advance, re-fetch on the next poll.
-                            let instructions_with_meta = match decoder::decode_slot(
+                            let instructions_with_meta = match decode_fetched_block(
+                                &poller,
                                 &block,
                                 slot,
                                 program_type,
                                 escrow_instance_id.as_ref(),
-                            ) {
+                            )
+                            .await
+                            {
                                 Ok(instructions) => instructions,
                                 Err(rejection) => {
                                     let recovered = match &fallback_poller {
@@ -256,6 +290,7 @@ impl DataSource for RpcPollingSource {
                                 }
                             };
 
+                            last_block = Some(slot);
                             if !instructions_with_meta.is_empty() {
                                 info!(
                                     "Slot {}: found {} {:?} instructions",
@@ -398,7 +433,9 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot - 1,
-                        "transactions": []
+                        "transactions": [],
+                        // Also answers the signatures view, so an escrow consumer can confirm it empty.
+                        "signatures": []
                     },
                     "id": 1
                 })
@@ -424,7 +461,9 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": parent_slot,
-                        "transactions": []
+                        "transactions": [],
+                        // Also answers the signatures view, so an escrow consumer can confirm it empty.
+                        "signatures": []
                     },
                     "id": 1
                 })
@@ -500,7 +539,7 @@ mod tests {
         }
         json!({
             "transaction": {
-                "signatures": ["sig_missing_meta"],
+                "signatures": [crate::test_utils::pubkey::test_sig("sig_missing_meta")],
                 "message": {
                     "accountKeys": account_keys,
                     "instructions": [{
@@ -1001,6 +1040,264 @@ mod tests {
         assert!(
             saw_slot_complete,
             "SlotComplete{{slot:{slot}}} must be emitted after fallback recovery"
+        );
+    }
+
+    /// getBlock returns the withdraw transaction with a signature that is not 64 bytes, a shape
+    /// no validator produces.
+    fn mock_get_block_malformed_withdraw(server: &mut Server, slot: u64) -> mockito::Mock {
+        let meta = json!({
+            "err": null,
+            "logMessages": null,
+            "innerInstructions": null,
+            "loadedAddresses": { "writable": [], "readonly": [] }
+        });
+        let mut transaction = withdraw_block_transaction(meta);
+        transaction["transaction"]["signatures"] = json!([bs58::encode([1u8; 63]).into_string()]);
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": "TestBlockHash11111111111111111111111111111",
+                        "parentSlot": slot - 1,
+                        "transactions": [transaction]
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create()
+    }
+
+    /// A malformed transaction fails the slot like missing meta does: with no fallback the
+    /// slot never completes, and a fallback serving the block intact recovers it.
+    #[tokio::test]
+    async fn malformed_transaction_fails_closed_or_recovers_from_fallback() {
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 101);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        // A second fetch means the first attempt ran to its end and the source retried.
+        let bad = mock_get_block_malformed_withdraw(&mut primary, 100).expect_at_least(2);
+
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Withdraw, |_| bad.matched()).await;
+        assert!(
+            !completed(&messages, 100),
+            "a malformed slot must not complete"
+        );
+
+        let mut fallback = Server::new_async().await;
+        let m_fallback = mock_get_block_complete_withdraw(&mut fallback, 100, 1);
+        let messages = poll_slot_100(&primary, Some(&fallback), ProgramType::Withdraw, |m| {
+            completed(m, 100)
+        })
+        .await;
+        m_fallback.assert();
+        assert!(
+            completed(&messages, 100),
+            "the fallback's intact block completes the slot"
+        );
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m, ProcessorMessage::Instruction(_))));
+    }
+
+    /// Serves an empty full-view block for `slot`, which only the signatures view can confirm.
+    fn mock_empty_full_block(server: &mut Server, slot: u64) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot, { "transactionDetails": "full" }]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": format!("TestBlockHash{slot}"),
+                        "parentSlot": slot - 1,
+                        "transactions": []
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Polls from slot 100 with `program_type` until `done` holds, or 10 s pass, and returns
+    /// every message sent. Waiting on a condition instead of a fixed sleep keeps slow CI green.
+    async fn poll_slot_100(
+        primary: &Server,
+        fallback: Option<&Server>,
+        program_type: ProgramType,
+        done: impl Fn(&[ProcessorMessage]) -> bool,
+    ) -> Vec<ProcessorMessage> {
+        let mut source = RpcPollingSource::new(
+            primary.url(),
+            Some(100),
+            10,
+            10,
+            1,
+            solana_transaction_status::UiTransactionEncoding::Json,
+            solana_commitment_config::CommitmentLevel::Finalized,
+            program_type,
+            None,
+            fallback.map(|server| server.url()),
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let handle = source.start(tx, cancel.clone()).await.unwrap();
+        let mut messages = vec![];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(&messages) && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(message)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+            {
+                messages.push(message);
+            }
+        }
+        cancel.cancel();
+        let _ = handle.await;
+        messages.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        messages
+    }
+
+    fn completed(messages: &[ProcessorMessage], slot: u64) -> bool {
+        messages
+            .iter()
+            .any(|m| matches!(m, ProcessorMessage::SlotComplete { slot: s, .. } if *s == slot))
+    }
+
+    /// An escrow block served with no transactions, while its signatures view lists one,
+    /// was truncated: the slot must not complete, and with no fallback it retries.
+    #[tokio::test]
+    async fn escrow_unconfirmed_empty_block_fails_closed() {
+        use crate::test_utils::{pubkey::test_sig, rpc_mocks::mock_get_block_signatures};
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 101);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _full = mock_empty_full_block(&mut primary, 100);
+        let confirm = mock_get_block_signatures(
+            &mut primary,
+            100,
+            "TestBlockHash100",
+            vec![test_sig("dropped")],
+        )
+        .expect_at_least(2);
+
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Escrow, |_| confirm.matched()).await;
+
+        confirm.assert();
+        assert!(
+            !completed(&messages, 100),
+            "an unproven empty block must not complete"
+        );
+    }
+
+    /// The same truncated escrow block is recovered from a fallback that serves it in full.
+    #[tokio::test]
+    async fn escrow_unconfirmed_empty_block_recovers_from_fallback() {
+        use crate::test_utils::{
+            pubkey::test_sig,
+            rpc_mocks::{mock_get_block_signatures, mock_get_block_with_deposit},
+        };
+        let mut primary = Server::new_async().await;
+        let mut fallback = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 101);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _full = mock_empty_full_block(&mut primary, 100);
+        let _confirm = mock_get_block_signatures(
+            &mut primary,
+            100,
+            "TestBlockHash100",
+            vec![test_sig("dropped")],
+        );
+        let m_fallback = mock_get_block_with_deposit(&mut fallback, 100, 99, 500);
+
+        let messages = poll_slot_100(&primary, Some(&fallback), ProgramType::Escrow, |m| {
+            completed(m, 100)
+        })
+        .await;
+
+        m_fallback.assert();
+        assert!(
+            completed(&messages, 100),
+            "the fallback's full block completes the slot"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, ProcessorMessage::Instruction(_))),
+            "the deposit the primary dropped is indexed"
+        );
+    }
+
+    /// A real empty escrow block confirms through its signatures view and completes.
+    #[tokio::test]
+    async fn escrow_confirmed_empty_block_completes() {
+        use crate::test_utils::rpc_mocks::mock_get_block_signatures;
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 101);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _full = mock_empty_full_block(&mut primary, 100);
+        let confirm = mock_get_block_signatures(&mut primary, 100, "TestBlockHash100", vec![])
+            .expect_at_least(1);
+
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Escrow, |m| completed(m, 100)).await;
+
+        confirm.assert();
+        assert!(completed(&messages, 100));
+    }
+
+    /// The channel node builds both views from one list, so withdraw never pays for a confirm.
+    #[tokio::test]
+    async fn withdraw_empty_block_is_not_confirmed() {
+        use crate::test_utils::rpc_mocks::mock_get_block_signatures;
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 101);
+        let _enum = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _full = mock_empty_full_block(&mut primary, 100);
+        let confirm =
+            mock_get_block_signatures(&mut primary, 100, "TestBlockHash100", vec![]).expect(0);
+
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Withdraw, |m| completed(m, 100)).await;
+
+        confirm.assert();
+        assert!(completed(&messages, 100));
+    }
+
+    /// One slot per poll puts every link across a batch boundary. Block 101 names parent 55
+    /// after block 100 completed, so it contradicts the chain and must never complete.
+    #[tokio::test]
+    async fn a_contradicting_block_in_the_next_poll_never_completes() {
+        use crate::test_utils::rpc_mocks::mock_get_block_at;
+        let mut primary = Server::new_async().await;
+        let _slot = mock_get_slot(&mut primary, 102);
+        let _first = mock_get_blocks(&mut primary, 100, 100, &[100]);
+        let _second = mock_get_blocks(&mut primary, 101, 101, &[101]);
+        let _b100 = mock_get_block_at(&mut primary, 100, 99);
+        let b101 = mock_get_block_at(&mut primary, 101, 55).expect_at_least(2);
+
+        let messages =
+            poll_slot_100(&primary, None, ProgramType::Withdraw, |_| b101.matched()).await;
+
+        assert!(completed(&messages, 100), "block 100 links to the anchor");
+        assert!(
+            !completed(&messages, 101),
+            "block 101 contradicts the block completed before it"
         );
     }
 
