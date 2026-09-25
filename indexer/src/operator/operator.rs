@@ -735,8 +735,8 @@ async fn stop_without_draining(cancellation_token: &CancellationToken, workers: 
 
 /// Stop the storage writer when boot refuses to start.
 ///
-/// It normally drains so queued ManualReview updates land. After a lost live-state lock a
-/// resync may own these rows, so it is aborted and awaited instead, like the running path.
+/// It normally drains so queued ManualReview updates land. If the live-state lock is lost
+/// before or during the drain, a resync may own these rows, so it is aborted and awaited instead.
 async fn stop_boot_writer(
     lock_lost: &CancellationToken,
     cancellation_token: &CancellationToken,
@@ -745,16 +745,22 @@ async fn stop_boot_writer(
 ) {
     // The writer exits only when its channel closes, and this is the only sender so far.
     drop(storage_tx);
-    if lock_lost.is_cancelled() {
-        stop_without_draining(cancellation_token, &[writer.abort_handle()]).await;
-        return;
-    }
     cancellation_token.cancel();
-    if let Err(join_err) = writer.await {
-        error!(
-            "Storage writer join error during refuse-to-start: {}",
-            join_err
-        );
+    let abort = writer.abort_handle();
+    // Biased, so a lock that is already lost never starts the drain.
+    tokio::select! {
+        biased;
+        _ = lock_lost.cancelled() => {
+            stop_without_draining(cancellation_token, &[abort]).await;
+        }
+        joined = writer => {
+            if let Err(join_err) = joined {
+                error!(
+                    "Storage writer join error during refuse-to-start: {}",
+                    join_err
+                );
+            }
+        }
     }
 }
 
@@ -874,6 +880,48 @@ mod tests {
             "a queued update must not land after the lock is lost"
         );
         assert!(writer.is_finished());
+        assert!(cancellation_token.is_cancelled());
+    }
+
+    /// A drain that is still waiting when the lock goes must stop, not keep writing.
+    #[tokio::test]
+    async fn refused_boot_stops_draining_when_the_lock_is_lost_midway() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let guard = SetOnDrop(stopped.clone());
+        // A writer stuck mid-drain, standing in for a slow write or webhook call.
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let cancellation_token = CancellationToken::new();
+        let lock_lost = CancellationToken::new();
+        let canceller = lock_lost.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            canceller.cancel();
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stop_boot_writer(&lock_lost, &cancellation_token, storage_tx, handle),
+        )
+        .await
+        .expect("the drain must stop once the lock is lost");
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the writer must be aborted and stopped"
+        );
         assert!(cancellation_token.is_cancelled());
     }
 
