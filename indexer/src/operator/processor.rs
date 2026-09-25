@@ -146,11 +146,12 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         OperatorError::Program(_) => ErrorDisposition::Quarantine("program_error"),
         // MissingBuilder means the processor was constructed without the state it
         // needs — configuration bug, not a row problem.  Exit to surface it.
-        // The sender-lock errors are startup errors and never reach the processor,
-        // but they're Fatal in spirit, so classify them alongside.
+        // Sender-lock and config errors are startup errors and never reach the
+        // processor, but they're Fatal in spirit, so classify them alongside.
         OperatorError::MissingBuilder
         | OperatorError::SenderAlreadyRunning { .. }
-        | OperatorError::SenderLockLostAtBoot { .. } => ErrorDisposition::Fatal,
+        | OperatorError::SenderLockLostAtBoot { .. }
+        | OperatorError::InvalidConfig(_) => ErrorDisposition::Fatal,
         // A dead downstream channel means the sender or storage writer died; the
         // supervisor handles this by aborting the whole operator.
         OperatorError::ChannelSend(_)
@@ -395,7 +396,7 @@ pub async fn run_processor(
     sender_tx: mpsc::Sender<TransactionBuilder>,
     storage_tx: mpsc::Sender<TransactionStatusUpdate>,
     program_type: ProgramType,
-    instance_pda: Option<Pubkey>,
+    instance_pda: Pubkey,
     storage: Arc<Storage>,
     rpc_client: Arc<crate::operator::RpcClientWithRetry>,
     fallback_rpc_client: Option<Arc<crate::operator::RpcClientWithRetry>>,
@@ -405,13 +406,6 @@ pub async fn run_processor(
 
     match program_type {
         ProgramType::Withdraw => {
-            // A withdrawal operator without an instance_pda is misconfigured.
-            let Some(instance_pda) = instance_pda else {
-                error!(
-                    "Withdraw operator missing escrow_instance_id, cannot build ReleaseFunds instructions; processor exiting"
-                );
-                return;
-            };
             let mut processor_state = ProcessorState::new_with_release_funds_state(
                 instance_pda,
                 storage.clone(),

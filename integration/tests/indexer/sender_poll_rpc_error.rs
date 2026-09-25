@@ -327,7 +327,7 @@ async fn confirmed_with_onchain_error_routes_via_handle_confirmation_result() {
         .in_flight
         .push(make_in_flight_tx(sig, 306, RetryPolicy::None, 0, 0));
 
-    // Finalized + err set (custom code 99, unrecognised by parse_program_error).
+    // Finalized + err set (custom code 99, not an escrow error code).
     mock.enqueue(
         "getSignatureStatuses",
         Reply::result(json!({

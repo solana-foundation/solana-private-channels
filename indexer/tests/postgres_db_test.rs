@@ -156,6 +156,25 @@ async fn init_schema_concurrent() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A reboot must leave the nonce trigger in place. Dropping and recreating it opens a
+/// window where live workers insert withdrawals with no nonce.
+#[tokio::test(flavor = "multi_thread")]
+async fn init_schema_keeps_the_nonce_trigger() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let trigger_oid_sql = "SELECT oid::bigint FROM pg_trigger \
+        WHERE tgname = 'trigger_assign_withdrawal_nonce' AND tgrelid = 'transactions'::regclass";
+
+    let (before,): (i64,) = sqlx::query_as(trigger_oid_sql).fetch_one(&pool).await?;
+    storage.init_schema().await?;
+    let (after,): (i64,) = sqlx::query_as(trigger_oid_sql).fetch_one(&pool).await?;
+
+    assert_eq!(
+        before, after,
+        "init_schema must not recreate the nonce trigger"
+    );
+    Ok(())
+}
+
 /// A session stuck holding the init lock must fail boot, not hang it.
 #[tokio::test(flavor = "multi_thread")]
 async fn init_schema_fails_when_lock_is_held() -> Result<(), Box<dyn std::error::Error>> {

@@ -412,12 +412,15 @@ async fn second_operator_is_refused_before_its_boot_preflight() {
 async fn failed_startup_releases_the_sender_lock() {
     let (url, _container) = start_postgres().await;
 
-    // No source_rpc_url is a withdraw refuse-to-start.
-    let (common, operator_config) = withdraw_operator_configs(&url, "http://127.0.0.1:1", None);
+    // A fallback equal to rpc_url is a withdraw refuse-to-start checked after the lock.
+    let rpc_url = "http://127.0.0.1:1";
+    let (mut common, operator_config) =
+        withdraw_operator_configs(&url, rpc_url, Some(rpc_url.to_string()));
+    common.fallback_rpc_url = Some(rpc_url.to_string());
     let result = operator::run(connect(&url).await, common, operator_config, None).await;
     assert!(
         matches!(result, Err(OperatorError::RpcError(_))),
-        "startup must fail on the missing source_rpc_url; got {result:?}"
+        "startup must fail on the fallback matching rpc_url; got {result:?}"
     );
 
     assert!(

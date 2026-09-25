@@ -9,7 +9,6 @@ use crate::operator::utils::instruction_util::{
     mint_extra_error_checks_policy, TransactionBuilder, TransactionKind, WithdrawalRemintInfo,
 };
 use crate::operator::utils::storage_util::with_storage_backoff;
-use crate::operator::utils::transaction_util::parse_program_error;
 use crate::operator::utils::transaction_util::{
     build_and_sign, check_transaction_status, send_signed, ConfirmationResult,
     MAX_POLL_ATTEMPTS_CONFIRMATION,
@@ -681,6 +680,7 @@ pub(super) async fn send_and_confirm(
             let result = check_transaction_status(
                 state.rpc_client.clone(),
                 &signature,
+                ctx.kind,
                 commitment_config,
                 extra_error_checks_policy,
                 state.confirmation_poll_interval_ms,
@@ -2068,8 +2068,9 @@ pub(super) async fn route_poll_results(
                             }
                         }
                     }
-                    extra_result
-                        .unwrap_or_else(|| Ok(ConfirmationResult::Failed(parse_program_error(err))))
+                    // Only mints are polled here, and no mint can raise an escrow
+                    // error, so a custom code is never decoded as one.
+                    extra_result.unwrap_or(Ok(ConfirmationResult::Failed(None)))
                 } else {
                     Ok(ConfirmationResult::Confirmed)
                 };
@@ -4473,6 +4474,58 @@ mod tests {
             mock.get_release_signatures(txn_id).await.unwrap().len(),
             1,
             "the JIT retry must take the slot the finalized entry gave back and broadcast"
+        );
+    }
+
+    /// A mint cannot raise an escrow error, so a token program's code 12 on one is an
+    /// ordinary failure, not a NonceAlreadyUsed for the nonce handler.
+    #[tokio::test]
+    async fn mint_custom_error_is_not_decoded_as_escrow() {
+        let mut state = make_sender_state();
+        let txn_id = 42;
+        let permit = state.semaphore.clone().try_acquire_owned().unwrap();
+        let tx = InFlightTx {
+            signature: Signature::new_unique(),
+            ctx: TransactionContext {
+                kind: TransactionKind::Mint,
+                transaction_id: Some(txn_id),
+                withdrawal_nonce: None,
+                trace_id: None,
+                deposit_claim_lease: None,
+            },
+            instruction: dummy_instruction(),
+            compute_unit_price: None,
+            retry_policy: RetryPolicy::None,
+            extra_error_checks_policy: ExtraErrorCheckPolicy::None,
+            poll_attempts: 0,
+            resend_count: 0,
+            persisted: false,
+            permit,
+        };
+        let err = solana_sdk::transaction::TransactionError::InstructionError(
+            0,
+            solana_sdk::instruction::InstructionError::Custom(12),
+        );
+        let status = solana_transaction_status::TransactionStatus {
+            slot: 100,
+            confirmations: None,
+            status: Err(err.clone()),
+            err: Some(err),
+            confirmation_status: Some(
+                solana_transaction_status::TransactionConfirmationStatus::Finalized,
+            ),
+        };
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        route_poll_results(&mut state, vec![(tx, Some(status))], &storage_tx).await;
+
+        let update = storage_rx.try_recv().expect("the failure must be reported");
+        assert_eq!(update.transaction_id, txn_id);
+        assert_eq!(
+            update.status,
+            TransactionStatus::Failed,
+            "a mint failure is not a spent nonce: {:?}",
+            update.error_message
         );
     }
 

@@ -600,18 +600,19 @@ mod tests {
     use crate::config::DEFAULT_CONFIRMATION_POLL_INTERVAL_MS;
     use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::sender::test_support::{
-        mock_with_parked_row, mock_with_processing_row, row_status, row_updated_at,
-        sender_state as make_sender_state, sender_state_with_storage,
+        mock_rejection_logs, mock_with_parked_row, mock_with_processing_row, row_status,
+        row_updated_at, sender_state as make_sender_state, sender_state_with_storage,
     };
     use crate::operator::sender::types::{
         InFlightTx, InstructionWithSigners, TransactionContext, MAX_IN_FLIGHT,
     };
     use crate::operator::utils::instruction_util::{
-        ExtraErrorCheckPolicy, RetryPolicy, TransactionKind,
+        ExtraErrorCheckPolicy, RetryPolicy, SourceEventId, TransactionKind, WithdrawalRemintInfo,
     };
     use crate::storage::common::models::TransactionStatus;
     use crate::storage::common::storage::mock::MockStorage;
     use crate::PrivateChannelIndexerConfig;
+    use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
     use solana_commitment_config::CommitmentLevel;
     use solana_keychain::Signer;
     use solana_sdk::pubkey::Pubkey;
@@ -732,12 +733,15 @@ mod tests {
 
     // ── drain_rotation_retry_queue ────────────────────────────────────
 
-    /// Script a node that accepts the broadcast, refuses it with the generation
-    /// error, and reports a bitmap still one generation behind the nonce.
+    /// Script a node that accepts the broadcast, refuses it with code 13 raised by
+    /// `origin`, and reports a bitmap still one generation behind the nonce.
     ///
-    /// That is exactly the state a queued withdrawal is retried into before its
-    /// rotation lands, which is the case the drain has to survive.
-    async fn mock_generation_refusal(server: &mut mockito::ServerGuard) -> mockito::Mock {
+    /// With the escrow as origin, that is exactly the state a queued withdrawal is
+    /// retried into before its rotation lands, which is the case the drain has to survive.
+    async fn mock_generation_refusal(
+        server: &mut mockito::ServerGuard,
+        origin: Pubkey,
+    ) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::Regex(
@@ -788,6 +792,7 @@ mod tests {
             .await;
 
         crate::operator::sender::test_support::mock_bitmap_account(server, 0, &[]);
+        mock_rejection_logs(server, origin, 13);
 
         server
             .mock("POST", "/")
@@ -880,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn rotation_retry_drain_gives_each_entry_one_attempt_per_tick() {
         let mut server = mockito::Server::new_async().await;
-        let send = mock_generation_refusal(&mut server).await;
+        let send = mock_generation_refusal(&mut server, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).await;
 
         // Inside the window the bitmap reports, so the send happens and its refusal is what the entry survives.
         let nonce = 5;
@@ -906,6 +911,62 @@ mod tests {
             storage_rx.try_recv().is_err(),
             "a queued withdrawal has no terminal outcome yet"
         );
+    }
+
+    /// A transfer hook's 13 is not the escrow's generation refusal. Parking it for a
+    /// rotation would resend a release the hook rejects forever, at no cost to its budget;
+    /// the burn is compensated instead, through the proof-gated remint.
+    #[tokio::test]
+    async fn rotation_retry_drain_remints_a_release_a_hook_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let send = mock_generation_refusal(&mut server, Pubkey::new_unique()).await;
+
+        let nonce = 5;
+        let mock = mock_with_parked_row(QUEUED_ROW);
+        let mut state = sender_state_with_storage(&server.url(), mock.clone());
+        state.instance_pda = Some(Pubkey::new_unique());
+        state.remint_cache.insert(
+            nonce,
+            WithdrawalRemintInfo {
+                transaction_id: QUEUED_ROW,
+                source_event_id: SourceEventId::new("burn-70", 0, None),
+                trace_id: "trace-70".to_string(),
+                mint: Pubkey::new_unique(),
+                user: Pubkey::new_unique(),
+                user_ata: Pubkey::new_unique(),
+                token_program: spl_token::id(),
+                amount: 1_000,
+            },
+        );
+        state.rotation_retry_queue.push(queued_release(nonce));
+
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+        drain_rotation_retry_queue(&mut state, &storage_tx).await;
+
+        send.assert_async().await;
+        assert!(
+            state.rotation_retry_queue.is_empty(),
+            "a release a hook refused must not wait for a rotation"
+        );
+        assert_ne!(
+            row_status(&mock, QUEUED_ROW),
+            Some(TransactionStatus::Parked),
+            "a release a hook refused must not be parked again"
+        );
+        assert_eq!(
+            state.pending_remints.len(),
+            1,
+            "the burn must be queued for compensation"
+        );
+        assert_eq!(state.pending_remints[0].ctx.withdrawal_nonce, Some(nonce));
+        while let Ok(update) = storage_rx.try_recv() {
+            assert_ne!(
+                update.status,
+                TransactionStatus::ManualReview,
+                "a hook refusal must not strand the burn in manual review: {:?}",
+                update.error_message
+            );
+        }
     }
 
     /// A lost rotation releases the drain's only hold, and each tick then pays a fee per entry for a certain refusal.
@@ -1003,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn rotation_retry_drain_unparks_before_it_sends() {
         let mut server = mockito::Server::new_async().await;
-        let send = mock_generation_refusal(&mut server).await;
+        let send = mock_generation_refusal(&mut server, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID).await;
 
         // Inside the window, so the drain reaches the broadcast under test.
         let nonce = 5;

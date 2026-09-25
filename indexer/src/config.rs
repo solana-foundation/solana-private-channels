@@ -167,7 +167,8 @@ pub struct PrivateChannelIndexerConfig {
     pub source_rpc_url: Option<String>,
     /// Postgres configuration
     pub postgres: PostgresConfig,
-    /// Instance ID to filter (required for Escrow program)
+    /// Escrow instance. Required for the escrow indexer and every operator; the withdraw
+    /// indexer must omit it.
     pub escrow_instance_id: Option<Pubkey>,
 }
 
@@ -177,6 +178,8 @@ fn normalized(v: &Option<String>) -> Option<&str> {
 }
 
 impl PrivateChannelIndexerConfig {
+    /// Indexer rules only. The operator needs `escrow_instance_id` for both program types
+    /// and enforces that in `operator::run`, so it never calls this.
     pub fn validate(&self) -> Result<(), String> {
         match (self.program_type, &self.escrow_instance_id) {
             (ProgramType::Escrow, None) => {

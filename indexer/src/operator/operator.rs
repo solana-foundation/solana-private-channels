@@ -37,6 +37,41 @@ pub async fn run(
     );
     info!("Retry max attempts: {}", config.retry_max_attempts);
 
+    // Config checks first: a misconfigured operator must not take the lock or migrate
+    // the schema before refusing.
+
+    // The withdraw operator's compensating remint MintTo must broadcast on the source
+    // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
+    // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
+    // to the wrong chain and never restoring the burned balance. Fail closed at startup.
+    if common_config.program_type == crate::config::ProgramType::Withdraw
+        && common_config.source_rpc_url.is_none()
+    {
+        return Err(OperatorError::InvalidConfig(
+            "source_rpc_url required for Withdraw operator: remints must target the source \
+             PrivateChannel, not the Solana destination"
+                .to_string(),
+        ));
+    }
+
+    // Both roles are bound to one instance: withdraw derives the bitmap and ReleaseFunds
+    // accounts from it, escrow reconciles its custody. Refuse before the fetcher can claim
+    // a row the pipeline could never finish.
+    let Some(escrow_instance) = common_config.escrow_instance_id else {
+        return Err(OperatorError::InvalidConfig(
+            "escrow_instance_id required for every operator: withdraw releases and escrow \
+             reconciliation are bound to the instance"
+                .to_string(),
+        ));
+    };
+
+    // Empty means unset (env renders "") and maps to None.
+    let normalized_fallback_url = common_config
+        .fallback_rpc_url
+        .as_deref()
+        .filter(|s| !s.is_empty());
+    reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
+
     let cancellation_token = CancellationToken::new();
 
     // Take the live-state lock before touching the schema or any row. A resync
@@ -91,11 +126,7 @@ pub async fn run(
     ));
 
     // Optional destination fallback for recovery and the boot pre-flight to
-    // re-check a Dead verdict. Empty means unset (env renders "") and maps to None.
-    let normalized_fallback_url = common_config
-        .fallback_rpc_url
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    // re-check a Dead verdict.
     let fallback_rpc_client = normalized_fallback_url.map(|url| {
         Arc::new(RpcClientWithRetry::with_retry_config(
             url.to_string(),
@@ -105,22 +136,6 @@ pub async fn run(
             },
         ))
     });
-
-    // The withdraw operator's compensating remint MintTo must broadcast on the source
-    // chain (PrivateChannel), where the burn happened. Without source_rpc_url the sender
-    // falls back to rpc_client (the Solana ReleaseFunds destination), silently reminting
-    // to the wrong chain and never restoring the burned balance. Fail closed at startup.
-    if common_config.program_type == crate::config::ProgramType::Withdraw
-        && common_config.source_rpc_url.is_none()
-    {
-        return Err(OperatorError::RpcError(
-            "source_rpc_url required for Withdraw operator: remints must target the source \
-             PrivateChannel, not the Solana destination"
-                .to_string(),
-        ));
-    }
-
-    reject_escrow_fallback(common_config.program_type, normalized_fallback_url)?;
 
     // A lone prunable Solana RPC's absent status is not proof of non-inclusion, so require
     // an independent, same-cluster, reachable fallback before starting.
@@ -173,48 +188,44 @@ pub async fn run(
     // refuse-to-start. The opposite direction, a release the chain made that the
     // database never recorded, is repaired in place and startup continues.
     if program_type == crate::config::ProgramType::Withdraw {
-        if let Some(preflight_instance) = instance_pda {
-            // The main rpc_client is the chain where the instance and releases live.
-            let preflight = run_withdraw_preflight(
-                &storage,
-                &rpc_client,
-                fallback_rpc_client.as_deref(),
-                preflight_instance,
-                &storage_tx,
-                &cancellation_token,
-            )
-            .await
-            // Only a lost sender lock cancels the token this early. Its fenced writes
-            // already failed, but another operator may now own the rows, so stop.
-            .and_then(|()| {
-                if cancellation_token.is_cancelled() {
-                    Err(OperatorError::SenderLockLostAtBoot { program_type })
-                } else {
-                    Ok(())
-                }
-            });
-
-            if let Err(e) = preflight {
-                error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
-                // Drop the sole storage_tx so the writer's recv() returns None and
-                // the task exits, then await it so the reconcile's queued
-                // ManualReview alerts are flushed before we return. The writer
-                // watches only its channel, not the cancellation token, so without
-                // this drop the await would block forever. No storage_tx clones
-                // exist yet: the processor/sender/recovery senders are created
-                // after this block.
-                cancellation_token.cancel();
-                drop(storage_tx);
-                if let Err(join_err) = storage_writer_handle.await {
-                    error!(
-                        "Storage writer join error during refuse-to-start: {}",
-                        join_err
-                    );
-                }
-                return Err(e);
+        // The main rpc_client is the chain where the instance and releases live.
+        let preflight = run_withdraw_preflight(
+            &storage,
+            &rpc_client,
+            fallback_rpc_client.as_deref(),
+            escrow_instance,
+            &storage_tx,
+            &cancellation_token,
+        )
+        .await
+        // Only a lost sender lock cancels the token this early. Its fenced writes
+        // already failed, but another operator may now own the rows, so stop.
+        .and_then(|()| {
+            if cancellation_token.is_cancelled() {
+                Err(OperatorError::SenderLockLostAtBoot { program_type })
+            } else {
+                Ok(())
             }
-        } else {
-            warn!("Withdraw operator has no escrow_instance_id; skipping boot pre-flight");
+        });
+
+        if let Err(e) = preflight {
+            error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
+            // Drop the sole storage_tx so the writer's recv() returns None and
+            // the task exits, then await it so the reconcile's queued
+            // ManualReview alerts are flushed before we return. The writer
+            // watches only its channel, not the cancellation token, so without
+            // this drop the await would block forever. No storage_tx clones
+            // exist yet: the processor/sender/recovery senders are created
+            // after this block.
+            cancellation_token.cancel();
+            drop(storage_tx);
+            if let Err(join_err) = storage_writer_handle.await {
+                error!(
+                    "Storage writer join error during refuse-to-start: {}",
+                    join_err
+                );
+            }
+            return Err(e);
         }
     }
 
@@ -254,7 +265,7 @@ pub async fn run(
             sender_tx,
             processor_storage_tx,
             program_type,
-            instance_pda,
+            escrow_instance,
             processor_storage,
             processor_rpc,
             processor_fallback_rpc,
@@ -293,9 +304,8 @@ pub async fn run(
     // Withdraw operators don't maintain escrow ATA balances, so reconciliation is skipped.
     let reconciliation_handle = if common_config.program_type == crate::config::ProgramType::Escrow
     {
-        // Both are guaranteed present for a validated escrow config: source_rpc_url
-        // is enforced above and escrow_instance_id by config validation. Fail loud
-        // rather than silently skip if that ever regresses.
+        // escrow_instance_id is enforced above; source_rpc_url is only checked at startup
+        // for withdraw. Fail loud rather than silently skip reconciliation.
         match (common_config.escrow_instance_id, source_rpc_client.clone()) {
             (Some(reconciliation_escrow), Some(reconciliation_rpc)) => {
                 let reconciliation_storage = storage.clone();
@@ -638,7 +648,7 @@ fn reject_escrow_fallback(
     fallback_url: Option<&str>,
 ) -> Result<(), OperatorError> {
     if program_type == crate::config::ProgramType::Escrow && fallback_url.is_some() {
-        return Err(OperatorError::RpcError(
+        return Err(OperatorError::InvalidConfig(
             "fallback_rpc_url is not supported for the escrow operator: its finality checks \
              must come from the channel rpc_url alone"
                 .to_string(),
@@ -761,6 +771,7 @@ mod tests {
         }
     }
 
+    use crate::config::{PostgresConfig, ProgramType, StorageType};
     use crate::operator::utils::account_util::bitmap_account_bytes;
     use crate::operator::utils::rpc_util::RetryConfig;
     use crate::storage::common::amount::TokenAmount;
@@ -1266,7 +1277,7 @@ mod tests {
             crate::config::ProgramType::Escrow,
             Some("https://archival.example"),
         );
-        assert!(matches!(result, Err(OperatorError::RpcError(_))));
+        assert!(matches!(result, Err(OperatorError::InvalidConfig(_))));
     }
 
     /// The escrow refusal must not catch the withdraw operator, whose fallback is supported.
@@ -1279,6 +1290,100 @@ mod tests {
         assert!(
             result.is_ok(),
             "withdraw fallback must pass the escrow gate: {result:?}"
+        );
+    }
+
+    /// Without the escrow instance no ReleaseFunds can be built, so the withdraw operator
+    /// must refuse before it takes the lock, migrates the schema or claims a burned row.
+    #[tokio::test]
+    async fn withdraw_operator_without_instance_refuses_before_claiming() {
+        let mock = MockStorage::new();
+        let now = chrono::Utc::now();
+        mock.pending_transactions
+            .lock()
+            .unwrap()
+            .push(DbTransaction {
+                id: 1,
+                signature: "burn-sig".to_string(),
+                trace_id: "trace-1".to_string(),
+                slot: 100,
+                initiator: Pubkey::new_unique().to_string(),
+                recipient: Pubkey::new_unique().to_string(),
+                mint: Pubkey::new_unique().to_string(),
+                amount: TokenAmount(1_000),
+                memo: None,
+                transaction_type: TransactionType::Withdrawal,
+                withdrawal_nonce: Some(7),
+                status: TransactionStatus::Pending,
+                created_at: now,
+                updated_at: now,
+                processed_at: None,
+                counterpart_signature: None,
+                remint_signatures: None,
+                remint_last_valid_block_heights: None,
+                pending_remint_deadline_at: None,
+                finality_check_attempts: 0,
+                recovery_requeue_attempts: 0,
+                instruction_index: 0,
+                inner_index: None,
+                landed_remint_signature: None,
+                release_refused_on_chain: false,
+            });
+        let common_config = PrivateChannelIndexerConfig {
+            program_type: ProgramType::Withdraw,
+            storage_type: StorageType::Postgres,
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            fallback_rpc_url: None,
+            source_rpc_url: Some("http://127.0.0.1:1".to_string()),
+            postgres: PostgresConfig {
+                database_url: String::new(),
+                max_connections: 1,
+            },
+            escrow_instance_id: None,
+        };
+        let config = OperatorConfig {
+            db_poll_interval: Duration::from_millis(50),
+            batch_size: 10,
+            retry_max_attempts: 3,
+            retry_base_delay: Duration::from_millis(100),
+            channel_buffer_size: 100,
+            rpc_commitment: solana_commitment_config::CommitmentLevel::Confirmed,
+            alert_webhook_url: None,
+            reconciliation_interval: Duration::from_secs(300),
+            reconciliation_tolerance_bps: 10,
+            reconciliation_webhook_url: None,
+            feepayer_monitor_interval: Duration::from_secs(60),
+            confirmation_poll_interval_ms: 400,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run(
+                Arc::new(Storage::Mock(mock.clone())),
+                common_config,
+                config,
+                None,
+            ),
+        )
+        .await
+        .expect("a withdraw operator without an instance must refuse, not start");
+
+        assert!(
+            matches!(&result, Err(OperatorError::InvalidConfig(msg)) if msg.contains("escrow_instance_id")),
+            "missing instance must refuse to start: {result:?}"
+        );
+        assert!(
+            !mock
+                .call_order
+                .lock()
+                .unwrap()
+                .contains(&"init_schema".to_string()),
+            "config must be checked before the schema is touched"
+        );
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Pending,
+            "no row may be claimed before the refusal"
         );
     }
 }

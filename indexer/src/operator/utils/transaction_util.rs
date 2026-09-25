@@ -1,15 +1,21 @@
 use std::sync::Arc;
 
+use crate::config::ProgramType;
 use crate::error::TransactionError;
-use crate::operator::utils::instruction_util::RetryPolicy;
+use crate::metrics::OPERATOR_TRANSACTION_ERRORS;
+use crate::operator::utils::instruction_util::{RetryPolicy, TransactionKind};
 use crate::operator::ExtraErrorCheckPolicy;
 use crate::operator::{sender::types::InstructionWithSigners, RpcClientWithRetry};
 use private_channel_escrow_program_client::errors::PrivateChannelEscrowProgramError;
+use private_channel_escrow_program_client::programs::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+use private_channel_metrics::MetricLabel;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_keychain::SolanaSigner;
 use solana_sdk::instruction::InstructionError;
-use solana_sdk::{message::Message, signature::Signature, transaction::Transaction};
+use solana_sdk::{
+    message::Message, pubkey::Pubkey, signature::Signature, transaction::Transaction,
+};
 use tracing::{debug, warn};
 
 pub const MAX_POLL_ATTEMPTS_CONFIRMATION: u32 = 5;
@@ -120,6 +126,7 @@ pub async fn send_signed(
 pub async fn check_transaction_status(
     rpc_client: Arc<RpcClientWithRetry>,
     signature: &Signature,
+    kind: TransactionKind,
     commitment_config: CommitmentConfig,
     extra_error_checks_policy: &ExtraErrorCheckPolicy,
     poll_interval_ms: u64,
@@ -150,7 +157,7 @@ pub async fn check_transaction_status(
                         }
                     }
 
-                    return Ok(ConfirmationResult::Failed(parse_program_error(tx_err)));
+                    return Ok(classify_failure(&rpc_client, signature, tx_err, kind).await);
                 }
 
                 debug!("Transaction confirmed: {}", signature);
@@ -214,28 +221,97 @@ pub fn is_mint_already_initialized_error(
     None
 }
 
-/// Parse program error code from transaction error
+/// Route a failed transaction by what its custom code can prove, given the kind that sent it.
 ///
-/// Extracts PrivateChannelEscrowProgramError from Solana transaction errors.
-/// Returns None if error is not a custom program error.
-pub fn parse_program_error(
+/// A code names an escrow error only if the escrow raised it. RotateBitmap's only CPI is
+/// the escrow's own event, so its code is trusted. ReleaseFunds calls Token-2022 and any
+/// transfer hook, which fail under the same top-level instruction with their own
+/// numbering, so the runtime log decides: another program's error is a generic failure,
+/// and an unreadable log is retried, since the failed release moved nothing. A channel
+/// transaction cannot raise an escrow error at all.
+pub async fn classify_failure(
+    rpc_client: &RpcClientWithRetry,
+    signature: &Signature,
     err: &solana_sdk::transaction::TransactionError,
-) -> Option<PrivateChannelEscrowProgramError> {
-    match err {
-        solana_sdk::transaction::TransactionError::InstructionError(
-            _,
-            InstructionError::Custom(code),
-        ) => {
-            match *code {
-                11 => Some(PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap),
-                12 => Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
-                13 => Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
-                14 => Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
-                _ => None, // Ignore other program errors
-            }
+    kind: TransactionKind,
+) -> ConfirmationResult {
+    let solana_sdk::transaction::TransactionError::InstructionError(
+        _,
+        InstructionError::Custom(code),
+    ) = err
+    else {
+        return ConfirmationResult::Failed(None);
+    };
+    let Some(escrow_error) = escrow_error_for_code(*code) else {
+        return ConfirmationResult::Failed(None);
+    };
+    match kind {
+        TransactionKind::Mint | TransactionKind::InitializeMint => {
+            return ConfirmationResult::Failed(None)
         }
+        TransactionKind::RotateBitmap => return ConfirmationResult::Failed(Some(escrow_error)),
+        TransactionKind::ReleaseFunds => {}
+    }
+
+    let logs = match rpc_client.get_transaction(signature).await {
+        Ok(transaction) => transaction
+            .transaction
+            .meta
+            .and_then(|meta| Option::<Vec<String>>::from(meta.log_messages)),
+        Err(e) => {
+            warn!("Could not read logs for failed transaction {signature}: {e}");
+            None
+        }
+    };
+    match logs.as_deref().and_then(failing_program) {
+        Some(origin) if origin == PRIVATE_CHANNEL_ESCROW_PROGRAM_ID => {
+            ConfirmationResult::Failed(Some(escrow_error))
+        }
+        Some(origin) => {
+            warn!("Custom error {code} on {signature} raised by {origin}, not the escrow; treating it as a generic failure");
+            ConfirmationResult::Failed(None)
+        }
+        None => {
+            // The retry also counts as a confirmation timeout; this label names the cause.
+            OPERATOR_TRANSACTION_ERRORS
+                .with_label_values(&[
+                    ProgramType::Withdraw.as_label(),
+                    "escrow_error_origin_unproven",
+                ])
+                .inc();
+            warn!(
+                "Custom error {code} on {signature} has no provable origin; retrying the release"
+            );
+            ConfirmationResult::Retry
+        }
+    }
+}
+
+/// The escrow error a custom code names, if the escrow raised it.
+fn escrow_error_for_code(code: u32) -> Option<PrivateChannelEscrowProgramError> {
+    match code {
+        11 => Some(PrivateChannelEscrowProgramError::InvalidWithdrawalBitmap),
+        12 => Some(PrivateChannelEscrowProgramError::NonceAlreadyUsed),
+        13 => Some(PrivateChannelEscrowProgramError::NonceOutsideCurrentGeneration),
+        14 => Some(PrivateChannelEscrowProgramError::UnexpectedGeneration),
         _ => None,
     }
+}
+
+/// The program whose error failed the transaction: the runtime logs each failing frame
+/// innermost first. Program output is always prefixed `Program log:`, so it cannot pose
+/// as a runtime line. A truncated log may have lost the innermost frame, so it names none.
+fn failing_program(logs: &[String]) -> Option<Pubkey> {
+    if logs.iter().any(|line| line == "Log truncated") {
+        return None;
+    }
+    logs.iter().find_map(|line| {
+        let (program, outcome) = line.strip_prefix("Program ")?.split_once(' ')?;
+        if !outcome.starts_with("failed:") {
+            return None;
+        }
+        program.parse().ok()
+    })
 }
 
 #[cfg(test)]
@@ -316,7 +392,7 @@ mod tests {
     }
 
     // ====================================================================
-    // parse_program_error
+    // classify_failure
     // ====================================================================
 
     /// This map is the single point where an on-chain error code becomes a
@@ -324,7 +400,7 @@ mod tests {
     /// stale entry here would silently route one rejection down another's arm,
     /// which is how a spent nonce could end up reminted. Pin every code.
     #[test]
-    fn parse_program_error_code_table() {
+    fn escrow_error_code_table() {
         let cases = [
             (
                 11u32,
@@ -343,21 +419,270 @@ mod tests {
         ];
 
         for (code, expected) in cases {
-            let err = TransactionError::InstructionError(0, InstructionError::Custom(code));
-            assert_eq!(parse_program_error(&err), expected, "custom code {code}");
+            assert_eq!(escrow_error_for_code(code), expected, "custom code {code}");
         }
     }
 
-    #[test]
-    fn parse_non_custom_returns_none() {
-        let err = TransactionError::InstructionError(0, InstructionError::InvalidAccountData);
-        assert!(parse_program_error(&err).is_none());
+    /// Runtime log of a ReleaseFunds whose transfer hook rejected the transfer. Each
+    /// failing frame logs its own `failed:` line, innermost first.
+    fn hook_rejection_logs(token_program: &Pubkey, hook: &Pubkey, code: u32) -> Vec<String> {
+        let escrow = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+        vec![
+            format!("Program {escrow} invoke [1]"),
+            "Program log: Instruction: ReleaseFunds".to_string(),
+            format!("Program {token_program} invoke [2]"),
+            format!("Program {hook} invoke [3]"),
+            format!("Program {hook} consumed 1200 of 180000 compute units"),
+            format!("Program {hook} failed: custom program error: {code:#x}"),
+            format!("Program {token_program} consumed 9000 of 190000 compute units"),
+            format!("Program {token_program} failed: custom program error: {code:#x}"),
+            format!("Program {escrow} consumed 20000 of 200000 compute units"),
+            format!("Program {escrow} failed: custom program error: {code:#x}"),
+        ]
+    }
+
+    /// Runtime log of a ReleaseFunds the escrow refused itself, before any CPI.
+    fn escrow_rejection_logs(code: u32) -> Vec<String> {
+        let escrow = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
+        vec![
+            format!("Program {escrow} invoke [1]"),
+            "Program log: Instruction: ReleaseFunds".to_string(),
+            format!("Program {escrow} consumed 8000 of 200000 compute units"),
+            format!("Program {escrow} failed: custom program error: {code:#x}"),
+        ]
     }
 
     #[test]
-    fn parse_non_instruction_error_returns_none() {
-        let err = TransactionError::InsufficientFundsForFee;
-        assert!(parse_program_error(&err).is_none());
+    fn failing_program_names_the_innermost_failure() {
+        let hook = Pubkey::new_unique();
+        let logs = hook_rejection_logs(&Pubkey::new_unique(), &hook, 12);
+        assert_eq!(failing_program(&logs), Some(hook));
+        assert_eq!(
+            failing_program(&escrow_rejection_logs(12)),
+            Some(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        );
+    }
+
+    /// A program can log any text, but only behind `Program log:`, so it cannot pass as the escrow.
+    #[test]
+    fn failing_program_ignores_program_logged_text() {
+        let hook = Pubkey::new_unique();
+        let mut logs = hook_rejection_logs(&Pubkey::new_unique(), &hook, 12);
+        logs.insert(
+            4,
+            format!(
+                "Program log: Program {PRIVATE_CHANNEL_ESCROW_PROGRAM_ID} failed: custom program error: 0xc"
+            ),
+        );
+        assert_eq!(failing_program(&logs), Some(hook));
+    }
+
+    /// A truncated log may have lost the innermost failure, so it proves no origin.
+    #[test]
+    fn failing_program_refuses_truncated_logs() {
+        let mut logs = escrow_rejection_logs(12);
+        logs.push("Log truncated".to_string());
+        assert_eq!(failing_program(&logs), None);
+    }
+
+    /// `getTransaction` reply carrying the given runtime log.
+    fn transaction_reply_with_logs(logs: &[String], code: u32) -> String {
+        let err = serde_json::json!({"InstructionError": [0, {"Custom": code}]});
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "slot": 100,
+                "blockTime": null,
+                "transaction": {
+                    "signatures": [Signature::new_unique().to_string()],
+                    "message": {
+                        "header": {
+                            "numRequiredSignatures": 1,
+                            "numReadonlySignedAccounts": 0,
+                            "numReadonlyUnsignedAccounts": 1,
+                        },
+                        "accountKeys": [
+                            Pubkey::new_unique().to_string(),
+                            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                        ],
+                        "recentBlockhash": "11111111111111111111111111111111",
+                        "instructions": [],
+                    },
+                },
+                "meta": {
+                    "err": err,
+                    "status": {"Err": err},
+                    "fee": 5000,
+                    "preBalances": [0, 0],
+                    "postBalances": [0, 0],
+                    "logMessages": logs,
+                },
+            },
+        })
+        .to_string()
+    }
+
+    fn mock_transaction_logs(
+        server: &mut mockito::ServerGuard,
+        logs: &[String],
+        code: u32,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getTransaction"
+            })))
+            .with_status(200)
+            .with_body(transaction_reply_with_logs(logs, code))
+            .create()
+    }
+
+    /// A transfer hook's code 12 is not the escrow's NonceAlreadyUsed: the failed release
+    /// consumed nothing, so it must take the generic, proof-gated failure path.
+    #[tokio::test]
+    async fn hook_custom_error_is_not_decoded_as_escrow() {
+        let mut server = mockito::Server::new_async().await;
+        let logs = hook_rejection_logs(&Pubkey::new_unique(), &Pubkey::new_unique(), 12);
+        let _tx = mock_transaction_logs(&mut server, &logs, 12);
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
+
+        let result = classify_failure(
+            &rpc_client,
+            &Signature::new_unique(),
+            &err,
+            TransactionKind::ReleaseFunds,
+        )
+        .await;
+
+        assert!(
+            matches!(result, ConfirmationResult::Failed(None)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escrow_custom_error_is_decoded() {
+        let mut server = mockito::Server::new_async().await;
+        let _tx = mock_transaction_logs(&mut server, &escrow_rejection_logs(12), 12);
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
+
+        let result = classify_failure(
+            &rpc_client,
+            &Signature::new_unique(),
+            &err,
+            TransactionKind::ReleaseFunds,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                ConfirmationResult::Failed(Some(
+                    PrivateChannelEscrowProgramError::NonceAlreadyUsed
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Unreadable logs prove no origin either way. The failed release moved nothing, so it
+    /// is resent under the retry budget rather than routed as a foreign failure.
+    #[tokio::test]
+    async fn unreadable_release_logs_retry() {
+        let mut server = mockito::Server::new_async().await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getTransaction"
+            })))
+            .with_status(500)
+            .create();
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(13));
+        let unproven = OPERATOR_TRANSACTION_ERRORS
+            .with_label_values(&["withdraw", "escrow_error_origin_unproven"]);
+        let before = unproven.get();
+
+        let result = classify_failure(
+            &rpc_client,
+            &Signature::new_unique(),
+            &err,
+            TransactionKind::ReleaseFunds,
+        )
+        .await;
+
+        assert!(matches!(result, ConfirmationResult::Retry), "{result:?}");
+        assert_eq!(
+            unproven.get(),
+            before + 1.0,
+            "the retry must be visible as an unproven origin, not only as a timeout"
+        );
+    }
+
+    /// RotateBitmap's only CPI is the escrow's own event, so its code is the escrow's.
+    #[tokio::test]
+    async fn rotation_custom_error_is_trusted_without_logs() {
+        let mut server = mockito::Server::new_async().await;
+        let logs_read = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getTransaction"
+            })))
+            .expect(0)
+            .create();
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(14));
+
+        let result = classify_failure(
+            &rpc_client,
+            &Signature::new_unique(),
+            &err,
+            TransactionKind::RotateBitmap,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                ConfirmationResult::Failed(Some(
+                    PrivateChannelEscrowProgramError::UnexpectedGeneration
+                ))
+            ),
+            "{result:?}"
+        );
+        logs_read.assert();
+    }
+
+    /// A channel mint cannot raise an escrow error, so its code is never decoded as one.
+    #[tokio::test]
+    async fn mint_custom_error_is_never_decoded() {
+        let mut server = mockito::Server::new_async().await;
+        let logs_read = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "getTransaction"
+            })))
+            .expect(0)
+            .create();
+        let rpc_client = make_rpc_client_for_test(server.url());
+        let err = TransactionError::InstructionError(0, InstructionError::Custom(12));
+
+        let result = classify_failure(
+            &rpc_client,
+            &Signature::new_unique(),
+            &err,
+            TransactionKind::Mint,
+        )
+        .await;
+
+        assert!(
+            matches!(result, ConfirmationResult::Failed(None)),
+            "{result:?}"
+        );
+        logs_read.assert();
     }
 
     // ====================================================================
@@ -414,6 +739,7 @@ mod tests {
         let result = check_transaction_status(
             rpc_client,
             &sig,
+            TransactionKind::ReleaseFunds,
             CommitmentConfig::confirmed(),
             &ExtraErrorCheckPolicy::None,
             400,
@@ -423,12 +749,13 @@ mod tests {
         assert!(matches!(result, Ok(ConfirmationResult::Confirmed)));
     }
 
-    /// A confirmed status carrying Custom(11) must decode to
+    /// A confirmed status carrying the escrow's own Custom(11) must decode to
     /// Failed(InvalidWithdrawalBitmap) so the sender receives the exact
     /// escrow-program error rather than a generic failure.
     #[tokio::test]
     async fn check_transaction_status_returns_failed_on_program_error() {
         let mut server = mockito::Server::new_async().await;
+        let _tx = mock_transaction_logs(&mut server, &escrow_rejection_logs(11), 11);
         let _m = server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
@@ -460,6 +787,7 @@ mod tests {
         let result = check_transaction_status(
             rpc_client,
             &sig,
+            TransactionKind::ReleaseFunds,
             CommitmentConfig::confirmed(),
             &ExtraErrorCheckPolicy::None,
             400,
@@ -501,6 +829,7 @@ mod tests {
         let result = check_transaction_status(
             rpc_client,
             &sig,
+            TransactionKind::ReleaseFunds,
             CommitmentConfig::confirmed(),
             &ExtraErrorCheckPolicy::None,
             400,
