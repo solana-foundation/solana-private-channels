@@ -1797,9 +1797,9 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
-    /// CAS `Processing` to `Pending` for a claim a reconciliation halt refused. Only a row
-    /// with no journaled signature qualifies, since that proves it never broadcast; it spends
-    /// no requeue attempt, so a halt alone can never push a row into manual review.
+    /// CAS `Processing` to `Pending`, spending no requeue attempt, for a halt-refused row with no
+    /// journaled signature. A row with an earlier attempt still goes to recovery, since only an
+    /// on-chain check can rule it out, and that path can spend an attempt.
     pub async fn requeue_halted_claim_internal(
         &self,
         transaction_id: i64,

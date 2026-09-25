@@ -431,7 +431,7 @@ pub(super) async fn claim_and_persist_or_abort(
                     signature = %signature,
                     "Reconciliation halt active; dropping builder without sending"
                 );
-                // An unsent row waits in Pending, so recovery never spends a requeue attempt on a halt.
+                // A row that never broadcast waits in Pending without spending a requeue attempt.
                 match storage
                     .requeue_halted_claim(transaction_id, expected_updated_at)
                     .await
