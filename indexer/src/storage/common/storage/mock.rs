@@ -4,7 +4,7 @@ use crate::storage::common::models::{
     MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, StoredSig, TransactionStatus,
     TransactionType,
 };
-use crate::storage::common::storage::RequeueOutcome;
+use crate::storage::common::storage::{RemintClaim, RequeueOutcome};
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -32,6 +32,8 @@ pub struct MockStorage {
     pub call_counts: std::sync::Arc<Mutex<HashMap<String, usize>>>,
     /// Storage operation names in call order, for tests that pin read ordering.
     pub call_order: std::sync::Arc<Mutex<Vec<String>>>,
+    /// Per-op latency, for tests that need a write still in flight when a deadline passes.
+    pub delays: std::sync::Arc<Mutex<HashMap<String, std::time::Duration>>>,
     pub mints: std::sync::Arc<Mutex<HashMap<String, DbMint>>>,
     pub mint_balances: std::sync::Arc<Mutex<Vec<MintDbBalance>>>,
     /// Rows the unpinned reconciliation read answers with; `None` mirrors `mint_balances`.
@@ -68,6 +70,10 @@ pub struct MockStorage {
     /// to represent the other operator's row that the partial unique index
     /// arbitrates against. The real arbiter is covered against Postgres.
     pub foreign_remint_claims: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// Transactions whose row left `pending_remint` behind the sender's back, so a
+    /// claim finds nothing to refund. Kept apart from `pending_transactions` because
+    /// most remint tests never seed a row.
+    pub moved_remint_parents: Arc<Mutex<std::collections::HashSet<i64>>>,
     /// Mirrors the durable `transactions.release_signatures` column: the full
     /// attempt list written on an SMT-confirmed completion. COALESCE-guarded.
     pub completed_release_signatures: Arc<Mutex<HashMap<i64, Vec<String>>>>,
@@ -128,6 +134,14 @@ impl MockStorage {
             .lock()
             .unwrap()
             .insert(program_type.to_string(), should_fail);
+    }
+
+    /// Make every call to `operation` take `delay` before it applies.
+    pub fn set_delay(&self, operation: &str, delay: std::time::Duration) {
+        self.delays
+            .lock()
+            .unwrap()
+            .insert(operation.to_string(), delay);
     }
 
     /// How many times `operation` has been invoked on this mock.
@@ -1159,6 +1173,15 @@ impl MockStorage {
         counterpart_signature: Option<String>,
     ) -> Result<bool, StorageError> {
         self.check_should_fail("try_complete_stalled_withdrawal")?;
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .get("try_complete_stalled_withdrawal")
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if !matches!(
             from_status,
             TransactionStatus::ManualReview | TransactionStatus::PendingRemint
@@ -1393,7 +1416,7 @@ impl MockStorage {
 
     /// Mirror `claim_remint_attempt_internal`: retire the named proven-dead
     /// attempts, then take the one live slot the partial unique index allows.
-    /// `Ok(false)` means another sender already owns it, so nothing is written.
+    /// A moved parent writes nothing at all, supersedes included.
     pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
@@ -1401,8 +1424,16 @@ impl MockStorage {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
-    ) -> Result<bool, StorageError> {
+    ) -> Result<RemintClaim, StorageError> {
         self.check_should_fail("claim_remint_attempt")?;
+        if self
+            .moved_remint_parents
+            .lock()
+            .unwrap()
+            .contains(&transaction_id)
+        {
+            return Ok(RemintClaim::RowMoved);
+        }
         let mut map = self.remint_signatures.lock().unwrap();
         let mut superseded = self.superseded_remint_signatures.lock().unwrap();
 
@@ -1429,7 +1460,7 @@ impl MockStorage {
                 .unwrap()
                 .contains(&transaction_id)
         {
-            return Ok(false);
+            return Ok(RemintClaim::HeldElsewhere);
         }
 
         map.entry(transaction_id).or_default().push(StoredSig {
@@ -1437,7 +1468,7 @@ impl MockStorage {
             last_valid_block_height,
             blockhash_slot,
         });
-        Ok(true)
+        Ok(RemintClaim::Claimed)
     }
 
     pub async fn get_remint_signatures(

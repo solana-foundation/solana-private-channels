@@ -29,7 +29,9 @@ use private_channel_indexer::storage::common::models::StoredSig;
 use {
     chrono::{Duration as ChronoDuration, Utc},
     private_channel_indexer::{
-        storage::{common::models::DbTransactionBuilder, PostgresDb, Storage, TransactionType},
+        storage::{
+            common::models::DbTransactionBuilder, PostgresDb, RemintClaim, Storage, TransactionType,
+        },
         PostgresConfig,
     },
     solana_sdk::{pubkey::Pubkey, signature::Signature},
@@ -341,17 +343,21 @@ async fn test_remint_signatures_round_trip_and_gc() {
     // First attempt takes the one live slot.
     let attempt_a = Signature::new_unique().to_string();
     let attempt_b = Signature::new_unique().to_string();
-    assert!(db
-        .claim_remint_attempt_internal(tx_id, attempt_a.clone(), 100, None, &[])
-        .await
-        .unwrap());
+    assert_eq!(
+        db.claim_remint_attempt_internal(tx_id, attempt_a.clone(), 100, None, &[])
+            .await
+            .unwrap(),
+        RemintClaim::Claimed
+    );
     // A second attempt only takes it by naming the one it proved dead.
-    assert!(!db
-        .claim_remint_attempt_internal(tx_id, attempt_b.clone(), 200, None, &[])
-        .await
-        .unwrap());
-    assert!(db
-        .claim_remint_attempt_internal(
+    assert_eq!(
+        db.claim_remint_attempt_internal(tx_id, attempt_b.clone(), 200, None, &[])
+            .await
+            .unwrap(),
+        RemintClaim::HeldElsewhere
+    );
+    assert_eq!(
+        db.claim_remint_attempt_internal(
             tx_id,
             attempt_b.clone(),
             200,
@@ -359,7 +365,9 @@ async fn test_remint_signatures_round_trip_and_gc() {
             std::slice::from_ref(&attempt_a)
         )
         .await
-        .unwrap());
+        .unwrap(),
+        RemintClaim::Claimed
+    );
 
     let stored = db.get_remint_signatures_internal(tx_id).await.unwrap();
     assert_eq!(

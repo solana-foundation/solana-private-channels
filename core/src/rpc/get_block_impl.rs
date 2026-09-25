@@ -46,10 +46,9 @@ pub async fn get_block_impl(
 
     let config = config.map(|c| c.convert_to_current()).unwrap_or_default();
 
-    // Get transactions for this block. A lookup *failure* errors out rather than
-    // encoding a block that silently drops a transaction it could not read. A row
-    // that is genuinely gone is still skipped: truncation deletes transactions while
-    // their block row can survive, so erroring there would break reads of pruned blocks.
+    // Get transactions for this block. A lookup failure errors out, and so does a missing row:
+    // a block whose rows were pruned under it, by a truncation racing this read or a cached
+    // block outliving its rows, cannot be served whole, and a partial list would drop data.
     let mut transactions: Vec<TransactionWithStatusMeta> = Vec::new();
     for sig in &block_info.transaction_signatures {
         let stored = read_deps
@@ -62,9 +61,15 @@ pub async fn get_block_impl(
                     format!("Failed to get block transaction: {}", e),
                 )
             })?;
-        if let Some(stored_tx) = stored {
-            transactions.push(stored_tx.transaction_with_status_meta());
-        }
+        let Some(stored_tx) = stored else {
+            return Err(custom_error(
+                JSON_RPC_SERVER_ERROR,
+                format!(
+                    "Block at slot {slot} lists transaction {sig}, which this node no longer holds"
+                ),
+            ));
+        };
+        transactions.push(stored_tx.transaction_with_status_meta());
     }
 
     let confirmed_block = ConfirmedBlock {

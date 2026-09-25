@@ -21,6 +21,9 @@ use crate::config::ProgramType;
 use crate::error::{DataSourceError, DataSourceRpcError};
 use crate::indexer::datasource::common::parser::escrow::parse_escrow_instruction;
 use crate::indexer::datasource::common::parser::withdraw::parse_withdraw_instruction;
+use crate::indexer::datasource::common::tx_validation::{
+    check_inner_set_index, check_instruction, check_loaded_counts, check_signature,
+};
 use crate::indexer::datasource::common::{datasource::DataSource, types::*};
 use crate::indexer::datasource::rpc_polling::decoder::targets_configured_instance;
 use crate::indexer::datasource::rpc_polling::types::{InnerInstruction, InnerInstructions};
@@ -326,11 +329,9 @@ struct ReconnectGapCtx {
 /// Gate the checkpoint up to the slot this stream opened at, or to `floor` when that is higher,
 /// then spawn a backfill for the window. Sent first so the gate beats that block's SlotComplete.
 #[cfg(feature = "datasource-rpc")]
-/// Returns whether it is safe to forward the block that triggered this arm. `false`
-/// means cancellation ended the wait before the gate was armed, so the caller must NOT
-/// forward the block: its SlotComplete would advance the checkpoint over the still
-/// unfilled gap, and every slot underneath it would stop being reachable. `true` means
-/// the gate is armed and the block is safe to hand on.
+/// Returns the armed target, which the gap-fill covers, when it is safe to forward the block
+/// that triggered this arm. `None` means cancellation ended the wait before the gate was set,
+/// so the caller must NOT forward it: its SlotComplete would skip the unfilled gap.
 async fn arm_reconnect_gap(
     t_sub: u64,
     floor: &mut Option<u64>,
@@ -339,7 +340,7 @@ async fn arm_reconnect_gap(
     cancel: &CancellationToken,
     backoff: Duration,
     prev: &mut Option<tokio::task::JoinHandle<()>>,
-) -> Result<bool, DataSourceRpcError> {
+) -> Result<Option<u64>, DataSourceRpcError> {
     // Held rather than taken: every path that leaves without a gate must return it unspent.
     let floor_slot = *floor;
     // Never below what startup still owes, so its gate is widened rather than narrowed.
@@ -359,14 +360,14 @@ async fn arm_reconnect_gap(
                 );
                 record_missing_anchor(ctx.program_type);
                 if backoff_cancelled(cancel, backoff).await {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
             Err(e) => {
                 warn!("Reconnect gap: checkpoint read failed, retrying: {}", e);
                 record_gap_fill_error(ctx.program_type);
                 if backoff_cancelled(cancel, backoff).await {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
         }
@@ -421,7 +422,7 @@ async fn arm_reconnect_gap(
     *prev = Some(handle);
     // The gate is set and the fill owns the range, so no later connection may claim it again.
     *floor = None;
-    Ok(true)
+    Ok(Some(target))
 }
 
 /// Waits one backoff period; true means cancellation fired first.
@@ -637,8 +638,8 @@ async fn connect_and_stream(
         },
     );
 
-    // Slots carry the point the stream resumed at, which is what the gap gate arms on. Blocks
-    // are program-filtered, so waiting for one would measure idle time instead of the outage.
+    // Slots carry the point the stream resumed at, which is what the gap gate arms on. The
+    // block filter drops only transactions, so every block still arrives and can be chained.
     let mut slots = HashMap::new();
     slots.insert(
         "private_channel_slots".to_string(),
@@ -678,6 +679,9 @@ async fn connect_and_stream(
     // Arm the gap gate on the first live block of this connection only.
     #[cfg(feature = "datasource-rpc")]
     let mut armed = false;
+    // Highest slot the gap-fill covers, and the last block forwarded; both reset per connection.
+    let mut gate_target: Option<u64> = None;
+    let mut last_forwarded: Option<ForwardedBlock> = None;
 
     loop {
         tokio::select! {
@@ -716,7 +720,7 @@ async fn connect_and_stream(
                     if let Some(ctx) = gap_ctx {
                         if !armed {
                             armed = true;
-                            let safe_to_forward = arm_reconnect_gap(
+                            let armed_target = arm_reconnect_gap(
                                 slot_update.slot,
                                 startup_floor,
                                 ctx,
@@ -728,9 +732,10 @@ async fn connect_and_stream(
                             .await
                             .map_err(DataSourceError::Rpc)?;
                             // Cancelled mid-arm, so stop rather than stream on ungated.
-                            if !safe_to_forward {
+                            let Some(target) = armed_target else {
                                 break;
-                            }
+                            };
+                            gate_target = Some(target);
                         }
                     }
                     #[cfg(not(feature = "datasource-rpc"))]
@@ -759,7 +764,7 @@ async fn connect_and_stream(
                     if let Some(ctx) = gap_ctx {
                         if !armed {
                             armed = true;
-                            let safe_to_forward = arm_reconnect_gap(
+                            let armed_target = arm_reconnect_gap(
                                 block.slot,
                                 startup_floor,
                                 ctx,
@@ -773,12 +778,84 @@ async fn connect_and_stream(
                             // Cancelled mid-arm before the gate was set: stop instead of
                             // forwarding this block, whose SlotComplete would leapfrog the
                             // unfilled gap. Shutdown proceeds; a restart replays the slot.
-                            if !safe_to_forward {
+                            let Some(target) = armed_target else {
                                 break;
+                            };
+                            gate_target = Some(target);
+                        }
+                    }
+
+                    // The stream carries every finalized block, so a parent that is neither the
+                    // last forwarded block nor inside the gap-fill range means one was dropped.
+                    match check_block_link(
+                        last_forwarded.as_ref(),
+                        gate_target,
+                        block.slot,
+                        block.parent_slot,
+                        &block.parent_blockhash,
+                    ) {
+                        Ok(()) => {}
+                        // Re-filling up to the parent cannot vet this block, since the parent is
+                        // already forwarded. Drop it and reconnect so RPC reads the slot instead.
+                        Err(LinkBreak::Fork(reason)) => {
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "chain_break_stream"])
+                                .inc();
+                            error!("Yellowstone block {} is on another fork: {reason}", block.slot);
+                            return Err(DataSourceRpcError::Protocol {
+                                reason: format!("block {} is on another fork: {reason}", block.slot),
+                            }
+                            .into());
+                        }
+                        Err(LinkBreak::Hole(reason)) => {
+                            metrics::INDEXER_RPC_ERRORS
+                                .with_label_values(&[program_type.as_label(), "chain_break_stream"])
+                                .inc();
+                            // Re-arm on this stream so RPC fills the hole before this block's
+                            // SlotComplete can pass it; without RPC repair, fail loudly instead.
+                            #[cfg(feature = "datasource-rpc")]
+                            let rearmed = match gap_ctx {
+                                Some(ctx) => {
+                                    warn!(
+                                        "Yellowstone block {} leaves a hole ({reason}); re-arming the gap-fill up to slot {}",
+                                        block.slot, block.parent_slot
+                                    );
+                                    let armed_target = arm_reconnect_gap(
+                                        block.parent_slot,
+                                        startup_floor,
+                                        ctx,
+                                        &tx,
+                                        &cancellation_token,
+                                        RECONNECT_GAP_RETRY_BACKOFF,
+                                        backfill_handle,
+                                    )
+                                    .await
+                                    .map_err(DataSourceError::Rpc)?;
+                                    let Some(target) = armed_target else {
+                                        break;
+                                    };
+                                    gate_target =
+                                        Some(gate_target.map_or(target, |t| t.max(target)));
+                                    true
+                                }
+                                None => false,
+                            };
+                            #[cfg(not(feature = "datasource-rpc"))]
+                            let rearmed = false;
+                            if !rearmed {
+                                error!("Yellowstone block {} leaves a hole: {reason}", block.slot);
+                                return Err(DataSourceRpcError::Protocol {
+                                    reason: format!("block {} leaves a hole: {reason}", block.slot),
+                                }
+                                .into());
                             }
                         }
                     }
 
+                    let forwarded = ForwardedBlock {
+                        slot: block.slot,
+                        blockhash: block.blockhash.clone(),
+                    };
                     // Fail-closed: any parse/send failure returns Err (reconnect + gap-fill
                     // replays the slot) and no SlotComplete is emitted for it.
                     if let Err(e) =
@@ -787,6 +864,13 @@ async fn connect_and_stream(
                     {
                         error!("Error handling block: {}", e);
                         return Err(DataSourceError::Rpc(e));
+                    }
+                    // A late block from inside the gap-fill range must not move the chain back.
+                    if last_forwarded
+                        .as_ref()
+                        .is_none_or(|prev| forwarded.slot > prev.slot)
+                    {
+                        last_forwarded = Some(forwarded);
                     }
                 }
                 Some(UpdateOneof::Ping(_)) => {
@@ -848,7 +932,9 @@ mod tests {
                     "result": {
                         "blockhash": "TestBlockHash11111111111111111111111111111",
                         "parentSlot": slot.saturating_sub(1),
-                        "transactions": []
+                        "transactions": [],
+                        // Also answers the signatures view, so an escrow consumer can confirm it empty.
+                        "signatures": []
                     },
                     "id": 1
                 })
@@ -1432,7 +1518,7 @@ mod tests {
         while rx.recv().await.is_some() {}
         prev.unwrap().await.unwrap();
 
-        assert!(armed);
+        assert_eq!(armed, Some(110), "the armed target is widened to the floor");
         assert_eq!(floor, None, "a spent floor must not be reused");
     }
 
@@ -1512,7 +1598,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!armed, "no gate was set");
+        assert_eq!(armed, None, "no gate was set");
         assert_eq!(floor, Some(110), "the floor must survive for the next arm");
     }
 
@@ -1584,7 +1670,7 @@ mod tests {
         drop(tx);
 
         assert!(
-            !safe,
+            safe.is_none(),
             "a missing anchor must report the block unsafe to forward"
         );
         assert!(
@@ -1628,7 +1714,7 @@ mod tests {
         drop(tx);
 
         assert!(
-            !safe,
+            safe.is_none(),
             "cancellation before arming must report the block unsafe to forward"
         );
         assert!(prev.is_none(), "no backfill is spawned on a cancelled arm");
@@ -1743,10 +1829,10 @@ mod tests {
         yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
             slot: 42,
             transaction: Some(proto::SubscribeUpdateTransactionInfo {
-                signature,
+                signature: signature.clone(),
                 is_vote: false,
                 transaction: Some(proto::Transaction {
-                    signatures: vec![signature_placeholder()],
+                    signatures: vec![signature],
                     message: Some(message),
                 }),
                 // Present-but-empty meta: a real tx always carries meta, and the handler
@@ -1902,15 +1988,24 @@ mod tests {
             recent_blockhash: vec![0u8; 32],
             instructions: top_level,
             versioned: true,
-            address_table_lookups: vec![],
+            // One table that loads exactly the addresses the meta carries.
+            address_table_lookups: if loaded_writable.is_empty() && loaded_readonly.is_empty() {
+                vec![]
+            } else {
+                vec![proto::MessageAddressTableLookup {
+                    account_key: vec![77u8; 32],
+                    writable_indexes: (0..loaded_writable.len() as u8).collect(),
+                    readonly_indexes: (0..loaded_readonly.len() as u8).collect(),
+                }]
+            },
         };
         yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction {
             slot: 7,
             transaction: Some(proto::SubscribeUpdateTransactionInfo {
-                signature,
+                signature: signature.clone(),
                 is_vote: false,
                 transaction: Some(proto::Transaction {
-                    signatures: vec![signature_placeholder()],
+                    signatures: vec![signature],
                     message: Some(message),
                 }),
                 meta: Some(proto::TransactionStatusMeta {
@@ -2249,6 +2344,369 @@ mod tests {
         );
     }
 
+    fn forwarded(slot: u64) -> ForwardedBlock {
+        ForwardedBlock {
+            slot,
+            blockhash: format!("hash{slot}"),
+        }
+    }
+
+    /// A live block must continue the chain from the last forwarded block, or start inside
+    /// the range the reconnect gap-fill owns. Anything else means a finalized block was dropped.
+    #[test]
+    fn check_block_link_table() {
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Ok,
+            Hole,
+            Fork,
+        }
+        use Want::{Fork, Hole, Ok};
+        // (name, last forwarded, gate target, block slot, parent slot, parent hash, outcome)
+        type Case<'a> = (
+            &'a str,
+            Option<&'a ForwardedBlock>,
+            Option<u64>,
+            u64,
+            u64,
+            &'a str,
+            Want,
+        );
+        let last = forwarded(101);
+        let last_late = forwarded(108);
+        let after_rearm = forwarded(111);
+        let armed_on = forwarded(200);
+        let past_range = forwarded(120);
+        let cases: Vec<Case> = vec![
+            ("next block", Some(&last), Some(90), 102, 101, "hash101", Ok),
+            (
+                "block 102 dropped",
+                Some(&last),
+                Some(90),
+                103,
+                102,
+                "hash102",
+                Hole,
+            ),
+            (
+                "same slot, other fork",
+                Some(&last),
+                Some(90),
+                102,
+                101,
+                "fork",
+                Fork,
+            ),
+            (
+                "older parent than the last forwarded block",
+                Some(&last),
+                Some(90),
+                102,
+                100,
+                "hash100",
+                Fork,
+            ),
+            (
+                "late block inside the gap-fill range",
+                Some(&last),
+                Some(110),
+                96,
+                95,
+                "any",
+                Ok,
+            ),
+            (
+                "first block inside the gap-fill range",
+                None,
+                Some(110),
+                111,
+                110,
+                "any",
+                Ok,
+            ),
+            (
+                "first block past the gap-fill range",
+                None,
+                Some(110),
+                112,
+                111,
+                "any",
+                Hole,
+            ),
+            (
+                "no repair wired, first block",
+                None,
+                None,
+                501,
+                500,
+                "any",
+                Ok,
+            ),
+            (
+                "no repair wired, later gap",
+                Some(&last),
+                None,
+                103,
+                102,
+                "hash102",
+                Hole,
+            ),
+            // A sibling of a forwarded block names the same covered parent but contradicts it.
+            (
+                "sibling of the block forwarded after a re-arm",
+                Some(&after_rearm),
+                Some(110),
+                111,
+                110,
+                "hash110",
+                Fork,
+            ),
+            (
+                "block after the arming block names an older parent",
+                Some(&armed_on),
+                Some(200),
+                201,
+                199,
+                "hash199",
+                Fork,
+            ),
+            (
+                "covered parent past the last forwarded block",
+                Some(&last_late),
+                Some(110),
+                111,
+                110,
+                "hash110",
+                Ok,
+            ),
+            (
+                "block inside the range skips the forwarded one",
+                Some(&last_late),
+                Some(110),
+                109,
+                105,
+                "hash105",
+                Fork,
+            ),
+            (
+                "late block outside the gap-fill range",
+                Some(&past_range),
+                Some(110),
+                115,
+                114,
+                "hash114",
+                Fork,
+            ),
+        ];
+        for (name, last, target, slot, parent_slot, parent_hash, want) in cases {
+            let got = match check_block_link(last, target, slot, parent_slot, parent_hash) {
+                std::result::Result::Ok(()) => Ok,
+                Err(LinkBreak::Hole(_)) => Hole,
+                Err(LinkBreak::Fork(_)) => Fork,
+            };
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// Runs one transaction through `handle_block` and returns the result plus every message sent.
+    async fn run_block_with(
+        tx_info: yellowstone_grpc_proto::geyser::SubscribeUpdateTransactionInfo,
+        program_id: &Pubkey,
+        program_type: ProgramType,
+        escrow_instance_id: Option<Pubkey>,
+    ) -> (Result<(), DataSourceRpcError>, Vec<ProcessorMessage>) {
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = handle_block(
+            block_update(950, vec![tx_info]),
+            program_id,
+            program_type,
+            escrow_instance_id,
+            &tx,
+        )
+        .await;
+        drop(tx);
+        let mut msgs = vec![];
+        while let Some(m) = rx.recv().await {
+            msgs.push(m);
+        }
+        (res, msgs)
+    }
+
+    /// Every structural corruption of a successful transaction fails the block before any
+    /// row or SlotComplete is sent, so the slot is left for the RPC gap-fill.
+    #[tokio::test]
+    async fn malformed_transaction_fails_the_block() {
+        use std::str::FromStr;
+        use yellowstone_grpc_proto::prelude as proto;
+        type Info = proto::SubscribeUpdateTransactionInfo;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+
+        fn message(info: &mut Info) -> &mut proto::Message {
+            info.transaction.as_mut().unwrap().message.as_mut().unwrap()
+        }
+        fn meta(info: &mut Info) -> &mut proto::TransactionStatusMeta {
+            info.meta.as_mut().unwrap()
+        }
+        fn one_lookup(info: &mut Info, writable: u8) {
+            let msg = message(info);
+            msg.versioned = true;
+            msg.address_table_lookups = vec![proto::MessageAddressTableLookup {
+                account_key: vec![77u8; 32],
+                writable_indexes: (0..writable).collect(),
+                readonly_indexes: vec![],
+            }];
+        }
+        fn inner_set(index: u32, program_id_index: u32) -> proto::InnerInstructions {
+            proto::InnerInstructions {
+                index,
+                instructions: vec![proto::InnerInstruction {
+                    program_id_index,
+                    accounts: vec![],
+                    data: vec![],
+                    stack_height: Some(2),
+                }],
+            }
+        }
+
+        type Corrupt = fn(&mut Info);
+        // (case, the rule the error must name, corruption)
+        let cases: Vec<(&str, &str, Corrupt)> = vec![
+            ("31-byte loaded address", "invalid loaded address", |info| {
+                one_lookup(info, 1);
+                meta(info).loaded_writable_addresses = vec![vec![1u8; 31]];
+            }),
+            (
+                "loaded address without a lookup",
+                "lookups load (0, 0)",
+                |info| {
+                    meta(info).loaded_writable_addresses = vec![vec![1u8; 32]];
+                },
+            ),
+            (
+                "lookup without its loaded address",
+                "lookups load (1, 0)",
+                |info| one_lookup(info, 1),
+            ),
+            ("empty signature", "signature is 0 bytes", |info| {
+                info.signature = vec![]
+            }),
+            (
+                "signature differs from the embedded one",
+                "does not match the transaction's first signature",
+                |info| info.signature = vec![1u8; 64],
+            ),
+            (
+                "top-level program index out of range",
+                "program index 40 is outside",
+                |info| message(info).instructions[0].program_id_index = 40,
+            ),
+            (
+                "top-level account index out of range",
+                "account index 40 is outside",
+                |info| message(info).instructions[0].accounts = vec![40],
+            ),
+            // With 262 keys index 261 is inside the key list; narrowed to u8 it would wrap to 5.
+            (
+                "inner program index past u8",
+                "does not fit in a u8",
+                |info| {
+                    let keys = &mut message(info).account_keys;
+                    keys.resize(262, vec![200u8; 32]);
+                    meta(info).inner_instructions = vec![inner_set(0, 261)];
+                },
+            ),
+            (
+                "inner set names no top-level instruction",
+                "names no top-level instruction",
+                |info| meta(info).inner_instructions = vec![inner_set(3, 0)],
+            ),
+            (
+                "delivered without our program",
+                "does not name our program",
+                |info| {
+                    message(info).account_keys[WITHDRAW_PROGRAM_KEY_INDEX as usize] = vec![99u8; 32]
+                },
+            ),
+            (
+                "inner instructions marked unavailable",
+                "marked unavailable",
+                |info| meta(info).inner_instructions_none = true,
+            ),
+        ];
+
+        for (name, rule, corrupt) in cases {
+            let mut info = withdraw_tx_update(vec![4u8; 64], &program_id, 1)
+                .transaction
+                .unwrap();
+            corrupt(&mut info);
+            let (res, msgs) = run_block_with(info, &program_id, ProgramType::Withdraw, None).await;
+            let err = res.expect_err(name).to_string();
+            assert!(err.contains(rule), "{name}: {err}");
+            assert!(
+                msgs.is_empty(),
+                "{name}: nothing may be sent, got {}",
+                msgs.len()
+            );
+        }
+    }
+
+    /// Inner metadata is only required on our own transactions: a foreign escrow instance's
+    /// transaction without it is skipped, and the slot completes.
+    #[tokio::test]
+    async fn unavailable_inner_instructions_on_a_foreign_instance_completes() {
+        use crate::test_utils::escrow_fixtures::deposit_ix_bytes;
+        use yellowstone_grpc_proto::prelude as proto;
+
+        let escrow = escrow_pubkey();
+        let mut account_keys: Vec<Vec<u8>> = vec![escrow.to_bytes().to_vec()];
+        account_keys.extend((1u8..12).map(|i| vec![i; 32]));
+        let top = vec![proto::CompiledInstruction {
+            program_id_index: 0,
+            accounts: (0u8..12).collect(),
+            data: deposit_ix_bytes(1000, None),
+        }];
+        let mut info = escrow_tx_update(vec![6u8; 64], account_keys, top, vec![], vec![], vec![])
+            .transaction
+            .unwrap();
+        info.meta.as_mut().unwrap().inner_instructions_none = true;
+
+        let our_instance = crate::test_utils::pubkey::test_pubkey(222);
+        let (res, msgs) =
+            run_block_with(info, &escrow, ProgramType::Escrow, Some(our_instance)).await;
+        assert!(
+            res.is_ok(),
+            "a foreign instance's transaction must not fail the block"
+        );
+        assert!(matches!(
+            msgs.as_slice(),
+            [ProcessorMessage::SlotComplete { slot: 950, .. }]
+        ));
+    }
+
+    /// A failed transaction is skipped whatever it holds, so corrupt fields there do not fail the block.
+    #[tokio::test]
+    async fn malformed_failed_transaction_is_still_skipped() {
+        use std::str::FromStr;
+        use yellowstone_grpc_proto::prelude as proto;
+        let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
+        let mut info = withdraw_tx_update(vec![4u8; 64], &program_id, 1)
+            .transaction
+            .unwrap();
+        info.signature = vec![];
+        info.meta = Some(proto::TransactionStatusMeta {
+            err: Some(proto::TransactionError { err: vec![1] }),
+            loaded_writable_addresses: vec![vec![1u8; 3]],
+            ..Default::default()
+        });
+
+        let (res, msgs) = run_block_with(info, &program_id, ProgramType::Withdraw, None).await;
+        assert!(res.is_ok());
+        assert!(matches!(
+            msgs.as_slice(),
+            [ProcessorMessage::SlotComplete { slot: 950, .. }]
+        ));
+    }
+
     /// Absolute per-instruction indices from the block path match the per-tx path.
     #[tokio::test]
     async fn block_absolute_instruction_index_preserved() {
@@ -2585,52 +3043,13 @@ async fn handle_transaction_info(
         return Ok(());
     }
 
-    // ALT-resolved keys live on meta, not the message; capture them so inner and v0
-    // top-level account indices resolve (no RPC).
-    let inner_instructions_vec: Vec<InnerInstructions> = meta
-        .inner_instructions
-        .iter()
-        .map(|ix_set| InnerInstructions {
-            index: ix_set.index as u8,
-            instructions: ix_set
-                .instructions
-                .iter()
-                .map(|ix| InnerInstruction {
-                    instruction: CompiledInstruction {
-                        program_id_index: ix.program_id_index as u8,
-                        accounts: ix.accounts.clone(),
-                        data: bs58::encode(&ix.data).into_string(),
-                    },
-                    stack_height: ix.stack_height,
-                })
-                .collect(),
-        })
-        .collect();
-
-    // Order matters: writable then readonly, matching execution order.
-    let loaded_pubkeys: Vec<Pubkey> = match meta
-        .loaded_writable_addresses
-        .iter()
-        .chain(meta.loaded_readonly_addresses.iter())
-        .map(|bytes| Pubkey::try_from(bytes.as_slice()))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Skipping transaction at slot {slot}: invalid loaded address: {e}");
-            return Ok(());
-        }
-    };
-
-    // Extract signature
-    let signature = bs58::encode(&tx_info.signature).into_string();
-
     // Convert protobuf transaction to Solana types
     let proto_tx = tx_info
         .transaction
         .ok_or_else(|| DataSourceRpcError::Protocol {
             reason: "Missing transaction".to_string(),
         })?;
+    let embedded_signature = proto_tx.signatures.into_iter().next();
     let proto_message = proto_tx
         .message
         .ok_or_else(|| DataSourceRpcError::Protocol {
@@ -2641,21 +3060,18 @@ async fn handle_transaction_info(
             reason: format!("Failed to create message: {}", e),
         })?;
 
-    // Get account keys and instructions
-    let (static_keys, instructions): (
-        Vec<Pubkey>,
-        Vec<solana_sdk::message::compiled_instruction::CompiledInstruction>,
-    ) = match &versioned_message {
-        VersionedMessage::Legacy(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
-        VersionedMessage::V0(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
-        // A v1 message carries the same static keys and instructions; only the
-        // compute budget moved into the message, and nothing here reads it.
-        VersionedMessage::V1(msg) => (msg.account_keys.clone(), msg.instructions.clone()),
-    };
+    let signature = bs58::encode(&tx_info.signature).into_string();
 
-    // Full account list (static message keys, then loaded writable, then readonly) that inner and v0 top-level account indices reference.
-    let mut account_keys = static_keys;
-    account_keys.extend(loaded_pubkeys);
+    // Checked on every delivered transaction before scoping: a corrupt key list could
+    // otherwise hide our program or instance and make the transaction look unrelated.
+    let (account_keys, instructions) = validate_transaction(
+        &tx_info.signature,
+        embedded_signature.as_deref(),
+        meta,
+        &versioned_message,
+        program_id,
+    )
+    .map_err(|reason| malformed_tx(program_type, slot, &signature, reason))?;
 
     // Scope to our own escrow instance before parsing anything, matching the RPC decoder.
     // Without this the live stream fails the block on a foreign instance's undecodable
@@ -2667,6 +3083,20 @@ async fn handle_transaction_info(
         }
     }
 
+    // Without inner metadata a CPI into our program is invisible, so the slot cannot be proven.
+    if meta.inner_instructions_none {
+        return Err(malformed_tx(
+            program_type,
+            slot,
+            &signature,
+            "inner instructions are marked unavailable".to_string(),
+        ));
+    }
+
+    // Indices were checked above, so these conversions only fail on a bug.
+    let inner_instructions_vec = convert_inner_instructions(&meta.inner_instructions)
+        .map_err(|reason| malformed_tx(program_type, slot, &signature, reason))?;
+
     info!(
         "Yellowstone received transaction at slot {}, signature: {}, {} instructions",
         slot,
@@ -2676,16 +3106,8 @@ async fn handle_transaction_info(
 
     // Parse each top-level instruction that belongs to our program.
     for (ix_index, instruction) in instructions.into_iter().enumerate() {
-        let program_id_index = instruction.program_id_index as usize;
-        if program_id_index >= account_keys.len() {
-            error!(
-                "Invalid program_id_index {} for transaction {}",
-                program_id_index, signature
-            );
-            continue;
-        }
-
-        if account_keys[program_id_index] != *program_id {
+        // In range: validate_transaction checked every program index.
+        if account_keys[instruction.program_id_index as usize] != *program_id {
             continue; // Not our program
         }
 
@@ -2745,6 +3167,187 @@ async fn handle_transaction_info(
     }
 
     Ok(())
+}
+
+/// The last block a connection forwarded, which the next live block must name as its parent.
+struct ForwardedBlock {
+    slot: u64,
+    blockhash: String,
+}
+
+/// Why a live block cannot be forwarded as it is.
+#[derive(Debug)]
+enum LinkBreak {
+    /// Blocks between the last forwarded one and this parent never arrived; RPC can fill them.
+    Hole(String),
+    /// The parent contradicts a block already forwarded, so this block belongs to another fork.
+    Fork(String),
+}
+
+/// Proves a live block leaves no hole and contradicts nothing forwarded: its parent is the last
+/// forwarded block, or a slot the reconnect gap-fill covers that no forwarded block sits past.
+fn check_block_link(
+    last: Option<&ForwardedBlock>,
+    gate_target: Option<u64>,
+    slot: u64,
+    parent_slot: u64,
+    parent_blockhash: &str,
+) -> Result<(), LinkBreak> {
+    let covered = |s: u64| gate_target.is_some_and(|target| s <= target);
+    let Some(prev) = last else {
+        // Without RPC repair there is nothing to link the first block to.
+        return match gate_target {
+            Some(target) if parent_slot > target => Err(LinkBreak::Hole(format!(
+                "parent {parent_slot} is past the gap-fill target {target}"
+            ))),
+            _ => Ok(()),
+        };
+    };
+    if prev.slot == parent_slot && prev.blockhash == parent_blockhash {
+        return Ok(());
+    }
+    if parent_slot > prev.slot {
+        if covered(parent_slot) {
+            return Ok(());
+        }
+        return Err(LinkBreak::Hole(format!(
+            "parent {parent_slot} is past the last forwarded block {}",
+            prev.slot
+        )));
+    }
+    // A block below the last forwarded one, inside the range RPC re-reads, is a late delivery.
+    if slot < prev.slot && covered(slot) {
+        return Ok(());
+    }
+    Err(LinkBreak::Fork(format!(
+        "block {slot} names parent {parent_slot} ({parent_blockhash}), which contradicts the last forwarded block {} ({})",
+        prev.slot, prev.blockhash
+    )))
+}
+
+/// Runs the shared structural checks on one delivered transaction and returns its full key
+/// list (static, then loaded writable, then loaded readonly) and its top-level instructions.
+fn validate_transaction(
+    signature: &[u8],
+    embedded_signature: Option<&[u8]>,
+    meta: &yellowstone_grpc_proto::prelude::TransactionStatusMeta,
+    message: &VersionedMessage,
+    program_id: &Pubkey,
+) -> Result<
+    (
+        Vec<Pubkey>,
+        Vec<solana_sdk::message::compiled_instruction::CompiledInstruction>,
+    ),
+    String,
+> {
+    let (static_keys, instructions, expected_loaded) = match message {
+        VersionedMessage::Legacy(msg) => (&msg.account_keys, &msg.instructions, (0, 0)),
+        VersionedMessage::V0(msg) => (
+            &msg.account_keys,
+            &msg.instructions,
+            msg.address_table_lookups
+                .iter()
+                .fold((0, 0), |(writable, readonly), lookup| {
+                    (
+                        writable + lookup.writable_indexes.len(),
+                        readonly + lookup.readonly_indexes.len(),
+                    )
+                }),
+        ),
+        // A v1 message has no lookup tables, so it loads nothing.
+        VersionedMessage::V1(msg) => (&msg.account_keys, &msg.instructions, (0, 0)),
+    };
+
+    check_loaded_counts(
+        expected_loaded,
+        meta.loaded_writable_addresses.len(),
+        meta.loaded_readonly_addresses.len(),
+    )?;
+    // Order matters: writable then readonly, matching execution order.
+    let loaded_keys = meta
+        .loaded_writable_addresses
+        .iter()
+        .chain(meta.loaded_readonly_addresses.iter())
+        .map(|bytes| {
+            Pubkey::try_from(bytes.as_slice()).map_err(|e| format!("invalid loaded address: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    check_signature(signature)?;
+    if embedded_signature != Some(signature) {
+        return Err("signature does not match the transaction's first signature".to_string());
+    }
+
+    let mut account_keys = static_keys.clone();
+    account_keys.extend(loaded_keys);
+    let num_keys = account_keys.len();
+    for instruction in instructions {
+        check_instruction(
+            num_keys,
+            instruction.program_id_index.into(),
+            &instruction.accounts,
+        )?;
+    }
+    for inner_set in &meta.inner_instructions {
+        check_inner_set_index(inner_set.index, instructions.len())?;
+        for inner in &inner_set.instructions {
+            check_instruction(num_keys, inner.program_id_index, &inner.accounts)?;
+        }
+    }
+
+    // The block filter only delivers transactions that name our program.
+    if !account_keys.contains(program_id) {
+        return Err("delivered by our program filter but does not name our program".to_string());
+    }
+
+    Ok((account_keys, instructions.clone()))
+}
+
+/// Converts the proto inner instructions, refusing any index that does not fit its u8 field.
+fn convert_inner_instructions(
+    sets: &[yellowstone_grpc_proto::prelude::InnerInstructions],
+) -> Result<Vec<InnerInstructions>, String> {
+    let to_u8 =
+        |value: u32| u8::try_from(value).map_err(|_| format!("index {value} does not fit in a u8"));
+    sets.iter()
+        .map(|ix_set| {
+            Ok(InnerInstructions {
+                index: to_u8(ix_set.index)?,
+                instructions: ix_set
+                    .instructions
+                    .iter()
+                    .map(|ix| {
+                        Ok(InnerInstruction {
+                            instruction: CompiledInstruction {
+                                program_id_index: to_u8(ix.program_id_index)?,
+                                accounts: ix.accounts.clone(),
+                                data: bs58::encode(&ix.data).into_string(),
+                            },
+                            stack_height: ix.stack_height,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?,
+            })
+        })
+        .collect()
+}
+
+/// Logs and counts a malformed transaction, and returns the error that withholds its slot.
+fn malformed_tx(
+    program_type: ProgramType,
+    slot: u64,
+    signature: &str,
+    reason: String,
+) -> DataSourceRpcError {
+    error!(
+        "Slot {slot} transaction {signature} is malformed: {reason}; refusing to complete the slot"
+    );
+    metrics::INDEXER_RPC_ERRORS
+        .with_label_values(&[program_type.as_label(), "malformed_tx_stream"])
+        .inc();
+    DataSourceRpcError::Protocol {
+        reason: format!("slot {slot} transaction {signature} is malformed: {reason}"),
+    }
 }
 
 /// Whether an inner (CPI) instruction's discriminator is one the indexer skips,

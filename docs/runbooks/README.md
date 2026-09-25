@@ -138,6 +138,8 @@ The runbooks call this out at every relevant site.
   checkpoint past a slot holding an instruction it supports but cannot decode.
   Paged by the `indexer-parse-failed` Grafana alert. Retrying the same endpoint
   re-parses the same bytes, so only a fuller data source or a code fix clears it.
+  Also covers `malformed_tx`, `empty_block_unconfirmed`, `malformed_tx_stream` and
+  `chain_break_stream`: provider data a real validator cannot produce.
 - [`mint_memo_cutover.md`](mint_memo_cutover.md) - a resync aborting because a
   channel mint carries a legacy-scheme idempotency memo. Log-discovered, not
   paged; the resync fails closed before dropping anything, so the database is

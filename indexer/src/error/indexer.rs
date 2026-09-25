@@ -209,6 +209,13 @@ pub enum BackfillError {
     #[error("Slot {slot} transaction {signature} is missing metadata; block is incomplete")]
     MissingMeta { slot: u64, signature: String },
 
+    #[error("Slot {slot} transaction {signature} meta is missing `{field}`; block is incomplete")]
+    MissingMetaField {
+        slot: u64,
+        signature: String,
+        field: &'static str,
+    },
+
     #[error("Slot {slot} transaction {signature} instruction {instruction_index} (inner {inner_index:?}) will not decode, so the slot's contents are unknown: {reason}")]
     InstructionUndecodable {
         slot: u64,
@@ -217,6 +224,18 @@ pub enum BackfillError {
         inner_index: Option<u32>,
         reason: String,
     },
+
+    #[error("Slot {slot} transaction {signature} is malformed, so the slot's contents are unknown: {reason}")]
+    Malformed {
+        slot: u64,
+        signature: String,
+        reason: String,
+    },
+
+    #[error(
+        "Slot {slot} came back with no transactions and could not be confirmed empty: {reason}"
+    )]
+    EmptyUnconfirmed { slot: u64, reason: String },
 
     #[error("Slot {slot} is unavailable: a block exists here that this endpoint will not serve, so its contents are unknown")]
     SlotUnavailable { slot: u64 },

@@ -9,6 +9,14 @@ pub mod pubkey {
         bytes[0] = seed;
         Pubkey::new_from_array(bytes)
     }
+
+    /// A valid base58 signature derived from a readable label, so tests keep naming their transactions.
+    pub fn test_sig(label: &str) -> String {
+        let mut bytes = [0u8; 64];
+        let label = label.as_bytes();
+        bytes[..label.len()].copy_from_slice(label);
+        bs58::encode(bytes).into_string()
+    }
 }
 
 #[cfg(feature = "datasource-rpc")]
@@ -16,9 +24,11 @@ pub mod pubkey {
 pub mod rpc_blocks {
     use crate::indexer::datasource::common::types::CompiledInstruction;
     use crate::indexer::datasource::rpc_polling::types::{
-        EncodedMessage, EncodedTransaction, RpcBlock, RpcTransactionWithMeta, TransactionMeta,
+        EncodedMessage, EncodedTransaction, Reported, RpcBlock, RpcTransactionWithMeta,
+        TransactionMeta,
     };
     use crate::test_utils::pubkey;
+    use solana_transaction_status::UiLoadedAddresses;
 
     /// Create an empty test block with default values
     pub fn create_test_block() -> RpcBlock {
@@ -38,26 +48,36 @@ pub mod rpc_blocks {
     ) -> RpcTransactionWithMeta {
         let meta = if is_failed {
             Some(TransactionMeta {
-                err: Some(serde_json::json!({"InstructionError": [0, "Custom(1)"]})),
+                err: Reported::Present(Some(
+                    serde_json::json!({"InstructionError": [0, "Custom(1)"]}),
+                )),
                 log_messages: None,
-                inner_instructions: None,
-                loaded_addresses: None,
+                inner_instructions: Reported::Present(None),
+                loaded_addresses: Some(UiLoadedAddresses {
+                    writable: vec![],
+                    readonly: vec![],
+                }),
             })
         } else {
+            // A Solana node that records CPIs returns an empty list, not null.
             Some(TransactionMeta {
-                err: None,
+                err: Reported::Present(None),
                 log_messages: None,
-                inner_instructions: None,
-                loaded_addresses: None,
+                inner_instructions: Reported::Present(Some(vec![])),
+                loaded_addresses: Some(UiLoadedAddresses {
+                    writable: vec![],
+                    readonly: vec![],
+                }),
             })
         };
 
         RpcTransactionWithMeta {
             transaction: EncodedTransaction {
-                signatures: vec![signature],
+                signatures: vec![pubkey::test_sig(&signature)],
                 message: EncodedMessage {
                     account_keys,
                     instructions,
+                    address_table_lookups: None,
                 },
             },
             meta,
@@ -90,10 +110,11 @@ pub mod rpc_blocks {
     ) -> RpcTransactionWithMeta {
         RpcTransactionWithMeta {
             transaction: EncodedTransaction {
-                signatures: vec![signature],
+                signatures: vec![pubkey::test_sig(&signature)],
                 message: EncodedMessage {
                     account_keys,
                     instructions,
+                    address_table_lookups: None,
                 },
             },
             meta: None,
@@ -109,7 +130,7 @@ pub mod rpc_blocks {
     ) -> RpcTransactionWithMeta {
         let mut tx = create_successful_transaction(signature, account_keys, instructions);
         if let Some(meta) = tx.meta.as_mut() {
-            meta.inner_instructions = None;
+            meta.inner_instructions = Reported::Present(None);
         }
         tx
     }
@@ -253,7 +274,7 @@ pub mod rpc_mocks {
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJson(json!({
                 "method": "getBlock",
-                "params": [slot]
+                "params": [slot, { "transactionDetails": "full" }]
             })))
             .with_status(200)
             .with_body(
@@ -263,6 +284,35 @@ pub mod rpc_mocks {
                         "blockhash": format!("TestBlockHash{slot}"),
                         "parentSlot": parent_slot,
                         "transactions": []
+                    },
+                    "id": 1
+                })
+                .to_string(),
+            )
+            .create()
+    }
+
+    /// Mock the signatures view of `getBlock(slot)`, the shape an escrow empty block is confirmed with.
+    pub fn mock_get_block_signatures(
+        server: &mut Server,
+        slot: u64,
+        blockhash: &str,
+        signatures: Vec<String>,
+    ) -> Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "method": "getBlock",
+                "params": [slot, { "transactionDetails": "signatures" }]
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "blockhash": blockhash,
+                        "parentSlot": slot.saturating_sub(1),
+                        "signatures": signatures
                     },
                     "id": 1
                 })
@@ -318,7 +368,7 @@ pub mod rpc_mocks {
                         "parentSlot": parent_slot,
                         "transactions": [{
                             "transaction": {
-                                "signatures": [format!("sig_deposit_slot_{slot}")],
+                                "signatures": [crate::test_utils::pubkey::test_sig(&format!("sig_deposit_slot_{slot}"))],
                                 "message": {
                                     "accountKeys": account_keys,
                                     "instructions": [{
@@ -331,7 +381,7 @@ pub mod rpc_mocks {
                             "meta": {
                                 "err": null,
                                 "logMessages": null,
-                                "loadedAddresses": null,
+                                "loadedAddresses": { "writable": [], "readonly": [] },
                                 "innerInstructions": [{
                                     "index": 0,
                                     "instructions": [{
@@ -389,6 +439,13 @@ pub mod rpc_mocks {
         ];
         for (slot, parent) in producers {
             mocks.push(mock_get_block_at(server, *slot, *parent));
+            // Confirms each empty block for an escrow consumer.
+            mocks.push(mock_get_block_signatures(
+                server,
+                *slot,
+                &format!("TestBlockHash{slot}"),
+                vec![],
+            ));
         }
         mocks
     }

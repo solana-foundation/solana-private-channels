@@ -1,4 +1,5 @@
 pub use super::models::*;
+pub use claim_remint_attempt::RemintClaim;
 pub use try_requeue_prebroadcast::RequeueOutcome;
 
 pub mod bump_pending_remint_finality_attempt;
@@ -720,8 +721,8 @@ impl Storage {
     /// Claim the exclusive right to broadcast one remint attempt for a
     /// transaction, persisting the signature write-ahead in the same step.
     /// `superseded_signatures` are prior attempts the caller has already proven
-    /// dead on-chain. `Ok(false)` means another sender owns the live attempt,
-    /// so the caller must not broadcast.
+    /// dead on-chain. Anything but `RemintClaim::Claimed` means the caller must
+    /// not broadcast.
     pub async fn claim_remint_attempt(
         &self,
         transaction_id: i64,
@@ -729,7 +730,7 @@ impl Storage {
         last_valid_block_height: i64,
         blockhash_slot: Option<i64>,
         superseded_signatures: &[String],
-    ) -> Result<bool, StorageError> {
+    ) -> Result<RemintClaim, StorageError> {
         claim_remint_attempt::claim_remint_attempt(
             self,
             transaction_id,

@@ -12,9 +12,12 @@ use crate::{
     },
     operator::{instruction_util::SourceEventId, ConsumedMint, ConsumedMintKind, ConsumedSet},
     storage::{
-        common::models::{
-            DbMint, DbMintStatus, DbObservedRelease, DbTransaction, DbTransactionBuilder,
-            TransactionStatus, TransactionType,
+        common::{
+            amount::TokenAmount,
+            models::{
+                DbMint, DbMintStatus, DbObservedRelease, DbTransaction, DbTransactionBuilder,
+                TransactionStatus, TransactionType,
+            },
         },
         Storage,
     },
@@ -737,9 +740,7 @@ fn convert_to_db_models(
                         withdrawal_nonce: data.transaction_nonce as i64,
                         signature: signature.clone(),
                         slot: instruction_meta.slot as i64,
-                        // Saturating, not wrapping: an amount past i64 would otherwise
-                        // record negative, and the query caps it at the row's own amount.
-                        amount: Some(i64::try_from(data.amount).unwrap_or(i64::MAX)),
+                        amount: Some(TokenAmount(data.amount)),
                     }),
                 ),
                 _ => (None, None, None, None),
@@ -974,14 +975,22 @@ mod tests {
         slot: u64,
         sig: Option<String>,
         nonce: u64,
+        amount: u64,
     ) -> InstructionWithMetadata {
-        make_release_funds_instruction_on_instance(slot, sig, nonce, release_funds_instance())
+        make_release_funds_instruction_on_instance(
+            slot,
+            sig,
+            nonce,
+            amount,
+            release_funds_instance(),
+        )
     }
 
     fn make_release_funds_instruction_on_instance(
         slot: u64,
         sig: Option<String>,
         nonce: u64,
+        amount: u64,
         instance: Pubkey,
     ) -> InstructionWithMetadata {
         InstructionWithMetadata {
@@ -1002,7 +1011,7 @@ mod tests {
                     private_channel_escrow_program: make_pubkey(20),
                 },
                 data: ReleaseFundsData {
-                    amount: 750,
+                    amount,
                     user: make_pubkey(1),
                     transaction_nonce: nonce,
                 },
@@ -1419,10 +1428,12 @@ mod tests {
         nonce: u64,
         slot: u64,
         signature: &'static str,
+        amount: u64,
     }
 
     /// The refund gate reads this record, so a release the indexer saw land has
-    /// to reach storage with its nonce, signature and slot intact.
+    /// to reach storage with its nonce, signature and slot intact. Reconciliation
+    /// subtracts its amount, so that must survive the full u64 range too.
     #[tokio::test]
     async fn finalize_records_observed_release() {
         let cases = [
@@ -1431,12 +1442,28 @@ mod tests {
                 nonce: 42,
                 slot: 300,
                 signature: "sig-release-current",
+                amount: 750,
             },
             ObservedReleaseCase {
                 label: "later release",
                 nonce: 43,
                 slot: 301,
                 signature: "sig-release-later",
+                amount: 750,
+            },
+            ObservedReleaseCase {
+                label: "release just past i64::MAX",
+                nonce: 47,
+                slot: 302,
+                signature: "sig-release-past-i64",
+                amount: i64::MAX as u64 + 1,
+            },
+            ObservedReleaseCase {
+                label: "release of u64::MAX",
+                nonce: 48,
+                slot: 303,
+                signature: "sig-release-u64-max",
+                amount: u64::MAX,
             },
         ];
 
@@ -1447,6 +1474,7 @@ mod tests {
                 case.slot,
                 Some(case.signature.to_string()),
                 case.nonce,
+                case.amount,
             ));
             processor
                 .finalize_and_checkpoint(case.slot, ProgramType::Escrow)
@@ -1465,6 +1493,12 @@ mod tests {
             );
             assert_eq!(recorded.signature, case.signature, "{}", case.label);
             assert_eq!(recorded.slot, case.slot as i64, "{}", case.label);
+            assert_eq!(
+                recorded.amount,
+                Some(TokenAmount(case.amount)),
+                "{}",
+                case.label
+            );
 
             let cp = recv_slot(&mut checkpoint_rx).await;
             assert_eq!(cp.slot, case.slot, "{}", case.label);
@@ -1485,6 +1519,7 @@ mod tests {
                 310,
                 Some("sig-release-replay".to_string()),
                 44,
+                750,
             ));
             processor
                 .finalize_and_checkpoint(310, ProgramType::Escrow)
@@ -1510,6 +1545,7 @@ mod tests {
             320,
             Some("sig-release-foreign".to_string()),
             45,
+            750,
             make_pubkey(99),
         ));
         processor
@@ -1535,6 +1571,7 @@ mod tests {
             330,
             Some("sig-release-fail".to_string()),
             46,
+            750,
         ));
         let result = processor
             .finalize_and_checkpoint(330, ProgramType::Escrow)

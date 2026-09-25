@@ -375,7 +375,7 @@ groups:
         noDataState: OK
         execErrState: Error
         annotations:
-          summary: "Indexer {{ $labels.program_type }} is rejecting a slot whose transactions are missing metadata (meta: null); the checkpoint cannot advance past it. Repoint the datasource RPC (or configure an archival fallback_rpc_url) at a full-history endpoint. This catches the sustained live-polling wedge; a backfill or resync hitting missing metadata instead aborts loudly with a MissingMeta error in the logs rather than sustaining this metric."
+          summary: "Indexer {{ $labels.program_type }} is rejecting a slot whose transactions are missing metadata (meta: null, or meta without its err, innerInstructions or loadedAddresses key); the checkpoint cannot advance past it. Repoint the datasource RPC (or configure an archival fallback_rpc_url) at a full-history endpoint. This catches the sustained live-polling wedge; a backfill or resync hitting missing metadata instead aborts loudly with a MissingMeta or MissingMetaField error in the logs rather than sustaining this metric."
         labels:
           severity: critical
         data:
@@ -464,6 +464,162 @@ groups:
             datasourceUid: prometheus
             model:
               expr: rate(private_channel_indexer_rpc_errors_total{error_type="parse_failed_stream"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-malformed-tx-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-malformed-tx
+        title: "Indexer received a malformed transaction and will not advance"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} got a block holding a successful transaction that breaks a rule the Solana runtime enforces (signature, account keys, indices, loaded addresses, or escrow inner instructions), so the provider corrupted it and the indexer is refusing to checkpoint past that slot. The fallback was tried if configured. Repoint the datasource at a correct endpoint. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="malformed_tx"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-empty-block-unconfirmed-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-empty-block-unconfirmed
+        title: "Indexer cannot confirm an empty escrow block and will not advance"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} got an escrow block with no transactions whose signatures view listed some or named another blockhash, so the list may have been truncated and the indexer is refusing to checkpoint past that slot. The fallback was tried if configured. Repoint the datasource at a correct endpoint. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: critical
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="empty_block_unconfirmed"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-malformed-tx-stream-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-malformed-tx-stream
+        title: "Indexer geyser stream keeps delivering malformed transactions"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} keeps receiving malformed transactions on its geyser stream. No data is lost: each affected slot is re-read over RPC by the gap-fill. A steady rate means the provider is corrupting its feed; switch provider or datasource. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="malformed_tx_stream"}[5m])
+              instant: true
+              refId: A
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+              refId: C
+
+  - orgId: 1
+    name: indexer-chain-break-stream-alerts
+    folder: Solana Private Channels Alerts
+    interval: 1m
+    rules:
+      - uid: indexer-chain-break-stream
+        title: "Indexer geyser stream keeps dropping blocks"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        annotations:
+          summary: "Indexer {{ $labels.program_type }} keeps receiving geyser blocks whose parent is not the last block it forwarded, so the provider is dropping finalized blocks. Each hole is re-read over RPC by the gap-fill, but if drops outpace fills the checkpoint stops moving. Switch provider or datasource. See docs/runbooks/indexer_parse_failed.md."
+        labels:
+          severity: warning
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: rate(private_channel_indexer_rpc_errors_total{error_type="chain_break_stream"}[5m])
               instant: true
               refId: A
           - refId: C

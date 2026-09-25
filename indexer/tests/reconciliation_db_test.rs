@@ -156,7 +156,7 @@ async fn observe_release_of(
             withdrawal_nonce: nonce,
             signature: format!("release_{nonce}"),
             slot,
-            amount: Some(amount as i64),
+            amount: Some(TokenAmount(amount)),
         }])
         .await?;
     Ok(())
@@ -412,6 +412,30 @@ async fn an_over_release_discharges_no_more_than_the_row_owed(
         withdrawals_at(&storage, &mint, u64::MAX).await?,
         BigDecimal::from(100u64)
     );
+    Ok(())
+}
+
+/// A release past `i64::MAX` is still a valid `u64` payout. Recording less than it moved
+/// would leave phantom liability behind and trip a false insolvency halt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_past_i64_max_subtracts_its_full_amount() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (pool, storage, _pg) = start_postgres().await?;
+
+    for amount in [i64::MAX as u64 + 1, u64::MAX] {
+        let mint = Pubkey::new_unique().to_string();
+        insert_mint(&pool, &mint, 6, &spl_token::id().to_string()).await?;
+
+        let signature = format!("w_large_{amount}");
+        let nonce = insert_withdrawal(&pool, &signature, &mint, amount, "processing", 100).await?;
+        observe_release_of(&storage, nonce, 100, amount).await?;
+
+        assert_eq!(
+            withdrawals_at(&storage, &mint, u64::MAX).await?,
+            BigDecimal::from(amount),
+            "release of {amount} must subtract in full"
+        );
+    }
     Ok(())
 }
 
