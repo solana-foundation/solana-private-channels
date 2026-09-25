@@ -1,7 +1,17 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
 
+/// Outcome of a remint claim. Only `Claimed` authorizes a broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemintClaim {
+    /// The caller owns the live attempt and may broadcast.
+    Claimed,
+    /// Another sender owns the live attempt.
+    HeldElsewhere,
+    /// The row is no longer `pending_remint`, so there is nothing left to refund.
+    RowMoved,
+}
+
 /// Claim the exclusive right to broadcast one remint attempt.
-/// `Ok(false)` means another sender owns the live attempt: do not broadcast.
 pub async fn claim_remint_attempt(
     storage: &Storage,
     transaction_id: i64,
@@ -9,7 +19,7 @@ pub async fn claim_remint_attempt(
     last_valid_block_height: i64,
     blockhash_slot: Option<i64>,
     superseded_signatures: &[String],
-) -> Result<bool, StorageError> {
+) -> Result<RemintClaim, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db
             .claim_remint_attempt_internal(

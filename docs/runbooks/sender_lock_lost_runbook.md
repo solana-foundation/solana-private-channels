@@ -24,7 +24,8 @@ Every query below is **read-only**. There is no recovery SQL for this condition.
 
 ## What the operator does automatically
 
-The sender takes a per-role session advisory lock at startup and then re-proves
+The operator takes a per-role session advisory lock at startup, before its boot
+pre-flight, hands it to the sender, and then re-proves
 ownership on a fixed interval (default 5s) by reading `pg_locks` on that same
 pinned connection. Sender-owned failure-path writes also execute on that
 connection, so each of them is its own ownership proof.
@@ -95,8 +96,7 @@ WHERE l.locktype = 'advisory'
 
 Expect at most one row per key. **Two rows for one key is impossible** and means
 the query was run against the wrong database. Zero rows for a key whose operator
-is running means that operator has not reached its sender yet, or is refusing to
-start.
+is running means that operator is still starting up, or is refusing to start.
 
 `client_addr` is the important column: if it does not match the pod you expect,
 a second operator exists.

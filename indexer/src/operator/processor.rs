@@ -146,11 +146,11 @@ fn classify_processor_error(err: &OperatorError) -> ErrorDisposition {
         OperatorError::Program(_) => ErrorDisposition::Quarantine("program_error"),
         // MissingBuilder means the processor was constructed without the state it
         // needs — configuration bug, not a row problem.  Exit to surface it.
-        // SenderAlreadyRunning is a sender-startup error and never reaches the
-        // processor, but it's Fatal in spirit, so classify it alongside.
-        OperatorError::MissingBuilder | OperatorError::SenderAlreadyRunning { .. } => {
-            ErrorDisposition::Fatal
-        }
+        // The sender-lock errors are startup errors and never reach the processor,
+        // but they're Fatal in spirit, so classify them alongside.
+        OperatorError::MissingBuilder
+        | OperatorError::SenderAlreadyRunning { .. }
+        | OperatorError::SenderLockLostAtBoot { .. } => ErrorDisposition::Fatal,
         // A dead downstream channel means the sender or storage writer died; the
         // supervisor handles this by aborting the whole operator.
         OperatorError::ChannelSend(_)
