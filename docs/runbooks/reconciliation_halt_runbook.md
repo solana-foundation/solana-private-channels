@@ -118,6 +118,10 @@ building: look for `halt pending confirmation` warnings and a nonzero
 counting toward its third tick has not quarantined anything yet, so clearing the
 flag then would let withdrawals of that mint go out.
 
+When there are more than 100 mints, custody is read in batches of 100 that can
+answer at different slots. Each mint is compared with the ledger at the slot its
+own batch answered at, so this never makes a tick dark.
+
 ### Where the halt is enforced
 
 The halt flag is read at the top of the shared fetcher loop, so it freezes

@@ -12,7 +12,7 @@ use crate::metrics::{
     OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL, OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
 };
 use crate::operator::escrow_sweep::{
-    channel_anchor, fetch_channel_supply_at, fetch_escrow_custody, CustodySnapshot,
+    channel_anchor, fetch_channel_supply_at, fetch_escrow_custody, EscrowCustody,
 };
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
@@ -495,7 +495,8 @@ async fn check_invariants(
     // Rows are read whatever the wait outcome. A mint that appeared since the enumeration
     // has no supply reading, so the supply arm holds it as it holds any unread mint, while
     // the liability arm still sees it.
-    let (ledger_mints, liabilities) = fetch_ledger(storage, custody.slot).await?;
+    let (ledger_mints, liabilities) =
+        fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
 
     evaluate_and_maybe_halt(
@@ -652,6 +653,32 @@ async fn fetch_ledger(
         liabilities.insert(mint, ledger_liability(&row));
     }
     Ok((mints, liabilities))
+}
+
+/// The ledger for each mint at the slot its custody was read at; a mint with no custody
+/// slot uses `highest`.
+async fn fetch_ledger_at(
+    storage: &Arc<Storage>,
+    slots: &HashMap<Pubkey, u64>,
+    highest: u64,
+) -> Result<(HashSet<Pubkey>, HashMap<Pubkey, u64>), OperatorError> {
+    let mut by_slot = HashMap::new();
+    for slot in slots.values().copied().chain([highest]) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = by_slot.entry(slot) {
+            entry.insert(fetch_ledger(storage, slot).await?);
+        }
+    }
+    let (mints, at_highest) = &by_slot[&highest];
+    let mut all_mints = mints.clone();
+    let mut liabilities = at_highest.clone();
+    for (mint, slot) in slots {
+        let (slot_mints, at_slot) = &by_slot[slot];
+        all_mints.extend(slot_mints);
+        if let Some(&owed) = at_slot.get(mint) {
+            liabilities.insert(*mint, owed);
+        }
+    }
+    Ok((all_mints, liabilities))
 }
 
 /// Query the per-mint in-flight envelope (unsettled amount) as u64.
@@ -1108,26 +1135,12 @@ pub struct BalanceMismatch {
     pub delta_bps: u64,
 }
 
-/// Fetches on-chain token balances for all token accounts owned by the escrow
-///
-/// Queries the Solana RPC using `get_token_accounts_by_owner` to retrieve all SPL token accounts
-/// (both Token and Token-2022 programs) owned by the escrow instance. Returns a mapping of mint
-/// addresses to total balances, aggregating across multiple token accounts for the same mint if present.
-///
-/// # Arguments
-/// * `rpc_client` - RPC client with retry logic for on-chain queries
-/// * `escrow_instance_id` - Public key of the escrow account that owns the token accounts
-///
-/// # Returns
-/// * `CustodySnapshot` - Per-mint balances (smallest token units) and the slot they are valid at
-///
-/// # Errors
-/// Returns `OperatorError::RpcError` if the RPC call fails after retries or if token account data cannot be parsed
+/// Escrow custody for each known `(mint, token_program)`, read from the instance ATAs.
 async fn fetch_on_chain_balances(
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
     mints: &[(Pubkey, Pubkey)],
-) -> Result<CustodySnapshot, OperatorError> {
+) -> Result<EscrowCustody, OperatorError> {
     fetch_escrow_custody(rpc_client, escrow_instance_id, mints)
         .await
         .map_err(|e| OperatorError::RpcError(e.to_string()))
@@ -3980,6 +3993,45 @@ mod tests {
         assert_eq!(reason, "prior halt");
         assert_eq!(env.mock.calls("quarantine_active_withdrawals"), 0);
         alert.assert_async().await;
+    }
+
+    /// Each mint's liabilities come from the ledger at its own custody slot, one read per slot.
+    #[tokio::test]
+    async fn ledger_is_read_at_each_mints_custody_slot() {
+        let (a, b, late) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mock = MockStorage::new();
+        let rows = |deposits: u64| {
+            vec![
+                ledger_row(&a.to_string(), deposits, 0),
+                ledger_row(&b.to_string(), deposits, 0),
+                ledger_row(&late.to_string(), deposits, 0),
+            ]
+        };
+        mock.mint_balances_at
+            .lock()
+            .unwrap()
+            .extend([(7, rows(100)), (9, rows(900))]);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let slots = HashMap::from([(a, 7), (b, 9)]);
+
+        let (mints, liabilities) = fetch_ledger_at(&storage, &slots, 9).await.unwrap();
+
+        assert_eq!(liabilities[&a], 100, "a is compared at its slot 7");
+        assert_eq!(liabilities[&b], 900, "b is compared at its slot 9");
+        assert_eq!(
+            liabilities[&late], 900,
+            "a mint with no custody slot uses the highest"
+        );
+        assert_eq!(mints, HashSet::from([a, b, late]));
+        assert_eq!(
+            mock.calls("get_mint_balances_for_reconciliation"),
+            2,
+            "one read per distinct slot"
+        );
     }
 
     /// One tick like `run_tick_full`, but with a health handle so the forced-unhealthy latch shows.

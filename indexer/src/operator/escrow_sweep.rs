@@ -82,6 +82,17 @@ pub struct CustodySnapshot {
     pub slot: u64,
 }
 
+/// Escrow custody read from the instance ATAs, with the slot each mint's reading reflects.
+#[derive(Debug, Clone)]
+pub struct EscrowCustody {
+    /// Per-mint custody; a mint absent from the map holds zero on-chain.
+    pub balances: HashMap<Pubkey, u64>,
+    /// Slot each requested mint's balance was read at.
+    pub slots: HashMap<Pubkey, u64>,
+    /// Highest slot read, or the finalized slot when there are no mints.
+    pub slot: u64,
+}
+
 /// Attempts allowed to get both token-program sweeps to answer at the same slot. Set
 /// generously because running out is fatal, not a fallback: back-to-back finalized reads
 /// agree almost every time, so needing five means something is genuinely wrong.
@@ -143,7 +154,7 @@ pub async fn fetch_escrow_custody(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
     mints: &[(Pubkey, Pubkey)],
-) -> Result<CustodySnapshot, SweepFailure> {
+) -> Result<EscrowCustody, SweepFailure> {
     if mints.is_empty() {
         let slot = rpc_client
             .with_retry("get_slot", RetryPolicy::Idempotent, || async {
@@ -154,54 +165,37 @@ pub async fn fetch_escrow_custody(
             })
             .await
             .map_err(|e| read_failure(format!("Failed to read the finalized slot: {e}")))?;
-        return Ok(CustodySnapshot {
+        return Ok(EscrowCustody {
             balances: HashMap::new(),
+            slots: HashMap::new(),
             slot,
         });
     }
 
-    let mut attempt = 1;
-    loop {
-        let (balances, low, high) = read_custody_once(rpc_client, escrow_instance_id, mints)
-            .await
-            .map_err(SweepFailure::Read)?;
-        if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
-            attempt += 1;
-            continue;
-        }
-        if low != high {
-            warn!(
-                low_slot = low,
-                high_slot = high,
-                attempts = SWEEP_SLOT_AGREEMENT_ATTEMPTS,
-                "Escrow custody: ATA reads kept answering at different slots"
-            );
-            return Err(SweepFailure::SlotUnsettled {
-                attempts: SWEEP_SLOT_AGREEMENT_ATTEMPTS,
-                low,
-                high,
-            });
-        }
-        return Ok(CustodySnapshot {
-            balances,
-            slot: low,
-        });
-    }
+    // Each mint is compared with the ledger at its own slot, so chunks need not agree on one.
+    let (balances, slots) = read_custody_once(rpc_client, escrow_instance_id, mints)
+        .await
+        .map_err(SweepFailure::Read)?;
+    let slot = slots.values().copied().max().unwrap_or_default();
+    Ok(EscrowCustody {
+        balances,
+        slots,
+        slot,
+    })
 }
 
 fn read_failure(reason: String) -> SweepFailure {
     SweepFailure::Read(EscrowSweepError { reason })
 }
 
-/// One pass over every ATA. Returns the balances plus the lowest and highest slot seen.
+/// One pass over every ATA. Returns the balances plus the slot each mint was read at.
 async fn read_custody_once(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
     mints: &[(Pubkey, Pubkey)],
-) -> Result<(HashMap<Pubkey, u64>, u64, u64), EscrowSweepError> {
+) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), EscrowSweepError> {
     let mut balances = HashMap::new();
-    let mut lowest_slot = u64::MAX;
-    let mut highest_slot = 0u64;
+    let mut slots = HashMap::new();
 
     for chunk in mints.chunks(MAX_ACCOUNTS_PER_CALL) {
         let keys: Vec<String> = chunk
@@ -242,9 +236,9 @@ async fn read_custody_once(
                 ),
             });
         }
-        lowest_slot = lowest_slot.min(response.context.slot);
-        highest_slot = highest_slot.max(response.context.slot);
-
+        for (mint, _) in chunk {
+            slots.insert(*mint, response.context.slot);
+        }
         for ((mint, token_program), account) in chunk.iter().zip(response.value) {
             // No account at the ATA means the escrow holds none of this mint.
             let Some(account) = account else { continue };
@@ -253,7 +247,7 @@ async fn read_custody_once(
         }
     }
 
-    Ok((balances, lowest_slot, highest_slot))
+    Ok((balances, slots))
 }
 
 /// The balance of one escrow ATA, refusing anything that is not `mint`'s token account.
@@ -1217,9 +1211,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// More mints than one call takes are read in chunks that must share a slot.
+    /// More mints than one call takes are read in chunks, and each mint keeps its chunk's slot.
     #[tokio::test]
-    async fn custody_chunks_merge_only_at_one_slot() {
+    async fn custody_chunks_keep_each_mints_slot() {
         let instance = Pubkey::new_unique();
         let mints: Vec<(Pubkey, Pubkey)> = (0..101)
             .map(|_| (Pubkey::new_unique(), spl_token::id()))
@@ -1241,6 +1235,7 @@ pub(crate) mod tests {
         let sizes: Vec<usize> = requested.lock().unwrap().iter().map(Vec::len).collect();
         assert_eq!(sizes, vec![100, 1], "one call per 100 keys");
 
+        // Chunks answering at different slots are kept, each mint tagged with its own slot.
         let mut split = mockito::Server::new_async().await;
         let alternating = (0..20).map(|n| 10 + n % 2).collect();
         mock_multiple_accounts(
@@ -1250,11 +1245,13 @@ pub(crate) mod tests {
             Arc::new(Mutex::new(Vec::new())),
         )
         .await;
-        let result = fetch_escrow_custody(&client(&split.url()), instance, &mints).await;
-        assert!(
-            matches!(result, Err(SweepFailure::SlotUnsettled { .. })),
-            "{result:?}"
-        );
+        let custody = fetch_escrow_custody(&client(&split.url()), instance, &mints)
+            .await
+            .unwrap();
+        assert_eq!(custody.slots[&mints[0].0], 10);
+        assert_eq!(custody.slots[&held], 11);
+        assert_eq!(custody.slot, 11, "the highest slot read");
+        assert_eq!(custody.balances[&held], 9);
     }
 
     /// With no mints there is nothing to read, but the snapshot still needs a slot to pin the ledger.

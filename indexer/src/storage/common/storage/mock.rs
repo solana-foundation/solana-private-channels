@@ -40,6 +40,8 @@ pub struct MockStorage {
     /// bound reached storage. The stored balances are pre-aggregated with no slot of
     /// their own, so the mock records the bound rather than applying it.
     pub last_reconciliation_slot: std::sync::Arc<Mutex<Option<u64>>>,
+    /// Rows a pinned reconciliation read answers with at one slot, overriding `mint_balances`.
+    pub mint_balances_at: std::sync::Arc<Mutex<HashMap<u64, Vec<MintDbBalance>>>>,
     pub pending_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
     pub inserted_transactions: std::sync::Arc<Mutex<Vec<Vec<DbTransaction>>>>,
     pub inserted_single_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
@@ -443,6 +445,9 @@ impl MockStorage {
     ) -> Result<Vec<MintDbBalance>, StorageError> {
         self.check_should_fail("get_mint_balances_for_reconciliation")?;
         *self.last_reconciliation_slot.lock().unwrap() = Some(as_of_slot);
+        if let Some(rows) = self.mint_balances_at.lock().unwrap().get(&as_of_slot) {
+            return Ok(rows.clone());
+        }
         Ok(self.mint_balances.lock().unwrap().clone())
     }
 
