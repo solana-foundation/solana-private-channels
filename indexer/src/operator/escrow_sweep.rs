@@ -215,7 +215,8 @@ async fn read_custody_once(
                 .to_string()
             })
             .collect();
-        // Raw request so an account that will not decode is an error, never "absent".
+        // Raw request so an account that will not decode is an error, never "absent". A backend
+        // below `anchor` refuses with -32016, which is retried rather than read as stale.
         let response = rpc_client
             .with_retry("get_multiple_accounts", RetryPolicy::Idempotent, || async {
                 rpc_client
@@ -224,7 +225,7 @@ async fn read_custody_once(
                         RpcRequest::GetMultipleAccounts,
                         serde_json::json!([
                             keys,
-                            {"encoding": "base64", "commitment": "finalized"}
+                            {"encoding": "base64", "commitment": "finalized", "minContextSlot": anchor}
                         ]),
                     )
                     .await
@@ -437,6 +438,28 @@ pub async fn fetch_channel_supply_at(
         reason: format!("Failed to parse channel mint account {mint}: {e}"),
     })?;
     Ok((mint_state.supply, slot))
+}
+
+/// Extra reads a channel supply answer behind the anchor gets before it counts as stale.
+pub const SUPPLY_REREADS: u32 = 3;
+
+/// Channel supply for `mint`, re-read with the client's backoff while it answers behind
+/// `anchor`, since the node ignores `minContextSlot`. The last answer is returned either way.
+pub async fn fetch_fresh_channel_supply(
+    channel_rpc: &RpcClientWithRetry,
+    mint: &Pubkey,
+    anchor: u64,
+) -> Result<(u64, u64), EscrowSweepError> {
+    let retry = &channel_rpc.retry_config;
+    let mut read = fetch_channel_supply_at(channel_rpc, mint).await?;
+    for attempt in 0..SUPPLY_REREADS {
+        if read.1 >= anchor {
+            break;
+        }
+        tokio::time::sleep((retry.base_delay * 2_u32.pow(attempt)).min(retry.max_delay)).await;
+        read = fetch_channel_supply_at(channel_rpc, mint).await?;
+    }
+    Ok(read)
 }
 
 /// Oldest a chain's newest block may be, and how far its time may run ahead of ours, before
@@ -1308,6 +1331,94 @@ pub(crate) mod tests {
         }
     }
 
+    /// Answer `getMultipleAccounts` with -32016 for the first `lagging` calls, then with no
+    /// accounts at `slot`, recording each call's config.
+    async fn mock_multiple_accounts_min_slot(
+        server: &mut mockito::Server,
+        lagging: usize,
+        slot: u64,
+        configs: Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getMultipleAccounts"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                configs.lock().unwrap().push(body["params"][1].clone());
+                let n = body["params"][0].as_array().unwrap().len();
+                let reply = if calls.fetch_add(1, Ordering::SeqCst) < lagging {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {
+                        "code": -32016, "message": "Minimum context slot has not been reached"}})
+                } else {
+                    serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {
+                        "context": {"slot": slot}, "value": vec![serde_json::Value::Null; n]}})
+                };
+                reply.to_string().into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    /// A retrying client with no real backoff, so lag cases run fast.
+    fn retrying_client(url: &str, max_attempts: u32) -> RpcClientWithRetry {
+        RpcClientWithRetry::with_retry_config(
+            url.to_string(),
+            RetryConfig {
+                max_attempts,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(1),
+            },
+            CommitmentConfig::finalized(),
+        )
+    }
+
+    /// Custody asks the node for the anchor as its minimum slot, so a lagging backend refuses
+    /// instead of answering old, and a retry lands once it or another backend catches up.
+    #[tokio::test]
+    async fn custody_retries_a_backend_below_the_min_context_slot() {
+        let mut server = mockito::Server::new_async().await;
+        mock_channel_clock(&mut server, 50, vec![50], Some(1)).await;
+        let configs = Arc::new(Mutex::new(Vec::new()));
+        mock_multiple_accounts_min_slot(&mut server, 2, 50, configs.clone()).await;
+
+        let custody = fetch_escrow_custody(
+            &retrying_client(&server.url(), 5),
+            Pubkey::new_unique(),
+            &[(Pubkey::new_unique(), spl_token::id())],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(custody.slot, 50);
+        let configs = configs.lock().unwrap();
+        assert_eq!(configs.len(), 3, "two refusals then an answer");
+        assert!(
+            configs.iter().all(|c| c["minContextSlot"] == 50),
+            "{configs:?}"
+        );
+    }
+
+    /// A backend that never reaches the anchor still fails the read once retries run out.
+    #[tokio::test]
+    async fn custody_fails_when_the_backend_stays_below_the_min_context_slot() {
+        let mut server = mockito::Server::new_async().await;
+        mock_channel_clock(&mut server, 50, vec![50], Some(1)).await;
+        mock_multiple_accounts_min_slot(&mut server, usize::MAX, 50, Arc::default()).await;
+
+        let result = fetch_escrow_custody(
+            &retrying_client(&server.url(), 3),
+            Pubkey::new_unique(),
+            &[(Pubkey::new_unique(), spl_token::id())],
+        )
+        .await;
+
+        assert!(matches!(result, Err(SweepFailure::Read(_))), "{result:?}");
+    }
+
     /// Custody is only as fresh as the chain it is read from: an old newest block fails the read.
     #[tokio::test]
     async fn custody_requires_a_recent_chain_block() {
@@ -1503,5 +1614,62 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(got, (0, 77));
+    }
+
+    /// Answer every `getAccountInfo` with a mint of supply 7 at the next slot in `slots`,
+    /// repeating the last one, and count the calls.
+    async fn mock_supply_slots(server: &mut mockito::Server, slots: Vec<u64>) -> Arc<AtomicUsize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let slot = slots[n.min(slots.len() - 1)];
+                mint_account_body(7)
+                    .replace(r#""slot":1"#, &format!(r#""slot":{slot}"#))
+                    .into_bytes()
+            })
+            .create_async()
+            .await;
+        calls
+    }
+
+    /// The channel ignores `minContextSlot`, so a read behind the anchor is re-read until it
+    /// catches up.
+    #[tokio::test]
+    async fn fresh_supply_rereads_until_the_anchor() {
+        let mut server = mockito::Server::new_async().await;
+        let calls = mock_supply_slots(&mut server, vec![8, 9, 10]).await;
+
+        let got = fetch_fresh_channel_supply(
+            &retrying_client(&server.url(), 1),
+            &Pubkey::new_unique(),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, (7, 10));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Re-reads are bounded: a read that stays behind comes back behind, for the caller to refuse.
+    #[tokio::test]
+    async fn fresh_supply_gives_up_behind_the_anchor() {
+        let mut server = mockito::Server::new_async().await;
+        let calls = mock_supply_slots(&mut server, vec![8]).await;
+
+        let got = fetch_fresh_channel_supply(
+            &retrying_client(&server.url(), 1),
+            &Pubkey::new_unique(),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(got, (7, 8));
+        assert_eq!(calls.load(Ordering::SeqCst), 1 + SUPPLY_REREADS as usize);
     }
 }

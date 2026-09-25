@@ -66,9 +66,13 @@ invariant compares one instant.
 
 Channel supply is only used when it is fresh. Each tick first finds the channel's
 newest block and requires its block time to be under 120 s old, then accepts a
-supply read only if it was answered at or after that block. A channel node that
-is frozen, a read replica that lags, or a backend behind the others therefore
-gives no supply reading for that tick instead of an old one. This needs the
+supply read only if it was answered at or after that block. A read that answers
+behind is re-read up to three times with a short backoff, so a backend a few
+slots behind the others does not darken the tick. A channel node that is frozen
+or a read replica that stays behind therefore gives no supply reading for that
+tick instead of an old one. Custody reads send Solana's newest block as
+`minContextSlot`, so a lagging Solana backend refuses and the read is retried
+rather than failed. This needs the
 channel write node's clock and the operator's clock to agree to well within
 120 s (run NTP on both). Both checks use the same small bps cushion of
 custody; startup applies the same formula on top of `mismatch_threshold_raw`,

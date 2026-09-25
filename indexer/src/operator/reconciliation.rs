@@ -12,7 +12,7 @@ use crate::metrics::{
     OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL, OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
 };
 use crate::operator::escrow_sweep::{
-    channel_anchor, fetch_channel_supply_at, fetch_escrow_custody, EscrowCustody,
+    channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply, EscrowCustody,
 };
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
@@ -739,7 +739,7 @@ async fn load_halt_inputs(
     let mut supply = HashMap::new();
     let mut missing = None;
     for mint in mints {
-        let reason = match fetch_channel_supply_at(channel_rpc, mint).await {
+        let reason = match fetch_fresh_channel_supply(channel_rpc, mint, anchor).await {
             Ok((s, slot)) if slot >= anchor => {
                 supply.insert(*mint, s);
                 continue;
