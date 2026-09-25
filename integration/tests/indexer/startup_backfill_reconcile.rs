@@ -371,6 +371,7 @@ fn deposit_block_json(slot: u64, instance: Pubkey, mint: Pubkey, amount: u64) ->
             },
             "meta": {
                 "err": null,
+                "loadedAddresses": { "writable": [], "readonly": [] },
                 "innerInstructions": [{
                     "index": 0,
                     "instructions": [{
