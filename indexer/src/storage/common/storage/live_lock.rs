@@ -386,8 +386,8 @@ fn spawn_heartbeat(
 
 /// Run one startup step, refusing it if the live-state lock is lost while it runs.
 ///
-/// Biased, so a lock already lost refuses without starting the step. Used only before any
-/// writer is spawned, so stopping is just returning.
+/// Biased, so a lock already lost refuses without starting the step. It only drops the step,
+/// so a caller that already has a writer running must stop that writer itself.
 pub(crate) async fn under_live_lock<T, E>(
     lock_lost: &CancellationToken,
     step: impl Future<Output = Result<T, E>>,

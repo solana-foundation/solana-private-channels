@@ -414,4 +414,6 @@ async fn operator_stops_when_the_live_lock_is_lost_during_the_withdraw_preflight
     .await;
 
     assert_stopped_on_lock_loss(result);
+    // Only the preflight's first call reached RPC: no retry and no worker ran before the stop.
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
 }

@@ -217,14 +217,8 @@ pub async fn run(
         });
 
         if let Err(e) = preflight {
-            // A separate line so a lost lock is not read as a bitmap or RPC failure.
-            if live_lock_lost.is_cancelled() {
-                error!(
-                    "Live-state lock lost during the withdraw boot pre-flight; refusing to start"
-                );
-            } else {
-                error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
-            }
+            // Log the error itself, so a real divergence is never hidden by a later lock loss.
+            error!("Withdraw boot pre-flight failed, refusing to start: {}", e);
             stop_boot_writer(
                 &live_lock_lost,
                 &cancellation_token,
