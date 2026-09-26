@@ -12,6 +12,16 @@ pub async fn set_reconciliation_halt(storage: &Storage, reason: &str) -> Result<
     }
 }
 
+/// Set the halt for unreadable reconciliation inputs, never replacing an active insolvency halt.
+/// Returns false when an insolvency halt was already set and so kept.
+pub async fn set_outage_halt(storage: &Storage, reason: &str) -> Result<bool, StorageError> {
+    match storage {
+        Storage::Postgres(db) => Ok(db.set_outage_halt_internal(reason).await?),
+        #[cfg(any(test, feature = "test-mock-storage"))]
+        Storage::Mock(mock_db) => mock_db.set_outage_halt(reason).await,
+    }
+}
+
 /// Return the halt info when the flag is set, else `None`.
 pub async fn is_reconciliation_halted(storage: &Storage) -> Result<Option<HaltInfo>, StorageError> {
     match storage {

@@ -2174,6 +2174,112 @@ async fn claim_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// An active reconciliation halt refuses even a valid claim, so neither a mint nor
+/// a release can broadcast; clearing the halt lets the same token claim again.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_is_refused_while_halted() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let id = storage
+        .insert_db_transaction(&make_db_transaction(
+            "claim_halted",
+            TransactionType::Deposit,
+        ))
+        .await?;
+    storage
+        .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+        .await?;
+    let token = updated_at_of(&pool, id).await;
+
+    storage.set_reconciliation_halt("test halt").await?;
+    let refused = storage
+        .claim_and_persist_signature(id, token, "sig-halted".to_string(), 1, None)
+        .await?;
+    assert!(refused.is_none(), "a halted claim must not be granted");
+    assert!(storage.get_release_signatures(id).await?.is_empty());
+    assert_eq!(
+        updated_at_of(&pool, id).await,
+        token,
+        "a refused claim leaves updated_at unchanged"
+    );
+
+    storage.clear_reconciliation_halt().await?;
+    let granted = storage
+        .claim_and_persist_signature(id, token, "sig-cleared".to_string(), 1, None)
+        .await?;
+    assert!(
+        granted.is_some(),
+        "a cleared halt lets the same token claim"
+    );
+    assert_eq!(storage.get_release_signatures(id).await?.len(), 1);
+    Ok(())
+}
+
+/// A halt-refused row that never broadcast goes back to Pending without spending a
+/// requeue attempt; a row with a journaled attempt, a stale token or no halt stays put.
+#[tokio::test(flavor = "multi_thread")]
+async fn halted_claim_requeues_only_an_unsent_row() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let lock = |sig: &'static str| {
+        let storage = &storage;
+        let pool = &pool;
+        async move {
+            let id = storage
+                .insert_db_transaction(&make_db_transaction(sig, TransactionType::Deposit))
+                .await?;
+            storage
+                .get_and_lock_pending_transactions(TransactionType::Deposit, 100)
+                .await?;
+            sqlx::query("UPDATE transactions SET recovery_requeue_attempts = 3 WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            Ok::<_, Box<dyn std::error::Error>>((id, updated_at_of(pool, id).await))
+        }
+    };
+
+    let (unsent, unsent_token) = lock("requeue_unsent").await?;
+    assert!(
+        !storage.requeue_halted_claim(unsent, unsent_token).await?,
+        "no halt, no requeue"
+    );
+
+    let (journaled, journaled_token) = lock("requeue_journaled").await?;
+    let journaled_token = storage
+        .claim_and_persist_signature(journaled, journaled_token, "sig-sent".to_string(), 1, None)
+        .await?
+        .expect("claim before the halt");
+
+    storage.set_reconciliation_halt("test halt").await?;
+    let stale = unsent_token - chrono::Duration::seconds(1);
+    assert!(
+        !storage.requeue_halted_claim(unsent, stale).await?,
+        "stale token"
+    );
+    assert!(
+        !storage
+            .requeue_halted_claim(journaled, journaled_token)
+            .await?,
+        "a row that may have broadcast is left for recovery"
+    );
+    assert!(storage.requeue_halted_claim(unsent, unsent_token).await?);
+
+    let (status, attempts): (String, i32) = sqlx::query_as(
+        "SELECT status::text, recovery_requeue_attempts FROM transactions WHERE id = $1",
+    )
+    .bind(unsent)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(status, "pending");
+    assert_eq!(attempts, 3, "a halt spends no requeue attempt");
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status::text FROM transactions WHERE id = $1")
+            .bind(journaled)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(status, "processing");
+    Ok(())
+}
+
 /// Claiming the same signature twice yields a single row (ON CONFLICT
 /// (signature) DO NOTHING), even though each claim owns the current token.
 #[tokio::test(flavor = "multi_thread")]
@@ -3842,6 +3948,35 @@ async fn escrow_wipe_keeps_withdrawal_side() -> Result<(), Box<dyn std::error::E
         }
         other => panic!("workers must refuse an unfinished resync, got {other:?}"),
     }
+    Ok(())
+}
+
+/// A resync halt written over a cleared outage row must not be replaceable by a later outage halt.
+#[tokio::test(flavor = "multi_thread")]
+async fn outage_halt_never_replaces_a_resync_halt() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    assert!(storage.set_outage_halt("inputs unavailable").await?);
+    storage.clear_reconciliation_halt().await?;
+
+    let guard = take_live_lock(
+        &storage,
+        LiveLockMode::Exclusive,
+        "resync_kind",
+        Duration::ZERO,
+    )
+    .await?;
+    storage
+        .wipe_program_fenced(&guard, ProgramType::Escrow)
+        .await?;
+
+    assert!(
+        !storage.set_outage_halt("inputs unavailable").await?,
+        "an outage halt must not overwrite the resync halt"
+    );
+    assert_eq!(
+        active_halt(&pool).await,
+        Some(resync_halt_reason(ProgramType::Escrow))
+    );
     Ok(())
 }
 

@@ -4,8 +4,8 @@ use crate::{error::StorageError, storage::common::storage::Storage};
 /// mint and the withdrawal release. `Ok(Some(lease))` means the sender still owns
 /// the `Processing` incarnation it was handed and may broadcast; the returned
 /// lease is the row's new `updated_at`, which a later re-claim must present.
-/// `Ok(None)` means the row was demoted or re-locked so the builder must be
-/// dropped without broadcasting.
+/// `Ok(None)` means the row was demoted or re-locked, or a reconciliation halt is
+/// active, so the builder must be dropped without broadcasting.
 pub async fn claim_and_persist_signature(
     storage: &Storage,
     transaction_id: i64,
