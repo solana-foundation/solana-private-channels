@@ -323,8 +323,9 @@ mod tests {
         );
     }
 
-    /// Blocks commit while reads run; every deadline must belong to the hash it came with.
-    /// Each hash encodes its block's height, so a torn read shows as a mismatch.
+    /// Blocks commit while reads run; each hash encodes its height, so a torn read mismatches.
+    /// Old code fails only if a commit lands between its reads; the deterministic
+    /// regression is `latest_blockhash_never_mixes_cache_and_postgres`.
     #[tokio::test(flavor = "multi_thread")]
     async fn latest_blockhash_deadline_pairs_with_its_hash_under_load() {
         let hash_of = |height: u64| {

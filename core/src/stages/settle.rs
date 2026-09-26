@@ -493,6 +493,17 @@ pub async fn warm_redis_cache(
     Ok(purged)
 }
 
+/// What the startup warm-up left the AIO read path to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheState {
+    /// Purged and stamped for this ledger.
+    Aligned,
+    /// Not verified; the settler holds the handle paused and a probe restamps it later.
+    Recoverable,
+    /// The settler never connected and runs Postgres-only until restarted.
+    Disabled,
+}
+
 pub struct SettleArgs {
     pub execution_results_rx: mpsc::Receiver<ExecutedBatch>,
     pub settled_accounts_tx: SettledInbox,
@@ -520,9 +531,9 @@ pub struct SettleArgs {
     /// The slot last published to the DB, read by isBlockhashValid for its context.
     pub settled_slot: Arc<AtomicU64>,
     pub blockhash_progress: Arc<BlockhashProgress>,
-    /// Told whether the startup warm-up left the cache aligned, so an AIO read
-    /// path trusts Redis only after this settler has purged and stamped it.
-    pub cache_aligned: Option<oneshot::Sender<bool>>,
+    /// Told what the startup warm-up left the cache in, so an AIO read path
+    /// trusts Redis only after this settler has purged and stamped it.
+    pub cache_aligned: Option<oneshot::Sender<CacheState>>,
 }
 
 pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
@@ -564,7 +575,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             writer_epoch: Option<u64>,
             settled_slot: Arc<AtomicU64>,
             blockhash_progress: Arc<BlockhashProgress>,
-            cache_aligned: Option<oneshot::Sender<bool>>,
+            cache_aligned: Option<oneshot::Sender<CacheState>>,
         ) -> anyhow::Result<()> {
             info!("Settle worker started");
 
@@ -666,7 +677,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             // Align the cache with Postgres before the first dual-write. Failing
             // to verify it means the cache cannot be trusted, so run Postgres-only
             // rather than write a second ledger into it.
-            let mut aligned = false;
+            let mut cache_state = CacheState::Disabled;
             redis_db = match redis_db {
                 Some(redis) => {
                     match warm_redis_cache(
@@ -682,7 +693,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             if purged {
                                 metrics.redis_cache_purged();
                             }
-                            aligned = true;
+                            cache_state = CacheState::Aligned;
                             Some(redis)
                         }
                         Err(e) => {
@@ -702,6 +713,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
                             // recovers a cache lost at runtime also recovers one
                             // that could not be verified at boot.
                             redis.pause_mirroring(cache_mirror_cooldown);
+                            cache_state = CacheState::Recoverable;
                             Some(redis)
                         }
                     }
@@ -710,7 +722,7 @@ pub async fn start_settle_worker(args: SettleArgs) -> WorkerHandle {
             };
             // A dropped receiver means the node already gave up waiting.
             if let Some(tx) = cache_aligned {
-                let _ = tx.send(aligned);
+                let _ = tx.send(cache_state);
             }
 
             let mut processing_results: Vec<BufferedResult> = Vec::new();
@@ -5300,7 +5312,7 @@ mod tests {
     async fn cache_aligned_signal(
         accountsdb_connection_url: String,
         redis_cache_url: Option<String>,
-    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+    ) -> Result<CacheState, tokio::sync::oneshot::error::RecvError> {
         let (exec_tx, exec_rx) = mpsc::channel(RESULTS_CAP);
         let (settled_blockhashes_tx, _settled_blockhashes_rx) = mpsc::channel(TEST_BLOCKHASH_SINK);
         let (address_signatures_tx, _address_signatures_rx) = mpsc::channel(64);
@@ -5336,11 +5348,18 @@ mod tests {
         signal
     }
 
-    /// Aligned caches report true (a stale key already purged); an unreachable Redis false.
+    /// Aligned (a stale key already purged), recoverable when warm-up fails on a reachable
+    /// Redis, and disabled when the settler never connects.
     #[tokio::test(flavor = "multi_thread")]
     async fn settle_signals_cache_aligned_on_every_outcome() {
         use testcontainers::{runners::AsyncRunner, ImageExt};
-        let (_db, pg) = start_test_postgres().await;
+        let (db, pg) = start_test_postgres().await;
+        let AccountsDB::Postgres(ref postgres_db) = db else {
+            panic!("Expected Postgres variant")
+        };
+        let deployment_id = redis_coherence::read_deployment_id(postgres_db)
+            .await
+            .unwrap();
         let url = postgres_container_url(&pg, "test_db").await;
         let redis = testcontainers_modules::redis::Redis::default()
             .with_tag("7.0")
@@ -5360,7 +5379,7 @@ mod tests {
 
         assert_eq!(
             cache_aligned_signal(url.clone(), Some(redis_url.clone())).await,
-            Ok(true),
+            Ok(CacheState::Aligned),
             "an empty cache aligns"
         );
 
@@ -5368,18 +5387,39 @@ mod tests {
         let stale_key = format!("account:{}", Pubkey::new_unique());
         let _: () = conn.set(&stale_key, vec![1u8, 2, 3]).await.unwrap();
         let _: () = conn.set("latest_slot", 4242u64).await.unwrap();
+        let _: () = conn
+            .set(redis_coherence::DEPLOYMENT_ID_KEY, &deployment_id)
+            .await
+            .unwrap();
         assert_eq!(
             cache_aligned_signal(url.clone(), Some(redis_url.clone())).await,
-            Ok(true),
+            Ok(CacheState::Aligned),
             "a stale cache is purged, then aligned"
         );
         let exists: bool = conn.exists(&stale_key).await.unwrap();
         assert!(!exists, "the stale key is gone before the signal");
 
+        // A stamp of the wrong type fails warm-up on its first read, with Redis reachable.
+        let _: () = conn.del(redis_coherence::DEPLOYMENT_ID_KEY).await.unwrap();
+        let _: () = conn
+            .rpush(redis_coherence::DEPLOYMENT_ID_KEY, "not-a-stamp")
+            .await
+            .unwrap();
+        assert_eq!(
+            cache_aligned_signal(url.clone(), Some(redis_url.clone())).await,
+            Ok(CacheState::Recoverable),
+            "a failed alignment leaves a handle the probe can restamp"
+        );
+        let exists: bool = conn
+            .exists(redis_coherence::DEPLOYMENT_ID_KEY)
+            .await
+            .unwrap();
+        assert!(!exists, "the failure branch took the cache out of service");
+
         assert_eq!(
             cache_aligned_signal(url, Some("redis://127.0.0.1:1".to_string())).await,
-            Ok(false),
-            "an unreachable cache is not aligned"
+            Ok(CacheState::Disabled),
+            "an unreachable cache is disabled until restart"
         );
     }
 

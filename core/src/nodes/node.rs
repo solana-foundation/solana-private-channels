@@ -15,7 +15,7 @@ use {
             dedup::load_dedup_state,
             execution::start_execution_worker,
             sequencer::start_sequence_worker,
-            settle::start_settle_worker,
+            settle::{start_settle_worker, CacheState},
             sigverify::start_sigverify_workerpool,
             ExecutedBatch, SettledInbox,
         },
@@ -210,22 +210,26 @@ async fn wait_for_verified_cache(
     }
 }
 
-/// The read path's accounts handle. With `cache_aligned` set (Aio) and the cache not
-/// aligned, a leftover stamp is cleared first so reads miss to Postgres until the
-/// settler recovers and restamps it; if that clear fails, reads use Postgres only.
+/// The read path's accounts handle. With `cache_state` set (Aio), a disabled cache is
+/// skipped, and an unaligned one has a leftover stamp cleared first so reads miss to
+/// Postgres until the settler restamps it; if that clear fails, reads use Postgres only.
 async fn read_accounts_db(
     accountsdb_connection_url: &str,
     redis_cache_url: Option<&str>,
-    cache_aligned: Option<tokio::sync::oneshot::Receiver<bool>>,
+    cache_state: Option<tokio::sync::oneshot::Receiver<CacheState>>,
 ) -> Result<AccountsDB, Box<dyn std::error::Error>> {
     let Some(redis_url) = redis_cache_url else {
         return Ok(AccountsDB::new(accountsdb_connection_url, true).await?);
     };
-    if let Some(aligned) = cache_aligned {
-        let aligned = aligned
+    if let Some(state) = cache_state {
+        let state = state
             .await
             .map_err(|_| "the settler stopped before aligning the Redis cache")?;
-        if !aligned {
+        if state == CacheState::Disabled {
+            warn!("Redis cache is disabled until restart, serving reads from Postgres");
+            return Ok(AccountsDB::new(accountsdb_connection_url, true).await?);
+        }
+        if state == CacheState::Recoverable {
             let postgres = PostgresAccountsDB::new(accountsdb_connection_url, true)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create PostgresAccountsDB: {}", e))?;
@@ -756,7 +760,7 @@ mod tests {
         );
 
         let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel();
-        aligned_tx.send(false).unwrap();
+        aligned_tx.send(CacheState::Recoverable).unwrap();
         let db = read_accounts_db(&url, Some(&redis_url), Some(aligned_rx))
             .await
             .unwrap();
@@ -783,7 +787,18 @@ mod tests {
             "a restamped cache is used again"
         );
 
-        let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel::<bool>();
+        // A settler that never connected has no handle to restamp, so reads skip Redis.
+        let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel();
+        aligned_tx.send(CacheState::Disabled).unwrap();
+        let db = read_accounts_db(&url, Some(&redis_url), Some(aligned_rx))
+            .await
+            .unwrap();
+        assert!(
+            matches!(db, AccountsDB::Postgres(_)),
+            "a disabled cache is not read"
+        );
+
+        let (aligned_tx, aligned_rx) = tokio::sync::oneshot::channel::<CacheState>();
         drop(aligned_tx);
         assert!(
             read_accounts_db(&url, Some(&redis_url), Some(aligned_rx))

@@ -149,6 +149,16 @@ was interrupted after its wipe, confirm all three:
 Waiting a fixed time is not a substitute: a crashed write node leaves index rows
 missing until it restarts, and replica lag has no bound.
 
+### Failed deposits
+
+The missing-row check covers `completed` deposits only. A `failed` deposit keeps
+no mint signature (its broadcast journal is deleted once the row is terminal),
+so resync cannot tell a mint that never landed from one that landed after the
+confirmation timed out. If the channel index lags, a landed one is rebuilt
+`pending` and minted again. Before any escrow resync, triage every `failed`
+deposit with [`deposit_failed.md`](deposit_failed.md): a `LANDED` verdict makes
+the row `completed`, and the missing-row check then covers it.
+
 ### Release gate
 
 Core hides history below `getFirstAvailableBlock` instead of failing on it. An

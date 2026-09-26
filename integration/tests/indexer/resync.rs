@@ -2014,8 +2014,7 @@ async fn resync_aborts_on_pruned_channel_history_db_intact(
     let (validator, _faucet) = start_test_validator_no_geyser().await;
     let client = RpcClient::new(validator.rpc_url());
     let current_slot = client.get_slot().await?;
-    let tip = client.get_slot().await?;
-    wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
+    wait_for_finalized_slot(&validator.rpc_url(), current_slot + 5).await;
 
     // One reply per retry of the default client config, so the floor read fails for good.
     let cases: [(&str, Vec<Reply>); 2] = [
