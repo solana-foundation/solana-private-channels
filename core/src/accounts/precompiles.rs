@@ -110,7 +110,13 @@ fn build_precompiles() -> HashMap<Pubkey, AccountSharedData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use solana_sdk::account::ReadableAccount;
+
+    /// SHA-256 of `precompiles/dvp_swap_program.so`, reproducible with
+    /// solana-verify as described in dvp-swap-program/README.md.
+    const DVP_SWAP_PROGRAM_SHA256: &str =
+        "3aec277fbd59f74afbc6d3807212a384a4bbd16ae845de7d048d9eff2fb3d1f8";
 
     #[test]
     fn precompiles_contains_expected_entries() {
@@ -139,6 +145,20 @@ mod tests {
             assert!(account.executable(), "{} should be executable", program_id);
             assert!(!account.data().is_empty());
         }
+    }
+
+    /// A swapped DvP binary must arrive with a visible change to this pin.
+    #[test]
+    fn dvp_swap_program_matches_the_pinned_build() {
+        let account = PRECOMPILES
+            .get(&dvp_swap_program_client::DVP_SWAP_PROGRAM_ID)
+            .expect("missing DvP precompile");
+        assert_eq!(
+            hex::encode(Sha256::digest(account.data())),
+            DVP_SWAP_PROGRAM_SHA256,
+            "dvp_swap_program.so changed: update the pin and the provenance in \
+             dvp-swap-program/README.md together"
+        );
     }
 
     #[test]

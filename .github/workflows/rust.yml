@@ -105,6 +105,7 @@ jobs:
       integration: ${{ steps.filter.outputs.integration }}
       core_indexer: ${{ steps.filter.outputs.core_indexer }}
       trident: ${{ steps.filter.outputs.trident }}
+      dvp_precompile: ${{ steps.filter.outputs.dvp_precompile }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -165,6 +166,14 @@ jobs:
               - '.github/workflows/rust.yml'
               - '.github/actions/setup-environment/**'
               - 'private-channel-escrow-program/**'
+            dvp_precompile:
+              # Anything that can change the DvP provenance check or its answer.
+              - 'Makefile'
+              - '.github/workflows/rust.yml'
+              - '.github/actions/setup-environment/**'
+              - 'core/precompiles/dvp_swap_program.so'
+              - 'scripts/verify-dvp-precompile.sh'
+              - 'dvp-swap-program/clients/**'
 
   build-artifacts:
     name: Build Shared Artifacts
@@ -545,3 +554,33 @@ jobs:
 
       - name: Run fuzz harnesses
         run: make -C private-channel-escrow-program fuzz
+
+  dvp-precompile-provenance:
+    name: DvP Precompile Provenance
+    # Rebuilds the vendored DvP .so from its pinned upstream commit, so a PR
+    # cannot change the binary and its core pin together unnoticed.
+    needs: changes
+    if: needs.changes.outputs.dvp_precompile == 'true'
+    runs-on: private-channel-runner-1
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-environment
+        with:
+          setup-node: "false"
+          setup-pnpm: "false"
+          install-dependencies: "false"
+          install-base-cargo-tools: "false"
+          setup-solana: "false"
+          build-programs: "false"
+
+      # A no-op when this version is already installed on the runner.
+      - name: Install solana-verify
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          cargo install solana-verify --version 0.5.2 --locked
+
+      - name: Verify the DvP precompile against upstream
+        run: make verify-dvp-precompile

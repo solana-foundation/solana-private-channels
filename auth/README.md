@@ -100,7 +100,7 @@ Request a sign challenge to prove ownership of a Solana wallet. Requires a valid
 
 Request: `{ "pubkey": "<base58 pubkey>" }`
 
-Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes. The message names both the account and the wallet so a signer only ever consents to linking their own wallet to their own account.
+Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes. Each account holds one challenge at a time, so a new request replaces the last; requests past 5 per minute per account get `429`. The message names both the account and the wallet so a signer only ever consents to linking their own wallet to their own account.
 
 ```json
 {
