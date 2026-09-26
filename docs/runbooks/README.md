@@ -127,7 +127,8 @@ The runbooks call this out at every relevant site.
 - [`reconciliation_halt_runbook.md`](reconciliation_halt_runbook.md) - the runtime
   reconciliation halt: a proven per-mint insolvency freezes both operators'
   fetchers, quarantines active withdrawals and forces the escrow operator's
-  `/health` to 503. The halt webhook is the only alert (configure
+  `/health` to 503. Inputs that stay unreadable for three ticks halt the same
+  way, without the quarantine. The halt webhook is the only alert (configure
   `reconciliation_webhook_url`); the 503 also trips the service-down probes.
   Recovery is manual.
 - [`indexer_block_unavailable.md`](indexer_block_unavailable.md) - the indexer

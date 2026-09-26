@@ -42,6 +42,8 @@ pub struct MockStorage {
     /// bound reached storage. The stored balances are pre-aggregated with no slot of
     /// their own, so the mock records the bound rather than applying it.
     pub last_reconciliation_slot: std::sync::Arc<Mutex<Option<u64>>>,
+    /// Rows a pinned reconciliation read answers with at one slot, overriding `mint_balances`.
+    pub mint_balances_at: std::sync::Arc<Mutex<HashMap<u64, Vec<MintDbBalance>>>>,
     pub pending_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
     pub inserted_transactions: std::sync::Arc<Mutex<Vec<Vec<DbTransaction>>>>,
     pub inserted_single_transactions: std::sync::Arc<Mutex<Vec<DbTransaction>>>,
@@ -206,6 +208,7 @@ impl MockStorage {
         *halt = Some(HaltInfo {
             reason,
             halted_at: Utc::now(),
+            insolvency: true,
         });
         *marker = Some(key.clone());
         let own = program.owned_transaction_type();
@@ -517,6 +520,9 @@ impl MockStorage {
     ) -> Result<Vec<MintDbBalance>, StorageError> {
         self.check_should_fail("get_mint_balances_for_reconciliation")?;
         *self.last_reconciliation_slot.lock().unwrap() = Some(as_of_slot);
+        if let Some(rows) = self.mint_balances_at.lock().unwrap().get(&as_of_slot) {
+            return Ok(rows.clone());
+        }
         Ok(self.mint_balances.lock().unwrap().clone())
     }
 
@@ -538,9 +544,15 @@ impl MockStorage {
     }
 
     /// Reads the mints map, mirroring the Postgres query's `mints` table source.
-    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
+    pub async fn get_mint_addresses(&self) -> Result<Vec<(String, String)>, StorageError> {
         self.check_should_fail("get_mint_addresses")?;
-        Ok(self.mints.lock().unwrap().keys().cloned().collect())
+        Ok(self
+            .mints
+            .lock()
+            .unwrap()
+            .values()
+            .map(|m| (m.mint_address.clone(), m.token_program.clone()))
+            .collect())
     }
 
     pub async fn get_in_flight_amounts_by_mint(
@@ -588,8 +600,24 @@ impl MockStorage {
         *self.reconciliation_halt.lock().unwrap() = Some(HaltInfo {
             reason: reason.to_string(),
             halted_at: Utc::now(),
+            insolvency: true,
         });
         Ok(())
+    }
+
+    pub async fn set_outage_halt(&self, reason: &str) -> Result<bool, StorageError> {
+        self.check_should_fail("set_outage_halt")?;
+        let mut halt = self.reconciliation_halt.lock().unwrap();
+        // Mirror the conditional upsert: an active insolvency halt is kept.
+        if halt.as_ref().is_some_and(|h| h.insolvency) {
+            return Ok(false);
+        }
+        *halt = Some(HaltInfo {
+            reason: reason.to_string(),
+            halted_at: Utc::now(),
+            insolvency: false,
+        });
+        Ok(true)
     }
 
     /// Same rules as the Postgres query: own-type in-flight rows, failed withdrawals, observed releases.
@@ -1022,6 +1050,36 @@ impl MockStorage {
         Ok(false)
     }
 
+    pub async fn requeue_halted_claim(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        self.check_should_fail("requeue_halted_claim")?;
+        // Snapshot the other guards first so no two locks are held at once.
+        let halted = self.reconciliation_halt.lock().unwrap().is_some();
+        let journaled = self
+            .release_signatures
+            .lock()
+            .unwrap()
+            .get(&transaction_id)
+            .is_some_and(|sigs| !sigs.is_empty());
+        if !halted || journaled {
+            return Ok(false);
+        }
+        let mut pending = self.pending_transactions.lock().unwrap();
+        let Some(txn) = pending.iter_mut().find(|t| {
+            t.id == transaction_id
+                && t.status == TransactionStatus::Processing
+                && t.updated_at == expected_updated_at
+        }) else {
+            return Ok(false);
+        };
+        txn.status = TransactionStatus::Pending;
+        txn.updated_at = Utc::now();
+        Ok(true)
+    }
+
     pub async fn try_requeue_prebroadcast(
         &self,
         transaction_id: i64,
@@ -1334,6 +1392,10 @@ impl MockStorage {
         blockhash_slot: Option<i64>,
     ) -> Result<Option<DateTime<Utc>>, StorageError> {
         self.check_should_fail("claim_and_persist_signature")?;
+        // Mirrors the SQL halt predicate; read before the row lock so the guards never nest.
+        if self.reconciliation_halt.lock().unwrap().is_some() {
+            return Ok(None);
+        }
         // Scope the guard so it is released before the await below.
         let lease = {
             let mut pending = self.pending_transactions.lock().unwrap();

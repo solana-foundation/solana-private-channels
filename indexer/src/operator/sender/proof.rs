@@ -772,6 +772,19 @@ mod tests {
         assert_eq!(state.rotation_bound_generation, Some(1));
     }
 
+    /// A halt-refused retry drops its nonce from the in-flight set while an earlier attempt may
+    /// still land; the row is still Processing, so the owed-nonce gate holds the rotation.
+    #[tokio::test]
+    async fn send_gate_holds_the_rotation_for_a_processing_release_not_in_flight() {
+        let mut server = mockito::Server::new_async().await;
+        let _bitmap = mock_bitmap_account(&mut server, 0, &[]);
+
+        let mut state = send_gate_state(&server.url(), &[(1, 5, TransactionStatus::Processing)]);
+        assert!(state.in_flight_withdrawals.is_empty());
+
+        assert!(take_pending_rotation_if_ready(&mut state).await.is_none());
+    }
+
     #[tokio::test]
     async fn send_gate_releases_a_rearmed_rotation_whose_bound_is_stale() {
         let mut server = mockito::Server::new_async().await;

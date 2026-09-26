@@ -58,9 +58,9 @@ pub struct HealthState {
     last_progress_at: AtomicI64,
     /// Service-defined backlog metric (slot lag for indexer, queue depth for operator).
     pending: AtomicU64,
-    /// Deliberate sticky-unhealthy latch (`Some(reason)`); never self-clears,
+    /// Deliberate sticky-unhealthy latch (`Some((reason, provisional))`); never self-clears,
     /// recovery is manual so a solvency incident stays visible. Read on /health.
-    forced_unhealthy: Mutex<Option<String>>,
+    forced_unhealthy: Mutex<Option<(String, bool)>>,
     config: HealthConfig,
 }
 
@@ -97,13 +97,21 @@ impl HealthState {
         self.last_progress_at.store(now_unix(), Ordering::Relaxed);
     }
 
-    /// Latch the service unhealthy with a durable reason. Idempotent: once
-    /// latched it keeps the first reason, so the original incident stays visible
-    /// even if a caller re-invokes it every poll.
+    /// Latch the service unhealthy with a durable reason. Idempotent: it keeps the first
+    /// firm reason even if re-invoked every poll, and replaces only a provisional latch.
     pub fn force_unhealthy(&self, reason: impl Into<String>) {
         let mut latched = self.forced_unhealthy.lock().unwrap();
+        if latched.as_ref().is_none_or(|(_, provisional)| *provisional) {
+            *latched = Some((reason.into(), false));
+        }
+    }
+
+    /// Latch like `force_unhealthy`, but let a later `force_unhealthy` replace this reason,
+    /// so an outage latched first does not hide a worse incident found after it.
+    pub fn force_unhealthy_provisional(&self, reason: impl Into<String>) {
+        let mut latched = self.forced_unhealthy.lock().unwrap();
         if latched.is_none() {
-            *latched = Some(reason.into());
+            *latched = Some((reason.into(), true));
         }
     }
 
@@ -126,7 +134,7 @@ impl HealthState {
     fn check_at(&self, now: i64) -> HealthOutcome {
         // The latch wins over every derived signal so a forced-unhealthy state
         // is never masked by an idle/healthy backlog reading.
-        if let Some(reason) = self.forced_unhealthy.lock().unwrap().clone() {
+        if let Some((reason, _)) = self.forced_unhealthy.lock().unwrap().clone() {
             return HealthOutcome::ForcedUnhealthy { reason };
         }
         let pending = self.pending.load(Ordering::Relaxed);
@@ -345,6 +353,41 @@ mod tests {
             }
             other => panic!("expected ForcedUnhealthy, got {:?}", other),
         }
+    }
+
+    fn forced_reason(h: &HealthState) -> String {
+        match h.check_at(1000) {
+            HealthOutcome::ForcedUnhealthy { reason } => reason,
+            other => panic!("expected ForcedUnhealthy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn firm_latch_replaces_a_provisional_one() {
+        let h = HealthState::new(cfg(10, 30));
+        h.force_unhealthy_provisional("inputs unavailable");
+        assert_eq!(forced_reason(&h), "inputs unavailable");
+        h.force_unhealthy("mint ABC insolvent");
+        assert_eq!(forced_reason(&h), "mint ABC insolvent");
+        h.force_unhealthy("mint DEF insolvent");
+        assert_eq!(
+            forced_reason(&h),
+            "mint ABC insolvent",
+            "firm stays first-wins"
+        );
+    }
+
+    #[test]
+    fn provisional_latch_never_replaces_a_latch() {
+        let h = HealthState::new(cfg(10, 30));
+        h.force_unhealthy_provisional("outage one");
+        h.force_unhealthy_provisional("outage two");
+        assert_eq!(forced_reason(&h), "outage one");
+
+        let h = HealthState::new(cfg(10, 30));
+        h.force_unhealthy("mint ABC insolvent");
+        h.force_unhealthy_provisional("inputs unavailable");
+        assert_eq!(forced_reason(&h), "mint ABC insolvent");
     }
 
     #[test]
