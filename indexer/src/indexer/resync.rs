@@ -9,9 +9,13 @@ use crate::{
         enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda, ConsumedSet,
         RetryConfig, RpcClientWithRetry, CONSUMED_SET_PAGE_SIZE,
     },
+    shutdown_utils::WRITER_STOP_TIMEOUT,
     storage::common::models::ResyncBlockers,
-    storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
+    storage::common::storage::live_lock::{
+        under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL, LIVE_LOCK_UNCONFIRMED_BUDGET,
+    },
     storage::common::storage::resync_state::resync_halt_reason,
+    storage::postgres::lock_connection::PROBE_TIMEOUT,
     storage::Storage,
 };
 use solana_commitment_config::CommitmentConfig;
@@ -28,6 +32,14 @@ const MAX_BITMAP_RPC_TIP_LAG_SECS: i64 = 120;
 
 /// Metric label for the live-state lock this service holds.
 const RESYNC_LOCK_ROLE: &str = "resync";
+
+/// How long a worker whose lock session died can keep working: one heartbeat and probe,
+/// or the full unconfirmed budget, then the wait for its aborted writers, plus a margin.
+pub const STALE_HOLDER_GRACE: Duration = LIVE_LOCK_HEARTBEAT_INTERVAL
+    .saturating_add(LIVE_LOCK_UNCONFIRMED_BUDGET)
+    .saturating_add(PROBE_TIMEOUT)
+    .saturating_add(WRITER_STOP_TIMEOUT)
+    .saturating_add(Duration::from_secs(5));
 
 /// Why a resync must not wipe its rows yet, or `None` when it may. Only own-program rows count
 /// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent.
@@ -88,6 +100,8 @@ pub struct ResyncService {
     withdrawal_bitmap_rpc_url: Option<String>,
     // How often the live-state lock re-proves itself. Only tests override it.
     lock_heartbeat_interval: Duration,
+    // How long to wait after taking the lock before reading anything. Only tests override it.
+    stale_holder_grace: Duration,
 }
 
 impl ResyncService {
@@ -107,6 +121,7 @@ impl ResyncService {
             channel_reconcile: None,
             withdrawal_bitmap_rpc_url: None,
             lock_heartbeat_interval: LIVE_LOCK_HEARTBEAT_INTERVAL,
+            stale_holder_grace: STALE_HOLDER_GRACE,
         }
     }
 
@@ -114,6 +129,12 @@ impl ResyncService {
     /// test can drive a lock loss without waiting out a rebuild.
     pub fn with_lock_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.lock_heartbeat_interval = interval;
+        self
+    }
+
+    /// Wait `grace` instead of the production grace after taking the lock, so tests stay fast.
+    pub fn with_stale_holder_grace(mut self, grace: Duration) -> Self {
+        self.stale_holder_grace = grace;
         self
     }
 
@@ -363,6 +384,18 @@ impl ResyncService {
             .await
             .inspect_err(|e| error!("Refusing to resync: {}", e))?;
         info!("Live-state lock acquired; no indexer or operator can run against this database");
+
+        // A worker whose session died just before we got the lock can still be writing until
+        // its heartbeat notices, so read nothing until it has had time to stop.
+        info!(
+            "Waiting {:?} for any worker that just lost its lock to stop",
+            self.stale_holder_grace
+        );
+        under_live_lock(&lock_lost, async {
+            tokio::time::sleep(self.stale_holder_grace).await;
+            Ok::<_, StorageError>(())
+        })
+        .await?;
 
         // The reads below need the tables to exist, and a resync is also the supported
         // way to build a database from nothing. Creating the schema is idempotent and
@@ -708,7 +741,8 @@ mod tests {
             ProgramType::Escrow,
             backfill_config,
             None,
-        );
+        )
+        .with_stale_holder_grace(Duration::ZERO);
 
         match service.run(100).await {
             Err(IndexerError::Reconciliation(ReconciliationError::InvalidPubkey {
@@ -910,7 +944,8 @@ mod tests {
             ProgramType::Withdraw,
             backfill_config,
             instance,
-        );
+        )
+        .with_stale_holder_grace(Duration::ZERO);
         match bitmap_rpc_url {
             Some(url) => service.with_withdrawal_bitmap_rpc(url),
             None => service,
@@ -1124,6 +1159,7 @@ mod tests {
             backfill_config,
             None,
         )
+        .with_stale_holder_grace(Duration::ZERO)
     }
 
     /// A reconciliation halt is a solvency interlock, and a rebuild would drop the
@@ -1288,6 +1324,7 @@ mod tests {
             backfill_config,
             Some(Pubkey::new_unique()),
         )
+        .with_stale_holder_grace(Duration::ZERO)
     }
 
     /// The gate is local, so it must refuse before the bitmap read, the tip fetch and the wipe.
@@ -1521,5 +1558,45 @@ mod tests {
             })) => {}
             other => panic!("another program's resync halt must refuse, got: {other:?}"),
         }
+    }
+
+    /// A worker whose session just died may still be writing, so nothing is read inside the grace.
+    #[tokio::test(start_paused = true)]
+    async fn run_reads_nothing_until_stale_workers_have_had_time_to_stop() {
+        let mock = MockStorage::new();
+        let grace = Duration::from_secs(60);
+        let service =
+            halt_test_service(Arc::new(Storage::Mock(mock.clone()))).with_stale_holder_grace(grace);
+        let run = tokio::spawn(async move { service.run(100).await });
+
+        tokio::time::sleep(grace - Duration::from_millis(1)).await;
+        assert_eq!(
+            mock.calls("init_schema"),
+            0,
+            "nothing may be read inside the grace"
+        );
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        for _ in 0..100 {
+            if mock.calls("init_schema") > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            mock.calls("init_schema"),
+            1,
+            "the resync must go on once the grace is over"
+        );
+        run.abort();
+    }
+
+    /// The grace must outlast both ways a stale worker notices the loss, plus its writer stop.
+    #[test]
+    fn stale_holder_grace_outlasts_a_stale_worker() {
+        assert!(
+            STALE_HOLDER_GRACE > LIVE_LOCK_HEARTBEAT_INTERVAL + PROBE_TIMEOUT + WRITER_STOP_TIMEOUT
+        );
+        assert!(STALE_HOLDER_GRACE > LIVE_LOCK_UNCONFIRMED_BUDGET + WRITER_STOP_TIMEOUT);
     }
 }

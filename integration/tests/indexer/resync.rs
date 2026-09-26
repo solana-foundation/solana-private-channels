@@ -207,6 +207,7 @@ fn make_resync_service(rpc_url: String, storage: Arc<Storage>) -> ResyncService 
         backfill_config,
         Some(Pubkey::new_unique()),
     )
+    .with_stale_holder_grace(Duration::ZERO)
 }
 
 /// Resync service that reconciles each rebuilt row against the PrivateChannel
@@ -241,6 +242,7 @@ fn make_channel_resync_service(
         backfill_config,
         escrow_instance_id,
     )
+    .with_stale_holder_grace(Duration::ZERO)
     .with_channel_reconcile(ChannelReconcileConfig {
         channel_rpc_url,
         authority,
@@ -2255,6 +2257,7 @@ async fn resync_aborts_when_the_live_lock_is_lost_mid_rebuild(
         },
         Some(Pubkey::new_unique()),
     )
+    .with_stale_holder_grace(Duration::ZERO)
     .with_lock_heartbeat_interval(Duration::from_millis(5));
 
     // Pull the lock the moment the seeded row is gone, which is the wipe landing. One
@@ -2365,6 +2368,7 @@ fn dead_rpc_service(storage: Arc<Storage>, program: ProgramType) -> ResyncServic
         backfill_config,
         Some(Pubkey::new_unique()),
     )
+    .with_stale_holder_grace(Duration::ZERO)
     .with_withdrawal_bitmap_rpc(DEAD.to_string())
 }
 
@@ -3288,6 +3292,7 @@ async fn e2e_interrupted_resync_blocks_workers_until_rerun(
         },
         Some(env.instance),
     )
+    .with_stale_holder_grace(Duration::ZERO)
     .with_channel_reconcile(ChannelReconcileConfig {
         channel_rpc_url: rpc_url.clone(),
         authority: admin().pubkey(),
@@ -3457,6 +3462,7 @@ async fn e2e_interrupted_withdraw_resync_reruns_cleanly() -> Result<(), Box<dyn 
         },
         Some(env.instance),
     )
+    .with_stale_holder_grace(Duration::ZERO)
     .with_channel_reconcile(ChannelReconcileConfig {
         channel_rpc_url: mock.url(),
         authority: CHANNEL_AUTHORITY,

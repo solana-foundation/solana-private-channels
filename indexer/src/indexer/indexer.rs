@@ -12,7 +12,9 @@ use crate::{
         transaction_processor::TransactionProcessor,
     },
     shutdown_utils::{cleanup_after_backfill, shutdown_indexer, stop_signal, StopReason},
-    storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
+    storage::common::storage::live_lock::{
+        under_live_lock, LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL,
+    },
     storage::{PostgresDb, Storage},
     DatasourceType, IndexerConfig, PrivateChannelIndexerConfig, StorageType,
 };
@@ -63,28 +65,6 @@ enum Supervision {
     ProcessorEnded(Result<Result<(), IndexerError>, tokio::task::JoinError>),
     /// A shutdown signal arrived while the processor was still running.
     ShutdownSignalled(std::io::Result<StopReason>),
-}
-
-/// Run one startup step, refusing it if the live-state lock is lost while it runs.
-///
-/// Used only before any writer is spawned, so stopping is just returning: there is no
-/// task to abort and no drain to skip. Later stages have writers running and stop them
-/// explicitly instead.
-async fn under_live_lock<T, E>(
-    lock_lost: &CancellationToken,
-    step: impl std::future::Future<Output = Result<T, E>>,
-) -> Result<T, IndexerError>
-where
-    IndexerError: From<E>,
-{
-    tokio::select! {
-        biased;
-        _ = lock_lost.cancelled() => {
-            error!("Live-state lock lost during startup; refusing to continue");
-            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
-        }
-        result = step => result.map_err(IndexerError::from),
-    }
 }
 
 /// Wind the checkpoint writer down once the processor has ended.
