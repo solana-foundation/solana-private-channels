@@ -401,6 +401,7 @@ async fn test_suite(private_channel_ctx: &PrivateChannelContext, solana_ctx: &So
     run_get_blocks_with_limit_test(private_channel_ctx).await;
     run_get_signature_statuses_test(private_channel_ctx).await;
     run_get_block_time_test(private_channel_ctx).await;
+    run_channel_anchor_test(private_channel_ctx).await;
     run_get_slot_leaders_test(private_channel_ctx).await;
     run_epoch_info_test(private_channel_ctx).await;
     run_epoch_schedule_test(private_channel_ctx).await;

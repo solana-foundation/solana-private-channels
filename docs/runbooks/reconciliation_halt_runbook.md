@@ -56,9 +56,26 @@ halt is still exported per mint as
 is the state that refuses the next boot.
 
 The DB also supplies the mint universe (every `mints` row, so a blocked or
-not-held mint is still checked) and the in-flight envelope. Custody, channel
+not-held mint is still checked) and the in-flight envelope. Custody is read from
+the escrow instance's associated token account (ATA) for each of those mints,
+using the mint's recorded token program. The escrow program only deposits into
+and releases from that ATA, so it is the whole backing; tokens sent to any other
+account the escrow happens to own are not custody. Custody, channel
 supply and the envelope are all read before the checkpoint wait, so the supply
-invariant compares one instant. Both checks use the same small bps cushion of
+invariant compares one instant.
+
+Channel supply is only used when it is fresh. Each tick first finds the channel's
+newest block and requires its block time to be under 120 s old, then accepts a
+supply read only if it was answered at or after that block. A read that answers
+behind is re-read up to three times with a short backoff, so a backend a few
+slots behind the others does not darken the tick. One tick spends at most six
+re-reads across all mints, so many stale mints still go dark within seconds. A channel node that is frozen
+or a read replica that stays behind therefore gives no supply reading for that
+tick instead of an old one. Custody reads send Solana's newest block as
+`minContextSlot`, so a lagging Solana backend refuses and the read is retried
+rather than failed. This needs the
+channel write node's clock and the operator's clock to agree to well within
+120 s (run NTP on both). Both checks use the same small bps cushion of
 custody; startup applies the same formula on top of `mismatch_threshold_raw`,
 defaulting to 0 so a boot tolerates nothing it is not configured to.
 
@@ -71,13 +88,77 @@ When either check breaches for three consecutive ticks, the operator **halts**:
 4. Posts the halt webhook. This webhook is the only alert - there is no separate
    sensitive alert layer; the alert fires together with the halt.
 
+### Inputs-dark halt
+
+The checks are only as good as their inputs. A tick that cannot read a required
+input (the DB mint set, custody, the in-flight envelope, a fresh channel supply
+for any mint, the escrow checkpoint, or the ledger rows) counts as a dark tick, exported as
+`private_channel_operator_reconciliation_input_dark_ticks`. Three dark ticks in
+a row (about 10 minutes at the default 5 minute interval) halt with the reason
+`reconciliation halt: required inputs unavailable for <N> consecutive ticks (last: <reason>)`.
+Any tick that reads everything resets the count. A lagging escrow checkpoint is
+not a dark tick; it stays on the liability-dark alert described above. A
+checkpoint that cannot be read at all during the wait is a dark tick.
+
+This halt sets the flag, forces `/health` to 503 once the flag has been written, and
+posts a webhook with `halt_reason` and `dark_ticks`, but it does **not** quarantine
+withdrawals: nothing is proven wrong, and the flag alone already blocks every send. Typical causes are
+a Solana RPC or DB outage, a channel node that is down, frozen or more than 120 s
+behind, more than 120 s of clock skew either way between the channel write node
+and the operator, or an unreadable `mints` row. Restore the input first. Clearing
+the flag while the input is still unreadable halts again on the next tick. If the
+flag write itself fails, the operator retries it within the tick and again on
+later ticks until it lands. `/health` is only forced to 503 once the flag has
+landed, because that latch lasts until a restart; until then the webhook, the
+`input_dark_ticks` gauge and its alert are what page. An outage reason on
+`/health` is replaced by the insolvency reason if a breach later upgrades the
+halt, so `/health` never shows an outage while an insolvency is in force. The halt webhook fires once
+per incident, not on every retry: once for the outage, and once for each mint
+whose breach confirms while the flag write is still failing.
+
+An inputs-dark halt never replaces an insolvency halt: if the flag already holds
+an insolvency, it is left as it is, reason included. The other way round, a
+breach that confirms while an inputs-dark halt holds still trips as an
+insolvency: it replaces the reason, quarantines active withdrawals and posts the
+insolvency webhook. Before clearing an inputs-dark halt, check that no breach is
+building: look for `halt pending confirmation` warnings and a nonzero
+`private_channel_operator_reconciliation_liability_shortfall_raw`. A breach still
+counting toward its third tick has not quarantined anything yet, so clearing the
+flag then would let withdrawals of that mint go out.
+
+When there are more than 100 mints, custody is read in batches of 100 that can
+answer at different slots. Each mint is compared with the ledger at the slot its
+own batch answered at, and a liability halt reason names that slot. Custody is
+held to the same freshness rule as channel supply: each tick finds Solana's
+newest finalized block, requires it to be under 120 s old, and a custody batch
+answered below it is a failed custody read, so a lagging RPC backend makes the
+tick dark instead of checking an old balance.
+
+### Where the halt is enforced
+
 The halt flag is read at the top of the shared fetcher loop, so it freezes
 **both** the escrow and withdraw operators, and it **survives restarts** - both
-re-read it at first poll and stay frozen until it is cleared.
+re-read it at first poll and stay frozen until it is cleared. A fetcher that
+cannot read the flag skips the poll too, counted as
+`private_channel_operator_transaction_errors_total{error_reason="halt_read_error"}`.
+
+The flag is also checked in the same database statement that claims a row right
+before its mint or release is broadcast, so work already in the pipeline when the
+halt lands is not sent either. Such a claim is counted as
+`error_reason="halted_before_broadcast"`. A deposit or withdrawal stopped this way
+that never broadcast is put back to `pending` right away, without using a requeue
+attempt, and goes out once the flag is cleared. One with an earlier broadcast
+attempt stays `processing` for the recovery worker to check on chain. A claim whose
+statement ran before the halt committed is still sent; each later attempt is refused.
+
+Remints are not gated by the halt. A remint only returns tokens that were burned
+for a withdrawal whose release is proven not to have happened, so it cannot push
+supply above custody.
 
 ## Symptom
 
 - Deposits stop minting and withdrawals stop releasing across both operators.
+  Remints of failed withdrawals continue.
 - The escrow operator's `/health` returns 503 with `"reason":"forced"`.
 - Logs carry `RECONCILIATION HALT tripped; freezing both pipelines` with the
   reason: `short of supply by` (supply check) or `short of ledger liabilities`
@@ -118,9 +199,10 @@ refuses under any halt that is not its own.
 Do **not** clear the flag until you have confirmed real backing. For the mint in
 the halt reason:
 
-1. **On-chain Solana custody.** Sum the escrow instance's token accounts for the
-   mint (`getTokenAccountsByOwner` on the escrow PDA), at `finalized`. This is
-   authoritative custody. See [`_verify_onchain_release.md`](_verify_onchain_release.md).
+1. **On-chain Solana custody.** Read the balance of the escrow instance's ATA
+   for the mint (derived from the escrow PDA, the mint and its token program), at
+   `finalized`. This is authoritative custody. Other token accounts the escrow PDA
+   owns (`getTokenAccountsByOwner`) are not custody: the program never moves them. See [`_verify_onchain_release.md`](_verify_onchain_release.md).
 2. **On-chain PrivateChannel supply.** Read the channel mint's `Mint.supply`
    (`getAccountInfo` on the mint, decode the SPL Mint). This is the total minted,
    already net of burns. `supply - custody` is the halt gap.
@@ -142,11 +224,12 @@ the halt reason:
    SELECT
      SUM(CASE WHEN t.transaction_type='deposit' AND t.slot <= <SLOT>
               THEN t.amount ELSE 0 END) AS deposits,
-     SUM(CASE WHEN t.transaction_type='withdrawal' AND EXISTS (
-              SELECT 1 FROM observed_releases r
-              WHERE r.withdrawal_nonce = t.withdrawal_nonce AND r.slot <= <SLOT>)
-              THEN t.amount ELSE 0 END) AS released
-   FROM transactions t WHERE t.mint = '<MINT>';
+     SUM(CASE WHEN t.transaction_type='withdrawal' AND r.withdrawal_nonce IS NOT NULL
+              THEN LEAST(COALESCE(r.amount, t.amount), t.amount) ELSE 0 END) AS released
+   FROM transactions t
+   LEFT JOIN observed_releases r
+     ON r.withdrawal_nonce = t.withdrawal_nonce AND r.slot <= <SLOT>
+   WHERE t.mint = '<MINT>';
    ```
 
    A boot refuses on the same comparison. When the escrow indexer's checkpoint is

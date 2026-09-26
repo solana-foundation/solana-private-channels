@@ -1076,9 +1076,17 @@ impl PostgresDb {
                 id          BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
                 halted      BOOLEAN NOT NULL,
                 reason      TEXT NOT NULL,
-                halted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                halted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                insolvency  BOOLEAN NOT NULL DEFAULT TRUE
             );
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Every halt written before this column was an insolvency halt, hence the default.
+        sqlx::query(
+            "ALTER TABLE reconciliation_halt ADD COLUMN IF NOT EXISTS insolvency BOOLEAN NOT NULL DEFAULT TRUE",
         )
         .execute(&self.pool)
         .await?;
@@ -1178,11 +1186,12 @@ impl PostgresDb {
 
         // Operators that predate the marker still honour the halt and stop fetching value work.
         // A halt someone else set is evidence, so it is never overwritten.
+        // Written as a non-outage kind so an inputs-dark halt cannot replace this reason.
         let halted = sqlx::query(
-            "INSERT INTO reconciliation_halt (id, halted, reason, halted_at)
-             VALUES (TRUE, TRUE, $1, NOW())
+            "INSERT INTO reconciliation_halt (id, halted, reason, halted_at, insolvency)
+             VALUES (TRUE, TRUE, $1, NOW(), TRUE)
              ON CONFLICT (id) DO UPDATE
-             SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW()
+             SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW(), insolvency = TRUE
              WHERE NOT reconciliation_halt.halted
                 OR reconciliation_halt.reason = EXCLUDED.reason",
         )
@@ -1957,6 +1966,36 @@ impl PostgresDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// CAS `Processing` to `Pending`, spending no requeue attempt, for a halt-refused row with no
+    /// journaled signature. A row with an earlier attempt still goes to recovery, since only an
+    /// on-chain check can rule it out, and that path can spend an attempt.
+    pub async fn requeue_halted_claim_internal(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            UPDATE transactions
+            SET status = 'pending'
+            WHERE id = $1
+              AND status = 'processing'
+              AND updated_at = $2
+              AND EXISTS (
+                  SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pending_release_signatures WHERE transaction_id = $1
+              )
+            "#,
+        )
+        .bind(transaction_id)
+        .bind(expected_updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Status-only CAS `Processing` to `Pending` for pre-broadcast build/sign
     /// failures. Bumps `recovery_requeue_attempts` so the recovery quarantine cap
     /// survives restarts.
@@ -2557,7 +2596,8 @@ impl PostgresDb {
     /// demote (also a CAS on that column) loses; sharing one transaction leaves no
     /// bumped-but-unsigned window. `Ok(Some(lease))` returns the committed
     /// post-claim `updated_at`, valid as the next CAS token; `Ok(None)` means the
-    /// row was demoted or re-locked, so the caller must not broadcast.
+    /// row was demoted or re-locked, or a reconciliation halt is active, so the
+    /// caller must not broadcast.
     ///
     /// Nothing here is type-specific: the deposit mint and the withdrawal release
     /// both need exactly this ownership proof before they move funds.
@@ -2580,6 +2620,10 @@ impl PostgresDb {
             WHERE id = $1
               AND status = 'processing'
               AND updated_at = $2
+              -- Last gate before any value moves. A claim whose statement read no halt counts as before it, so only its one send can follow.
+              AND NOT EXISTS (
+                  SELECT 1 FROM reconciliation_halt WHERE id = TRUE AND halted = TRUE
+              )
             RETURNING updated_at
             "#,
         )
@@ -3128,8 +3172,9 @@ impl PostgresDb {
     /// Every mint address the DB knows: the mint universe runtime reconciliation checks.
     /// Addresses only, so it can be read before the tick knows whether the ledger is
     /// pinnable at all.
-    pub async fn get_mint_addresses_internal(&self) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT mint_address FROM mints")
+    /// Every mint with its token program, which custody needs to derive the escrow ATA.
+    pub async fn get_mint_addresses_internal(&self) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as("SELECT mint_address, token_program FROM mints")
             .fetch_all(&self.pool)
             .await
     }
@@ -3161,10 +3206,10 @@ impl PostgresDb {
     pub async fn set_reconciliation_halt_internal(&self, reason: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            INSERT INTO reconciliation_halt (id, halted, reason, halted_at)
-            VALUES (TRUE, TRUE, $1, NOW())
+            INSERT INTO reconciliation_halt (id, halted, reason, halted_at, insolvency)
+            VALUES (TRUE, TRUE, $1, NOW(), TRUE)
             ON CONFLICT (id) DO UPDATE
-            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW()
+            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW(), insolvency = TRUE
             "#,
         )
         .bind(reason)
@@ -3173,12 +3218,30 @@ impl PostgresDb {
         Ok(())
     }
 
+    /// Set the halt for unreadable reconciliation inputs. An active insolvency halt is kept, so
+    /// its reason survives; returns false in that case, when the flag was already set.
+    pub async fn set_outage_halt_internal(&self, reason: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO reconciliation_halt (id, halted, reason, halted_at, insolvency)
+            VALUES (TRUE, TRUE, $1, NOW(), FALSE)
+            ON CONFLICT (id) DO UPDATE
+            SET halted = TRUE, reason = EXCLUDED.reason, halted_at = NOW(), insolvency = FALSE
+            WHERE NOT (reconciliation_halt.halted AND reconciliation_halt.insolvency)
+            "#,
+        )
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Return the halt reason/timestamp when the flag is set, else `None`.
     /// A row with `halted = FALSE` (cleared) also reads as not halted.
     pub async fn is_reconciliation_halted_internal(&self) -> Result<Option<HaltInfo>, sqlx::Error> {
         sqlx::query_as::<_, HaltInfo>(
             r#"
-            SELECT reason, halted_at
+            SELECT reason, halted_at, insolvency
             FROM reconciliation_halt
             WHERE id = TRUE AND halted = TRUE
             "#,

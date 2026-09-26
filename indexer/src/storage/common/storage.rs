@@ -45,6 +45,7 @@ pub mod live_lock;
 pub mod quarantine_active_withdrawals;
 pub mod reconciliation_halt;
 pub mod record_remint_result;
+pub mod requeue_halted_claim;
 pub mod resync_state;
 pub mod sender_lock;
 pub mod set_pending_remint;
@@ -276,7 +277,7 @@ impl Storage {
     }
 
     /// Every mint address the DB knows: the mint universe that runtime reconciliation checks.
-    pub async fn get_mint_addresses(&self) -> Result<Vec<String>, StorageError> {
+    pub async fn get_mint_addresses(&self) -> Result<Vec<(String, String)>, StorageError> {
         get_mint_addresses::get_mint_addresses(self).await
     }
 
@@ -305,6 +306,11 @@ impl Storage {
     /// Set the durable reconciliation halt flag. Idempotent.
     pub async fn set_reconciliation_halt(&self, reason: &str) -> Result<(), StorageError> {
         reconciliation_halt::set_reconciliation_halt(self, reason).await
+    }
+
+    /// Set the halt for unreadable inputs; an active insolvency halt is left in place.
+    pub async fn set_outage_halt(&self, reason: &str) -> Result<bool, StorageError> {
+        reconciliation_halt::set_outage_halt(self, reason).await
     }
 
     /// Return the halt info when the flag is set, else `None` (not halted).
@@ -543,6 +549,16 @@ impl Storage {
     ) -> Result<bool, StorageError> {
         try_requeue_processing::try_requeue_processing(self, transaction_id, expected_updated_at)
             .await
+    }
+
+    /// CAS `Processing` to `Pending` for a claim refused by a halt, only if nothing was
+    /// ever journaled for the row; spends no requeue attempt.
+    pub async fn requeue_halted_claim(
+        &self,
+        transaction_id: i64,
+        expected_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, StorageError> {
+        requeue_halted_claim::requeue_halted_claim(self, transaction_id, expected_updated_at).await
     }
 
     /// Cap-gated CAS `Processing` → `Pending` for sender-side pre-broadcast failures
@@ -1047,21 +1063,33 @@ mod tests {
     /// a live sender.
     #[tokio::test]
     async fn claim_and_persist_signature_disposition_matrix() {
-        // (label, seeded status, token offset from the presented one, claimable)
+        // (label, seeded status, token offset from the presented one, halted, claimable)
         let dispositions = [
-            ("owned", TransactionStatus::Processing, 0, true),
-            ("demoted", TransactionStatus::Pending, 0, false),
-            ("token stale", TransactionStatus::Processing, 30, false),
-            ("terminal", TransactionStatus::Completed, 0, false),
+            ("owned", TransactionStatus::Processing, 0, false, true),
+            ("demoted", TransactionStatus::Pending, 0, false, false),
+            (
+                "token stale",
+                TransactionStatus::Processing,
+                30,
+                false,
+                false,
+            ),
+            ("terminal", TransactionStatus::Completed, 0, false, false),
+            ("halted", TransactionStatus::Processing, 0, true, false),
         ];
 
         for txn_type in [TransactionType::Deposit, TransactionType::Withdrawal] {
-            for (id, (label, status, skew_secs, claimable)) in dispositions.iter().enumerate() {
+            for (id, (label, status, skew_secs, halted, claimable)) in
+                dispositions.iter().enumerate()
+            {
                 let (storage, mock) = make_mock_storage();
                 let id = id as i64 + 1;
                 let presented = Utc::now();
                 let seeded = presented + chrono::Duration::seconds(*skew_secs);
                 seed_claim_row(&mock, id, txn_type, *status, seeded);
+                if *halted {
+                    storage.set_reconciliation_halt("test halt").await.unwrap();
+                }
 
                 let case = format!("{txn_type:?}/{label}");
                 let signature = format!("sig-{case}");
@@ -1076,6 +1104,11 @@ mod tests {
                     assert!(
                         persisted.is_empty(),
                         "{case}: no signature may be persisted on a lost claim"
+                    );
+                    assert_eq!(
+                        mock.pending_transactions.lock().unwrap()[0].updated_at,
+                        seeded,
+                        "{case}: a refused claim must not bump the row"
                     );
                     continue;
                 }
@@ -1348,7 +1381,13 @@ mod tests {
 
         let mut addresses = storage.get_mint_addresses().await.unwrap();
         addresses.sort();
-        assert_eq!(addresses, vec!["mint_1", "mint_2"]);
+        assert_eq!(
+            addresses,
+            vec![
+                ("mint_1".to_string(), TOKEN_PROGRAM.to_string()),
+                ("mint_2".to_string(), TOKEN_PROGRAM.to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

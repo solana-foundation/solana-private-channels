@@ -8,11 +8,12 @@ use crate::config::{OperatorConfig, ProgramType};
 use crate::error::OperatorError;
 use crate::indexer::checkpoint::program_key;
 use crate::metrics::{
-    OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS, OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL,
-    OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
+    OPERATOR_RECONCILIATION_INPUT_DARK_TICKS, OPERATOR_RECONCILIATION_LIABILITY_DARK_TICKS,
+    OPERATOR_RECONCILIATION_LIABILITY_SHORTFALL, OPERATOR_RECONCILIATION_LIABILITY_UNKNOWN,
 };
 use crate::operator::escrow_sweep::{
-    fetch_channel_supply, fetch_escrow_balances_by_mint, CustodySnapshot,
+    channel_anchor, fetch_escrow_custody, fetch_fresh_channel_supply, EscrowCustody,
+    SUPPLY_REREAD_BUDGET,
 };
 use crate::operator::RpcClientWithRetry;
 use crate::storage::common::amount::{net_to_u64, NetBalance};
@@ -37,6 +38,12 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 /// corrupt RPC read cannot halt while a persistent shortfall always will.
 const HALT_CONFIRM_TICKS: u32 = 3;
 
+/// Tries at writing the halt flag within one tick; the guard stays down until one lands.
+const HALT_WRITE_ATTEMPTS: u32 = 3;
+
+/// Consecutive ticks with a required input unreadable before the pipelines are frozen.
+const INPUT_DARK_HALT_TICKS: u32 = 3;
+
 /// Longest a tick waits for the escrow indexer's checkpoint to reach the custody slot.
 #[cfg(not(test))]
 const LEDGER_CATCHUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,6 +67,37 @@ const LEDGER_CATCHUP_POLL_MS: u64 = 5;
 struct BreachCounters {
     supply: HashMap<Pubkey, u32>,
     liability: HashMap<Pubkey, u32>,
+    /// The current incident paged its outage, so a failing write never re-pages it.
+    announced_outage: bool,
+    /// Mints the current incident paged an insolvency for; each distinct shortfall pages once.
+    announced_mints: HashSet<Pubkey>,
+    /// An insolvency halt is in force; only that suppresses a new breach trip.
+    insolvency_halted: bool,
+}
+
+/// Why the pipelines are frozen. An insolvency outranks an outage and is never replaced by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HaltKind {
+    /// Reconciliation inputs were unreadable; nothing is proven wrong.
+    Outage,
+    /// A breach was confirmed; active withdrawals need a human.
+    Insolvency,
+}
+
+impl BreachCounters {
+    /// End the incident's paging, so the next one pages again.
+    fn clear_announced(&mut self) {
+        self.announced_outage = false;
+        self.announced_mints.clear();
+    }
+
+    /// Whether any mint has reached the breach count that trips a halt.
+    fn any_confirmed(&self) -> bool {
+        self.supply
+            .values()
+            .chain(self.liability.values())
+            .any(|&count| count >= HALT_CONFIRM_TICKS)
+    }
 }
 
 /// Runs periodic escrow balance reconciliation checks
@@ -101,15 +139,14 @@ pub async fn run_reconciliation(
     // Consecutive ticks the liability arm could not be pinned for. Held across ticks so a
     // silently dark arm is alertable rather than just repeatedly warned about.
     let mut liability_dark_ticks: u32 = 0;
+    let mut input_dark_ticks: u32 = 0;
 
     // Seed the set-once guard from the durable flag so a restart into an active
     // halt does not re-quarantine or re-webhook; it stays frozen until cleared.
-    let mut halted = storage
-        .is_reconciliation_halted()
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+    // A failed read seeds "not halted"; the flag write itself never lets an outage replace an insolvency.
+    let seeded = storage.is_reconciliation_halted().await.ok().flatten();
+    let mut halted = seeded.is_some();
+    breach_counters.insolvency_halted = seeded.is_some_and(|flag| flag.insolvency);
 
     loop {
         // Check for cancellation
@@ -131,6 +168,7 @@ pub async fn run_reconciliation(
             &mut breach_counters,
             &mut halted,
             &mut liability_dark_ticks,
+            &mut input_dark_ticks,
             &cancellation_token,
         )
         .await
@@ -261,11 +299,16 @@ fn insolvency_delta_bps(custody: u64, gap: u64) -> u64 {
     u64::try_from((gap as u128 * 10_000) / custody as u128).unwrap_or(u64::MAX)
 }
 
-/// Performs a single reconciliation check.
-///
-/// Per mint, over finalized reads: supply against custody plus envelope, and ledger
-/// liabilities at the custody slot against custody. A failed halt-input load warns and
-/// returns Ok with the counters held, so a transient glitch keeps the evidence.
+/// Whether a tick read every input the invariants need.
+#[derive(Debug, PartialEq, Eq)]
+enum TickInputs {
+    Complete,
+    /// Something required could not be read; carries the reason.
+    Missing(String),
+}
+
+/// Performs a single reconciliation check, then counts a tick that could not read
+/// every required input toward the input-dark halt.
 #[allow(clippy::too_many_arguments)]
 async fn perform_reconciliation_check(
     storage: &Arc<Storage>,
@@ -279,8 +322,125 @@ async fn perform_reconciliation_check(
     breach_counters: &mut BreachCounters,
     halted: &mut bool,
     liability_dark_ticks: &mut u32,
+    input_dark_ticks: &mut u32,
     cancellation_token: &CancellationToken,
 ) -> Result<(), OperatorError> {
+    let result = check_invariants(
+        storage,
+        config,
+        rpc_client,
+        channel_rpc,
+        escrow_instance_id,
+        webhook_client,
+        health,
+        previously_alerted_orphans,
+        breach_counters,
+        halted,
+        liability_dark_ticks,
+        cancellation_token,
+    )
+    .await;
+    // A tick cut short by shutdown is evidence of nothing.
+    if cancellation_token.is_cancelled() {
+        return result.map(|_| ());
+    }
+    let missing = match &result {
+        Ok(TickInputs::Complete) => None,
+        Ok(TickInputs::Missing(reason)) => Some(reason.clone()),
+        Err(e) => Some(e.to_string()),
+    };
+    track_input_state(
+        storage,
+        config,
+        health,
+        webhook_client,
+        missing,
+        input_dark_ticks,
+        halted,
+        breach_counters,
+    )
+    .await;
+    // An incident whose flag never landed ends once nothing would trip it, so the next one pages.
+    if !*halted && *input_dark_ticks < INPUT_DARK_HALT_TICKS && !breach_counters.any_confirmed() {
+        breach_counters.clear_announced();
+    }
+    result.map(|_| ())
+}
+
+/// Count a tick with a missing input and freeze once the streak reaches the limit. Unread
+/// inputs mean the invariants are unchecked, so value stops rather than moves blind; `>=`
+/// sets a flag cleared while the inputs are still dark again on the next dark tick.
+#[allow(clippy::too_many_arguments)]
+async fn track_input_state(
+    storage: &Arc<Storage>,
+    config: &OperatorConfig,
+    health: &Option<Arc<HealthState>>,
+    webhook_client: &WebhookClient,
+    missing: Option<String>,
+    input_dark_ticks: &mut u32,
+    halted: &mut bool,
+    breach_counters: &mut BreachCounters,
+) {
+    match missing {
+        None => *input_dark_ticks = 0,
+        Some(reason) => {
+            *input_dark_ticks = input_dark_ticks.saturating_add(1);
+            error!(
+                dark_ticks = *input_dark_ticks,
+                reason = %reason,
+                "Reconciliation could not read a required input this tick"
+            );
+            if *input_dark_ticks >= INPUT_DARK_HALT_TICKS && !*halted {
+                let halt_reason = format!(
+                    "reconciliation halt: required inputs unavailable for {} consecutive ticks (last: {})",
+                    input_dark_ticks, reason
+                );
+                error!(reason = %halt_reason, "RECONCILIATION HALT tripped; freezing both pipelines");
+                let in_force =
+                    freeze_pipelines(storage, health, &halt_reason, HaltKind::Outage).await;
+                *halted = in_force.is_some();
+                // The write found an insolvency halt already set, which has paged on its own.
+                if in_force == Some(HaltKind::Insolvency) {
+                    breach_counters.insolvency_halted = true;
+                } else if !breach_counters.announced_outage {
+                    match send_inputs_dark_halt_alert(
+                        &config.reconciliation_webhook_url,
+                        *input_dark_ticks,
+                        &halt_reason,
+                        webhook_client,
+                    )
+                    .await
+                    {
+                        Ok(()) => breach_counters.announced_outage = true,
+                        Err(e) => error!("Failed to send inputs-dark halt webhook: {}", e),
+                    }
+                }
+            }
+        }
+    }
+    OPERATOR_RECONCILIATION_INPUT_DARK_TICKS
+        .with_label_values(&[ProgramType::Escrow.as_label()])
+        .set(*input_dark_ticks as f64);
+}
+
+/// One pass per mint over finalized reads: supply against custody plus envelope, and ledger
+/// liabilities at the custody slot against custody. A failed read holds the breach counters,
+/// so a transient glitch keeps the evidence, and is reported as missing.
+#[allow(clippy::too_many_arguments)]
+async fn check_invariants(
+    storage: &Arc<Storage>,
+    config: &OperatorConfig,
+    rpc_client: &Arc<RpcClientWithRetry>,
+    channel_rpc: &Arc<RpcClientWithRetry>,
+    escrow_instance_id: Pubkey,
+    webhook_client: &WebhookClient,
+    health: &Option<Arc<HealthState>>,
+    previously_alerted_orphans: &mut Option<HashSet<i64>>,
+    breach_counters: &mut BreachCounters,
+    halted: &mut bool,
+    liability_dark_ticks: &mut u32,
+    cancellation_token: &CancellationToken,
+) -> Result<TickInputs, OperatorError> {
     check_orphan_deposit_rows(
         storage,
         previously_alerted_orphans,
@@ -293,26 +453,34 @@ async fn perform_reconciliation_check(
     // (runbook) must let a fresh insolvency re-trip, while a still-set flag keeps
     // re-firing suppressed. On a read error leave the guard as-is.
     if let Ok(flag) = storage.is_reconciliation_halted().await {
+        // A flag cleared after it landed ends the incident, so a re-trip pages again.
+        if *halted && flag.is_none() {
+            breach_counters.clear_announced();
+        }
+        breach_counters.insolvency_halted = flag.as_ref().is_some_and(|flag| flag.insolvency);
         *halted = flag.is_some();
     }
 
-    let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id).await?;
+    // Custody is read at each known mint's ATA, so the mint set comes first.
+    let db_mints = fetch_db_mint_set(storage).await?;
+    let custody = fetch_on_chain_balances(rpc_client, escrow_instance_id, &db_mints).await?;
 
     // Envelope (DB) and channel supply (PrivateChannel RPC) are read here, next to
     // custody, because the supply invariant compares all three as one instant. The ledger
     // wait below costs seconds and must never sit between two readings being compared.
-    let mut mints: HashSet<Pubkey> = custody.balances.keys().copied().collect();
-    mints.extend(fetch_db_mint_set(storage).await?);
+    let mut mints: HashSet<Pubkey> = db_mints.iter().map(|(mint, _)| *mint).collect();
     // A failure of either input holds the breach counters and skips the tick, so a
     // transient glitch cannot reset a building breach.
-    let (supply, envelope) = match load_halt_inputs(storage, channel_rpc, &mints).await {
-        Ok(inputs) => inputs,
-        Err(e) => {
-            warn!("Skipping halt evaluation this tick (counters held): {}", e);
-            return Ok(());
-        }
-    };
+    let (supply, envelope, supply_missing) =
+        match load_halt_inputs(storage, channel_rpc, &mints).await {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                warn!("Skipping halt evaluation this tick (counters held): {}", e);
+                return Ok(TickInputs::Missing(format!("halt inputs unavailable: {e}")));
+            }
+        };
 
+    let mut ledger_missing = None;
     let covered = match wait_for_ledger(storage, custody.slot, cancellation_token).await {
         LedgerWait::Covered => {
             *liability_dark_ticks = 0;
@@ -322,14 +490,22 @@ async fn perform_reconciliation_check(
             *liability_dark_ticks += 1;
             false
         }
-        LedgerWait::Cancelled => return Ok(()),
+        // Lag stays alert-only, but a checkpoint that cannot be read at all is a missing input.
+        LedgerWait::Unreadable => {
+            *liability_dark_ticks += 1;
+            ledger_missing = Some("escrow checkpoint unreadable".to_string());
+            false
+        }
+        // Never counted: the caller skips input accounting once cancelled.
+        LedgerWait::Cancelled => return Ok(TickInputs::Complete),
     };
     report_liability_arm_state(*liability_dark_ticks, config, webhook_client).await;
 
     // Rows are read whatever the wait outcome. A mint that appeared since the enumeration
     // has no supply reading, so the supply arm holds it as it holds any unread mint, while
     // the liability arm still sees it.
-    let (ledger_mints, liabilities) = fetch_ledger(storage, custody.slot).await?;
+    let (ledger_mints, liabilities) =
+        fetch_ledger_at(storage, &custody.slots, custody.slot).await?;
     mints.extend(ledger_mints);
 
     evaluate_and_maybe_halt(
@@ -339,6 +515,7 @@ async fn perform_reconciliation_check(
         webhook_client,
         &custody.balances,
         custody.slot,
+        &custody.slots,
         &mints,
         &supply,
         &envelope,
@@ -348,18 +525,21 @@ async fn perform_reconciliation_check(
     )
     .await;
 
-    Ok(())
+    Ok(match supply_missing.or(ledger_missing) {
+        Some(reason) => TickInputs::Missing(reason),
+        None => TickInputs::Complete,
+    })
 }
 
-/// Every mint the DB knows, parsed. Read before the ledger wait so enumeration never
-/// depends on whether the ledger can be pinned this tick.
-async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<HashSet<Pubkey>, OperatorError> {
+/// Every mint the DB knows with its token program, parsed. Read before the ledger wait so
+/// enumeration never depends on whether the ledger can be pinned this tick.
+async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<Vec<(Pubkey, Pubkey)>, OperatorError> {
     storage
         .get_mint_addresses()
         .await
         .map_err(OperatorError::Storage)?
         .iter()
-        .map(|address| parse_mint(address))
+        .map(|(address, token_program)| Ok((parse_mint(address)?, parse_mint(token_program)?)))
         .collect()
 }
 
@@ -368,6 +548,8 @@ async fn fetch_db_mint_set(storage: &Arc<Storage>) -> Result<HashSet<Pubkey>, Op
 enum LedgerWait {
     Covered,
     Unknown,
+    /// Every checkpoint read failed, so the ledger is unknown and the input is missing.
+    Unreadable,
     Cancelled,
 }
 
@@ -383,10 +565,14 @@ async fn wait_for_ledger(
     let key = program_key(ProgramType::Escrow);
     let started = tokio::time::Instant::now();
     let mut last: Option<u64> = None;
+    let mut read_once = false;
     loop {
         match storage.get_committed_checkpoint(&key).await {
             Ok(Some(committed)) if committed >= slot => return LedgerWait::Covered,
-            Ok(Some(committed)) => last = Some(committed),
+            Ok(Some(committed)) => {
+                read_once = true;
+                last = Some(committed);
+            }
             // No escrow indexer has ever committed, so waiting cannot help.
             Ok(None) => {
                 warn!(
@@ -399,6 +585,14 @@ async fn wait_for_ledger(
             Err(e) => warn!("Checkpoint read failed while waiting for the ledger: {}", e),
         }
         if started.elapsed() >= LEDGER_CATCHUP_TIMEOUT {
+            if !read_once {
+                warn!(
+                    slot,
+                    "Checkpoint never read within the wait; ledger input unreadable this tick"
+                );
+                count_unknown_ledger("checkpoint_unreadable");
+                return LedgerWait::Unreadable;
+            }
             warn!(
                 checkpoint = ?last,
                 slot,
@@ -471,6 +665,32 @@ async fn fetch_ledger(
     Ok((mints, liabilities))
 }
 
+/// The ledger for each mint at the slot its custody was read at; a mint with no custody
+/// slot uses `highest`.
+async fn fetch_ledger_at(
+    storage: &Arc<Storage>,
+    slots: &HashMap<Pubkey, u64>,
+    highest: u64,
+) -> Result<(HashSet<Pubkey>, HashMap<Pubkey, u64>), OperatorError> {
+    let mut by_slot = HashMap::new();
+    for slot in slots.values().copied().chain([highest]) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = by_slot.entry(slot) {
+            entry.insert(fetch_ledger(storage, slot).await?);
+        }
+    }
+    let (mints, at_highest) = &by_slot[&highest];
+    let mut all_mints = mints.clone();
+    let mut liabilities = at_highest.clone();
+    for (mint, slot) in slots {
+        let (slot_mints, at_slot) = &by_slot[slot];
+        all_mints.extend(slot_mints);
+        if let Some(&owed) = at_slot.get(mint) {
+            liabilities.insert(*mint, owed);
+        }
+    }
+    Ok((all_mints, liabilities))
+}
+
 /// Query the per-mint in-flight envelope (unsettled amount) as u64.
 async fn fetch_in_flight_envelope(
     storage: &Arc<Storage>,
@@ -487,31 +707,58 @@ async fn fetch_in_flight_envelope(
     Ok(out)
 }
 
+/// Per-mint channel supply, the in-flight envelope, and why any supply is missing.
+type HaltInputs = (HashMap<Pubkey, u64>, HashMap<Pubkey, u64>, Option<String>);
+
 /// Load the halt inputs: the in-flight envelope (DB) and per-mint channel supply
 /// (PrivateChannel RPC) for the given mint set. An envelope-query failure skips
 /// the whole tick (one DB read), but a single mint's supply read failing must not
 /// blind the others: that mint is omitted from the returned map and held in
 /// `evaluate_and_maybe_halt`, so a flaky read on one mint cannot suppress
-/// detection on a genuinely over-issued one.
+/// detection on a genuinely over-issued one. The tick is still reported missing, and a
+/// supply read older than the channel's newest recent block counts as failed.
 async fn load_halt_inputs(
     storage: &Arc<Storage>,
     channel_rpc: &Arc<RpcClientWithRetry>,
     mints: &HashSet<Pubkey>,
-) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), OperatorError> {
+) -> Result<HaltInputs, OperatorError> {
     let envelope = fetch_in_flight_envelope(storage).await?;
-    let mut supply = HashMap::new();
-    for mint in mints {
-        match fetch_channel_supply(channel_rpc, mint).await {
-            Ok(s) => {
-                supply.insert(*mint, s);
-            }
-            Err(e) => warn!(
-                mint = %mint,
-                "Channel supply read failed; skipping this mint this tick: {}", e.reason
-            ),
-        }
+    // No mints means no supply to read, so the channel's freshness does not matter.
+    if mints.is_empty() {
+        return Ok((HashMap::new(), envelope, None));
     }
-    Ok((supply, envelope))
+    let anchor = match channel_anchor(channel_rpc).await {
+        Ok(anchor) => anchor,
+        Err(e) => {
+            warn!(
+                "Channel freshness unknown; holding every supply counter this tick: {}",
+                e.reason
+            );
+            return Ok((HashMap::new(), envelope, Some(e.reason)));
+        }
+    };
+    let mut supply = HashMap::new();
+    let mut missing = None;
+    let mut rereads = SUPPLY_REREAD_BUDGET;
+    for mint in mints {
+        let reason = match fetch_fresh_channel_supply(channel_rpc, mint, anchor, &mut rereads).await
+        {
+            Ok((s, slot)) if slot >= anchor => {
+                supply.insert(*mint, s);
+                continue;
+            }
+            Ok((_, slot)) => {
+                format!("answered at slot {slot}, behind the channel's block {anchor}")
+            }
+            Err(e) => e.reason,
+        };
+        warn!(
+            mint = %mint,
+            "Channel supply read unusable; skipping this mint this tick: {}", reason
+        );
+        missing = Some(format!("channel supply for mint {mint}: {reason}"));
+    }
+    Ok((supply, envelope, missing))
 }
 
 fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
@@ -526,6 +773,7 @@ fn parse_mint(mint_address: &str) -> Result<Pubkey, OperatorError> {
 /// Halt path: per mint, advance each invariant's own counter and freeze the pipelines once
 /// (durable flag + quarantine + forced-unhealthy + webhook) on the `HALT_CONFIRM_TICKS`-th breach of either.
 /// `liabilities` is `None` when the ledger could not be pinned to `slot`; that arm then holds.
+/// `slots` holds each mint's custody slot; a mint without one was read at `slot`.
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_and_maybe_halt(
     storage: &Arc<Storage>,
@@ -534,6 +782,7 @@ async fn evaluate_and_maybe_halt(
     webhook_client: &WebhookClient,
     custody: &HashMap<Pubkey, u64>,
     slot: u64,
+    slots: &HashMap<Pubkey, u64>,
     mints: &HashSet<Pubkey>,
     supply: &HashMap<Pubkey, u64>,
     envelope: &HashMap<Pubkey, u64>,
@@ -543,7 +792,12 @@ async fn evaluate_and_maybe_halt(
 ) {
     // Rebuild counters from scratch each tick so a mint that stops breaching (or
     // disappears) resets to zero rather than lingering.
-    let mut next_counters = BreachCounters::default();
+    let mut next_counters = BreachCounters {
+        announced_outage: breach_counters.announced_outage,
+        announced_mints: std::mem::take(&mut breach_counters.announced_mints),
+        insolvency_halted: breach_counters.insolvency_halted,
+        ..Default::default()
+    };
     for &mint in mints {
         // A mint absent from `supply` had its read fail this tick (an absent
         // account reads as Ok(0), not a miss). Hold its counter rather than
@@ -566,7 +820,8 @@ async fn evaluate_and_maybe_halt(
         let count = breach_counters.supply.get(&mint).copied().unwrap_or(0) + 1;
         next_counters.supply.insert(mint, count);
 
-        if count < HALT_CONFIRM_TICKS || *halted {
+        // An outage halt does not suppress this: a proven breach must still quarantine and page.
+        if count < HALT_CONFIRM_TICKS || next_counters.insolvency_halted {
             warn!(
                 mint = %mint,
                 supply_gap = breach.supply_gap,
@@ -578,15 +833,14 @@ async fn evaluate_and_maybe_halt(
             continue;
         }
 
-        // Confirmed insolvency: trip the halt exactly once.
-        *halted = true;
+        // Confirmed insolvency: trip the halt once the flag lands; a failed write retries next tick.
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of supply by {}, \
              envelope {} tolerance {} over {} consecutive finalized ticks",
             mint, c, breach.supply_gap, breach.envelope, breach.tolerance, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-        trip_halt(
+        if trip_halt(
             storage,
             health,
             webhook_client,
@@ -596,8 +850,13 @@ async fn evaluate_and_maybe_halt(
             breach.supply_gap,
             c.saturating_add(breach.supply_gap),
             &reason,
+            &mut next_counters.announced_mints,
         )
-        .await;
+        .await
+        {
+            *halted = true;
+            next_counters.insolvency_halted = true;
+        }
     }
 
     for &mint in mints {
@@ -631,28 +890,29 @@ async fn evaluate_and_maybe_halt(
 
         let count = breach_counters.liability.get(&mint).copied().unwrap_or(0) + 1;
         next_counters.liability.insert(mint, count);
+        let mint_slot = slots.get(&mint).copied().unwrap_or(slot);
 
-        if count < HALT_CONFIRM_TICKS || *halted {
+        // An outage halt does not suppress this: a proven breach must still quarantine and page.
+        if count < HALT_CONFIRM_TICKS || next_counters.insolvency_halted {
             warn!(
                 mint = %mint,
                 gap = breach.gap,
                 liabilities = breach.liabilities,
                 tolerance = breach.tolerance,
-                slot,
+                slot = mint_slot,
                 consecutive_ticks = count,
                 "Custody short of ledger liabilities; halt pending confirmation"
             );
             continue;
         }
 
-        *halted = true;
         let reason = format!(
             "reconciliation halt: mint {} custody {} short of ledger liabilities {} by {}, \
              tolerance {} at slot {} over {} consecutive finalized ticks",
-            mint, c, breach.liabilities, breach.gap, breach.tolerance, slot, count
+            mint, c, breach.liabilities, breach.gap, breach.tolerance, mint_slot, count
         );
         error!(reason = %reason, "RECONCILIATION HALT tripped; freezing both pipelines");
-        trip_halt(
+        if trip_halt(
             storage,
             health,
             webhook_client,
@@ -662,8 +922,13 @@ async fn evaluate_and_maybe_halt(
             breach.gap,
             breach.liabilities,
             &reason,
+            &mut next_counters.announced_mints,
         )
-        .await;
+        .await
+        {
+            *halted = true;
+            next_counters.insolvency_halted = true;
+        }
     }
 
     *breach_counters = next_counters;
@@ -684,17 +949,14 @@ async fn trip_halt(
     gap: u64,
     db_balance: u64,
     reason: &str,
-) {
-    if let Err(e) = storage.set_reconciliation_halt(reason).await {
-        error!("Failed to set durable reconciliation halt flag: {}", e);
-    }
-    // Unbounded on purpose: an insolvency halt is not nonce-scoped.
-    match storage.quarantine_active_withdrawals(None, None).await {
-        Ok(n) => info!(rows = n, "Quarantined active withdrawals on halt"),
-        Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
-    }
-    if let Some(h) = health {
-        h.force_unhealthy(reason.to_string());
+    announced: &mut HashSet<Pubkey>,
+) -> bool {
+    let persisted = freeze_pipelines(storage, health, reason, HaltKind::Insolvency)
+        .await
+        .is_some();
+    // An outage page does not cover this: an upgrade to insolvency pages again.
+    if announced.contains(mint) {
+        return persisted;
     }
     // Payload carries real custody and the amount the escrow should hold (supply it
     // could not honor, or ledger liabilities); delta_bps is u64::MAX when custody is 0.
@@ -704,11 +966,104 @@ async fn trip_halt(
         db_balance,
         delta_bps: insolvency_delta_bps(custody, gap),
     };
-    if let Err(e) =
-        send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await
-    {
-        error!("Failed to send reconciliation halt webhook: {}", e);
+    match send_webhook_alert(&config.reconciliation_webhook_url, &[alert], webhook_client).await {
+        Ok(()) => {
+            announced.insert(*mint);
+        }
+        Err(e) => error!("Failed to send reconciliation halt webhook: {}", e),
     }
+    persisted
+}
+
+/// The levers every halt pulls: the durable flag, quarantine for an insolvency, forced-unhealthy.
+/// Returns the kind of halt now in force, or `None` when the flag never landed. An outage skips
+/// quarantine because nothing is proven wrong and the flag already blocks every send.
+async fn freeze_pipelines(
+    storage: &Arc<Storage>,
+    health: &Option<Arc<HealthState>>,
+    reason: &str,
+    kind: HaltKind,
+) -> Option<HaltKind> {
+    let mut in_force = None;
+    for attempt in 1..=HALT_WRITE_ATTEMPTS {
+        let written = match kind {
+            HaltKind::Insolvency => storage
+                .set_reconciliation_halt(reason)
+                .await
+                .map(|()| HaltKind::Insolvency),
+            // The outage write leaves an insolvency halt in place and says so.
+            HaltKind::Outage => storage.set_outage_halt(reason).await.map(|written| {
+                if written {
+                    HaltKind::Outage
+                } else {
+                    HaltKind::Insolvency
+                }
+            }),
+        };
+        match written {
+            Ok(held) => {
+                in_force = Some(held);
+                break;
+            }
+            Err(e) => error!(
+                attempt,
+                "Failed to set durable reconciliation halt flag: {}", e
+            ),
+        }
+    }
+    if kind == HaltKind::Insolvency {
+        // Unbounded on purpose: an insolvency halt is not nonce-scoped.
+        match storage.quarantine_active_withdrawals(None, None).await {
+            Ok(n) => info!(rows = n, "Quarantined active withdrawals on halt"),
+            Err(e) => error!("Failed to quarantine active withdrawals on halt: {}", e),
+        }
+    }
+    // The latch never clears, so it waits for a flag that is really set, and only carries this
+    // reason when this kind is in force. An insolvency found in force is latched by the fetcher.
+    if let Some(h) = health {
+        match (kind, in_force) {
+            (HaltKind::Insolvency, Some(_)) => h.force_unhealthy(reason.to_string()),
+            (HaltKind::Outage, Some(HaltKind::Outage)) => {
+                h.force_unhealthy_provisional(reason.to_string())
+            }
+            _ => {}
+        }
+    }
+    in_force
+}
+
+/// Posts the inputs-dark halt as `{ halt_reason, dark_ticks, timestamp }`, retrying
+/// transient HTTP errors. With no webhook URL configured it only logs.
+pub async fn send_inputs_dark_halt_alert(
+    webhook_url: &Option<String>,
+    dark_ticks: u32,
+    reason: &str,
+    webhook_client: &WebhookClient,
+) -> Result<(), OperatorError> {
+    let Some(url) = webhook_url else {
+        warn!(dark_ticks, "Inputs-dark halt but no webhook URL configured");
+        return Ok(());
+    };
+    let payload = serde_json::json!({
+        "halt_reason": reason,
+        "dark_ticks": dark_ticks,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    webhook_client
+        .post_json(
+            url,
+            &payload,
+            &format!("inputs dark for {dark_ticks} tick(s)"),
+        )
+        .await
+        .map_err(|error| {
+            OperatorError::WebhookError(format!(
+                "Failed to send inputs-dark halt webhook after {} attempts: {}",
+                error.attempts(),
+                error.message()
+            ))
+        })?;
+    Ok(())
 }
 
 /// Surface orphan deposit rows (deposits whose mint was not `allowed` at the
@@ -805,26 +1160,13 @@ pub struct BalanceMismatch {
     pub delta_bps: u64,
 }
 
-/// Fetches on-chain token balances for all token accounts owned by the escrow
-///
-/// Queries the Solana RPC using `get_token_accounts_by_owner` to retrieve all SPL token accounts
-/// (both Token and Token-2022 programs) owned by the escrow instance. Returns a mapping of mint
-/// addresses to total balances, aggregating across multiple token accounts for the same mint if present.
-///
-/// # Arguments
-/// * `rpc_client` - RPC client with retry logic for on-chain queries
-/// * `escrow_instance_id` - Public key of the escrow account that owns the token accounts
-///
-/// # Returns
-/// * `CustodySnapshot` - Per-mint balances (smallest token units) and the slot they are valid at
-///
-/// # Errors
-/// Returns `OperatorError::RpcError` if the RPC call fails after retries or if token account data cannot be parsed
+/// Escrow custody for each known `(mint, token_program)`, read from the instance ATAs.
 async fn fetch_on_chain_balances(
     rpc_client: &Arc<RpcClientWithRetry>,
     escrow_instance_id: Pubkey,
-) -> Result<CustodySnapshot, OperatorError> {
-    fetch_escrow_balances_by_mint(rpc_client, escrow_instance_id)
+    mints: &[(Pubkey, Pubkey)],
+) -> Result<EscrowCustody, OperatorError> {
+    fetch_escrow_custody(rpc_client, escrow_instance_id, mints)
         .await
         .map_err(|e| OperatorError::RpcError(e.to_string()))
 }
@@ -1266,6 +1608,7 @@ mod tests {
             &test_webhook_client(),
             &custody,
             1,
+            &HashMap::new(),
             &db_mints,
             &supply,
             &envelope,
@@ -1300,6 +1643,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1343,6 +1687,7 @@ mod tests {
                 &webhook,
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 supply,
                 &envelope,
@@ -1379,6 +1724,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1397,6 +1743,7 @@ mod tests {
             &test_webhook_client(),
             &custody,
             1,
+            &HashMap::new(),
             &db_mints,
             &supply,
             &envelope,
@@ -1425,6 +1772,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1446,6 +1794,7 @@ mod tests {
             &test_webhook_client(),
             &custody,
             1,
+            &HashMap::new(),
             &db_mints,
             &supply,
             &envelope,
@@ -1488,6 +1837,7 @@ mod tests {
                 &test_webhook_client(),
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1533,6 +1883,7 @@ mod tests {
                 &webhook,
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 supply,
                 &envelope,
@@ -1577,6 +1928,7 @@ mod tests {
                 &webhook,
                 &custody,
                 1,
+                &HashMap::new(),
                 &db_mints,
                 &supply,
                 &envelope,
@@ -1639,6 +1991,7 @@ mod tests {
             &test_webhook_client(),
             custody,
             1,
+            &HashMap::new(),
             mints,
             supply,
             envelope,
@@ -1689,6 +2042,39 @@ mod tests {
         assert!(!reason.contains("supply by"), "{reason}");
         assert!(reason.contains(&mint.to_string()), "{reason}");
         assert_eq!(counters.liability.get(&mint).copied(), Some(3));
+    }
+
+    /// A liability halt names the slot the breaching mint's custody was read at, not the highest.
+    #[tokio::test]
+    async fn liability_halt_reason_names_the_mints_own_slot() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
+        let mut counters = BreachCounters {
+            liability: HashMap::from([(mint, HALT_CONFIRM_TICKS - 1)]),
+            ..Default::default()
+        };
+        let mut halted = false;
+
+        evaluate_and_maybe_halt(
+            &storage,
+            &recon_config_zero_tolerance(),
+            &None,
+            &test_webhook_client(),
+            &custody,
+            11,
+            &HashMap::from([(mint, 10)]),
+            &mints,
+            &supply,
+            &envelope,
+            Some(&liabilities),
+            &mut counters,
+            &mut halted,
+        )
+        .await;
+
+        assert!(halted);
+        let reason = halt_reason(&storage).await;
+        assert!(reason.contains("at slot 10 "), "{reason}");
     }
 
     #[tokio::test]
@@ -1977,7 +2363,11 @@ mod tests {
             ..recon_config_zero_tolerance()
         };
         let (custody, mints, supply, envelope, liabilities, mint) = liability_maps();
-        let mut counters = BreachCounters::default();
+        // The insolvency halt is in force, as the tick's resync would have found it.
+        let mut counters = BreachCounters {
+            insolvency_halted: true,
+            ..Default::default()
+        };
         let mut halted = true;
 
         for _ in 0..3 {
@@ -2107,30 +2497,72 @@ mod tests {
         assert_eq!(counters.liability.get(&mint).copied(), Some(1));
     }
 
-    /// Mock the escrow custody sweep on a mockito server: the SPL Token program
-    /// call returns one jsonParsed token account (mint, amount); Token-2022 empty.
+    /// Escrow instance every tick in these tests reads custody for.
+    fn test_instance() -> Pubkey {
+        Pubkey::new_from_array([7; 32])
+    }
+
+    /// Mock escrow custody: `getMultipleAccounts` answers the test instance's SPL ATA for
+    /// `mint` with `amount` at slot 1, and any other requested key as absent.
     async fn mock_custody_sweep(server: &mut mockito::Server, mint: Pubkey, amount: u64) {
-        let account = format!(
-            r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":165,"data":{{"program":"spl-token","space":165,"parsed":{{"type":"account","info":{{"mint":"{mint}","owner":"{owner}","tokenAmount":{{"amount":"{amount}","decimals":6,"uiAmount":null,"uiAmountString":"{amount}"}}}}}}}}}}}}"#,
-            ata = Pubkey::new_unique(),
-            prog = spl_token::id(),
-            owner = Pubkey::new_unique(),
-        );
+        crate::operator::escrow_sweep::tests::mock_channel_clock(server, 1, vec![1], Some(1)).await;
+        use base64::Engine as _;
+        use spl_token::solana_program::program_option::COption;
+        use spl_token::solana_program::program_pack::Pack;
+        let account = spl_token::state::Account {
+            mint,
+            owner: test_instance(),
+            amount,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+        let mut buf = vec![0u8; spl_token::state::Account::LEN];
+        account.pack_into_slice(&mut buf);
+        let held = serde_json::json!({
+            "lamports": 2_039_280u64,
+            "owner": spl_token::id().to_string(),
+            "executable": false,
+            "rentEpoch": 0,
+            "space": buf.len(),
+            "data": [base64::engine::general_purpose::STANDARD.encode(&buf), "base64"],
+        });
+        let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &test_instance(),
+            &mint,
+            &spl_token::id(),
+        )
+        .to_string();
         server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
-            .with_status(200)
-            .with_body(format!(
-                r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":1}},"value":[{}]}},"id":1}}"#,
-                account
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getMultipleAccounts"}),
             ))
-            .create_async()
-            .await;
-        server
-            .mock("POST", "/")
-            .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
             .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":1},"value":[]},"id":1}"#)
+            .with_body_from_request(move |req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                let value: Vec<serde_json::Value> = body["params"][0]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|k| {
+                        if k.as_str() == Some(ata.as_str()) {
+                            held.clone()
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    })
+                    .collect();
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"context": {"slot": 1}, "value": value}
+                })
+                .to_string()
+                .into_bytes()
+            })
             .create_async()
             .await;
     }
@@ -2165,8 +2597,16 @@ mod tests {
         mock.set_checkpoint(&program_key(ProgramType::Escrow), slot);
     }
 
-    /// Answer every channel `getAccountInfo` with an SPL mint at `supply`.
+    /// Channel slot the test clock's newest block sits at, and supply reads answer at.
+    const CHANNEL_TIP: u64 = 100;
+
+    /// Answer every channel `getAccountInfo` with an SPL mint at `supply`, at `CHANNEL_TIP`.
     async fn mock_channel_supply(server: &mut mockito::Server, supply: u64) {
+        mock_channel_supply_at(server, supply, CHANNEL_TIP).await;
+    }
+
+    /// Answer every channel `getAccountInfo` with an SPL mint at `supply`, read at `slot`.
+    async fn mock_channel_supply_at(server: &mut mockito::Server, supply: u64, slot: u64) {
         use base64::Engine as _;
         use spl_token::solana_program::program_option::COption;
         use spl_token::solana_program::program_pack::Pack;
@@ -2182,13 +2622,27 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         server
             .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getAccountInfo"}),
+            ))
             .with_status(200)
             .with_body(format!(
-                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":{slot}}},"value":{{"owner":"{prog}","lamports":1000000,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
                 prog = spl_token::id(),
             ))
             .create_async()
             .await;
+    }
+
+    /// A live channel clock: its newest block is `CHANNEL_TIP`, produced a second ago.
+    async fn mock_fresh_channel_clock(server: &mut mockito::Server) {
+        crate::operator::escrow_sweep::tests::mock_channel_clock(
+            server,
+            CHANNEL_TIP,
+            vec![CHANNEL_TIP],
+            Some(1),
+        )
+        .await;
     }
 
     /// One-attempt RPC client so a failing read ends the tick quickly.
@@ -2219,7 +2673,9 @@ mod tests {
         mock_custody_sweep(&mut custody_server, mint, custody).await;
         let mut channel = mockito::Server::new_async().await;
         mock_channel_supply(&mut channel, supply).await;
+        mock_fresh_channel_clock(&mut channel).await;
         let mock = MockStorage::new();
+        seed_mints(&mock, &[mint]).await;
         let storage = Arc::new(Storage::Mock(mock.clone()));
         TickEnv {
             custody: custody_server,
@@ -2247,18 +2703,32 @@ mod tests {
         token: &CancellationToken,
         dark_ticks: &mut u32,
     ) -> Result<(), OperatorError> {
+        run_tick_full(env, config, counters, halted, token, dark_ticks, &mut 0).await
+    }
+
+    /// One tick with both the liability-dark and the input-dark counters supplied.
+    async fn run_tick_full(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        token: &CancellationToken,
+        dark_ticks: &mut u32,
+        input_dark_ticks: &mut u32,
+    ) -> Result<(), OperatorError> {
         perform_reconciliation_check(
             &env.storage,
             config,
             &fast_rpc(env.custody.url()),
             &fast_rpc(env.channel.url()),
-            Pubkey::new_unique(),
+            test_instance(),
             &test_webhook_client(),
             &None,
             &mut None,
             counters,
             halted,
             dark_ticks,
+            input_dark_ticks,
             token,
         )
         .await
@@ -2292,6 +2762,7 @@ mod tests {
         let mut counters = BreachCounters {
             supply: HashMap::from([(mint, 2)]),
             liability: HashMap::from([(mint, 2)]),
+            ..Default::default()
         };
         let mut halted = false;
 
@@ -2429,6 +2900,9 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         server
             .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getAccountInfo"}),
+            ))
             .with_status(200)
             .with_body_from_request(move |_| {
                 seen.lock()
@@ -2438,7 +2912,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "result": {
-                        "context": {"slot": 1},
+                        "context": {"slot": CHANNEL_TIP},
                         "value": {
                             "owner": spl_token::id().to_string(),
                             "lamports": 1_000_000u64,
@@ -2566,9 +3040,11 @@ mod tests {
         let mut custody_server = mockito::Server::new_async().await;
         mock_custody_sweep(&mut custody_server, mint, 100).await;
         let mock = MockStorage::new();
+        seed_mints(&mock, &[mint]).await;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut channel = mockito::Server::new_async().await;
         mock_channel_supply_recording(&mut channel, 100, mock.clone(), seen.clone()).await;
+        mock_fresh_channel_clock(&mut channel).await;
         let storage = Arc::new(Storage::Mock(mock.clone()));
         // A checkpoint stuck below the custody slot makes the wait spend its whole budget.
         seed_checkpoint(&mock, 0);
@@ -2745,13 +3221,16 @@ mod tests {
             ..Default::default()
         };
         let mut halted = false;
+        let mut input_dark = 0;
 
-        let res = run_tick(
+        let res = run_tick_full(
             &env,
             &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
             &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
         )
         .await;
 
@@ -2759,6 +3238,7 @@ mod tests {
         assert_eq!(counters.liability.get(&mint).copied(), Some(2), "held");
         assert_eq!(counters.supply.get(&mint).copied(), Some(1));
         assert!(!halted);
+        assert_eq!(input_dark, 1, "an unreadable checkpoint is a missing input");
     }
 
     #[tokio::test]
@@ -2771,18 +3251,25 @@ mod tests {
             .set_mint_balances(vec![ledger_row(&mint.to_string(), 200, 0)]);
         let mut counters = BreachCounters::default();
         let mut halted = false;
+        let mut input_dark = 0;
 
-        run_tick(
+        run_tick_full(
             &env,
             &recon_config_zero_tolerance(),
             &mut counters,
             &mut halted,
             &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
         )
         .await
         .unwrap();
 
         assert_eq!(counters.liability.get(&mint).copied(), Some(1));
+        assert_eq!(
+            input_dark, 0,
+            "a read that recovers within the wait is not missing"
+        );
     }
 
     #[tokio::test]
@@ -2910,6 +3397,7 @@ mod tests {
         mock_custody_sweep(&mut custody_server, mint, 900).await;
 
         let mock = MockStorage::new();
+        seed_mints(&mock, &[mint]).await;
         mock.set_mint_balances(vec![ledger_row(&mint.to_string(), 0, 0)]);
         let storage = Arc::new(Storage::Mock(mock));
 
@@ -2950,12 +3438,13 @@ mod tests {
             &config,
             &custody_rpc,
             &channel_rpc,
-            Pubkey::new_unique(),
+            test_instance(),
             &webhook_client,
             &None,
             &mut orphans,
             &mut counters,
             &mut halted,
+            &mut 0,
             &mut 0,
             &CancellationToken::new(),
         )
@@ -3004,12 +3493,13 @@ mod tests {
             &config,
             &rpc,
             &rpc,
-            Pubkey::new_unique(),
+            test_instance(),
             &webhook,
             &None,
             &mut orphans,
             &mut counters,
             &mut halted,
+            &mut 0,
             &mut 0,
             &CancellationToken::new(),
         )
@@ -3024,12 +3514,13 @@ mod tests {
             &config,
             &rpc,
             &rpc,
-            Pubkey::new_unique(),
+            test_instance(),
             &webhook,
             &None,
             &mut orphans,
             &mut counters,
             &mut halted,
+            &mut 0,
             &mut 0,
             &CancellationToken::new(),
         )
@@ -3038,6 +3529,1014 @@ mod tests {
             !halted,
             "a cleared durable flag must drop the in-memory guard"
         );
+    }
+
+    // ── channel supply freshness ──────────────────────────────────────
+
+    /// Point the env's channel at a clock whose newest block is `block`, `age_secs` old,
+    /// answering supply reads with `supply` at `read_slot`.
+    async fn set_channel(
+        env: &mut TickEnv,
+        supply: u64,
+        read_slot: u64,
+        block: u64,
+        age_secs: i64,
+    ) {
+        env.channel.reset();
+        mock_channel_supply_at(&mut env.channel, supply, read_slot).await;
+        crate::operator::escrow_sweep::tests::mock_channel_clock(
+            &mut env.channel,
+            block,
+            vec![block],
+            Some(age_secs),
+        )
+        .await;
+    }
+
+    /// Runs one tick with a supply counter already at 2 and returns (counter, input-dark).
+    async fn supply_tick(env: &TickEnv, mint: Pubkey) -> (Option<u32>, u32) {
+        let mut counters = BreachCounters {
+            supply: HashMap::from([(mint, 2)]),
+            ..Default::default()
+        };
+        let mut input_dark = 0;
+        run_tick_full(
+            env,
+            &recon_config_zero_tolerance(),
+            &mut counters,
+            &mut false,
+            &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
+        )
+        .await
+        .unwrap();
+        (counters.supply.get(&mint).copied(), input_dark)
+    }
+
+    /// A supply read answered below the channel's newest block is stale: it may not clear
+    /// a building breach, and the tick counts as missing an input.
+    #[tokio::test]
+    async fn a_supply_read_behind_the_anchor_is_held() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        set_channel(&mut env, 100, 5, 10, 1).await;
+
+        assert_eq!(supply_tick(&env, mint).await, (Some(2), 1));
+        assert!(env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A read at or past the anchor is fresh and counts as a clean reading.
+    #[tokio::test]
+    async fn a_supply_read_at_the_anchor_is_accepted() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        set_channel(&mut env, 100, 10, 10, 1).await;
+
+        assert_eq!(
+            supply_tick(&env, mint).await,
+            (None, 0),
+            "a clean fresh read resets"
+        );
+    }
+
+    /// A channel whose newest block is old cannot build or clear evidence either way.
+    #[tokio::test]
+    async fn a_stale_channel_holds_every_supply_counter() {
+        let mint = Pubkey::new_unique();
+        let mut env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        // Breaching supply, but the node's newest block is ten minutes old.
+        set_channel(&mut env, 5_000, 10, 10, 600).await;
+
+        assert_eq!(supply_tick(&env, mint).await, (Some(2), 1));
+    }
+
+    // ── missing inputs (input-dark ticks) ─────────────────────────────
+
+    /// A required reconciliation input that a tick can fail to read.
+    #[derive(Clone, Copy, Debug)]
+    enum Input {
+        MintSet,
+        Custody,
+        Envelope,
+        ChannelSupply,
+        Ledger,
+    }
+
+    const ALL_INPUTS: [Input; 5] = [
+        Input::MintSet,
+        Input::Custody,
+        Input::Envelope,
+        Input::ChannelSupply,
+        Input::Ledger,
+    ];
+
+    /// Make `input` unreadable (or readable again) for the ticks that follow.
+    async fn set_input_failing(env: &mut TickEnv, input: Input, failing: bool) {
+        match input {
+            Input::MintSet => env.mock.set_should_fail("get_mint_addresses", failing),
+            Input::Envelope => env
+                .mock
+                .set_should_fail("get_in_flight_amounts_by_mint", failing),
+            Input::Ledger => env
+                .mock
+                .set_should_fail("get_mint_balances_for_reconciliation", failing),
+            Input::Custody | Input::ChannelSupply => {
+                assert!(failing, "RPC inputs are only ever broken in these tests");
+                let server = match input {
+                    Input::Custody => &mut env.custody,
+                    _ => &mut env.channel,
+                };
+                server.reset();
+                server
+                    .mock("POST", "/")
+                    .with_status(503)
+                    .create_async()
+                    .await;
+            }
+        }
+    }
+
+    /// A tick env whose one mint also has an active withdrawal, so a quarantine would show.
+    async fn dark_env() -> (TickEnv, Pubkey) {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 1);
+        seed_pending_withdrawal(&env.mock, 1, 1);
+        env.mock.pending_transactions.lock().unwrap()[0].mint = mint.to_string();
+        (env, mint)
+    }
+
+    fn withdrawal_status(env: &TickEnv) -> crate::storage::common::models::TransactionStatus {
+        env.mock.pending_transactions.lock().unwrap()[0].status
+    }
+
+    /// Every required input counts: three unreadable ticks in a row set the durable halt,
+    /// page with the inputs-dark webhook, and leave active withdrawals untouched.
+    #[tokio::test]
+    async fn each_missing_input_halts_after_three_ticks_without_quarantine() {
+        use crate::storage::common::models::TransactionStatus;
+        for input in ALL_INPUTS {
+            let (mut env, _) = dark_env().await;
+            set_input_failing(&mut env, input, true).await;
+            let mut hook = mockito::Server::new_async().await;
+            let alert = hook
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJson(
+                    serde_json::json!({"dark_ticks": INPUT_DARK_HALT_TICKS}),
+                ))
+                .with_status(200)
+                .expect(1)
+                .create_async()
+                .await;
+            let config = OperatorConfig {
+                reconciliation_webhook_url: Some(hook.url()),
+                ..recon_config_zero_tolerance()
+            };
+            let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+
+            for tick in 1..=INPUT_DARK_HALT_TICKS {
+                let _ = run_tick_full(
+                    &env,
+                    &config,
+                    &mut counters,
+                    &mut halted,
+                    &CancellationToken::new(),
+                    &mut 0,
+                    &mut input_dark,
+                )
+                .await;
+                assert_eq!(
+                    input_dark, tick,
+                    "{input:?}: one dark tick per unreadable tick"
+                );
+                assert_eq!(
+                    halted,
+                    tick == INPUT_DARK_HALT_TICKS,
+                    "{input:?} tick {tick}"
+                );
+            }
+
+            let reason = env
+                .storage
+                .is_reconciliation_halted()
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{input:?}: halt must be durable"))
+                .reason;
+            assert!(
+                reason.contains("required inputs unavailable"),
+                "{input:?}: {reason}"
+            );
+            assert_eq!(
+                withdrawal_status(&env),
+                TransactionStatus::Pending,
+                "{input:?}: an outage halt must not quarantine"
+            );
+            alert.assert_async().await;
+        }
+    }
+
+    /// One tick that reads everything clears the streak, so scattered failures never halt.
+    #[tokio::test]
+    async fn a_complete_tick_resets_the_input_dark_streak() {
+        let (mut env, _) = dark_env().await;
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for failing in [true, true, false, true, true] {
+            set_input_failing(&mut env, Input::Envelope, failing).await;
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+            if !failing {
+                assert_eq!(input_dark, 0, "a complete tick resets the streak");
+            }
+        }
+        assert_eq!(input_dark, 2);
+        assert!(!halted);
+        assert!(env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Clearing the flag while the inputs are still down re-trips on the next dark tick.
+    #[tokio::test]
+    async fn clearing_while_still_dark_trips_again() {
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Ledger, true).await;
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert!(halted);
+
+        env.storage.clear_reconciliation_halt().await.unwrap();
+        let _ = run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
+        )
+        .await;
+
+        assert!(halted);
+        assert!(
+            env.storage
+                .is_reconciliation_halted()
+                .await
+                .unwrap()
+                .is_some(),
+            "the halt is set again while the inputs stay dark"
+        );
+    }
+
+    /// A halt whose flag write failed is not treated as set, so a later tick writes it,
+    /// even while the flag cannot be read back to resync the guard.
+    #[tokio::test]
+    async fn a_failed_halt_write_is_retried_on_the_next_tick() {
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Ledger, true).await;
+        env.mock.set_should_fail("is_reconciliation_halted", true);
+        env.mock.set_should_fail("set_outage_halt", true);
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert!(!halted, "an unwritten flag must not latch the guard");
+        assert!(env.mock.reconciliation_halt.lock().unwrap().is_none());
+
+        env.mock.set_should_fail("set_outage_halt", false);
+        let _ = run_tick_full(
+            &env,
+            &config,
+            &mut counters,
+            &mut halted,
+            &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
+        )
+        .await;
+
+        assert!(halted);
+        assert!(
+            env.mock.reconciliation_halt.lock().unwrap().is_some(),
+            "the next dark tick writes the flag"
+        );
+    }
+
+    /// A webhook that counts every halt alert it receives.
+    async fn counting_halt_hook() -> (mockito::ServerGuard, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut hook = mockito::Server::new_async().await;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        hook.mock("POST", "/")
+            .with_status(200)
+            .with_body_from_request(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            })
+            .create_async()
+            .await;
+        (hook, seen)
+    }
+
+    /// One tick whose result is ignored, for tests that only watch state across ticks.
+    async fn one_tick(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        input_dark: &mut u32,
+    ) {
+        let _ = run_tick_full(
+            env,
+            config,
+            counters,
+            halted,
+            &CancellationToken::new(),
+            &mut 0,
+            input_dark,
+        )
+        .await;
+    }
+
+    /// While the flag write keeps failing, every dark tick retries it but the incident pages
+    /// once; a manual clear starts a new incident that pages again.
+    #[tokio::test]
+    async fn a_failing_halt_write_alerts_once_per_incident() {
+        use std::sync::atomic::Ordering;
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Ledger, true).await;
+        env.mock.set_should_fail("set_outage_halt", true);
+        let (hook, alerts) = counting_halt_hook().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS + 2 {
+            one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        }
+        assert!(!halted, "an unwritten flag must not latch the guard");
+        assert_eq!(
+            env.mock.calls("set_outage_halt"),
+            3 * HALT_WRITE_ATTEMPTS as usize,
+            "the write is retried on every dark tick past the limit"
+        );
+        assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
+
+        env.mock.set_should_fail("set_outage_halt", false);
+        one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        assert!(halted, "the guard latches once the write lands");
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            1,
+            "landing the flag does not page again"
+        );
+
+        env.storage.clear_reconciliation_halt().await.unwrap();
+        one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        assert!(halted);
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            2,
+            "a cleared halt that re-trips is a new incident"
+        );
+    }
+
+    /// An incident whose flag never landed ends when its inputs come back, so the next one pages.
+    #[tokio::test]
+    async fn an_unwritten_halt_rearms_its_alert_once_the_inputs_recover() {
+        use std::sync::atomic::Ordering;
+        let (mut env, _) = dark_env().await;
+        env.mock.set_should_fail("set_outage_halt", true);
+        let (hook, alerts) = counting_halt_hook().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        let dark = INPUT_DARK_HALT_TICKS as usize;
+        let pattern = std::iter::repeat_n(true, dark)
+            .chain([false])
+            .chain(std::iter::repeat_n(true, dark));
+        for failing in pattern {
+            set_input_failing(&mut env, Input::Envelope, failing).await;
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            2,
+            "two separate incidents page twice"
+        );
+    }
+
+    /// A confirmed breach whose flag write keeps failing retries the write each tick and pages once.
+    #[tokio::test]
+    async fn a_breach_with_a_failing_halt_write_alerts_once() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_reconciliation_halt", true);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, db_mints, supply, envelope, _) = breach_maps();
+        let mut counters = BreachCounters::default();
+        let mut halted = false;
+
+        for _ in 0..HALT_CONFIRM_TICKS + 2 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &HashMap::new(),
+                &db_mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert!(!halted);
+        assert_eq!(
+            mock.calls("set_reconciliation_halt"),
+            3 * HALT_WRITE_ATTEMPTS as usize,
+            "the write is retried on every confirmed tick"
+        );
+        assert_eq!(alerts.load(Ordering::SeqCst), 1, "one page per incident");
+    }
+
+    /// Two mints confirming while the flag write fails each page once, not only the first.
+    #[tokio::test]
+    async fn each_mint_confirming_under_a_failing_write_pages_once() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_reconciliation_halt", true);
+        let storage = Arc::new(Storage::Mock(mock));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut custody, mut mints, mut supply, mut envelope, _) = breach_maps();
+        let (custody_b, mints_b, supply_b, envelope_b, _) = breach_maps();
+        custody.extend(custody_b);
+        mints.extend(mints_b);
+        supply.extend(supply_b);
+        envelope.extend(envelope_b);
+        let (mut counters, mut halted) = (BreachCounters::default(), false);
+
+        for _ in 0..HALT_CONFIRM_TICKS + 2 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &HashMap::new(),
+                &mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        assert_eq!(alerts.load(Ordering::SeqCst), 2, "one page per mint");
+    }
+
+    /// An insolvency page for an unwritten flag does not silence a later inputs-dark page.
+    #[tokio::test]
+    async fn an_insolvency_page_does_not_silence_an_inputs_dark_page() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        mock.set_should_fail("set_reconciliation_halt", true);
+        mock.set_should_fail("set_outage_halt", true);
+        let storage = Arc::new(Storage::Mock(mock));
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, mints, supply, envelope, _) = breach_maps();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..HALT_CONFIRM_TICKS {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &HashMap::new(),
+                &mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+        assert_eq!(alerts.load(Ordering::SeqCst), 1);
+
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            track_input_state(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                Some("custody unreadable".to_string()),
+                &mut input_dark,
+                &mut halted,
+                &mut counters,
+            )
+            .await;
+        }
+
+        assert_eq!(alerts.load(Ordering::SeqCst), 2, "the outage pages too");
+    }
+
+    /// An existing halt is never overwritten or re-announced by a dark streak.
+    #[tokio::test]
+    async fn a_dark_streak_under_an_existing_halt_trips_nothing() {
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Envelope, true).await;
+        env.storage
+            .set_reconciliation_halt("prior halt")
+            .await
+            .unwrap();
+        let mut hook = mockito::Server::new_async().await;
+        let alert = hook.mock("POST", "/").expect(0).create_async().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS {
+            let _ = run_tick_full(
+                &env,
+                &config,
+                &mut counters,
+                &mut halted,
+                &CancellationToken::new(),
+                &mut 0,
+                &mut input_dark,
+            )
+            .await;
+        }
+
+        let reason = env
+            .storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("still halted")
+            .reason;
+        assert_eq!(reason, "prior halt");
+        assert_eq!(env.mock.calls("quarantine_active_withdrawals"), 0);
+        alert.assert_async().await;
+    }
+
+    /// Each mint's liabilities come from the ledger at its own custody slot, one read per slot.
+    #[tokio::test]
+    async fn ledger_is_read_at_each_mints_custody_slot() {
+        let (a, b, late) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let mock = MockStorage::new();
+        let rows = |deposits: u64| {
+            vec![
+                ledger_row(&a.to_string(), deposits, 0),
+                ledger_row(&b.to_string(), deposits, 0),
+                ledger_row(&late.to_string(), deposits, 0),
+            ]
+        };
+        mock.mint_balances_at
+            .lock()
+            .unwrap()
+            .extend([(7, rows(100)), (9, rows(900))]);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let slots = HashMap::from([(a, 7), (b, 9)]);
+
+        let (mints, liabilities) = fetch_ledger_at(&storage, &slots, 9).await.unwrap();
+
+        assert_eq!(liabilities[&a], 100, "a is compared at its slot 7");
+        assert_eq!(liabilities[&b], 900, "b is compared at its slot 9");
+        assert_eq!(
+            liabilities[&late], 900,
+            "a mint with no custody slot uses the highest"
+        );
+        assert_eq!(mints, HashSet::from([a, b, late]));
+        assert_eq!(
+            mock.calls("get_mint_balances_for_reconciliation"),
+            2,
+            "one read per distinct slot"
+        );
+    }
+
+    /// One tick like `run_tick_full`, but with a health handle so the forced-unhealthy latch shows.
+    async fn tick_with_health(
+        env: &TickEnv,
+        config: &OperatorConfig,
+        health: &Arc<HealthState>,
+        counters: &mut BreachCounters,
+        halted: &mut bool,
+        input_dark: &mut u32,
+    ) {
+        let _ = perform_reconciliation_check(
+            &env.storage,
+            config,
+            &fast_rpc(env.custody.url()),
+            &fast_rpc(env.channel.url()),
+            test_instance(),
+            &test_webhook_client(),
+            &Some(health.clone()),
+            &mut None,
+            counters,
+            halted,
+            &mut 0,
+            input_dark,
+            &CancellationToken::new(),
+        )
+        .await;
+    }
+
+    /// A breach confirmed while an outage halt holds still quarantines, pages as an insolvency,
+    /// and replaces the stored reason, so clearing the outage cannot release a drained mint.
+    #[tokio::test]
+    async fn a_breach_during_an_outage_halt_still_trips_as_insolvency() {
+        use std::sync::atomic::Ordering;
+        let (hook, alerts) = counting_halt_hook().await;
+        let mock = MockStorage::new();
+        seed_pending_withdrawal(&mock, 1, 1);
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        storage
+            .set_outage_halt("reconciliation halt: required inputs unavailable")
+            .await
+            .unwrap();
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (custody, db_mints, supply, envelope, mint) = breach_maps();
+        let mut counters = BreachCounters::default();
+        // The outage halt is in force, as the tick's resync would have found it.
+        let mut halted = true;
+
+        for _ in 0..HALT_CONFIRM_TICKS + 2 {
+            evaluate_and_maybe_halt(
+                &storage,
+                &config,
+                &None,
+                &test_webhook_client(),
+                &custody,
+                1,
+                &HashMap::new(),
+                &db_mints,
+                &supply,
+                &envelope,
+                None,
+                &mut counters,
+                &mut halted,
+            )
+            .await;
+        }
+
+        let halt = storage
+            .is_reconciliation_halted()
+            .await
+            .unwrap()
+            .expect("halted");
+        assert!(halt.insolvency, "the breach upgrades the halt");
+        assert!(halt.reason.contains(&mint.to_string()), "{}", halt.reason);
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            crate::storage::common::models::TransactionStatus::ManualReview,
+            "an insolvency quarantines active withdrawals"
+        );
+        assert_eq!(alerts.load(Ordering::SeqCst), 1, "the upgrade pages once");
+    }
+
+    /// A dark streak never replaces an insolvency halt, even when the guard could not read the
+    /// flag and so believes nothing is halted.
+    #[tokio::test]
+    async fn a_dark_streak_never_replaces_an_insolvency_halt() {
+        use std::sync::atomic::Ordering;
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Envelope, true).await;
+        env.storage
+            .set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        env.mock.set_should_fail("is_reconciliation_halted", true);
+        let (hook, alerts) = counting_halt_hook().await;
+        let config = OperatorConfig {
+            reconciliation_webhook_url: Some(hook.url()),
+            ..recon_config_zero_tolerance()
+        };
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS + 1 {
+            one_tick(&env, &config, &mut counters, &mut halted, &mut input_dark).await;
+        }
+
+        let halt = env
+            .mock
+            .reconciliation_halt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("halted");
+        assert_eq!(halt.reason, "mint X insolvent");
+        assert!(halt.insolvency);
+        assert!(halted, "the guard learns a halt is in force");
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            0,
+            "no outage page over an insolvency"
+        );
+    }
+
+    /// Health is forced unhealthy only once the flag has landed, since that latch never clears.
+    #[tokio::test]
+    async fn health_is_forced_only_once_the_halt_flag_lands() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome};
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Envelope, true).await;
+        env.mock.set_should_fail("set_outage_halt", true);
+        env.mock.set_should_fail("set_reconciliation_halt", true);
+        let health = HealthState::new(HealthConfig::operator());
+        let config = recon_config_zero_tolerance();
+        let (mut counters, mut halted, mut input_dark) = (BreachCounters::default(), false, 0);
+        for _ in 0..INPUT_DARK_HALT_TICKS + 1 {
+            tick_with_health(
+                &env,
+                &config,
+                &health,
+                &mut counters,
+                &mut halted,
+                &mut input_dark,
+            )
+            .await;
+        }
+        assert!(
+            !matches!(health.check(), HealthOutcome::ForcedUnhealthy { .. }),
+            "an unwritten halt must not latch health"
+        );
+
+        env.mock.set_should_fail("set_outage_halt", false);
+        env.mock.set_should_fail("set_reconciliation_halt", false);
+        tick_with_health(
+            &env,
+            &config,
+            &health,
+            &mut counters,
+            &mut halted,
+            &mut input_dark,
+        )
+        .await;
+        assert!(matches!(
+            health.check(),
+            HealthOutcome::ForcedUnhealthy { .. }
+        ));
+    }
+
+    /// With no mints there is no supply to read, so an unreachable channel is not a dark tick.
+    #[tokio::test]
+    async fn no_mints_needs_no_channel() {
+        let mut custody = mockito::Server::new_async().await;
+        custody
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getSlot"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":1}"#)
+            .create_async()
+            .await;
+        let mut channel = mockito::Server::new_async().await;
+        channel
+            .mock("POST", "/")
+            .with_status(503)
+            .create_async()
+            .await;
+        let mock = MockStorage::new();
+        seed_checkpoint(&mock, 1);
+        let env = TickEnv {
+            custody,
+            channel,
+            storage: Arc::new(Storage::Mock(mock.clone())),
+            mock,
+        };
+        let mut input_dark = 0;
+        run_tick_full(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut BreachCounters::default(),
+            &mut false,
+            &CancellationToken::new(),
+            &mut 0,
+            &mut input_dark,
+        )
+        .await
+        .unwrap();
+        assert_eq!(input_dark, 0);
+    }
+
+    /// A tick cut short by shutdown is not evidence of anything.
+    #[tokio::test]
+    async fn a_cancelled_tick_is_not_counted() {
+        let (mut env, _) = dark_env().await;
+        set_input_failing(&mut env, Input::Envelope, true).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut input_dark = 0;
+        let _ = run_tick_full(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut BreachCounters::default(),
+            &mut false,
+            &token,
+            &mut 0,
+            &mut input_dark,
+        )
+        .await;
+        assert_eq!(input_dark, 0);
+    }
+
+    /// A lagging escrow checkpoint is not a failed read: it stays on the liability-dark
+    /// alert path and never feeds the input-dark halt.
+    #[tokio::test]
+    async fn checkpoint_lag_is_not_an_input_failure() {
+        let mint = Pubkey::new_unique();
+        let env = tick_env(mint, 100, 100).await;
+        seed_checkpoint(&env.mock, 0);
+        env.mock
+            .set_mint_balances(vec![ledger_row(&mint.to_string(), 100, 0)]);
+        let (mut liability_dark, mut input_dark) = (0, 0);
+        run_tick_full(
+            &env,
+            &recon_config_zero_tolerance(),
+            &mut BreachCounters::default(),
+            &mut false,
+            &CancellationToken::new(),
+            &mut liability_dark,
+            &mut input_dark,
+        )
+        .await
+        .unwrap();
+        assert_eq!((liability_dark, input_dark), (1, 0));
+    }
+
+    /// Both halt kinds pull the same levers, but only a proven insolvency quarantines.
+    #[tokio::test]
+    async fn freeze_pipelines_quarantines_only_when_asked() {
+        use crate::storage::common::models::TransactionStatus;
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        for (kind, expected) in [
+            (HaltKind::Insolvency, TransactionStatus::ManualReview),
+            (HaltKind::Outage, TransactionStatus::Pending),
+        ] {
+            let mock = MockStorage::new();
+            seed_pending_withdrawal(&mock, 1, 1);
+            let storage = Arc::new(Storage::Mock(mock.clone()));
+            let health = HealthState::new(HealthConfig::operator());
+
+            let in_force =
+                freeze_pipelines(&storage, &Some(health.clone()), "test freeze", kind).await;
+
+            assert_eq!(in_force, Some(kind));
+            assert!(storage.is_reconciliation_halted().await.unwrap().is_some());
+            assert_eq!(
+                mock.pending_transactions.lock().unwrap()[0].status,
+                expected,
+                "{kind:?}"
+            );
+            assert!(matches!(
+                health.check(),
+                HealthOutcome::ForcedUnhealthy { .. }
+            ));
+        }
+    }
+
+    /// An outage write that finds an insolvency in force leaves the outage text off /health,
+    /// and a later insolvency replaces an outage latch.
+    #[tokio::test]
+    async fn freeze_pipelines_latches_only_the_kind_in_force() {
+        use private_channel_metrics::{HealthConfig, HealthOutcome, HealthState};
+        let reason = |h: &HealthState| match h.check() {
+            HealthOutcome::ForcedUnhealthy { reason } => Some(reason),
+            _ => None,
+        };
+
+        let mock = MockStorage::new();
+        mock.set_reconciliation_halt("mint X insolvent")
+            .await
+            .unwrap();
+        let storage = Arc::new(Storage::Mock(mock));
+        let health = HealthState::new(HealthConfig::operator());
+        let in_force =
+            freeze_pipelines(&storage, &Some(health.clone()), "outage", HaltKind::Outage).await;
+        assert_eq!(in_force, Some(HaltKind::Insolvency));
+        assert_eq!(reason(&health), None, "the outage text must not be latched");
+
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let health = HealthState::new(HealthConfig::operator());
+        freeze_pipelines(&storage, &Some(health.clone()), "outage", HaltKind::Outage).await;
+        freeze_pipelines(
+            &storage,
+            &Some(health.clone()),
+            "insolvent",
+            HaltKind::Insolvency,
+        )
+        .await;
+        assert_eq!(reason(&health).as_deref(), Some("insolvent"));
+    }
+
+    /// The flag write is retried within the tick, and a write that never lands is reported.
+    #[tokio::test]
+    async fn freeze_pipelines_reports_whether_the_flag_landed() {
+        for (failures, expected) in [(1, true), (HALT_WRITE_ATTEMPTS as usize, false)] {
+            let mock = MockStorage::new();
+            mock.set_fail_times("set_reconciliation_halt", failures);
+            let storage = Arc::new(Storage::Mock(mock.clone()));
+
+            let in_force =
+                freeze_pipelines(&storage, &None, "test freeze", HaltKind::Insolvency).await;
+
+            assert_eq!(in_force.is_some(), expected, "{failures} failed writes");
+            assert_eq!(mock.reconciliation_halt.lock().unwrap().is_some(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn inputs_dark_alert_without_url_is_ok() {
+        let result = send_inputs_dark_halt_alert(&None, 3, "reason", &test_webhook_client()).await;
+        assert!(result.is_ok());
     }
 
     fn test_webhook_client() -> WebhookClient {

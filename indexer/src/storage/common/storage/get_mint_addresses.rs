@@ -1,6 +1,7 @@
 use crate::{error::StorageError, storage::common::storage::Storage};
 
-pub async fn get_mint_addresses(storage: &Storage) -> Result<Vec<String>, StorageError> {
+/// Every mint as `(mint_address, token_program)`.
+pub async fn get_mint_addresses(storage: &Storage) -> Result<Vec<(String, String)>, StorageError> {
     match storage {
         Storage::Postgres(db) => Ok(db.get_mint_addresses_internal().await?),
         #[cfg(any(test, feature = "test-mock-storage"))]
