@@ -10,8 +10,8 @@ use crate::{
     indexer::checkpoint::program_key,
     storage::common::models::{
         DbMint, DbMintStatus, DbObservedRelease, DbTransaction, HaltInfo, MintDbBalance,
-        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, StoredSig,
-        TransactionStatus, TransactionType,
+        MintInFlightAmount, MintStatusAtSlot, ReleasedWithdrawal, ResyncBlockers, ServicedRow,
+        StoredSig, TransactionStatus, TransactionType,
     },
     storage::common::storage::live_lock::{LiveLockMode, LIVE_STATE_LOCK_KEY},
     storage::common::storage::resync_state::resync_halt_reason,
@@ -3391,6 +3391,30 @@ impl PostgresDb {
             observed_releases,
             earliest_slot,
         })
+    }
+
+    /// One page of `own` rows the channel has serviced: completed deposits, reminted withdrawals.
+    pub async fn get_serviced_rows_internal(
+        &self,
+        own: TransactionType,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ServicedRow>, sqlx::Error> {
+        let status = match own {
+            TransactionType::Deposit => TransactionStatus::Completed,
+            TransactionType::Withdrawal => TransactionStatus::FailedReminted,
+        };
+        sqlx::query_as(
+            "SELECT id, signature, instruction_index, inner_index FROM transactions
+             WHERE transaction_type = $1 AND status = $2 AND id > $3
+             ORDER BY id LIMIT $4",
+        )
+        .bind(own)
+        .bind(status)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn get_completed_withdrawal_nonces_internal(

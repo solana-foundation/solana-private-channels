@@ -158,6 +158,10 @@ async fn get_signatures_for_address_postgres(
     //
     // LEFT JOIN: a missing transactions row surfaces as NULL data rather than
     // silently dropping the row. We treat a NULL as data corruption below.
+    //
+    // Hide rows below the oldest retained block: truncation deletes their transactions,
+    // not their index rows. Same floor as getFirstAvailableBlock, in this snapshot; the
+    // metadata row goes first because MIN(slot) walks dead index entries until VACUUM.
     let rows = sqlx::query(
         "SELECT address_signatures.signature,
                 address_signatures.slot,
@@ -173,6 +177,20 @@ async fn get_signatures_for_address_postgres(
                 OR EXISTS (
                     SELECT 1 FROM UNNEST($7::int8[], $8::int8[]) AS scope(first_slot, last_slot)
                     WHERE address_signatures.slot BETWEEN scope.first_slot AND scope.last_slot))
+           AND address_signatures.slot >= COALESCE(
+                (SELECT CASE WHEN length(value) = 8 THEN
+                            get_byte(value, 0)::int8
+                            | (get_byte(value, 1)::int8 << 8)
+                            | (get_byte(value, 2)::int8 << 16)
+                            | (get_byte(value, 3)::int8 << 24)
+                            | (get_byte(value, 4)::int8 << 32)
+                            | (get_byte(value, 5)::int8 << 40)
+                            | (get_byte(value, 6)::int8 << 48)
+                            | (get_byte(value, 7)::int8 << 56)
+                        END
+                 FROM metadata WHERE key = 'first_available_block'),
+                (SELECT MIN(slot) FROM blocks),
+                0)
          ORDER BY address_signatures.slot DESC, address_signatures.signature DESC
          LIMIT $6",
     )
@@ -192,8 +210,8 @@ async fn get_signatures_for_address_postgres(
     for row in rows {
         let sig_bytes: Vec<u8> = row.get("signature");
         let slot: i64 = row.get("slot");
-        // NULL when the transaction row is missing (should never happen since
-        // address_signatures and transactions are written in the same atomic tx).
+        // NULL when the transaction row is missing. Rows at or above the floor always
+        // have one, since the index is only written after its block commits.
         let tx_data: Option<Vec<u8>> = row.get("data");
 
         let signature = match Signature::try_from(sig_bytes.as_slice()) {
@@ -206,8 +224,7 @@ async fn get_signatures_for_address_postgres(
             }
         };
 
-        // address_signatures and transactions are written in the same atomic
-        // DB transaction, so a missing transaction row is data corruption.
+        // Above the floor a missing transaction row is data corruption.
         let tx_data = match tx_data {
             Some(data) => data,
             None => {

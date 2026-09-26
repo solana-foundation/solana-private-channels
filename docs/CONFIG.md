@@ -50,6 +50,8 @@ The wall-clock duration of the window therefore moves with load, which is also h
 
 Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points to a PostgreSQL replica for read isolation.
 
+`GATEWAY_READ_URL` must be exactly one read node on one replica. Load-balancing several read nodes or replicas behind it is not supported: clients decide when to re-sign by reading `getBlockHeight` and then `getSignatureStatuses`, and that is only safe when both reads see the same replica.
+
 ### Gateway
 
 **Source**: [`gateway/src/lib.rs`](../gateway/src/lib.rs)

@@ -283,6 +283,101 @@ mod tests {
         );
     }
 
+    /// A cache missing one tip key answers nothing; slot, height and hash all come from Postgres.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_blockhash_never_mixes_cache_and_postgres() {
+        let postgres_blockhash = Hash::new_unique();
+        let (postgres_db, _pg) = start_test_postgres_raw().await;
+        let (mut redis_db, _redis) = start_stamped_redis(postgres_db.clone()).await;
+        AccountsDB::Postgres(postgres_db)
+            .write_batch(
+                &[],
+                vec![],
+                Some(make_sparse_block_info(50, 5, postgres_blockhash)),
+            )
+            .await
+            .unwrap();
+        write_batch_redis(
+            &mut redis_db,
+            &[],
+            vec![],
+            Some(make_sparse_block_info(100, 10, Hash::new_unique())),
+        )
+        .await
+        .unwrap();
+        let _: () = redis::cmd("DEL")
+            .arg(crate::accounts::get_block_height::BLOCK_HEIGHT_KEY)
+            .query_async(&mut redis_db.connection.clone())
+            .await
+            .unwrap();
+        let deps = make_read_deps(AccountsDB::Redis(redis_db));
+
+        let latest = get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
+            .await
+            .unwrap();
+        assert_eq!(latest.context.slot, 50);
+        assert_eq!(latest.value.blockhash, postgres_blockhash.to_string());
+        assert_eq!(
+            latest.value.last_valid_block_height,
+            5 + TEST_MAX_BLOCKHASHES - 1
+        );
+    }
+
+    /// Blocks commit while reads run; each hash encodes its height, so a torn read mismatches.
+    /// Old code fails only if a commit lands between its reads; the deterministic
+    /// regression is `latest_blockhash_never_mixes_cache_and_postgres`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_blockhash_deadline_pairs_with_its_hash_under_load() {
+        let hash_of = |height: u64| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&height.to_le_bytes());
+            Hash::new_from_array(bytes)
+        };
+        let (mut db, _pg) = start_pg().await;
+        db.write_batch(&[], vec![], Some(make_block_info(0, hash_of(0))))
+            .await
+            .unwrap();
+        let deps = Arc::new(make_read_deps(db.clone()));
+
+        let writer = tokio::spawn(async move {
+            for slot in 1..=300 {
+                db.write_batch(&[], vec![], Some(make_block_info(slot, hash_of(slot))))
+                    .await
+                    .unwrap();
+            }
+        });
+        // 500 reads from 20 tasks, so the pool is never the bottleneck.
+        let readers: Vec<_> = (0..20)
+            .map(|_| {
+                let deps = deps.clone();
+                tokio::spawn(async move {
+                    let mut values = Vec::new();
+                    for _ in 0..25 {
+                        values.push(
+                            get_latest_blockhash_impl::get_latest_blockhash_impl(&deps, None)
+                                .await
+                                .unwrap()
+                                .value,
+                        );
+                    }
+                    values
+                })
+            })
+            .collect();
+        for reader in readers {
+            for value in reader.await.unwrap() {
+                let hash = value.blockhash.parse::<Hash>().unwrap();
+                let height = u64::from_le_bytes(hash.as_ref()[..8].try_into().unwrap());
+                assert_eq!(
+                    value.last_valid_block_height - (TEST_MAX_BLOCKHASHES - 1),
+                    height,
+                    "deadline must come from the same block as the hash"
+                );
+            }
+        }
+        writer.await.unwrap();
+    }
+
     // ── get_block_time ────────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]

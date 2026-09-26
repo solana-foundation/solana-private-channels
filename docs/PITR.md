@@ -59,6 +59,14 @@ This document describes how WAL archiving, base backups, and point-in-time recov
 > `--env-file versions.env --env-file .env.local`, or use the guarded `make docker-*`
 > targets.
 
+### Restore whole databases only
+
+Restore a whole database, with the write node stopped, never selected rows of
+`accounts`. An account row's data does not name its own pubkey, so a row-level
+restore that puts one account's bytes under another key cannot be detected by
+the node. Any row-level restore tool, or a design with more than one writer,
+reopens this risk (audit finding SOLA6-104) and needs its own review.
+
 ### Step 1: Stop the database and dependents
 
 ```bash
