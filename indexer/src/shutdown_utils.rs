@@ -146,7 +146,7 @@ pub async fn stop_signal(
 }
 
 /// How long a stop path waits for the writers it aborted to actually stop.
-const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the wait re-checks. Short, because the normal case resolves in one poll.
 const WRITER_STOP_POLL_INTERVAL: Duration = Duration::from_millis(10);

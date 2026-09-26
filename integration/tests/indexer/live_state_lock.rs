@@ -17,6 +17,7 @@ use {
             StorageType, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         error::{IndexerError, OperatorError, StorageError},
+        indexer::{datasource::rpc_polling::rpc::RpcPoller, resync::ResyncService},
         operator,
         storage::{
             common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
@@ -416,4 +417,64 @@ async fn operator_stops_when_the_live_lock_is_lost_during_the_withdraw_preflight
     assert_stopped_on_lock_loss(result);
     // Only the preflight's first call reached RPC: no retry and no worker ran before the stop.
     assert_eq!(accepts.load(Ordering::SeqCst), 1);
+}
+
+/// I16. A resync must read and change nothing until a worker whose session just died has had
+/// time to stop, and a lock lost during that wait must stop it with nothing done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resync_stops_when_its_lock_is_lost_while_waiting_out_stale_workers() {
+    let (url, _container) = start_postgres("resync_lock_lost_in_grace").await;
+    let service = ResyncService::new(
+        connect(&url).await,
+        Arc::new(RpcPoller::new(
+            DEAD_RPC.to_string(),
+            solana_transaction_status::UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        )),
+        ProgramType::Escrow,
+        BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: DEAD_RPC.to_string(),
+            batch_size: 10,
+            max_gap_slots: u64::MAX,
+            start_slot: None,
+        },
+        Some(solana_sdk::pubkey::Pubkey::new_unique()),
+    )
+    .with_lock_heartbeat_interval(Duration::from_millis(50))
+    .with_stale_holder_grace(Duration::from_secs(60));
+    let resync = tokio::spawn(async move { service.run(0).await });
+
+    wait_until(
+        "the resync to take the live-state lock",
+        Duration::from_secs(30),
+        || async { advisory_sessions(&url, LIVE_STATE_LOCK_KEY, true).await == 1 },
+    )
+    .await;
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    let result = tokio::time::timeout(LOCK_LOST_STOP_BOUND, resync)
+        .await
+        .expect("the resync must stop soon after losing the live-state lock")
+        .expect("resync task must not panic");
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "a lock lost inside the grace must stop the resync, got: {result:?}"
+    );
+
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("admin connect");
+    let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('transactions')::text")
+        .fetch_one(&mut conn)
+        .await
+        .expect("look up the transactions table");
+    assert_eq!(
+        table, None,
+        "nothing, not even the schema, may be touched inside the grace"
+    );
 }

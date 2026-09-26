@@ -118,7 +118,9 @@ if anything fails. It is guarded these ways.
    in shared mode for its whole life; resync takes the same key exclusively and holds
    it for the entire rebuild. Postgres enforces the separation: workers coexist freely,
    resync refuses to start while any worker is up, and a worker refuses to start while
-   a resync runs. Ownership is re-proved on a heartbeat, and once more synchronously
+   a resync runs. After taking the lock, resync waits about 52s before it reads or deletes
+   anything, so a worker whose session had just died has noticed and stopped by then.
+   Ownership is re-proved on a heartbeat, and once more synchronously
    immediately before the rows are deleted. A role that cannot prove it still owns
    the lock stops itself. A probe that goes unanswered is not treated as proof: the
    server may simply be slow, and the session still holds the lock while we retry, so
