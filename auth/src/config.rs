@@ -40,7 +40,8 @@ pub struct Config {
     #[arg(long, env = "AUTH_ARGON2_MAX_CONCURRENCY", default_value = "4")]
     pub argon2_max_concurrency: NonZeroUsize,
 
-    /// Sustained per-IP request rate for /auth/register and /auth/login.
+    /// Sustained per-IP request rate for /auth/register, /auth/login and
+    /// /auth/challenge-wallet.
     #[arg(long, env = "AUTH_RATE_LIMIT_PER_SECOND", default_value = "5")]
     pub auth_rate_limit_per_second: NonZeroU32,
 

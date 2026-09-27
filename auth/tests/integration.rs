@@ -22,6 +22,7 @@ use uuid::Uuid;
 use private_channel_auth::{
     build_app, db,
     jwt::JwtConfig,
+    models::Role,
     password::PasswordWorker,
     serve::{serve, Limits},
     throttle::{AuthThrottle, CHALLENGES_PER_USER_PER_MINUTE},
@@ -1330,6 +1331,80 @@ async fn challenge_issuance_over_budget_is_shed() {
         neighbour.status(),
         200,
         "another account must keep its own budget"
+    );
+}
+
+/// The per-user budget alone lets one host multiply its write rate by
+/// registering accounts, so challenges also draw on the per-IP budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn challenge_issuance_over_budget_ip_is_shed_across_accounts() {
+    let (db_url, _container) = start_postgres().await;
+    let burst = NonZeroU32::new(3).unwrap();
+    let addr = start_throttled_app(
+        &db_url,
+        NonZeroU32::new(1).unwrap(),
+        burst,
+        NonZeroU32::new(10_000).unwrap(),
+    )
+    .await;
+
+    // Accounts and tokens are made directly, so the setup spends none of the
+    // per-IP budget under test.
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to test db");
+    let jwt = JwtConfig::new("test-secret");
+    let mut tokens = Vec::new();
+    for account in 0..burst.get() + 3 {
+        let user = db::insert_user(&pool, &format!("account{account}"), "fakehash")
+            .await
+            .expect("failed to insert user");
+        tokens.push(jwt.sign(user.id, Role::User).expect("failed to sign token"));
+    }
+
+    // One request per account, far inside each per-user budget, so any shed
+    // comes from the per-IP one. Fired concurrently so the bucket can't refill.
+    let url = format!("{}/auth/challenge-wallet", base_url(addr));
+    let pubkey = Keypair::new().pubkey().to_string();
+    let attempts: Vec<_> = tokens
+        .into_iter()
+        .map(|token| {
+            let url = url.clone();
+            let pubkey = pubkey.clone();
+            tokio::spawn(async move {
+                Client::new()
+                    .post(&url)
+                    .bearer_auth(token)
+                    .json(&json!({ "pubkey": pubkey }))
+                    .send()
+                    .await
+                    .expect("request failed")
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+
+    let statuses: Vec<u16> = futures::future::join_all(attempts)
+        .await
+        .into_iter()
+        .map(|joined| joined.expect("task panicked"))
+        .collect();
+
+    let served = statuses.iter().filter(|&&status| status == 200).count();
+    assert!(
+        served > 0,
+        "the burst allowance should be served: {statuses:?}"
+    );
+    assert!(
+        served <= burst.get() as usize,
+        "no more than the burst should be served: {statuses:?}"
+    );
+    assert!(
+        statuses.contains(&429),
+        "challenges past the burst should be shed: {statuses:?}"
     );
 }
 

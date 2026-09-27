@@ -126,9 +126,18 @@ pub fn build_app(state: AppState, cors_allowed_origin: &str, request_timeout: Du
             throttle::per_ip,
         ));
 
+    // Challenges cost no signature and are also capped per user, but that alone
+    // lets one host multiply its write rate by registering accounts.
+    let challenges = Router::new()
+        .route("/auth/challenge-wallet", post(routes::challenge::challenge))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            throttle::per_ip,
+        ));
+
     Router::new()
         .merge(credentials)
-        .route("/auth/challenge-wallet", post(routes::challenge::challenge))
+        .merge(challenges)
         .route(
             "/auth/verify-wallet",
             post(routes::verify_wallet::verify_wallet),

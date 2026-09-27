@@ -24,9 +24,9 @@ type IpRateLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, Default
 type UsernameRateLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 type UserRateLimiter = RateLimiter<Uuid, DefaultKeyedStateStore<Uuid>, DefaultClock>;
 
-/// Per-IP stops one host flooding the credential routes; per-username stops
-/// guesses against one account spread across many hosts. Per-user caps wallet
-/// challenges, which need a token but no signature.
+/// Per-IP stops one host flooding the credential and wallet challenge routes;
+/// per-username stops guesses against one account spread across many hosts.
+/// Per-user caps wallet challenges, which need a token but no signature.
 pub struct AuthThrottle {
     pub per_ip: IpRateLimiter,
     pub per_username: UsernameRateLimiter,
