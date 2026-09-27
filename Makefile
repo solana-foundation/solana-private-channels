@@ -11,7 +11,7 @@ FMT_DIRS := $(PROGRAM_DIRS) $(RUST_DIRS) integration
 OBS_SERVICES := cadvisor prometheus grafana
 
 .PHONY: all help
-.PHONY: install install-toolchain check-toolchain check-docker build fmt generate-idl generate-clients
+.PHONY: install install-toolchain check-toolchain check-docker verify-dvp-precompile build fmt generate-idl generate-clients
 .PHONY: unit-test integration-test all-test drills drill dvp-client-test
 .PHONY: ci-unit-test ci-integration-test ci-integration-test-prebuilt ci-integration-test-build-test-tree ci-integration-test-indexer
 .PHONY: unit-test-ci integration-test-ci integration-test-ci-prebuilt integration-test-ci-build-test-tree integration-test-ci-indexer integration-test-ci-no-build
@@ -84,6 +84,11 @@ check-toolchain:
 # enforces the same Docker precondition (present + daemon reachable + >= 26).
 check-docker:
 	@./scripts/check-docker.sh
+
+# Rebuild the vendored DvP precompile from its pinned upstream commit and fail
+# unless it matches the committed .so and the core pin. Needs Docker and solana-verify.
+verify-dvp-precompile:
+	@./scripts/verify-dvp-precompile.sh
 
 install: install-toolchain ensure-geyser-plugin
 	@echo "Installing dependencies for all projects..."

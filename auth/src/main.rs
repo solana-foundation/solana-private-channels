@@ -58,7 +58,7 @@ async fn main() {
         throttle: auth_throttle,
     };
 
-    // Periodically remove expired and used challenges so the table doesn't grow unboundedly.
+    // Periodically remove expired and used challenges. Each user holds at most one row.
     let cleanup_pool = state.pool.clone();
     let cleanup_status = pool_status.clone();
     tokio::spawn(async move {

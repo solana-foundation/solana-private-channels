@@ -12,7 +12,7 @@ Authentication service for the Solana Private Channels platform. Handles user re
 | `CORS_ALLOWED_ORIGIN` | `*` | Value for `Access-Control-Allow-Origin`. Set to your frontend origin in production (e.g. `https://app.example.com` — placeholder, replace with your real domain before use). Defaults to `*` for local dev. |
 | `AUTH_DATABASE_MAX_CONNECTIONS` | `10` | Maximum Postgres pool size. Increase under high concurrency. |
 | `AUTH_ARGON2_MAX_CONCURRENCY` | `4` | Concurrent Argon2 hashes. Hashing is CPU-bound, so past the core count this costs memory without adding throughput. |
-| `AUTH_RATE_LIMIT_PER_SECOND` | `5` | Sustained per-IP request rate for `/auth/register` and `/auth/login`. |
+| `AUTH_RATE_LIMIT_PER_SECOND` | `5` | Sustained per-IP request rate for `/auth/register`, `/auth/login` and `/auth/challenge-wallet`. |
 | `AUTH_RATE_LIMIT_BURST` | `10` | Burst allowance above the sustained per-IP rate. |
 | `AUTH_USERNAME_ATTEMPTS_PER_MINUTE` | `5` | Credential attempts per minute against a single username, across all IPs. |
 | `AUTH_MAX_CONNECTIONS` | `1024` | Maximum concurrent client connections. Past this, a new connection is dropped rather than queued. |
@@ -100,7 +100,7 @@ Request a sign challenge to prove ownership of a Solana wallet. Requires a valid
 
 Request: `{ "pubkey": "<base58 pubkey>" }`
 
-Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes. The message names both the account and the wallet so a signer only ever consents to linking their own wallet to their own account.
+Returns a `message`, `nonce`, and `expires_at`. The challenge expires in 10 minutes. Each account holds one challenge at a time, so a new request replaces the last; requests past 5 per minute per account, or past the per-IP rate, get `429`. The message names both the account and the wallet so a signer only ever consents to linking their own wallet to their own account.
 
 ```json
 {

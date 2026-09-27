@@ -19,6 +19,11 @@ pub async fn challenge(
     // Reject a malformed pubkey before issuing a challenge for it.
     Pubkey::from_str(&request.pubkey).map_err(|_| AppError::BadRequest("invalid pubkey".into()))?;
 
+    // Charged before any database work: issuing costs the caller no signature.
+    if state.throttle.per_user.check_key(&claims.sub).is_err() {
+        return Err(AppError::TooManyRequests);
+    }
+
     // Name the account in the signed message so the signer knows what they are linking.
     let username_result = db::find_username_by_id(&state.pool, claims.sub).await;
     state.pool_status.observe_app(&username_result);

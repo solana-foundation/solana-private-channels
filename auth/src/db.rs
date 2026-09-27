@@ -49,7 +49,7 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
         r#"
         CREATE TABLE IF NOT EXISTS private_channel_auth.challenges (
             id UUID PRIMARY KEY,
-            user_id UUID NOT NULL REFERENCES private_channel_auth.users(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL UNIQUE REFERENCES private_channel_auth.users(id) ON DELETE CASCADE,
             nonce UUID NOT NULL UNIQUE,
             expires_at TIMESTAMPTZ NOT NULL,
             used_at TIMESTAMPTZ
@@ -99,12 +99,6 @@ pub async fn init_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(
         r#"CREATE INDEX IF NOT EXISTS idx_admin_audit_target_user_id ON private_channel_auth.admin_audit (target_user_id)"#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"CREATE INDEX IF NOT EXISTS idx_challenges_user_id ON private_channel_auth.challenges (user_id)"#,
     )
     .execute(pool)
     .await?;
@@ -351,7 +345,8 @@ pub async fn insert_admin_audit<'e, E: PgExecutor<'e>>(
     Ok(())
 }
 
-/// Insert a new challenge tied to this user. Expires in 10 minutes.
+/// Issue this user's challenge, replacing any outstanding one so the table holds
+/// at most one row per user. Expires in 10 minutes.
 pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppResult<Challenge> {
     let expires_at = Utc::now() + chrono::Duration::minutes(10);
 
@@ -359,6 +354,8 @@ pub async fn insert_challenge(pool: &PgPool, user_id: Uuid, nonce: Uuid) -> AppR
         r#"
         INSERT INTO private_channel_auth.challenges (id, user_id, nonce, expires_at)
         VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id) DO UPDATE
+            SET nonce = EXCLUDED.nonce, expires_at = EXCLUDED.expires_at, used_at = NULL
         RETURNING nonce, expires_at
         "#,
     )
