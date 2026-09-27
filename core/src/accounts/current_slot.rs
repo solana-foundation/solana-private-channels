@@ -223,16 +223,17 @@ mod tests {
         use sqlx::Connection;
 
         let (mut fenced, _pg, url) = start_test_postgres_with_url().await;
-        fenced.writer_epoch = Some(bump(&fenced).await.unwrap());
+        let epoch = bump(&fenced).await.unwrap();
+        fenced.writer_epoch = Some(epoch);
         assert!(set_current_slot(&fenced, 5).await.unwrap());
 
         // A bump by the replacement, held open between its update and its commit.
         let mut bumper = sqlx::PgConnection::connect(&url).await.unwrap();
         sqlx::query("BEGIN").execute(&mut bumper).await.unwrap();
-        assert_eq!(read_locked(&mut bumper).await.unwrap(), Some(1));
+        assert_eq!(read_locked(&mut bumper).await.unwrap(), Some(epoch));
         sqlx::query("UPDATE metadata SET value = $2 WHERE key = $1")
             .bind(WRITER_EPOCH_KEY)
-            .bind(&crate::accounts::counter::encode(2)[..])
+            .bind(&crate::accounts::counter::encode(epoch + 1)[..])
             .execute(&mut bumper)
             .await
             .unwrap();

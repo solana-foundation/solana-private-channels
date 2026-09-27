@@ -9,7 +9,7 @@
 //! `get_signatures_for_address` and asserts the expected error
 //! surfaces.
 //!
-//! Three arms, three sub-tests:
+//! Three arms, four sub-tests (arm 2 also above the history floor):
 //!   1. `sig_bytes` that's not a valid 64-byte ed25519 signature
 //!      (`Signature::try_from` guard).
 //!   2. `transactions.data` missing (LEFT JOIN NULL).
@@ -116,6 +116,43 @@ async fn missing_transaction_row_surfaces_as_corruption_error() {
     let err = get_signatures_for_address(&db, &addr, 10, None, None, None)
         .await
         .expect_err("missing transaction row must surface as Err");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Transaction data missing"),
+        "error must point at the missing-transactions guard: {msg}"
+    );
+}
+
+/// Arm 2 above the history floor: an orphan newer than the oldest retained block is
+/// still corruption, not pruned history.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_above_the_floor_still_errors() {
+    let (_pg, _url, accounts) = start_postgres().await;
+    let addr = Pubkey::new_unique();
+
+    let good_sig: Vec<u8> = (2..=65u8).collect();
+    accounts
+        .pool
+        .execute(sqlx::query("INSERT INTO blocks (slot, data) VALUES (1, $1)").bind(&b"block"[..]))
+        .await
+        .expect("insert block row");
+    accounts
+        .pool
+        .execute(
+            sqlx::query(
+                "INSERT INTO address_signatures (address, slot, signature) VALUES ($1, $2, $3)",
+            )
+            .bind(addr.to_bytes().as_slice())
+            .bind(2i64)
+            .bind(good_sig.as_slice()),
+        )
+        .await
+        .expect("insert orphaned address_signatures row");
+
+    let db = AccountsDB::Postgres(accounts.clone());
+    let err = get_signatures_for_address(&db, &addr, 10, None, None, None)
+        .await
+        .expect_err("an orphan above the floor must surface as Err");
     let msg = format!("{err}");
     assert!(
         msg.contains("Transaction data missing"),

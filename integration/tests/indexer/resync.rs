@@ -464,6 +464,7 @@ fn script_channel_consumed(
             );
         }
     }
+    script_channel_floor(mock);
 }
 
 /// Enqueue an empty channel history: no serviced mints. Used by the discovery
@@ -471,6 +472,14 @@ fn script_channel_consumed(
 fn script_channel_empty(mock: &MockRpcServer) {
     for _ in 0..RESYNC_ATTEMPTS {
         mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+    }
+    script_channel_floor(mock);
+}
+
+/// Report a never-pruned channel history on every resync attempt.
+fn script_channel_floor(mock: &MockRpcServer) {
+    for _ in 0..RESYNC_ATTEMPTS {
+        mock.enqueue("getFirstAvailableBlock", Reply::result(json!(0)));
     }
 }
 
@@ -514,6 +523,7 @@ fn script_channel_consumed_on_page2(
             Reply::result(authority_signed_mint(key, kind)),
         );
     }
+    script_channel_floor(mock);
 }
 
 // ── DB assertion helpers (fresh pool: drop_tables invalidates old caches) ────
@@ -1598,6 +1608,7 @@ async fn resync_ignores_foreign_event_and_nonidempotency_memos(
             )),
         );
     }
+    script_channel_floor(&mock);
     h.run().await.expect("resync should succeed");
 
     let st = status_of(&db_url, &dep).await;
@@ -1671,6 +1682,7 @@ async fn resync_aborts_on_signed_mint_that_does_not_pay_the_deposit_db_intact(
             )),
         );
     }
+    script_channel_floor(&mock);
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_mismatch_sentinel";
     seed_pending_deposit(&db_url, sentinel_signature).await;
@@ -1770,6 +1782,7 @@ async fn resync_aborts_on_remint_marker_for_a_deposit_db_intact(
             )),
         );
     }
+    script_channel_floor(&mock);
 
     // Only the live table holds this row; any drop and rebuild would erase it.
     let sentinel_signature = "resync_kind_mismatch_sentinel";
@@ -1929,6 +1942,123 @@ async fn resync_leaves_released_withdrawal_for_smt_guard() -> Result<(), Box<dyn
 // ════════════════════════════════════════════════════════════════════════════
 // Reconcile-on-rebuild: pre-drop fail-closed gates (no real source needed)
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Regression #25: a deposit the operator completed but the channel index does not list
+/// yet would be rebuilt pending and minted again, so resync refuses with the row intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_aborts_when_channel_history_omits_a_completed_deposit_db_intact(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, faucet, _geyser_port) = start_test_validator().await;
+    let client = Arc::new(RpcClient::new_with_commitment(
+        validator.rpc_url(),
+        CommitmentConfig::confirmed(),
+    ));
+    let genesis = client.get_slot().await?;
+    let (db_url, _storage, _pg) = start_postgres_for_resync("resync_index_lag").await?;
+
+    let env = TestEnvironment::setup(&client, &faucet, 1, USER_BALANCE, None).await?;
+    do_deposit(
+        &client,
+        &env.users[0],
+        env.instance,
+        env.mint,
+        DEPOSIT_AMOUNT,
+    )
+    .await?;
+    let tip = client.get_slot().await?;
+    wait_for_finalized_slot(&validator.rpc_url(), tip + 5).await;
+
+    let mock = MockRpcServer::start().await;
+    let h = Harness {
+        db_url: db_url.clone(),
+        source_rpc_url: validator.rpc_url(),
+        program_type: ProgramType::Escrow,
+        instance: Some(env.instance),
+        channel_url: mock.url(),
+        genesis,
+    };
+    let keys = h.discover().await;
+    let dep = keys_of_type(&keys, "deposit")[0].clone();
+    // The operator minted it, but the channel's address index has not caught up.
+    seed_sql(
+        &db_url,
+        &format!(
+            "UPDATE transactions SET status = 'completed'::transaction_status \
+             WHERE signature = '{}'",
+            dep.signature
+        ),
+    )
+    .await;
+    script_channel_empty(&mock);
+
+    let result = h.run().await;
+    match &result {
+        Err(IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+            reason,
+        })) => assert!(reason.contains(&dep.signature), "reason: {reason}"),
+        other => panic!("an unlisted completed deposit must refuse, got {other:?}"),
+    }
+    assert_eq!(status_of(&db_url, &dep).await.status, "completed");
+    assert_eq!(marker(&db_url).await, None);
+    assert_eq!(active_halt(&db_url).await, None);
+
+    mock.shutdown().await;
+    Ok(())
+}
+
+/// Pruned channel history, or an unreadable floor, cannot prove the consumed-set complete,
+/// so resync refuses with the database untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn resync_aborts_on_pruned_channel_history_db_intact(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (validator, _faucet) = start_test_validator_no_geyser().await;
+    let client = RpcClient::new(validator.rpc_url());
+    let current_slot = client.get_slot().await?;
+    wait_for_finalized_slot(&validator.rpc_url(), current_slot + 5).await;
+
+    // One reply per retry of the default client config, so the floor read fails for good.
+    let cases: [(&str, Vec<Reply>); 2] = [
+        ("floor 7", vec![Reply::result(json!(7))]),
+        (
+            "floor unreadable",
+            std::iter::repeat_with(|| Reply::error(-32000, "floor rpc boom"))
+                .take(5)
+                .collect(),
+        ),
+    ];
+    for (i, (label, floor)) in cases.into_iter().enumerate() {
+        let (db_url, storage, _pg) =
+            start_postgres_for_resync(&format!("resync_pruned_{i}")).await?;
+        seed_pending_deposit(&db_url, "resync_pruned_seed").await;
+
+        let mock = MockRpcServer::start().await;
+        mock.enqueue("getSignaturesForAddress", Reply::result(json!([])));
+        mock.enqueue_sequence("getFirstAvailableBlock", floor);
+        let service = make_channel_resync_service(
+            validator.rpc_url(),
+            storage,
+            ProgramType::Escrow,
+            Some(Pubkey::new_unique()),
+            mock.url(),
+            Pubkey::new_unique(),
+        );
+        let result = service.run(current_slot).await;
+        assert!(
+            matches!(
+                result,
+                Err(IndexerError::Reconciliation(
+                    ReconciliationError::ConsumedSetUnavailable { .. }
+                ))
+            ),
+            "{label}: must refuse with ConsumedSetUnavailable, got {result:?}"
+        );
+        assert_eq!(row_count(&db_url).await, 1, "{label}: the drop never ran");
+        assert_eq!(marker(&db_url).await, None, "{label}");
+        assert_eq!(active_halt(&db_url).await, None, "{label}");
+        mock.shutdown().await;
+    }
+    Ok(())
+}
 
 /// IT-R6: when the channel RPC errors mid-enumeration, `run()` returns Err AND
 /// the pre-existing DB rows are still present (the drop never ran -- D3).

@@ -667,3 +667,91 @@ async fn idle_ticks_do_not_condemn_the_cache() -> Result<()> {
     handles.shutdown().await;
     Ok(())
 }
+
+/// Regression: an AIO node served reads before its own settler purged a stale cache.
+/// `CLIENT PAUSE ... WRITE` holds the purge but not reads, so a node that does not
+/// wait for alignment answers the first read from the stale account.
+#[tokio::test(flavor = "multi_thread")]
+async fn aio_never_serves_a_stale_cache_after_startup() -> Result<()> {
+    let pg = Postgres::default()
+        .with_db_name("private_channel_node")
+        .with_user("postgres")
+        .with_password("password")
+        .start()
+        .await
+        .expect("start postgres");
+    let pg_host = pg.get_host().await.expect("pg host");
+    let pg_port = pg.get_host_port_ipv4(5432).await.expect("pg port");
+    let pg_url = format!("postgres://postgres:password@{pg_host}:{pg_port}/private_channel_node");
+
+    let redis = Redis::default()
+        .with_tag("7")
+        .start()
+        .await
+        .expect("start redis");
+    let redis_host = redis.get_host().await.expect("redis host");
+    let redis_port = redis.get_host_port_ipv4(6379).await.expect("redis port");
+    let redis_url = format!("redis://{redis_host}:{redis_port}");
+
+    // A ledger with a produced block past genesis, then the node is stopped.
+    let port = get_free_port();
+    let handles = run_node(minimal_node_config(pg_url.clone(), port))
+        .await
+        .expect("run_node");
+    wait_for_block_height(&RpcClient::new(format!("http://127.0.0.1:{port}")), 1).await;
+    handles.shutdown().await;
+
+    let pool = sqlx::PgPool::connect(&pg_url).await?;
+    let tip: i64 = sqlx::query_scalar("SELECT MAX(slot) FROM blocks")
+        .fetch_one(&pool)
+        .await?;
+    let deployment_id: Vec<u8> =
+        sqlx::query_scalar("SELECT value FROM metadata WHERE key = 'deployment_id'")
+            .fetch_one(&pool)
+            .await?;
+
+    // Stamped for this ledger, one block behind it, holding an account Postgres never had.
+    use redis::AsyncCommands;
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    let stale = Keypair::new().pubkey();
+    let stale_account = solana_sdk::account::AccountSharedData::new(
+        777,
+        0,
+        &solana_sdk::pubkey::Pubkey::new_unique(),
+    );
+    let _: () = conn.set("deployment_id", deployment_id).await?;
+    let _: () = conn.set("latest_slot", tip - 1).await?;
+    let _: () = conn
+        .set(
+            format!("account:{stale}"),
+            bincode::serialize(&stale_account)?,
+        )
+        .await?;
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(3_000)
+        .arg("WRITE")
+        .query_async(&mut conn)
+        .await?;
+
+    let port = get_free_port();
+    let mut config = minimal_node_config(pg_url, port);
+    config.redis_cache_url = Some(redis_url);
+    let handles = run_node(config).await.expect("run_node");
+    let client = RpcClient::new(format!("http://127.0.0.1:{port}"));
+    let account = client
+        .get_account_with_commitment(&stale, client.commitment())
+        .await?
+        .value;
+    assert!(
+        account.is_none(),
+        "the first read must come from Postgres, not the stale cache: {account:?}"
+    );
+
+    handles.shutdown().await;
+    Ok(())
+}

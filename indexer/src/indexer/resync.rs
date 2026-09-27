@@ -6,10 +6,11 @@ use crate::{
         datasource::rpc_polling::rpc::RpcPoller, transaction_processor::TransactionProcessor,
     },
     operator::{
-        enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda, ConsumedSet,
-        RetryConfig, RpcClientWithRetry, CONSUMED_SET_PAGE_SIZE,
+        enumerate_consumed_mints, fetch_consumed_nonces, find_withdrawal_bitmap_pda,
+        ConsumedMintKind, ConsumedSet, RetryConfig, RpcClientWithRetry, SourceEventId,
+        CONSUMED_SET_PAGE_SIZE,
     },
-    storage::common::models::ResyncBlockers,
+    storage::common::models::{ResyncBlockers, ServicedRow},
     storage::common::storage::live_lock::{LiveLockMode, LIVE_LOCK_HEARTBEAT_INTERVAL},
     storage::common::storage::resync_state::resync_halt_reason,
     storage::Storage,
@@ -28,6 +29,28 @@ const MAX_BITMAP_RPC_TIP_LAG_SECS: i64 = 120;
 
 /// Metric label for the live-state lock this service holds.
 const RESYNC_LOCK_ROLE: &str = "resync";
+
+/// How many serviced rows the completeness check reads per query.
+const SERVICED_ROWS_PAGE_SIZE: i64 = 10_000;
+
+/// The first serviced row the consumed-set does not list as the same kind, and how many
+/// rows miss. A miss would be rebuilt pending and serviced again.
+fn first_unserviced(
+    program: ProgramType,
+    rows: &[ServicedRow],
+    consumed: &ConsumedSet,
+) -> Option<(String, usize)> {
+    let kind = match program {
+        ProgramType::Escrow => ConsumedMintKind::Deposit,
+        ProgramType::Withdraw => ConsumedMintKind::Remint,
+    };
+    let mut missing = rows.iter().filter(|row| {
+        let id = SourceEventId::new(&row.signature, row.instruction_index, row.inner_index);
+        consumed.get(&id).map(|mint| mint.kind) != Some(kind)
+    });
+    let first = missing.next()?;
+    Some((first.signature.clone(), 1 + missing.count()))
+}
 
 /// Why a resync must not wipe its rows yet, or `None` when it may. Only own-program rows count
 /// because the wipe deletes nothing else; withdraw also restarts nonces, so it needs proof none is spent.
@@ -164,11 +187,71 @@ impl ResyncService {
                         reason,
                     })
                 })?;
+        // Read after enumerating: the floor only rises, so 0 here means nothing was pruned
+        // before or during it. Genesis is slot 0, so any other value means lost history.
+        match channel_rpc.get_first_available_block().await {
+            Ok(0) => {}
+            Ok(floor) => {
+                return Err(IndexerError::Reconciliation(
+                    ReconciliationError::ConsumedSetUnavailable {
+                        reason: format!(
+                            "channel history is pruned below slot {floor}, so the consumed-set \
+                             may miss serviced mints"
+                        ),
+                    },
+                ))
+            }
+            Err(e) => {
+                return Err(IndexerError::Reconciliation(
+                    ReconciliationError::ConsumedSetUnavailable {
+                        reason: format!("channel first available block unreadable: {e}"),
+                    },
+                ))
+            }
+        }
         info!(
             "Consumed-set built: {} serviced mint(s) on the channel",
             set.len()
         );
         Ok(Some(Arc::new(set)))
+    }
+
+    /// Refuse unless every row this database already serviced is in the consumed-set.
+    /// A missing one proves the channel history the set came from is incomplete.
+    async fn refuse_if_serviced_rows_missing(
+        &self,
+        consumed: &ConsumedSet,
+    ) -> Result<(), IndexerError> {
+        let own = self.program_type.owned_transaction_type();
+        let (mut after_id, mut first, mut missing) = (0, None, 0);
+        loop {
+            let rows = self
+                .storage
+                .get_serviced_rows(own, after_id, SERVICED_ROWS_PAGE_SIZE)
+                .await?;
+            let Some(last) = rows.last() else { break };
+            after_id = last.id;
+            if let Some((signature, count)) = first_unserviced(self.program_type, &rows, consumed) {
+                first.get_or_insert(signature);
+                missing += count;
+            }
+        }
+        let Some(signature) = first else {
+            return Ok(());
+        };
+        error!(
+            missing,
+            %signature,
+            "Serviced rows are missing from the channel history; aborting resync before drop"
+        );
+        Err(IndexerError::Reconciliation(
+            ReconciliationError::ConsumedSetUnavailable {
+                reason: format!(
+                    "{missing} serviced {own:?} row(s) are missing from the channel history, \
+                     first {signature}; the channel index may lag, rerun once it catches up"
+                ),
+            },
+        ))
     }
 
     /// Replay `(from_slot, to_slot]` through the rebuild's own event conversion without
@@ -456,6 +539,12 @@ impl ResyncService {
         // Pre-flight 4+5: channel reachability + consumed-set completeness + cross-scheme
         // guard, all inside build_consumed_set, which returns Err on any of them.
         let consumed = self.build_consumed_set().await?;
+
+        // Pre-flight 5b: every serviced row must be in the set. Pre-flight 2 already refused
+        // rows below genesis, so every row checked here is one the rebuild re-creates.
+        if let Some(consumed) = &consumed {
+            self.refuse_if_serviced_rows_missing(consumed).await?;
+        }
 
         let backfill_service = BackfillService::new(
             self.storage.clone(),
@@ -1521,5 +1610,182 @@ mod tests {
             })) => {}
             other => panic!("another program's resync halt must refuse, got: {other:?}"),
         }
+    }
+
+    // ── serviced-row completeness ────────────────────────────────────
+
+    fn serviced(sig: &str, instruction_index: i32, inner_index: Option<i32>) -> ServicedRow {
+        ServicedRow {
+            id: 1,
+            signature: sig.to_string(),
+            instruction_index,
+            inner_index,
+        }
+    }
+
+    fn consumed_as(row: &ServicedRow, kind: crate::operator::ConsumedMintKind) -> ConsumedSet {
+        use crate::operator::{ConsumedMint, SourceEventId};
+        let id = SourceEventId::new(&row.signature, row.instruction_index, row.inner_index);
+        ConsumedSet::from([(
+            id,
+            ConsumedMint {
+                signature: solana_sdk::signature::Signature::new_unique(),
+                kind,
+                mint: Pubkey::new_unique(),
+                recipient_ata: Pubkey::new_unique(),
+                token_program: Pubkey::new_unique(),
+                amount: 1,
+            },
+        )])
+    }
+
+    /// Each serviced row needs a consumed entry of its own kind; the count covers every miss.
+    #[test]
+    fn first_unserviced_matrix() {
+        use crate::operator::ConsumedMintKind::{Deposit, Remint};
+        let row = serviced("sig-a", 2, Some(1));
+        let other = serviced("sig-b", 0, None);
+        let empty = ConsumedSet::new();
+        let cases = [
+            (ProgramType::Escrow, consumed_as(&row, Deposit), None),
+            (ProgramType::Escrow, empty.clone(), Some(("sig-a", 1))),
+            (
+                ProgramType::Escrow,
+                consumed_as(&row, Remint),
+                Some(("sig-a", 1)),
+            ),
+            (ProgramType::Withdraw, consumed_as(&row, Remint), None),
+            (ProgramType::Withdraw, empty.clone(), Some(("sig-a", 1))),
+            (
+                ProgramType::Withdraw,
+                consumed_as(&row, Deposit),
+                Some(("sig-a", 1)),
+            ),
+            // Same signature at another instruction is a different event.
+            (
+                ProgramType::Escrow,
+                consumed_as(&serviced("sig-a", 2, None), Deposit),
+                Some(("sig-a", 1)),
+            ),
+        ];
+        for (program, consumed, expected) in cases {
+            let got = first_unserviced(program, std::slice::from_ref(&row), &consumed);
+            assert_eq!(
+                got.as_ref().map(|(sig, n)| (sig.as_str(), *n)),
+                expected,
+                "{program:?}"
+            );
+        }
+        let got = first_unserviced(
+            ProgramType::Escrow,
+            &[row.clone(), other.clone()],
+            &consumed_as(&other, Deposit),
+        );
+        assert_eq!(got, Some(("sig-a".to_string(), 1)));
+        let got = first_unserviced(ProgramType::Escrow, &[row, other], &empty);
+        assert_eq!(got, Some(("sig-a".to_string(), 2)));
+    }
+
+    /// Escrow service over mock RPCs: a source tip, an empty and never-pruned channel.
+    async fn reconciling_escrow_service(
+        storage: Arc<Storage>,
+    ) -> (ResyncService, mockito::ServerGuard, mockito::ServerGuard) {
+        let mut source = mockito::Server::new_async().await;
+        source
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSlot""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":200}"#)
+            .create();
+        let mut channel = mockito::Server::new_async().await;
+        channel
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getSignaturesForAddress""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":[]}"#)
+            .create();
+        channel
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getFirstAvailableBlock""#.into(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":0}"#)
+            .create();
+        let rpc_poller = Arc::new(RpcPoller::new(
+            source.url(),
+            UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        ));
+        let backfill_config = BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: source.url(),
+            batch_size: 50,
+            max_gap_slots: 500,
+            start_slot: None,
+        };
+        let service = ResyncService::new(
+            storage,
+            rpc_poller,
+            ProgramType::Escrow,
+            backfill_config,
+            Some(Pubkey::new_unique()),
+        )
+        .with_channel_reconcile(ChannelReconcileConfig {
+            channel_rpc_url: channel.url(),
+            authority: Pubkey::new_unique(),
+        });
+        (service, source, channel)
+    }
+
+    /// Regression #25: an unlisted completed deposit would be minted again, so resync refuses.
+    #[tokio::test]
+    async fn serviced_gap_refuses_before_wipe() {
+        let mock = MockStorage::new();
+        seed_row(
+            &mock,
+            1,
+            TransactionType::Deposit,
+            TransactionStatus::Completed,
+        );
+        let (service, _source, _channel) =
+            reconciling_escrow_service(Arc::new(Storage::Mock(mock.clone()))).await;
+        match service.run(100).await {
+            Err(IndexerError::Reconciliation(ReconciliationError::ConsumedSetUnavailable {
+                reason,
+            })) => {
+                let sig = mock.pending_transactions.lock().unwrap()[0]
+                    .signature
+                    .clone();
+                assert!(reason.contains(&sig), "reason must name the row: {reason}");
+            }
+            other => panic!("an unlisted completed deposit must refuse, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert!(mock.unfinished_resync.lock().unwrap().is_none());
+        assert_eq!(
+            mock.pending_transactions.lock().unwrap()[0].status,
+            TransactionStatus::Completed
+        );
+    }
+
+    /// An unreadable serviced-row list proves nothing, so it refuses too.
+    #[tokio::test]
+    async fn serviced_rows_read_error_refuses() {
+        let mock = MockStorage::new();
+        mock.set_should_fail("get_serviced_rows", true);
+        let (service, _source, _channel) =
+            reconciling_escrow_service(Arc::new(Storage::Mock(mock.clone()))).await;
+        match service.run(100).await {
+            Err(IndexerError::Storage(_)) => {}
+            other => panic!("an unreadable serviced-row list must refuse, got: {other:?}"),
+        }
+        assert_eq!(mock.calls("wipe_program"), 0);
+        assert!(mock.unfinished_resync.lock().unwrap().is_none());
     }
 }
