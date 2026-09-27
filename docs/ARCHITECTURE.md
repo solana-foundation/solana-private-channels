@@ -159,3 +159,5 @@ flowchart TB
 | **Withdrawal** | User → Gateway → Write Node → Withdraw Program (burn) → Indexer Solana Private Channels → Indexer DB → Operator Solana Private Channels → Escrow Program (release on Mainnet) |
 | **Reads** | User → Gateway → Read Node → Postgres Replica |
 | **Streaming** | Postgres Primary → Streamer → WebSocket (internal network only; not publicly exposed) → in-network consumer |
+
+The gateway's read endpoint is one read node on one replica. Load-balancing several replicas behind it is not supported, because the client re-sign rule for a `null` signature status relies on every read seeing the same replica.

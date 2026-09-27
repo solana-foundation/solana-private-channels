@@ -3695,6 +3695,91 @@ async fn resync_blockers_sql_matrix() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// P1c. Serviced rows are completed deposits and reminted withdrawals, coordinates intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn serviced_rows_sql_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let statuses = [
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+        "failed_reminted",
+        "manual_review",
+        "pending_remint",
+        "parked",
+    ];
+    let mut expected = Vec::new();
+    for (n, (ty, status)) in [TransactionType::Deposit, TransactionType::Withdrawal]
+        .into_iter()
+        .flat_map(|ty| statuses.map(|s| (ty, s)))
+        .enumerate()
+    {
+        let sig = format!("{ty:?}-{status}");
+        let id = seed_with_status(&pool, &storage, &sig, ty, status).await?;
+        // Alternate a NULL and a set inner index so both round-trip.
+        let inner = (n % 2 == 1).then_some(n as i32);
+        sqlx::query(
+            "UPDATE transactions SET instruction_index = $2, inner_index = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(n as i32)
+        .bind(inner)
+        .execute(&pool)
+        .await?;
+        let serviced = matches!(
+            (ty, status),
+            (TransactionType::Deposit, "completed")
+                | (TransactionType::Withdrawal, "failed_reminted")
+        );
+        if serviced {
+            expected.push((ty, id, sig, n as i32, inner));
+        }
+    }
+    for ty in [TransactionType::Deposit, TransactionType::Withdrawal] {
+        let got: Vec<_> = storage
+            .get_serviced_rows(ty, 0, 100)
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r.signature, r.instruction_index, r.inner_index))
+            .collect();
+        let want: Vec<_> = expected
+            .iter()
+            .filter(|e| e.0 == ty)
+            .map(|e| (e.1, e.2.clone(), e.3, e.4))
+            .collect();
+        assert_eq!(got, want, "{ty:?}");
+    }
+    Ok(())
+}
+
+/// P1d. Paging by id returns each serviced row once, in id order, then an empty page.
+#[tokio::test(flavor = "multi_thread")]
+async fn serviced_rows_pages_by_id() -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    let mut ids = Vec::new();
+    for sig in ["a", "b", "c"] {
+        ids.push(
+            seed_with_status(&pool, &storage, sig, TransactionType::Deposit, "completed").await?,
+        );
+    }
+    let mut after = 0;
+    let mut seen = Vec::new();
+    loop {
+        let page = storage
+            .get_serviced_rows(TransactionType::Deposit, after, 1)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        assert_eq!(page.len(), 1);
+        after = page[0].id;
+        seen.push(after);
+    }
+    assert_eq!(seen, ids);
+    Ok(())
+}
+
 /// P1b. The earliest slot is the lowest row of the resync's own type, whatever its status.
 #[tokio::test(flavor = "multi_thread")]
 async fn resync_blockers_earliest_slot_is_per_program() -> Result<(), Box<dyn std::error::Error>> {
