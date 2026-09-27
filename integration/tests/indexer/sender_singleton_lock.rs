@@ -151,7 +151,7 @@ fn lock_lost_total(program_type: ProgramType) -> f64 {
 static WITHDRAW_LOCK_LOST_METRIC: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Kill whichever backend holds `key`, standing in for a failover or an idle-session reap.
-async fn terminate_advisory_lock_holder(url: &str, key: i64) {
+pub(super) async fn terminate_advisory_lock_holder(url: &str, key: i64) {
     use sqlx::Connection;
     let mut conn = sqlx::PgConnection::connect(url)
         .await
@@ -163,7 +163,7 @@ async fn terminate_advisory_lock_holder(url: &str, key: i64) {
     .bind(key)
     .fetch_one(&mut conn)
     .await
-    .expect("exactly one backend must hold the sender key");
+    .expect("exactly one backend must hold the key");
     let _: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
         .bind(pid)
         .fetch_one(&mut conn)
@@ -334,7 +334,7 @@ async fn graceful_cancellation_releases_the_lock_without_a_lost_signal() {
 
 /// A withdraw operator on `url`. Pass a refusing `rpc_url` so anything past the
 /// startup lock checks surfaces as an RPC failure instead.
-fn withdraw_operator_configs(
+pub(super) fn withdraw_operator_configs(
     url: &str,
     rpc_url: &str,
     source_rpc_url: Option<String>,

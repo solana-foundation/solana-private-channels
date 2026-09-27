@@ -8,6 +8,7 @@
 //! lock refusal would surface as a datasource or RPC error instead. That is the
 //! assertion: the lock is checked before any network call and before the schema.
 
+use crate::sender_singleton_lock::{terminate_advisory_lock_holder, withdraw_operator_configs};
 use {
     private_channel_indexer::{
         config::{
@@ -16,15 +17,25 @@ use {
             StorageType, DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
         },
         error::{IndexerError, OperatorError, StorageError},
+        indexer::{datasource::rpc_polling::rpc::RpcPoller, resync::ResyncService},
         operator,
         storage::{
-            common::storage::live_lock::{LiveLockGuard, LiveLockMode},
+            common::storage::live_lock::{LiveLockGuard, LiveLockMode, LIVE_STATE_LOCK_KEY},
+            postgres::db::SCHEMA_INIT_LOCK_KEY,
             PostgresDb, Storage,
         },
         DatasourceType,
     },
     solana_commitment_config::CommitmentLevel,
-    std::{sync::Arc, time::Duration},
+    sqlx::Connection,
+    std::{
+        future::Future,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    },
     testcontainers::{runners::AsyncRunner, ContainerAsync},
     testcontainers_modules::postgres::Postgres,
     tokio_util::sync::CancellationToken,
@@ -241,5 +252,229 @@ async fn indexer_refuses_to_start_after_an_unfinished_resync() {
             Err(IndexerError::Storage(StorageError::UnfinishedResync { program })) if program == "withdraw"
         ),
         "the indexer must refuse to start after an unfinished resync, got: {result:?}"
+    );
+}
+
+/// How long a startup stall may last once the lock is gone. Detection takes about one 5s
+/// heartbeat, and every stall below lasts 30s or more if nothing stops it.
+const LOCK_LOST_STOP_BOUND: Duration = Duration::from_secs(15);
+
+/// Poll `cond` every 50ms until it holds, or panic naming what never happened.
+async fn wait_until<F, Fut>(what: &str, within: Duration, mut cond: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + within;
+    while !cond().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Count the sessions holding (or waiting for) the advisory `key`.
+async fn advisory_sessions(url: &str, key: i64, granted: bool) -> i64 {
+    let mut conn = sqlx::PgConnection::connect(url)
+        .await
+        .expect("admin connect");
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 \
+         AND granted = $2 AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(key)
+    .bind(granted)
+    .fetch_one(&mut conn)
+    .await
+    .expect("read pg_locks")
+}
+
+/// An RPC endpoint that accepts every connection and never answers, counting accepts.
+async fn black_hole_rpc() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind black hole");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        // Sockets are kept open so each request hangs until the client gives up.
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(socket);
+        }
+    });
+    (url, accepted)
+}
+
+/// Start the operator, wait until it holds the live-state lock and `stalled` reports it is
+/// parked inside the step under test, then kill the lock's session and return how `run` ended.
+async fn run_until_lock_lost<S, Fut>(
+    url: &str,
+    common: PrivateChannelIndexerConfig,
+    operator_config: OperatorConfig,
+    stalled: S,
+) -> Result<(), OperatorError>
+where
+    S: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let run = tokio::spawn(operator::run(
+        connect(url).await,
+        common,
+        operator_config,
+        None,
+    ));
+    wait_until(
+        "the operator to take the live-state lock",
+        Duration::from_secs(30),
+        || async { advisory_sessions(url, LIVE_STATE_LOCK_KEY, true).await == 1 },
+    )
+    .await;
+    wait_until("the operator to stall", Duration::from_secs(30), stalled).await;
+
+    terminate_advisory_lock_holder(url, LIVE_STATE_LOCK_KEY).await;
+
+    tokio::time::timeout(LOCK_LOST_STOP_BOUND, run)
+        .await
+        .expect("the operator must stop soon after losing the live-state lock")
+        .expect("operator task must not panic")
+}
+
+fn assert_stopped_on_lock_loss(result: Result<(), OperatorError>) {
+    assert!(
+        matches!(
+            result,
+            Err(OperatorError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "the operator must stop on the lost lock, got: {result:?}"
+    );
+}
+
+/// I13. A lock lost while schema init waits must stop startup, not carry on after the wait.
+/// The test holds the schema-init lock so init stays parked where the kill can land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_stops_when_the_live_lock_is_lost_during_schema_init() {
+    let (url, _container) = start_postgres("live_lock_lost_schema_init").await;
+    let mut schema_holder = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("schema holder connect");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SCHEMA_INIT_LOCK_KEY)
+        .execute(&mut schema_holder)
+        .await
+        .expect("hold the schema-init lock");
+
+    let postgres = PostgresConfig {
+        database_url: url.clone(),
+        max_connections: 5,
+    };
+    let result = run_until_lock_lost(&url, common_config(postgres), operator_config(), || async {
+        advisory_sessions(&url, SCHEMA_INIT_LOCK_KEY, false).await == 1
+    })
+    .await;
+
+    assert_stopped_on_lock_loss(result);
+}
+
+/// I14. A lock lost while the withdraw fallback check waits on RPC must stop startup before
+/// the storage writer starts. Both endpoints never answer, so the check stays parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_stops_when_the_live_lock_is_lost_during_fallback_validation() {
+    let (url, _container) = start_postgres("live_lock_lost_fallback").await;
+    let (primary, primary_accepts) = black_hole_rpc().await;
+    let (fallback, _) = black_hole_rpc().await;
+    let (mut common, operator_config) =
+        withdraw_operator_configs(&url, &primary, Some(DEAD_RPC.to_string()));
+    common.fallback_rpc_url = Some(fallback);
+
+    let result = run_until_lock_lost(&url, common, operator_config, || async {
+        primary_accepts.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+
+    assert_stopped_on_lock_loss(result);
+}
+
+/// I15. A lock lost while the withdraw boot preflight waits on RPC must stop startup before
+/// any worker starts. With no fallback the preflight makes the first RPC call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_stops_when_the_live_lock_is_lost_during_the_withdraw_preflight() {
+    let (url, _container) = start_postgres("live_lock_lost_preflight").await;
+    let (rpc, accepts) = black_hole_rpc().await;
+    // The helper sets escrow_instance_id; without it the preflight would be skipped.
+    let (common, operator_config) =
+        withdraw_operator_configs(&url, &rpc, Some(DEAD_RPC.to_string()));
+
+    let result = run_until_lock_lost(&url, common, operator_config, || async {
+        accepts.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+
+    assert_stopped_on_lock_loss(result);
+    // Only the preflight's first call reached RPC: no retry and no worker ran before the stop.
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+}
+
+/// I16. A resync must read and change nothing until a worker whose session just died has had
+/// time to stop, and a lock lost during that wait must stop it with nothing done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resync_stops_when_its_lock_is_lost_while_waiting_out_stale_workers() {
+    let (url, _container) = start_postgres("resync_lock_lost_in_grace").await;
+    let service = ResyncService::new(
+        connect(&url).await,
+        Arc::new(RpcPoller::new(
+            DEAD_RPC.to_string(),
+            solana_transaction_status::UiTransactionEncoding::Json,
+            CommitmentLevel::Finalized,
+        )),
+        ProgramType::Escrow,
+        BackfillConfig {
+            enabled: true,
+            exit_after_backfill: false,
+            rpc_url: DEAD_RPC.to_string(),
+            batch_size: 10,
+            max_gap_slots: u64::MAX,
+            start_slot: None,
+        },
+        Some(solana_sdk::pubkey::Pubkey::new_unique()),
+    )
+    .with_lock_heartbeat_interval(Duration::from_millis(50))
+    .with_stale_holder_grace(Duration::from_secs(60));
+    let resync = tokio::spawn(async move { service.run(0).await });
+
+    wait_until(
+        "the resync to take the live-state lock",
+        Duration::from_secs(30),
+        || async { advisory_sessions(&url, LIVE_STATE_LOCK_KEY, true).await == 1 },
+    )
+    .await;
+    terminate_advisory_lock_holder(&url, LIVE_STATE_LOCK_KEY).await;
+
+    let result = tokio::time::timeout(LOCK_LOST_STOP_BOUND, resync)
+        .await
+        .expect("the resync must stop soon after losing the live-state lock")
+        .expect("resync task must not panic");
+    assert!(
+        matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ),
+        "a lock lost inside the grace must stop the resync, got: {result:?}"
+    );
+
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("admin connect");
+    let table: Option<String> = sqlx::query_scalar("SELECT to_regclass('transactions')::text")
+        .fetch_one(&mut conn)
+        .await
+        .expect("look up the transactions table");
+    assert_eq!(
+        table, None,
+        "nothing, not even the schema, may be touched inside the grace"
     );
 }

@@ -18,7 +18,7 @@ use sqlx::{
     postgres::{PgDatabaseError, PgSeverity},
     Connection, PgConnection,
 };
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
@@ -384,6 +384,27 @@ fn spawn_heartbeat(
     }
 }
 
+/// Run one startup step, refusing it if the live-state lock is lost while it runs.
+///
+/// Biased, so a lock already lost refuses without starting the step. It only drops the step,
+/// so a caller that already has a writer running must stop that writer itself.
+pub(crate) async fn under_live_lock<T, E>(
+    lock_lost: &CancellationToken,
+    step: impl Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<StorageError>,
+{
+    tokio::select! {
+        biased;
+        _ = lock_lost.cancelled() => {
+            error!("Live-state lock lost during startup; refusing to continue");
+            Err(StorageError::LiveStateLockLost.into())
+        }
+        result = step => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,5 +528,97 @@ mod tests {
 
         assert_ne!(LIVE_STATE_LOCK_KEY, sender_lock_key(ProgramType::Escrow));
         assert_ne!(LIVE_STATE_LOCK_KEY, sender_lock_key(ProgramType::Withdraw));
+    }
+
+    /// A fence that swallowed or rewrote a step's own result would hide real startup failures.
+    #[tokio::test]
+    async fn under_live_lock_passes_the_step_result_through_while_held() {
+        let held = CancellationToken::new();
+
+        let ok: Result<u32, StorageError> = under_live_lock(&held, async { Ok(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+
+        let err: Result<u32, StorageError> = under_live_lock(&held, async {
+            Err(StorageError::DatabaseError {
+                message: "boom".to_string(),
+            })
+        })
+        .await;
+        assert!(
+            matches!(&err, Err(StorageError::DatabaseError { message }) if message == "boom"),
+            "the step's own error must come back unchanged, got: {err:?}"
+        );
+    }
+
+    /// Refuse a lost lock with the same error every role expects, and never start the step.
+    #[tokio::test]
+    async fn under_live_lock_refuses_without_starting_the_step_once_lost() {
+        use crate::error::{IndexerError, OperatorError};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        async fn refuse<E: From<StorageError>>() -> (Result<(), E>, bool) {
+            let lost = CancellationToken::new();
+            lost.cancel();
+            let started = AtomicBool::new(false);
+            let result = under_live_lock(&lost, async {
+                started.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+            (result, started.load(Ordering::SeqCst))
+        }
+
+        let (result, started) = refuse::<StorageError>().await;
+        assert!(matches!(result, Err(StorageError::LiveStateLockLost)));
+        assert!(!started, "a lost lock must refuse before the step runs");
+
+        let (result, started) = refuse::<OperatorError>().await;
+        assert!(matches!(
+            result,
+            Err(OperatorError::Storage(StorageError::LiveStateLockLost))
+        ));
+        assert!(!started);
+
+        let (result, started) = refuse::<IndexerError>().await;
+        assert!(matches!(
+            result,
+            Err(IndexerError::Storage(StorageError::LiveStateLockLost))
+        ));
+        assert!(!started);
+    }
+
+    /// A slow step must really stop when the lock goes, not keep running in the background.
+    #[tokio::test]
+    async fn under_live_lock_abandons_a_step_when_the_lock_is_lost_midway() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let lost = CancellationToken::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        let canceller = lost.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            canceller.cancel();
+        });
+
+        let result: Result<(), StorageError> = under_live_lock(&lost, async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(StorageError::LiveStateLockLost)));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the step must be dropped before the fence returns"
+        );
     }
 }
