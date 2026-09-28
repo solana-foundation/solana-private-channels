@@ -12,6 +12,30 @@ pub enum PrivateChannelWithdrawProgramError {
     /// (1) Withdrawal amount must be greater than zero
     #[error("Withdrawal amount must be greater than zero")]
     ZeroAmount,
+
+    /// (2) Fee config is not the mint's PDA or its data is malformed
+    #[error("Invalid withdraw fee config")]
+    InvalidFeeConfig,
+
+    /// (3) No fee config exists for this mint yet
+    #[error("Withdraw fee config not initialized")]
+    FeeConfigNotInitialized,
+
+    /// (4) Signer is not the mint authority
+    #[error("Signer is not the mint authority")]
+    InvalidMintAuthority,
+
+    /// (5) Fee destination is not the configured treasury token account
+    #[error("Invalid treasury token account")]
+    InvalidTreasuryAccount,
+
+    /// (6) System program account is not the system program
+    #[error("Invalid system program")]
+    InvalidSystemProgram,
+
+    /// (7) Withdraw fee must be greater than zero
+    #[error("Withdraw fee must be greater than zero")]
+    ZeroFee,
 }
 
 impl From<PrivateChannelWithdrawProgramError> for ProgramError {

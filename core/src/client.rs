@@ -68,17 +68,27 @@ pub fn create_spl_burn(from: &Keypair, mint: &Pubkey, amount: u64, blockhash: Ha
     )
 }
 
-/// Create a withdraw funds transaction (burns tokens and logs the event)
+/// Create a withdraw funds transaction (burns tokens and logs the event).
+/// `treasury_token_account` comes from the mint's fee config, which the fee is
+/// paid to on top of `amount`.
 pub fn create_withdraw_funds(
     from: &Keypair,
     mint: &Pubkey,
     amount: u64,
+    treasury_token_account: &Pubkey,
     blockhash: Hash,
 ) -> Transaction {
     use private_channel_withdraw_program_client::instructions::WithdrawFundsBuilder;
 
     let from_pubkey = from.pubkey();
     let token_account = get_associated_token_address(&from_pubkey, mint);
+    let (withdraw_fee_config, _) = Pubkey::find_program_address(
+        &[
+            private_channel_withdraw_program_client::WITHDRAW_FEE_CONFIG_SEED,
+            mint.as_ref(),
+        ],
+        &private_channel_withdraw_program_client::programs::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    );
 
     let withdraw_ix = WithdrawFundsBuilder::new()
         .user(from_pubkey)
@@ -86,6 +96,8 @@ pub fn create_withdraw_funds(
         .token_account(token_account)
         .token_program(spl_token::id())
         .associated_token_program(spl_associated_token_account::id())
+        .withdraw_fee_config(withdraw_fee_config)
+        .treasury_token_account(*treasury_token_account)
         .amount(amount)
         .instruction();
 
@@ -379,9 +391,10 @@ mod tests {
         let from = Keypair::new();
         let mint = Pubkey::new_unique();
         let amount: u64 = 500;
+        let treasury_token_account = Pubkey::new_unique();
         let blockhash = Hash::new_unique();
 
-        let tx = create_withdraw_funds(&from, &mint, amount, blockhash);
+        let tx = create_withdraw_funds(&from, &mint, amount, &treasury_token_account, blockhash);
 
         assert_eq!(tx.message.recent_blockhash, blockhash);
         assert_eq!(tx.message.instructions.len(), 1);
@@ -402,6 +415,21 @@ mod tests {
         assert!(
             tx.message.account_keys.contains(&mint),
             "mint missing from account keys"
+        );
+        let (withdraw_fee_config, _) = Pubkey::find_program_address(
+            &[
+                private_channel_withdraw_program_client::WITHDRAW_FEE_CONFIG_SEED,
+                mint.as_ref(),
+            ],
+            &private_channel_withdraw_program_client::programs::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        );
+        assert!(
+            tx.message.account_keys.contains(&withdraw_fee_config),
+            "fee config PDA missing from account keys"
+        );
+        assert!(
+            tx.message.account_keys.contains(&treasury_token_account),
+            "treasury token account missing from account keys"
         );
         assert!(
             tx.message.account_keys.contains(&spl_token::id()),

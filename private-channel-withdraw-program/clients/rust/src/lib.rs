@@ -8,3 +8,6 @@ pub use generated::*;
 // Re-export commonly used items
 pub use generated::errors::*;
 pub use generated::programs::*;
+
+/// Seeds of the per-mint `WithdrawFeeConfig` PDA: `[WITHDRAW_FEE_CONFIG_SEED, mint]`.
+pub const WITHDRAW_FEE_CONFIG_SEED: &[u8] = b"withdraw_fee_config";

@@ -171,7 +171,9 @@ Note that parking is not a refund. `WithdrawFunds` burns the user's channel
 tokens before the row exists, and a row parked here never reaches the
 sender, so the compensating remint that normally restores those tokens
 after a permanent release failure never runs. Every disposition below has
-to say explicitly what the user is owed.
+to say explicitly what the user is owed. That is always the row's `amount`,
+never the withdraw fee: the fee was paid to the treasury, and refunding it
+would reopen the free retry loop it exists to close.
 
 1. **Verify on-chain.** Run [`_verify_onchain_release.md`](_verify_onchain_release.md)
    for this row. Expected: `NOT_LANDED` (pre-flight aborted before send).

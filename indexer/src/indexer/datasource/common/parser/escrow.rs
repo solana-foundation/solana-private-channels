@@ -173,6 +173,9 @@ pub struct CreateInstanceData {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
 pub struct AllowMintData {
     pub bump: u8,
+    /// Per-withdrawal fee on the channel. The escrow rejects zero, so a parsed
+    /// AllowMint always carries a usable fee.
+    pub withdraw_fee: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -654,10 +657,14 @@ mod tests {
         vec![42] // Just one byte for bump
     }
 
+    const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+
     /// Create minimal valid Borsh-encoded data for AllowMint instruction
-    /// AllowMintIxData { bump: u8 }
+    /// AllowMintIxData { bump: u8, withdraw_fee: u64 }
     fn create_allow_mint_borsh_data() -> Vec<u8> {
-        vec![123] // Just one byte for bump
+        let mut data = vec![123]; // bump
+        data.extend_from_slice(&ALLOW_MINT_WITHDRAW_FEE.to_le_bytes());
+        data
     }
 
     /// Create valid inner instruction data for AllowMint event matching the actual program format
@@ -834,6 +841,7 @@ mod tests {
         assert!(parsed.is_some());
         if let Some(EscrowInstruction::AllowMint { data, .. }) = parsed {
             assert_eq!(data.bump, 123);
+            assert_eq!(data.withdraw_fee, ALLOW_MINT_WITHDRAW_FEE);
         } else {
             panic!("Expected AllowMint instruction");
         }

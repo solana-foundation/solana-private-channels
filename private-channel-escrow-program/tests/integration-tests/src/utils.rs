@@ -77,6 +77,10 @@ pub const WITHDRAWALS_BLOCKED_FOR_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint as u32;
 pub const MINT_PROFILE_CHANGED_ERROR: u32 =
     PrivateChannelEscrowProgramError::MintProfileChanged as u32;
+pub const ZERO_WITHDRAW_FEE_ERROR: u32 = PrivateChannelEscrowProgramError::ZeroWithdrawFee as u32;
+
+/// Withdraw fee every test AllowMint sets. The escrow only checks it is nonzero.
+pub const TEST_WITHDRAW_FEE: u64 = 1_000;
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
 pub const NONCES_PER_GENERATION: u64 = 65_536;

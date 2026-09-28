@@ -1,5 +1,5 @@
 use pinocchio::{account::AccountView, error::ProgramError, Address, ProgramResult};
-use pinocchio_token::instructions::Burn;
+use pinocchio_token::instructions::{Burn, Transfer};
 
 use crate::{
     error::PrivateChannelWithdrawProgramError,
@@ -8,9 +8,15 @@ use crate::{
         validate_ata, verify_ata_program, verify_mint_account, verify_signer, verify_token_program,
     },
     require_len,
+    state::{WithdrawFeeConfig, WITHDRAW_FEE_CONFIG_SEED},
 };
 
 /// Processes the WithdrawFunds instruction.
+///
+/// Charges the mint's fee on top of `amount`, so a balance below
+/// `amount + fee` fails and nothing is burned. The fee is never reminted if the
+/// Solana release later fails, which is what makes a withdrawal to a
+/// destination that refuses the transfer cost the user every time.
 ///
 /// # Account Layout
 /// 0. `[signer]` user - User initiating the withdrawal
@@ -18,12 +24,14 @@ use crate::{
 /// 2. `[writable]` token_account - Source token account
 /// 3. `[]` token_program - Token program
 /// 4. `[]` associated_token_program - Associated token program
+/// 5. `[]` withdraw_fee_config - Fee config PDA for the mint
+/// 6. `[writable]` treasury_token_account - Treasury token account the fee is paid to
 ///
 /// # Instruction Data
 /// * `amount` (u64) - Amount of tokens to withdraw
 /// * `destination` (Option<Pubkey>) - Destination public key
 pub fn process_withdraw_funds(
-    _program_id: &Address,
+    program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
@@ -33,7 +41,7 @@ pub fn process_withdraw_funds(
         return Err(PrivateChannelWithdrawProgramError::ZeroAmount.into());
     }
 
-    let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info] =
+    let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info, withdraw_fee_config_info, treasury_token_account_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -50,6 +58,39 @@ pub fn process_withdraw_funds(
         mint_info,
         token_program_info,
     )?;
+
+    if !withdraw_fee_config_info.owned_by(program_id) {
+        return Err(PrivateChannelWithdrawProgramError::FeeConfigNotInitialized.into());
+    }
+    let withdraw_fee_config =
+        WithdrawFeeConfig::try_from_bytes(&withdraw_fee_config_info.try_borrow()?)?;
+    let expected_withdraw_fee_config = Address::create_program_address(
+        &[
+            WITHDRAW_FEE_CONFIG_SEED,
+            mint_info.address().as_ref(),
+            &[withdraw_fee_config.bump],
+        ],
+        program_id,
+    )
+    .map_err(|_| PrivateChannelWithdrawProgramError::InvalidFeeConfig)?;
+    if withdraw_fee_config_info.address() != &expected_withdraw_fee_config {
+        return Err(PrivateChannelWithdrawProgramError::InvalidFeeConfig.into());
+    }
+
+    // The treasury withdraws the fees it collected without paying one.
+    if user_info.address() != &withdraw_fee_config.treasury {
+        if treasury_token_account_info.address() != &withdraw_fee_config.treasury_token_account {
+            return Err(PrivateChannelWithdrawProgramError::InvalidTreasuryAccount.into());
+        }
+
+        Transfer {
+            from: token_account_info,
+            to: treasury_token_account_info,
+            authority: user_info,
+            amount: withdraw_fee_config.fee,
+        }
+        .invoke()?;
+    }
 
     Burn {
         account: token_account_info,

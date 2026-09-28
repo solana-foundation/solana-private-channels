@@ -262,8 +262,11 @@ cargo run --bin allow_mint -- \
   https://api.devnet.solana.com \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
-  <MINT_ADDRESS>
+  <MINT_ADDRESS> \
+  <WITHDRAW_FEE>
 ```
+
+`<WITHDRAW_FEE>` is required, in the mint's base units (e.g. `10000` is 0.01 USDC). It is charged on top of every withdrawal from the payment channel and paid to the operator admin, so size it to cover the SOL the operator can spend on a release that fails. To reprice, run `allow_mint` again with the new value; it takes effect from the mint's next deposit, and also re-opens both gates.
 
 ### Add Operator
 
@@ -309,6 +312,8 @@ cargo run --bin withdraw -- \
   <MINT_ADDRESS> \
   <AMOUNT>
 ```
+
+`withdraw` prints the mint's withdraw fee first; your channel balance must cover `<AMOUNT>` plus that fee, and a mint can only be withdrawn once at least one of its deposits has been processed.
 
 The indexer detects the burn on Solana Private Channels, and the operator releases funds from the Solana escrow, consuming that withdrawal's nonce in the escrow instance's withdrawal bitmap. You should be able to check your balance in your wallet or on Solana explorer to see the withdrawal.
 

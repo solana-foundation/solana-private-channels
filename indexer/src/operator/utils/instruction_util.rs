@@ -7,6 +7,10 @@ use crate::storage::common::models::DbTransaction;
 use private_channel_escrow_program_client::instructions::{
     ReleaseFundsBuilder, RotateBitmapBuilder,
 };
+use private_channel_withdraw_program_client::{
+    instructions::SetWithdrawFeeConfigBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    WITHDRAW_FEE_CONFIG_SEED,
+};
 use solana_keychain::Signer;
 use solana_sdk::hash::hashv;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -290,6 +294,13 @@ pub struct ReleaseFundsBuilderWithNonce {
     pub fetched_updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The mint's withdraw fee config a deposit writes to the channel before minting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithdrawFeeSetup {
+    pub fee: u64,
+    pub treasury: Pubkey,
+}
+
 /// Builder for simple SPL token mint instructions (deposit flow)
 /// Creates ATA idempotently, then mints tokens
 #[derive(Clone, Debug, Default)]
@@ -302,6 +313,9 @@ pub struct MintToBuilder {
     token_program: Option<Pubkey>,
     amount: Option<u64>,
     idempotency_memo: Option<String>,
+    /// Set on deposits only. A remint follows a withdrawal, which already
+    /// needed the config, so it leaves the fee alone.
+    withdraw_fee_setup: Option<WithdrawFeeSetup>,
 }
 
 impl MintToBuilder {
@@ -349,6 +363,11 @@ impl MintToBuilder {
         self
     }
 
+    pub fn withdraw_fee_setup(&mut self, withdraw_fee_setup: WithdrawFeeSetup) -> &mut Self {
+        self.withdraw_fee_setup = Some(withdraw_fee_setup);
+        self
+    }
+
     pub fn get_mint(&self) -> Option<Pubkey> {
         self.mint
     }
@@ -373,7 +392,13 @@ impl MintToBuilder {
         self.recipient_ata
     }
 
-    /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to]
+    /// Returns instructions: [create_ata_idempotent, optional_memo, mint_to],
+    /// preceded by [create_treasury_ata_idempotent, set_withdraw_fee_config]
+    /// when a fee setup is set.
+    ///
+    /// The treasury ATA create goes first so a missing mint fails at index 0
+    /// with IncorrectProgramId, as the user ATA create would. That error is
+    /// what starts JIT mint creation, and the retry reuses this same list.
     pub fn instructions(&self) -> Result<Vec<Instruction>, crate::error::ProgramError> {
         let mint = self.mint.ok_or_else(|| ProgramError::InvalidBuilder {
             reason: "mint not set".to_string(),
@@ -390,14 +415,46 @@ impl MintToBuilder {
                 reason: "token_program not set".to_string(),
             })?;
 
-        let mut instructions = vec![
+        let mut instructions = Vec::new();
+
+        if let Some(withdraw_fee_setup) = self.withdraw_fee_setup {
+            let mint_authority =
+                self.mint_authority
+                    .ok_or_else(|| ProgramError::InvalidBuilder {
+                        reason: "mint_authority not set".to_string(),
+                    })?;
+            let (withdraw_fee_config, _) = Pubkey::find_program_address(
+                &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+                &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+            );
+
+            instructions.push(
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &payer,
+                    &withdraw_fee_setup.treasury,
+                    &mint,
+                    &token_program,
+                ),
+            );
+            instructions.push(
+                SetWithdrawFeeConfigBuilder::new()
+                    .authority(mint_authority)
+                    .mint(mint)
+                    .withdraw_fee_config(withdraw_fee_config)
+                    .fee(withdraw_fee_setup.fee)
+                    .treasury(withdraw_fee_setup.treasury)
+                    .instruction(),
+            );
+        }
+
+        instructions.push(
             spl_associated_token_account::instruction::create_associated_token_account_idempotent(
                 &payer,
                 &recipient,
                 &mint,
                 &token_program,
             ),
-        ];
+        );
 
         if let Some(memo) = self.idempotency_memo.as_deref() {
             instructions.push(Instruction {
@@ -537,6 +594,58 @@ mod tests {
         let b = fully_configured_builder();
         let ixs = b.instructions().unwrap();
         assert_eq!(ixs.len(), 2);
+    }
+
+    #[test]
+    fn instructions_with_withdraw_fee_setup_prepends_treasury_ata_and_config() {
+        let mint = pk(1);
+        let mint_authority = pk(5);
+        let treasury = pk(6);
+        let mut b = fully_configured_builder();
+        b.idempotency_memo("test:memo".to_string())
+            .withdraw_fee_setup(WithdrawFeeSetup {
+                fee: 1_000,
+                treasury,
+            });
+
+        let ixs = b.instructions().unwrap();
+
+        let program_ids: Vec<Pubkey> = ixs.iter().map(|ix| ix.program_id).collect();
+        assert_eq!(
+            program_ids,
+            vec![
+                spl_associated_token_account::id(),
+                PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+                spl_associated_token_account::id(),
+                spl_memo::id(),
+                spl_token::id(),
+            ]
+        );
+
+        // First, so a missing mint fails here with IncorrectProgramId and
+        // still triggers JIT mint creation. Account 1 is the ATA being created.
+        let treasury_ata =
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &treasury,
+                &mint,
+                &spl_token::id(),
+            );
+        assert_eq!(ixs[0].accounts[1].pubkey, treasury_ata);
+
+        // The mint authority signs and pays for the config on first use.
+        let set_withdraw_fee_config = &ixs[1];
+        let (withdraw_fee_config, _) = Pubkey::find_program_address(
+            &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+            &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        );
+        assert_eq!(set_withdraw_fee_config.accounts[0].pubkey, mint_authority);
+        assert!(set_withdraw_fee_config.accounts[0].is_signer);
+        assert!(set_withdraw_fee_config.accounts[0].is_writable);
+        assert_eq!(set_withdraw_fee_config.accounts[1].pubkey, mint);
+        assert_eq!(
+            set_withdraw_fee_config.accounts[2].pubkey,
+            withdraw_fee_config
+        );
     }
 
     #[test]

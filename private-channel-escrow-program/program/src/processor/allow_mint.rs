@@ -43,12 +43,19 @@ use pinocchio::{
 ///
 /// # Instruction Data
 /// * `bump` (u8) - Bump for the allowed mint PDA
+/// * `withdraw_fee` (u64) - Per-withdrawal fee on the channel. Only validated
+///   here; the indexer reads it from the instruction data.
 pub fn process_allow_mint(
     program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+
+    if args.withdraw_fee == 0 {
+        return Err(PrivateChannelEscrowProgramError::ZeroWithdrawFee.into());
+    }
+
     let [payer_info, admin_info, instance_info, mint_info, allowed_mint_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
         accounts
     else {
@@ -153,11 +160,22 @@ pub fn process_allow_mint(
 
 struct AllowMintArgs {
     bump: u8,
+    withdraw_fee: u64,
 }
 
 fn process_instruction_data(data: &[u8]) -> Result<AllowMintArgs, ProgramError> {
-    require_len!(data, 1);
-    Ok(AllowMintArgs { bump: data[0] })
+    require_len!(data, 1 + 8);
+
+    let withdraw_fee = u64::from_le_bytes(
+        data[1..9]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+
+    Ok(AllowMintArgs {
+        bump: data[0],
+        withdraw_fee,
+    })
 }
 
 #[cfg(test)]
@@ -167,14 +185,39 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn test_process_allow_mint_valid_bump() {
-        // Test with valid bump
-        let instruction_data = vec![123]; // bump = 123
+    fn test_process_allow_mint_valid_bump_and_fee() {
+        let bump = 123;
+        let withdraw_fee = 1_234_567u64;
+        let mut instruction_data = vec![bump];
+        instruction_data.extend_from_slice(&withdraw_fee.to_le_bytes());
 
-        let result = process_instruction_data(&instruction_data);
+        let args = process_instruction_data(&instruction_data).unwrap();
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().bump, 123);
+        assert_eq!(args.bump, bump);
+        assert_eq!(args.withdraw_fee, withdraw_fee);
+    }
+
+    // The pre-fee layout carried only the bump.
+    #[test]
+    fn test_process_allow_mint_missing_fee() {
+        let result = process_instruction_data(&[123]);
+
+        assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
+    }
+
+    // Rejected before any account is read, so an empty account list still
+    // surfaces the fee error.
+    #[test]
+    fn test_process_allow_mint_zero_fee() {
+        let mut instruction_data = vec![123];
+        instruction_data.extend_from_slice(&0u64.to_le_bytes());
+
+        let result = process_allow_mint(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &[], &instruction_data);
+
+        assert_eq!(
+            result.unwrap_err(),
+            PrivateChannelEscrowProgramError::ZeroWithdrawFee.into()
+        );
     }
 
     #[test]

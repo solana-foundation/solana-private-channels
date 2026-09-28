@@ -2,7 +2,8 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::instruction_util::{
-    mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawalRemintInfo,
+    mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawFeeSetup,
+    WithdrawalRemintInfo,
 };
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
 use crate::operator::sender::{FinalityRpc, TransactionStatusUpdate};
@@ -1160,6 +1161,30 @@ pub async fn process_deposit_funds(
                 .assert_mint_allowed_at_slot(&mint, transaction.slot, transaction.id)
                 .await?;
 
+            // The fee comes from the latest AllowMint's `mints` row. Read it here
+            // rather than through MintCache, which never refreshes, so a re-allow
+            // reprices without a restart. The row is written before the allowed
+            // status, so it is only missing if the indexer started after the
+            // AllowMint; minting then would leave the mint without a fee.
+            let Some(mint_row) =
+                with_storage_backoff("mint withdraw fee read", transaction.id, || {
+                    storage.get_mint(&transaction.mint)
+                })
+                .await?
+            else {
+                park_row(
+                    &storage_tx,
+                    pt_label,
+                    &transaction,
+                    BailReason::new(
+                        metrics::BAIL_REASON_WITHDRAW_FEE_UNKNOWN,
+                        format!("no mints row for {mint}, withdraw fee unknown"),
+                    ),
+                )
+                .await;
+                return Ok(());
+            };
+
             let token_program = processor_state
                 .mint_cache
                 .get_private_channel_token_program();
@@ -1180,7 +1205,13 @@ pub async fn process_deposit_funds(
                 // rows; the row id would not.
                 .idempotency_memo(mint_idempotency_memo(&SourceEventId::from_row(
                     &transaction,
-                )));
+                )))
+                // The admin is the treasury: it pays the SOL a failed release
+                // burns, so it collects the fee that pays for it.
+                .withdraw_fee_setup(WithdrawFeeSetup {
+                    fee: mint_row.withdraw_fee.value(),
+                    treasury: processor_state.admin_pubkey,
+                });
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
             info!(proc_elapsed_ms, "Processing deposit");
@@ -1258,12 +1289,16 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use private_channel_core::rpc::constants::PACKET_DATA_SIZE;
+    use private_channel_withdraw_program_client::PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID;
     use solana_client::rpc_request::RpcRequest;
     use solana_sdk::hash::Hash;
     use solana_sdk::instruction::AccountMeta;
     use solana_sdk::program_option::COption;
     use solana_sdk::program_pack::Pack;
     use spl_token_2022::state::Mint as Token2022MintState;
+
+    /// Fee the seeded mints rows carry, as their AllowMint would have set it.
+    const TEST_WITHDRAW_FEE: u64 = 1_000;
 
     fn make_release_funds_state() -> ReleaseFundsState {
         let instance_pda = Pubkey::new_unique();
@@ -1345,6 +1380,7 @@ mod tests {
             mint.to_string(),
             DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token::id().to_string(),
@@ -1393,6 +1429,7 @@ mod tests {
             mint.to_string(),
             DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -2252,6 +2289,7 @@ mod tests {
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
+                    withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -2339,6 +2377,7 @@ mod tests {
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
+                    withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -2403,6 +2442,7 @@ mod tests {
             mint_pubkey.to_string(),
             DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -2740,8 +2780,9 @@ mod tests {
     async fn process_deposit_funds_sends_mint_builder() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
+        let admin = Pubkey::new_unique();
         let mut ps = ProcessorState {
-            admin_pubkey: Pubkey::new_unique(),
+            admin_pubkey: admin,
             release_funds_state: None,
             mint_cache: crate::operator::MintCache::new(storage.clone()),
         };
@@ -2784,6 +2825,20 @@ mod tests {
         };
         assert_eq!(b.txn_id, 1);
         assert_eq!(b.trace_id, "trace-1");
+
+        // The deposit writes the fee config: the fee from the mints row, and the
+        // operator admin as treasury. Data is [discriminator][fee u64 LE][treasury].
+        let instructions = b.builder.instructions().unwrap();
+        let set_withdraw_fee_config = &instructions[1];
+        assert_eq!(
+            set_withdraw_fee_config.program_id,
+            PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
+        );
+        assert_eq!(
+            &set_withdraw_fee_config.data[1..9],
+            &TEST_WITHDRAW_FEE.to_le_bytes()
+        );
+        assert_eq!(&set_withdraw_fee_config.data[9..41], admin.as_ref());
     }
 
     /// The deposit mint's on-chain memo must key on the event's chain coordinates,
@@ -3165,6 +3220,7 @@ mod tests {
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
+                    withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -3609,6 +3665,7 @@ mod tests {
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
+                    withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -3742,6 +3799,7 @@ mod tests {
                 mint_pubkey.to_string(),
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
+                    withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -4101,6 +4159,7 @@ mod tests {
             mint_pubkey.to_string(),
             crate::storage::common::models::DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -4201,6 +4260,7 @@ mod tests {
             mint_pubkey.to_string(),
             crate::storage::common::models::DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -4347,6 +4407,94 @@ mod tests {
         assert!(
             sender_rx.try_recv().is_err(),
             "no Mint builder should be forwarded for an unknown mint",
+        );
+    }
+
+    /// Allowed in `mint_status_history` but no `mints` row, which is what an
+    /// indexer started after the AllowMint leaves. The fee is unknown, so the
+    /// row parks instead of minting a balance that could withdraw fee-free, and
+    /// the next row still goes through.
+    #[tokio::test]
+    async fn process_deposit_funds_parks_when_withdraw_fee_unknown() {
+        let mock = MockStorage::new();
+        let storage = Arc::new(Storage::Mock(mock.clone()));
+        let mut ps = ProcessorState {
+            admin_pubkey: Pubkey::new_unique(),
+            release_funds_state: None,
+            mint_cache: crate::operator::MintCache::new(storage.clone()),
+        };
+
+        let unknown_fee_mint = Pubkey::new_unique();
+        mock.mint_status_history.lock().unwrap().push(
+            crate::storage::common::models::DbMintStatus {
+                withdrawals_blocked: false,
+                mint_address: unknown_fee_mint.to_string(),
+                status: "allowed".to_string(),
+                effective_slot: 0,
+                signature: format!("test-seed-{unknown_fee_mint}"),
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let known_mint = Pubkey::new_unique();
+        insert_mint_row(&storage, &known_mint);
+
+        let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(2);
+        let (sender_tx, mut sender_rx) = mpsc::channel(10);
+        let (storage_tx, mut storage_rx) = mpsc::channel(10);
+
+        let parked_id = 7;
+        let minted_id = 8;
+        fetcher_tx
+            .send(make_db_transaction(
+                parked_id,
+                &unknown_fee_mint.to_string(),
+                &Pubkey::new_unique().to_string(),
+                None,
+                TransactionType::Deposit,
+            ))
+            .await
+            .unwrap();
+        fetcher_tx
+            .send(make_db_transaction(
+                minted_id,
+                &known_mint.to_string(),
+                &Pubkey::new_unique().to_string(),
+                None,
+                TransactionType::Deposit,
+            ))
+            .await
+            .unwrap();
+        drop(fetcher_tx);
+
+        let result = process_deposit_funds(
+            &mut ps,
+            fetcher_rx,
+            sender_tx,
+            storage_tx,
+            storage.clone(),
+            Arc::new(unreachable_rpc()),
+            None,
+            ProgramType::Escrow,
+        )
+        .await;
+        assert!(result.is_ok(), "a park must not stop the loop: {result:?}");
+
+        let update = storage_rx.try_recv().expect("the row must be parked");
+        assert_eq!(update.transaction_id, parked_id);
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        let reason = update.error_message.expect("a park carries its reason");
+        assert!(
+            reason.contains("withdraw fee unknown"),
+            "expected the fee reason, got: {reason}"
+        );
+
+        let TransactionBuilder::Mint(minted) = sender_rx.recv().await.unwrap() else {
+            panic!("expected the next row's Mint builder");
+        };
+        assert_eq!(minted.txn_id, minted_id);
+        assert!(
+            sender_rx.try_recv().is_err(),
+            "the parked row must never reach the sender"
         );
     }
 }

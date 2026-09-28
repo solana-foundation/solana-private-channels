@@ -1,5 +1,7 @@
-use private_channel_withdraw_program_client::instructions::{
-    WithdrawFunds, WithdrawFundsInstructionArgs,
+use private_channel_withdraw_program_client::{
+    accounts::WithdrawFeeConfig,
+    instructions::{WithdrawFunds, WithdrawFundsInstructionArgs},
+    PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, WITHDRAW_FEE_CONFIG_SEED,
 };
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
@@ -22,6 +24,7 @@ fn main() -> Result<()> {
         eprintln!("  - Local:  http://localhost:8899");
         eprintln!("  - Docker: gateway:8899");
         eprintln!("\nThis burns tokens on PrivateChannel. The operator will then release funds on Solana.");
+        eprintln!("The mint's withdraw fee is charged on top of <amount>, so the balance must cover both.");
         std::process::exit(1);
     }
 
@@ -54,8 +57,37 @@ fn main() -> Result<()> {
 
     let user_ata = get_associated_token_address(&user_keypair.pubkey(), &mint);
 
+    // The fee and where it goes live in the mint's config on PrivateChannel.
+    // The operator writes it on the mint's deposits, so a mint nothing has been
+    // deposited into cannot be withdrawn yet.
+    let (withdraw_fee_config_pda, _) = Pubkey::find_program_address(
+        &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+        &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    );
+    let withdraw_fee_config_data = client
+        .get_account_data(&withdraw_fee_config_pda)
+        .map_err(|e| {
+            format!(
+                "No withdraw fee config for mint {} at {} ({}). Has a deposit of this mint been processed yet?",
+                mint, withdraw_fee_config_pda, e
+            )
+        })?;
+    let withdraw_fee_config = WithdrawFeeConfig::from_bytes(&withdraw_fee_config_data)
+        .map_err(|e| format!("Failed to decode withdraw fee config: {}", e))?;
+    // The treasury moves its collected fees out without paying one.
+    let fee = if user_keypair.pubkey() == withdraw_fee_config.treasury {
+        0
+    } else {
+        withdraw_fee_config.fee
+    };
+
     println!("\n📍 Transaction details:");
     println!("User ATA (on PrivateChannel): {}", user_ata);
+    println!(
+        "Withdraw fee: {} (paid to {})",
+        fee, withdraw_fee_config.treasury_token_account
+    );
+    println!("Total debited: {} (amount + fee)", amount + fee);
 
     let instruction = WithdrawFunds {
         user: user_keypair.pubkey(),
@@ -63,6 +95,8 @@ fn main() -> Result<()> {
         token_account: user_ata,
         token_program: spl_token::ID,
         associated_token_program: spl_associated_token_account::ID,
+        withdraw_fee_config: withdraw_fee_config_pda,
+        treasury_token_account: withdraw_fee_config.treasury_token_account,
     }
     .instruction(WithdrawFundsInstructionArgs {
         amount,

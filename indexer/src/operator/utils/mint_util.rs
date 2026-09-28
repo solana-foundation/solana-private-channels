@@ -471,6 +471,7 @@ mod tests {
     use crate::error::OperatorError;
     use crate::operator::rpc_util::RpcClientWithRetry;
     use crate::operator::RetryConfig;
+    use crate::storage::common::amount::TokenAmount;
     use crate::storage::common::models::DbMint;
     use crate::storage::common::models::DbMintStatus;
     use crate::storage::common::storage::mock::MockStorage;
@@ -544,6 +545,7 @@ mod tests {
 
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
+            withdraw_fee: TokenAmount(1),
             mint_address: mint.to_string(),
             decimals,
             token_program: token_program.to_string(),
@@ -592,6 +594,7 @@ mod tests {
             mint.to_string(),
             DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(1),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -644,6 +647,7 @@ mod tests {
         for mint in [&mint1, &mint2, &mint3] {
             mock.add_mint(DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(1),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -674,6 +678,7 @@ mod tests {
         let mut mock = MockStorage::new();
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
+            withdraw_fee: TokenAmount(1),
             mint_address: spl_mint.to_string(),
             decimals: 6,
             token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -682,6 +687,7 @@ mod tests {
         });
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
+            withdraw_fee: TokenAmount(1),
             mint_address: t22_mint.to_string(),
             decimals: 9,
             token_program: TOKEN_2022_PROGRAM_ID.to_string(),
@@ -756,6 +762,7 @@ mod tests {
             mint.to_string(),
             DbMint {
                 withdrawals_blocked: false,
+                withdraw_fee: TokenAmount(1),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),

@@ -1,12 +1,13 @@
 import { expect } from '@jest/globals';
 import {
     getWithdrawFundsInstruction,
+    getWithdrawFundsInstructionAsync,
     getWithdrawFundsInstructionDataCodec,
     WITHDRAW_FUNDS_DISCRIMINATOR,
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
 } from '../../../src/generated';
 import { mockTransactionSigner, TEST_ADDRESSES } from '../../setup/mocks';
-import { AccountRole } from '@solana/kit';
+import { AccountRole, getAddressEncoder, getProgramDerivedAddress } from '@solana/kit';
 import { TOKEN_PROGRAM_ADDRESS, ASSOCIATED_TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
 
 describe('withdraw_funds', () => {
@@ -20,6 +21,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: testDestination,
             });
@@ -54,6 +57,8 @@ describe('withdraw_funds', () => {
                     user,
                     mint: TEST_ADDRESSES.MINT,
                     tokenAccount: TEST_ADDRESSES.WALLET,
+                    withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                    treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                     amount: testAmount,
                     destination: null,
                 });
@@ -69,6 +74,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: numberAmount,
                 destination: null,
             });
@@ -86,6 +93,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: null,
             });
@@ -99,6 +108,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: testDestination,
             });
@@ -114,6 +125,8 @@ describe('withdraw_funds', () => {
                     user,
                     mint: TEST_ADDRESSES.MINT,
                     tokenAccount: TEST_ADDRESSES.WALLET,
+                    withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                    treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                     amount: testAmount,
                     destination,
                 });
@@ -133,6 +146,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: testDestination,
             });
@@ -155,6 +170,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: null,
             });
@@ -177,19 +194,21 @@ describe('withdraw_funds', () => {
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: user, mint, tokenAccount, tokenProgram, associatedTokenProgram', async () => {
+        it('should include all required accounts: user, mint, tokenAccount, tokenProgram, associatedTokenProgram, withdrawFeeConfig, treasuryTokenAccount', async () => {
             const user = mockTransactionSigner(TEST_ADDRESSES.WALLET);
 
             const instruction = getWithdrawFundsInstruction({
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: 1000000n,
                 destination: null,
             });
 
-            // Based on withdraw_funds.rs, should have 5 accounts
-            expect(instruction.accounts).toHaveLength(5);
+            // Based on withdraw_funds.rs, should have 7 accounts
+            expect(instruction.accounts).toHaveLength(7);
 
             // Account 0: user (Signer)
             const userAccount = instruction.accounts[0];
@@ -210,6 +229,14 @@ describe('withdraw_funds', () => {
             // Account 4: associatedTokenProgram (Readonly)
             const associatedTokenProgramAccount = instruction.accounts[4];
             expect(associatedTokenProgramAccount.address).toBe(ASSOCIATED_TOKEN_PROGRAM_ADDRESS);
+
+            // Account 5: withdrawFeeConfig (Readonly)
+            const withdrawFeeConfigAccount = instruction.accounts[5];
+            expect(withdrawFeeConfigAccount.address).toBe(TEST_ADDRESSES.WITHDRAW_FEE_CONFIG);
+
+            // Account 6: treasuryTokenAccount (Writable)
+            const treasuryTokenAccountAccount = instruction.accounts[6];
+            expect(treasuryTokenAccountAccount.address).toBe(TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT);
         });
 
         it('should set correct account permissions (writable/readable/signer)', async () => {
@@ -219,6 +246,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: 1000000n,
                 destination: null,
             });
@@ -242,6 +271,14 @@ describe('withdraw_funds', () => {
             // Account 4: associatedTokenProgram - should be Readonly
             const associatedTokenProgramAccount = instruction.accounts[4];
             expect(associatedTokenProgramAccount.role).toBe(AccountRole.READONLY);
+
+            // Account 5: withdrawFeeConfig - should be Readonly
+            const withdrawFeeConfigAccount = instruction.accounts[5];
+            expect(withdrawFeeConfigAccount.role).toBe(AccountRole.READONLY);
+
+            // Account 6: treasuryTokenAccount - should be Writable, it receives the fee
+            const treasuryTokenAccountAccount = instruction.accounts[6];
+            expect(treasuryTokenAccountAccount.role).toBe(AccountRole.WRITABLE);
         });
 
         it('should use correct program addresses', async () => {
@@ -251,6 +288,8 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
+                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: 1000000n,
                 destination: null,
             });
@@ -265,6 +304,26 @@ describe('withdraw_funds', () => {
             // Verify associatedTokenProgram uses the correct address
             const associatedTokenProgramAccount = instruction.accounts[4];
             expect(associatedTokenProgramAccount.address).toBe(ASSOCIATED_TOKEN_PROGRAM_ADDRESS);
+        });
+
+        it('should derive withdrawFeeConfig from the mint when not provided', async () => {
+            const user = mockTransactionSigner(TEST_ADDRESSES.WALLET);
+
+            const [expectedWithdrawFeeConfig] = await getProgramDerivedAddress({
+                programAddress: PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
+                seeds: ['withdraw_fee_config', getAddressEncoder().encode(TEST_ADDRESSES.MINT)],
+            });
+
+            const instruction = await getWithdrawFundsInstructionAsync({
+                user,
+                mint: TEST_ADDRESSES.MINT,
+                tokenAccount: TEST_ADDRESSES.WALLET,
+                treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
+                amount: 1000000n,
+                destination: null,
+            });
+
+            expect(instruction.accounts[5].address).toBe(expectedWithdrawFeeConfig);
         });
     });
 });

@@ -6,24 +6,24 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                                                 |
-| ----------------------------- | ------------ | --------------------------------------------------------------------------------------- |
-| Instruction handlers          | 100% (1/1)   | WithdrawFunds tested                                                                    |
-| Account validation paths      | 100% (5/5)   | Signer, ATA program, token program, mint, ATA derivation                                |
-| Business logic error branches | 100% (5/5)   | Zero amount, insufficient funds, wrong mint, truncated destination, not enough accounts |
-| Custom error codes exercised  | 100% (2/2)   | InvalidMint, ZeroAmount                                                                 |
-| State & trait coverage (unit) | 100% (11/11) | Instruction parsing, discriminator, event serialization                                 |
-| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test               |
-| Security edge cases           | 100% (3/3)   | Non-signer, wrong programs, wrong ATA address                                           |
-| **Overall (risk-weighted)**   | **~90%**     |                                                                                         |
+| Category                      | Coverage     | Details                                                                                                     |
+| ----------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------- |
+| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawFeeConfig                                                                         |
+| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, fee config owner/address, treasury, system program |
+| Business logic error branches | 100% (8/8)   | Zero amount, insufficient funds, balance below amount + fee, zero fee, mint authority, wrong mint           |
+| Custom error codes exercised  | 100% (8/8)   | InvalidMint, ZeroAmount, InvalidFeeConfig, FeeConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram, ZeroFee |
+| State & trait coverage (unit) | 100% (17/17) | Instruction parsing, discriminator, event serialization, fee config layout                                  |
+| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                   |
+| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign fee config, wrong treasury, pre-funded config PDA    |
+| **Overall (risk-weighted)**   | **~90%**     |                                                                                                             |
 
 ## Test Inventory
 
-**11 unit tests** + **13 integration tests** (LiteSVM) + **7 TypeScript SDK tests**.
+**17 unit tests** + **24 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
 
-### Unit Tests (11 tests)
+### Unit Tests (17 tests)
 
-#### Instruction Data Parsing (8 tests in `withdraw_funds.rs`)
+#### WithdrawFunds Instruction Data Parsing (8 tests in `withdraw_funds.rs`)
 
 - `test_parse_instruction_data_valid_with_destination` — 41-byte data with destination
 - `test_parse_instruction_data_valid_without_destination` — 9-byte data, no destination
@@ -34,22 +34,41 @@
 - `test_parse_instruction_data_non_canonical_option_tag` — Option tag byte other than 0/1 rejected
 - `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
 
+#### SetWithdrawFeeConfig (3 tests in `set_withdraw_fee_config.rs`)
+
+- `test_parse_instruction_data_valid` — fee and treasury parsed from 40 bytes
+- `test_parse_instruction_data_missing_treasury` — fee without treasury rejected
+- `test_process_set_withdraw_fee_config_zero_fee` — ZeroFee returned before any account is read
+
+#### Fee Config State (2 tests in `state/withdraw_fee_config.rs`)
+
+- `test_withdraw_fee_config_serialization_roundtrip` — 73-byte layout, byte-asymmetric fee catches field order and endianness
+- `test_withdraw_fee_config_try_from_bytes_wrong_length` — short data returns the custom InvalidFeeConfig, never a builtin error
+
 #### Discriminator (2 tests in `discriminator.rs`)
 
 - `test_discriminator_valid` — byte 0 maps to WithdrawFunds
-- `test_discriminator_invalid` — byte 1 returns Err
+- `test_discriminator_invalid` — byte 2 returns Err
 
 #### Event Serialization (1 test in `events.rs`)
 
 - `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
-### WithdrawFunds — Integration Tests (13 tests)
+### WithdrawFunds — Integration Tests (18 tests)
 
 #### Happy Path
 
-- `test_withdraw_funds_success` — basic withdrawal, balance verified
+- `test_withdraw_funds_success` — user pays amount + fee, treasury gains the fee, supply drops by the amount only
 - `test_withdraw_funds_with_destination` — optional destination parameter
+- `test_withdraw_funds_treasury_pays_no_fee` — the treasury's own withdrawal moves only the amount
 - `test_withdraw_funds_event_emission` — verifies the `WithdrawFundsEvent` log is actually emitted on-chain with the correct amount and destination bytes; reconstructs the expected pinocchio_log format (`[b0, b1, ..., b39]`) and matches it against the transaction logs
+
+#### Fee Paths
+
+- `test_withdraw_funds_balance_covers_amount_but_not_fee` — fails as a whole; neither the fee moves nor anything is burned
+- `test_withdraw_funds_fee_config_not_initialized` — FeeConfigNotInitialized
+- `test_withdraw_funds_fee_config_wrong_address` — another mint's config rejected with InvalidFeeConfig
+- `test_withdraw_funds_wrong_treasury_account` — a token account other than the configured one rejected with InvalidTreasuryAccount
 
 #### Error Paths
 
@@ -65,22 +84,37 @@
 - `test_withdraw_funds_wrong_token_program` — wrong token program address (IncorrectProgramId)
 - `test_withdraw_funds_wrong_ata_address` — ATA PDA mismatch (InvalidInstructionData)
 - `test_withdraw_funds_invalid_discriminator` — byte 255 discriminator rejected
-- `test_withdraw_funds_not_enough_accounts` — only 3 of 5 required accounts
+- `test_withdraw_funds_not_enough_accounts` — only 3 of 7 required accounts
 
-### WithdrawFunds — TypeScript SDK Tests (7 tests)
+### SetWithdrawFeeConfig — Integration Tests (6 tests)
 
-#### Instruction Data Validation (4 tests)
+- `test_set_withdraw_fee_config_creates_config` — stores bump, fee, treasury and the treasury's ATA
+- `test_set_withdraw_fee_config_overwrites` — a second call replaces fee, treasury and treasury ATA
+- `test_set_withdraw_fee_config_prefunded_pda` — succeeds when the PDA already holds lamports
+- `test_set_withdraw_fee_config_not_mint_authority` — InvalidMintAuthority
+- `test_set_withdraw_fee_config_wrong_address` — InvalidFeeConfig, a custom error so the operator's mint retry never matches it
+- `test_set_withdraw_fee_config_wrong_system_program` — InvalidSystemProgram, for the same reason
+
+### TypeScript SDK Tests (10 tests)
+
+#### WithdrawFunds Instruction Data Validation (4 tests)
 
 - Encodes discriminator, amount, and destination correctly
 - Handles u64 amounts (0, 1, 1M, 1B, max safe integer, max u64)
 - Handles optional destination (None/Some variants)
 - Round-trip encode/decode verification
 
-#### Account Requirements (3 tests)
+#### WithdrawFunds Account Requirements (4 tests)
 
-- All 5 required accounts present in correct order
+- All 7 required accounts present in correct order
 - Account permissions correct (READONLY_SIGNER, WRITABLE, READONLY)
 - Program addresses correct (private_channel program, token program, ATA program)
+- `withdrawFeeConfig` derived from `["withdraw_fee_config", mint]` when not provided
+
+#### SetWithdrawFeeConfig (2 tests)
+
+- Data bytes are discriminator, fee (u64 LE), treasury, in the order the program parses them
+- `withdrawFeeConfig` derived from the mint, system program defaulted, account roles correct
 
 ## Documented Gaps
 

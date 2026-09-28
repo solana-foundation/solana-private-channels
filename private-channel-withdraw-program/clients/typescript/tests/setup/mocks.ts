@@ -36,6 +36,9 @@ export const mockTransactionSigner = (address: Address): TransactionSigner => ({
 export const TEST_ADDRESSES = {
     WALLET: '7BgH7Hq2P3CsQQ2DgJtfHPNNdJtKJsKJGJhRPNkkvuY3' as Address,
     MINT: 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL' as Address,
+    ADMIN: '4aMgkHVGzK3FAhWvJRpCpG2kTkA4dxUQSGfPbhpZsDbF' as Address,
+    WITHDRAW_FEE_CONFIG: '8MKrYq1F8xKhXp4FJWfYSgYZNgPqvP3DQa2Jv7rXfQN8' as Address,
+    TREASURY_TOKEN_ACCOUNT: '9LqZxwCF5N4FdpTJGcZpYPvT2GcLXMdNzQf5EyN5DhYx' as Address,
 } as const;
 
 /**

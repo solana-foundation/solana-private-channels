@@ -690,7 +690,9 @@ fn convert_to_db_models(
                     )
                 }
                 EscrowInstruction::AllowMint {
-                    accounts, event, ..
+                    accounts,
+                    data,
+                    event,
                 } => {
                     let mint_address = accounts.mint.to_string();
                     (
@@ -698,6 +700,7 @@ fn convert_to_db_models(
                             mint_address.clone(),
                             event.decimals as i16,
                             accounts.token_program.to_string(),
+                            TokenAmount(data.withdraw_fee),
                         )),
                         Some(MintStatusChange {
                             mint_address,
@@ -860,6 +863,8 @@ mod tests {
         }
     }
 
+    const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+
     fn make_allow_mint_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
         InstructionWithMetadata {
             instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::AllowMint {
@@ -876,7 +881,10 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                },
                 event: AllowMintEvent { decimals: 6 },
             })),
             slot,
@@ -1070,6 +1078,7 @@ mod tests {
         assert_eq!(mint.mint_address, make_pubkey(2).to_string());
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
+        assert_eq!(mint.withdraw_fee, TokenAmount(ALLOW_MINT_WITHDRAW_FEE));
     }
 
     #[test]
@@ -1214,7 +1223,10 @@ mod tests {
                     event_authority: make_pubkey(18),
                     private_channel_escrow_program: make_pubkey(19),
                 },
-                data: AllowMintData { bump: 255 },
+                data: AllowMintData {
+                    bump: 255,
+                    withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                },
                 event: AllowMintEvent { decimals: 6 },
             })),
             slot: 200,
@@ -1383,7 +1395,12 @@ mod tests {
         // Seed the allowed mints row the prior AllowMint would have created.
         mock.mints.lock().unwrap().insert(
             make_pubkey(2).to_string(),
-            DbMint::new(make_pubkey(2).to_string(), 6, spl_token::id().to_string()),
+            DbMint::new(
+                make_pubkey(2).to_string(),
+                6,
+                spl_token::id().to_string(),
+                TokenAmount(ALLOW_MINT_WITHDRAW_FEE),
+            ),
         );
         processor.buffer(make_block_mint_instruction(
             250,

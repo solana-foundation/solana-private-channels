@@ -774,17 +774,19 @@ async fn upsert_mints_empty_ok() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string());
-    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string());
+    let fee_a = TokenAmount(1_000);
+    let fee_b = TokenAmount(2_500);
+    let m1 = DbMint::new("mint_a".to_string(), 6, "TokenkegQ".to_string(), fee_a);
+    let m2 = DbMint::new("mint_b".to_string(), 9, "TokenzQdB".to_string(), fee_b);
     storage.upsert_mints_batch(&[m1, m2]).await?;
 
-    let got_a = storage.get_mint("mint_a").await?;
-    assert!(got_a.is_some());
-    assert_eq!(got_a.unwrap().decimals, 6);
+    let got_a = storage.get_mint("mint_a").await?.unwrap();
+    assert_eq!(got_a.decimals, 6);
+    assert_eq!(got_a.withdraw_fee, fee_a);
 
-    let got_b = storage.get_mint("mint_b").await?;
-    assert!(got_b.is_some());
-    assert_eq!(got_b.unwrap().decimals, 9);
+    let got_b = storage.get_mint("mint_b").await?.unwrap();
+    assert_eq!(got_b.decimals, 9);
+    assert_eq!(got_b.withdraw_fee, fee_b);
 
     // Missing mint
     let got_c = storage.get_mint("mint_c").await?;
@@ -793,18 +795,30 @@ async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>> {
+async fn upsert_mint_updates_decimals_and_fee() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m = DbMint::new("mint_upd".to_string(), 6, "TokenkegQ".to_string());
+    let m = DbMint::new(
+        "mint_upd".to_string(),
+        6,
+        "TokenkegQ".to_string(),
+        TokenAmount(1_000),
+    );
     storage.upsert_mints_batch(&[m]).await?;
 
-    // Upsert with new decimals
-    let m2 = DbMint::new("mint_upd".to_string(), 9, "TokenkegQ".to_string());
+    // A re-allow carries new decimals and a new fee; both must replace the old row.
+    let repriced_fee = TokenAmount(5_000);
+    let m2 = DbMint::new(
+        "mint_upd".to_string(),
+        9,
+        "TokenkegQ".to_string(),
+        repriced_fee,
+    );
     storage.upsert_mints_batch(&[m2]).await?;
 
     let got = storage.get_mint("mint_upd").await?.unwrap();
     assert_eq!(got.decimals, 9);
+    assert_eq!(got.withdraw_fee, repriced_fee);
     Ok(())
 }
 
@@ -814,7 +828,12 @@ async fn sync_mint_status_mirrors_history_against_postgres(
     let (_pool, storage, _pg) = start_postgres().await?;
 
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "sm".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     assert_eq!(storage.get_mint("sm").await?.unwrap().status, "allowed");
 
@@ -846,7 +865,12 @@ async fn sync_mint_status_mirrors_history_against_postgres(
         .await?;
     storage.sync_mint_status(&["sm".to_string()]).await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("sm".to_string(), 6, "TokenkegQ".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "sm".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     assert_eq!(
         storage.get_mint("sm").await?.unwrap().status,
@@ -870,7 +894,12 @@ async fn reconciliation_balance_counts_correctly() -> Result<(), Box<dyn std::er
     let mint = "recon_mint";
     let tp = "TokenkegQ";
     storage
-        .upsert_mints_batch(&[DbMint::new(mint.to_string(), 6, tp.to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            mint.to_string(),
+            6,
+            tp.to_string(),
+            TokenAmount(1),
+        )])
         .await?;
 
     // Pending deposit (ALL deposits count for reconciliation)
@@ -3523,7 +3552,12 @@ async fn seed_both_sides(
     .execute(pool)
     .await?;
     storage
-        .upsert_mints_batch(&[DbMint::new("mint_addr".to_string(), 6, "token".to_string())])
+        .upsert_mints_batch(&[DbMint::new(
+            "mint_addr".to_string(),
+            6,
+            "token".to_string(),
+            TokenAmount(1),
+        )])
         .await?;
     storage
         .insert_mint_statuses_batch(&[mk_status("mint_addr", "allowed", 1, "allow-sig")])

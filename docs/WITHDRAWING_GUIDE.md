@@ -8,7 +8,7 @@ Want to jump to the code example? [Jump to the TypeScript example](#initiate-a-w
 
 Withdrawals move tokens from the Solana Private Channels payment channel to Solana Mainnet through a three-step process:
 
-1. **Burn on Solana Private Channels**: User calls `WithdrawFunds` instruction to burn tokens on the Solana Private Channels payment channel
+1. **Burn on Solana Private Channels**: User calls `WithdrawFunds` instruction to burn tokens on the Solana Private Channels payment channel, paying the mint's withdraw fee to the treasury on top of the burned amount
 2. **Backend Processing**: Indexer detects the burn event and submits the release to Mainnet
 3. **Release on Mainnet**: Operator calls `ReleaseFunds`, which consumes the withdrawal's nonce in the instance's bitmap and unlocks the escrowed tokens
 
@@ -160,14 +160,24 @@ Users initiate withdrawals by burning tokens on the Solana Private Channels paym
 ### TypeScript Example
 
 ```typescript
-import { getWithdrawFundsInstructionAsync } from 'private-channel-withdraw-program';
+import {
+  fetchWithdrawFeeConfig,
+  getWithdrawFundsInstructionAsync,
+  PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
+} from 'private-channel-withdraw-program';
 import {
   address,
   createDefaultRpcTransport,
   createSolanaRpc,
   generateKeyPairSigner,
+  getAddressEncoder,
+  getProgramDerivedAddress,
   none,
 } from '@solana/kit';
+
+// Solana Private Channels RPC.
+// Replace the URL placeholder with your real RPC endpoint.
+const private_channelRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'https://private-channel-rpc.example.com' }));
 
 const user = await generateKeyPairSigner();
 const withdrawAmount = 1_000_000n; // 1 USDC (6 decimals)
@@ -176,18 +186,24 @@ const USDC_MINT = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 // Optional: Specify destination address on Mainnet (defaults to user if null)
 const destinationOnMainnet = address('DestinationAddressOnMainnet...');
 
-// Build withdraw instruction
+// The mint's fee config says what the fee is and which account it is paid to.
+const [withdrawFeeConfig] = await getProgramDerivedAddress({
+  programAddress: PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
+  seeds: ['withdraw_fee_config', getAddressEncoder().encode(USDC_MINT)],
+});
+const feeConfig = await fetchWithdrawFeeConfig(private_channelRpc, withdrawFeeConfig);
+// The balance must cover withdrawAmount + feeConfig.data.fee
+
+// Build withdraw instruction. withdrawFeeConfig is derived from the mint.
 const withdrawIx = await getWithdrawFundsInstructionAsync({
   user,
   mint: USDC_MINT,
+  treasuryTokenAccount: feeConfig.data.treasuryTokenAccount,
   amount: withdrawAmount,
   destination: none(), // Optionally pass a destination address on Mainnet
 });
 
-// Send to Solana Private Channels RPC.
-// Replace the URL placeholder with your real RPC endpoint.
-const private_channelRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'https://private-channel-rpc.example.com' }));
-// ... sign and send transaction
+// ... sign and send transaction to private_channelRpc
 ```
 
 **Key Points:**
@@ -196,6 +212,7 @@ const private_channelRpc = createSolanaRpc(createDefaultRpcTransport({ url: 'htt
   - If `null`: Tokens released to `user` address on Mainnet
   - If specified: Tokens released to `destination` address on Mainnet (its associated token account must already exist on Mainnet; `ReleaseFunds` validates the ATA, it does not create it)
 - Executing the `WithdrawFunds` instruction will burn tokens from the Solana Private Channels payment channel immediately.
+- **Withdraw fee**: Charged on top of `amount` and paid to the treasury (the operator admin), who withdraws fee-free. It is never refunded: if the release on Mainnet fails, only `amount` is reminted. A mint whose fee config does not exist yet (no deposit processed) cannot be withdrawn.
 
 ### Related Documentation
 - [Escrow Interaction Guide](ESCROW_INTERACTION_GUIDE.md)

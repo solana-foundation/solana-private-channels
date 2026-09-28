@@ -53,8 +53,10 @@ cargo run --bin allow_mint -- \
   https://api.devnet.solana.com \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
-  <MINT_ADDRESS>
+  <MINT_ADDRESS> \
+  <WITHDRAW_FEE>
 ```
+`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin. It must be nonzero. Run again with a new value to reprice; it applies from the mint's next deposit, and also re-opens both gates.
 
 ## 4. Deposit (Solana → Solana Private Channels)
 ```bash
@@ -74,6 +76,7 @@ cargo run --bin withdraw -- \
   <MINT_ADDRESS> \
   <AMOUNT>
 ```
+Prints the mint's withdraw fee before sending. The balance must cover `<AMOUNT>` plus the fee, and only `<AMOUNT>` is released on Solana.
 
 ## Block Mint (set the deposit / withdrawal gates)
 Both flags are absolute, so passing `false` for one re-opens that gate. The script

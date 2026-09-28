@@ -69,6 +69,7 @@ to the right Path below.
 | `error_message` contains | Cause |
 |---|---|
 | `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path F**. |
+| `withdraw fee unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee the deposit must write to the channel is unknown (metric label `withdraw_fee_unknown`). This happens when the indexer started after the mint's `AllowMint`. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee, its history insert is a no-op, then re-arm. |
 
 Pull the row:
 
@@ -88,8 +89,8 @@ solana confirm -v <signature> --url <solana-rpc-url>
 
 ## Recovery
 
-Processor-side and allowlist quarantines (Paths A/B/C/F) trigger on row-data
-validation before any mint is attempted, so they do not need on-chain mint
+Processor-side and allowlist quarantines (Paths A/B/C/F, and `withdraw fee
+unknown`) trigger before any mint is attempted, so they do not need on-chain mint
 verification before recovery. The signature-driven recovery worker (Path E)
 is the gate against a double-mint: it re-arms (`pending`) only a deposit it
 has proven did not mint - either no signature was ever persisted (so it was
@@ -348,14 +349,16 @@ Replay the indexer over the `AllowMint`'s slot (preferred — same code path
 as production), or insert directly. The gate (`assert_mint_allowed_at_slot`)
 reads **`mint_status_history`**, so backfilling only `mints` loops
 `pending` → `manual_review` forever — both rows are required. Values must
-match the on-chain mint. `status` and `withdrawals_blocked` are left to their
-defaults (`allowed`, open), which is what an `AllowMint` sets:
+match the on-chain mint, and `withdraw_fee` is the `withdraw_fee` argument of
+that `AllowMint` (bytes 2..10 of its instruction data, u64 LE). `status` and
+`withdrawals_blocked` are left to their defaults (`allowed`, open), which is
+what an `AllowMint` sets:
 
 ```sql
 INSERT INTO mints
-  (mint_address, decimals, token_program, created_at)
+  (mint_address, decimals, token_program, withdraw_fee, created_at)
 VALUES
-  (:mint, :decimals, :token_program, NOW());
+  (:mint, :decimals, :token_program, :withdraw_fee, NOW());
 
 -- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
 INSERT INTO mint_status_history

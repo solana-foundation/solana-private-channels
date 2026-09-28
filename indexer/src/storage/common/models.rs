@@ -205,11 +205,19 @@ pub struct DbMint {
     /// transition. Read per withdrawal so an admin blocking a live mint takes
     /// effect without restarting the operator.
     pub withdrawals_blocked: bool,
+    /// Per-withdrawal fee from the latest AllowMint. Read per deposit, so a
+    /// re-allow reprices the channel without restarting the operator.
+    pub withdraw_fee: TokenAmount,
     pub created_at: DateTime<Utc>,
 }
 
 impl DbMint {
-    pub fn new(mint_address: String, decimals: i16, token_program: String) -> Self {
+    pub fn new(
+        mint_address: String,
+        decimals: i16,
+        token_program: String,
+        withdraw_fee: TokenAmount,
+    ) -> Self {
         Self {
             mint_address,
             decimals,
@@ -217,6 +225,7 @@ impl DbMint {
             // A DbMint is only ever constructed on the allow path.
             status: "allowed".to_string(),
             withdrawals_blocked: false,
+            withdraw_fee,
             created_at: Utc::now(),
         }
     }

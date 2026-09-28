@@ -63,6 +63,7 @@ Discriminator: `1`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `bump` | u8 | PDA bump seed for allowed mint account |
+| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. Must be nonzero. The escrow only validates it; the indexer reads it from the instruction data and the operator writes it to the channel's fee config on every deposit, so re-allowing with a new value reprices from the next deposit on |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |
@@ -413,6 +414,7 @@ The program defines the following custom errors:
 | 15 | `DepositsBlockedForMint` | Deposits are blocked for this mint |
 | 16 | `WithdrawalsBlockedForMint` | Withdrawals are blocked for this mint |
 | 17 | `MintProfileChanged` | Mint no longer matches the profile recorded at AllowMint |
+| 18 | `ZeroWithdrawFee` | AllowMint must set a nonzero withdraw fee |
 
 ## Other Constants
 

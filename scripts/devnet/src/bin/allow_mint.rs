@@ -31,12 +31,14 @@ fn find_event_authority_pda() -> (Pubkey, u8) {
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 5 {
+    if args.len() < 6 {
         eprintln!(
-            "Usage: {} <rpc-url> <escrow-admin-keypair-path> <instance-id> <mint-address>",
+            "Usage: {} <rpc-url> <escrow-admin-keypair-path> <instance-id> <mint-address> <withdraw-fee>",
             args[0]
         );
-        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv So11111111111111111111111111111111111111112", args[0]);
+        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv So11111111111111111111111111111111111111112 10000", args[0]);
+        eprintln!("\n<withdraw-fee> is in the mint's base units, charged on top of every PrivateChannel withdrawal. Must be nonzero.");
+        eprintln!("Run again with a new fee to reprice; it applies from the next deposit, and also re-opens both gates.");
         std::process::exit(1);
     }
 
@@ -44,11 +46,13 @@ fn main() -> Result<()> {
     let keypair_path = &args[2];
     let instance_id = Pubkey::from_str(&args[3])?;
     let mint = Pubkey::from_str(&args[4])?;
+    let withdraw_fee: u64 = args[5].parse()?;
 
     println!("Connecting to: {}", rpc_url);
     println!("Using admin keypair: {}", keypair_path);
     println!("Instance: {}", instance_id);
     println!("Mint: {}", mint);
+    println!("Withdraw fee: {}", withdraw_fee);
 
     let client = RpcClient::new(rpc_url.to_string());
     let admin_keypair =
@@ -86,7 +90,7 @@ fn main() -> Result<()> {
         event_authority: event_authority_pda,
         private_channel_escrow_program: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
     }
-    .instruction(AllowMintInstructionArgs { bump });
+    .instruction(AllowMintInstructionArgs { bump, withdraw_fee });
 
     let recent_blockhash = client.get_latest_blockhash()?;
     let transaction = Transaction::new_signed_with_payer(
@@ -102,6 +106,10 @@ fn main() -> Result<()> {
     println!("\n✅ Success!");
     println!("Transaction signature: {}", signature);
     println!("Mint {} allowed for instance {}", mint, instance_id);
+    println!(
+        "Withdraw fee {} reaches PrivateChannel with the mint's next deposit",
+        withdraw_fee
+    );
 
     Ok(())
 }

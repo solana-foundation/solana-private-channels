@@ -4,6 +4,10 @@ use private_channel_escrow_program_client::{
     instructions::{AddOperatorBuilder, AllowMintBuilder, CreateInstanceBuilder},
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
+use private_channel_withdraw_program_client::{
+    instructions::SetWithdrawFeeConfigBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    WITHDRAW_FEE_CONFIG_SEED,
+};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -15,6 +19,7 @@ use spl_associated_token_account::{
     instruction::create_associated_token_account_idempotent,
 };
 use spl_token::{instruction::mint_to, ID as TOKEN_PROGRAM_ID};
+use test_utils::mint_helper::TEST_WITHDRAW_FEE;
 
 use super::helpers::{
     generate_mint, get_token_balance, mint_to_owner, send_and_confirm_instructions, setup_wallets,
@@ -84,6 +89,37 @@ impl TestEnvironment {
 
         let mint_keypair = Keypair::new();
         let mint = generate_mint(client, &admin, &admin, &mint_keypair).await?;
+
+        // This validator plays both chains, so write the fee config the
+        // operator would on the first deposit. Withdrawals then work with or
+        // without a deposit, and the operator's own write lands the same values.
+        let (withdraw_fee_config, _) = Pubkey::find_program_address(
+            &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+            &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+        );
+        let fee_config_ixs = [
+            create_associated_token_account_idempotent(
+                &admin.pubkey(),
+                &admin.pubkey(),
+                &mint,
+                &TOKEN_PROGRAM_ID,
+            ),
+            SetWithdrawFeeConfigBuilder::new()
+                .authority(admin.pubkey())
+                .mint(mint)
+                .withdraw_fee_config(withdraw_fee_config)
+                .fee(TEST_WITHDRAW_FEE)
+                .treasury(admin.pubkey())
+                .instruction(),
+        ];
+        send_and_confirm_instructions(
+            client,
+            &fee_config_ixs,
+            &admin,
+            &[&admin],
+            "Set Withdraw Fee Config",
+        )
+        .await?;
 
         // batch all user ATA-creation + mint instructions into a
         // single transaction instead of one confirmation round-trip per user.
@@ -162,6 +198,7 @@ impl TestEnvironment {
             .event_authority(event_authority_pda)
             .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
             .bump(bump)
+            .withdraw_fee(TEST_WITHDRAW_FEE)
             .instruction();
 
         send_and_confirm_instructions(client, &[allow_ix], &admin, &[&admin], "Allow Mint").await?;
@@ -312,6 +349,7 @@ pub async fn allow_mint_for_program(
         .event_authority(event_authority_pda)
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
+        .withdraw_fee(TEST_WITHDRAW_FEE)
         .instruction();
 
     send_and_confirm_instructions(client, &[allow_ix], admin, &[admin], "Allow Mint").await?;
