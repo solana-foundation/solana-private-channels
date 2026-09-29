@@ -280,8 +280,11 @@ async fn wait_for_block_servable(rpc_url: &str, slot: u64) {
 /// hold; an empty slice means the escrow holds nothing.
 ///
 /// Answers every attempt's two token programs, so it is left uncounted rather than pinned
-/// to an exact hit count.
-async fn mock_escrow_custody(rpc: &mut MockitoServer, holdings: &[(String, i64)]) -> mockito::Mock {
+/// to an exact hit count. Every held mint is reported as allowed.
+async fn mock_escrow_custody(
+    rpc: &mut MockitoServer,
+    holdings: &[(String, i64)],
+) -> Vec<mockito::Mock> {
     mock_escrow_custody_at(rpc, holdings, MOCK_TIP).await
 }
 
@@ -291,7 +294,7 @@ async fn mock_escrow_custody_at(
     rpc: &mut MockitoServer,
     holdings: &[(String, i64)],
     context_slot: u64,
-) -> mockito::Mock {
+) -> Vec<mockito::Mock> {
     let accounts: Vec<serde_json::Value> = holdings
         .iter()
         .map(|(mint, amount)| {
@@ -319,7 +322,8 @@ async fn mock_escrow_custody_at(
         })
         .collect();
 
-    rpc.mock("POST", "/")
+    let sweep = rpc
+        .mock("POST", "/")
         .match_body(Matcher::PartialJson(
             json!({"method": "getTokenAccountsByOwner"}),
         ))
@@ -334,7 +338,42 @@ async fn mock_escrow_custody_at(
         )
         .expect_at_least(1)
         .create_async()
-        .await
+        .await;
+
+    // The sweep keeps a mint only if its AllowedMint PDA is owned by the escrow program, so
+    // answer every PDA with such an account, at the slot asked for.
+    let allowed_mints = rpc
+        .mock("POST", "/")
+        .match_body(Matcher::PartialJson(
+            json!({"method": "getMultipleAccounts"}),
+        ))
+        .with_status(200)
+        .with_body_from_request(|req| {
+            let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+            let key_count = body["params"][0].as_array().unwrap().len();
+            let allowed_mint = json!({
+                "lamports": 1_000_000,
+                "owner": PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": 0,
+                "data": ["", "base64"]
+            });
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "context": {"slot": body["params"][1]["minContextSlot"]},
+                    "value": vec![allowed_mint; key_count]
+                }
+            })
+            .to_string()
+            .into_bytes()
+        })
+        .create_async()
+        .await;
+
+    vec![sweep, allowed_mints]
 }
 
 /// A block whose one transaction is a top-level escrow Deposit, shaped the way the fill's

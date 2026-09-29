@@ -13,8 +13,8 @@
 //! reduce the ATA balance.
 //!
 //! Flow:
-//! 1. Sweep the escrow instance's on-chain token accounts, summed per mint, noting the
-//!    slot the reading is valid as of.
+//! 1. Sweep the escrow instance's on-chain token accounts, summed per allowed mint, noting
+//!    the slot the reading is valid as of.
 //! 2. Query the DB for per-mint aggregate balances (all deposits - released
 //!    withdrawals), bounded by that slot so both sides describe the same instant.
 //! 3. Compare the union of both mint sets; a mint on only one side compares against 0.

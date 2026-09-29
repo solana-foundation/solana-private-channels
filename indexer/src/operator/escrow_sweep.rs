@@ -1,12 +1,14 @@
 //! Shared on-chain escrow balance sweep.
 //!
-//! Both the operator's continuous reconciliation and the indexer's startup
-//! reconciliation need the authoritative custody view: the token balance the
-//! escrow instance actually holds, summed per mint across every token account
-//! it owns, for mints with an `AllowedMint` PDA. Deriving the set of mints from
-//! this sweep (rather than from the DB `mints` table) is what closes the startup
-//! blind spot where a fresh or partially restored DB with real escrow balances
-//! would otherwise pass the check without ever looking on-chain.
+//! The indexer's startup reconciliation needs the authoritative custody view: the
+//! token balance the escrow instance actually holds, summed per mint across every
+//! token account it owns, for mints with an `AllowedMint` PDA. Deriving the set of
+//! mints from this sweep (rather than from the DB `mints` table) is what closes the
+//! startup blind spot where a fresh or partially restored DB with real escrow
+//! balances would otherwise pass the check without ever looking on-chain.
+//!
+//! The operator's continuous reconciliation reads custody with `fetch_escrow_custody`
+//! instead, from the ATAs of the mints it already knows.
 
 use crate::operator::utils::account_util::find_allowed_mint_pda;
 use crate::operator::utils::instruction_util::RetryPolicy;
