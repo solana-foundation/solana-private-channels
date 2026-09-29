@@ -3,13 +3,15 @@
 //! Both the operator's continuous reconciliation and the indexer's startup
 //! reconciliation need the authoritative custody view: the token balance the
 //! escrow instance actually holds, summed per mint across every token account
-//! it owns. Deriving the set of mints from this sweep (rather than from the DB
-//! `mints` table) is what closes the startup blind spot where a fresh or
-//! partially restored DB with real escrow balances would otherwise pass the
-//! check without ever looking on-chain.
+//! it owns, for mints with an `AllowedMint` PDA. Deriving the set of mints from
+//! this sweep (rather than from the DB `mints` table) is what closes the startup
+//! blind spot where a fresh or partially restored DB with real escrow balances
+//! would otherwise pass the check without ever looking on-chain.
 
+use crate::operator::utils::account_util::find_allowed_mint_pda;
 use crate::operator::utils::instruction_util::RetryPolicy;
 use crate::operator::utils::rpc_util::RpcClientWithRetry;
+use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use solana_account_decoder_client_types::{UiAccount, UiAccountData};
 use solana_client::rpc_request::{RpcRequest, TokenAccountsFilter};
 use solana_client::rpc_response::Response;
@@ -99,7 +101,8 @@ pub struct EscrowCustody {
 const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 5;
 
 /// Sum every token account owned by the escrow instance, grouped by mint, across
-/// the SPL Token and Token-2022 programs.
+/// the SPL Token and Token-2022 programs. Mints without an `AllowedMint` PDA are dropped,
+/// since anyone can open a token account for the escrow.
 ///
 /// The two programs need one call each, so their readings can land on different slots and
 /// the merged balances would then hold activity the lower slot never saw. No single slot
@@ -117,7 +120,7 @@ pub async fn fetch_escrow_balances_by_mint(
 ) -> Result<CustodySnapshot, SweepFailure> {
     let mut attempt = 1;
     loop {
-        let (balances, low, high) = sweep_once(rpc_client, escrow_instance_id)
+        let (mut balances, low, high) = sweep_once(rpc_client, escrow_instance_id)
             .await
             .map_err(SweepFailure::Read)?;
         if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
@@ -137,11 +140,56 @@ pub async fn fetch_escrow_balances_by_mint(
                 high,
             });
         }
+
+        let dropped = retain_allowed_mints(rpc_client, escrow_instance_id, &mut balances, low)
+            .await
+            .map_err(SweepFailure::Read)?;
+        if !dropped.is_empty() {
+            warn!(
+                count = dropped.len(),
+                sample = ?dropped.iter().take(DROPPED_MINT_SAMPLE).collect::<Vec<_>>(),
+                "Escrow sweep: ignoring escrow token accounts for mints that were never allowed"
+            );
+        }
+
         return Ok(CustodySnapshot {
             balances,
             slot: low,
         });
     }
+}
+
+/// How many dropped mints the sweep's warning names; the rest are only counted.
+const DROPPED_MINT_SAMPLE: usize = 5;
+
+/// Remove every mint without an `AllowedMint` PDA owned by the escrow program, and return them.
+/// Anyone can open a token account for the escrow, but only the admin's `AllowMint` creates
+/// that PDA.
+async fn retain_allowed_mints(
+    rpc_client: &RpcClientWithRetry,
+    escrow_instance_id: Pubkey,
+    balances: &mut HashMap<Pubkey, u64>,
+    min_slot: u64,
+) -> Result<Vec<Pubkey>, EscrowSweepError> {
+    let mints: Vec<Pubkey> = balances.keys().copied().collect();
+    let pdas: Vec<Pubkey> = mints
+        .iter()
+        .map(|mint| find_allowed_mint_pda(&escrow_instance_id, mint))
+        .collect();
+    let accounts = read_accounts_chunked(rpc_client, &pdas, min_slot, "AllowedMint PDAs").await?;
+
+    let escrow_program = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+    let mut dropped = Vec::new();
+    for (mint, (account, _)) in mints.into_iter().zip(accounts) {
+        // An absent PDA, or one holding only lamports someone sent there, is not an allow.
+        let allowed = account.is_some_and(|account| account.owner == escrow_program);
+        if !allowed {
+            balances.remove(&mint);
+            dropped.push(mint);
+        }
+    }
+
+    Ok(dropped)
 }
 
 /// Most keys one `getMultipleAccounts` call accepts.
@@ -200,23 +248,42 @@ async fn read_custody_once(
     mints: &[(Pubkey, Pubkey)],
     anchor: u64,
 ) -> Result<(HashMap<Pubkey, u64>, HashMap<Pubkey, u64>), EscrowSweepError> {
+    let keys: Vec<Pubkey> = mints
+        .iter()
+        .map(|(mint, token_program)| {
+            get_associated_token_address_with_program_id(&escrow_instance_id, mint, token_program)
+        })
+        .collect();
+    let accounts = read_accounts_chunked(rpc_client, &keys, anchor, "escrow ATAs").await?;
+
     let mut balances = HashMap::new();
     let mut slots = HashMap::new();
+    for ((mint, token_program), (account, slot)) in mints.iter().zip(accounts) {
+        slots.insert(*mint, slot);
+        // No account at the ATA means the escrow holds none of this mint.
+        let Some(account) = account else { continue };
+        let amount = decode_ata_amount(&account, mint, token_program)?;
+        balances.insert(*mint, amount);
+    }
 
-    for chunk in mints.chunks(MAX_ACCOUNTS_PER_CALL) {
-        let keys: Vec<String> = chunk
-            .iter()
-            .map(|(mint, token_program)| {
-                get_associated_token_address_with_program_id(
-                    &escrow_instance_id,
-                    mint,
-                    token_program,
-                )
-                .to_string()
-            })
-            .collect();
-        // Raw request so an account that will not decode is an error, never "absent". A backend
-        // below `anchor` refuses with -32016, which is retried rather than read as stale.
+    Ok((balances, slots))
+}
+
+/// Read `keys` in chunks of `MAX_ACCOUNTS_PER_CALL`. Returns each key's account (None when
+/// absent) and the slot its chunk answered at, in key order. A chunk below `min_slot` fails.
+async fn read_accounts_chunked(
+    rpc_client: &RpcClientWithRetry,
+    keys: &[Pubkey],
+    min_slot: u64,
+    what: &str,
+) -> Result<Vec<(Option<UiAccount>, u64)>, EscrowSweepError> {
+    let mut accounts = Vec::with_capacity(keys.len());
+
+    for chunk in keys.chunks(MAX_ACCOUNTS_PER_CALL) {
+        let chunk_keys: Vec<String> = chunk.iter().map(Pubkey::to_string).collect();
+        // Sent raw because the client's get_multiple_accounts turns an account it cannot decode
+        // into None, which would read as "no account". Here None only ever means absent.
+        // A node behind `min_slot` refuses with -32016, which with_retry retries.
         let response = rpc_client
             .with_retry("get_multiple_accounts", RetryPolicy::Idempotent, || async {
                 rpc_client
@@ -224,45 +291,39 @@ async fn read_custody_once(
                     .send::<Response<Vec<Option<UiAccount>>>>(
                         RpcRequest::GetMultipleAccounts,
                         serde_json::json!([
-                            keys,
-                            {"encoding": "base64", "commitment": "finalized", "minContextSlot": anchor}
+                            chunk_keys,
+                            {"encoding": "base64", "commitment": "finalized", "minContextSlot": min_slot}
                         ]),
                     )
                     .await
             })
             .await
             .map_err(|e| EscrowSweepError {
-                reason: format!("Failed to read escrow ATAs: {e}"),
+                reason: format!("Failed to read {what}: {e}"),
             })?;
+
         if response.value.len() != chunk.len() {
             return Err(EscrowSweepError {
                 reason: format!(
-                    "Escrow ATA read returned {} accounts for {} keys",
+                    "{what} read returned {} accounts for {} keys",
                     response.value.len(),
                     chunk.len()
                 ),
             });
         }
-        if response.context.slot < anchor {
+        let slot = response.context.slot;
+        if slot < min_slot {
             return Err(EscrowSweepError {
-                reason: format!(
-                    "Escrow ATA read answered at slot {}, behind the Solana block {anchor}",
-                    response.context.slot
-                ),
+                reason: format!("{what} read answered at slot {slot}, behind slot {min_slot}"),
             });
         }
-        for (mint, _) in chunk {
-            slots.insert(*mint, response.context.slot);
-        }
-        for ((mint, token_program), account) in chunk.iter().zip(response.value) {
-            // No account at the ATA means the escrow holds none of this mint.
-            let Some(account) = account else { continue };
-            let amount = decode_ata_amount(&account, mint, token_program)?;
-            balances.insert(*mint, amount);
+
+        for account in response.value {
+            accounts.push((account, slot));
         }
     }
 
-    Ok((balances, slots))
+    Ok(accounts)
 }
 
 /// The balance of one escrow ATA, refusing anything that is not `mint`'s token account.
@@ -542,7 +603,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::operator::RetryConfig;
     use base64::Engine as _;
+    use private_channel_escrow_program_client::AllowedMint;
     use solana_commitment_config::CommitmentConfig;
+    use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
     use spl_token::solana_program::program_option::COption;
     use spl_token::state::AccountState;
     use spl_token_2022::extension::transfer_hook::TransferHookAccount;
@@ -678,6 +741,7 @@ pub(crate) mod tests {
             ],
         )
         .await;
+        mock_all_mints_allowed(&mut server).await;
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
@@ -694,6 +758,7 @@ pub(crate) mod tests {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_sweep(&mut server, &[base64_account(mint, 1_234)]).await;
+        mock_all_mints_allowed(&mut server).await;
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
@@ -717,6 +782,7 @@ pub(crate) mod tests {
             ],
         )
         .await;
+        mock_all_mints_allowed(&mut server).await;
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
@@ -789,6 +855,7 @@ pub(crate) mod tests {
         )
         .await;
         mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 905, 905).await;
+        mock_all_mints_allowed(&mut server).await;
 
         let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
@@ -812,6 +879,120 @@ pub(crate) mod tests {
             .balances;
 
         assert!(balances.is_empty());
+    }
+
+    /// The `AllowedMint` account the admin's `AllowMint` creates at the mint's PDA.
+    pub(crate) fn allowed_mint_account() -> serde_json::Value {
+        let allowed_mint = AllowedMint {
+            discriminator: 2,
+            bump: 255,
+            deposits_blocked: false,
+            withdrawals_blocked: false,
+            decimals: 6,
+            token_program: spl_token::id(),
+            extensions: 0,
+            has_freeze_authority: false,
+        };
+        ui_account(
+            PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            &borsh::to_vec(&allowed_mint).unwrap(),
+        )
+    }
+
+    /// Answers every requested PDA with an AllowedMint, at the slot asked for, so every swept
+    /// mint counts as allowed.
+    pub(crate) async fn mock_all_mints_allowed(server: &mut mockito::Server) {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"method": "getMultipleAccounts"}),
+            ))
+            .with_status(200)
+            .with_body_from_request(|req| {
+                let body: serde_json::Value = serde_json::from_slice(req.body().unwrap()).unwrap();
+                let key_count = body["params"][0].as_array().unwrap().len();
+                let slot = body["params"][1]["minContextSlot"].clone();
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"context": {"slot": slot}, "value": vec![allowed_mint_account(); key_count]}
+                })
+                .to_string()
+                .into_bytes()
+            })
+            .create_async()
+            .await;
+    }
+
+    /// Anyone can open a token account for the escrow. A mint the admin never allowed must not
+    /// reach reconciliation, or its channel read can stop the boot.
+    #[tokio::test]
+    async fn sweep_drops_a_mint_without_an_allowed_mint_pda() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let allowed = Pubkey::new_unique();
+        let unapproved = Pubkey::new_unique();
+
+        // The escrow owns a token account for each mint. The attacker opened the unapproved one.
+        mock_sweep(
+            &mut server,
+            &[
+                json_parsed_account(allowed, 100),
+                json_parsed_account(unapproved, 0),
+            ],
+        )
+        .await;
+        // Only the allowed mint has an AllowedMint PDA; the unapproved one's reads as absent.
+        let pdas = HashMap::from([(
+            find_allowed_mint_pda(&instance, &allowed),
+            allowed_mint_account(),
+        )]);
+        mock_multiple_accounts(&mut server, pdas, vec![1], Arc::default()).await;
+
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+            .await
+            .unwrap()
+            .balances;
+
+        assert_eq!(balances, HashMap::from([(allowed, 100)]));
+    }
+
+    /// Sending lamports to the PDA address creates a System account there. That is not an
+    /// AllowedMint, so the mint must still be dropped.
+    #[tokio::test]
+    async fn sweep_drops_a_mint_whose_pda_is_not_owned_by_the_escrow() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let allowed = Pubkey::new_unique();
+        let unapproved = Pubkey::new_unique();
+
+        mock_sweep(
+            &mut server,
+            &[
+                json_parsed_account(allowed, 100),
+                json_parsed_account(unapproved, 0),
+            ],
+        )
+        .await;
+        // The unapproved mint's PDA exists, but only as a System account holding lamports.
+        let pdas = HashMap::from([
+            (
+                find_allowed_mint_pda(&instance, &allowed),
+                allowed_mint_account(),
+            ),
+            (
+                find_allowed_mint_pda(&instance, &unapproved),
+                ui_account(SYSTEM_PROGRAM_ID, &[]),
+            ),
+        ]);
+        mock_multiple_accounts(&mut server, pdas, vec![1], Arc::default()).await;
+
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
+            .await
+            .unwrap()
+            .balances;
+
+        assert_eq!(balances, HashMap::from([(allowed, 100)]));
     }
 
     /// getAccountInfo response wrapping an 82-byte SPL Mint blob with `supply`.
@@ -1030,6 +1211,7 @@ pub(crate) mod tests {
         let mut server = mockito::Server::new_async().await;
         let mint = Pubkey::new_unique();
         mock_sweep_token_2022(&mut server, &[base64_token2022_account(mint, 4_242)]).await;
+        mock_all_mints_allowed(&mut server).await;
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
@@ -1053,6 +1235,7 @@ pub(crate) mod tests {
             &[base64_token2022_account_without_extensions(mint, 7_000)],
         )
         .await;
+        mock_all_mints_allowed(&mut server).await;
 
         let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
             .await
@@ -1116,7 +1299,7 @@ pub(crate) mod tests {
 
     /// Answer `getMultipleAccounts` per requested key from `accounts` (absent keys are null).
     /// Call `n` answers at `slots[n]`, repeating the last slot; requested keys are recorded.
-    async fn mock_multiple_accounts(
+    pub(crate) async fn mock_multiple_accounts(
         server: &mut mockito::Server,
         accounts: HashMap<Pubkey, serde_json::Value>,
         slots: Vec<u64>,

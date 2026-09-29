@@ -48,7 +48,6 @@ mod multi_instruction_pipeline;
 mod liability_reconciliation;
 
 use helpers::{generate_mint, mint_to_owner, setup_wallets};
-use private_channel_escrow_program_client::PRIVATE_CHANNEL_ESCROW_PROGRAM_ID;
 use private_channel_indexer::{
     config::{ProgramType, ReconciliationConfig},
     error::{IndexerError, ReconciliationError},
@@ -56,6 +55,7 @@ use private_channel_indexer::{
     storage::{PostgresDb, Storage},
     PostgresConfig,
 };
+use setup::{allow_mint_for_program, TestEnvironment, TEST_ADMIN_KEYPAIR};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::{
@@ -69,15 +69,6 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Derive the escrow instance PDA from a seed pubkey.
-fn instance_pda(seed: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"instance", seed.as_ref()],
-        &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
-    )
-    .0
-}
 
 /// Slot the seeded rows below are written at.
 const SEEDED_ROW_SLOT: u64 = 1;
@@ -285,10 +276,12 @@ async fn test_reconciliation_passes_with_matching_on_chain_balance(
     let mint_keypair = Keypair::new();
     let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
-    // Derive the escrow instance PDA and mint tokens directly to its ATA.
-    let seed_keypair = Keypair::new();
-    let pda = instance_pda(&seed_keypair.pubkey());
+    // A real instance with the mint allowed; startup ignores custody of unapproved mints.
+    let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
 
+    // Mint tokens directly to the instance ATA.
     const AMOUNT: u64 = 1_000_000;
     mint_to_owner(
         client.as_ref(),
@@ -374,9 +367,12 @@ async fn test_reconciliation_attacker_surplus_does_not_block(
     let mint_keypair = Keypair::new();
     let mint_pubkey = generate_mint(client.as_ref(), &authority, &authority, &mint_keypair).await?;
 
-    // Derive the escrow instance PDA and mint the balanced amount to its ATA.
-    let seed_keypair = Keypair::new();
-    let pda = instance_pda(&seed_keypair.pubkey());
+    // A real instance with the mint allowed; startup ignores custody of unapproved mints.
+    let (_, pda) = TestEnvironment::setup_instance(client.as_ref(), &faucet_keypair, None).await?;
+    let admin = Keypair::try_from(&TEST_ADMIN_KEYPAIR[..])?;
+    allow_mint_for_program(client.as_ref(), &admin, pda, mint_pubkey, spl_token::id()).await?;
+
+    // Mint the balanced amount to the instance ATA.
 
     const AMOUNT: u64 = 1_000_000;
     const ATTACKER_EXTRA: u64 = 500_000;

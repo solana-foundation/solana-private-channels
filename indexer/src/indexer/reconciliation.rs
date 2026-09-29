@@ -683,6 +683,11 @@ fn classify_and_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::escrow_sweep::tests::{
+        allowed_mint_account, mock_all_mints_allowed, mock_multiple_accounts,
+    };
+    use crate::operator::utils::account_util::find_allowed_mint_pda;
+    use std::sync::Arc;
 
     // =========================================================================
     // directional accessor tests
@@ -1056,7 +1061,7 @@ mod tests {
 
     /// Mock both sweep calls (SPL Token and Token-2022). The SPL Token call (matched
     /// by its program id in the request body) returns `entries`; the Token-2022 call
-    /// returns an empty list so balances are not double-counted.
+    /// returns an empty list so balances are not double-counted. Every mint is allowed.
     async fn mock_escrow_sweep(server: &mut mockito::Server, entries: &[(String, u64)]) {
         let value: Vec<String> = entries
             .iter()
@@ -1083,6 +1088,7 @@ mod tests {
             .with_body(empty_body)
             .create_async()
             .await;
+        mock_all_mints_allowed(server).await;
     }
 
     #[tokio::test]
@@ -1258,6 +1264,83 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "balanced state should pass: {:?}", result);
+    }
+
+    /// An attacker opens an escrow token account for a mint nobody allowed and makes the same
+    /// address a System account on the channel. Reading that mint's supply fails every round,
+    /// so it must never be read, or it stops every boot.
+    #[tokio::test]
+    async fn an_unapproved_mint_in_custody_does_not_stop_startup() {
+        let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
+        let allowed = Pubkey::new_unique();
+        let unapproved = Pubkey::new_unique();
+
+        // The escrow owns a token account for each mint. The attacker opened the unapproved one.
+        // Mocked here, not via mock_escrow_sweep, which treats every mint as allowed.
+        let sweep_body = format!(
+            r#"{{"jsonrpc":"2.0","result":{{"context":{{"slot":100}},"value":[{},{}]}},"id":1}}"#,
+            token_account_entry(&allowed.to_string(), 1_000),
+            token_account_entry(&unapproved.to_string(), 0),
+        );
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token::id().to_string()))
+            .with_status(200)
+            .with_body(sweep_body)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(spl_token_2022::id().to_string()))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","result":{"context":{"slot":100},"value":[]},"id":1}"#)
+            .create_async()
+            .await;
+        // Only the allowed mint has an AllowedMint PDA.
+        let pdas = HashMap::from([(
+            find_allowed_mint_pda(&instance, &allowed),
+            allowed_mint_account(),
+        )]);
+        mock_multiple_accounts(&mut server, pdas, vec![100], Arc::default()).await;
+
+        // Channel side: the allowed mint is fully backed; the unapproved address is the poison.
+        mock_supply_for_mint(&mut server, &allowed, 1_000, None).await;
+        let unapproved_channel_read = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("getAccountInfo".to_string()),
+                mockito::Matcher::Regex(unapproved.to_string()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":100},"value":{"owner":"11111111111111111111111111111111","lamports":1000000,"data":["","base64"],"executable":false,"rentEpoch":0}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mock_storage = MockStorage::new();
+        mock_storage.set_mint_balances(vec![make_mint_balance(&allowed.to_string(), 1_000, 0)]);
+        let storage = Storage::Mock(mock_storage);
+        let config = ReconciliationConfig {
+            mismatch_threshold_raw: 0,
+            ..Default::default()
+        };
+        let url = server.url();
+        let result = run_startup_reconciliation(
+            &config,
+            ProgramType::Escrow,
+            &storage,
+            &url,
+            Some(&url),
+            &instance,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "an unapproved mint must not stop startup: {result:?}"
+        );
+        unapproved_channel_read.assert_async().await;
     }
 
     #[tokio::test]
