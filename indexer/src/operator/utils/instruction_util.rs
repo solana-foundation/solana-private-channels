@@ -368,7 +368,10 @@ impl MintToBuilder {
         self
     }
 
-    pub fn withdraw_config_setup(&mut self, withdraw_config_setup: WithdrawConfigSetup) -> &mut Self {
+    pub fn withdraw_config_setup(
+        &mut self,
+        withdraw_config_setup: WithdrawConfigSetup,
+    ) -> &mut Self {
         self.withdraw_config_setup = Some(withdraw_config_setup);
         self
     }
@@ -651,10 +654,7 @@ mod tests {
         assert!(set_withdraw_config.accounts[0].is_signer);
         assert!(set_withdraw_config.accounts[0].is_writable);
         assert_eq!(set_withdraw_config.accounts[1].pubkey, mint);
-        assert_eq!(
-            set_withdraw_config.accounts[2].pubkey,
-            withdraw_config
-        );
+        assert_eq!(set_withdraw_config.accounts[2].pubkey, withdraw_config);
     }
 
     #[test]

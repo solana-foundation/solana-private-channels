@@ -390,10 +390,7 @@ pub fn set_withdraw_config_with_minimum(
     (withdraw_config, treasury_token_account)
 }
 
-pub fn get_withdraw_config(
-    context: &mut TestContext,
-    withdraw_config: &Pubkey,
-) -> WithdrawConfig {
+pub fn get_withdraw_config(context: &mut TestContext, withdraw_config: &Pubkey) -> WithdrawConfig {
     let account = context
         .get_account(withdraw_config)
         .expect("Withdraw config should exist");

@@ -65,8 +65,7 @@ pub fn process_withdraw_funds(
     if !withdraw_config_info.owned_by(program_id) {
         return Err(PrivateChannelWithdrawProgramError::WithdrawConfigNotInitialized.into());
     }
-    let withdraw_config =
-        WithdrawConfig::try_from_bytes(&withdraw_config_info.try_borrow()?)?;
+    let withdraw_config = WithdrawConfig::try_from_bytes(&withdraw_config_info.try_borrow()?)?;
     let expected_withdraw_config = Address::create_program_address(
         &[
             WITHDRAW_CONFIG_SEED,

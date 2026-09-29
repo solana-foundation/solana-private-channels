@@ -6,16 +6,16 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                                                                                                                                  |
-| ----------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawConfig                                                                                                                                         |
-| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, withdraw config owner/address, treasury, system program                                                        |
-| Business logic error branches | 100% (11/11) | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, below minimum, at minimum, treasury exemptions, mint authority, wrong mint                   |
+| Category                      | Coverage     | Details                                                                                                                                                              |
+| ----------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawConfig                                                                                                                                     |
+| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, withdraw config owner/address, treasury, system program                                                    |
+| Business logic error branches | 100% (11/11) | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, below minimum, at minimum, treasury exemptions, mint authority, wrong mint               |
 | Custom error codes exercised  | 100% (8/8)   | InvalidMint, ZeroAmount, InvalidWithdrawConfig, WithdrawConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram, AmountBelowMinimum |
-| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, withdraw config layout                                                                                          |
-| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                                                                |
-| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign withdraw config, wrong treasury, pre-funded config PDA                                                            |
-| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                                                          |
+| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, withdraw config layout                                                                                      |
+| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                                                            |
+| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign withdraw config, wrong treasury, pre-funded config PDA                                                        |
+| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                                                      |
 
 ## Test Inventory
 

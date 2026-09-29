@@ -45,8 +45,7 @@ pub fn process_set_withdraw_config(
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
-    let [authority_info, mint_info, withdraw_config_info, system_program_info] = accounts
-    else {
+    let [authority_info, mint_info, withdraw_config_info, system_program_info] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
