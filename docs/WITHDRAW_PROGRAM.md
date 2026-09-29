@@ -56,7 +56,7 @@ The instruction emits a `WithdrawFundsEvent` via program log:
 #### SetWithdrawConfig
 Creates the mint's withdraw config on first use and overwrites it on later calls whose `allow_mint_slot` is at or after the stored one. Only the mint authority can sign it. The operator sends it in every deposit mint transaction with the fee, minimum and slot of the escrow's latest `AllowMint` and its own admin as the treasury, so re-allowing a mint with new values reprices it from the next deposit on. Deposits land in any order, so a deposit built before a reprice carries an older `allow_mint_slot`; its write succeeds without changing the config, and the deposit still mints.
 
-Every failure is a custom error. The deposit transaction carries this instruction, and the operator treats `InvalidAccountData`, `UninitializedAccount` or `IncorrectProgramId` from it as a missing mint and retries forever.
+Every failure is a custom error or a builtin the operator does not retry on. The deposit transaction carries this instruction, and the operator treats `InvalidAccountData`, `UninitializedAccount` or `IncorrectProgramId` from it as a missing mint and retries forever.
 
 Discriminator: `1`
 

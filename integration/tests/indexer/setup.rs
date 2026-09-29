@@ -120,7 +120,7 @@ impl TestEnvironment {
             &withdraw_config_ixs,
             &admin,
             &[&admin],
-            "Set Withdraw Fee Config",
+            "Set Withdraw Config",
         )
         .await?;
 

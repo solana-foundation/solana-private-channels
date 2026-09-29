@@ -122,6 +122,7 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
     let repriced_min_withdraw_amount = 50_000;
     let later_fee = 20_000;
     let later_min_withdraw_amount = 70_000;
+    let stale_treasury = Pubkey::new_unique();
 
     set_mint_with_authority(&mut context, &mint.pubkey(), COption::Some(admin.pubkey()));
     context
@@ -151,7 +152,7 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(1)
         .allow_mint_slot(90)
-        .treasury(admin.pubkey())
+        .treasury(stale_treasury)
         .min_withdraw_amount(1)
         .instruction();
     context
@@ -162,6 +163,11 @@ fn test_set_withdraw_config_ignores_an_older_allow_mint_slot() {
     assert_eq!(config.fee, repriced_fee);
     assert_eq!(config.min_withdraw_amount, repriced_min_withdraw_amount);
     assert_eq!(config.allow_mint_slot, 100);
+    assert_eq!(config.treasury, admin.pubkey());
+    assert_eq!(
+        config.treasury_token_account,
+        get_associated_token_address(&admin.pubkey(), &mint.pubkey())
+    );
 
     let instruction = SetWithdrawConfigBuilder::new()
         .authority(admin.pubkey())

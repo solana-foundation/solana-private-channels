@@ -89,8 +89,8 @@ solana confirm -v <signature> --url <solana-rpc-url>
 
 ## Recovery
 
-Processor-side and allowlist quarantines (Paths A/B/C/F, and `withdraw fee
-unknown`) trigger before any mint is attempted, so they do not need on-chain mint
+Processor-side and allowlist quarantines (Paths A/B/C/F, and
+`withdraw config unknown`) trigger before any mint is attempted, so they do not need on-chain mint
 verification before recovery. The signature-driven recovery worker (Path E)
 is the gate against a double-mint: it re-arms (`pending`) only a deposit it
 has proven did not mint - either no signature was ever persisted (so it was
