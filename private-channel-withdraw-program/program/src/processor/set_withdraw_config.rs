@@ -12,15 +12,15 @@ use crate::{
     error::PrivateChannelWithdrawProgramError,
     processor::{create_pda_account, verify_mint_account, verify_signer},
     require_len,
-    state::{WithdrawFeeConfig, WITHDRAW_FEE_CONFIG_SEED},
+    state::{WithdrawConfig, WITHDRAW_CONFIG_SEED},
 };
 
-/// Processes the SetWithdrawFeeConfig instruction.
+/// Processes the SetWithdrawConfig instruction.
 ///
-/// Creates the mint's fee config on first use and overwrites it on later calls
-/// whose `fee_slot` is at or after the stored one. The operator sends it in
-/// every deposit mint transaction, and those land in any order, so a deposit
-/// built before a reprice is a no-op instead of restoring the older fee.
+/// Creates the mint's withdraw config on first use and overwrites it on later
+/// calls whose `allow_mint_slot` is at or after the stored one. The operator
+/// sends it in every deposit mint transaction, and those land in any order, so
+/// a deposit built before a reprice is a no-op instead of restoring older values.
 ///
 /// Every failure is a custom error or a builtin the operator does not retry
 /// on. `InvalidAccountData`, `UninitializedAccount` and `IncorrectProgramId`
@@ -30,21 +30,22 @@ use crate::{
 /// # Account Layout
 /// 0. `[signer, writable]` authority - Mint authority, also pays for the config
 /// 1. `[]` mint - Token mint
-/// 2. `[writable]` withdraw_fee_config - Fee config PDA for the mint
+/// 2. `[writable]` withdraw_config - Withdraw config PDA for the mint
 /// 3. `[]` system_program - System program
 ///
 /// # Instruction Data
 /// * `fee` (u64) - Fee in base units charged on top of each withdrawal, 0 allowed
-/// * `fee_slot` (u64) - Slot of the AllowMint the fee came from
+/// * `allow_mint_slot` (u64) - Slot of the AllowMint these values came from
 /// * `treasury` (Pubkey) - Owner of the token account fees are paid to
-pub fn process_set_withdraw_fee_config(
+/// * `min_withdraw_amount` (u64) - Smallest amount a withdrawal may move, 0 for none
+pub fn process_set_withdraw_config(
     program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
 
-    let [authority_info, mint_info, withdraw_fee_config_info, system_program_info] = accounts
+    let [authority_info, mint_info, withdraw_config_info, system_program_info] = accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
@@ -66,33 +67,33 @@ pub fn process_set_withdraw_fee_config(
         return Err(PrivateChannelWithdrawProgramError::InvalidSystemProgram.into());
     }
 
-    let (withdraw_fee_config_address, bump) = Address::find_program_address(
-        &[WITHDRAW_FEE_CONFIG_SEED, mint_info.address().as_ref()],
+    let (withdraw_config_address, bump) = Address::find_program_address(
+        &[WITHDRAW_CONFIG_SEED, mint_info.address().as_ref()],
         program_id,
     );
-    if withdraw_fee_config_info.address() != &withdraw_fee_config_address {
-        return Err(PrivateChannelWithdrawProgramError::InvalidFeeConfig.into());
+    if withdraw_config_info.address() != &withdraw_config_address {
+        return Err(PrivateChannelWithdrawProgramError::InvalidWithdrawConfig.into());
     }
 
-    if withdraw_fee_config_info.owned_by(program_id) {
-        let stored = WithdrawFeeConfig::try_from_bytes(&withdraw_fee_config_info.try_borrow()?)?;
+    if withdraw_config_info.owned_by(program_id) {
+        let stored = WithdrawConfig::try_from_bytes(&withdraw_config_info.try_borrow()?)?;
         // Ok, not an error: the deposit carrying this write must still mint.
-        if args.fee_slot < stored.fee_slot {
+        if args.allow_mint_slot < stored.allow_mint_slot {
             return Ok(());
         }
     } else {
         let bump_seed = [bump];
         let seeds = [
-            Seed::from(WITHDRAW_FEE_CONFIG_SEED),
+            Seed::from(WITHDRAW_CONFIG_SEED),
             Seed::from(mint_info.address().as_ref()),
             Seed::from(&bump_seed),
         ];
         create_pda_account(
             authority_info,
             &Rent::get()?,
-            WithdrawFeeConfig::LEN,
+            WithdrawConfig::LEN,
             program_id,
-            withdraw_fee_config_info,
+            withdraw_config_info,
             seeds,
         )?;
     }
@@ -109,29 +110,31 @@ pub fn process_set_withdraw_fee_config(
     )
     .0;
 
-    let withdraw_fee_config = WithdrawFeeConfig {
+    let withdraw_config = WithdrawConfig {
         bump,
         fee: args.fee,
-        fee_slot: args.fee_slot,
+        allow_mint_slot: args.allow_mint_slot,
         treasury: args.treasury,
         treasury_token_account,
+        min_withdraw_amount: args.min_withdraw_amount,
     };
-    withdraw_fee_config_info
+    withdraw_config_info
         .try_borrow_mut()?
-        .copy_from_slice(&withdraw_fee_config.to_bytes());
+        .copy_from_slice(&withdraw_config.to_bytes());
 
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct SetWithdrawFeeConfigArgs {
+pub struct SetWithdrawConfigArgs {
     pub fee: u64,
-    pub fee_slot: u64,
+    pub allow_mint_slot: u64,
     pub treasury: Address,
+    pub min_withdraw_amount: u64,
 }
 
-fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawFeeConfigArgs, ProgramError> {
-    require_len!(data, 8 + 8 + 32);
+fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawConfigArgs, ProgramError> {
+    require_len!(data, 8 + 8 + 32 + 8);
 
     let fee = u64::from_le_bytes(
         data[..8]
@@ -139,7 +142,7 @@ fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawFeeConfigArgs, Progr
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
-    let fee_slot = u64::from_le_bytes(
+    let allow_mint_slot = u64::from_le_bytes(
         data[8..16]
             .try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?,
@@ -151,10 +154,17 @@ fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawFeeConfigArgs, Progr
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
-    Ok(SetWithdrawFeeConfigArgs {
+    let min_withdraw_amount = u64::from_le_bytes(
+        data[48..56]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+
+    Ok(SetWithdrawConfigArgs {
         fee,
-        fee_slot,
+        allow_mint_slot,
         treasury,
+        min_withdraw_amount,
     })
 }
 
@@ -168,30 +178,35 @@ mod tests {
     #[test]
     fn test_parse_instruction_data_valid() {
         let fee = 1_234_567u64;
-        let fee_slot = 7_654_321u64;
+        let allow_mint_slot = 7_654_321u64;
         let treasury = Address::new_from_array([7u8; 32]);
+        let min_withdraw_amount = 2_468_024u64;
         let mut instruction_data = vec![];
         instruction_data.extend_from_slice(&fee.to_le_bytes());
-        instruction_data.extend_from_slice(&fee_slot.to_le_bytes());
+        instruction_data.extend_from_slice(&allow_mint_slot.to_le_bytes());
         instruction_data.extend_from_slice(treasury.as_ref());
+        instruction_data.extend_from_slice(&min_withdraw_amount.to_le_bytes());
 
         let args = parse_instruction_data(&instruction_data).unwrap();
 
         assert_eq!(
             args,
-            SetWithdrawFeeConfigArgs {
+            SetWithdrawConfigArgs {
                 fee,
-                fee_slot,
-                treasury
+                allow_mint_slot,
+                treasury,
+                min_withdraw_amount
             }
         );
     }
 
+    // The pre-minimum layout ended at the treasury.
     #[test]
-    fn test_parse_instruction_data_missing_treasury() {
+    fn test_parse_instruction_data_missing_minimum() {
         let mut instruction_data = vec![];
         instruction_data.extend_from_slice(&1_000u64.to_le_bytes());
         instruction_data.extend_from_slice(&1u64.to_le_bytes());
+        instruction_data.extend_from_slice(Address::new_from_array([7u8; 32]).as_ref());
 
         let result = parse_instruction_data(&instruction_data);
 

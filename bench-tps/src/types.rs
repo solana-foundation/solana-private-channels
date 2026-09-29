@@ -24,6 +24,10 @@ pub const MINT_DECIMALS: u8 = 6;
 /// spends 2 of a withdrawer's `initial_balance`.
 pub const BENCH_WITHDRAW_FEE: u64 = 1;
 
+/// Minimum withdrawal every bench AllowMint sets, and the withdraw setup
+/// writes to the channel. At 1 so the bench's 1-raw-unit withdrawals pass.
+pub const BENCH_MIN_WITHDRAW_AMOUNT: u64 = 1;
+
 /// Maximum time to wait for a batch of on-chain confirmations before giving up.
 pub const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -144,8 +148,8 @@ pub struct WithdrawConfig {
     pub mint: Pubkey,
     /// Withdrawer keypairs, one per account.  Each has a PrivateChannel ATA funded with tokens.
     pub keypairs: Vec<Arc<Keypair>>,
-    /// The mint's fee config PDA on PrivateChannel.
-    pub withdraw_fee_config: Pubkey,
+    /// The mint's withdraw config PDA on PrivateChannel.
+    pub withdraw_config: Pubkey,
     /// The admin's PrivateChannel ATA, which each withdrawal's fee is paid to.
     pub treasury_token_account: Pubkey,
     /// Shared mutable state seeded with the current PrivateChannel blockhash.

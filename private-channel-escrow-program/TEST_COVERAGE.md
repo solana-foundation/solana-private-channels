@@ -22,7 +22,7 @@
 
 ## Test Inventory
 
-**63 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **101 integration tests** (end-to-end behavior).
+**63 unit tests** (instruction data parsing, state serialization, error ABI, event encoding, bitmap logic) + **102 integration tests** (end-to-end behavior).
 
 ### CreateInstance (6 integration tests)
 
@@ -33,12 +33,13 @@
 - `test_create_instance_invalid_event_authority` — invalid event authority PDA
 - `test_create_instance_invalid_system_program` — wrong system program address
 
-### AllowMint (11 integration tests)
+### AllowMint (12 integration tests)
 
 - `test_allow_mint_success` — SPL Token mint
 - `test_allow_mint_twice_repins_instead_of_failing` — since BlockMint stopped closing the PDA, a second AllowMint re-pins the profile and re-opens both gates; expires the blockhash so the second transaction is not dropped as a replay
 - `test_allow_mint_invalid_pda` — wrong PDA rejected
-- `test_allow_mint_zero_fee_accepted` — a zero `withdraw_fee` is allowed and creates the AllowedMint PDA
+- `test_allow_mint_zero_fee_and_minimum_accepted` — a zero `withdraw_fee` and `min_withdraw_amount` are allowed and create the AllowedMint PDA
+- `test_allow_mint_event_records_fee_and_minimum` — the emitted 90-byte `AllowMintEvent` carries both values from the instruction data
 - `test_allow_mint_invalid_admin_not_signer` — unsigned admin rejected
 - `test_allow_mint_invalid_admin` — wrong admin rejected
 - `test_allow_mint_invalid_instance_account_owner` — wrong owner rejected

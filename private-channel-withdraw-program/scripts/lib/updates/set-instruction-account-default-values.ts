@@ -18,12 +18,12 @@ const ATA_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
 
-function createWithdrawFeeConfigPdaValueNode(mintAccount: string) {
+function createWithdrawConfigPdaValueNode(mintAccount: string) {
     return pdaValueNode(
         pdaNode({
-            name: 'withdrawFeeConfig',
+            name: 'withdrawConfig',
             seeds: [
-                constantPdaSeedNode(stringTypeNode('utf8'), stringValueNode('withdraw_fee_config')),
+                constantPdaSeedNode(stringTypeNode('utf8'), stringValueNode('withdraw_config')),
                 variablePdaSeedNode('mint', publicKeyTypeNode()),
             ],
             programId: WITHDRAW_PROGRAM_ID,
@@ -75,8 +75,8 @@ export function setInstructionAccountDefaultValues(privateChannelWithdrawCodama:
                 defaultValue: publicKeyValueNode(SYSTEM_PROGRAM_ID),
             },
             {
-                account: 'withdrawFeeConfig',
-                defaultValue: createWithdrawFeeConfigPdaValueNode('mint'),
+                account: 'withdrawConfig',
+                defaultValue: createWithdrawConfigPdaValueNode('mint'),
             },
         ]),
     );

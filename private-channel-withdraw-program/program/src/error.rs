@@ -13,13 +13,13 @@ pub enum PrivateChannelWithdrawProgramError {
     #[error("Withdrawal amount must be greater than zero")]
     ZeroAmount,
 
-    /// (2) Fee config is not the mint's PDA or its data is malformed
-    #[error("Invalid withdraw fee config")]
-    InvalidFeeConfig,
+    /// (2) Withdraw config is not the mint's PDA or its data is malformed
+    #[error("Invalid withdraw config")]
+    InvalidWithdrawConfig,
 
-    /// (3) No fee config exists for this mint yet
-    #[error("Withdraw fee config not initialized")]
-    FeeConfigNotInitialized,
+    /// (3) No withdraw config exists for this mint yet
+    #[error("Withdraw config not initialized")]
+    WithdrawConfigNotInitialized,
 
     /// (4) Signer is not the mint authority
     #[error("Signer is not the mint authority")]
@@ -32,6 +32,10 @@ pub enum PrivateChannelWithdrawProgramError {
     /// (6) System program account is not the system program
     #[error("Invalid system program")]
     InvalidSystemProgram,
+
+    /// (7) Withdrawal amount is below the mint's minimum
+    #[error("Withdrawal amount is below the mint's minimum")]
+    AmountBelowMinimum,
 }
 
 impl From<PrivateChannelWithdrawProgramError> for ProgramError {

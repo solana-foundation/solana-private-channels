@@ -6,20 +6,20 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                                                                                                |
-| ----------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawFeeConfig                                                                                                    |
-| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, fee config owner/address, treasury, system program                           |
-| Business logic error branches | 100% (8/8)   | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, mint authority, wrong mint                                 |
-| Custom error codes exercised  | 100% (7/7)   | InvalidMint, ZeroAmount, InvalidFeeConfig, FeeConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram |
-| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, fee config layout                                                             |
-| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                              |
-| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign fee config, wrong treasury, pre-funded config PDA                               |
-| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                        |
+| Category                      | Coverage     | Details                                                                                                                                                                  |
+| ----------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawConfig                                                                                                                                         |
+| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, withdraw config owner/address, treasury, system program                                                        |
+| Business logic error branches | 100% (11/11) | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, below minimum, at minimum, treasury exemptions, mint authority, wrong mint                   |
+| Custom error codes exercised  | 100% (8/8)   | InvalidMint, ZeroAmount, InvalidWithdrawConfig, WithdrawConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram, AmountBelowMinimum |
+| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, withdraw config layout                                                                                          |
+| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                                                                |
+| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign withdraw config, wrong treasury, pre-funded config PDA                                                            |
+| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                                                          |
 
 ## Test Inventory
 
-**16 unit tests** + **27 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
+**16 unit tests** + **30 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
 
 ### Unit Tests (16 tests)
 
@@ -34,15 +34,15 @@
 - `test_parse_instruction_data_non_canonical_option_tag` — Option tag byte other than 0/1 rejected
 - `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
 
-#### SetWithdrawFeeConfig (2 tests in `set_withdraw_fee_config.rs`)
+#### SetWithdrawConfig (2 tests in `set_withdraw_config.rs`)
 
-- `test_parse_instruction_data_valid` — fee, fee slot and treasury parsed from 48 bytes
-- `test_parse_instruction_data_missing_treasury` — fee without treasury rejected
+- `test_parse_instruction_data_valid` — fee, AllowMint slot, treasury and minimum parsed from 56 bytes
+- `test_parse_instruction_data_missing_minimum` — the 48-byte layout without a minimum rejected
 
-#### Fee Config State (2 tests in `state/withdraw_fee_config.rs`)
+#### Withdraw Config State (2 tests in `state/withdraw_config.rs`)
 
-- `test_withdraw_fee_config_serialization_roundtrip` — 81-byte layout, distinct fee and fee slot catch field order and endianness
-- `test_withdraw_fee_config_try_from_bytes_wrong_length` — short data returns the custom InvalidFeeConfig, never a builtin error
+- `test_withdraw_config_serialization_roundtrip` — 89-byte layout, distinct values for every field catch field order and endianness
+- `test_withdraw_config_try_from_bytes_wrong_length` — short data returns the custom InvalidWithdrawConfig, never a builtin error
 
 #### Discriminator (2 tests in `discriminator.rs`)
 
@@ -53,22 +53,28 @@
 
 - `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
-### WithdrawFunds — Integration Tests (19 tests)
+### WithdrawFunds — Integration Tests (22 tests)
 
 #### Happy Path
 
 - `test_withdraw_funds_success` — user pays amount + fee, treasury gains the fee, supply drops by the amount only
 - `test_withdraw_funds_with_destination` — optional destination parameter
-- `test_withdraw_funds_treasury_pays_no_fee` — the treasury's own withdrawal moves only the amount
+- `test_withdraw_funds_treasury_pays_no_fee` — the treasury's own withdrawal moves only the amount and never reads the treasury account, which a wrong one proves
 - `test_withdraw_funds_event_emission` — verifies the `WithdrawFundsEvent` log is actually emitted on-chain with the correct amount and destination bytes; reconstructs the expected pinocchio_log format (`[b0, b1, ..., b39]`) and matches it against the transaction logs
 
 #### Fee Paths
 
 - `test_withdraw_funds_balance_covers_amount_but_not_fee` — fails as a whole; neither the fee moves nor anything is burned
 - `test_withdraw_funds_zero_fee` — a zero-fee mint burns only the amount and never reads the treasury account, even one that does not exist
-- `test_withdraw_funds_fee_config_not_initialized` — FeeConfigNotInitialized
-- `test_withdraw_funds_fee_config_wrong_address` — another mint's config rejected with InvalidFeeConfig
+- `test_withdraw_funds_withdraw_config_not_initialized` — WithdrawConfigNotInitialized
+- `test_withdraw_funds_withdraw_config_wrong_address` — another mint's config rejected with InvalidWithdrawConfig
 - `test_withdraw_funds_wrong_treasury_account` — a token account other than the configured one rejected with InvalidTreasuryAccount
+
+#### Minimum Paths
+
+- `test_withdraw_funds_below_minimum` — one unit below the minimum fails with AmountBelowMinimum; neither the fee moves nor anything is burned
+- `test_withdraw_funds_at_minimum` — exactly the minimum succeeds and still pays the fee
+- `test_withdraw_funds_treasury_has_no_minimum` — the treasury withdraws below the minimum
 
 #### Error Paths
 
@@ -86,16 +92,16 @@
 - `test_withdraw_funds_invalid_discriminator` — byte 255 discriminator rejected
 - `test_withdraw_funds_not_enough_accounts` — only 3 of 7 required accounts
 
-### SetWithdrawFeeConfig — Integration Tests (8 tests)
+### SetWithdrawConfig — Integration Tests (8 tests)
 
-- `test_set_withdraw_fee_config_creates_config` — stores bump, fee, treasury and the treasury's ATA
-- `test_set_withdraw_fee_config_zero_fee` — a zero fee is stored, not rejected
-- `test_set_withdraw_fee_config_ignores_an_older_fee_slot` — a write from an older AllowMint slot succeeds but leaves the config unchanged, and a newer one still reprices
-- `test_set_withdraw_fee_config_overwrites` — a second call replaces fee, treasury and treasury ATA
-- `test_set_withdraw_fee_config_prefunded_pda` — succeeds when the PDA already holds lamports
-- `test_set_withdraw_fee_config_not_mint_authority` — InvalidMintAuthority
-- `test_set_withdraw_fee_config_wrong_address` — InvalidFeeConfig, a custom error so the operator's mint retry never matches it
-- `test_set_withdraw_fee_config_wrong_system_program` — InvalidSystemProgram, for the same reason
+- `test_set_withdraw_config_creates_config` — stores bump, fee, minimum, treasury and the treasury's ATA
+- `test_set_withdraw_config_zero_fee_and_minimum` — a zero fee and no minimum are stored, not rejected
+- `test_set_withdraw_config_ignores_an_older_allow_mint_slot` — a write from an older AllowMint slot succeeds but leaves the fee and minimum unchanged, and a newer one still reprices both
+- `test_set_withdraw_config_overwrites` — a second call replaces fee, minimum, treasury and treasury ATA
+- `test_set_withdraw_config_prefunded_pda` — succeeds when the PDA already holds lamports
+- `test_set_withdraw_config_not_mint_authority` — InvalidMintAuthority
+- `test_set_withdraw_config_wrong_address` — InvalidWithdrawConfig, a custom error so the operator's mint retry never matches it
+- `test_set_withdraw_config_wrong_system_program` — InvalidSystemProgram, for the same reason
 
 ### TypeScript SDK Tests (10 tests)
 
@@ -111,12 +117,12 @@
 - All 7 required accounts present in correct order
 - Account permissions correct (READONLY_SIGNER, WRITABLE, READONLY)
 - Program addresses correct (private_channel program, token program, ATA program)
-- `withdrawFeeConfig` derived from `["withdraw_fee_config", mint]` when not provided
+- `withdrawConfig` derived from `["withdraw_config", mint]` when not provided
 
-#### SetWithdrawFeeConfig (2 tests)
+#### SetWithdrawConfig (2 tests)
 
-- Data bytes are discriminator, fee (u64 LE), treasury, in the order the program parses them
-- `withdrawFeeConfig` derived from the mint, system program defaulted, account roles correct
+- Data bytes are discriminator, fee, AllowMint slot (u64 LE), treasury, minimum (u64 LE), in the order the program parses them
+- `withdrawConfig` derived from the mint, system program defaulted, account roles correct
 
 ## Documented Gaps
 

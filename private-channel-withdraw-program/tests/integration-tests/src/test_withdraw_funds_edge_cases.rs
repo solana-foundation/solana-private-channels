@@ -8,7 +8,7 @@ use spl_associated_token_account::get_associated_token_address;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 
 use crate::utils::{
-    assert_program_error, set_mint, set_withdraw_fee_config, setup_test_balances, TestContext,
+    assert_program_error, set_mint, set_withdraw_config, setup_test_balances, TestContext,
     ATA_PROGRAM_ID, INCORRECT_PROGRAM_ID_ERROR, INVALID_INSTRUCTION_DATA_ERROR, INVALID_MINT_ERROR,
     MISSING_REQUIRED_SIGNATURE_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
     PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, TEST_WITHDRAW_FEE,
@@ -27,8 +27,8 @@ fn test_withdraw_funds_wrong_mint() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -39,7 +39,7 @@ fn test_withdraw_funds_wrong_mint() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -58,8 +58,8 @@ fn test_withdraw_funds_non_signer_user() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -71,7 +71,7 @@ fn test_withdraw_funds_non_signer_user() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -93,8 +93,8 @@ fn test_withdraw_funds_wrong_ata_program() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -106,7 +106,7 @@ fn test_withdraw_funds_wrong_ata_program() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(fake_ata_program)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -129,8 +129,8 @@ fn test_withdraw_funds_wrong_token_program() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -142,7 +142,7 @@ fn test_withdraw_funds_wrong_token_program() {
         .token_account(user_ata)
         .token_program(fake_token_program)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -164,8 +164,8 @@ fn test_withdraw_funds_wrong_ata_address() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     // Use a random address instead of the correct ATA
@@ -175,7 +175,7 @@ fn test_withdraw_funds_wrong_ata_address() {
         .token_account(wrong_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();

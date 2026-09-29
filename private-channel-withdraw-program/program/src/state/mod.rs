@@ -1,3 +1,3 @@
-pub mod withdraw_fee_config;
+pub mod withdraw_config;
 
-pub use withdraw_fee_config::*;
+pub use withdraw_config::*;

@@ -208,9 +208,13 @@ pub struct DbMint {
     /// Per-withdrawal fee from the latest AllowMint. Read per deposit, so a
     /// re-allow reprices the channel without restarting the operator.
     pub withdraw_fee: TokenAmount,
-    /// Slot of the AllowMint `withdraw_fee` came from. The upsert only replaces
-    /// the fee from a slot at or after this one, so a replay cannot lower it.
-    pub withdraw_fee_slot: i64,
+    /// Smallest channel withdrawal amount from the latest AllowMint, 0 for
+    /// none. Read and written with `withdraw_fee`.
+    pub min_withdraw_amount: TokenAmount,
+    /// Slot of the AllowMint `withdraw_fee` and `min_withdraw_amount` came from.
+    /// The upsert only replaces them from a slot at or after this one, so a
+    /// replay cannot restore older values.
+    pub allow_mint_slot: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -229,8 +233,10 @@ impl DbMint {
             status: "allowed".to_string(),
             withdrawals_blocked: false,
             withdraw_fee,
+            // The AllowMint path sets the real one; other callers want none.
+            min_withdraw_amount: TokenAmount(0),
             // The indexer sets the AllowMint's slot; 0 loses to any real one.
-            withdraw_fee_slot: 0,
+            allow_mint_slot: 0,
             created_at: Utc::now(),
         }
     }

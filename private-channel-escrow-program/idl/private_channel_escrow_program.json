@@ -247,6 +247,15 @@
                 "format": "u64",
                 "kind": "numberTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "minWithdrawAmount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -922,6 +931,15 @@
           {
             "kind": "instructionArgumentNode",
             "name": "withdrawFee",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "minWithdrawAmount",
             "type": {
               "endian": "le",
               "format": "u64",

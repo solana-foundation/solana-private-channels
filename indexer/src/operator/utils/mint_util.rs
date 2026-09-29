@@ -593,7 +593,8 @@ mod tests {
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
             withdraw_fee: TokenAmount(1),
-            withdraw_fee_slot: 0,
+            allow_mint_slot: 0,
+            min_withdraw_amount: TokenAmount(0),
             mint_address: mint.to_string(),
             decimals,
             token_program: token_program.to_string(),
@@ -643,7 +644,8 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(1),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -697,7 +699,8 @@ mod tests {
             mock.add_mint(DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(1),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -729,7 +732,8 @@ mod tests {
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
             withdraw_fee: TokenAmount(1),
-            withdraw_fee_slot: 0,
+            allow_mint_slot: 0,
+            min_withdraw_amount: TokenAmount(0),
             mint_address: spl_mint.to_string(),
             decimals: 6,
             token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -739,7 +743,8 @@ mod tests {
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
             withdraw_fee: TokenAmount(1),
-            withdraw_fee_slot: 0,
+            allow_mint_slot: 0,
+            min_withdraw_amount: TokenAmount(0),
             mint_address: t22_mint.to_string(),
             decimals: 9,
             token_program: TOKEN_2022_PROGRAM_ID.to_string(),
@@ -815,7 +820,8 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(1),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),

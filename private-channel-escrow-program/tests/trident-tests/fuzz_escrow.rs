@@ -25,7 +25,7 @@ use trident_fuzz::fuzzing::*;
 
 use shared::{
     clamp_amount, setup_escrow, token_amount, AccountAddresses, ToClient, ToTrident,
-    FUZZ_WITHDRAW_FEE, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+    FUZZ_MIN_WITHDRAW_AMOUNT, FUZZ_WITHDRAW_FEE, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
@@ -353,6 +353,7 @@ impl FuzzTest {
             .instance_ata(instance_ata.client())
             .bump(allowed_mint_bump)
             .withdraw_fee(FUZZ_WITHDRAW_FEE)
+            .min_withdraw_amount(FUZZ_MIN_WITHDRAW_AMOUNT)
             .instruction()
             .to_trident();
 

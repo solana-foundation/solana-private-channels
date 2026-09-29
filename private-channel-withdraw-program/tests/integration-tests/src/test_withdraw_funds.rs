@@ -11,12 +11,12 @@ use spl_token::{state::Mint, ID as TOKEN_PROGRAM_ID};
 use crate::{
     state_utils::assert_get_or_withdraw_funds,
     utils::{
-        assert_program_error, find_withdraw_fee_config_pda, get_token_balance, set_mint,
-        set_token_balance, set_withdraw_fee_config, setup_test_balances, TestContext,
-        ATA_PROGRAM_ID, FEE_CONFIG_NOT_INITIALIZED_ERROR, INVALID_FEE_CONFIG_ERROR,
+        assert_program_error, find_withdraw_config_pda, get_token_balance, set_mint,
+        set_token_balance, set_withdraw_config, set_withdraw_config_with_minimum,
+        setup_test_balances, TestContext, AMOUNT_BELOW_MINIMUM_ERROR, ATA_PROGRAM_ID,
         INVALID_INSTRUCTION_DATA_ERROR, INVALID_TREASURY_ACCOUNT_ERROR,
-        PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, TEST_WITHDRAW_FEE, TOKEN_INSUFFICIENT_FUNDS_ERROR,
-        ZERO_AMOUNT_ERROR,
+        INVALID_WITHDRAW_CONFIG_ERROR, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID, TEST_WITHDRAW_FEE,
+        TOKEN_INSUFFICIENT_FUNDS_ERROR, WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR, ZERO_AMOUNT_ERROR,
     },
 };
 
@@ -34,7 +34,7 @@ fn test_withdraw_funds_success() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let supply_before = Mint::unpack(&context.get_account_data(&mint.pubkey()).unwrap())
@@ -67,7 +67,7 @@ fn test_withdraw_funds_with_destination() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     assert_get_or_withdraw_funds(
@@ -94,7 +94,7 @@ fn test_withdraw_funds_treasury_pays_no_fee() {
 
     set_mint(&mut context, &mint.pubkey());
     // Before the balance: the config setup resets the treasury ATA to zero.
-    let (withdraw_fee_config, _) = set_withdraw_fee_config(
+    let (withdraw_config, _) = set_withdraw_config(
         &mut context,
         &mint.pubkey(),
         TEST_WITHDRAW_FEE,
@@ -110,7 +110,7 @@ fn test_withdraw_funds_treasury_pays_no_fee() {
         .token_account(admin_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(unread_treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -136,7 +136,7 @@ fn test_withdraw_funds_zero_fee() {
     let missing_treasury_token_account = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, _) = set_withdraw_fee_config(&mut context, &mint.pubkey(), 0, &admin);
+    let (withdraw_config, _) = set_withdraw_config(&mut context, &mint.pubkey(), 0, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -147,7 +147,7 @@ fn test_withdraw_funds_zero_fee() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(missing_treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -170,8 +170,8 @@ fn test_withdraw_funds_insufficient_funds() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
 
     // Set balance less than withdraw amount
     setup_test_balances(&mut context, &user, &mint.pubkey(), WITHDRAW_AMOUNT / 2);
@@ -184,7 +184,7 @@ fn test_withdraw_funds_insufficient_funds() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -204,8 +204,8 @@ fn test_withdraw_funds_balance_covers_amount_but_not_fee() {
     let admin = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), WITHDRAW_AMOUNT);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -216,7 +216,7 @@ fn test_withdraw_funds_balance_covers_amount_but_not_fee() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -228,16 +228,24 @@ fn test_withdraw_funds_balance_covers_amount_but_not_fee() {
     assert_eq!(get_token_balance(&mut context, &treasury_token_account), 0);
 }
 
+// Every accepted withdrawal is its own Solana release, so one below the mint's
+// minimum is refused before the fee moves or anything is burned.
 #[test]
-fn test_withdraw_funds_zero_amount() {
+fn test_withdraw_funds_below_minimum() {
     let mut context = TestContext::new();
     let user = Keypair::new();
     let mint = Keypair::new();
     let admin = Pubkey::new_unique();
+    let min_withdraw_amount = WITHDRAW_AMOUNT;
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) = set_withdraw_config_with_minimum(
+        &mut context,
+        &mint.pubkey(),
+        TEST_WITHDRAW_FEE,
+        &admin,
+        min_withdraw_amount,
+    );
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -248,7 +256,126 @@ fn test_withdraw_funds_zero_amount() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(treasury_token_account)
+        .amount(min_withdraw_amount - 1)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, AMOUNT_BELOW_MINIMUM_ERROR);
+    assert_eq!(get_token_balance(&mut context, &user_ata), INITIAL_BALANCE);
+    assert_eq!(get_token_balance(&mut context, &treasury_token_account), 0);
+}
+
+// The minimum itself is a valid amount, and the fee is still charged on top.
+#[test]
+fn test_withdraw_funds_at_minimum() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let admin = Pubkey::new_unique();
+    let min_withdraw_amount = WITHDRAW_AMOUNT;
+
+    set_mint(&mut context, &mint.pubkey());
+    let (withdraw_config, treasury_token_account) = set_withdraw_config_with_minimum(
+        &mut context,
+        &mint.pubkey(),
+        TEST_WITHDRAW_FEE,
+        &admin,
+        min_withdraw_amount,
+    );
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+
+    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint.pubkey())
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(treasury_token_account)
+        .amount(min_withdraw_amount)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&user])
+        .expect("a withdrawal of exactly the minimum should succeed");
+
+    assert_eq!(
+        get_token_balance(&mut context, &user_ata),
+        INITIAL_BALANCE - min_withdraw_amount - TEST_WITHDRAW_FEE
+    );
+    assert_eq!(
+        get_token_balance(&mut context, &treasury_token_account),
+        TEST_WITHDRAW_FEE
+    );
+}
+
+// Collected fees can add up to less than the minimum, and the treasury still
+// has to be able to move them out.
+#[test]
+fn test_withdraw_funds_treasury_has_no_minimum() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new();
+    let below_minimum = 1;
+
+    set_mint(&mut context, &mint.pubkey());
+    // Before the balance: the config setup resets the treasury ATA to zero.
+    let (withdraw_config, treasury_token_account) = set_withdraw_config_with_minimum(
+        &mut context,
+        &mint.pubkey(),
+        TEST_WITHDRAW_FEE,
+        &admin.pubkey(),
+        WITHDRAW_AMOUNT,
+    );
+    setup_test_balances(&mut context, &admin, &mint.pubkey(), INITIAL_BALANCE);
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(admin.pubkey())
+        .mint(mint.pubkey())
+        .token_account(treasury_token_account)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_config(withdraw_config)
+        .treasury_token_account(treasury_token_account)
+        .amount(below_minimum)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("the treasury should withdraw below the minimum");
+
+    assert_eq!(
+        get_token_balance(&mut context, &treasury_token_account),
+        INITIAL_BALANCE - below_minimum
+    );
+}
+
+#[test]
+fn test_withdraw_funds_zero_amount() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let admin = Pubkey::new_unique();
+
+    set_mint(&mut context, &mint.pubkey());
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+
+    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint.pubkey())
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(0)
         .instruction();
@@ -261,7 +388,7 @@ fn test_withdraw_funds_zero_amount() {
 // A mint with no config cannot be withdrawn at all, so a fee can never be
 // skipped by withdrawing before the operator has written one.
 #[test]
-fn test_withdraw_funds_fee_config_not_initialized() {
+fn test_withdraw_funds_withdraw_config_not_initialized() {
     let mut context = TestContext::new();
     let user = Keypair::new();
     let mint = Keypair::new();
@@ -271,7 +398,7 @@ fn test_withdraw_funds_fee_config_not_initialized() {
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
-    let (withdraw_fee_config, _) = find_withdraw_fee_config_pda(&mint.pubkey());
+    let (withdraw_config, _) = find_withdraw_config_pda(&mint.pubkey());
     let treasury_token_account = get_associated_token_address(&admin, &mint.pubkey());
 
     let instruction = WithdrawFundsBuilder::new()
@@ -280,20 +407,20 @@ fn test_withdraw_funds_fee_config_not_initialized() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
-    assert_program_error(result, FEE_CONFIG_NOT_INITIALIZED_ERROR);
+    assert_program_error(result, WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR);
 }
 
 // A program-owned config at any address but the mint's PDA is not that mint's
 // config, even with a well-formed layout.
 #[test]
-fn test_withdraw_funds_fee_config_wrong_address() {
+fn test_withdraw_funds_withdraw_config_wrong_address() {
     let mut context = TestContext::new();
     let user = Keypair::new();
     let mint = Keypair::new();
@@ -303,7 +430,7 @@ fn test_withdraw_funds_fee_config_wrong_address() {
     set_mint(&mut context, &mint.pubkey());
     set_mint(&mut context, &other_mint.pubkey());
     // A real config, but for another mint.
-    let (other_withdraw_fee_config, treasury_token_account) = set_withdraw_fee_config(
+    let (other_withdraw_config, treasury_token_account) = set_withdraw_config(
         &mut context,
         &other_mint.pubkey(),
         TEST_WITHDRAW_FEE,
@@ -319,14 +446,14 @@ fn test_withdraw_funds_fee_config_wrong_address() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(other_withdraw_fee_config)
+        .withdraw_config(other_withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
 
     let result = context.send_transaction_with_signers(instruction, &[&user]);
 
-    assert_program_error(result, INVALID_FEE_CONFIG_ERROR);
+    assert_program_error(result, INVALID_WITHDRAW_CONFIG_ERROR);
 }
 
 #[test]
@@ -338,8 +465,8 @@ fn test_withdraw_funds_wrong_treasury_account() {
     let attacker = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, _) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, _) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -353,7 +480,7 @@ fn test_withdraw_funds_wrong_treasury_account() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(attacker_ata)
         .amount(WITHDRAW_AMOUNT)
         .instruction();
@@ -390,8 +517,8 @@ fn test_withdraw_funds_event_emission() {
     let amount: u64 = 500_000;
 
     set_mint(&mut context, &mint.pubkey());
-    let (withdraw_fee_config, treasury_token_account) =
-        set_withdraw_fee_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
+    let (withdraw_config, treasury_token_account) =
+        set_withdraw_config(&mut context, &mint.pubkey(), TEST_WITHDRAW_FEE, &admin);
     setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
 
     let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
@@ -402,7 +529,7 @@ fn test_withdraw_funds_event_emission() {
         .token_account(user_ata)
         .token_program(TOKEN_PROGRAM_ID)
         .associated_token_program(ATA_PROGRAM_ID)
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(amount)
         .destination(destination)

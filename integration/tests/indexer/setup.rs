@@ -5,8 +5,8 @@ use private_channel_escrow_program_client::{
     PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
 };
 use private_channel_withdraw_program_client::{
-    instructions::SetWithdrawFeeConfigBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
-    WITHDRAW_FEE_CONFIG_SEED,
+    instructions::SetWithdrawConfigBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
+    WITHDRAW_CONFIG_SEED,
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -19,7 +19,7 @@ use spl_associated_token_account::{
     instruction::create_associated_token_account_idempotent,
 };
 use spl_token::{instruction::mint_to, ID as TOKEN_PROGRAM_ID};
-use test_utils::mint_helper::TEST_WITHDRAW_FEE;
+use test_utils::mint_helper::{TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE};
 
 use super::helpers::{
     generate_mint, get_token_balance, mint_to_owner, send_and_confirm_instructions, setup_wallets,
@@ -90,33 +90,34 @@ impl TestEnvironment {
         let mint_keypair = Keypair::new();
         let mint = generate_mint(client, &admin, &admin, &mint_keypair).await?;
 
-        // This validator plays both chains, so write the fee config the
+        // This validator plays both chains, so write the withdraw config the
         // operator would on the first deposit. Withdrawals then work with or
         // without a deposit, and the operator's own write lands the same values.
-        let (withdraw_fee_config, _) = Pubkey::find_program_address(
-            &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+        let (withdraw_config, _) = Pubkey::find_program_address(
+            &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
             &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         );
-        let fee_config_ixs = [
+        let withdraw_config_ixs = [
             create_associated_token_account_idempotent(
                 &admin.pubkey(),
                 &admin.pubkey(),
                 &mint,
                 &TOKEN_PROGRAM_ID,
             ),
-            SetWithdrawFeeConfigBuilder::new()
+            SetWithdrawConfigBuilder::new()
                 .authority(admin.pubkey())
                 .mint(mint)
-                .withdraw_fee_config(withdraw_fee_config)
+                .withdraw_config(withdraw_config)
                 .fee(TEST_WITHDRAW_FEE)
                 // Below any real AllowMint slot, so the operator's deposits still overwrite it.
-                .fee_slot(0)
+                .allow_mint_slot(0)
                 .treasury(admin.pubkey())
+                .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
                 .instruction(),
         ];
         send_and_confirm_instructions(
             client,
-            &fee_config_ixs,
+            &withdraw_config_ixs,
             &admin,
             &[&admin],
             "Set Withdraw Fee Config",
@@ -201,6 +202,7 @@ impl TestEnvironment {
             .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
             .bump(bump)
             .withdraw_fee(TEST_WITHDRAW_FEE)
+            .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
             .instruction();
 
         send_and_confirm_instructions(client, &[allow_ix], &admin, &[&admin], "Allow Mint").await?;
@@ -352,6 +354,7 @@ pub async fn allow_mint_for_program(
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     send_and_confirm_instructions(client, &[allow_ix], admin, &[admin], "Allow Mint").await?;

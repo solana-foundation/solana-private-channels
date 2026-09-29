@@ -68,6 +68,9 @@ pub enum PrivateChannelEscrowProgramInstruction {
         /// Fee in base units charged on each channel withdrawal of this mint.
         /// Re-allowing with a new value reprices from the next deposit on.
         withdraw_fee: u64,
+        /// Smallest amount a channel withdrawal of this mint may move, 0 for
+        /// none. Updated with the fee, from the next deposit on.
+        min_withdraw_amount: u64,
     } = 1,
 
     /// Set the deposit and withdrawal gates on an allowed mint (admin-only).

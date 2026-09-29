@@ -63,7 +63,8 @@ Discriminator: `1`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `bump` | u8 | PDA bump seed for allowed mint account |
-| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. `0` is allowed but removes the bound on failed-release retries; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The escrow records it in `AllowMintEvent`; the indexer reads it from the instruction data and the operator writes it to the channel's fee config on every deposit, so re-allowing with a new value (to or from `0`) reprices from the next deposit on. A re-allow also re-opens both gates and re-pins the profile; see the [reprice procedure](ESCROW_INTERACTION_GUIDE.md#allowmint) |
+| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. `0` is allowed but removes the bound on failed-release retries; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The escrow records it in `AllowMintEvent`; the indexer reads it from the instruction data and the operator writes it to the channel's withdraw config on every deposit, so re-allowing with a new value (to or from `0`) reprices from the next deposit on. A re-allow also re-opens both gates and re-pins the profile; see the [reprice procedure](ESCROW_INTERACTION_GUIDE.md#allowmint) |
+| `min_withdraw_amount` | u64 | Smallest amount one channel withdrawal of this mint may move, `0` for none. Recorded, read and repriced the same way as `withdraw_fee` |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |

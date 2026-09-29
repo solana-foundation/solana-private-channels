@@ -1,6 +1,6 @@
 use litesvm::{types::TransactionMetadata, LiteSVM};
 use private_channel_withdraw_program_client::{
-    accounts::WithdrawFeeConfig, PrivateChannelWithdrawProgramError, WITHDRAW_FEE_CONFIG_SEED,
+    accounts::WithdrawConfig, PrivateChannelWithdrawProgramError, WITHDRAW_CONFIG_SEED,
 };
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_program::pubkey;
@@ -33,19 +33,24 @@ pub const PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID: Pubkey =
 // PrivateChannel Withdraw Program Error Codes (using generated error enum)
 pub const INVALID_MINT_ERROR: u32 = PrivateChannelWithdrawProgramError::InvalidMint as u32;
 pub const ZERO_AMOUNT_ERROR: u32 = PrivateChannelWithdrawProgramError::ZeroAmount as u32;
-pub const INVALID_FEE_CONFIG_ERROR: u32 =
-    PrivateChannelWithdrawProgramError::InvalidFeeConfig as u32;
-pub const FEE_CONFIG_NOT_INITIALIZED_ERROR: u32 =
-    PrivateChannelWithdrawProgramError::FeeConfigNotInitialized as u32;
+pub const INVALID_WITHDRAW_CONFIG_ERROR: u32 =
+    PrivateChannelWithdrawProgramError::InvalidWithdrawConfig as u32;
+pub const WITHDRAW_CONFIG_NOT_INITIALIZED_ERROR: u32 =
+    PrivateChannelWithdrawProgramError::WithdrawConfigNotInitialized as u32;
 pub const INVALID_MINT_AUTHORITY_ERROR: u32 =
     PrivateChannelWithdrawProgramError::InvalidMintAuthority as u32;
 pub const INVALID_TREASURY_ACCOUNT_ERROR: u32 =
     PrivateChannelWithdrawProgramError::InvalidTreasuryAccount as u32;
 pub const INVALID_SYSTEM_PROGRAM_ERROR: u32 =
     PrivateChannelWithdrawProgramError::InvalidSystemProgram as u32;
+pub const AMOUNT_BELOW_MINIMUM_ERROR: u32 =
+    PrivateChannelWithdrawProgramError::AmountBelowMinimum as u32;
 
 /// Fee the test configs charge on top of each withdrawal.
 pub const TEST_WITHDRAW_FEE: u64 = 1_000;
+
+/// Minimum the SetWithdrawConfig tests store.
+pub const TEST_MIN_WITHDRAW_AMOUNT: u64 = 100;
 
 // Standard Solana Program Error Codes
 pub const INVALID_ARGUMENT_ERROR: u32 = 5; // ProgramError::InvalidArgument
@@ -338,32 +343,43 @@ pub fn set_mint_with_authority(
         .expect("Failed to set mint account");
 }
 
-pub fn find_withdraw_fee_config_pda(mint: &Pubkey) -> (Pubkey, u8) {
+pub fn find_withdraw_config_pda(mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+        &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     )
 }
 
-/// Writes the mint's fee config straight into the SVM and creates an empty
-/// treasury ATA, so withdrawal tests do not go through SetWithdrawFeeConfig.
-/// Returns the config PDA and the treasury ATA.
-pub fn set_withdraw_fee_config(
+/// Writes the mint's withdraw config straight into the SVM, with no minimum,
+/// and creates an empty treasury ATA, so withdrawal tests do not go through
+/// SetWithdrawConfig. Returns the config PDA and the treasury ATA.
+pub fn set_withdraw_config(
     context: &mut TestContext,
     mint: &Pubkey,
     fee: u64,
     treasury: &Pubkey,
 ) -> (Pubkey, Pubkey) {
-    let (withdraw_fee_config, bump) = find_withdraw_fee_config_pda(mint);
+    set_withdraw_config_with_minimum(context, mint, fee, treasury, 0)
+}
+
+pub fn set_withdraw_config_with_minimum(
+    context: &mut TestContext,
+    mint: &Pubkey,
+    fee: u64,
+    treasury: &Pubkey,
+    min_withdraw_amount: u64,
+) -> (Pubkey, Pubkey) {
+    let (withdraw_config, bump) = find_withdraw_config_pda(mint);
     let treasury_token_account = get_associated_token_address(treasury, mint);
 
     let mut data = vec![bump];
     data.extend_from_slice(&fee.to_le_bytes());
-    data.extend_from_slice(&0u64.to_le_bytes()); // fee_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // allow_mint_slot
     data.extend_from_slice(treasury.as_ref());
     data.extend_from_slice(treasury_token_account.as_ref());
+    data.extend_from_slice(&min_withdraw_amount.to_le_bytes());
     context.create_account(
-        &withdraw_fee_config,
+        &withdraw_config,
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
         data,
         1_000_000,
@@ -371,18 +387,18 @@ pub fn set_withdraw_fee_config(
 
     set_token_balance(context, &treasury_token_account, mint, treasury, 0);
 
-    (withdraw_fee_config, treasury_token_account)
+    (withdraw_config, treasury_token_account)
 }
 
-pub fn get_withdraw_fee_config(
+pub fn get_withdraw_config(
     context: &mut TestContext,
-    withdraw_fee_config: &Pubkey,
-) -> WithdrawFeeConfig {
+    withdraw_config: &Pubkey,
+) -> WithdrawConfig {
     let account = context
-        .get_account(withdraw_fee_config)
-        .expect("Fee config should exist");
+        .get_account(withdraw_config)
+        .expect("Withdraw config should exist");
     assert_eq!(account.owner, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID);
-    WithdrawFeeConfig::from_bytes(&account.data).expect("Should deserialize fee config")
+    WithdrawConfig::from_bytes(&account.data).expect("Should deserialize withdraw config")
 }
 
 // Helper function to check if error contains specific program error code
@@ -473,7 +489,7 @@ fn get_operation_name(instruction: &Instruction) -> &'static str {
 
     match instruction.data[0] {
         0 => "WithdrawFunds",
-        1 => "SetWithdrawFeeConfig",
+        1 => "SetWithdrawConfig",
         _ => "Unknown",
     }
 }

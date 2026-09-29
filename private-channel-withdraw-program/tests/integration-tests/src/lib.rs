@@ -3,7 +3,7 @@ pub mod assertions;
 #[cfg(test)]
 pub mod state_utils;
 #[cfg(test)]
-pub mod test_set_withdraw_fee_config;
+pub mod test_set_withdraw_config;
 #[cfg(test)]
 pub mod test_withdraw_funds;
 #[cfg(test)]

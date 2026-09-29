@@ -161,7 +161,7 @@ Users initiate withdrawals by burning tokens on the Solana Private Channels paym
 
 ```typescript
 import {
-  fetchWithdrawFeeConfig,
+  fetchWithdrawConfig,
   getWithdrawFundsInstructionAsync,
   PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
 } from 'private-channel-withdraw-program';
@@ -186,19 +186,21 @@ const USDC_MINT = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
 // Optional: Specify destination address on Mainnet (defaults to user if null)
 const destinationOnMainnet = address('DestinationAddressOnMainnet...');
 
-// The mint's fee config says what the fee is and which account it is paid to.
-const [withdrawFeeConfig] = await getProgramDerivedAddress({
+// The mint's withdraw config says what the fee is, which account it is paid to
+// and the smallest amount one withdrawal may move.
+const [withdrawConfig] = await getProgramDerivedAddress({
   programAddress: PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
-  seeds: ['withdraw_fee_config', getAddressEncoder().encode(USDC_MINT)],
+  seeds: ['withdraw_config', getAddressEncoder().encode(USDC_MINT)],
 });
-const feeConfig = await fetchWithdrawFeeConfig(private_channelRpc, withdrawFeeConfig);
-// The balance must cover withdrawAmount + feeConfig.data.fee
+const config = await fetchWithdrawConfig(private_channelRpc, withdrawConfig);
+// withdrawAmount must be at least config.data.minWithdrawAmount,
+// and the balance must cover withdrawAmount + config.data.fee
 
-// Build withdraw instruction. withdrawFeeConfig is derived from the mint.
+// Build withdraw instruction. withdrawConfig is derived from the mint.
 const withdrawIx = await getWithdrawFundsInstructionAsync({
   user,
   mint: USDC_MINT,
-  treasuryTokenAccount: feeConfig.data.treasuryTokenAccount,
+  treasuryTokenAccount: config.data.treasuryTokenAccount,
   amount: withdrawAmount,
   destination: none(), // Optionally pass a destination address on Mainnet
 });
@@ -212,7 +214,8 @@ const withdrawIx = await getWithdrawFundsInstructionAsync({
   - If `null`: Tokens released to `user` address on Mainnet
   - If specified: Tokens released to `destination` address on Mainnet (its associated token account must already exist on Mainnet; `ReleaseFunds` validates the ATA, it does not create it)
 - Executing the `WithdrawFunds` instruction will burn tokens from the Solana Private Channels payment channel immediately.
-- **Withdraw fee**: Charged on top of `amount` and paid to the treasury (the operator admin), who withdraws fee-free. It is never refunded: if the release on Mainnet fails, only `amount` is reminted. A mint whose fee config does not exist yet (no deposit processed) cannot be withdrawn.
+- **Withdraw fee**: Charged on top of `amount` and paid to the treasury (the operator admin), who withdraws fee-free. It is never refunded: if the release on Mainnet fails, only `amount` is reminted. A mint whose withdraw config does not exist yet (no deposit processed) cannot be withdrawn.
+- **Minimum amount**: An `amount` below the mint's `minWithdrawAmount` fails with `AmountBelowMinimum` and nothing is burned. The treasury has no minimum.
 
 ### Related Documentation
 - [Escrow Interaction Guide](ESCROW_INTERACTION_GUIDE.md)

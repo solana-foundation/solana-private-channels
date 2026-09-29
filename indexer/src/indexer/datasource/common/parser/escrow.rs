@@ -175,6 +175,8 @@ pub struct AllowMintData {
     pub bump: u8,
     /// Per-withdrawal fee on the channel. Zero is allowed and means no fee.
     pub withdraw_fee: u64,
+    /// Smallest channel withdrawal amount. Zero means no minimum.
+    pub min_withdraw_amount: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
@@ -657,12 +659,14 @@ mod tests {
     }
 
     const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+    const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
 
     /// Create minimal valid Borsh-encoded data for AllowMint instruction
-    /// AllowMintIxData { bump: u8, withdraw_fee: u64 }
+    /// AllowMintIxData { bump: u8, withdraw_fee: u64, min_withdraw_amount: u64 }
     fn create_allow_mint_borsh_data() -> Vec<u8> {
         let mut data = vec![123]; // bump
         data.extend_from_slice(&ALLOW_MINT_WITHDRAW_FEE.to_le_bytes());
+        data.extend_from_slice(&ALLOW_MINT_MIN_WITHDRAW_AMOUNT.to_le_bytes());
         data
     }
 
@@ -841,6 +845,7 @@ mod tests {
         if let Some(EscrowInstruction::AllowMint { data, .. }) = parsed {
             assert_eq!(data.bump, 123);
             assert_eq!(data.withdraw_fee, ALLOW_MINT_WITHDRAW_FEE);
+            assert_eq!(data.min_withdraw_amount, ALLOW_MINT_MIN_WITHDRAW_AMOUNT);
         } else {
             panic!("Expected AllowMint instruction");
         }

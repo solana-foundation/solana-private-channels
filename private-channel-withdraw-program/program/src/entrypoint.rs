@@ -2,7 +2,7 @@ use pinocchio::{account::AccountView, entrypoint, error::ProgramError, Address, 
 
 use crate::{
     discriminator::PrivateChannelWithdrawInstructionDiscriminators,
-    processor::{process_set_withdraw_fee_config, process_withdraw_funds},
+    processor::{process_set_withdraw_config, process_withdraw_funds},
 };
 
 entrypoint!(process_instruction);
@@ -23,8 +23,8 @@ pub fn process_instruction(
         PrivateChannelWithdrawInstructionDiscriminators::WithdrawFunds => {
             process_withdraw_funds(program_id, accounts, instruction_data)
         }
-        PrivateChannelWithdrawInstructionDiscriminators::SetWithdrawFeeConfig => {
-            process_set_withdraw_fee_config(program_id, accounts, instruction_data)
+        PrivateChannelWithdrawInstructionDiscriminators::SetWithdrawConfig => {
+            process_set_withdraw_config(program_id, accounts, instruction_data)
         }
     }
 }

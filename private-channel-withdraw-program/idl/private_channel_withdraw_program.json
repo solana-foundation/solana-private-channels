@@ -26,7 +26,7 @@
             },
             {
               "kind": "structFieldTypeNode",
-              "name": "feeSlot",
+              "name": "allowMintSlot",
               "type": {
                 "endian": "le",
                 "format": "u64",
@@ -46,12 +46,21 @@
               "type": {
                 "kind": "publicKeyTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "minWithdrawAmount",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
         },
         "kind": "accountNode",
-        "name": "withdrawFeeConfig"
+        "name": "withdrawConfig"
       }
     ],
     "definedTypes": [
@@ -97,14 +106,14 @@
       {
         "code": 2,
         "kind": "errorNode",
-        "message": "Invalid withdraw fee config",
-        "name": "invalidFeeConfig"
+        "message": "Invalid withdraw config",
+        "name": "invalidWithdrawConfig"
       },
       {
         "code": 3,
         "kind": "errorNode",
-        "message": "Withdraw fee config not initialized",
-        "name": "feeConfigNotInitialized"
+        "message": "Withdraw config not initialized",
+        "name": "withdrawConfigNotInitialized"
       },
       {
         "code": 4,
@@ -123,6 +132,12 @@
         "kind": "errorNode",
         "message": "Invalid system program",
         "name": "invalidSystemProgram"
+      },
+      {
+        "code": 7,
+        "kind": "errorNode",
+        "message": "Withdrawal amount is below the mint's minimum",
+        "name": "amountBelowMinimum"
       }
     ],
     "instructions": [
@@ -175,12 +190,12 @@
           },
           {
             "docs": [
-              "Fee config PDA for the mint"
+              "Withdraw config PDA for the mint"
             ],
             "isSigner": false,
             "isWritable": false,
             "kind": "instructionAccountNode",
-            "name": "withdrawFeeConfig"
+            "name": "withdrawConfig"
           },
           {
             "docs": [
@@ -264,12 +279,12 @@
           },
           {
             "docs": [
-              "Fee config PDA for the mint"
+              "Withdraw config PDA for the mint"
             ],
             "isSigner": false,
             "isWritable": true,
             "kind": "instructionAccountNode",
-            "name": "withdrawFeeConfig"
+            "name": "withdrawConfig"
           },
           {
             "docs": [
@@ -307,7 +322,7 @@
           },
           {
             "kind": "instructionArgumentNode",
-            "name": "feeSlot",
+            "name": "allowMintSlot",
             "type": {
               "endian": "le",
               "format": "u64",
@@ -320,6 +335,15 @@
             "type": {
               "kind": "publicKeyTypeNode"
             }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "minWithdrawAmount",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
           }
         ],
         "discriminators": [
@@ -330,7 +354,7 @@
           }
         ],
         "kind": "instructionNode",
-        "name": "setWithdrawFeeConfig"
+        "name": "setWithdrawConfig"
       }
     ],
     "kind": "programNode",

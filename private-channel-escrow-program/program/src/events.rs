@@ -61,29 +61,39 @@ pub struct AllowMintEvent {
     pub decimals: u8,
     /// Per-withdrawal fee this AllowMint set on the channel, 0 allowed
     pub withdraw_fee: u64,
+    /// Smallest channel withdrawal amount this AllowMint set, 0 for none
+    pub min_withdraw_amount: u64,
 }
 
 impl AllowMintEvent {
-    pub fn new(instance_seed: Pubkey, mint: Pubkey, decimals: u8, withdraw_fee: u64) -> Self {
+    pub fn new(
+        instance_seed: Pubkey,
+        mint: Pubkey,
+        decimals: u8,
+        withdraw_fee: u64,
+        min_withdraw_amount: u64,
+    ) -> Self {
         Self {
             event_discriminator: EventDiscriminators::AllowMint as u8,
             instance_seed,
             mint,
             decimals,
             withdraw_fee,
+            min_withdraw_amount,
         }
     }
 
     // 8 (tag) + 1 (discriminator) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
-    // + 8 (withdraw_fee)
+    // + 8 (withdraw_fee) + 8 (min_withdraw_amount)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(82);
+        let mut data = Vec::with_capacity(90);
         data.extend_from_slice(EVENT_IX_TAG_LE);
         data.push(self.event_discriminator);
         data.extend_from_slice(self.instance_seed.as_ref());
         data.extend_from_slice(self.mint.as_ref());
         data.push(self.decimals);
         data.extend_from_slice(&self.withdraw_fee.to_le_bytes());
+        data.extend_from_slice(&self.min_withdraw_amount.to_le_bytes());
         data
     }
 }
@@ -384,7 +394,8 @@ mod tests {
         let instance_seed = Pubkey::new_from_array([1u8; 32]);
         let mint = Pubkey::new_from_array([2u8; 32]);
         let withdraw_fee = 1_234_567u64;
-        let event = AllowMintEvent::new(instance_seed, mint, 6, withdraw_fee);
+        let min_withdraw_amount = 7_654_321u64;
+        let event = AllowMintEvent::new(instance_seed, mint, 6, withdraw_fee, min_withdraw_amount);
 
         assert_eq!(
             event.event_discriminator,
@@ -394,15 +405,17 @@ mod tests {
         assert_eq!(event.mint, mint);
         assert_eq!(event.decimals, 6);
         assert_eq!(event.withdraw_fee, withdraw_fee);
+        assert_eq!(event.min_withdraw_amount, min_withdraw_amount);
 
         // 8 (tag) + 1 (disc) + 32 (instance_seed) + 32 (mint) + 1 (decimals)
-        // + 8 (withdraw_fee)
+        // + 8 (withdraw_fee) + 8 (min_withdraw_amount)
         let bytes = event.to_bytes();
-        assert_eq!(bytes.len(), 82);
+        assert_eq!(bytes.len(), 90);
         assert_eq!(&bytes[..8], EVENT_IX_TAG_LE);
         assert_eq!(bytes[8], EventDiscriminators::AllowMint as u8);
         assert_eq!(bytes[73], 6);
         assert_eq!(&bytes[74..82], &withdraw_fee.to_le_bytes());
+        assert_eq!(&bytes[82..90], &min_withdraw_amount.to_le_bytes());
     }
 
     #[test]

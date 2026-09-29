@@ -2,7 +2,7 @@ use crate::channel_utils::send_guaranteed;
 use crate::error::{AccountError, OperatorError, ProgramError};
 use crate::metrics;
 use crate::operator::instruction_util::{
-    mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawFeeSetup,
+    mint_idempotency_memo, MintToBuilder, SourceEventId, TransactionBuilder, WithdrawConfigSetup,
     WithdrawalRemintInfo,
 };
 use crate::operator::recovery::{check_deposit, DepositOutcome, MAX_RECOVERY_REQUEUE_ATTEMPTS};
@@ -1189,15 +1189,16 @@ pub async fn process_deposit_funds(
                 .assert_mint_allowed_at_slot(&mint, transaction.slot, transaction.id)
                 .await?;
 
-            // The fee comes from the latest AllowMint's `mints` row. Read it here
-            // rather than through MintCache, which never refreshes, so a re-allow
-            // reprices without a restart. An indexed AllowMint writes the row before
-            // its allowed status, so the row is only missing when the AllowMint was
-            // never indexed and a later BlockMint re-opened deposits. Without the
-            // fee this deposit cannot write the channel's config, and the balance
-            // it mints could not be withdrawn, or would pay a stale fee.
+            // The fee and minimum come from the latest AllowMint's `mints` row.
+            // Read it here rather than through MintCache, which never refreshes,
+            // so a re-allow reprices without a restart. An indexed AllowMint writes
+            // the row before its allowed status, so the row is only missing when
+            // the AllowMint was never indexed and a later BlockMint re-opened
+            // deposits. Without them this deposit cannot write the channel's
+            // config, and the balance it mints could not be withdrawn, or would
+            // follow stale values.
             let Some(mint_row) =
-                with_storage_backoff("mint withdraw fee read", transaction.id, || {
+                with_storage_backoff("mint withdraw config read", transaction.id, || {
                     storage.get_mint(&transaction.mint)
                 })
                 .await?
@@ -1207,8 +1208,8 @@ pub async fn process_deposit_funds(
                     pt_label,
                     &transaction,
                     BailReason::new(
-                        metrics::BAIL_REASON_WITHDRAW_FEE_UNKNOWN,
-                        format!("no mints row for {mint}, withdraw fee unknown"),
+                        metrics::BAIL_REASON_WITHDRAW_CONFIG_UNKNOWN,
+                        format!("no mints row for {mint}, withdraw config unknown"),
                     ),
                 )
                 .await;
@@ -1238,12 +1239,13 @@ pub async fn process_deposit_funds(
                 )))
                 // The admin is the treasury: it pays the SOL a failed release
                 // burns, so it collects the fee that pays for it.
-                .withdraw_fee_setup(WithdrawFeeSetup {
+                .withdraw_config_setup(WithdrawConfigSetup {
                     fee: mint_row.withdraw_fee.value(),
                     // Lets the program drop this write if a deposit built after
                     // a reprice has already landed.
-                    fee_slot: mint_row.withdraw_fee_slot as u64,
+                    allow_mint_slot: mint_row.allow_mint_slot as u64,
                     treasury: processor_state.admin_pubkey,
+                    min_withdraw_amount: mint_row.min_withdraw_amount.value(),
                 });
 
             let proc_elapsed_ms = proc_t0.elapsed().as_millis();
@@ -1420,7 +1422,8 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token::id().to_string(),
@@ -1470,7 +1473,8 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -2441,7 +2445,8 @@ mod tests {
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                    withdraw_fee_slot: 0,
+                    allow_mint_slot: 0,
+                    min_withdraw_amount: TokenAmount(0),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -2530,7 +2535,8 @@ mod tests {
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                    withdraw_fee_slot: 0,
+                    allow_mint_slot: 0,
+                    min_withdraw_amount: TokenAmount(0),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -2596,7 +2602,8 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -2935,7 +2942,8 @@ mod tests {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let admin = Pubkey::new_unique();
-        let fee_slot = 42u64;
+        let allow_mint_slot = 42u64;
+        let min_withdraw_amount = 2_468_024u64;
         let mut ps = ProcessorState {
             admin_pubkey: admin,
             release_funds_state: None,
@@ -2945,12 +2953,12 @@ mod tests {
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
         insert_mint_row(&storage, &mint_pubkey);
-        mock.mints
-            .lock()
-            .unwrap()
-            .get_mut(&mint_pubkey.to_string())
-            .unwrap()
-            .withdraw_fee_slot = fee_slot as i64;
+        {
+            let mut mints = mock.mints.lock().unwrap();
+            let mint_row = mints.get_mut(&mint_pubkey.to_string()).unwrap();
+            mint_row.allow_mint_slot = allow_mint_slot as i64;
+            mint_row.min_withdraw_amount = TokenAmount(min_withdraw_amount);
+        }
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2987,24 +2995,29 @@ mod tests {
         assert_eq!(b.txn_id, 1);
         assert_eq!(b.trace_id, "trace-1");
 
-        // The deposit writes the fee config: the fee and its AllowMint slot from
-        // the mints row, and the operator admin as treasury. Data is
-        // [discriminator][fee u64 LE][fee_slot u64 LE][treasury].
+        // The deposit writes the withdraw config: the fee, minimum and their
+        // AllowMint slot from the mints row, and the operator admin as treasury.
+        // Data is [discriminator][fee u64 LE][allow_mint_slot u64 LE][treasury]
+        // [min_withdraw_amount u64 LE].
         let instructions = b.builder.instructions().unwrap();
-        let set_withdraw_fee_config = &instructions[1];
+        let set_withdraw_config = &instructions[1];
         assert_eq!(
-            set_withdraw_fee_config.program_id,
+            set_withdraw_config.program_id,
             PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID
         );
         assert_eq!(
-            &set_withdraw_fee_config.data[1..9],
+            &set_withdraw_config.data[1..9],
             &TEST_WITHDRAW_FEE.to_le_bytes()
         );
         assert_eq!(
-            &set_withdraw_fee_config.data[9..17],
-            &fee_slot.to_le_bytes()
+            &set_withdraw_config.data[9..17],
+            &allow_mint_slot.to_le_bytes()
         );
-        assert_eq!(&set_withdraw_fee_config.data[17..49], admin.as_ref());
+        assert_eq!(&set_withdraw_config.data[17..49], admin.as_ref());
+        assert_eq!(
+            &set_withdraw_config.data[49..57],
+            &min_withdraw_amount.to_le_bytes()
+        );
     }
 
     /// The deposit mint's on-chain memo must key on the event's chain coordinates,
@@ -3387,7 +3400,8 @@ mod tests {
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                    withdraw_fee_slot: 0,
+                    allow_mint_slot: 0,
+                    min_withdraw_amount: TokenAmount(0),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -3833,7 +3847,8 @@ mod tests {
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                    withdraw_fee_slot: 0,
+                    allow_mint_slot: 0,
+                    min_withdraw_amount: TokenAmount(0),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -3968,7 +3983,8 @@ mod tests {
                 crate::storage::common::models::DbMint {
                     withdrawals_blocked: false,
                     withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                    withdraw_fee_slot: 0,
+                    allow_mint_slot: 0,
+                    min_withdraw_amount: TokenAmount(0),
                     mint_address: mint_pubkey.to_string(),
                     decimals: 6,
                     token_program: spl_token::id().to_string(),
@@ -4329,7 +4345,8 @@ mod tests {
             crate::storage::common::models::DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -4431,7 +4448,8 @@ mod tests {
             crate::storage::common::models::DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(TEST_WITHDRAW_FEE),
-                withdraw_fee_slot: 0,
+                allow_mint_slot: 0,
+                min_withdraw_amount: TokenAmount(0),
                 mint_address: mint_pubkey.to_string(),
                 decimals: 6,
                 token_program: spl_token_2022::id().to_string(),
@@ -4587,7 +4605,7 @@ mod tests {
     /// minting a balance that could not be withdrawn, and the next row still goes
     /// through.
     #[tokio::test]
-    async fn process_deposit_funds_parks_when_withdraw_fee_unknown() {
+    async fn process_deposit_funds_parks_when_withdraw_config_unknown() {
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock.clone()));
         let mut ps = ProcessorState {
@@ -4656,7 +4674,7 @@ mod tests {
         assert_eq!(update.status, TransactionStatus::ManualReview);
         let reason = update.error_message.expect("a park carries its reason");
         assert!(
-            reason.contains("withdraw fee unknown"),
+            reason.contains("withdraw config unknown"),
             "expected the fee reason, got: {reason}"
         );
 

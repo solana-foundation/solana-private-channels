@@ -25,6 +25,8 @@ const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
 /// Per-withdrawal fee in base units for the generated mint.
 const WITHDRAW_FEE: u64 = 1_000;
+/// Smallest withdrawal amount in base units for the generated mint.
+const MIN_WITHDRAW_AMOUNT: u64 = 1;
 
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
@@ -108,6 +110,7 @@ async fn send_allow_mint(
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .withdraw_fee(WITHDRAW_FEE)
+        .min_withdraw_amount(MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     let signature =

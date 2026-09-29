@@ -94,6 +94,7 @@ const allowMintIx = await getAllowMintInstructionAsync({
   instance: instanceAddress,
   mint: USDC_MINT,
   withdrawFee: 10_000n, // 0.01 USDC per channel withdrawal, in base units
+  minWithdrawAmount: 1_000_000n, // smallest channel withdrawal, 1 USDC
 });
 
 // Sign and send transaction with payer and admin as signers
@@ -107,11 +108,12 @@ const allowMintIx = await getAllowMintInstructionAsync({
 - `withdrawFee` is required and may be `0`. It is charged on top of every channel withdrawal of this mint and paid to the operator admin, so it has to cover the SOL the operator can spend on a release that fails on-chain.
   - **Zero fee.** `0` turns the fee off for the mint: withdrawals burn only the amount, and nothing is paid to the treasury. That also removes the economic bound on the failed-release loop. A user can withdraw to a destination that will refuse the transfer, have the burn reminted when the release fails, and repeat, and every round costs the operator's fee payer SOL. Use `0` only where every participant is known and accountable, for example a permissioned channel whose users are onboarded, so an account that loops can be identified and cut off. The remaining controls are the withdrawal pre-flight, which parks destinations that already refuse ordinary credits, and blocking withdrawals for the mint. Anywhere else, size the fee to cover failed releases.
   - **Changing it later.** A fee can go from `0` to a nonzero value, or back, at any time. It is an ordinary reprice with the procedure below, and needs no other setup: every deposit already creates the treasury's token account, even at `0`. Until the next deposit of the mint lands, withdrawals keep paying the old fee, which for a mint at `0` means nothing. To switch a fee on urgently, block withdrawals first, then reprice and make a small deposit yourself.
+- `minWithdrawAmount` is required and may be `0`. Every accepted channel withdrawal becomes its own Solana release, so size it so one release never costs the operator more than it moves; without it one token can be split into a million 1-unit releases. The operator admin, as treasury, has no minimum. `0` turns it off and is for the same permissioned deployments as a zero fee. It reprices with the fee.
 
-  AllowMint is the only way to reprice, and calling it again does three things beyond changing the fee:
+  AllowMint is the only way to reprice, and calling it again does three things beyond changing the fee and minimum:
   - **Re-opens both gates.** To keep the mint blocked, send a `BlockMint` in a later transaction, once the AllowMint is confirmed. Not in the same one: both would share a slot, the indexer records one status per mint and slot, and it would keep the AllowMint's, so its mirror would read open while the chain is blocked.
   - **Re-pins the mint profile.** Any profile change since the last allow is accepted silently, so `MintProfileChanged` no longer catches it. Review the mint before repricing.
-  - **Applies on the next deposit.** The operator writes the fee to the channel with each deposit, so until one lands withdrawals pay the old fee. Make a small deposit yourself to apply it now.
+  - **Applies on the next deposit.** The operator writes the fee and minimum to the channel with each deposit, so until one lands withdrawals follow the old values. Make a small deposit yourself to apply them now.
 
   If a mint is under attack, block withdrawals first: parked withdrawals send no release and spend no SOL, so the reprice can wait for the procedure above
 - Records the mint's `decimals`, `token_program`, extension set and whether it has a freeze authority as the reviewed profile. `Deposit` rejects the mint with `MintProfileChanged` if any of them changes, which an admin clears by blocking and re-allowing (a re-allow also re-opens both gates). Freeze authority is checked in one direction only — revoking one is fine, gaining one is not. The metadata, group and group-member bits are recorded but not compared, since an issuer adds them to a live mint as a routine step. A decimals change also needs the channel mint re-created, since re-allow leaves it on the old decimals

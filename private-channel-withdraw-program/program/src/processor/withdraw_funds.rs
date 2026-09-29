@@ -8,7 +8,7 @@ use crate::{
         validate_ata, verify_ata_program, verify_mint_account, verify_signer, verify_token_program,
     },
     require_len,
-    state::{WithdrawFeeConfig, WITHDRAW_FEE_CONFIG_SEED},
+    state::{WithdrawConfig, WITHDRAW_CONFIG_SEED},
 };
 
 /// Processes the WithdrawFunds instruction.
@@ -17,7 +17,9 @@ use crate::{
 /// `amount + fee` fails and nothing is burned. The fee is never reminted if the
 /// Solana release later fails, which is what makes a withdrawal to a
 /// destination that refuses the transfer cost the user every time. A zero-fee
-/// mint charges nothing and leaves `treasury_token_account` unread.
+/// mint charges nothing and leaves `treasury_token_account` unread. An `amount`
+/// below the mint's minimum is rejected before anything moves. The treasury
+/// pays no fee and has no minimum.
 ///
 /// # Account Layout
 /// 0. `[signer]` user - User initiating the withdrawal
@@ -25,7 +27,7 @@ use crate::{
 /// 2. `[writable]` token_account - Source token account
 /// 3. `[]` token_program - Token program
 /// 4. `[]` associated_token_program - Associated token program
-/// 5. `[]` withdraw_fee_config - Fee config PDA for the mint
+/// 5. `[]` withdraw_config - Withdraw config PDA for the mint
 /// 6. `[writable]` treasury_token_account - Treasury token account the fee is paid to
 ///
 /// # Instruction Data
@@ -42,7 +44,7 @@ pub fn process_withdraw_funds(
         return Err(PrivateChannelWithdrawProgramError::ZeroAmount.into());
     }
 
-    let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info, withdraw_fee_config_info, treasury_token_account_info] =
+    let [user_info, mint_info, token_account_info, token_program_info, associated_token_program_info, withdraw_config_info, treasury_token_account_info] =
         accounts
     else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -60,30 +62,39 @@ pub fn process_withdraw_funds(
         token_program_info,
     )?;
 
-    if !withdraw_fee_config_info.owned_by(program_id) {
-        return Err(PrivateChannelWithdrawProgramError::FeeConfigNotInitialized.into());
+    if !withdraw_config_info.owned_by(program_id) {
+        return Err(PrivateChannelWithdrawProgramError::WithdrawConfigNotInitialized.into());
     }
-    let withdraw_fee_config =
-        WithdrawFeeConfig::try_from_bytes(&withdraw_fee_config_info.try_borrow()?)?;
-    let expected_withdraw_fee_config = Address::create_program_address(
+    let withdraw_config =
+        WithdrawConfig::try_from_bytes(&withdraw_config_info.try_borrow()?)?;
+    let expected_withdraw_config = Address::create_program_address(
         &[
-            WITHDRAW_FEE_CONFIG_SEED,
+            WITHDRAW_CONFIG_SEED,
             mint_info.address().as_ref(),
-            &[withdraw_fee_config.bump],
+            &[withdraw_config.bump],
         ],
         program_id,
     )
-    .map_err(|_| PrivateChannelWithdrawProgramError::InvalidFeeConfig)?;
-    if withdraw_fee_config_info.address() != &expected_withdraw_fee_config {
-        return Err(PrivateChannelWithdrawProgramError::InvalidFeeConfig.into());
+    .map_err(|_| PrivateChannelWithdrawProgramError::InvalidWithdrawConfig)?;
+    if withdraw_config_info.address() != &expected_withdraw_config {
+        return Err(PrivateChannelWithdrawProgramError::InvalidWithdrawConfig.into());
     }
 
-    // Nothing is owed on a zero-fee mint, and the treasury withdraws the fees it
-    // collected without paying one. Either way the treasury account goes unused.
-    let charges_fee =
-        withdraw_fee_config.fee > 0 && user_info.address() != &withdraw_fee_config.treasury;
+    // The treasury moves out the fees it collected, which can sit below the
+    // minimum, so it pays no fee and has no minimum.
+    let is_treasury = user_info.address() == &withdraw_config.treasury;
+
+    // Every accepted withdrawal becomes its own Solana release, so an amount
+    // below the minimum would cost more to settle than it moves.
+    if !is_treasury && args.amount < withdraw_config.min_withdraw_amount {
+        return Err(PrivateChannelWithdrawProgramError::AmountBelowMinimum.into());
+    }
+
+    // Nothing is owed on a zero-fee mint or by the treasury. Either way the
+    // treasury account goes unused.
+    let charges_fee = withdraw_config.fee > 0 && !is_treasury;
     if charges_fee {
-        if treasury_token_account_info.address() != &withdraw_fee_config.treasury_token_account {
+        if treasury_token_account_info.address() != &withdraw_config.treasury_token_account {
             return Err(PrivateChannelWithdrawProgramError::InvalidTreasuryAccount.into());
         }
 
@@ -91,7 +102,7 @@ pub fn process_withdraw_funds(
             from: token_account_info,
             to: treasury_token_account_info,
             authority: user_info,
-            amount: withdraw_fee_config.fee,
+            amount: withdraw_config.fee,
         }
         .invoke()?;
     }

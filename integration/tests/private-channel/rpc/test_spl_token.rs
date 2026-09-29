@@ -21,7 +21,7 @@ use {
     spl_associated_token_account::get_associated_token_address_with_program_id,
     spl_token::state::Account as TokenAccount,
     std::time::Duration,
-    test_utils::mint_helper::TEST_WITHDRAW_FEE,
+    test_utils::mint_helper::{TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE},
     tokio::time::sleep,
 };
 
@@ -210,6 +210,7 @@ async fn allow_mint_on_escrow_instance(
         .token_program(*token_program_id)
         .bump(allowed_mint_bump)
         .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     let blockhash = solana_ctx.get_latest_blockhash().await.unwrap();
@@ -716,7 +717,7 @@ async fn private_channel_burn(
         "\n=== Withdrawing {} tokens from Alice ===",
         withdrawal_amount / 1000
     );
-    // The operator's deposits wrote the fee config with its own admin key as
+    // The operator's deposits wrote the withdraw config with its own admin key as
     // the treasury, so the fee is paid to that key's ATA.
     let blockhash = private_channel_ctx.get_blockhash().await.unwrap();
     let withdraw_tx = setup::withdraw_funds_transaction(

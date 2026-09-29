@@ -13,6 +13,10 @@ use private_channel_indexer::{
 /// the channel on every deposit, so every withdrawal after one pays it.
 pub const TEST_WITHDRAW_FEE: u64 = 1_000;
 
+/// Minimum withdrawal the e2e harnesses allow mints with. Kept at 1 so every
+/// amount these suites withdraw stays valid.
+pub const TEST_MIN_WITHDRAW_AMOUNT: u64 = 1;
+
 /// Test helper: seed a mint AND a slot-0 `allowed` history entry so the
 /// operator gate (`assert_mint_allowed_at_slot`) and the reconciliation
 /// orphan query both treat the mint as allowed for any deposit slot.

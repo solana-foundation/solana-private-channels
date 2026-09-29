@@ -51,7 +51,7 @@ use spl_transfer_hook_interface::{
     get_extra_account_metas_address, instruction::ExecuteInstruction,
 };
 use std::time::Duration;
-use test_utils::mint_helper::TEST_WITHDRAW_FEE;
+use test_utils::mint_helper::{TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE};
 use test_utils::operator_helper::start_private_channel_to_solana_operator;
 use test_utils::validator_helper::{start_test_validator_no_geyser, HOOK_FIXTURE_PROGRAM_ID};
 use testcontainers::runners::AsyncRunner;
@@ -225,6 +225,7 @@ async fn allow_mint_2022(
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     let recent_blockhash = client.get_latest_blockhash().await?;

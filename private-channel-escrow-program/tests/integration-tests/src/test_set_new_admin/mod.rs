@@ -7,7 +7,7 @@ use crate::{
     utils::{
         assert_program_error, set_mint, setup_test_balances, TestContext, ATA_PROGRAM_ID,
         INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, MISSING_REQUIRED_SIGNATURE_ERROR,
-        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_WITHDRAW_FEE,
+        PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_MIN_WITHDRAW_AMOUNT, TEST_WITHDRAW_FEE,
     },
 };
 use private_channel_escrow_program_client::instructions::{AllowMintBuilder, SetNewAdminBuilder};
@@ -224,6 +224,7 @@ fn test_set_new_admin_old_admin_locked_out() {
         .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
         .bump(bump)
         .withdraw_fee(TEST_WITHDRAW_FEE)
+        .min_withdraw_amount(TEST_MIN_WITHDRAW_AMOUNT)
         .instruction();
 
     context

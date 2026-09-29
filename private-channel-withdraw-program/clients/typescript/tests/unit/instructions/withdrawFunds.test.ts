@@ -21,7 +21,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: testDestination,
@@ -57,7 +57,7 @@ describe('withdraw_funds', () => {
                     user,
                     mint: TEST_ADDRESSES.MINT,
                     tokenAccount: TEST_ADDRESSES.WALLET,
-                    withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                    withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                     treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                     amount: testAmount,
                     destination: null,
@@ -74,7 +74,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: numberAmount,
                 destination: null,
@@ -93,7 +93,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: null,
@@ -108,7 +108,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: testDestination,
@@ -125,7 +125,7 @@ describe('withdraw_funds', () => {
                     user,
                     mint: TEST_ADDRESSES.MINT,
                     tokenAccount: TEST_ADDRESSES.WALLET,
-                    withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                    withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                     treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                     amount: testAmount,
                     destination,
@@ -146,7 +146,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: testDestination,
@@ -170,7 +170,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: testAmount,
                 destination: null,
@@ -194,14 +194,14 @@ describe('withdraw_funds', () => {
     });
 
     describe('Account requirements', () => {
-        it('should include all required accounts: user, mint, tokenAccount, tokenProgram, associatedTokenProgram, withdrawFeeConfig, treasuryTokenAccount', async () => {
+        it('should include all required accounts: user, mint, tokenAccount, tokenProgram, associatedTokenProgram, withdrawConfig, treasuryTokenAccount', async () => {
             const user = mockTransactionSigner(TEST_ADDRESSES.WALLET);
 
             const instruction = getWithdrawFundsInstruction({
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: 1000000n,
                 destination: null,
@@ -230,9 +230,9 @@ describe('withdraw_funds', () => {
             const associatedTokenProgramAccount = instruction.accounts[4];
             expect(associatedTokenProgramAccount.address).toBe(ASSOCIATED_TOKEN_PROGRAM_ADDRESS);
 
-            // Account 5: withdrawFeeConfig (Readonly)
-            const withdrawFeeConfigAccount = instruction.accounts[5];
-            expect(withdrawFeeConfigAccount.address).toBe(TEST_ADDRESSES.WITHDRAW_FEE_CONFIG);
+            // Account 5: withdrawConfig (Readonly)
+            const withdrawConfigAccount = instruction.accounts[5];
+            expect(withdrawConfigAccount.address).toBe(TEST_ADDRESSES.WITHDRAW_CONFIG);
 
             // Account 6: treasuryTokenAccount (Writable)
             const treasuryTokenAccountAccount = instruction.accounts[6];
@@ -246,7 +246,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: 1000000n,
                 destination: null,
@@ -272,9 +272,9 @@ describe('withdraw_funds', () => {
             const associatedTokenProgramAccount = instruction.accounts[4];
             expect(associatedTokenProgramAccount.role).toBe(AccountRole.READONLY);
 
-            // Account 5: withdrawFeeConfig - should be Readonly
-            const withdrawFeeConfigAccount = instruction.accounts[5];
-            expect(withdrawFeeConfigAccount.role).toBe(AccountRole.READONLY);
+            // Account 5: withdrawConfig - should be Readonly
+            const withdrawConfigAccount = instruction.accounts[5];
+            expect(withdrawConfigAccount.role).toBe(AccountRole.READONLY);
 
             // Account 6: treasuryTokenAccount - should be Writable, it receives the fee
             const treasuryTokenAccountAccount = instruction.accounts[6];
@@ -288,7 +288,7 @@ describe('withdraw_funds', () => {
                 user,
                 mint: TEST_ADDRESSES.MINT,
                 tokenAccount: TEST_ADDRESSES.WALLET,
-                withdrawFeeConfig: TEST_ADDRESSES.WITHDRAW_FEE_CONFIG,
+                withdrawConfig: TEST_ADDRESSES.WITHDRAW_CONFIG,
                 treasuryTokenAccount: TEST_ADDRESSES.TREASURY_TOKEN_ACCOUNT,
                 amount: 1000000n,
                 destination: null,
@@ -306,12 +306,12 @@ describe('withdraw_funds', () => {
             expect(associatedTokenProgramAccount.address).toBe(ASSOCIATED_TOKEN_PROGRAM_ADDRESS);
         });
 
-        it('should derive withdrawFeeConfig from the mint when not provided', async () => {
+        it('should derive withdrawConfig from the mint when not provided', async () => {
             const user = mockTransactionSigner(TEST_ADDRESSES.WALLET);
 
-            const [expectedWithdrawFeeConfig] = await getProgramDerivedAddress({
+            const [expectedWithdrawConfig] = await getProgramDerivedAddress({
                 programAddress: PRIVATE_CHANNEL_WITHDRAW_PROGRAM_PROGRAM_ADDRESS,
-                seeds: ['withdraw_fee_config', getAddressEncoder().encode(TEST_ADDRESSES.MINT)],
+                seeds: ['withdraw_config', getAddressEncoder().encode(TEST_ADDRESSES.MINT)],
             });
 
             const instruction = await getWithdrawFundsInstructionAsync({
@@ -323,7 +323,7 @@ describe('withdraw_funds', () => {
                 destination: null,
             });
 
-            expect(instruction.accounts[5].address).toBe(expectedWithdrawFeeConfig);
+            expect(instruction.accounts[5].address).toBe(expectedWithdrawConfig);
         });
     });
 });

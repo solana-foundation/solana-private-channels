@@ -13,7 +13,7 @@ pub enum PrivateChannelWithdrawProgramInstruction {
     #[codama(account(name = "token_account", docs = "Source token account", writable))]
     #[codama(account(name = "token_program", docs = "Token program"))]
     #[codama(account(name = "associated_token_program", docs = "Associated token program"))]
-    #[codama(account(name = "withdraw_fee_config", docs = "Fee config PDA for the mint"))]
+    #[codama(account(name = "withdraw_config", docs = "Withdraw config PDA for the mint"))]
     #[codama(account(
         name = "treasury_token_account",
         docs = "Treasury token account the fee is paid to",
@@ -26,7 +26,7 @@ pub enum PrivateChannelWithdrawProgramInstruction {
         destination: Option<Pubkey>,
     } = 0,
 
-    /// Create or overwrite the mint's withdraw fee config (mint authority only)
+    /// Create or overwrite the mint's withdraw fee and minimum (mint authority only)
     #[codama(account(
         name = "authority",
         docs = "Mint authority, also pays for the config",
@@ -35,17 +35,19 @@ pub enum PrivateChannelWithdrawProgramInstruction {
     ))]
     #[codama(account(name = "mint", docs = "Token mint"))]
     #[codama(account(
-        name = "withdraw_fee_config",
-        docs = "Fee config PDA for the mint",
+        name = "withdraw_config",
+        docs = "Withdraw config PDA for the mint",
         writable
     ))]
     #[codama(account(name = "system_program", docs = "System program"))]
-    SetWithdrawFeeConfig {
+    SetWithdrawConfig {
         /// Fee in base units charged on top of each withdrawal
         fee: u64,
-        /// Slot of the AllowMint the fee came from; an older one than stored is ignored
-        fee_slot: u64,
+        /// Slot of the AllowMint these values came from; an older one than stored is ignored
+        allow_mint_slot: u64,
         /// Owner of the token account fees are paid to
         treasury: Pubkey,
+        /// Smallest amount a withdrawal may move, 0 for none
+        min_withdraw_amount: u64,
     } = 1,
 }

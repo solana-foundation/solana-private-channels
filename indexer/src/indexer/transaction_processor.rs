@@ -697,7 +697,8 @@ fn convert_to_db_models(
                     let mint_address = accounts.mint.to_string();
                     (
                         Some(DbMint {
-                            withdraw_fee_slot: instruction_meta.slot as i64,
+                            min_withdraw_amount: TokenAmount(data.min_withdraw_amount),
+                            allow_mint_slot: instruction_meta.slot as i64,
                             ..DbMint::new(
                                 mint_address.clone(),
                                 event.decimals as i16,
@@ -867,6 +868,7 @@ mod tests {
     }
 
     const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
+    const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
 
     fn make_allow_mint_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
         InstructionWithMetadata {
@@ -887,6 +889,7 @@ mod tests {
                 data: AllowMintData {
                     bump: 255,
                     withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
                 },
                 event: AllowMintEvent { decimals: 6 },
             })),
@@ -1083,7 +1086,11 @@ mod tests {
         assert_eq!(mint.status, "allowed");
         assert_eq!(mint.withdraw_fee, TokenAmount(ALLOW_MINT_WITHDRAW_FEE));
         assert_eq!(
-            mint.withdraw_fee_slot, 200,
+            mint.min_withdraw_amount,
+            TokenAmount(ALLOW_MINT_MIN_WITHDRAW_AMOUNT)
+        );
+        assert_eq!(
+            mint.allow_mint_slot, 200,
             "the fee is stamped with its AllowMint's slot"
         );
     }
@@ -1233,6 +1240,7 @@ mod tests {
                 data: AllowMintData {
                     bump: 255,
                     withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
+                    min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
                 },
                 event: AllowMintEvent { decimals: 6 },
             })),

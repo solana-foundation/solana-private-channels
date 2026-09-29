@@ -66,9 +66,9 @@ The core payment channel processes transactions through a five-stage pipeline op
 
 **Key Instructions**:
 - `WithdrawFunds`: Burn tokens from payment channel and unlock them from the escrow program, paying the mint's withdraw fee to the treasury on top
-- `SetWithdrawFeeConfig`: Create or overwrite a mint's fee config (mint authority only)
+- `SetWithdrawConfig`: Create or overwrite a mint's withdraw config (mint authority only)
 
-**Withdraw fee**: The escrow admin sets a fee per mint at `AllowMint`. `0` is allowed for deployments whose participants are known, but gives up the bound described below; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The indexer stores it on the `mints` row, and the operator writes it to the channel's fee config in every deposit mint transaction, with its own admin as treasury. The fee is never reminted when a release fails, so a withdrawal that cannot settle costs the user the fee each time, which bounds the SOL a failing release can drain from the operator. See [Withdraw Program](WITHDRAW_PROGRAM.md#treasury).
+**Withdraw fee and minimum**: The escrow admin sets a fee and a minimum withdrawal amount per mint at `AllowMint`. `0` is allowed for either in deployments whose participants are known, but gives up the bound described below; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint). The indexer stores both on the `mints` row, and the operator writes them to the channel's withdraw config in every deposit mint transaction, with its own admin as treasury. The fee is never reminted when a release fails, so a withdrawal that cannot settle costs the user the fee each time, which bounds the SOL a failing release can drain from the operator. The minimum stops a balance from being split into many releases that each cost more than they move. See [Withdraw Program](WITHDRAW_PROGRAM.md#treasury).
 
 ### Indexer & Operator
 

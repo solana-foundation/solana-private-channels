@@ -69,7 +69,7 @@ to the right Path below.
 | `error_message` contains | Cause |
 |---|---|
 | `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path F**. |
-| `withdraw fee unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee the deposit must write to the channel is unknown (metric label `withdraw_fee_unknown`). This happens when the mint's `AllowMint` was never indexed (the indexer started after it) but a later `BlockMint` that re-opened deposits was, since that writes an `allowed` status without a `mints` row; a missed `AllowMint` alone trips the allowlist gate (Path F) first. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee, its history insert is a no-op, then re-arm. |
+| `withdraw config unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee and minimum the deposit must write to the channel are unknown (metric label `withdraw_config_unknown`). This happens when the mint's `AllowMint` was never indexed (the indexer started after it) but a later `BlockMint` that re-opened deposits was, since that writes an `allowed` status without a `mints` row; a missed `AllowMint` alone trips the allowlist gate (Path F) first. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee and minimum, its history insert is a no-op, then re-arm. |
 
 Pull the row:
 
@@ -349,17 +349,21 @@ Replay the indexer over the `AllowMint`'s slot (preferred — same code path
 as production), or insert directly. The gate (`assert_mint_allowed_at_slot`)
 reads **`mint_status_history`**, so backfilling only `mints` loops
 `pending` → `manual_review` forever — both rows are required. Values must
-match the on-chain mint, and `withdraw_fee` is the `withdraw_fee` argument of
-that `AllowMint` (bytes 2..10 of its instruction data, u64 LE), recorded with
-the same `:allow_mint_slot` so a replayed older AllowMint cannot lower it. `status` and
+match the on-chain mint. `withdraw_fee` and `min_withdraw_amount` are that
+`AllowMint`'s arguments (bytes 2..10 and 10..18 of its instruction data, u64 LE),
+recorded with the same `:allow_mint_slot` so a replayed older AllowMint cannot
+restore older values. Set `min_withdraw_amount` explicitly: its column defaults
+to 0, which would leave the mint with no minimum. `status` and
 `withdrawals_blocked` are left to their defaults (`allowed`, open), which is
 what an `AllowMint` sets:
 
 ```sql
 INSERT INTO mints
-  (mint_address, decimals, token_program, withdraw_fee, withdraw_fee_slot, created_at)
+  (mint_address, decimals, token_program, withdraw_fee, min_withdraw_amount,
+   allow_mint_slot, created_at)
 VALUES
-  (:mint, :decimals, :token_program, :withdraw_fee, :allow_mint_slot, NOW());
+  (:mint, :decimals, :token_program, :withdraw_fee, :min_withdraw_amount,
+   :allow_mint_slot, NOW());
 
 -- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
 INSERT INTO mint_status_history

@@ -263,10 +263,11 @@ cargo run --bin allow_mint -- \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <MINT_ADDRESS> \
-  <WITHDRAW_FEE>
+  <WITHDRAW_FEE> \
+  <MIN_WITHDRAW_AMOUNT>
 ```
 
-`<WITHDRAW_FEE>` is required, in the mint's base units (e.g. `10000` is 0.01 USDC). It is charged on top of every withdrawal from the payment channel and paid to the operator admin, so size it to cover the SOL the operator can spend on a release that fails. `0` is allowed but removes that protection, so only use it where every participant is known; see the [zero-fee warning](./ESCROW_INTERACTION_GUIDE.md#allowmint). To reprice, including to or from `0`, run `allow_mint` again with the new value; it takes effect from the mint's next deposit. Re-running it also re-opens both gates and re-pins the mint profile, so follow the [reprice procedure](./ESCROW_INTERACTION_GUIDE.md#allowmint).
+`<WITHDRAW_FEE>` is required, in the mint's base units (e.g. `10000` is 0.01 USDC). It is charged on top of every withdrawal from the payment channel and paid to the operator admin, so size it to cover the SOL the operator can spend on a release that fails. `<MIN_WITHDRAW_AMOUNT>` is also required, in base units (e.g. `1000000` is 1 USDC): the smallest amount one withdrawal may move, so a balance cannot be split into releases that each cost more than they move. `0` is allowed for either but removes that protection, so only use it where every participant is known; see the [zero-fee warning](./ESCROW_INTERACTION_GUIDE.md#allowmint). To reprice, including to or from `0`, run `allow_mint` again with the new values; they take effect from the mint's next deposit. Re-running it also re-opens both gates and re-pins the mint profile, so follow the [reprice procedure](./ESCROW_INTERACTION_GUIDE.md#allowmint).
 
 ### Add Operator
 
@@ -313,7 +314,7 @@ cargo run --bin withdraw -- \
   <AMOUNT>
 ```
 
-`withdraw` prints the mint's withdraw fee first; your channel balance must cover `<AMOUNT>` plus that fee, and a mint can only be withdrawn once at least one of its deposits has been processed.
+`withdraw` prints the mint's withdraw fee and minimum first; `<AMOUNT>` must be at least that minimum, your channel balance must cover `<AMOUNT>` plus the fee, and a mint can only be withdrawn once at least one of its deposits has been processed.
 
 The indexer detects the burn on Solana Private Channels, and the operator releases funds from the Solana escrow, consuming that withdrawal's nonce in the escrow instance's withdrawal bitmap. You should be able to check your balance in your wallet or on Solana explorer to see the withdrawal.
 

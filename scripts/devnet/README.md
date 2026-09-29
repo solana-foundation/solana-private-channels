@@ -54,9 +54,10 @@ cargo run --bin allow_mint -- \
   ./keypairs/escrow-admin.json \
   <INSTANCE_ID> \
   <MINT_ADDRESS> \
-  <WITHDRAW_FEE>
+  <WITHDRAW_FEE> \
+  <MIN_WITHDRAW_AMOUNT>
 ```
-`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin. `0` is allowed but removes the bound on failed-release retries, so use it only where every participant is known; see the [zero-fee warning](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). Run again with a new value, to or from `0`, to reprice; it applies from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint).
+`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin. `<MIN_WITHDRAW_AMOUNT>` is the smallest amount one withdrawal may move, also in base units, so a balance cannot be split into releases that cost more than they move. `0` is allowed for either but removes its bound, so use it only where every participant is known; see the [zero-fee warning](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). Run again with new values, to or from `0`, to reprice; they apply from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint).
 
 ## 4. Deposit (Solana → Solana Private Channels)
 ```bash
@@ -76,7 +77,7 @@ cargo run --bin withdraw -- \
   <MINT_ADDRESS> \
   <AMOUNT>
 ```
-Prints the mint's withdraw fee before sending. The balance must cover `<AMOUNT>` plus the fee, and only `<AMOUNT>` is released on Solana.
+Prints the mint's withdraw fee and minimum before sending, and stops if `<AMOUNT>` is below the minimum. The balance must cover `<AMOUNT>` plus the fee, and only `<AMOUNT>` is released on Solana. The operator admin withdraws without either.
 
 ## Block Mint (set the deposit / withdrawal gates)
 Both flags are absolute, so passing `false` for one re-opens that gate. The script

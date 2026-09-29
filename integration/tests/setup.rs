@@ -194,7 +194,7 @@ pub fn transfer_tokens_versioned_transaction(
     VersionedTransaction::try_new(message, &[from]).unwrap()
 }
 
-/// `treasury` is the owner the mint's fee config pays; in these tests the
+/// `treasury` is the owner the mint's withdraw config pays; in these tests the
 /// operator's channel admin, which every deposit writes there.
 pub fn withdraw_funds_transaction(
     from: &Keypair,
@@ -205,13 +205,13 @@ pub fn withdraw_funds_transaction(
 ) -> Transaction {
     use private_channel_withdraw_program_client::{
         instructions::WithdrawFundsBuilder, PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
-        WITHDRAW_FEE_CONFIG_SEED,
+        WITHDRAW_CONFIG_SEED,
     };
 
     let token_account =
         get_associated_token_address_with_program_id(&from.pubkey(), mint, &spl_token::ID);
-    let (withdraw_fee_config, _) = Pubkey::find_program_address(
-        &[WITHDRAW_FEE_CONFIG_SEED, mint.as_ref()],
+    let (withdraw_config, _) = Pubkey::find_program_address(
+        &[WITHDRAW_CONFIG_SEED, mint.as_ref()],
         &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
     );
     let treasury_token_account =
@@ -223,7 +223,7 @@ pub fn withdraw_funds_transaction(
         .token_account(token_account)
         .token_program(spl_token::id())
         .associated_token_program(spl_associated_token_account::id())
-        .withdraw_fee_config(withdraw_fee_config)
+        .withdraw_config(withdraw_config)
         .treasury_token_account(treasury_token_account)
         .amount(amount)
         .instruction();
