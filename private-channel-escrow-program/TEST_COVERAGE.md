@@ -88,7 +88,7 @@
 - `test_set_new_admin_old_admin_locked_out` — after transfer, old admin's allow_mint attempt is rejected with InvalidAdmin
 - `test_set_new_admin_existing_operators_still_valid` — operator PDAs are keyed to the instance, not the admin; they remain valid after an admin change
 
-### Deposit (22 integration tests)
+### Deposit (24 integration tests)
 
 - `test_deposit_success` — happy path
 - `test_deposit_with_recipient` — optional recipient parameter
@@ -101,6 +101,8 @@
 - `test_deposit_token_2022_transfer_hook_without_extras_fails` — omitting the extras fails the transfer rather than skipping the hook
 - `test_deposit_rejects_signer_bearing_hook_extra` — a hostile `ExtraAccountMetaList` names the fee payer as a signer extra; the stripped signer bit leaves the hook's drain CPI unsigned, so the deposit reverts and the attacker gets nothing
 - `test_deposit_token_2022_transfer_fee_success` — the escrow credits the measured balance delta, so the depositor is credited net of the fee
+- `test_deposit_rejects_zero_amount` — ZeroAmount; SPL Token accepts a zero transfer, so without the guard an empty ATA emits free DepositEvents
+- `test_deposit_rejects_zero_received_amount` — ZeroAmount; a 1-unit deposit on a 1% fee mint lands nothing, so the received amount is checked too
 - `test_deposit_invalid_associated_token_program` — wrong ATA program rejected
 - `test_multiple_depositors_same_instance` — three users deposit to same instance
 - `test_deposit_wrong_user_ata` — passing another user's ATA as the user_ata is rejected with InvalidInstructionData

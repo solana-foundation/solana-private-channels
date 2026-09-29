@@ -13,6 +13,7 @@ use crate::{
         INCORRECT_PROGRAM_ID_ERROR, INVALID_ACCOUNT_DATA_ERROR, INVALID_INSTRUCTION_DATA_ERROR,
         MINT_PROFILE_CHANGED_ERROR, NOT_ENOUGH_ACCOUNT_KEYS_ERROR,
         PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_INSUFFICIENT_FUNDS_ERROR,
+        ZERO_AMOUNT_ERROR,
     },
 };
 
@@ -198,6 +199,73 @@ fn test_deposit_insufficient_funds() {
     assert_program_error(result, TOKEN_INSUFFICIENT_FUNDS_ERROR);
 }
 
+// SPL Token accepts a zero transfer, so without the guard an empty ATA could
+// emit free DepositEvents to arbitrary recipients.
+#[test]
+fn test_deposit_rejects_zero_amount() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let recipient = Keypair::new();
+    let mint = Keypair::new();
+
+    let instance_seed = Keypair::new();
+
+    set_mint(&mut context, &mint.pubkey());
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    let (user_ata, instance_ata) = setup_test_balances(
+        &mut context,
+        &user,
+        &instance_pda,
+        &mint.pubkey(),
+        &TOKEN_PROGRAM_ID,
+        0,
+        0,
+    );
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(0)
+        .recipient(recipient.pubkey())
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, ZERO_AMOUNT_ERROR);
+}
+
 #[test]
 fn test_deposit_mint_not_allowed() {
     let mut context = TestContext::new();
@@ -283,8 +351,9 @@ fn test_deposit_not_enough_accounts() {
     let instruction = Instruction {
         program_id: PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
         accounts: vec![], // No accounts
-        // 1 discriminator + 8 amount + 1 recipient option
-        data: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        // 1 discriminator + 8 amount + 1 recipient option. Non-zero amount so
+        // the zero-amount guard does not fire first.
+        data: vec![6, 1, 0, 0, 0, 0, 0, 0, 0, 0],
     };
 
     let result = context.send_transaction(instruction);
@@ -533,6 +602,87 @@ fn test_deposit_token_2022_transfer_fee_success() {
         instance_balance_before + expected_received,
         "Escrow should receive deposit minus transfer fee"
     );
+}
+
+// A positive request can still land nothing: at 1% the fee on 1 base unit is
+// ceil(1 * 100 / 10_000) = 1, so the escrow receives 0.
+#[test]
+fn test_deposit_rejects_zero_received_amount() {
+    const TRANSFER_FEE_BASIS_POINTS: u16 = 100; // 1%
+    const TRANSFER_FEE_MAX: u64 = 1_000_000;
+
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let instance_seed = Keypair::new();
+    let deposit_amount = 1;
+
+    create_mint_2022_with_transfer_fee(
+        &mut context,
+        &mint,
+        TRANSFER_FEE_BASIS_POINTS,
+        TRANSFER_FEE_MAX,
+    );
+
+    let (instance_pda, _) =
+        assert_get_or_create_instance(&mut context, &admin, &instance_seed, false, false)
+            .expect("CreateInstance should succeed");
+
+    assert_get_or_allow_mint(
+        &mut context,
+        &admin,
+        &instance_pda,
+        &mint.pubkey(),
+        false,
+        false,
+    )
+    .expect("AllowMint should succeed");
+
+    context
+        .airdrop_if_required(&user.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let user_ata =
+        get_or_create_associated_token_account_2022(&mut context, &user.pubkey(), &mint.pubkey());
+    let instance_ata =
+        get_or_create_associated_token_account_2022(&mut context, &instance_pda, &mint.pubkey());
+
+    let mint_to_ix = spl_token_2022::instruction::mint_to(
+        &TOKEN_2022_PROGRAM_ID,
+        &mint.pubkey(),
+        &user_ata,
+        &context.payer.pubkey(),
+        &[],
+        deposit_amount,
+    )
+    .unwrap();
+    context
+        .send_transaction(mint_to_ix)
+        .expect("mint_to should succeed");
+
+    let (allowed_mint_pda, _) = find_allowed_mint_pda(&instance_pda, &mint.pubkey());
+    let (event_authority_pda, _) = find_event_authority_pda();
+
+    let instruction = DepositBuilder::new()
+        .payer(context.payer.pubkey())
+        .user(user.pubkey())
+        .instance(instance_pda)
+        .mint(mint.pubkey())
+        .allowed_mint(allowed_mint_pda)
+        .user_ata(user_ata)
+        .instance_ata(instance_ata)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .token_program(TOKEN_2022_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .event_authority(event_authority_pda)
+        .private_channel_escrow_program(PRIVATE_CHANNEL_ESCROW_PROGRAM_ID)
+        .amount(deposit_amount)
+        .instruction();
+
+    let result = context.send_transaction_with_signers(instruction, &[&user]);
+
+    assert_program_error(result, ZERO_AMOUNT_ERROR);
 }
 
 // The fixture logs how many accounts Token-2022 handed it. With one extra

@@ -78,6 +78,10 @@ pub enum PrivateChannelEscrowProgramError {
     /// (17) Mint no longer matches the profile recorded when it was allowed
     #[error("Mint no longer matches the profile recorded at AllowMint")]
     MintProfileChanged,
+
+    /// (18) Deposit requested or received zero tokens
+    #[error("Deposit amount must be greater than zero")]
+    ZeroAmount,
 }
 
 impl From<PrivateChannelEscrowProgramError> for ProgramError {
@@ -117,6 +121,7 @@ mod tests {
             (DepositsBlockedForMint, 15),
             (WithdrawalsBlockedForMint, 16),
             (MintProfileChanged, 17),
+            (ZeroAmount, 18),
         ];
 
         for (error, expected_code) in cases {

@@ -77,6 +77,7 @@ pub const WITHDRAWALS_BLOCKED_FOR_MINT_ERROR: u32 =
     PrivateChannelEscrowProgramError::WithdrawalsBlockedForMint as u32;
 pub const MINT_PROFILE_CHANGED_ERROR: u32 =
     PrivateChannelEscrowProgramError::MintProfileChanged as u32;
+pub const ZERO_AMOUNT_ERROR: u32 = PrivateChannelEscrowProgramError::ZeroAmount as u32;
 
 /// Nonces covered by one bitmap generation. Must match the on-chain constant.
 pub const NONCES_PER_GENERATION: u64 = 65_536;

@@ -662,6 +662,12 @@
         "kind": "errorNode",
         "message": "Mint no longer matches the profile recorded at AllowMint",
         "name": "mintProfileChanged"
+      },
+      {
+        "code": 18,
+        "kind": "errorNode",
+        "message": "Deposit amount must be greater than zero",
+        "name": "zeroAmount"
       }
     ],
     "instructions": [

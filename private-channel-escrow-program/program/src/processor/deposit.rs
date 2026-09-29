@@ -55,6 +55,11 @@ pub fn process_deposit(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
+
+    if args.amount == 0 {
+        return Err(PrivateChannelEscrowProgramError::ZeroAmount.into());
+    }
+
     if accounts.len() < FIXED_ACCOUNTS_LEN {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -147,6 +152,11 @@ pub fn process_deposit(
     let received = escrow_token_balance_after
         .checked_sub(escrow_token_balance_before)
         .ok_or(PrivateChannelEscrowProgramError::InvalidEscrowBalance)?;
+
+    // A transfer fee can consume a positive request entirely.
+    if received == 0 {
+        return Err(PrivateChannelEscrowProgramError::ZeroAmount.into());
+    }
 
     let recipient = args.recipient.unwrap_or(*user_info.address());
     let event = DepositEvent::new(
