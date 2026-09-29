@@ -23,7 +23,7 @@ use helpers::{generate_mint, mint_to_owner, send_and_confirm_instructions, setup
 const INSTANCE_SEED: &[u8] = b"instance";
 const EVENT_AUTHORITY_SEED: &[u8] = b"event_authority";
 const ALLOWED_MINT_SEED: &[u8] = b"allowed_mint";
-/// Per-withdrawal fee in base units for the generated mint. AllowMint rejects zero.
+/// Per-withdrawal fee in base units for the generated mint.
 const WITHDRAW_FEE: u64 = 1_000;
 
 fn find_instance_pda(instance_seed: &Pubkey) -> (Pubkey, u8) {

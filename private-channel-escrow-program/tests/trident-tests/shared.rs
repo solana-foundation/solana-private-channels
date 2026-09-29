@@ -16,7 +16,8 @@ pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: Pubkey =
     pubkey!("9tgHa1DcnaSSUtmMsst8ovKTe1Gfxzezn27KnH9xXYeU");
 pub const SPL_TOKEN_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
-/// Withdraw fee every harness AllowMint sets. The escrow only checks it is nonzero.
+/// Withdraw fee every harness AllowMint sets. The escrow records it but does not
+/// act on it.
 pub const FUZZ_WITHDRAW_FEE: u64 = 1_000;
 
 /// Clamp raw fuzz amounts to [1, 999_999].

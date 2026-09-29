@@ -7,7 +7,7 @@ use crate::{
         set_mint_2022_with_permanent_delegate, setup_hook_mint, TestContext,
         INVALID_ACCOUNT_DATA_ERROR, INVALID_ADMIN_ERROR, INVALID_ALLOWED_MINT_ERROR,
         MISSING_REQUIRED_SIGNATURE_ERROR, PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, TEST_WITHDRAW_FEE,
-        TOKEN_2022_PROGRAM_ID, ZERO_WITHDRAW_FEE_ERROR,
+        TOKEN_2022_PROGRAM_ID,
     },
 };
 use private_channel_escrow_program_client::instructions::AllowMintBuilder;
@@ -162,10 +162,10 @@ fn test_allow_mint_invalid_pda() {
     assert_program_error(result, INVALID_ALLOWED_MINT_ERROR);
 }
 
-// A mint allowed without a fee would let its channel balance be withdrawn to a
-// rejecting destination over and over at no cost.
+// A zero fee is a deliberate choice for permissioned deployments, so the escrow
+// must allow the mint rather than reject it.
 #[test]
-fn test_allow_mint_zero_fee() {
+fn test_allow_mint_zero_fee_accepted() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let mint = Keypair::new();
@@ -202,12 +202,16 @@ fn test_allow_mint_zero_fee() {
         .withdraw_fee(0)
         .instruction();
 
-    let result = context.send_transaction_with_signers(instruction, &[&admin]);
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("AllowMint with a zero fee should succeed");
 
-    assert_program_error(result, ZERO_WITHDRAW_FEE_ERROR);
-    assert!(
-        context.get_account(&allowed_mint_pda).is_none(),
-        "a rejected AllowMint must not create the PDA"
+    assert_allow_mint_account(
+        &mut context,
+        &allowed_mint_pda,
+        &mint.pubkey(),
+        bump,
+        &TOKEN_PROGRAM_ID,
     );
 }
 

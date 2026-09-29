@@ -23,7 +23,7 @@ J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi
 #### WithdrawFunds
 Burns tokens from the user's token account and emits a `WithdrawFundsEvent` containing the amount and destination. The `destination` is metadata only — it does not route tokens. The indexer decodes the instruction data (not the log) and triggers the corresponding `ReleaseFunds` on Mainnet.
 
-Before burning, it transfers the mint's fee from the same token account to the treasury's, so the balance must cover `amount + fee` or nothing happens. The fee is never reminted when a Solana release fails, so each retry of a withdrawal that cannot settle costs the user the fee. The treasury itself withdraws without paying it. Read `treasury_token_account` from the [fee config](#withdrawfeeconfig); a mint with no config cannot be withdrawn.
+Before burning, it transfers the mint's fee from the same token account to the treasury's, so the balance must cover `amount + fee` or nothing happens. The fee is never reminted when a Solana release fails, so each retry of a withdrawal that cannot settle costs the user the fee. The treasury itself withdraws without paying it. A mint whose fee is `0` charges nothing and never reads `treasury_token_account` (see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint)). Read `treasury_token_account` from the [fee config](#withdrawfeeconfig); a mint with no config cannot be withdrawn, whatever its fee.
 
 Discriminator: `0`
 
@@ -63,7 +63,7 @@ Discriminator: `1`
 **Parameters:**
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `fee` | u64 | Fee in base units charged on top of each withdrawal. Must be nonzero |
+| `fee` | u64 | Fee in base units charged on top of each withdrawal. `0` is allowed and means no fee; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint) |
 | `treasury` | Pubkey | Owner of the token account fees are paid to. Its ATA is derived and stored; the account itself may not exist yet |
 
 **Accounts:**
@@ -103,4 +103,3 @@ The program defines the following custom errors:
 | 4 | `InvalidMintAuthority` | Signer is not the mint authority |
 | 5 | `InvalidTreasuryAccount` | Fee destination is not the configured treasury token account |
 | 6 | `InvalidSystemProgram` | System program account is not the system program |
-| 7 | `ZeroFee` | Withdraw fee must be greater than zero |

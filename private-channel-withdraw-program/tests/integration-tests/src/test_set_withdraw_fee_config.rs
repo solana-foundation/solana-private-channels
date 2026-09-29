@@ -101,6 +101,38 @@ fn test_set_withdraw_fee_config_overwrites() {
     );
 }
 
+// Zero is a supported fee for permissioned deployments, so it is stored rather
+// than rejected.
+#[test]
+fn test_set_withdraw_fee_config_zero_fee() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new();
+
+    set_mint_with_authority(&mut context, &mint.pubkey(), COption::Some(admin.pubkey()));
+    context
+        .airdrop_if_required(&admin.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (withdraw_fee_config, _) = find_withdraw_fee_config_pda(&mint.pubkey());
+
+    let instruction = SetWithdrawFeeConfigBuilder::new()
+        .authority(admin.pubkey())
+        .mint(mint.pubkey())
+        .withdraw_fee_config(withdraw_fee_config)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .fee(0)
+        .treasury(admin.pubkey())
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("SetWithdrawFeeConfig with a zero fee should succeed");
+
+    let config = get_withdraw_fee_config(&mut context, &withdraw_fee_config);
+    assert_eq!(config.fee, 0);
+}
+
 // Anyone can send lamports to the PDA before it exists, which would make a
 // plain CreateAccount fail and wedge every deposit of the mint.
 #[test]

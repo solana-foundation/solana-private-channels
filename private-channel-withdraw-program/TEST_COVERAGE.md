@@ -10,18 +10,18 @@
 | ----------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------- |
 | Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawFeeConfig                                                                         |
 | Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, fee config owner/address, treasury, system program |
-| Business logic error branches | 100% (8/8)   | Zero amount, insufficient funds, balance below amount + fee, zero fee, mint authority, wrong mint           |
-| Custom error codes exercised  | 100% (8/8)   | InvalidMint, ZeroAmount, InvalidFeeConfig, FeeConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram, ZeroFee |
-| State & trait coverage (unit) | 100% (17/17) | Instruction parsing, discriminator, event serialization, fee config layout                                  |
+| Business logic error branches | 100% (8/8)   | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, mint authority, wrong mint      |
+| Custom error codes exercised  | 100% (7/7)   | InvalidMint, ZeroAmount, InvalidFeeConfig, FeeConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram |
+| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, fee config layout                                  |
 | Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                   |
 | Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign fee config, wrong treasury, pre-funded config PDA    |
 | **Overall (risk-weighted)**   | **~90%**     |                                                                                                             |
 
 ## Test Inventory
 
-**17 unit tests** + **24 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
+**16 unit tests** + **26 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
 
-### Unit Tests (17 tests)
+### Unit Tests (16 tests)
 
 #### WithdrawFunds Instruction Data Parsing (8 tests in `withdraw_funds.rs`)
 
@@ -34,11 +34,10 @@
 - `test_parse_instruction_data_non_canonical_option_tag` — Option tag byte other than 0/1 rejected
 - `test_process_withdraw_funds_empty_accounts` — empty accounts returns NotEnoughAccountKeys
 
-#### SetWithdrawFeeConfig (3 tests in `set_withdraw_fee_config.rs`)
+#### SetWithdrawFeeConfig (2 tests in `set_withdraw_fee_config.rs`)
 
 - `test_parse_instruction_data_valid` — fee and treasury parsed from 40 bytes
 - `test_parse_instruction_data_missing_treasury` — fee without treasury rejected
-- `test_process_set_withdraw_fee_config_zero_fee` — ZeroFee returned before any account is read
 
 #### Fee Config State (2 tests in `state/withdraw_fee_config.rs`)
 
@@ -54,7 +53,7 @@
 
 - `test_withdraw_funds_event_to_bytes` — verifies 40-byte layout (8 amount + 32 destination)
 
-### WithdrawFunds — Integration Tests (18 tests)
+### WithdrawFunds — Integration Tests (19 tests)
 
 #### Happy Path
 
@@ -66,6 +65,7 @@
 #### Fee Paths
 
 - `test_withdraw_funds_balance_covers_amount_but_not_fee` — fails as a whole; neither the fee moves nor anything is burned
+- `test_withdraw_funds_zero_fee` — a zero-fee mint burns only the amount and never reads the treasury account, even one that does not exist
 - `test_withdraw_funds_fee_config_not_initialized` — FeeConfigNotInitialized
 - `test_withdraw_funds_fee_config_wrong_address` — another mint's config rejected with InvalidFeeConfig
 - `test_withdraw_funds_wrong_treasury_account` — a token account other than the configured one rejected with InvalidTreasuryAccount
@@ -86,9 +86,10 @@
 - `test_withdraw_funds_invalid_discriminator` — byte 255 discriminator rejected
 - `test_withdraw_funds_not_enough_accounts` — only 3 of 7 required accounts
 
-### SetWithdrawFeeConfig — Integration Tests (6 tests)
+### SetWithdrawFeeConfig — Integration Tests (7 tests)
 
 - `test_set_withdraw_fee_config_creates_config` — stores bump, fee, treasury and the treasury's ATA
+- `test_set_withdraw_fee_config_zero_fee` — a zero fee is stored, not rejected
 - `test_set_withdraw_fee_config_overwrites` — a second call replaces fee, treasury and treasury ATA
 - `test_set_withdraw_fee_config_prefunded_pda` — succeeds when the PDA already holds lamports
 - `test_set_withdraw_fee_config_not_mint_authority` — InvalidMintAuthority

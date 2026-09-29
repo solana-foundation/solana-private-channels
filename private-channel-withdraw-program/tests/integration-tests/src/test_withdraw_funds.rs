@@ -110,6 +110,43 @@ fn test_withdraw_funds_treasury_pays_no_fee() {
     .expect("Treasury withdrawal should succeed without a fee");
 }
 
+// A zero-fee mint charges nothing and never reads the treasury account, so a
+// withdrawal works even when that account does not exist.
+#[test]
+fn test_withdraw_funds_zero_fee() {
+    let mut context = TestContext::new();
+    let user = Keypair::new();
+    let mint = Keypair::new();
+    let admin = Pubkey::new_unique();
+    let missing_treasury_token_account = Pubkey::new_unique();
+
+    set_mint(&mut context, &mint.pubkey());
+    let (withdraw_fee_config, _) = set_withdraw_fee_config(&mut context, &mint.pubkey(), 0, &admin);
+    setup_test_balances(&mut context, &user, &mint.pubkey(), INITIAL_BALANCE);
+
+    let user_ata = get_associated_token_address(&user.pubkey(), &mint.pubkey());
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(user.pubkey())
+        .mint(mint.pubkey())
+        .token_account(user_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_fee_config(withdraw_fee_config)
+        .treasury_token_account(missing_treasury_token_account)
+        .amount(WITHDRAW_AMOUNT)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&user])
+        .expect("a zero-fee withdrawal should succeed");
+
+    assert_eq!(
+        get_token_balance(&mut context, &user_ata),
+        INITIAL_BALANCE - WITHDRAW_AMOUNT
+    );
+}
+
 #[test]
 fn test_withdraw_funds_insufficient_funds() {
     let mut context = TestContext::new();

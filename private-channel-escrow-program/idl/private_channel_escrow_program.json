@@ -238,6 +238,15 @@
                 "format": "u8",
                 "kind": "numberTypeNode"
               }
+            },
+            {
+              "kind": "structFieldTypeNode",
+              "name": "withdrawFee",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
             }
           ],
           "kind": "structTypeNode"
@@ -662,12 +671,6 @@
         "kind": "errorNode",
         "message": "Mint no longer matches the profile recorded at AllowMint",
         "name": "mintProfileChanged"
-      },
-      {
-        "code": 18,
-        "kind": "errorNode",
-        "message": "Withdraw fee must be greater than zero",
-        "name": "zeroWithdrawFee"
       }
     ],
     "instructions": [

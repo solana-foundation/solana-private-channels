@@ -32,10 +32,6 @@ pub enum PrivateChannelWithdrawProgramError {
     /// (6) System program account is not the system program
     #[error("Invalid system program")]
     InvalidSystemProgram,
-
-    /// (7) Withdraw fee must be greater than zero
-    #[error("Withdraw fee must be greater than zero")]
-    ZeroFee,
 }
 
 impl From<PrivateChannelWithdrawProgramError> for ProgramError {

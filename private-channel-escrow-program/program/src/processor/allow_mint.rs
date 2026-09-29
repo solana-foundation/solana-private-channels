@@ -43,19 +43,14 @@ use pinocchio::{
 ///
 /// # Instruction Data
 /// * `bump` (u8) - Bump for the allowed mint PDA
-/// * `withdraw_fee` (u64) - Per-withdrawal fee on the channel. Only validated
-///   here; the indexer reads it from the instruction data.
+/// * `withdraw_fee` (u64) - Per-withdrawal fee on the channel, 0 allowed.
+///   Recorded in `AllowMintEvent`; the indexer reads it from the instruction data.
 pub fn process_allow_mint(
     program_id: &Address,
     accounts: &[AccountView],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = process_instruction_data(instruction_data)?;
-
-    if args.withdraw_fee == 0 {
-        return Err(PrivateChannelEscrowProgramError::ZeroWithdrawFee.into());
-    }
-
     let [payer_info, admin_info, instance_info, mint_info, allowed_mint_info, instance_ata_info, system_program_info, token_program_info, associated_token_program_info, event_authority_info, program_info] =
         accounts
     else {
@@ -147,7 +142,12 @@ pub fn process_allow_mint(
         .try_borrow_mut()?
         .copy_from_slice(&allowed_mint_data);
 
-    let event = AllowMintEvent::new(instance.instance_seed, *mint_info.address(), mint_decimals);
+    let event = AllowMintEvent::new(
+        instance.instance_seed,
+        *mint_info.address(),
+        mint_decimals,
+        args.withdraw_fee,
+    );
     emit_event(
         program_id,
         event_authority_info,
@@ -203,21 +203,6 @@ mod tests {
         let result = process_instruction_data(&[123]);
 
         assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
-    }
-
-    // Rejected before any account is read, so an empty account list still
-    // surfaces the fee error.
-    #[test]
-    fn test_process_allow_mint_zero_fee() {
-        let mut instruction_data = vec![123];
-        instruction_data.extend_from_slice(&0u64.to_le_bytes());
-
-        let result = process_allow_mint(&PRIVATE_CHANNEL_ESCROW_PROGRAM_ID, &[], &instruction_data);
-
-        assert_eq!(
-            result.unwrap_err(),
-            PrivateChannelEscrowProgramError::ZeroWithdrawFee.into()
-        );
     }
 
     #[test]

@@ -114,12 +114,6 @@
         "kind": "errorNode",
         "message": "Invalid system program",
         "name": "invalidSystemProgram"
-      },
-      {
-        "code": 7,
-        "kind": "errorNode",
-        "message": "Withdraw fee must be greater than zero",
-        "name": "zeroFee"
       }
     ],
     "instructions": [

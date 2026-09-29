@@ -266,7 +266,7 @@ cargo run --bin allow_mint -- \
   <WITHDRAW_FEE>
 ```
 
-`<WITHDRAW_FEE>` is required, in the mint's base units (e.g. `10000` is 0.01 USDC). It is charged on top of every withdrawal from the payment channel and paid to the operator admin, so size it to cover the SOL the operator can spend on a release that fails. To reprice, run `allow_mint` again with the new value; it takes effect from the mint's next deposit. Re-running it also re-opens both gates and re-pins the mint profile, so follow the [reprice procedure](./ESCROW_INTERACTION_GUIDE.md#allowmint).
+`<WITHDRAW_FEE>` is required, in the mint's base units (e.g. `10000` is 0.01 USDC). It is charged on top of every withdrawal from the payment channel and paid to the operator admin, so size it to cover the SOL the operator can spend on a release that fails. `0` is allowed but removes that protection, so only use it where every participant is known; see the [zero-fee warning](./ESCROW_INTERACTION_GUIDE.md#allowmint). To reprice, including to or from `0`, run `allow_mint` again with the new value; it takes effect from the mint's next deposit. Re-running it also re-opens both gates and re-pins the mint profile, so follow the [reprice procedure](./ESCROW_INTERACTION_GUIDE.md#allowmint).
 
 ### Add Operator
 

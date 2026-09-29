@@ -16,7 +16,8 @@ use crate::{
 /// Charges the mint's fee on top of `amount`, so a balance below
 /// `amount + fee` fails and nothing is burned. The fee is never reminted if the
 /// Solana release later fails, which is what makes a withdrawal to a
-/// destination that refuses the transfer cost the user every time.
+/// destination that refuses the transfer cost the user every time. A zero-fee
+/// mint charges nothing and leaves `treasury_token_account` unread.
 ///
 /// # Account Layout
 /// 0. `[signer]` user - User initiating the withdrawal
@@ -77,8 +78,11 @@ pub fn process_withdraw_funds(
         return Err(PrivateChannelWithdrawProgramError::InvalidFeeConfig.into());
     }
 
-    // The treasury withdraws the fees it collected without paying one.
-    if user_info.address() != &withdraw_fee_config.treasury {
+    // Nothing is owed on a zero-fee mint, and the treasury withdraws the fees it
+    // collected without paying one. Either way the treasury account goes unused.
+    let charges_fee =
+        withdraw_fee_config.fee > 0 && user_info.address() != &withdraw_fee_config.treasury;
+    if charges_fee {
         if treasury_token_account_info.address() != &withdraw_fee_config.treasury_token_account {
             return Err(PrivateChannelWithdrawProgramError::InvalidTreasuryAccount.into());
         }

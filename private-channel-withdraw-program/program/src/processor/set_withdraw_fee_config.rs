@@ -33,7 +33,7 @@ use crate::{
 /// 3. `[]` system_program - System program
 ///
 /// # Instruction Data
-/// * `fee` (u64) - Fee in base units charged on top of each withdrawal
+/// * `fee` (u64) - Fee in base units charged on top of each withdrawal, 0 allowed
 /// * `treasury` (Pubkey) - Owner of the token account fees are paid to
 pub fn process_set_withdraw_fee_config(
     program_id: &Address,
@@ -41,10 +41,6 @@ pub fn process_set_withdraw_fee_config(
     instruction_data: &[u8],
 ) -> ProgramResult {
     let args = parse_instruction_data(instruction_data)?;
-
-    if args.fee == 0 {
-        return Err(PrivateChannelWithdrawProgramError::ZeroFee.into());
-    }
 
     let [authority_info, mint_info, withdraw_fee_config_info, system_program_info] = accounts
     else {
@@ -149,7 +145,6 @@ mod tests {
     extern crate alloc;
 
     use super::*;
-    use crate::ID as PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID;
     use alloc::vec;
 
     #[test]
@@ -172,25 +167,5 @@ mod tests {
         let result = parse_instruction_data(&instruction_data);
 
         assert_eq!(result.err(), Some(ProgramError::InvalidInstructionData));
-    }
-
-    // Rejected before any account is read, so an empty account list still
-    // surfaces the fee error.
-    #[test]
-    fn test_process_set_withdraw_fee_config_zero_fee() {
-        let mut instruction_data = vec![];
-        instruction_data.extend_from_slice(&0u64.to_le_bytes());
-        instruction_data.extend_from_slice(&[7u8; 32]);
-
-        let result = process_set_withdraw_fee_config(
-            &PRIVATE_CHANNEL_WITHDRAW_PROGRAM_ID,
-            &[],
-            &instruction_data,
-        );
-
-        assert_eq!(
-            result.err(),
-            Some(PrivateChannelWithdrawProgramError::ZeroFee.into())
-        );
     }
 }

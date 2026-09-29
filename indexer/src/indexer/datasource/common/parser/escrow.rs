@@ -173,8 +173,7 @@ pub struct CreateInstanceData {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshDeserialize)]
 pub struct AllowMintData {
     pub bump: u8,
-    /// Per-withdrawal fee on the channel. The escrow rejects zero, so a parsed
-    /// AllowMint always carries a usable fee.
+    /// Per-withdrawal fee on the channel. Zero is allowed and means no fee.
     pub withdraw_fee: u64,
 }
 
