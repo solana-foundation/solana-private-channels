@@ -701,6 +701,7 @@ pub async fn run_setup_withdraw_phase(
                         .mint(mint)
                         .withdraw_fee_config(withdraw_fee_config)
                         .fee(BENCH_WITHDRAW_FEE)
+                        .fee_slot(0)
                         .treasury(admin_keypair.pubkey())
                         .instruction();
                     let tx = Transaction::new_signed_with_payer(

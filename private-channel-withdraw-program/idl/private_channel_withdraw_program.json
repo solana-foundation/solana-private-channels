@@ -26,6 +26,15 @@
             },
             {
               "kind": "structFieldTypeNode",
+              "name": "feeSlot",
+              "type": {
+                "endian": "le",
+                "format": "u64",
+                "kind": "numberTypeNode"
+              }
+            },
+            {
+              "kind": "structFieldTypeNode",
               "name": "treasury",
               "type": {
                 "kind": "publicKeyTypeNode"
@@ -290,6 +299,15 @@
           {
             "kind": "instructionArgumentNode",
             "name": "fee",
+            "type": {
+              "endian": "le",
+              "format": "u64",
+              "kind": "numberTypeNode"
+            }
+          },
+          {
+            "kind": "instructionArgumentNode",
+            "name": "feeSlot",
             "type": {
               "endian": "le",
               "format": "u64",

@@ -34,6 +34,7 @@ fn test_set_withdraw_fee_config_creates_config() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(TEST_WITHDRAW_FEE)
+        .fee_slot(0)
         .treasury(admin.pubkey())
         .instruction();
 
@@ -74,6 +75,7 @@ fn test_set_withdraw_fee_config_overwrites() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(TEST_WITHDRAW_FEE)
+        .fee_slot(0)
         .treasury(admin.pubkey())
         .instruction();
     context
@@ -86,6 +88,7 @@ fn test_set_withdraw_fee_config_overwrites() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(new_fee)
+        .fee_slot(0)
         .treasury(new_treasury)
         .instruction();
     context
@@ -99,6 +102,72 @@ fn test_set_withdraw_fee_config_overwrites() {
         config.treasury_token_account,
         get_associated_token_address(&new_treasury, &mint.pubkey())
     );
+}
+
+// Deposits land in any order, so one built before a reprice can arrive after
+// one built after it. Its older fee must not win, and it must still succeed so
+// the deposit carrying it mints.
+#[test]
+fn test_set_withdraw_fee_config_ignores_an_older_fee_slot() {
+    let mut context = TestContext::new();
+    let admin = Keypair::new();
+    let mint = Keypair::new();
+    let repriced_fee = 10_000;
+    let later_fee = 20_000;
+
+    set_mint_with_authority(&mut context, &mint.pubkey(), COption::Some(admin.pubkey()));
+    context
+        .airdrop_if_required(&admin.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let (withdraw_fee_config, _) = find_withdraw_fee_config_pda(&mint.pubkey());
+
+    let instruction = SetWithdrawFeeConfigBuilder::new()
+        .authority(admin.pubkey())
+        .mint(mint.pubkey())
+        .withdraw_fee_config(withdraw_fee_config)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .fee(repriced_fee)
+        .fee_slot(100)
+        .treasury(admin.pubkey())
+        .instruction();
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("the repriced write should succeed");
+
+    let instruction = SetWithdrawFeeConfigBuilder::new()
+        .authority(admin.pubkey())
+        .mint(mint.pubkey())
+        .withdraw_fee_config(withdraw_fee_config)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .fee(1)
+        .fee_slot(90)
+        .treasury(admin.pubkey())
+        .instruction();
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("a stale write must succeed so its deposit still mints");
+
+    let config = get_withdraw_fee_config(&mut context, &withdraw_fee_config);
+    assert_eq!(config.fee, repriced_fee);
+    assert_eq!(config.fee_slot, 100);
+
+    let instruction = SetWithdrawFeeConfigBuilder::new()
+        .authority(admin.pubkey())
+        .mint(mint.pubkey())
+        .withdraw_fee_config(withdraw_fee_config)
+        .system_program(SYSTEM_PROGRAM_ID)
+        .fee(later_fee)
+        .fee_slot(110)
+        .treasury(admin.pubkey())
+        .instruction();
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("a newer write should succeed");
+
+    let config = get_withdraw_fee_config(&mut context, &withdraw_fee_config);
+    assert_eq!(config.fee, later_fee);
+    assert_eq!(config.fee_slot, 110);
 }
 
 // Zero is a supported fee for permissioned deployments, so it is stored rather
@@ -122,6 +191,7 @@ fn test_set_withdraw_fee_config_zero_fee() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(0)
+        .fee_slot(0)
         .treasury(admin.pubkey())
         .instruction();
 
@@ -155,6 +225,7 @@ fn test_set_withdraw_fee_config_prefunded_pda() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(TEST_WITHDRAW_FEE)
+        .fee_slot(0)
         .treasury(admin.pubkey())
         .instruction();
 
@@ -187,6 +258,7 @@ fn test_set_withdraw_fee_config_not_mint_authority() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(1)
+        .fee_slot(0)
         .treasury(attacker.pubkey())
         .instruction();
 
@@ -215,6 +287,7 @@ fn test_set_withdraw_fee_config_wrong_address() {
         .withdraw_fee_config(wrong_withdraw_fee_config)
         .system_program(SYSTEM_PROGRAM_ID)
         .fee(TEST_WITHDRAW_FEE)
+        .fee_slot(0)
         .treasury(admin.pubkey())
         .instruction();
 
@@ -245,6 +318,7 @@ fn test_set_withdraw_fee_config_wrong_system_program() {
         .withdraw_fee_config(withdraw_fee_config)
         .system_program(fake_system_program)
         .fee(TEST_WITHDRAW_FEE)
+        .fee_slot(0)
         .treasury(admin.pubkey())
         .instruction();
 

@@ -359,6 +359,7 @@ pub fn set_withdraw_fee_config(
 
     let mut data = vec![bump];
     data.extend_from_slice(&fee.to_le_bytes());
+    data.extend_from_slice(&0u64.to_le_bytes()); // fee_slot
     data.extend_from_slice(treasury.as_ref());
     data.extend_from_slice(treasury_token_account.as_ref());
     context.create_account(

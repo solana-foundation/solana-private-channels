@@ -17,9 +17,10 @@ use crate::{
 
 /// Processes the SetWithdrawFeeConfig instruction.
 ///
-/// Creates the mint's fee config on first use and overwrites it on every later
-/// call. The operator sends it in every deposit mint transaction, so the last
-/// fee set at the escrow's AllowMint is always the one in force.
+/// Creates the mint's fee config on first use and overwrites it on later calls
+/// whose `fee_slot` is at or after the stored one. The operator sends it in
+/// every deposit mint transaction, and those land in any order, so a deposit
+/// built before a reprice is a no-op instead of restoring the older fee.
 ///
 /// Every failure is a custom error or a builtin the operator does not retry
 /// on. `InvalidAccountData`, `UninitializedAccount` and `IncorrectProgramId`
@@ -34,6 +35,7 @@ use crate::{
 ///
 /// # Instruction Data
 /// * `fee` (u64) - Fee in base units charged on top of each withdrawal, 0 allowed
+/// * `fee_slot` (u64) - Slot of the AllowMint the fee came from
 /// * `treasury` (Pubkey) - Owner of the token account fees are paid to
 pub fn process_set_withdraw_fee_config(
     program_id: &Address,
@@ -73,7 +75,11 @@ pub fn process_set_withdraw_fee_config(
     }
 
     if withdraw_fee_config_info.owned_by(program_id) {
-        WithdrawFeeConfig::try_from_bytes(&withdraw_fee_config_info.try_borrow()?)?;
+        let stored = WithdrawFeeConfig::try_from_bytes(&withdraw_fee_config_info.try_borrow()?)?;
+        // Ok, not an error: the deposit carrying this write must still mint.
+        if args.fee_slot < stored.fee_slot {
+            return Ok(());
+        }
     } else {
         let bump_seed = [bump];
         let seeds = [
@@ -106,6 +112,7 @@ pub fn process_set_withdraw_fee_config(
     let withdraw_fee_config = WithdrawFeeConfig {
         bump,
         fee: args.fee,
+        fee_slot: args.fee_slot,
         treasury: args.treasury,
         treasury_token_account,
     };
@@ -119,11 +126,12 @@ pub fn process_set_withdraw_fee_config(
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetWithdrawFeeConfigArgs {
     pub fee: u64,
+    pub fee_slot: u64,
     pub treasury: Address,
 }
 
 fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawFeeConfigArgs, ProgramError> {
-    require_len!(data, 8 + 32);
+    require_len!(data, 8 + 8 + 32);
 
     let fee = u64::from_le_bytes(
         data[..8]
@@ -131,13 +139,23 @@ fn parse_instruction_data(data: &[u8]) -> Result<SetWithdrawFeeConfigArgs, Progr
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
-    let treasury = Address::new_from_array(
-        data[8..40]
+    let fee_slot = u64::from_le_bytes(
+        data[8..16]
             .try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
 
-    Ok(SetWithdrawFeeConfigArgs { fee, treasury })
+    let treasury = Address::new_from_array(
+        data[16..48]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+
+    Ok(SetWithdrawFeeConfigArgs {
+        fee,
+        fee_slot,
+        treasury,
+    })
 }
 
 #[cfg(test)]
@@ -150,19 +168,30 @@ mod tests {
     #[test]
     fn test_parse_instruction_data_valid() {
         let fee = 1_234_567u64;
+        let fee_slot = 7_654_321u64;
         let treasury = Address::new_from_array([7u8; 32]);
         let mut instruction_data = vec![];
         instruction_data.extend_from_slice(&fee.to_le_bytes());
+        instruction_data.extend_from_slice(&fee_slot.to_le_bytes());
         instruction_data.extend_from_slice(treasury.as_ref());
 
         let args = parse_instruction_data(&instruction_data).unwrap();
 
-        assert_eq!(args, SetWithdrawFeeConfigArgs { fee, treasury });
+        assert_eq!(
+            args,
+            SetWithdrawFeeConfigArgs {
+                fee,
+                fee_slot,
+                treasury
+            }
+        );
     }
 
     #[test]
     fn test_parse_instruction_data_missing_treasury() {
-        let instruction_data = 1_000u64.to_le_bytes();
+        let mut instruction_data = vec![];
+        instruction_data.extend_from_slice(&1_000u64.to_le_bytes());
+        instruction_data.extend_from_slice(&1u64.to_le_bytes());
 
         let result = parse_instruction_data(&instruction_data);
 

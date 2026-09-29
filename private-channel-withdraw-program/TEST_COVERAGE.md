@@ -6,20 +6,20 @@
 
 ## Summary
 
-| Category                      | Coverage     | Details                                                                                                     |
-| ----------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------- |
-| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawFeeConfig                                                                         |
-| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, fee config owner/address, treasury, system program |
-| Business logic error branches | 100% (8/8)   | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, mint authority, wrong mint      |
+| Category                      | Coverage     | Details                                                                                                                                |
+| ----------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Instruction handlers          | 100% (2/2)   | WithdrawFunds, SetWithdrawFeeConfig                                                                                                    |
+| Account validation paths      | 100% (10/10) | Signer, ATA program, token program, mint, ATA derivation, fee config owner/address, treasury, system program                           |
+| Business logic error branches | 100% (8/8)   | Zero amount, insufficient funds, balance below amount + fee, zero-fee mint, mint authority, wrong mint                                 |
 | Custom error codes exercised  | 100% (7/7)   | InvalidMint, ZeroAmount, InvalidFeeConfig, FeeConfigNotInitialized, InvalidMintAuthority, InvalidTreasuryAccount, InvalidSystemProgram |
-| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, fee config layout                                  |
-| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                   |
-| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign fee config, wrong treasury, pre-funded config PDA    |
-| **Overall (risk-weighted)**   | **~90%**     |                                                                                                             |
+| State & trait coverage (unit) | 100% (16/16) | Instruction parsing, discriminator, event serialization, fee config layout                                                             |
+| Event coverage                | 100% (2/2)   | Serialization unit-tested; on-chain emission verified in integration test                                                              |
+| Security edge cases           | 100% (7/7)   | Non-signer, wrong programs, wrong ATA address, foreign fee config, wrong treasury, pre-funded config PDA                               |
+| **Overall (risk-weighted)**   | **~90%**     |                                                                                                                                        |
 
 ## Test Inventory
 
-**16 unit tests** + **26 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
+**16 unit tests** + **27 integration tests** (LiteSVM) + **10 TypeScript SDK tests**.
 
 ### Unit Tests (16 tests)
 
@@ -36,12 +36,12 @@
 
 #### SetWithdrawFeeConfig (2 tests in `set_withdraw_fee_config.rs`)
 
-- `test_parse_instruction_data_valid` — fee and treasury parsed from 40 bytes
+- `test_parse_instruction_data_valid` — fee, fee slot and treasury parsed from 48 bytes
 - `test_parse_instruction_data_missing_treasury` — fee without treasury rejected
 
 #### Fee Config State (2 tests in `state/withdraw_fee_config.rs`)
 
-- `test_withdraw_fee_config_serialization_roundtrip` — 73-byte layout, byte-asymmetric fee catches field order and endianness
+- `test_withdraw_fee_config_serialization_roundtrip` — 81-byte layout, distinct fee and fee slot catch field order and endianness
 - `test_withdraw_fee_config_try_from_bytes_wrong_length` — short data returns the custom InvalidFeeConfig, never a builtin error
 
 #### Discriminator (2 tests in `discriminator.rs`)
@@ -86,10 +86,11 @@
 - `test_withdraw_funds_invalid_discriminator` — byte 255 discriminator rejected
 - `test_withdraw_funds_not_enough_accounts` — only 3 of 7 required accounts
 
-### SetWithdrawFeeConfig — Integration Tests (7 tests)
+### SetWithdrawFeeConfig — Integration Tests (8 tests)
 
 - `test_set_withdraw_fee_config_creates_config` — stores bump, fee, treasury and the treasury's ATA
 - `test_set_withdraw_fee_config_zero_fee` — a zero fee is stored, not rejected
+- `test_set_withdraw_fee_config_ignores_an_older_fee_slot` — a write from an older AllowMint slot succeeds but leaves the config unchanged, and a newer one still reprices
 - `test_set_withdraw_fee_config_overwrites` — a second call replaces fee, treasury and treasury ATA
 - `test_set_withdraw_fee_config_prefunded_pda` — succeeds when the PDA already holds lamports
 - `test_set_withdraw_fee_config_not_mint_authority` — InvalidMintAuthority

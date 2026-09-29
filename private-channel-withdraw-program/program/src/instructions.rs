@@ -43,6 +43,8 @@ pub enum PrivateChannelWithdrawProgramInstruction {
     SetWithdrawFeeConfig {
         /// Fee in base units charged on top of each withdrawal
         fee: u64,
+        /// Slot of the AllowMint the fee came from; an older one than stored is ignored
+        fee_slot: u64,
         /// Owner of the token account fees are paid to
         treasury: Pubkey,
     } = 1,

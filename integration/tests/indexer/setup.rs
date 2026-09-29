@@ -109,6 +109,8 @@ impl TestEnvironment {
                 .mint(mint)
                 .withdraw_fee_config(withdraw_fee_config)
                 .fee(TEST_WITHDRAW_FEE)
+                // Below any real AllowMint slot, so the operator's deposits still overwrite it.
+                .fee_slot(0)
                 .treasury(admin.pubkey())
                 .instruction(),
         ];

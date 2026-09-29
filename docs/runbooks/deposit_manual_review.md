@@ -350,15 +350,16 @@ as production), or insert directly. The gate (`assert_mint_allowed_at_slot`)
 reads **`mint_status_history`**, so backfilling only `mints` loops
 `pending` → `manual_review` forever — both rows are required. Values must
 match the on-chain mint, and `withdraw_fee` is the `withdraw_fee` argument of
-that `AllowMint` (bytes 2..10 of its instruction data, u64 LE). `status` and
+that `AllowMint` (bytes 2..10 of its instruction data, u64 LE), recorded with
+the same `:allow_mint_slot` so a replayed older AllowMint cannot lower it. `status` and
 `withdrawals_blocked` are left to their defaults (`allowed`, open), which is
 what an `AllowMint` sets:
 
 ```sql
 INSERT INTO mints
-  (mint_address, decimals, token_program, withdraw_fee, created_at)
+  (mint_address, decimals, token_program, withdraw_fee, withdraw_fee_slot, created_at)
 VALUES
-  (:mint, :decimals, :token_program, :withdraw_fee, NOW());
+  (:mint, :decimals, :token_program, :withdraw_fee, :allow_mint_slot, NOW());
 
 -- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
 INSERT INTO mint_status_history

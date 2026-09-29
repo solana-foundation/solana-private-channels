@@ -54,7 +54,7 @@ The instruction emits a `WithdrawFundsEvent` via program log:
 | 6 | `treasury_token_account` | | ✓ | Treasury token account the fee is paid to |
 
 #### SetWithdrawFeeConfig
-Creates the mint's fee config on first use and overwrites it on every later call. Only the mint authority can sign it. The operator sends it in every deposit mint transaction with the fee set at the escrow's `AllowMint` and its own admin as the treasury, so re-allowing a mint with a new fee reprices it from the next deposit on.
+Creates the mint's fee config on first use and overwrites it on later calls whose `fee_slot` is at or after the stored one. Only the mint authority can sign it. The operator sends it in every deposit mint transaction with the fee and slot of the escrow's latest `AllowMint` and its own admin as the treasury, so re-allowing a mint with a new fee reprices it from the next deposit on. Deposits land in any order, so a deposit built before a reprice carries an older `fee_slot`; its write succeeds without changing the config, and the deposit still mints.
 
 Every failure is a custom error. The deposit transaction carries this instruction, and the operator treats `InvalidAccountData`, `UninitializedAccount` or `IncorrectProgramId` from it as a missing mint and retries forever.
 
@@ -64,6 +64,7 @@ Discriminator: `1`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `fee` | u64 | Fee in base units charged on top of each withdrawal. `0` is allowed and means no fee; see the [zero-fee warning](ESCROW_INTERACTION_GUIDE.md#allowmint) |
+| `fee_slot` | u64 | Slot of the `AllowMint` the fee came from. A value older than the stored one leaves the config unchanged |
 | `treasury` | Pubkey | Owner of the token account fees are paid to. Its ATA is derived and stored; the account itself may not exist yet |
 
 **Accounts:**
@@ -77,12 +78,13 @@ Discriminator: `1`
 ## Accounts
 
 #### WithdrawFeeConfig
-Seeds: `["withdraw_fee_config", mint]`. 73 bytes, no discriminator (it is the program's only account type).
+Seeds: `["withdraw_fee_config", mint]`. 81 bytes, no discriminator (it is the program's only account type).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `bump` | u8 | PDA bump |
 | `fee` | u64 | Fee in base units charged on top of each withdrawal |
+| `fee_slot` | u64 | Slot of the `AllowMint` the fee came from; orders later writes |
 | `treasury` | Pubkey | Withdraws without paying the fee |
 | `treasury_token_account` | Pubkey | The treasury's ATA for this mint; fees are credited here |
 

@@ -19,6 +19,9 @@ pub const WITHDRAW_FEE_CONFIG_SEED: &[u8] = b"withdraw_fee_config";
 pub struct WithdrawFeeConfig {
     pub bump: u8,
     pub fee: u64,
+    /// Slot of the AllowMint `fee` came from. A write from an older slot is
+    /// ignored, so a deposit that lands late cannot restore an older fee.
+    pub fee_slot: u64,
     /// Withdraws without paying the fee, so it can move collected fees out.
     pub treasury: Address,
     /// The treasury's ATA for this mint. Fees are credited here.
@@ -28,6 +31,7 @@ pub struct WithdrawFeeConfig {
 impl WithdrawFeeConfig {
     pub const LEN: usize = 1 + // bump
         8 + // fee
+        8 + // fee_slot
         32 + // treasury
         32; // treasury_token_account
 
@@ -35,6 +39,7 @@ impl WithdrawFeeConfig {
         let mut data = Vec::with_capacity(Self::LEN);
         data.push(self.bump);
         data.extend_from_slice(&self.fee.to_le_bytes());
+        data.extend_from_slice(&self.fee_slot.to_le_bytes());
         data.extend_from_slice(self.treasury.as_ref());
         data.extend_from_slice(self.treasury_token_account.as_ref());
         data
@@ -60,6 +65,13 @@ impl WithdrawFeeConfig {
         );
         offset += 8;
 
+        let fee_slot = u64::from_le_bytes(
+            data[offset..offset + 8]
+                .try_into()
+                .map_err(|_| PrivateChannelWithdrawProgramError::InvalidFeeConfig)?,
+        );
+        offset += 8;
+
         let treasury = Address::new_from_array(
             data[offset..offset + 32]
                 .try_into()
@@ -76,6 +88,7 @@ impl WithdrawFeeConfig {
         Ok(Self {
             bump,
             fee,
+            fee_slot,
             treasury,
             treasury_token_account,
         })
@@ -93,6 +106,7 @@ mod tests {
         let config = WithdrawFeeConfig {
             bump: 200,
             fee: 1_234_567,
+            fee_slot: 7_654_321,
             treasury: Address::new_from_array([7u8; 32]),
             treasury_token_account: Address::new_from_array([9u8; 32]),
         };

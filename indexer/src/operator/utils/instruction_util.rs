@@ -298,6 +298,9 @@ pub struct ReleaseFundsBuilderWithNonce {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WithdrawFeeSetup {
     pub fee: u64,
+    /// Slot of the AllowMint `fee` came from. The program ignores a write older
+    /// than the stored one, so a deposit that lands late cannot restore it.
+    pub fee_slot: u64,
     pub treasury: Pubkey,
 }
 
@@ -442,6 +445,7 @@ impl MintToBuilder {
                     .mint(mint)
                     .withdraw_fee_config(withdraw_fee_config)
                     .fee(withdraw_fee_setup.fee)
+                    .fee_slot(withdraw_fee_setup.fee_slot)
                     .treasury(withdraw_fee_setup.treasury)
                     .instruction(),
             );
@@ -605,6 +609,7 @@ mod tests {
         b.idempotency_memo("test:memo".to_string())
             .withdraw_fee_setup(WithdrawFeeSetup {
                 fee: 1_000,
+                fee_slot: 0,
                 treasury,
             });
 

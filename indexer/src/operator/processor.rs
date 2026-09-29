@@ -1240,6 +1240,9 @@ pub async fn process_deposit_funds(
                 // burns, so it collects the fee that pays for it.
                 .withdraw_fee_setup(WithdrawFeeSetup {
                     fee: mint_row.withdraw_fee.value(),
+                    // Lets the program drop this write if a deposit built after
+                    // a reprice has already landed.
+                    fee_slot: mint_row.withdraw_fee_slot as u64,
                     treasury: processor_state.admin_pubkey,
                 });
 
@@ -2930,8 +2933,9 @@ mod tests {
     #[tokio::test]
     async fn process_deposit_funds_sends_mint_builder() {
         let mock = MockStorage::new();
-        let storage = Arc::new(Storage::Mock(mock));
+        let storage = Arc::new(Storage::Mock(mock.clone()));
         let admin = Pubkey::new_unique();
+        let fee_slot = 42u64;
         let mut ps = ProcessorState {
             admin_pubkey: admin,
             release_funds_state: None,
@@ -2941,6 +2945,12 @@ mod tests {
         let mint_pubkey = Pubkey::new_unique();
         let recipient = Pubkey::new_unique();
         insert_mint_row(&storage, &mint_pubkey);
+        mock.mints
+            .lock()
+            .unwrap()
+            .get_mut(&mint_pubkey.to_string())
+            .unwrap()
+            .withdraw_fee_slot = fee_slot as i64;
 
         let (fetcher_tx, fetcher_rx) = mpsc::channel::<DbTransaction>(1);
         let (sender_tx, mut sender_rx) = mpsc::channel(10);
@@ -2977,8 +2987,9 @@ mod tests {
         assert_eq!(b.txn_id, 1);
         assert_eq!(b.trace_id, "trace-1");
 
-        // The deposit writes the fee config: the fee from the mints row, and the
-        // operator admin as treasury. Data is [discriminator][fee u64 LE][treasury].
+        // The deposit writes the fee config: the fee and its AllowMint slot from
+        // the mints row, and the operator admin as treasury. Data is
+        // [discriminator][fee u64 LE][fee_slot u64 LE][treasury].
         let instructions = b.builder.instructions().unwrap();
         let set_withdraw_fee_config = &instructions[1];
         assert_eq!(
@@ -2989,7 +3000,11 @@ mod tests {
             &set_withdraw_fee_config.data[1..9],
             &TEST_WITHDRAW_FEE.to_le_bytes()
         );
-        assert_eq!(&set_withdraw_fee_config.data[9..41], admin.as_ref());
+        assert_eq!(
+            &set_withdraw_fee_config.data[9..17],
+            &fee_slot.to_le_bytes()
+        );
+        assert_eq!(&set_withdraw_fee_config.data[17..49], admin.as_ref());
     }
 
     /// The deposit mint's on-chain memo must key on the event's chain coordinates,

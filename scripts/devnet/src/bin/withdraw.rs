@@ -87,7 +87,10 @@ fn main() -> Result<()> {
         "Withdraw fee: {} (paid to {})",
         fee, withdraw_fee_config.treasury_token_account
     );
-    println!("Total debited: {} (amount + fee)", amount + fee);
+    let total = amount
+        .checked_add(fee)
+        .ok_or("amount + fee exceeds u64::MAX, so no balance can cover this withdrawal")?;
+    println!("Total debited: {} (amount + fee)", total);
 
     let instruction = WithdrawFunds {
         user: user_keypair.pubkey(),
