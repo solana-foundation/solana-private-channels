@@ -82,16 +82,19 @@ fn test_withdraw_funds_with_destination() {
 }
 
 // The admin moves out the fees it collected, so charging it would only
-// shuffle tokens between its own account and itself.
+// shuffle tokens between its own account and itself. That self-transfer is a
+// no-op, so the balance alone cannot tell the exemption apart. Only the exempt
+// path leaves the treasury account unread, which a wrong one here proves.
 #[test]
 fn test_withdraw_funds_treasury_pays_no_fee() {
     let mut context = TestContext::new();
     let admin = Keypair::new();
     let mint = Keypair::new();
+    let unread_treasury_token_account = Pubkey::new_unique();
 
     set_mint(&mut context, &mint.pubkey());
     // Before the balance: the config setup resets the treasury ATA to zero.
-    set_withdraw_fee_config(
+    let (withdraw_fee_config, _) = set_withdraw_fee_config(
         &mut context,
         &mint.pubkey(),
         TEST_WITHDRAW_FEE,
@@ -99,15 +102,27 @@ fn test_withdraw_funds_treasury_pays_no_fee() {
     );
     setup_test_balances(&mut context, &admin, &mint.pubkey(), INITIAL_BALANCE);
 
-    assert_get_or_withdraw_funds(
-        &mut context,
-        &admin,
-        &mint.pubkey(),
-        WITHDRAW_AMOUNT,
-        None,
-        false,
-    )
-    .expect("Treasury withdrawal should succeed without a fee");
+    let admin_ata = get_associated_token_address(&admin.pubkey(), &mint.pubkey());
+
+    let instruction = WithdrawFundsBuilder::new()
+        .user(admin.pubkey())
+        .mint(mint.pubkey())
+        .token_account(admin_ata)
+        .token_program(TOKEN_PROGRAM_ID)
+        .associated_token_program(ATA_PROGRAM_ID)
+        .withdraw_fee_config(withdraw_fee_config)
+        .treasury_token_account(unread_treasury_token_account)
+        .amount(WITHDRAW_AMOUNT)
+        .instruction();
+
+    context
+        .send_transaction_with_signers(instruction, &[&admin])
+        .expect("Treasury withdrawal should succeed without a fee");
+
+    assert_eq!(
+        get_token_balance(&mut context, &admin_ata),
+        INITIAL_BALANCE - WITHDRAW_AMOUNT
+    );
 }
 
 // A zero-fee mint charges nothing and never reads the treasury account, so a

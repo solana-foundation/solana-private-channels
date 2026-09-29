@@ -3107,8 +3107,7 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
     .await;
     // The operator proves non-release before reminting, and on this validator finality and
     // indexing lag can outrun its three 32s tries. If it did not finish, remint as it would.
-    let reminted_by_operator = settled == "failed_reminted";
-    if !reminted_by_operator {
+    if settled != "failed_reminted" {
         stack.stop().await;
         remint_as_operator(
             &client,
@@ -3126,27 +3125,13 @@ async fn e2e_escrow_resync_does_not_release_a_reminted_withdrawal(
         "failed_reminted"
     );
     // The remint restores the burned amount but not the fee, so a withdrawal
-    // that cannot settle costs the user one fee each time it is retried.
-    if reminted_by_operator {
-        assert_eq!(
-            token_balance(&client, user.pubkey(), env.mint).await,
-            user_before_withdrawal - TEST_WITHDRAW_FEE,
-            "a failed release must still cost the withdraw fee"
-        );
-    } else {
-        // The fallback reminted the indexed amount itself, so the balance would
-        // only echo that helper. What still holds is that the amount the operator
-        // remints from excludes the fee.
-        let indexed_amount: i64 =
-            sqlx::query_scalar("SELECT amount::bigint FROM transactions WHERE signature = $1")
-                .bind(&withdrawal.signature)
-                .fetch_one(&fresh_pool(&db_url).await)
-                .await?;
-        assert_eq!(
-            indexed_amount as u64, WITHDRAW_AMOUNT,
-            "the indexed withdrawal amount must exclude the fee"
-        );
-    }
+    // that cannot settle costs the user one fee each time it is retried. Both
+    // paths remint the indexed amount, so this holds whichever one ran.
+    assert_eq!(
+        token_balance(&client, user.pubkey(), env.mint).await,
+        user_before_withdrawal - TEST_WITHDRAW_FEE,
+        "a failed release must still cost the withdraw fee"
+    );
     let (_, nonce, _) = row_of(&db_url, &withdrawal.signature).await;
     let nonce = nonce.expect("a withdrawal carries a nonce") as u64;
 
