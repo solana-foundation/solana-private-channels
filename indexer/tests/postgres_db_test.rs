@@ -822,6 +822,46 @@ async fn upsert_mint_updates_decimals_and_fee() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// A backfill or resync can write an older AllowMint after a newer one. The fee
+/// follows the AllowMint's slot, not the order the rows were written in.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_fee_ignores_an_older_allow_mint() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let mint = "mint_fee_slot";
+
+    let newer_fee = TokenAmount(10_000);
+    storage
+        .upsert_mints_batch(&[DbMint {
+            withdraw_fee_slot: 100,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), newer_fee)
+        }])
+        .await?;
+
+    // The replayed older AllowMint leaves the newer fee and its slot alone.
+    storage
+        .upsert_mints_batch(&[DbMint {
+            withdraw_fee_slot: 90,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), TokenAmount(1))
+        }])
+        .await?;
+    let got = storage.get_mint(mint).await?.unwrap();
+    assert_eq!(got.withdraw_fee, newer_fee);
+    assert_eq!(got.withdraw_fee_slot, 100);
+
+    // A later AllowMint still reprices.
+    let repriced_fee = TokenAmount(20_000);
+    storage
+        .upsert_mints_batch(&[DbMint {
+            withdraw_fee_slot: 110,
+            ..DbMint::new(mint.to_string(), 6, "TokenkegQ".to_string(), repriced_fee)
+        }])
+        .await?;
+    let got = storage.get_mint(mint).await?.unwrap();
+    assert_eq!(got.withdraw_fee, repriced_fee);
+    assert_eq!(got.withdraw_fee_slot, 110);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_mint_status_mirrors_history_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {

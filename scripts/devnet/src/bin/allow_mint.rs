@@ -38,7 +38,8 @@ fn main() -> Result<()> {
         );
         eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv So11111111111111111111111111111111111111112 10000", args[0]);
         eprintln!("\n<withdraw-fee> is in the mint's base units, charged on top of every PrivateChannel withdrawal. Must be nonzero.");
-        eprintln!("Run again with a new fee to reprice; it applies from the next deposit, and also re-opens both gates.");
+        eprintln!("Run again with a new fee to reprice; it applies from the next deposit.");
+        eprintln!("Re-running also re-opens both gates and re-pins the mint profile, accepting any change since the last allow.");
         std::process::exit(1);
     }
 

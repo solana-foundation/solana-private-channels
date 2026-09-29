@@ -69,7 +69,7 @@ to the right Path below.
 | `error_message` contains | Cause |
 |---|---|
 | `has no allowed status in mint_status_history` | The deposit's `mint` has no `allowed` entry in `mint_status_history` at the deposit's slot. The `mints` row may exist — the gate reads `mint_status_history`, not `mints`. The operator refused to issue private channel tokens because no indexed `AllowMint` event authorizes this mint at that slot. Row data is fine; no on-chain mint attempted. See **Path F**. |
-| `withdraw fee unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee the deposit must write to the channel is unknown (metric label `withdraw_fee_unknown`). This happens when the indexer started after the mint's `AllowMint`. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee, its history insert is a no-op, then re-arm. |
+| `withdraw fee unknown` | The mint is allowed in `mint_status_history` but has no `mints` row, so the withdraw fee the deposit must write to the channel is unknown (metric label `withdraw_fee_unknown`). This happens when the mint's `AllowMint` was never indexed (the indexer started after it) but a later `BlockMint` that re-opened deposits was, since that writes an `allowed` status without a `mints` row; a missed `AllowMint` alone trips the allowlist gate (Path F) first. No on-chain mint attempted. Recover with **Path F, Step 3a**: it inserts the `mints` row with the `AllowMint`'s fee, its history insert is a no-op, then re-arm. |
 
 Pull the row:
 

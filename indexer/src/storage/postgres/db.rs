@@ -807,6 +807,7 @@ impl PostgresDb {
                 decimals SMALLINT NOT NULL,
                 token_program TEXT NOT NULL,
                 withdraw_fee NUMERIC(20,0) NOT NULL,
+                withdraw_fee_slot BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -3012,12 +3013,20 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program, status, withdraw_fee)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO mints
+                    (mint_address, decimals, token_program, status, withdraw_fee, withdraw_fee_slot)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program,
-                    withdraw_fee = EXCLUDED.withdraw_fee
+                    -- Slot-ordered like mint_status_history: a backfill or resync
+                    -- replaying an older AllowMint cannot lower a newer fee.
+                    withdraw_fee = CASE
+                        WHEN EXCLUDED.withdraw_fee_slot >= mints.withdraw_fee_slot
+                        THEN EXCLUDED.withdraw_fee
+                        ELSE mints.withdraw_fee
+                    END,
+                    withdraw_fee_slot = GREATEST(mints.withdraw_fee_slot, EXCLUDED.withdraw_fee_slot)
                 "#,
             )
             .bind(&mint.mint_address)
@@ -3025,6 +3034,7 @@ impl PostgresDb {
             .bind(&mint.token_program)
             .bind(&mint.status)
             .bind(mint.withdraw_fee)
+            .bind(mint.withdraw_fee_slot)
             .execute(&mut *tx)
             .await?;
         }

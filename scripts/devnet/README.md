@@ -56,7 +56,7 @@ cargo run --bin allow_mint -- \
   <MINT_ADDRESS> \
   <WITHDRAW_FEE>
 ```
-`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin. It must be nonzero. Run again with a new value to reprice; it applies from the mint's next deposit, and also re-opens both gates.
+`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin. It must be nonzero. Run again with a new value to reprice; it applies from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint).
 
 ## 4. Deposit (Solana → Solana Private Channels)
 ```bash

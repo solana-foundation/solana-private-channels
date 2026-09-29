@@ -63,7 +63,7 @@ Discriminator: `1`
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `bump` | u8 | PDA bump seed for allowed mint account |
-| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. Must be nonzero. The escrow only validates it; the indexer reads it from the instruction data and the operator writes it to the channel's fee config on every deposit, so re-allowing with a new value reprices from the next deposit on |
+| `withdraw_fee` | u64 | Fee in base units charged on each channel withdrawal of this mint. Must be nonzero. The escrow only validates it; the indexer reads it from the instruction data and the operator writes it to the channel's fee config on every deposit, so re-allowing with a new value reprices from the next deposit on. A re-allow also re-opens both gates and re-pins the profile; see the [reprice procedure](ESCROW_INTERACTION_GUIDE.md#allowmint) |
 
 **Accounts:**
 | Account | Name | Signer | Writable | Description |

@@ -696,12 +696,15 @@ fn convert_to_db_models(
                 } => {
                     let mint_address = accounts.mint.to_string();
                     (
-                        Some(DbMint::new(
-                            mint_address.clone(),
-                            event.decimals as i16,
-                            accounts.token_program.to_string(),
-                            TokenAmount(data.withdraw_fee),
-                        )),
+                        Some(DbMint {
+                            withdraw_fee_slot: instruction_meta.slot as i64,
+                            ..DbMint::new(
+                                mint_address.clone(),
+                                event.decimals as i16,
+                                accounts.token_program.to_string(),
+                                TokenAmount(data.withdraw_fee),
+                            )
+                        }),
                         Some(MintStatusChange {
                             mint_address,
                             status: MintStatus::Allowed,
@@ -1079,6 +1082,10 @@ mod tests {
         assert_eq!(mint.decimals, 6);
         assert_eq!(mint.status, "allowed");
         assert_eq!(mint.withdraw_fee, TokenAmount(ALLOW_MINT_WITHDRAW_FEE));
+        assert_eq!(
+            mint.withdraw_fee_slot, 200,
+            "the fee is stamped with its AllowMint's slot"
+        );
     }
 
     #[test]

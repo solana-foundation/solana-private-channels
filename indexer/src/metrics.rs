@@ -177,10 +177,11 @@ pub const BAIL_REASON_ESCROW_DRAINED: &str = "escrow_drained";
 pub const BAIL_REASON_ESCROW_FROZEN: &str = "escrow_frozen";
 pub const BAIL_REASON_HOOK_UNRESOLVABLE: &str = "hook_unresolvable";
 pub const BAIL_REASON_MINT_PROFILE_MISMATCH: &str = "mint_profile_mismatch";
+pub const BAIL_REASON_DESTINATION_REFUSES_CREDITS: &str = "destination_refuses_credits";
 /// Deposit-side: no `mints` row, so the fee the channel config needs is unknown.
 pub const BAIL_REASON_WITHDRAW_FEE_UNKNOWN: &str = "withdraw_fee_unknown";
 
-pub const BAIL_REASONS: [&str; 9] = [
+pub const BAIL_REASONS: [&str; 10] = [
     BAIL_REASON_UNSUPPORTED_MINT,
     BAIL_REASON_WITHDRAWALS_BLOCKED,
     BAIL_REASON_TARGET_MINT_MISSING,
@@ -189,6 +190,7 @@ pub const BAIL_REASONS: [&str; 9] = [
     BAIL_REASON_ESCROW_FROZEN,
     BAIL_REASON_HOOK_UNRESOLVABLE,
     BAIL_REASON_MINT_PROFILE_MISMATCH,
+    BAIL_REASON_DESTINATION_REFUSES_CREDITS,
     BAIL_REASON_WITHDRAW_FEE_UNKNOWN,
 ];
 

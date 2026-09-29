@@ -11,8 +11,8 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
-    pausable::PausableConfig, transfer_hook::TransferHook, BaseStateWithExtensions,
-    StateWithExtensions,
+    confidential_transfer::ConfidentialTransferAccount, pausable::PausableConfig,
+    transfer_hook::TransferHook, BaseStateWithExtensions, StateWithExtensions,
 };
 use spl_token_2022::state::Account as Token2022AccountState;
 use spl_token_2022::state::AccountState;
@@ -392,6 +392,50 @@ impl MintCache {
         Ok(state.base.state == AccountState::Frozen)
     }
 
+    /// Whether the token account refuses an ordinary transfer because its owner
+    /// turned off non-confidential credits (`DisableNonConfidentialCredits`).
+    ///
+    /// A release to such an account fails on-chain after the operator has paid
+    /// for it, so the withdrawal pre-flight parks it instead. Best-effort: the
+    /// owner can flip the flag after this read, and then the withdraw fee is
+    /// the bound. Only call this once the reviewed profile says the mint has
+    /// `ConfidentialTransferMint`, the only mint whose accounts can carry it.
+    pub async fn refuses_non_confidential_credits(
+        &self,
+        ata: &Pubkey,
+    ) -> Result<bool, OperatorError> {
+        let rpc = self.rpc_client.as_ref().ok_or_else(|| {
+            OperatorError::RpcError(
+                "refuses_non_confidential_credits requires an RPC client".to_string(),
+            )
+        })?;
+
+        let response = rpc
+            .get_account_with_context(ata, rpc.rpc_client.commitment())
+            .await
+            .map_err(|e| OperatorError::RpcError(format!("get_account({ata}): {e}")))?;
+
+        // A missing account fails the release for its own reason; this check is
+        // only about one that exists but will not take the transfer.
+        let Some(account) = response.value else {
+            return Ok(false);
+        };
+
+        // The address is the user's choice, so anything that is not a Token-2022
+        // account parks here rather than halting the pipeline. It could not be
+        // credited either.
+        if account.owner != TOKEN_2022_PROGRAM_ID {
+            return Ok(true);
+        }
+        let Ok(state) = StateWithExtensions::<Token2022AccountState>::unpack(&account.data) else {
+            return Ok(true);
+        };
+
+        Ok(state
+            .get_extension::<ConfidentialTransferAccount>()
+            .is_ok_and(|extension| !bool::from(extension.allow_non_confidential_credits)))
+    }
+
     async fn fetch_mint_from_rpc(
         &self,
         mint: &Pubkey,
@@ -481,6 +525,9 @@ mod tests {
     use solana_client::rpc_request::RpcRequest;
     use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
+    use spl_token_2022::extension::{
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    };
     use spl_token_2022::ID as TOKEN_2022_PROGRAM_ID;
     use std::time::Duration;
 
@@ -546,6 +593,7 @@ mod tests {
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
             withdraw_fee: TokenAmount(1),
+            withdraw_fee_slot: 0,
             mint_address: mint.to_string(),
             decimals,
             token_program: token_program.to_string(),
@@ -595,6 +643,7 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(1),
+                withdraw_fee_slot: 0,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -648,6 +697,7 @@ mod tests {
             mock.add_mint(DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(1),
+                withdraw_fee_slot: 0,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -679,6 +729,7 @@ mod tests {
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
             withdraw_fee: TokenAmount(1),
+            withdraw_fee_slot: 0,
             mint_address: spl_mint.to_string(),
             decimals: 6,
             token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -688,6 +739,7 @@ mod tests {
         mock.add_mint(DbMint {
             withdrawals_blocked: false,
             withdraw_fee: TokenAmount(1),
+            withdraw_fee_slot: 0,
             mint_address: t22_mint.to_string(),
             decimals: 9,
             token_program: TOKEN_2022_PROGRAM_ID.to_string(),
@@ -763,6 +815,7 @@ mod tests {
             DbMint {
                 withdrawals_blocked: false,
                 withdraw_fee: TokenAmount(1),
+                withdraw_fee_slot: 0,
                 mint_address: mint.to_string(),
                 decimals: 6,
                 token_program: TOKEN_PROGRAM_ID.to_string(),
@@ -920,6 +973,116 @@ mod tests {
             .await
             .expect("a missing ATA is not a transient failure");
         assert!(!frozen, "an account that does not exist cannot be frozen");
+    }
+
+    /// A Token-2022 account carrying `ConfidentialTransferAccount`, as the
+    /// `getAccountInfo` response for the destination ATA.
+    fn confidential_account_response(allow_non_confidential_credits: bool) -> serde_json::Value {
+        let len = ExtensionType::try_calculate_account_len::<Token2022AccountState>(&[
+            ExtensionType::ConfidentialTransferAccount,
+        ])
+        .expect("a fixed-length extension has a calculable account length");
+        let mut data = vec![0u8; len];
+        let mut state =
+            StateWithExtensionsMut::<Token2022AccountState>::unpack_uninitialized(&mut data)
+                .expect("a zeroed buffer holds an uninitialized account");
+        state
+            .init_extension::<ConfidentialTransferAccount>(true)
+            .expect("the extension fits the calculated length")
+            .allow_non_confidential_credits = allow_non_confidential_credits.into();
+        state.base = Token2022AccountState {
+            mint: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        };
+        state.pack_base();
+        state
+            .init_account_type()
+            .expect("the account type matches the extension");
+
+        serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(data), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        })
+    }
+
+    fn cache_answering(response: serde_json::Value) -> MintCache {
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, response);
+        MintCache::with_rpc(
+            Arc::new(Storage::Mock(MockStorage::new())),
+            Arc::new(RpcClientWithRetry::new_mocked(mocks)),
+        )
+    }
+
+    /// `DisableNonConfidentialCredits` is what makes a release to this account
+    /// fail on-chain, so the flag alone decides.
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_reads_the_extension_flag() {
+        for allow_non_confidential_credits in [true, false] {
+            let cache = cache_answering(confidential_account_response(
+                allow_non_confidential_credits,
+            ));
+
+            assert_eq!(
+                cache
+                    .refuses_non_confidential_credits(&Pubkey::new_unique())
+                    .await
+                    .unwrap(),
+                !allow_non_confidential_credits
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_accepts_an_account_without_the_extension() {
+        let cache = cache_answering(serde_json::json!({
+            "context": {"slot": 1},
+            "value": {
+                "owner": TOKEN_2022_PROGRAM_ID.to_string(),
+                "lamports": 1_000_000u64,
+                "data": [STANDARD.encode(create_mock_token_account_data(0, false)), "base64"],
+                "executable": false,
+                "rentEpoch": 0
+            }
+        }));
+
+        assert!(!cache
+            .refuses_non_confidential_credits(&Pubkey::new_unique())
+            .await
+            .unwrap());
+    }
+
+    /// A missing ATA fails the release for its own reason, which this check does
+    /// not claim to catch.
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_ignores_a_missing_account() {
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let cache = MintCache::with_rpc(storage, Arc::new(rpc_reporting_absent_account()));
+
+        assert!(!cache
+            .refuses_non_confidential_credits(&Pubkey::new_unique())
+            .await
+            .expect("a missing ATA is not a transient failure"));
+    }
+
+    /// The address is user-chosen, so an account Token-2022 does not own parks
+    /// instead of surfacing as an error that would halt the pipeline.
+    #[tokio::test]
+    async fn refuses_non_confidential_credits_refuses_a_foreign_account() {
+        let cache = cache_answering(token_account_response(0, false));
+
+        assert!(cache
+            .refuses_non_confidential_credits(&Pubkey::new_unique())
+            .await
+            .unwrap());
     }
 
     /// The gate that decides whether a withdrawal pays for the ATA read at all.
