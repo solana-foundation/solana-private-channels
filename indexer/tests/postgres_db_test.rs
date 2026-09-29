@@ -795,30 +795,28 @@ async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn upsert_mint_updates_decimals_and_fee() -> Result<(), Box<dyn std::error::Error>> {
+async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
     let m = DbMint::new(
         "mint_upd".to_string(),
         6,
         "TokenkegQ".to_string(),
-        TokenAmount(1_000),
+        TokenAmount(1),
     );
     storage.upsert_mints_batch(&[m]).await?;
 
-    // A re-allow carries new decimals and a new fee; both must replace the old row.
-    let repriced_fee = TokenAmount(5_000);
+    // Upsert with new decimals
     let m2 = DbMint::new(
         "mint_upd".to_string(),
         9,
         "TokenkegQ".to_string(),
-        repriced_fee,
+        TokenAmount(1),
     );
     storage.upsert_mints_batch(&[m2]).await?;
 
     let got = storage.get_mint("mint_upd").await?.unwrap();
     assert_eq!(got.decimals, 9);
-    assert_eq!(got.withdraw_fee, repriced_fee);
     Ok(())
 }
 

@@ -43,7 +43,6 @@ pub const INVALID_TREASURY_ACCOUNT_ERROR: u32 =
     PrivateChannelWithdrawProgramError::InvalidTreasuryAccount as u32;
 pub const INVALID_SYSTEM_PROGRAM_ERROR: u32 =
     PrivateChannelWithdrawProgramError::InvalidSystemProgram as u32;
-pub const ZERO_FEE_ERROR: u32 = PrivateChannelWithdrawProgramError::ZeroFee as u32;
 
 /// Fee the test configs charge on top of each withdrawal.
 pub const TEST_WITHDRAW_FEE: u64 = 1_000;

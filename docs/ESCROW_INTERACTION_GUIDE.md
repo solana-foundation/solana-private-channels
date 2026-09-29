@@ -105,7 +105,7 @@ const allowMintIx = await getAllowMintInstructionAsync({
 - Token-2022 mints with `PermanentDelegate` or `PausableConfig` extensions are accepted; the operator enforces drain detection and pause state off-chain via a withdrawal pre-flight
 - Only the instance admin can allow mints
 - `withdrawFee` is required and must be nonzero (`ZeroWithdrawFee`). It is charged on top of every channel withdrawal of this mint and paid to the operator admin, so it has to cover the SOL the operator can spend on a release that fails on-chain. AllowMint is the only way to reprice, and calling it again does three things beyond changing the fee:
-  - **Re-opens both gates.** Send a `BlockMint` in the same transaction to keep the mint blocked.
+  - **Re-opens both gates.** To keep the mint blocked, send a `BlockMint` in a later transaction, once the AllowMint is confirmed. Not in the same one: both would share a slot, the indexer records one status per mint and slot, and it would keep the AllowMint's, so its mirror would read open while the chain is blocked.
   - **Re-pins the mint profile.** Any profile change since the last allow is accepted silently, so `MintProfileChanged` no longer catches it. Review the mint before repricing.
   - **Applies on the next deposit.** The operator writes the fee to the channel with each deposit, so until one lands withdrawals pay the old fee. Make a small deposit yourself to apply it now.
 
