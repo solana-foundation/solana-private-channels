@@ -555,7 +555,7 @@ async fn test_withdrawal_operator_prevents_double_withdrawal(
     let env = TestEnvironment::setup(&client, &faucet_keypair, 1, 1_000_000, None).await?;
     TestEnvironment::setup_operator(&client, &faucet_keypair, env.instance).await?;
 
-    // Seed mint metadata so the withdrawal operator can build the instruction.
+    // Seed the mint row. The release itself builds from AllowedMint, not this.
     let mint_meta = DbMint::new(env.mint.to_string(), 6, spl_token::id().to_string());
     storage.upsert_mints_batch(&[mint_meta]).await?;
     seed_mint_status_allowed(&storage, &env.mint.to_string()).await?;

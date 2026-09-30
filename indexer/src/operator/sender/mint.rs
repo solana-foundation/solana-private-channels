@@ -188,12 +188,10 @@ pub(super) async fn try_jit_mint_initialization(
         }
     }
 
-    // Look up the mint's decimals. This is a pure metadata read,
-    // only `decimals` is used.
+    // Look up the mint's decimals.
     //
-    // `get_mint_metadata` checks the in-memory cache first, then the
-    // DB, and finally falls back to a source-chain RPC fetch if
-    // neither has the mint. That last fallback would be dangerous on
+    // `get_mint_decimals` reads the DB and falls back to a source-chain
+    // RPC fetch if it has no row. That fallback would be dangerous on
     // its own: it would let any source-chain mint be resolved
     // here, initialized on the private channel, and minted into a
     // user's account.
@@ -203,20 +201,17 @@ pub(super) async fn try_jit_mint_initialization(
     // allowed status at the deposit's slot (see
     // `assert_mint_allowed_at_slot` in `process_deposit_funds`). By the
     // time execution reaches this point, the mint is known-allowed.
-    let Ok(mint_metadata) = state.mint_cache.get_mint_metadata(&mint).await else {
-        error!("Mint {} not found in mint cache", mint);
-        return JitOutcome::Transient(format!("mint not in mint cache: {}", mint));
+    let Ok(decimals) = state.mint_cache.get_mint_decimals(&mint).await else {
+        error!("Mint {} decimals unavailable", mint);
+        return JitOutcome::Transient(format!("mint decimals unavailable: {}", mint));
     };
 
-    info!(
-        "Found mint metadata: {} decimals for {}",
-        mint_metadata.decimals, mint
-    );
+    info!("Found mint decimals: {} for {}", decimals, mint);
 
     // 4. Build InitializeMint transaction.
     let init_mint_builder = InitializeMintBuilder::new(
         mint,
-        mint_metadata.decimals,
+        decimals,
         admin_pubkey,
         state.mint_cache.get_private_channel_token_program(),
         admin_pubkey,
