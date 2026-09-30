@@ -21,7 +21,7 @@ use solana_transaction_status::{
 use spl_token::solana_program::program_pack::Pack;
 use spl_token::state::Mint;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
@@ -439,6 +439,23 @@ pub struct ConsumedMint {
 /// row to its terminal state.
 pub type ConsumedSet = HashMap<SourceEventId, ConsumedMint>;
 
+/// Whose channel history a consumed-set scan lists, and which of its transactions count.
+#[derive(Clone, Copy, Debug)]
+enum Scope {
+    /// Mints the authority signed.
+    Signer(Pubkey),
+    /// Mints on this receipt mint, by whichever key held its mint authority at the time.
+    Mint(Pubkey),
+}
+
+impl Scope {
+    fn address(&self) -> &Pubkey {
+        match self {
+            Scope::Signer(address) | Scope::Mint(address) => address,
+        }
+    }
+}
+
 /// Enumerate every idempotency-memo'd mint the `authority` has confirmed on the channel
 /// into a `ConsumedSet`. Transactions the authority did not sign are skipped.
 ///
@@ -451,14 +468,41 @@ pub async fn enumerate_consumed_mints(
     authority: &Pubkey,
     page_limit: usize,
 ) -> Result<ConsumedSet, String> {
+    let mut set = ConsumedSet::new();
+    collect(rpc, Scope::Signer(*authority), page_limit, &mut set).await?;
+    Ok(set)
+}
+
+/// Add every memo'd `MintTo` on `mint` to `set` whoever signed it, so keys rotated out of the
+/// mint authority count too, and return how many were added. Fails closed like
+/// `enumerate_consumed_mints`; on `Err` the set may be partly extended and must be discarded.
+pub async fn extend_with_mint_history(
+    rpc: &RpcClientWithRetry,
+    mint: &Pubkey,
+    page_limit: usize,
+    set: &mut ConsumedSet,
+) -> Result<usize, String> {
+    collect(rpc, Scope::Mint(*mint), page_limit, set).await
+}
+
+/// Walk the history of `scope`'s address and add each authenticated channel mint to `set`.
+async fn collect(
+    rpc: &RpcClientWithRetry,
+    scope: Scope,
+    page_limit: usize,
+    set: &mut ConsumedSet,
+) -> Result<usize, String> {
+    let address = scope.address();
     let signatures = rpc
-        .get_signatures_for_address_paginated(authority, page_limit)
+        .get_signatures_for_address_paginated(address, page_limit)
         .await
         .map_err(|e| {
-            format!("consumed-set enumeration failed listing signatures for {authority}: {e}")
+            format!("consumed-set enumeration failed listing signatures for {address}: {e}")
         })?;
 
-    let mut set = ConsumedSet::new();
+    // An accepted signature would yield the same entry again, so it is not fetched twice.
+    let mut accepted: HashSet<Signature> = set.values().map(|mint| mint.signature).collect();
+    let (listed, mut fetched, mut added) = (signatures.len(), 0usize, 0usize);
     for status in signatures {
         if status.err.is_some() {
             continue;
@@ -483,18 +527,30 @@ pub async fn enumerate_consumed_mints(
 
         let signature = Signature::from_str(&status.signature)
             .map_err(|e| format!("invalid signature {} from RPC: {e}", status.signature))?;
+        if accepted.contains(&signature) {
+            continue;
+        }
         let transaction = rpc
             .get_transaction(&signature)
             .await
             .map_err(|e| format!("consumed-set enumeration failed fetching {signature}: {e}"))?;
-        // History lists every tx that mentions the authority, not only ones it signed.
-        if !transaction_succeeded(&transaction) || !transaction_signed_by(&transaction, authority) {
+        fetched += 1;
+        let targets = mint_to_targets(&transaction);
+        // History lists every tx that mentions the address, not only its mints.
+        let counts = transaction_succeeded(&transaction)
+            && match scope {
+                Scope::Signer(authority) => transaction_signed_by(&transaction, &authority),
+                // Reads the raw MintTo target, never the decoded authority, so a MintTo the
+                // strict decode below cannot read aborts instead of being skipped.
+                Scope::Mint(mint) => targets.contains(&mint),
+            };
+        if !counts {
             continue;
         }
 
         let &[(kind, encoded)] = markers.as_slice() else {
             return Err(format!(
-                "channel mint {signature} is signed by the authority but carries {} idempotency \
+                "channel mint {signature} passed the mint gate but carries {} idempotency \
                  markers; one mint cannot service them all",
                 markers.len()
             ));
@@ -515,7 +571,7 @@ pub async fn enumerate_consumed_mints(
         };
         if !transaction_has_memo(&transaction, &expected_memo) {
             return Err(format!(
-                "channel mint {signature} is signed by the authority but has no Memo \
+                "channel mint {signature} passed the mint gate but has no Memo \
                  instruction equal to {expected_memo}; cannot authenticate it"
             ));
         }
@@ -523,16 +579,27 @@ pub async fn enumerate_consumed_mints(
         let mint_tos = transaction_mint_tos(&transaction);
         let [mint_to] = mint_tos[..] else {
             return Err(format!(
-                "channel mint {signature} is signed by the authority but has {} MintTo \
+                "channel mint {signature} passed the mint gate but has {} MintTo \
                  instructions, expected one",
                 mint_tos.len()
             ));
         };
-        if mint_to.mint_authority != *authority {
-            return Err(format!(
-                "channel mint {signature} mints under {} instead of the authority {authority}",
-                mint_to.mint_authority
-            ));
+        match scope {
+            Scope::Signer(authority) if mint_to.mint_authority != authority => {
+                return Err(format!(
+                    "channel mint {signature} mints under {} instead of the authority {authority}",
+                    mint_to.mint_authority
+                ));
+            }
+            Scope::Mint(mint) if targets.len() != 1 || mint_to.mint != mint => {
+                return Err(format!(
+                    "channel mint {signature} passed the mint gate on {mint} but has {} \
+                     MintTo instructions and decodes one on {}; cannot authenticate it",
+                    targets.len(),
+                    mint_to.mint
+                ));
+            }
+            _ => {}
         }
 
         // The operator re-signs only after proving the earlier attempt dead, so two
@@ -547,12 +614,14 @@ pub async fn enumerate_consumed_mints(
                     token_program: mint_to.token_program,
                     amount: mint_to.amount,
                 });
+                accepted.insert(signature);
+                added += 1;
             }
             Entry::Occupied(occupied) if occupied.get().signature == signature => {}
             Entry::Occupied(occupied) => {
                 return Err(format!(
-                    "source event {} has two successful channel mints signed by the \
-                     authority, {} and {signature}; one event may be minted once, see \
+                    "source event {} has two successful channel mints, {} and {signature}; \
+                     one event may be minted once, see \
                      docs/runbooks/resync_consumed_mint_mismatch.md",
                     occupied.key(),
                     occupied.get().signature
@@ -560,7 +629,14 @@ pub async fn enumerate_consumed_mints(
             }
         }
     }
-    Ok(set)
+    info!(
+        %address,
+        listed,
+        fetched,
+        added,
+        "Scanned channel history for the consumed-set"
+    );
+    Ok(added)
 }
 
 fn strip_memo_length_prefix(memo: &str) -> &str {
@@ -641,6 +717,64 @@ fn transaction_mint_tos(
             .iter()
             .filter_map(|instruction| decode_raw_mint_to(raw_message, instruction))
             .collect(),
+    }
+}
+
+/// The mint (account 0) of each top-level `mintTo`/`mintToChecked`, read without the
+/// authority fields, so it also covers the multisig shape the strict decode rejects.
+fn mint_to_targets(
+    transaction: &solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta,
+) -> Vec<Pubkey> {
+    let EncodedTransaction::Json(ui_transaction) = &transaction.transaction.transaction else {
+        return Vec::new();
+    };
+
+    match &ui_transaction.message {
+        UiMessage::Parsed(parsed_message) => parsed_message
+            .instructions
+            .iter()
+            .filter_map(mint_to_target)
+            .collect(),
+        UiMessage::Raw(raw_message) => raw_message
+            .instructions
+            .iter()
+            .filter_map(|instruction| {
+                let keys = &raw_message.account_keys;
+                let program_id = parse_pubkey(keys.get(instruction.program_id_index as usize)?)?;
+                let data = bs58::decode(&instruction.data).into_vec().ok()?;
+                parse_token_instruction_mint_amount(&program_id, &data)?;
+                parse_pubkey(keys.get(*instruction.accounts.first()? as usize)?)
+            })
+            .collect(),
+    }
+}
+
+/// Parsed-message counterpart of `mint_to_targets` for one instruction.
+fn mint_to_target(instruction: &UiInstruction) -> Option<Pubkey> {
+    match instruction {
+        UiInstruction::Compiled(_) => None,
+        UiInstruction::Parsed(UiParsedInstruction::Parsed(parsed_instruction)) => {
+            let program_id = parse_pubkey(&parsed_instruction.program_id)?;
+            if program_id != spl_token::id() && program_id != spl_token_2022::id() {
+                return None;
+            }
+            match parsed_instruction
+                .parsed
+                .get("type")
+                .and_then(Value::as_str)?
+            {
+                "mintTo" | "mintToChecked" => {
+                    parse_pubkey_field(parsed_instruction.parsed.get("info")?, "mint")
+                }
+                _ => None,
+            }
+        }
+        UiInstruction::Parsed(UiParsedInstruction::PartiallyDecoded(partially_decoded)) => {
+            let program_id = parse_pubkey(&partially_decoded.program_id)?;
+            let data = bs58::decode(&partially_decoded.data).into_vec().ok()?;
+            parse_token_instruction_mint_amount(&program_id, &data)?;
+            parse_pubkey(partially_decoded.accounts.first()?)
+        }
     }
 }
 
@@ -1111,7 +1245,8 @@ mod mint_to_decode_tests {
 #[cfg(test)]
 mod consumed_set_tests {
     use super::{
-        enumerate_consumed_mints, ConsumedMint, ConsumedMintKind, ConsumedSet, MintToFields,
+        enumerate_consumed_mints, extend_with_mint_history, ConsumedMint, ConsumedMintKind,
+        ConsumedSet, MintToFields,
     };
     use crate::operator::instruction_util::{
         mint_idempotency_memo, remint_idempotency_memo, SourceEventId,
@@ -1145,13 +1280,60 @@ mod consumed_set_tests {
 
     /// A `MintTo` of `AMOUNT` signed by `mint_authority` into fresh mint and ATA keys.
     fn mint_to_by(mint_authority: &Pubkey) -> MintToFields {
+        mint_to_on(&Pubkey::new_unique(), mint_authority)
+    }
+
+    /// A `MintTo` of `AMOUNT` on `mint` signed by `mint_authority` into a fresh ATA.
+    fn mint_to_on(mint: &Pubkey, mint_authority: &Pubkey) -> MintToFields {
         MintToFields {
-            mint: Pubkey::new_unique(),
+            mint: *mint,
             recipient_ata: Pubkey::new_unique(),
             mint_authority: *mint_authority,
             token_program: spl_token::id(),
             amount: AMOUNT,
         }
+    }
+
+    /// Serves `entries` as the one-page history of `address`, and nothing for other addresses.
+    async fn history_for(
+        server: &mut mockito::ServerGuard,
+        address: &Pubkey,
+        entries: &[String],
+    ) -> mockito::Mock {
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#""method"\s*:\s*"getSignaturesForAddress""#.into()),
+                mockito::Matcher::Regex(address.to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","result":[{}],"id":0}}"#,
+                entries.join(",")
+            ))
+            .create_async()
+            .await
+    }
+
+    /// Rewrites each parsed `mintTo` on `mint` in `reply` the way `jsonParsed` renders one with
+    /// more than three accounts: `multisigMintAuthority` plus `signers`, no `mintAuthority`.
+    fn with_multisig_authority(reply: String, mint: &Pubkey) -> String {
+        let mut reply: Value = serde_json::from_str(&reply).unwrap();
+        let instructions = reply["result"]["transaction"]["message"]["instructions"]
+            .as_array_mut()
+            .unwrap();
+        for instruction in instructions {
+            if instruction["parsed"]["type"] == "mintTo"
+                && instruction["parsed"]["info"]["mint"] == mint.to_string()
+            {
+                let info = instruction["parsed"]["info"].as_object_mut().unwrap();
+                let authority = info.remove("mintAuthority").unwrap();
+                info.insert("multisigMintAuthority".to_string(), authority.clone());
+                info.insert("signers".to_string(), json!([authority]));
+            }
+        }
+        reply.to_string()
     }
 
     /// Raw-message `getTransaction` reply for a tx signed only by `signer`, with `mentioned`
@@ -2000,5 +2182,297 @@ mod consumed_set_tests {
             .await
             .expect("a failed tx must be skipped, not abort enumeration");
         assert!(set.is_empty(), "a failed tx must not mark a deposit minted");
+    }
+
+    /// What a mint-history scan made of one listed transaction.
+    #[derive(Debug, PartialEq)]
+    enum Verdict {
+        Accepted(ConsumedMintKind),
+        Skipped,
+        Refused,
+    }
+
+    /// Lists one `history_memo` entry (`history_err` as its status error) on `mint`, answers
+    /// its fetch with `reply`, and scans the mint's history into an empty set.
+    async fn scan_one(
+        mint: &Pubkey,
+        landed: &Signature,
+        history_memo: &str,
+        history_err: bool,
+        reply: String,
+    ) -> Result<ConsumedSet, String> {
+        let mut server = mockito::Server::new_async().await;
+        let mut entry = sig_entry(&landed.to_string(), history_memo);
+        if history_err {
+            entry = entry.replace(
+                r#""err":null"#,
+                r#""err":{"InstructionError":[0,{"Custom":1}]}"#,
+            );
+        }
+        let _history = history_for(&mut server, mint, &[entry]).await;
+        let _tx = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(reply)
+            .create_async()
+            .await;
+
+        let mut set = ConsumedSet::new();
+        let added =
+            extend_with_mint_history(&fast_rpc(&server.url()), mint, PAGE_LIMIT, &mut set).await?;
+        assert_eq!(added, set.len(), "the count must be what the scan added");
+        Ok(set)
+    }
+
+    /// A mint's history counts any key that minted on it, since a successful `MintTo` proves
+    /// that key held the authority then. Everything that did not mint on the mint is skipped,
+    /// and a tx that did but cannot be authenticated aborts, including a decode gap.
+    #[tokio::test]
+    async fn mint_history_gate_matrix() {
+        use ConsumedMintKind::{Deposit, Remint};
+        use Verdict::{Accepted, Refused, Skipped};
+        let mint = Pubkey::new_unique();
+        let old_key = Pubkey::new_unique();
+        let id = SourceEventId::new("evt-rotated", 0, None);
+        let deposit = mint_idempotency_memo(&id);
+        let remint = remint_idempotency_memo(&id);
+        let other = mint_idempotency_memo(&SourceEventId::new("evt-other", 0, None));
+        let legacy = "private_channel:mint-idempotency:42".to_string();
+        let on_mint = mint_to_on(&mint, &old_key);
+        let elsewhere = mint_to_by(&old_key);
+        let raw = |memo: &str, mint_tos: &[MintToFields], meta_err: Value| {
+            transaction_reply(&old_key, &Pubkey::new_unique(), memo, mint_tos, meta_err)
+        };
+        let parsed = |memo: &str, mint_tos: &[MintToFields]| {
+            parsed_transaction_reply(&old_key, &Pubkey::new_unique(), memo, mint_tos)
+        };
+        let failed = json!({"InstructionError": [0, {"Custom": 1}]});
+
+        let cases: Vec<(&str, String, bool, String, Verdict)> = vec![
+            (
+                "a: deposit by an old key",
+                deposit.clone(),
+                false,
+                parsed(&deposit, &[on_mint]),
+                Accepted(Deposit),
+            ),
+            (
+                "a: raw deposit by an old key",
+                deposit.clone(),
+                false,
+                raw(&deposit, &[on_mint], Value::Null),
+                Accepted(Deposit),
+            ),
+            (
+                "b: remint by an old key",
+                remint.clone(),
+                false,
+                parsed(&remint, &[on_mint]),
+                Accepted(Remint),
+            ),
+            (
+                "c: marker without a MintTo",
+                deposit.clone(),
+                false,
+                parsed(&deposit, &[]),
+                Skipped,
+            ),
+            (
+                "d: MintTo on another mint",
+                deposit.clone(),
+                false,
+                parsed(&deposit, &[mint_to_by(&old_key)]),
+                Skipped,
+            ),
+            (
+                "e: failed meta",
+                deposit.clone(),
+                false,
+                raw(&deposit, &[on_mint], failed.clone()),
+                Skipped,
+            ),
+            (
+                "f: failed history status",
+                deposit.clone(),
+                true,
+                parsed(&deposit, &[on_mint]),
+                Skipped,
+            ),
+            (
+                "g: two markers",
+                format!("{deposit}; {other}"),
+                false,
+                parsed(&deposit, &[on_mint]),
+                Refused,
+            ),
+            (
+                "h: legacy id",
+                legacy.clone(),
+                false,
+                parsed(&legacy, &[on_mint]),
+                Refused,
+            ),
+            (
+                "i: no exact Memo instruction",
+                deposit.clone(),
+                false,
+                parsed("unrelated-memo", &[on_mint]),
+                Refused,
+            ),
+            (
+                "j: two MintTos",
+                deposit.clone(),
+                false,
+                parsed(&deposit, &[on_mint, mint_to_on(&mint, &old_key)]),
+                Refused,
+            ),
+            (
+                "k: multisig or extra accounts",
+                deposit.clone(),
+                false,
+                with_multisig_authority(parsed(&deposit, &[on_mint]), &mint),
+                Refused,
+            ),
+            (
+                "k: second MintTo only the raw gate sees",
+                deposit.clone(),
+                false,
+                with_multisig_authority(parsed(&deposit, &[on_mint, elsewhere]), &elsewhere.mint),
+                Refused,
+            ),
+        ];
+        for (case, history_memo, history_err, reply, expected) in cases {
+            let landed = Signature::new_unique();
+            let verdict = match scan_one(&mint, &landed, &history_memo, history_err, reply).await {
+                Err(e) => {
+                    assert!(
+                        e.contains(&landed.to_string()) || e.contains("cutover"),
+                        "{case}: {e}"
+                    );
+                    Refused
+                }
+                Ok(set) if set.is_empty() => Skipped,
+                Ok(set) => {
+                    let consumed = set.get(&id).unwrap_or_else(|| panic!("{case}: {set:?}"));
+                    assert_eq!(consumed.signature, landed, "{case}");
+                    assert_eq!(consumed.mint, mint, "{case}");
+                    assert_eq!(consumed.recipient_ata, on_mint.recipient_ata, "{case}");
+                    assert_eq!(consumed.amount, AMOUNT, "{case}");
+                    Accepted(consumed.kind)
+                }
+            };
+            assert_eq!(verdict, expected, "{case}");
+        }
+    }
+
+    /// A signature already in the set is the same tx, so the mint scan must not fetch it again.
+    #[tokio::test]
+    async fn mint_history_skips_accepted_signatures() {
+        let mut server = mockito::Server::new_async().await;
+        let mint = Pubkey::new_unique();
+        let landed = Signature::new_unique();
+        let id = SourceEventId::new("evt-accepted", 0, None);
+        let memo = mint_idempotency_memo(&id);
+        let mint_to = mint_to_on(&mint, &Pubkey::new_unique());
+        let accepted = ConsumedMint {
+            signature: landed,
+            kind: ConsumedMintKind::Deposit,
+            mint,
+            recipient_ata: mint_to.recipient_ata,
+            token_program: mint_to.token_program,
+            amount: AMOUNT,
+        };
+        let _history =
+            history_for(&mut server, &mint, &[sig_entry(&landed.to_string(), &memo)]).await;
+        let fetch = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::Regex(
+                r#""method"\s*:\s*"getTransaction""#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(parsed_transaction_reply(
+                &mint_to.mint_authority,
+                &Pubkey::new_unique(),
+                &memo,
+                &[mint_to],
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut set = ConsumedSet::from([(id.clone(), accepted)]);
+        let added = extend_with_mint_history(&fast_rpc(&server.url()), &mint, PAGE_LIMIT, &mut set)
+            .await
+            .expect("an accepted signature is not an error");
+        assert_eq!(added, 0);
+        assert_eq!(set, ConsumedSet::from([(id, accepted)]));
+        fetch.assert_async().await;
+    }
+
+    /// A second key's mint of an event the set already holds is a double issuance across a
+    /// rotation, while the same signature again is the same mint.
+    #[tokio::test]
+    async fn mint_history_duplicate_event_matrix() {
+        let mint = Pubkey::new_unique();
+        let id = SourceEventId::new("evt-dup", 0, None);
+        let memo = mint_idempotency_memo(&id);
+        let first = Signature::new_unique();
+        let mint_to = mint_to_on(&mint, &Pubkey::new_unique());
+        let accepted = ConsumedMint {
+            signature: first,
+            kind: ConsumedMintKind::Deposit,
+            mint,
+            recipient_ata: mint_to.recipient_ata,
+            token_program: mint_to.token_program,
+            amount: AMOUNT,
+        };
+
+        for (case, listed, expect_err) in [
+            ("same signature", first, false),
+            ("other signature", Signature::new_unique(), true),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _history =
+                history_for(&mut server, &mint, &[sig_entry(&listed.to_string(), &memo)]).await;
+            let _tx = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::Regex(
+                    r#""method"\s*:\s*"getTransaction""#.into(),
+                ))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(parsed_transaction_reply(
+                    &Pubkey::new_unique(),
+                    &Pubkey::new_unique(),
+                    &memo,
+                    &[mint_to_on(&mint, &Pubkey::new_unique())],
+                ))
+                .create_async()
+                .await;
+
+            let mut set = ConsumedSet::from([(id.clone(), accepted)]);
+            let result =
+                extend_with_mint_history(&fast_rpc(&server.url()), &mint, PAGE_LIMIT, &mut set)
+                    .await;
+            match (result, expect_err) {
+                (Ok(added), false) => assert_eq!(added, 0, "{case}"),
+                (Err(e), true) => {
+                    for signature in [first, listed] {
+                        assert!(e.contains(&signature.to_string()), "{case}: {e}");
+                    }
+                }
+                (other, _) => panic!("{case}: unexpected {other:?}"),
+            }
+            assert_eq!(
+                set.get(&id),
+                Some(&accepted),
+                "{case}: the entry must not change"
+            );
+        }
     }
 }
