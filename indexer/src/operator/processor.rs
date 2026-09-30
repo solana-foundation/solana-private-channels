@@ -1862,34 +1862,47 @@ mod tests {
         assert!(builder.is_none(), "nothing may be dispatched");
     }
 
-    /// A Token-2022 mint closed at zero supply and recreated as legacy SPL is
-    /// re-pinned by `AllowMint`. The Token-2022 row stands in for what this process
-    /// already resolved, while the fresh `AllowedMint` says SPL. The release has to
-    /// follow the account, or every withdrawal for the mint fails on-chain.
+    /// A Token-2022 mint is closed at zero supply, recreated as SPL and re-allowed
+    /// while the operator keeps running. The next release must use SPL, not
+    /// anything left over from the first withdrawal.
     #[tokio::test]
-    async fn release_takes_the_token_program_from_the_allowed_mint() {
+    async fn release_follows_a_recreated_mint_in_a_running_operator() {
         let mint = Pubkey::new_unique();
         let spl = spl_token::id();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        insert_token_2022_mint_row(&storage, &mint);
 
-        let (mut ps, _server) =
-            processor_state_for(&storage, &mint, allowed_mint_bytes(false, false, false)).await;
+        // First withdrawal runs against the Token-2022 profile.
+        let (mut ps, mut server) =
+            processor_state_for(&storage, &mint, allowed_mint_bytes_token_2022(0)).await;
         assume_mint_allowlisted(&mut ps, &mint);
         let instance_pda = ps.release_funds_state.as_ref().unwrap().instance_pda;
 
-        let txn = withdrawal_for(&mint, 5);
-        let recipient = Pubkey::from_str(&txn.recipient).unwrap();
-
-        let (outcome, update, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
-
-        assert!(
-            outcome.is_ok(),
-            "no account beyond the allowlist may be read"
+        let (_, _, first) =
+            run_one_withdrawal(&mut ps, storage.clone(), withdrawal_for(&mint, 5)).await;
+        let Some(TransactionBuilder::ReleaseFunds(first)) = first else {
+            panic!("the first withdrawal must be dispatched");
+        };
+        assert_eq!(
+            first.builder.instruction().accounts[9].pubkey,
+            spl_token_2022::id()
         );
-        assert!(update.is_none(), "a clean SPL mint is payable");
+
+        // Recreated as SPL: the same AllowedMint account now pins the SPL program.
+        server.reset();
+        mock_account_read(
+            &mut server,
+            &find_allowed_mint_pda(&instance_pda, &mint),
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+        );
+
+        let txn = withdrawal_for(&mint, 6);
+        let recipient = Pubkey::from_str(&txn.recipient).unwrap();
+        let (outcome, _, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
+
+        assert!(outcome.is_ok(), "the second withdrawal must not error");
         let Some(TransactionBuilder::ReleaseFunds(release)) = builder else {
-            panic!("the withdrawal must be dispatched");
+            panic!("the second withdrawal must be dispatched");
         };
         // ReleaseFunds places user_ata, instance_ata and token_program at 7, 8, 9.
         let accounts = release.builder.instruction().accounts;
