@@ -214,16 +214,6 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .execute(pool)
     .await?;
 
-    // Lets a cursor signature be found, or proven absent, without walking the PK.
-    // Non-unique since one signature has a row per address; INCLUDE (slot) keeps it
-    // index-only. Plain, not CONCURRENTLY, so a failed build never leaves it invalid.
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS address_signatures_signature_idx
-         ON address_signatures (signature) INCLUDE (slot)",
-    )
-    .execute(pool)
-    .await?;
-
     // Every SPL Token `SetAuthority { AccountOwner }` that landed, recording both
     // sides of the handoff. The gateway reads these to scope a user's history to
     // the slots they actually owned the address for.
@@ -285,6 +275,19 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     .await?;
 
     info!("PostgreSQL tables initialized");
+    Ok(())
+}
+
+/// Lets a cursor signature be found, or proven absent, without walking the PK. Built
+/// only by the write node under its lease, since the plain build blocks inserts until done.
+/// Non-unique: a signature has one row per address. Plain so a failed build never stays invalid.
+pub async fn ensure_address_signatures_signature_index(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS address_signatures_signature_idx
+         ON address_signatures (signature) INCLUDE (slot)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -434,11 +437,20 @@ mod tests {
         assert_eq!(count.0, 0, "blocks table should exist and be empty");
     }
 
-    /// Booting over a pre-index database with rows must build a valid, non-unique
-    /// index, and a restart must not fail on it.
+    /// Opening the DB (as the admin CLI does) must not build the index; the write node's
+    /// call must build a valid, non-unique one over existing rows, and repeat safely.
     #[tokio::test(flavor = "multi_thread")]
-    async fn create_tables_adds_signature_index_to_existing_table() {
+    async fn signature_index_is_built_only_by_the_explicit_call() {
         let (db, _pg, url) = start_test_postgres_with_url().await;
+        PostgresAccountsDB::new(&url, false).await.unwrap();
+        let exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass('address_signatures_signature_idx') IS NOT NULL",
+        )
+        .fetch_one(db.pool.as_ref())
+        .await
+        .unwrap();
+        assert!(!exists, "create_tables must not build the signature index");
+
         let rows: Vec<AddressSignatureRow> = (0..10)
             .map(|slot| AddressSignatureRow {
                 address: Pubkey::new_unique().to_bytes().to_vec(),
@@ -450,13 +462,13 @@ mod tests {
             .collect();
         flush_address_signatures_sync(&crate::accounts::AccountsDB::Postgres(db.clone()), &rows)
             .await;
-        sqlx::query("DROP INDEX IF EXISTS address_signatures_signature_idx")
-            .execute(db.pool.as_ref())
+
+        ensure_address_signatures_signature_index(db.pool.as_ref())
             .await
             .unwrap();
-
-        PostgresAccountsDB::new(&url, false).await.unwrap();
-        PostgresAccountsDB::new(&url, false).await.unwrap();
+        ensure_address_signatures_signature_index(db.pool.as_ref())
+            .await
+            .unwrap();
 
         let (valid, unique): (bool, bool) = sqlx::query_as(
             "SELECT i.indisvalid, i.indisunique FROM pg_index i

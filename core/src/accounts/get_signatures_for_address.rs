@@ -272,6 +272,7 @@ async fn get_signatures_for_address_postgres(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::postgres::ensure_address_signatures_signature_index;
     use crate::accounts::write_batch::AddressSignatureRow;
     use crate::test_helpers::{flush_address_signatures_sync, start_test_postgres_raw};
 
@@ -279,6 +280,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_cursor_absent_signature_uses_signature_index() {
         let (db, _pg) = start_test_postgres_raw().await;
+        ensure_address_signatures_signature_index(db.pool.as_ref())
+            .await
+            .unwrap();
         let rows: Vec<AddressSignatureRow> = (0..100)
             .map(|slot| AddressSignatureRow {
                 address: Pubkey::new_unique().to_bytes().to_vec(),
