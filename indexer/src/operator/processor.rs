@@ -890,12 +890,11 @@ async fn attach_hook_extras(
                 format!("transfer-hook validation account invalid for mint {mint}: {reason}"),
             )));
         }
-        HookExtras::OverCap { declared } => {
+        HookExtras::OverCap { extras } => {
             return Ok(Some(BailReason::new(
                 metrics::BAIL_REASON_HOOK_UNRESOLVABLE,
                 format!(
-                    "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {} > {MAX_HOOK_EXTRAS_LEGACY_TX}",
-                    declared + 2
+                    "transfer-hook accounts exceed the per-transfer cap for mint {mint}: {extras} > {MAX_HOOK_EXTRAS_LEGACY_TX}"
                 ),
             )));
         }

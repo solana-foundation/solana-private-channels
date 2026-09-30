@@ -9,6 +9,8 @@ use solana_rpc_client_api::request::RpcError;
 use solana_sdk::account::Account;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
+use spl_tlv_account_resolution::error::AccountResolutionError;
+use spl_tlv_account_resolution::solana_program_error::ProgramError;
 use spl_tlv_account_resolution::state::ExtraAccountMetaList;
 use spl_token::ID as TOKEN_PROGRAM_ID;
 use spl_token_2022::extension::{
@@ -100,10 +102,10 @@ pub enum HookExtras {
     Resolved(Vec<AccountMeta>),
     /// The validation account is absent, so no transfer of the mint resolves.
     ValidationMissing,
-    /// The validation account holds no parseable `Execute` list.
+    /// The validation account's `Execute` list does not parse or cannot resolve.
     ValidationInvalid(String),
-    /// The list declares more entries than a transfer can carry.
-    OverCap { declared: usize },
+    /// The list resolves to `extras` accounts, more than a transfer can carry.
+    OverCap { extras: usize },
 }
 
 impl MintCache {
@@ -298,15 +300,17 @@ impl MintCache {
         // The resolver reads every declared entry, so an oversized list is
         // rejected before it runs. Extras are the entries plus the hook program
         // and the validation account.
-        let declared = match TlvStateBorrowed::unpack(&validation_data).and_then(|tlv_state| {
+        let extras_count = match TlvStateBorrowed::unpack(&validation_data).and_then(|tlv_state| {
             ExtraAccountMetaList::unpack_with_tlv_state::<ExecuteInstruction>(&tlv_state)
-                .map(|list| list.len())
+                .map(|list| list.len() + 2)
         }) {
-            Ok(declared) => declared,
+            Ok(extras_count) => extras_count,
             Err(e) => return Ok(HookExtras::ValidationInvalid(e.to_string())),
         };
-        if declared + 2 > max_extras {
-            return Ok(HookExtras::OverCap { declared });
+        if extras_count > max_extras {
+            return Ok(HookExtras::OverCap {
+                extras: extras_count,
+            });
         }
 
         // The resolver requires source, mint, destination and authority in the
@@ -327,7 +331,7 @@ impl MintCache {
         // makes it resolve exactly the list counted above, which is what makes
         // the cap hold: a fresh read could return a longer list.
         let fetch_rpc = Arc::clone(rpc);
-        add_extra_account_metas_for_execute(
+        if let Err(error) = add_extra_account_metas_for_execute(
             &mut instruction,
             &hook_program,
             source,
@@ -348,7 +352,19 @@ impl MintCache {
             },
         )
         .await
-        .map_err(|e| OperatorError::RpcError(format!("hook resolution for mint {mint}: {e}")))?;
+        {
+            // A failed read comes back as AccountFetchFailed and stays transient.
+            // Any other ProgramError is the list itself, which fails every retry.
+            let fetch_failed = ProgramError::from(AccountResolutionError::AccountFetchFailed);
+            return match error.downcast_ref::<ProgramError>() {
+                Some(list_error) if *list_error != fetch_failed => {
+                    Ok(HookExtras::ValidationInvalid(list_error.to_string()))
+                }
+                _ => Err(OperatorError::RpcError(format!(
+                    "hook resolution for mint {mint}: {error}"
+                ))),
+            };
+        }
 
         // Signer bits are dropped: the escrow strips them before the CPI too, and
         // the operator must never hand its own signature to a mint's hook.
@@ -520,6 +536,7 @@ mod tests {
     use solana_commitment_config::CommitmentConfig;
     use solana_sdk::pubkey::Pubkey;
     use spl_tlv_account_resolution::account::ExtraAccountMeta;
+    use spl_tlv_account_resolution::seeds::Seed;
     use spl_token_2022::extension::{
         BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
     };
@@ -1053,7 +1070,7 @@ mod tests {
     /// Every account is read once, the mint twice (hook lookup, then the
     /// resolver), so a list at the cap costs a fixed number of reads.
     #[tokio::test]
-    async fn resolve_hook_extras_reads_each_account_once() {
+    async fn resolve_hook_extras_at_cap_reads_validation_once() {
         let mint = create_test_mint();
         let hook_program = Pubkey::new_unique();
         let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
@@ -1167,9 +1184,11 @@ mod tests {
             .await
             .unwrap();
 
+        // Declared entries plus the hook program and the validation account.
+        let total = declared + 2;
         assert!(
-            matches!(resolved, HookExtras::OverCap { declared: count } if count == declared),
-            "expected OverCap with {declared} declared, got {resolved:?}"
+            matches!(resolved, HookExtras::OverCap { extras } if extras == total),
+            "expected OverCap with {total} extras, got {resolved:?}"
         );
         mint_reads.assert_async().await;
         validation_reads.assert_async().await;
@@ -1214,6 +1233,115 @@ mod tests {
         assert!(
             matches!(resolved, HookExtras::ValidationInvalid(_)),
             "expected ValidationInvalid, got {resolved:?}"
+        );
+    }
+
+    /// A list that parses but cannot resolve fails the same way on every retry,
+    /// so it must park the row rather than restart the processor.
+    #[tokio::test]
+    async fn resolve_hook_extras_rejects_a_list_that_cannot_resolve() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+
+        // Execute data is 16 bytes, so a seed at offset 16 never resolves.
+        let entries = [ExtraAccountMeta::new_with_seeds(
+            &[Seed::InstructionData {
+                index: 16,
+                length: 8,
+            }],
+            false,
+            false,
+        )
+        .unwrap()];
+
+        let mut server = mockito::Server::new_async().await;
+        mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 2).await;
+        mock_account(
+            &mut server,
+            &validation_pda,
+            Some(&validation_data(&entries)),
+            1,
+        )
+        .await;
+        for address in [source, destination, authority] {
+            mock_account(&mut server, &address, None, 1).await;
+        }
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let resolved = cache
+            .resolve_hook_extras(&mint, &source, &destination, &authority, 1_000, 15)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(resolved, HookExtras::ValidationInvalid(_)),
+            "expected ValidationInvalid, got {resolved:?}"
+        );
+    }
+
+    /// A read the node fails is not the list's fault, so it must stay transient
+    /// rather than park the row.
+    #[tokio::test]
+    async fn resolve_hook_extras_keeps_a_failed_read_transient() {
+        let mint = create_test_mint();
+        let hook_program = Pubkey::new_unique();
+        let validation_pda = get_extra_account_metas_address(&mint, &hook_program);
+        let entries =
+            [ExtraAccountMeta::new_with_pubkey(&Pubkey::new_unique(), false, false).unwrap()];
+
+        // The source is not mocked, so the resolver's first read fails.
+        let mut server = mockito::Server::new_async().await;
+        mock_account(&mut server, &mint, Some(&hook_mint_data(&hook_program)), 1).await;
+        mock_account(
+            &mut server,
+            &validation_pda,
+            Some(&validation_data(&entries)),
+            1,
+        )
+        .await;
+
+        let rpc = RpcClientWithRetry::with_retry_config(
+            server.url(),
+            RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+            },
+            CommitmentConfig::confirmed(),
+        );
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        let mut cache = MintCache::with_rpc(storage, Arc::new(rpc));
+
+        let err = cache
+            .resolve_hook_extras(
+                &mint,
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                &Pubkey::new_unique(),
+                1_000,
+                15,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, OperatorError::RpcError(_)),
+            "a failed read must stay transient, got {err:?}"
         );
     }
 

@@ -234,8 +234,9 @@ to say explicitly what the user is owed.
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook validation account invalid for mint` - the validation account
-     exists but holds no parseable `ExtraAccountMetaList`, so no release of that
-     mint can resolve. The message carries the parse error. The escrow still holds
+     exists but its `ExtraAccountMetaList` does not parse or cannot resolve (for
+     example, a seed reading past the instruction data), so no release of that
+     mint can resolve. The message carries the error. The escrow still holds
      the funds and the row is intact. Only the hook program can rewrite the
      account, so contact the mint issuer, and re-arm the row once it parses.
      Expect every withdrawal of that mint to park here. [Escalate](_escalation.md) (Tier 2).
