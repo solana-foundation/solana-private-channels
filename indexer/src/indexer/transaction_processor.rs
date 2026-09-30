@@ -1384,10 +1384,9 @@ mod tests {
             .unwrap();
 
         let mints = mock.mints.lock().unwrap();
-        assert_eq!(
-            mints[&make_pubkey(2).to_string()].decimals,
-            live_decimals as i16
-        );
+        let row = &mints[&make_pubkey(2).to_string()];
+        assert_eq!(row.decimals, live_decimals as i16);
+        assert_eq!(row.profile_slot, live_slot as i64);
     }
 
     #[tokio::test]

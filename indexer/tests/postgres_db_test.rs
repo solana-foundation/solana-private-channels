@@ -833,6 +833,22 @@ async fn upsert_mint_ignores_older_profile_slot() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_same_slot_later_profile_wins() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let slot = 106;
+
+    // A close and recreate between two AllowMints in one slot, in block order.
+    let first = DbMint::new("mint_same".to_string(), 6, "TokenkegQ".to_string(), slot);
+    let second = DbMint::new("mint_same".to_string(), 9, "TokenzQdB".to_string(), slot);
+    storage.upsert_mints_batch(&[first, second]).await?;
+
+    let got = storage.get_mint("mint_same").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sync_mint_status_mirrors_history_against_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
