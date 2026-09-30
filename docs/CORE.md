@@ -225,6 +225,8 @@ Solana Private Channels restricts which programs can execute in the payment chan
 
 The AdminVM (used for operator mint operations) only supports SPL Token `InitializeMint`. All other instruction types are rejected.
 
+An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidArgument`, so fabricated gasless lamports can never become a wSOL balance.
+
 **Source**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
 
 ## Limitations

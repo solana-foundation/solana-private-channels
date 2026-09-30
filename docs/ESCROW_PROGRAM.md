@@ -57,6 +57,8 @@ The bitmap is created here, so every instance has one by construction. It is
 #### AllowMint
 Allows new token mints for the instance (admin-only).
 
+The spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidMint` under either token program, because the channel cannot create it.
+
 Discriminator: `1`
 
 **Parameters:**
