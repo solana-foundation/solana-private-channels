@@ -57,7 +57,7 @@ cargo run --bin allow_mint -- \
   <WITHDRAW_FEE> \
   <MIN_WITHDRAW_AMOUNT>
 ```
-`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin. `<MIN_WITHDRAW_AMOUNT>` is the smallest amount one withdrawal may move, also in base units, so a balance cannot be split into releases that cost more than they move. `0` is allowed for either but removes its bound, so use it only where every participant is known; see the [zero-fee warning](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). Run again with new values, to or from `0`, to reprice; they apply from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint).
+`<WITHDRAW_FEE>` is in the mint's base units, charged on top of every Solana Private Channels withdrawal and paid to the operator admin; size it to cover one release's SOL cost. `<MIN_WITHDRAW_AMOUNT>` is the smallest amount one withdrawal may move, also in base units, which limits how many releases a balance can queue at once. `0` is allowed for either, but a fee of `0` leaves the operator paying every release, so use it only where every participant is known; see the [zero-fee warning](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint). Run again with new values, to or from `0`, to reprice; they apply from the mint's next deposit. Re-running also re-opens both gates and re-pins the mint profile (accepting any change since the last allow), so follow the [reprice procedure](../../docs/ESCROW_INTERACTION_GUIDE.md#allowmint).
 
 ## 4. Deposit (Solana → Solana Private Channels)
 ```bash

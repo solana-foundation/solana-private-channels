@@ -92,7 +92,7 @@ Seeds: `["withdraw_config", mint]`. 89 bytes, no discriminator (it is the progra
 
 ## Treasury
 
-The treasury is the operator admin (`ADMIN_SIGNER`), the same key that pays Solana fees for `ReleaseFunds`. Collected fees sit in its channel ATA. It moves them out with an ordinary `WithdrawFunds`, for example `scripts/devnet/src/bin/withdraw.rs`, with no fee and no minimum, since collected fees can add up to less than it. To reprice a mint, run the escrow's `AllowMint` again with the new values.
+The treasury is the operator admin (`ADMIN_SIGNER`), the same key that pays Solana fees for `ReleaseFunds`. Collected fees sit in its channel ATA. It moves them out with an ordinary `WithdrawFunds`, for example `scripts/devnet/src/bin/withdraw.rs`, with no fee and no minimum, since collected fees can add up to less than it. The exemption goes with the configured treasury, so once a rotation switches it, the old key's fees pay the fee and minimum like any balance. Sweep them before rotating. To reprice a mint, run the escrow's `AllowMint` again with the new values.
 
 ## Errors
 
