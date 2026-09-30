@@ -44,6 +44,7 @@ have prefixes.
 | `withdrawal mint absent on target chain:` | A.non-halting | no | pre-flight |
 | `no longer matches its reviewed profile:` | A.non-halting | no | pre-flight |
 | `transfer-hook validation account missing for mint:` | A.non-halting | no | hook resolution |
+| `transfer-hook validation account invalid for mint` | A.non-halting | no | hook resolution |
 | `transfer-hook accounts exceed the per-transfer cap` | A.non-halting | no | hook resolution |
 | `escrow ATA frozen for mint:` | A.non-halting | no | pre-flight |
 | `withdrawals blocked for mint:` | A.non-halting | no | allowlist gate |
@@ -232,6 +233,12 @@ to say explicitly what the user is owed.
      exists. Expect every withdrawal of that mint to park here. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook validation account invalid for mint` - the validation account
+     exists but holds no parseable `ExtraAccountMetaList`, so no release of that
+     mint can resolve. The message carries the parse error. The escrow still holds
+     the funds and the row is intact. Only the hook program can rewrite the
+     account, so contact the mint issuer, and re-arm the row once it parses.
+     Expect every withdrawal of that mint to park here. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook accounts exceed the per-transfer cap` - the mint's
      `ExtraAccountMetaList` resolves to more accounts than a release transaction
      can carry. The message gives the count and the cap. The escrow still holds

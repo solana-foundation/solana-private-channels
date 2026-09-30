@@ -48,8 +48,10 @@ sqlx = { workspace = true, features = [
     "chrono",
     "bigdecimal",
 ] }
+spl-tlv-account-resolution = { workspace = true }
 spl-token-2022 = { workspace = true, features = ["no-entrypoint"] }
 spl-transfer-hook-interface = { workspace = true }
+spl-type-length-value = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = "0.7.16"
 tracing = { workspace = true }
