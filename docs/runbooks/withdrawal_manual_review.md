@@ -233,13 +233,18 @@ to say explicitly what the user is owed.
      exists. Expect every withdrawal of that mint to park here. Deposits of it fail
      on-chain for the same reason, so consider blocking deposits (`BlockMint` with
      `block_deposits: true`) until it is fixed. [Escalate](_escalation.md) (Tier 2).
-   - `transfer-hook validation account invalid for mint` - the validation account
-     exists but its `ExtraAccountMetaList` does not parse or cannot resolve (for
-     example, a seed reading past the instruction data), so no release of that
-     mint can resolve. The message carries the error. The escrow still holds
-     the funds and the row is intact. Only the hook program can rewrite the
-     account, so contact the mint issuer, and re-arm the row once it parses.
-     Expect every withdrawal of that mint to park here. [Escalate](_escalation.md) (Tier 2).
+   - `transfer-hook validation account invalid for mint` - the mint's
+     `ExtraAccountMetaList` does not parse or cannot resolve. The escrow still
+     holds the funds and the row is intact. Two causes:
+     - The list itself is broken (for example, a seed reading past the
+       instruction data). Every withdrawal of that mint parks here, and only the
+       hook program can rewrite it, so contact the mint issuer.
+     - An account the hook seeds from is absent or too short right now (for
+       example, the recipient's token account does not exist yet, or the node
+       is behind). Only this row is affected.
+
+     Re-arm the row once. If it parks here again, or other rows of the mint do
+     too, treat it as the first case. [Escalate](_escalation.md) (Tier 2).
    - `transfer-hook accounts exceed the per-transfer cap` - the mint's
      `ExtraAccountMetaList` resolves to more accounts than a release transaction
      can carry. The message gives the count and the cap. The escrow still holds
