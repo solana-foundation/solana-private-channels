@@ -1,8 +1,8 @@
 //! Shared on-chain escrow balance sweep.
 //!
 //! The indexer's startup reconciliation needs the authoritative custody view: the
-//! token balance the escrow instance actually holds, summed per mint across every
-//! token account it owns, for mints with an `AllowedMint` PDA. Deriving the set of
+//! balance of the escrow instance's ATA for each mint with an `AllowedMint` PDA. Other
+//! token accounts the instance owns are not custody. Deriving the set of
 //! mints from this sweep (rather than from the DB `mints` table) is what closes the
 //! startup blind spot where a fresh or partially restored DB with real escrow
 //! balances would otherwise pass the check without ever looking on-chain.
@@ -102,9 +102,9 @@ pub struct EscrowCustody {
 /// agree almost every time, so needing five means something is genuinely wrong.
 const SWEEP_SLOT_AGREEMENT_ATTEMPTS: u32 = 5;
 
-/// Sum every token account owned by the escrow instance, grouped by mint, across
-/// the SPL Token and Token-2022 programs. Mints without an `AllowedMint` PDA are dropped,
-/// since anyone can open a token account for the escrow.
+/// The escrow instance's ATA balance per mint, across the SPL Token and Token-2022 programs.
+/// Other token accounts the instance owns, and mints without an `AllowedMint` PDA, are
+/// dropped, since anyone can open a token account for the escrow.
 ///
 /// The two programs need one call each, so their readings can land on different slots and
 /// the merged balances would then hold activity the lower slot never saw. No single slot
@@ -122,7 +122,7 @@ pub async fn fetch_escrow_balances_by_mint(
 ) -> Result<CustodySnapshot, SweepFailure> {
     let mut attempt = 1;
     loop {
-        let (mut balances, low, high) = sweep_once(rpc_client, escrow_instance_id)
+        let (mut balances, strays, low, high) = sweep_once(rpc_client, escrow_instance_id)
             .await
             .map_err(SweepFailure::Read)?;
         if low != high && attempt < SWEEP_SLOT_AGREEMENT_ATTEMPTS {
@@ -143,13 +143,21 @@ pub async fn fetch_escrow_balances_by_mint(
             });
         }
 
+        if !strays.is_empty() {
+            warn!(
+                count = strays.len(),
+                sample = ?strays.iter().take(WARN_SAMPLE).collect::<Vec<_>>(),
+                "Escrow sweep: ignoring escrow-owned token accounts that are not the instance ATA"
+            );
+        }
+
         let dropped = retain_allowed_mints(rpc_client, escrow_instance_id, &mut balances, low)
             .await
             .map_err(SweepFailure::Read)?;
         if !dropped.is_empty() {
             warn!(
                 count = dropped.len(),
-                sample = ?dropped.iter().take(DROPPED_MINT_SAMPLE).collect::<Vec<_>>(),
+                sample = ?dropped.iter().take(WARN_SAMPLE).collect::<Vec<_>>(),
                 "Escrow sweep: ignoring escrow token accounts for mints that were never allowed"
             );
         }
@@ -161,8 +169,8 @@ pub async fn fetch_escrow_balances_by_mint(
     }
 }
 
-/// How many dropped mints the sweep's warning names; the rest are only counted.
-const DROPPED_MINT_SAMPLE: usize = 5;
+/// How many addresses each sweep warning names; the rest are only counted.
+const WARN_SAMPLE: usize = 5;
 
 /// Remove every mint without an `AllowedMint` PDA owned by the escrow program, and return them.
 /// Anyone can open a token account for the escrow, but only the admin's `AllowMint` creates
@@ -362,13 +370,15 @@ fn decode_ata_amount(
     Ok(amount)
 }
 
-/// One pass over both token programs. Returns the merged balances plus the lowest and
-/// highest slot the two responses reported, which agree when the pass saw one instant.
+/// One pass over both token programs. Returns each mint's ATA balance, the addresses of the
+/// other token accounts the instance owns, and the lowest and highest slot the two responses
+/// reported, which agree when the pass saw one instant.
 async fn sweep_once(
     rpc_client: &RpcClientWithRetry,
     escrow_instance_id: Pubkey,
-) -> Result<(HashMap<Pubkey, u64>, u64, u64), EscrowSweepError> {
+) -> Result<(HashMap<Pubkey, u64>, Vec<String>, u64, u64), EscrowSweepError> {
     let mut balances = HashMap::new();
+    let mut strays = Vec::new();
     let token_programs = [spl_token::id(), spl_token_2022::id()];
     let mut lowest_slot = u64::MAX;
     let mut highest_slot = 0u64;
@@ -451,19 +461,28 @@ async fn sweep_once(
                 continue;
             };
 
-            // One mint can span several token accounts; sum them. Saturating so a corrupt
-            // over-u64 sum reports u64::MAX (and trips the mismatch) instead of wrapping.
-            let acc = balances.entry(mint).or_insert(0u64);
-            *acc = acc.saturating_add(amount);
+            // Deposits and releases only move the ATA. Anyone can open another token account
+            // owned by the instance, and what it holds backs nothing, so it is not custody.
+            let ata = get_associated_token_address_with_program_id(
+                &escrow_instance_id,
+                &mint,
+                &token_program_id,
+            );
+            if keyed_account.pubkey != ata.to_string() {
+                strays.push(keyed_account.pubkey);
+                continue;
+            }
+            balances.insert(mint, amount);
         }
     }
 
-    Ok((balances, lowest_slot, highest_slot))
+    Ok((balances, strays, lowest_slot, highest_slot))
 }
 
 /// Read the channel-token supply for `mint` on the PrivateChannel chain. An
-/// absent mint account (nothing minted yet) reads as supply 0; any other RPC or
-/// decode failure is surfaced so a bad read never silently looks like 0 supply.
+/// absent mint account (nothing minted yet), or one SPL Token does not own, reads as
+/// supply 0; any other RPC or decode failure is surfaced so a bad read never silently
+/// looks like 0 supply.
 pub async fn fetch_channel_supply(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
@@ -479,8 +498,8 @@ pub async fn fetch_channel_supply_at(
     channel_rpc: &RpcClientWithRetry,
     mint: &Pubkey,
 ) -> Result<(u64, u64), EscrowSweepError> {
-    // Only a truly absent account is Ok(None); a node error or data that will not
-    // decode is Err, so neither can masquerade as zero supply.
+    // Only an absent or non-token account reads as zero; a node error or data that will
+    // not decode is Err, so neither can masquerade as zero supply.
     let response = channel_rpc
         .get_account_with_context(mint, CommitmentConfig::finalized())
         .await
@@ -495,6 +514,12 @@ pub async fn fetch_channel_supply_at(
         Some(account) => account,
         None => return Ok((0, slot)),
     };
+
+    // Only SPL Token can mint, so an account it does not own (lamports someone sent to the
+    // address) has minted nothing. A token-owned account that will not decode stays an error.
+    if account.owner != spl_token::id() {
+        return Ok((0, slot));
+    }
 
     // The channel program mints classic SPL tokens (not Token-2022).
     let mint_state = Mint::unpack(&account.data).map_err(|e| EscrowSweepError {
@@ -625,9 +650,9 @@ pub(crate) mod tests {
         )
     }
 
-    /// One `RpcKeyedAccount` whose `data` is the SPL Token-2022/Token binary layout,
-    /// base64-encoded, exercising the `data.decode()` + `TokenAccount::unpack` path.
-    fn base64_account(mint: Pubkey, amount: u64) -> String {
+    /// `instance`'s ATA for `mint` as one `RpcKeyedAccount` whose `data` is the SPL Token
+    /// binary layout, base64-encoded, exercising the `data.decode()` + `TokenAccount::unpack` path.
+    fn base64_account(instance: Pubkey, mint: Pubkey, amount: u64) -> String {
         let account = TokenAccount {
             mint,
             owner: Pubkey::new_unique(),
@@ -643,16 +668,22 @@ pub(crate) mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
         format!(
             r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":165,"data":["{b64}","base64"]}}}}"#,
-            ata = Pubkey::new_unique(),
+            ata = get_associated_token_address_with_program_id(&instance, &mint, &spl_token::id()),
             prog = spl_token::id(),
         )
     }
 
-    /// One `RpcKeyedAccount` whose `data` is jsonParsed, exercising the JSON path.
-    fn json_parsed_account(mint: Pubkey, amount: u64) -> String {
+    /// `instance`'s ATA for `mint` as one `RpcKeyedAccount` whose `data` is jsonParsed,
+    /// exercising the JSON path.
+    fn json_parsed_account(instance: Pubkey, mint: Pubkey, amount: u64) -> String {
+        let ata = get_associated_token_address_with_program_id(&instance, &mint, &spl_token::id());
+        json_parsed_account_at(ata, mint, amount)
+    }
+
+    /// Same, for the token account at `address`.
+    fn json_parsed_account_at(address: Pubkey, mint: Pubkey, amount: u64) -> String {
         format!(
-            r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":165,"data":{{"program":"spl-token","space":165,"parsed":{{"type":"account","info":{{"mint":"{mint}","owner":"{owner}","tokenAmount":{{"amount":"{amount}","decimals":6,"uiAmount":null,"uiAmountString":"{amount}"}}}}}}}}}}}}"#,
-            ata = Pubkey::new_unique(),
+            r#"{{"pubkey":"{address}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":165,"data":{{"program":"spl-token","space":165,"parsed":{{"type":"account","info":{{"mint":"{mint}","owner":"{owner}","tokenAmount":{{"amount":"{amount}","decimals":6,"uiAmount":null,"uiAmountString":"{amount}"}}}}}}}}}}}}"#,
             prog = spl_token::id(),
             owner = Pubkey::new_unique(),
         )
@@ -728,65 +759,72 @@ pub(crate) mod tests {
         };
     }
 
+    /// Anyone can open a token account owned by the instance, but deposits and releases only
+    /// move its ATA. Anything held elsewhere backs no channel supply, so it is not custody.
     #[tokio::test]
-    async fn json_parsed_sums_multiple_accounts_per_mint() {
+    async fn sweep_counts_only_the_instance_ata() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint1 = Pubkey::new_unique();
         let mint2 = Pubkey::new_unique();
-        // mint1 split across two accounts (100 + 200), mint2 in one (500).
+        let mint1_ata =
+            get_associated_token_address_with_program_id(&instance, &mint1, &spl_token::id());
+        let mint2_ata =
+            get_associated_token_address_with_program_id(&instance, &mint2, &spl_token::id());
+        // mint1 has a stray instance-owned account next to its ATA.
         mock_sweep(
             &mut server,
             &[
-                json_parsed_account(mint1, 100),
-                json_parsed_account(mint1, 200),
-                json_parsed_account(mint2, 500),
+                json_parsed_account_at(mint1_ata, mint1, 100),
+                json_parsed_account_at(Pubkey::new_unique(), mint1, 200),
+                json_parsed_account_at(mint2_ata, mint2, 500),
             ],
         )
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .unwrap()
             .balances;
 
-        assert_eq!(balances.len(), 2);
-        assert_eq!(balances[&mint1], 300, "same mint across accounts must sum");
-        assert_eq!(balances[&mint2], 500);
+        assert_eq!(balances, HashMap::from([(mint1, 100), (mint2, 500)]));
     }
 
     #[tokio::test]
     async fn decodes_base64_binary_accounts() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_sweep(&mut server, &[base64_account(mint, 1_234)]).await;
+        mock_sweep(&mut server, &[base64_account(instance, mint, 1_234)]).await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .unwrap()
             .balances;
 
-        assert_eq!(balances[&mint], 1_234, "base64 layout must unpack and sum");
+        assert_eq!(balances[&mint], 1_234, "base64 layout must unpack");
     }
 
     #[tokio::test]
     async fn skips_unrecognised_encoding_without_erroring() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // A valid account plus one with an unrecognised encoding: the latter is skipped,
         // not fatal, so the valid balance still lands.
         mock_sweep(
             &mut server,
             &[
-                json_parsed_account(mint, 50),
+                json_parsed_account(instance, mint, 50),
                 unrecognised_encoding_account(),
             ],
         )
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .unwrap()
             .balances;
@@ -801,11 +839,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sweep_fails_when_the_two_programs_never_agree_on_a_slot() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 900, 880).await;
+        mock_sweep_at_slots(
+            &mut server,
+            &[json_parsed_account(instance, mint, 42)],
+            900,
+            880,
+        )
+        .await;
 
-        let result =
-            fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique()).await;
+        let result = fetch_escrow_balances_by_mint(&client(&server.url()), instance).await;
 
         let err = result.expect_err("a snapshot with no coherent slot must not be returned");
         assert!(
@@ -820,10 +864,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_slot_that_never_settles_is_reported_apart_from_a_read_failure() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 900, 880).await;
+        mock_sweep_at_slots(
+            &mut server,
+            &[json_parsed_account(instance, mint, 42)],
+            900,
+            880,
+        )
+        .await;
 
-        let err = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let err = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .expect_err("a snapshot with no coherent slot must not be returned");
 
@@ -846,20 +897,27 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sweep_is_retaken_until_both_token_programs_answer_at_one_slot() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         // First pass straddles a slot boundary; the next one lands inside a single slot.
         mock_sweep_at_slots_times(
             &mut server,
-            &[json_parsed_account(mint, 42)],
+            &[json_parsed_account(instance, mint, 42)],
             900,
             880,
             Some(1),
         )
         .await;
-        mock_sweep_at_slots(&mut server, &[json_parsed_account(mint, 42)], 905, 905).await;
+        mock_sweep_at_slots(
+            &mut server,
+            &[json_parsed_account(instance, mint, 42)],
+            905,
+            905,
+        )
+        .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let snapshot = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .unwrap();
 
@@ -939,8 +997,8 @@ pub(crate) mod tests {
         mock_sweep(
             &mut server,
             &[
-                json_parsed_account(allowed, 100),
-                json_parsed_account(unapproved, 0),
+                json_parsed_account(instance, allowed, 100),
+                json_parsed_account(instance, unapproved, 0),
             ],
         )
         .await;
@@ -971,8 +1029,8 @@ pub(crate) mod tests {
         mock_sweep(
             &mut server,
             &[
-                json_parsed_account(allowed, 100),
-                json_parsed_account(unapproved, 0),
+                json_parsed_account(instance, allowed, 100),
+                json_parsed_account(instance, unapproved, 0),
             ],
         )
         .await;
@@ -1048,6 +1106,24 @@ pub(crate) mod tests {
         assert_eq!(supply, 0, "absent mint account must read as zero supply");
     }
 
+    /// Anyone can send lamports to a mint address on the channel before the mint exists, which
+    /// leaves a System account there. Only SPL Token can mint, so that account has supply 0.
+    #[tokio::test]
+    async fn fetch_channel_supply_account_not_owned_by_spl_token_is_zero() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["","base64"],"executable":false,"rentEpoch":0}}}"#)
+            .create_async()
+            .await;
+
+        let supply = fetch_channel_supply(&client(&server.url()), &Pubkey::new_unique())
+            .await
+            .unwrap();
+        assert_eq!(supply, 0);
+    }
+
     #[tokio::test]
     async fn fetch_channel_supply_rpc_error_is_err() {
         // A transport/node error must surface as Err, never Ok(0): the plain
@@ -1076,12 +1152,18 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn fetch_channel_supply_undecodable_mint_is_err() {
-        // Data the operator cannot decode must never read as an absent mint, which is 0 supply.
+        // An SPL Token account that is not a mint must never read as 0 supply. Only a non-token
+        // owner can be written off as 0.
         let mut server = mockito::Server::new_async().await;
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(spl_account_bytes(Pubkey::new_unique(), 1_000));
         server
             .mock("POST", "/")
             .with_status(200)
-            .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":1},"value":{"owner":"11111111111111111111111111111111","lamports":1,"data":["not base64!","base64"],"executable":false,"rentEpoch":0}}}"#)
+            .with_body(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"context":{{"slot":1}},"value":{{"owner":"{prog}","lamports":1,"data":["{b64}","base64"],"executable":false,"rentEpoch":0}}}}}}"#,
+                prog = spl_token::id(),
+            ))
             .create_async()
             .await;
 
@@ -1141,13 +1223,18 @@ pub(crate) mod tests {
         }
     }
 
-    /// Wrap raw Token-2022 account data as one base64 `RpcKeyedAccount`, reporting the
-    /// real length as `space` so the fixture stays self-consistent.
-    fn keyed_token2022_account(data: &[u8]) -> String {
+    /// Wrap raw Token-2022 account data as `instance`'s Token-2022 ATA for `mint`, one base64
+    /// `RpcKeyedAccount`, reporting the real length as `space` so the fixture stays
+    /// self-consistent.
+    fn keyed_token2022_account(instance: Pubkey, mint: Pubkey, data: &[u8]) -> String {
         let b64 = base64::engine::general_purpose::STANDARD.encode(data);
         format!(
             r#"{{"pubkey":"{ata}","account":{{"lamports":2039280,"owner":"{prog}","executable":false,"rentEpoch":0,"space":{space},"data":["{b64}","base64"]}}}}"#,
-            ata = Pubkey::new_unique(),
+            ata = get_associated_token_address_with_program_id(
+                &instance,
+                &mint,
+                &spl_token_2022::id()
+            ),
             prog = spl_token_2022::id(),
             space = data.len(),
         )
@@ -1156,8 +1243,8 @@ pub(crate) mod tests {
     /// An extended Token-2022 account, sized by the library so the fixture cannot drift
     /// from the on-chain layout: base state, account-type discriminator, then a TLV entry
     /// costing four bytes of header before its value.
-    fn base64_token2022_account(mint: Pubkey, amount: u64) -> String {
-        keyed_token2022_account(&token2022_extended_bytes(mint, amount))
+    fn base64_token2022_account(instance: Pubkey, mint: Pubkey, amount: u64) -> String {
+        keyed_token2022_account(instance, mint, &token2022_extended_bytes(mint, amount))
     }
 
     /// Raw bytes of an extended Token-2022 account.
@@ -1182,10 +1269,14 @@ pub(crate) mod tests {
 
     /// The other layout Token-2022 produces: no extensions, so the account stays at the
     /// bare 165-byte base with no discriminator and no TLV data.
-    fn base64_token2022_account_without_extensions(mint: Pubkey, amount: u64) -> String {
+    fn base64_token2022_account_without_extensions(
+        instance: Pubkey,
+        mint: Pubkey,
+        amount: u64,
+    ) -> String {
         let mut buf = vec![0u8; Token2022Account::LEN];
         token2022_base(mint, amount).pack_into_slice(&mut buf);
-        keyed_token2022_account(&buf)
+        keyed_token2022_account(instance, mint, &buf)
     }
 
     /// Mirror of `mock_sweep` with the accounts on the Token-2022 side instead, so the
@@ -1211,11 +1302,16 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn decodes_token2022_account_with_extensions() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
-        mock_sweep_token_2022(&mut server, &[base64_token2022_account(mint, 4_242)]).await;
+        mock_sweep_token_2022(
+            &mut server,
+            &[base64_token2022_account(instance, mint, 4_242)],
+        )
+        .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .unwrap()
             .balances;
@@ -1231,15 +1327,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn decodes_token2022_account_without_extensions() {
         let mut server = mockito::Server::new_async().await;
+        let instance = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         mock_sweep_token_2022(
             &mut server,
-            &[base64_token2022_account_without_extensions(mint, 7_000)],
+            &[base64_token2022_account_without_extensions(
+                instance, mint, 7_000,
+            )],
         )
         .await;
         mock_all_mints_allowed(&mut server).await;
 
-        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), Pubkey::new_unique())
+        let balances = fetch_escrow_balances_by_mint(&client(&server.url()), instance)
             .await
             .unwrap()
             .balances;

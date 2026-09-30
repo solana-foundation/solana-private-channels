@@ -204,7 +204,8 @@ the halt reason:
    `finalized`. This is authoritative custody. Other token accounts the escrow PDA
    owns (`getTokenAccountsByOwner`) are not custody: the program never moves them. See [`_verify_onchain_release.md`](_verify_onchain_release.md).
 2. **On-chain PrivateChannel supply.** Read the channel mint's `Mint.supply`
-   (`getAccountInfo` on the mint, decode the SPL Mint). This is the total minted,
+   (`getAccountInfo` on the mint, decode the SPL Mint; an account there not owned by
+   SPL Token means nothing was minted, supply 0). This is the total minted,
    already net of burns. `supply - custody` is the halt gap.
 3. **In-flight envelope.** Confirm the gap is not merely un-settled work:
 
