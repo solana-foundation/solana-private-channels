@@ -40,6 +40,8 @@ pub(crate) const EVENT_IX_TAG_LE: &[u8] = &[0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 
 const ALLOW_MINT_EVENT_DISCRIMINATOR: u8 = 1;
 pub(crate) const DEPOSIT_EVENT_DISCRIMINATOR: u8 = 6;
 const EVENT_DISCRIMINATOR_INDEX: usize = 8;
+// AllowMintEvent: tag(8)+disc(1)+instance_seed(32) = 41
+const ALLOW_MINT_EVENT_MINT_INDEX: usize = 41;
 // AllowMintEvent: tag(8)+disc(1)+instance_seed(32)+mint(32) = 73
 const EVENT_DECIMALS_INDEX: usize = 73;
 // DepositEvent: tag(8)+disc(1)+instance_seed(32)+user(32) = 73
@@ -286,7 +288,13 @@ pub fn parse_escrow_instruction(
 
     match discriminator {
         CREATE_INSTANCE => parse_create_instance(ix_data, instruction, account_keys),
-        ALLOW_MINT => parse_allow_mint(ix_data, instruction, account_keys, inner_instructions),
+        ALLOW_MINT => parse_allow_mint(
+            ix_data,
+            instruction,
+            account_keys,
+            inner_instructions,
+            location,
+        ),
         BLOCK_MINT => parse_block_mint(ix_data, instruction, account_keys),
         DEPOSIT => parse_deposit(
             ix_data,
@@ -317,6 +325,28 @@ fn deposit_event_amount(inner: &InnerInstruction, account_keys: &[Pubkey]) -> Op
             .try_into()
             .ok()?;
         Some(u64::from_le_bytes(amount_bytes))
+    } else {
+        None
+    }
+}
+
+/// Decode an inner instruction and return its decimals only if it is the escrow program's AllowMintEvent self-CPI for `mint`; the mint check stops another AllowMint's event from supplying the decimals.
+fn allow_mint_event_decimals(
+    inner: &InnerInstruction,
+    account_keys: &[Pubkey],
+    mint: &Pubkey,
+) -> Option<u8> {
+    let program_id = account_keys.get(inner.instruction.program_id_index as usize)?;
+    if program_id.to_string() != PRIVATE_CHANNEL_ESCROW_PROGRAM_ID {
+        return None;
+    }
+    let event_data = bs58::decode(&inner.instruction.data).into_vec().ok()?;
+    if event_data.len() >= 74
+        && event_data.starts_with(EVENT_IX_TAG_LE)
+        && event_data[EVENT_DISCRIMINATOR_INDEX] == ALLOW_MINT_EVENT_DISCRIMINATOR
+        && event_data[ALLOW_MINT_EVENT_MINT_INDEX..EVENT_DECIMALS_INDEX] == *mint.as_ref()
+    {
+        Some(event_data[EVENT_DECIMALS_INDEX])
     } else {
         None
     }
@@ -363,6 +393,7 @@ fn parse_allow_mint(
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
     inner_instructions: &[InnerInstructions],
+    location: InstructionLocation,
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let ix_data = <AllowMintData as borsh::BorshDeserialize>::deserialize(&mut &data[..])?;
 
@@ -389,31 +420,27 @@ fn parse_allow_mint(
         private_channel_escrow_program: resolve_account(instruction, account_keys, 10)?,
     };
 
-    for inner_instruction_set in inner_instructions {
-        for inner_instruction in &inner_instruction_set.instructions {
-            let Ok(event_data) = bs58::decode(&inner_instruction.instruction.data).into_vec()
-            else {
-                continue;
-            };
+    // AllowMint is only indexed top-level (see `escrow_inner_discriminator_excluded`),
+    // so the inner set at its own index is its whole subtree.
+    let decimals = inner_instructions
+        .iter()
+        .find(|set| set.index as u32 == location.top_level_index)
+        .and_then(|set| {
+            set.instructions
+                .iter()
+                .find_map(|inner| allow_mint_event_decimals(inner, account_keys, &accounts.mint))
+        });
 
-            if event_data.len() >= 74
-                && event_data.starts_with(EVENT_IX_TAG_LE)
-                && event_data[EVENT_DISCRIMINATOR_INDEX] == ALLOW_MINT_EVENT_DISCRIMINATOR
-            {
-                return Ok(Some(EscrowInstruction::AllowMint {
-                    accounts,
-                    data: ix_data,
-                    event: AllowMintEvent {
-                        decimals: event_data[EVENT_DECIMALS_INDEX],
-                    },
-                }));
-            }
-        }
+    match decimals {
+        Some(decimals) => Ok(Some(EscrowInstruction::AllowMint {
+            accounts,
+            data: ix_data,
+            event: AllowMintEvent { decimals },
+        })),
+        None => Err(ParserError::InstructionParseFailed {
+            reason: "No allow mint event found".to_string(),
+        }),
     }
-
-    Err(ParserError::InstructionParseFailed {
-        reason: "No allow mint event found".to_string(),
-    })
 }
 
 /// Parse BlockMint instruction.
@@ -660,36 +687,26 @@ mod tests {
         vec![123] // Just one byte for bump
     }
 
-    /// Create valid inner instruction data for AllowMint event matching the actual program format
-    fn create_allow_mint_inner_instructions() -> Vec<InnerInstructions> {
+    /// An AllowMintEvent self-CPI for `mint` with `decimals`, emitted by the program at `program_id_index`.
+    fn allow_mint_event_inner(
+        program_id_index: u8,
+        mint: Pubkey,
+        decimals: u8,
+    ) -> InnerInstruction {
         let mut data = vec![];
-
-        // Event IX Tag (8 bytes)
-        data.extend_from_slice(&[0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d]);
-
-        // AllowMint discriminator (1 byte)
-        data.push(1);
-
-        // Instance seed (32 bytes) - dummy pubkey
-        data.extend_from_slice(&[0u8; 32]);
-
-        // Mint (32 bytes) - dummy pubkey
-        data.extend_from_slice(&[0u8; 32]);
-
-        // Decimals (1 byte)
-        data.push(2);
-
-        vec![InnerInstructions {
-            index: 0,
-            instructions: vec![InnerInstruction {
-                instruction: CompiledInstruction {
-                    program_id_index: ESCROW_PROGRAM_KEY_INDEX,
-                    accounts: vec![],
-                    data: bs58::encode(&data).into_string(),
-                },
-                stack_height: Some(2),
-            }],
-        }]
+        data.extend_from_slice(EVENT_IX_TAG_LE);
+        data.push(ALLOW_MINT_EVENT_DISCRIMINATOR);
+        data.extend_from_slice(&[0u8; 32]); // instance_seed
+        data.extend_from_slice(mint.as_ref());
+        data.push(decimals);
+        InnerInstruction {
+            instruction: CompiledInstruction {
+                program_id_index,
+                accounts: vec![],
+                data: bs58::encode(&data).into_string(),
+            },
+            stack_height: Some(2),
+        }
     }
 
     /// Create minimal valid Borsh-encoded data for Deposit instruction
@@ -822,11 +839,21 @@ mod tests {
         let instruction = create_instruction_with_accounts(11, "dummy".to_string());
         let account_keys = create_n_account_keys(11);
 
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                account_keys[3],
+                2,
+            )],
+        }];
+
         let result = parse_allow_mint(
             &borsh_data,
             &instruction,
             &account_keys,
-            &create_allow_mint_inner_instructions(),
+            &inner_sets,
+            InstructionLocation::top_level(0),
         );
 
         assert!(result.is_ok());
@@ -844,12 +871,21 @@ mod tests {
         let borsh_data = create_allow_mint_borsh_data();
         let instruction = create_instruction_with_accounts(10, "dummy".to_string()); // Only 10 accounts (need 11)
         let account_keys = create_n_account_keys(10);
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                account_keys[3],
+                2,
+            )],
+        }];
 
         let result = parse_allow_mint(
             &borsh_data,
             &instruction,
             &account_keys,
-            &create_allow_mint_inner_instructions(),
+            &inner_sets,
+            InstructionLocation::top_level(0),
         );
 
         assert!(result.is_err());
@@ -863,11 +899,190 @@ mod tests {
         let instruction = create_instruction_with_accounts(11, "dummy".to_string());
         let account_keys = create_n_account_keys(11);
 
-        let result = parse_allow_mint(&borsh_data, &instruction, &account_keys, &[]);
+        let result = parse_allow_mint(
+            &borsh_data,
+            &instruction,
+            &account_keys,
+            &[],
+            InstructionLocation::top_level(0),
+        );
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("No allow mint event found"), "Error: {}", err);
+    }
+
+    /// Two top-level AllowMints in one tx each read their own inner set's event, not the first one in the tx.
+    #[test]
+    fn two_allow_mints_in_one_tx_read_their_own_decimals() {
+        let account_keys = create_n_account_keys(11);
+        // Keys pad to 21, so 12 is a spare key outside the instruction's 11 accounts.
+        let mint_b_key_index = 12;
+        let mint_a = account_keys[3];
+        let mint_b = account_keys[mint_b_key_index as usize];
+        let mint_a_decimals = 6;
+        let mint_b_decimals = 9;
+
+        let data = encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data());
+        let instruction_a = create_instruction_with_accounts(11, data.clone());
+        let mut instruction_b = create_instruction_with_accounts(11, data);
+        instruction_b.accounts[3] = mint_b_key_index;
+
+        let inner_sets = vec![
+            InnerInstructions {
+                index: 0,
+                instructions: vec![allow_mint_event_inner(
+                    ESCROW_PROGRAM_KEY_INDEX,
+                    mint_a,
+                    mint_a_decimals,
+                )],
+            },
+            InnerInstructions {
+                index: 1,
+                instructions: vec![allow_mint_event_inner(
+                    ESCROW_PROGRAM_KEY_INDEX,
+                    mint_b,
+                    mint_b_decimals,
+                )],
+            },
+        ];
+
+        let parsed_a = parse_escrow_instruction(
+            &instruction_a,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap()
+        .unwrap();
+        let parsed_b = parse_escrow_instruction(
+            &instruction_b,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(1),
+        )
+        .unwrap()
+        .unwrap();
+
+        let EscrowInstruction::AllowMint {
+            accounts: accounts_a,
+            event: event_a,
+            ..
+        } = parsed_a
+        else {
+            panic!("expected AllowMint");
+        };
+        let EscrowInstruction::AllowMint {
+            accounts: accounts_b,
+            event: event_b,
+            ..
+        } = parsed_b
+        else {
+            panic!("expected AllowMint");
+        };
+        assert_eq!(accounts_a.mint, mint_a);
+        assert_eq!(event_a.decimals, mint_a_decimals);
+        assert_eq!(accounts_b.mint, mint_b);
+        assert_eq!(
+            event_b.decimals, mint_b_decimals,
+            "mint B reads its own event, not mint A's"
+        );
+    }
+
+    /// An AllowMintEvent sitting in another top-level instruction's inner set is not read, even for the same mint.
+    #[test]
+    fn allow_mint_event_in_another_instructions_set_is_ignored() {
+        let account_keys = create_n_account_keys(11);
+        let instruction = create_instruction_with_accounts(
+            11,
+            encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data()),
+        );
+        // The only matching event belongs to top-level instruction 1, not 0.
+        let inner_sets = vec![InnerInstructions {
+            index: 1,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                account_keys[3],
+                6,
+            )],
+        }];
+
+        let err = parse_escrow_instruction(
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("No allow mint event found"),
+            "event outside the instruction's own inner set must be ignored: {err}"
+        );
+    }
+
+    /// An AllowMintEvent for a different mint than the instruction's is not read as its event.
+    #[test]
+    fn allow_mint_event_for_other_mint_is_ignored() {
+        let account_keys = create_n_account_keys(11);
+        // Keys pad to 21, so 12 is a spare key outside the instruction's 11 accounts.
+        let other_mint = account_keys[12];
+        let instruction = create_instruction_with_accounts(
+            11,
+            encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data()),
+        );
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            instructions: vec![allow_mint_event_inner(
+                ESCROW_PROGRAM_KEY_INDEX,
+                other_mint,
+                6,
+            )],
+        }];
+
+        let err = parse_escrow_instruction(
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("No allow mint event found"),
+            "event for another mint must be ignored: {err}"
+        );
+    }
+
+    /// An AllowMintEvent lookalike on a non-escrow program is not read as the event.
+    #[test]
+    fn allow_mint_foreign_program_event_lookalike_is_ignored() {
+        let account_keys = create_n_account_keys(11);
+        let instruction = create_instruction_with_accounts(
+            11,
+            encode_instruction_data(ALLOW_MINT, create_allow_mint_borsh_data()),
+        );
+        let inner_sets = vec![InnerInstructions {
+            index: 0,
+            // Key index 0 is not the escrow program.
+            instructions: vec![allow_mint_event_inner(0, account_keys[3], 6)],
+        }];
+
+        let err = parse_escrow_instruction(
+            &instruction,
+            &account_keys,
+            &inner_sets,
+            InstructionLocation::top_level(0),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("No allow mint event found"),
+            "foreign-program event lookalike must be ignored: {err}"
+        );
     }
 
     // ============================================================================
