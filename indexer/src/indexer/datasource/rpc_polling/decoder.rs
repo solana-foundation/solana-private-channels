@@ -1962,4 +1962,46 @@ mod tests {
         assert_eq!(result[0].instruction_index, 0);
         assert_eq!(result[0].inner_index, None);
     }
+
+    /// A successful pre-memo release has 13 accounts. It must decode on replay,
+    /// or backfill stalls on the slot; one account fewer still fails it closed.
+    #[test]
+    fn pre_memo_release_decodes_and_short_release_fails_the_slot() {
+        use crate::test_utils::escrow_fixtures::release_funds_ix_bytes;
+
+        let our_instance = test_pubkey(200);
+        let release = |n_accounts: u8| {
+            // Key 0 is the escrow program; the release reads keys 1..=n, instance at slot 2.
+            let mut account_keys: Vec<String> = (0u8..=n_accounts)
+                .map(|i| test_pubkey(i).to_string())
+                .collect();
+            account_keys[0] = PRIVATE_CHANNEL_ESCROW_PROGRAM_ID.to_string();
+            account_keys[3] = our_instance.to_string();
+            let data = release_funds_ix_bytes(1_000, test_pubkey(100), 42);
+
+            let mut block = create_test_block();
+            block.transactions.push(create_successful_transaction(
+                format!("sig_release_{n_accounts}"),
+                account_keys,
+                vec![create_instruction(
+                    0,
+                    (1..=n_accounts).collect(),
+                    bs58::encode(data).into_string(),
+                )],
+            ));
+            parse_block(&block, 7, ProgramType::Escrow, Some(&our_instance))
+        };
+
+        let rows = release(13).expect("a 13-account release decodes");
+        assert_eq!(rows.len(), 1);
+        let ProgramInstruction::Escrow(ix) = &rows[0].instruction else {
+            panic!("expected an Escrow instruction");
+        };
+        let EscrowInstruction::ReleaseFunds { data, .. } = ix.as_ref() else {
+            panic!("expected a ReleaseFunds instruction");
+        };
+        assert_eq!(data.transaction_nonce, 42);
+
+        assert!(matches!(release(12), Err(SlotRejection::Undecodable(_))));
+    }
 }

@@ -16,9 +16,9 @@ pub const PRIVATE_CHANNEL_ESCROW_PROGRAM_ID: &str = "9tgHa1DcnaSSUtmMsst8ovKTe1G
 const CREATE_INSTANCE: u8 = 0;
 const ALLOW_MINT: u8 = 1;
 const BLOCK_MINT: u8 = 2;
-// pub(crate) so shared test fixtures can build valid Deposit instruction data.
+// pub(crate) so shared test fixtures can build valid Deposit and ReleaseFunds data.
 pub(crate) const DEPOSIT: u8 = 6;
-const RELEASE_FUNDS: u8 = 7;
+pub(crate) const RELEASE_FUNDS: u8 = 7;
 const ROTATE_BITMAP: u8 = 8;
 
 // Only the post-bitmap layouts are decoded. A pre-bitmap release can only name
@@ -26,7 +26,10 @@ const ROTATE_BITMAP: u8 = 8;
 // is not the configured one is dropped before it reaches storage.
 const CREATE_INSTANCE_ACCOUNTS: usize = 8;
 const BLOCK_MINT_ACCOUNTS: usize = 7;
-const RELEASE_FUNDS_ACCOUNTS: usize = 14;
+// ReleaseFunds reads only the 13 accounts every bitmap-era version shares; later ones
+// (memo program, hook extras) are version-specific and ignored. A new account the
+// indexer must read means parsing both layouts, as BlockMint does, not raising this.
+const RELEASE_FUNDS_MIN_ACCOUNTS: usize = 13;
 const ROTATE_BITMAP_ACCOUNTS: usize = 7;
 
 // BlockMint before the gates: no args, and a system_program at index 5. Removing
@@ -599,16 +602,18 @@ fn parse_deposit(
     }
 }
 
-/// Parse ReleaseFunds in the bitmap-era layout.
+/// Parse ReleaseFunds in the bitmap-era layout. 13 accounts is safe to accept: the
+/// current program rejects fewer than 14, and failed transactions never reach here,
+/// so a successful 13-account release can only be a pre-memo one.
 fn parse_release_funds(
     data: &[u8],
     instruction: &CompiledInstruction,
     account_keys: &[Pubkey],
 ) -> Result<Option<EscrowInstruction>, ParserError> {
     let account_count = instruction.accounts.len();
-    if account_count < RELEASE_FUNDS_ACCOUNTS {
+    if account_count < RELEASE_FUNDS_MIN_ACCOUNTS {
         return Err(AccountError::InsufficientAccounts {
-            required: RELEASE_FUNDS_ACCOUNTS,
+            required: RELEASE_FUNDS_MIN_ACCOUNTS,
             actual: account_count,
         }
         .into());
@@ -669,6 +674,7 @@ fn parse_rotate_bitmap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::escrow_fixtures::release_funds_borsh;
     use std::str::FromStr;
 
     // ============================================================================
@@ -731,15 +737,6 @@ mod tests {
                 stack_height: Some(2),
             }],
         }]
-    }
-
-    /// Current ReleaseFunds argument bytes: amount, user, nonce.
-    fn create_release_funds_borsh_data(amount: u64, user: Pubkey, nonce: u64) -> Vec<u8> {
-        let mut data = vec![];
-        data.extend_from_slice(&amount.to_le_bytes());
-        data.extend_from_slice(user.as_ref());
-        data.extend_from_slice(&nonce.to_le_bytes());
-        data
     }
 
     /// Encode instruction data with discriminator and Borsh data as base58
@@ -1290,38 +1287,53 @@ mod tests {
 
     /// The bitmap sits at index 3 and pushes every later account along by one,
     /// so a wrong offset table would put the wrong nonce and amount in the
-    /// database rather than fail.
+    /// database rather than fail. 13 is pre-memo, 14 current, 17 with hook extras.
     #[test]
     fn test_release_funds_account_offsets() {
-        let user = Pubkey::new_unique();
-        let data = create_release_funds_borsh_data(1_000, user, 42);
-        let instruction = create_instruction_with_accounts(14, "dummy".to_string());
-        let account_keys = create_n_account_keys(14);
+        for n in [13, 14, 17] {
+            let user = Pubkey::new_unique();
+            let data = release_funds_borsh(1_000, user, 42);
+            let instruction = create_instruction_with_accounts(n, "dummy".to_string());
+            let keys = create_n_account_keys(n);
 
-        let parsed = parse_release_funds(&data, &instruction, &account_keys)
-            .expect("must parse")
-            .expect("must yield an instruction");
+            let parsed = parse_release_funds(&data, &instruction, &keys)
+                .unwrap_or_else(|e| panic!("{n} accounts must parse: {e}"))
+                .expect("must yield an instruction");
 
-        let EscrowInstruction::ReleaseFunds { accounts, data } = parsed else {
-            panic!("must decode as ReleaseFunds");
-        };
+            let EscrowInstruction::ReleaseFunds { accounts: a, data } = parsed else {
+                panic!("must decode as ReleaseFunds");
+            };
 
-        assert_eq!(data.amount, 1_000);
-        assert_eq!(data.transaction_nonce, 42);
-        assert_eq!(data.user, user);
-        assert_eq!(accounts.withdrawal_bitmap, account_keys[3]);
-        assert_eq!(accounts.operator_pda, account_keys[4]);
-        assert_eq!(accounts.private_channel_escrow_program, account_keys[12]);
+            assert_eq!(data.amount, 1_000, "{n} accounts");
+            assert_eq!(data.transaction_nonce, 42, "{n} accounts");
+            assert_eq!(data.user, user, "{n} accounts");
+            let resolved = [
+                a.payer,
+                a.operator,
+                a.instance,
+                a.withdrawal_bitmap,
+                a.operator_pda,
+                a.mint,
+                a.allowed_mint,
+                a.user_ata,
+                a.instance_ata,
+                a.token_program,
+                a.associated_token_program,
+                a.event_authority,
+                a.private_channel_escrow_program,
+            ];
+            assert_eq!(resolved, keys[..13], "{n} accounts");
+        }
     }
 
     /// Data shorter than the layout needs must error rather than read past the
     /// end or silently mis-slice.
     #[test]
     fn test_release_funds_malformed_data_errors() {
-        let mut data = create_release_funds_borsh_data(1_000, Pubkey::new_unique(), 42);
+        let mut data = release_funds_borsh(1_000, Pubkey::new_unique(), 42);
         data.truncate(40);
-        let instruction = create_instruction_with_accounts(14, "dummy".to_string());
-        let account_keys = create_n_account_keys(14);
+        let instruction = create_instruction_with_accounts(13, "dummy".to_string());
+        let account_keys = create_n_account_keys(13);
 
         let err = parse_release_funds(&data, &instruction, &account_keys)
             .expect_err("short data must not parse")
@@ -1331,15 +1343,17 @@ mod tests {
 
     #[test]
     fn test_release_funds_insufficient_accounts() {
-        let data = create_release_funds_borsh_data(1_000, Pubkey::new_unique(), 1);
-        let instruction = create_instruction_with_accounts(11, "dummy".to_string());
-        let account_keys = create_n_account_keys(11);
+        let data = release_funds_borsh(1_000, Pubkey::new_unique(), 1);
+        let instruction = create_instruction_with_accounts(12, "dummy".to_string());
+        let account_keys = create_n_account_keys(12);
 
-        let result = parse_release_funds(&data, &instruction, &account_keys);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Insufficient accounts"), "Error: {}", err);
+        let err = parse_release_funds(&data, &instruction, &account_keys)
+            .expect_err("12 accounts must not parse")
+            .to_string();
+        assert!(
+            err.contains("Insufficient accounts: required 13, actual 12"),
+            "Error: {err}"
+        );
     }
 
     // ============================================================================
