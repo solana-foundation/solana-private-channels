@@ -262,8 +262,10 @@ rotates on its own.
 The old key also stays each mint's withdraw-fee treasury, exempt from the fee
 and minimum, until a deposit of that mint rewrites it. Sweep its collected fees
 before rotating: once the treasury switches they are an ordinary balance, and
-anything below the minimum plus the fee is stuck. After `SetAuthority`, make a small deposit per allowed mint, and
-check that each mint's
+anything below the minimum plus the fee is stuck. The sweep and `SetAuthority` can
+run under the halt, but the deposit that rewrites the treasury cannot mint until the
+flag is cleared. After [Recover](#recover-only-after-backing-is-confirmed), make a
+small deposit per allowed mint, and check that each mint's
 [`WithdrawConfig.treasury`](../WITHDRAW_PROGRAM.md#withdrawconfig) names the new
 key before treating the rotation as complete. If the old key was compromised,
 block withdrawals per mint until then.
