@@ -1256,6 +1256,7 @@ mod tests {
                 token_program: spl_token::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
         mock_storage.mint_status_history.lock().unwrap().push(
@@ -1304,6 +1305,7 @@ mod tests {
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
     }
@@ -2254,6 +2256,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
+                    profile_slot: 0,
                 },
             );
         }
@@ -2341,6 +2344,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
+                    profile_slot: 0,
                 },
             );
         }
@@ -2405,6 +2409,7 @@ mod tests {
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
         let storage = Arc::new(Storage::Mock(mock));
@@ -3167,6 +3172,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
+                    profile_slot: 0,
                 },
             );
         }
@@ -3611,6 +3617,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
+                    profile_slot: 0,
                 },
             );
         }
@@ -3744,6 +3751,7 @@ mod tests {
                     token_program: spl_token::id().to_string(),
                     created_at: chrono::Utc::now(),
                     status: "allowed".to_string(),
+                    profile_slot: 0,
                 },
             );
         }
@@ -4103,6 +4111,7 @@ mod tests {
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
         let storage = Arc::new(Storage::Mock(mock));
@@ -4203,6 +4212,7 @@ mod tests {
                 token_program: spl_token_2022::id().to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
         let storage = Arc::new(Storage::Mock(mock));

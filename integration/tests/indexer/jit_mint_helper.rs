@@ -160,7 +160,7 @@ async fn build_fixture_inner(populate_builder: bool, seed_mint_row: bool) -> Fix
         // (account probe, blockhash, send, confirm, backoff).
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
-            DbMint::new(mint.to_string(), 6, spl_token::id().to_string()),
+            DbMint::new(mint.to_string(), 6, spl_token::id().to_string(), 0),
         );
     }
 

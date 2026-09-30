@@ -282,7 +282,7 @@ async fn build_state_for_jit_caller_arm(
     if seed_mint_row {
         mock_storage.mints.lock().unwrap().insert(
             mint.to_string(),
-            DbMint::new(mint.to_string(), 6, spl_token::id().to_string()),
+            DbMint::new(mint.to_string(), 6, spl_token::id().to_string(), 0),
         );
     }
     let storage = Arc::new(Storage::Mock(mock_storage));

@@ -806,6 +806,7 @@ impl PostgresDb {
                 mint_address TEXT PRIMARY KEY,
                 decimals SMALLINT NOT NULL,
                 token_program TEXT NOT NULL,
+                profile_slot BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             "#,
@@ -3011,17 +3012,20 @@ impl PostgresDb {
         for mint in mints {
             sqlx::query(
                 r#"
-                INSERT INTO mints (mint_address, decimals, token_program, status)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO mints (mint_address, decimals, token_program, status, profile_slot)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
-                    token_program = EXCLUDED.token_program
+                    token_program = EXCLUDED.token_program,
+                    profile_slot = EXCLUDED.profile_slot
+                WHERE mints.profile_slot <= EXCLUDED.profile_slot
                 "#,
             )
             .bind(&mint.mint_address)
             .bind(mint.decimals)
             .bind(&mint.token_program)
             .bind(&mint.status)
+            .bind(mint.profile_slot)
             .execute(&mut *tx)
             .await?;
         }

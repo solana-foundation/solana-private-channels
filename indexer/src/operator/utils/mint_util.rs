@@ -484,6 +484,7 @@ mod tests {
                 token_program: TOKEN_PROGRAM_ID.to_string(),
                 created_at: chrono::Utc::now(),
                 status: "allowed".to_string(),
+                profile_slot: 0,
             },
         );
         // Two transient blips then success: the read backoff must ride them out.

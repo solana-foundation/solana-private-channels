@@ -205,11 +205,19 @@ pub struct DbMint {
     /// transition. Read per withdrawal so an admin blocking a live mint takes
     /// effect without restarting the operator.
     pub withdrawals_blocked: bool,
+    /// Slot of the AllowMint that set `decimals` and `token_program`. An upsert
+    /// from an older slot is ignored, so a gap repair cannot regress the profile.
+    pub profile_slot: i64,
     pub created_at: DateTime<Utc>,
 }
 
 impl DbMint {
-    pub fn new(mint_address: String, decimals: i16, token_program: String) -> Self {
+    pub fn new(
+        mint_address: String,
+        decimals: i16,
+        token_program: String,
+        profile_slot: i64,
+    ) -> Self {
         Self {
             mint_address,
             decimals,
@@ -217,6 +225,7 @@ impl DbMint {
             // A DbMint is only ever constructed on the allow path.
             status: "allowed".to_string(),
             withdrawals_blocked: false,
+            profile_slot,
             created_at: Utc::now(),
         }
     }

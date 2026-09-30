@@ -1240,6 +1240,7 @@ async fn unreadable_custody_halts_without_quarantine() {
             mint.to_string(),
             MINT_DECIMALS as i16,
             spl_token::id().to_string(),
+            0,
         )])
         .await
         .expect("seed mint");

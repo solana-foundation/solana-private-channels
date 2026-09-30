@@ -223,6 +223,7 @@ async fn test_withdrawal_routed_to_manual_review_when_permanent_delegate_drained
         mint_pubkey.to_string(),
         MINT_DECIMALS as i16,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        0,
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
@@ -388,6 +389,7 @@ async fn test_withdrawal_routed_to_manual_review_when_escrow_ata_is_empty(
         mint_pubkey.to_string(),
         MINT_DECIMALS as i16,
         TOKEN_2022_PROGRAM_ID.to_string(),
+        0,
     );
     storage.upsert_mints_batch(&[mint_meta]).await?;
     storage
