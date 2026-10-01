@@ -891,7 +891,11 @@ mod tests {
     const ALLOW_MINT_WITHDRAW_FEE: u64 = 1_234_567;
     const ALLOW_MINT_MIN_WITHDRAW_AMOUNT: u64 = 7_654_321;
 
-    fn make_allow_mint_instruction(slot: u64, sig: Option<String>) -> InstructionWithMetadata {
+    fn make_allow_mint_instruction(
+        slot: u64,
+        sig: Option<String>,
+        decimals: u8,
+    ) -> InstructionWithMetadata {
         InstructionWithMetadata {
             instruction: ProgramInstruction::Escrow(Box::new(EscrowInstruction::AllowMint {
                 accounts: AllowMintAccounts {
@@ -912,7 +916,7 @@ mod tests {
                     withdraw_fee: ALLOW_MINT_WITHDRAW_FEE,
                     min_withdraw_amount: ALLOW_MINT_MIN_WITHDRAW_AMOUNT,
                 },
-                event: AllowMintEvent { decimals: 6 },
+                event: AllowMintEvent { decimals },
             })),
             slot,
             program_type: ProgramType::Escrow,
@@ -1092,7 +1096,7 @@ mod tests {
 
     #[test]
     fn convert_allow_mint_returns_mint_no_txn() {
-        let ix = make_allow_mint_instruction(200, Some("sig3".to_string()));
+        let ix = make_allow_mint_instruction(200, Some("sig3".to_string()), 6);
         let (mint, status, txn, _) = convert_to_db_models(&ix, Some(&allow_mint_instance()));
         assert!(txn.is_none());
         let status = status.expect("AllowMint must emit a status change");
@@ -1382,7 +1386,7 @@ mod tests {
     async fn finalize_with_mints_upserts_first() {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
-        processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string())));
+        processor.buffer(make_allow_mint_instruction(200, Some("s2".to_string()), 6));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
             .await
@@ -1398,6 +1402,40 @@ mod tests {
         assert_eq!(cp.slot, 200);
     }
 
+    /// A gap repair finalizing an older AllowMint after a live one must not regress the profile.
+    #[tokio::test]
+    async fn finalize_keeps_newer_mint_profile_over_older_slot() {
+        let (mut processor, _checkpoint_rx, mock) = make_processor_with_mock(allow_mint_instance());
+        let live_slot = 106;
+        let live_decimals = 9;
+        let repaired_slot = 103;
+
+        processor.buffer(make_allow_mint_instruction(
+            live_slot,
+            Some("sig-live".to_string()),
+            live_decimals,
+        ));
+        processor
+            .finalize_and_checkpoint(live_slot, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        processor.buffer(make_allow_mint_instruction(
+            repaired_slot,
+            Some("sig-repaired".to_string()),
+            6,
+        ));
+        processor
+            .finalize_and_checkpoint(repaired_slot, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let mints = mock.mints.lock().unwrap();
+        let row = &mints[&make_pubkey(2).to_string()];
+        assert_eq!(row.decimals, live_decimals as i16);
+        assert_eq!(row.allow_mint_slot, live_slot as i64);
+    }
+
     #[tokio::test]
     async fn finalize_writes_mint_status_history_on_allow_mint() {
         let (mut processor, mut checkpoint_rx, mock) =
@@ -1405,6 +1443,7 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(
             200,
             Some("sig-allow-1".to_string()),
+            6,
         ));
         processor
             .finalize_and_checkpoint(200, ProgramType::Escrow)
@@ -1674,6 +1713,7 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(
             201,
             Some("sig-allow-2".to_string()),
+            6,
         ));
         let result = processor
             .finalize_and_checkpoint(201, ProgramType::Escrow)
@@ -1696,6 +1736,7 @@ mod tests {
         processor.buffer(make_allow_mint_instruction(
             202,
             Some("sig-allow-3".to_string()),
+            6,
         ));
         processor.buffer(make_deposit_instruction_on_instance(
             202,
@@ -1722,7 +1763,7 @@ mod tests {
         let (mut processor, mut checkpoint_rx, mock) =
             make_processor_with_mock(allow_mint_instance());
         mock.set_should_fail("upsert_mints_batch", true);
-        processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string())));
+        processor.buffer(make_allow_mint_instruction(300, Some("s3".to_string()), 6));
         let result = processor
             .finalize_and_checkpoint(300, ProgramType::Escrow)
             .await;
@@ -1892,6 +1933,7 @@ mod tests {
         tx.send(ProcessorMessage::Instruction(make_allow_mint_instruction(
             SLOT_S,
             Some("allow".to_string()),
+            6,
         )))
         .await
         .unwrap();

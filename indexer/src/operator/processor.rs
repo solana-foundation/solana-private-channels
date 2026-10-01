@@ -25,7 +25,6 @@ use private_channel_metrics::MetricLabel;
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token_2022::extension::ExtensionType;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -43,8 +42,6 @@ pub struct ReleaseFundsState {
     pub operator_pubkey: Pubkey,
     pub operator_pda: Pubkey,
     pub event_authority_pda: Pubkey,
-    pub allowed_mints: HashMap<String, Pubkey>,
-    pub instance_atas: HashMap<String, Pubkey>,
 }
 
 impl ProcessorState {
@@ -66,8 +63,6 @@ impl ProcessorState {
                 operator_pubkey,
                 operator_pda,
                 event_authority_pda,
-                allowed_mints: HashMap::new(),
-                instance_atas: HashMap::new(),
             }),
             mint_cache: MintCache::with_rpc(storage, rpc_client),
         }
@@ -82,28 +77,6 @@ impl ProcessorState {
             release_funds_state: None,
             mint_cache: MintCache::with_rpc(storage, mint_rpc_client),
         }
-    }
-}
-
-impl ReleaseFundsState {
-    pub fn get_allowed_mint_pda(&mut self, mint: &Pubkey) -> Pubkey {
-        *self
-            .allowed_mints
-            .entry(mint.to_string())
-            .or_insert_with(|| find_allowed_mint_pda(&self.instance_pda, mint))
-    }
-
-    pub fn get_instance_ata(&mut self, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
-        *self
-            .instance_atas
-            .entry(mint.to_string())
-            .or_insert_with(|| {
-                get_associated_token_address_with_program_id(
-                    &self.instance_pda,
-                    mint,
-                    token_program,
-                )
-            })
     }
 }
 
@@ -454,9 +427,10 @@ pub async fn run_processor(
 ///
 /// Kept out of the loop so error handling in the caller is a single
 /// Result<TransactionBuilder, OperatorError> to match on.
-async fn build_release_funds(
-    processor_state: &mut ProcessorState,
+fn build_release_funds(
+    processor_state: &ProcessorState,
     transaction: &DbTransaction,
+    allowed_mint: &AllowedMint,
 ) -> Result<TransactionBuilder, OperatorError> {
     // `withdrawal_nonce IS NOT NULL` is enforced by the insert-trigger for
     // withdrawal rows; a NULL here means the row was inserted by something
@@ -473,7 +447,7 @@ async fn build_release_funds(
 
     let release_funds_state = processor_state
         .release_funds_state
-        .as_mut()
+        .as_ref()
         .ok_or(OperatorError::MissingBuilder)?;
 
     let mut builder = ReleaseFundsBuilder::new();
@@ -488,12 +462,15 @@ async fn build_release_funds(
             reason: e.to_string(),
         })?;
 
-    // Fetch mint metadata from cache (or storage if not cached)
-    let mint_metadata = processor_state.mint_cache.get_mint_metadata(&mint).await?;
-    let token_program = mint_metadata.token_program;
+    // A recreated mint can change token program, and AllowMint re-pins it here.
+    let token_program = allowed_mint.token_program;
 
-    let allowed_mint_pda = release_funds_state.get_allowed_mint_pda(&mint);
-    let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
+    let allowed_mint_pda = find_allowed_mint_pda(&release_funds_state.instance_pda, &mint);
+    let instance_ata = get_associated_token_address_with_program_id(
+        &release_funds_state.instance_pda,
+        &mint,
+        &token_program,
+    );
 
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
@@ -582,11 +559,12 @@ async fn read_withdrawal_allowed_mint(
         reason: e.to_string(),
     })?;
 
-    let allowed_mint_pda = processor_state
+    let instance_pda = processor_state
         .release_funds_state
-        .as_mut()
+        .as_ref()
         .ok_or(OperatorError::MissingBuilder)?
-        .get_allowed_mint_pda(&mint);
+        .instance_pda;
+    let allowed_mint_pda = find_allowed_mint_pda(&instance_pda, &mint);
 
     // A floor already proves this account existed, so it doubles as the freshness
     // anchor and spares the extra round-trip on every withdrawal after the first.
@@ -732,11 +710,14 @@ async fn check_withdrawal_preflights_inner(
         reason: e.to_string(),
     })?;
 
-    let token_program = processor_state
-        .mint_cache
-        .get_mint_metadata(&mint)
-        .await?
-        .token_program;
+    let token_program = allowed_mint.token_program;
+    let instance_pda = processor_state
+        .release_funds_state
+        .as_ref()
+        .ok_or(OperatorError::MissingBuilder)?
+        .instance_pda;
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance_pda, &mint, &token_program);
 
     // A freeze_authority holder can freeze the pooled escrow ATA, which strands
     // every depositor for that mint. This runs before the Token-2022 gate below
@@ -745,23 +726,16 @@ async fn check_withdrawal_preflights_inner(
     // per-withdrawal read. Gaining a freeze authority needs a close and recreate,
     // which Deposit rejects against the pinned profile, so a mint pinned without
     // one cannot be holding a balance it could freeze.
-    if allowed_mint.has_freeze_authority {
-        let release_funds_state = processor_state
-            .release_funds_state
-            .as_mut()
-            .ok_or(OperatorError::MissingBuilder)?;
-        let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
-
-        if processor_state
+    if allowed_mint.has_freeze_authority
+        && processor_state
             .mint_cache
             .is_ata_frozen(&instance_ata)
             .await?
-        {
-            return Ok(Some(BailReason::new(
-                metrics::BAIL_REASON_ESCROW_FROZEN,
-                format!("escrow ATA frozen for mint: {mint}"),
-            )));
-        }
+    {
+        return Ok(Some(BailReason::new(
+            metrics::BAIL_REASON_ESCROW_FROZEN,
+            format!("escrow ATA frozen for mint: {mint}"),
+        )));
     }
 
     // PausableConfig and PermanentDelegate only exist on Token-2022 mints.
@@ -784,12 +758,6 @@ async fn check_withdrawal_preflights_inner(
 
     if has_permanent_delegate {
         let amount = transaction.amount.value();
-
-        let release_funds_state = processor_state
-            .release_funds_state
-            .as_mut()
-            .ok_or(OperatorError::MissingBuilder)?;
-        let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
 
         let on_chain = processor_state
             .mint_cache
@@ -872,11 +840,7 @@ async fn attach_hook_extras(
         reason: e.to_string(),
     })?;
 
-    let token_program = processor_state
-        .mint_cache
-        .get_mint_metadata(&mint)
-        .await?
-        .token_program;
+    let token_program = allowed_mint.token_program;
 
     let recipient =
         Pubkey::from_str(&transaction.recipient).map_err(|e| OperatorError::InvalidPubkey {
@@ -886,12 +850,13 @@ async fn attach_hook_extras(
     let recipient_ata =
         get_associated_token_address_with_program_id(&recipient, &mint, &token_program);
 
-    let release_funds_state = processor_state
+    let instance_pda = processor_state
         .release_funds_state
-        .as_mut()
-        .ok_or(OperatorError::MissingBuilder)?;
-    let instance_pda = release_funds_state.instance_pda;
-    let instance_ata = release_funds_state.get_instance_ata(&mint, &token_program);
+        .as_ref()
+        .ok_or(OperatorError::MissingBuilder)?
+        .instance_pda;
+    let instance_ata =
+        get_associated_token_address_with_program_id(&instance_pda, &mint, &token_program);
 
     let Some(hook_extras) = processor_state
         .mint_cache
@@ -961,10 +926,9 @@ pub async fn process_release_funds(
 
             // Build first so row-data poison, such as a NULL nonce or an
             // unparseable pubkey, surfaces here as an `InvalidBuilder` for the
-            // classifier to halt the pipeline on. Building also warms
-            // `MintCache.cache`, so the pre-flight below does not pay an extra
-            // database or RPC round-trip for `get_mint_metadata`.
-            let mut release_funds_tx = build_release_funds(processor_state, &transaction).await?;
+            // classifier to halt the pipeline on.
+            let mut release_funds_tx =
+                build_release_funds(processor_state, &transaction, &allowed_mint)?;
 
             // Pre-flight for Token-2022 pause / permanent-delegate drain. These
             // are row-specific, so bails route to ManualReview and continue the
@@ -1349,65 +1313,7 @@ mod tests {
             operator_pubkey: Pubkey::new_unique(),
             operator_pda: Pubkey::new_unique(),
             event_authority_pda: Pubkey::new_unique(),
-            allowed_mints: HashMap::new(),
-            instance_atas: HashMap::new(),
         }
-    }
-
-    #[test]
-    fn get_allowed_mint_pda_derives_and_caches() {
-        let mut state = make_release_funds_state();
-        let mint = Pubkey::new_unique();
-
-        let pda1 = state.get_allowed_mint_pda(&mint);
-        let pda2 = state.get_allowed_mint_pda(&mint);
-
-        assert_eq!(pda1, pda2);
-        assert_eq!(pda1, find_allowed_mint_pda(&state.instance_pda, &mint));
-        assert_eq!(state.allowed_mints.len(), 1);
-    }
-
-    #[test]
-    fn get_allowed_mint_pda_different_mints() {
-        let mut state = make_release_funds_state();
-        let mint_a = Pubkey::new_unique();
-        let mint_b = Pubkey::new_unique();
-
-        assert_ne!(
-            state.get_allowed_mint_pda(&mint_a),
-            state.get_allowed_mint_pda(&mint_b)
-        );
-        assert_eq!(state.allowed_mints.len(), 2);
-    }
-
-    #[test]
-    fn get_instance_ata_derives_and_caches() {
-        let mut state = make_release_funds_state();
-        let mint = Pubkey::new_unique();
-        let tp = spl_token::id();
-
-        let ata1 = state.get_instance_ata(&mint, &tp);
-        let ata2 = state.get_instance_ata(&mint, &tp);
-
-        assert_eq!(ata1, ata2);
-        let expected =
-            get_associated_token_address_with_program_id(&state.instance_pda, &mint, &tp);
-        assert_eq!(ata1, expected);
-        assert_eq!(state.instance_atas.len(), 1);
-    }
-
-    #[test]
-    fn get_instance_ata_different_mints() {
-        let mut state = make_release_funds_state();
-        let mint_a = Pubkey::new_unique();
-        let mint_b = Pubkey::new_unique();
-        let tp = spl_token::id();
-
-        assert_ne!(
-            state.get_instance_ata(&mint_a, &tp),
-            state.get_instance_ata(&mint_b, &tp)
-        );
-        assert_eq!(state.instance_atas.len(), 2);
     }
 
     /// Insert a minimal `mints` row AND a slot-0 `allowed` status history
@@ -2066,6 +1972,97 @@ mod tests {
         assert!(builder.is_none(), "nothing may be dispatched");
     }
 
+    /// A Token-2022 mint is closed at zero supply, recreated as SPL and re-allowed
+    /// while the operator keeps running. The next release must use SPL, not
+    /// anything left over from the first withdrawal.
+    #[tokio::test]
+    async fn release_follows_a_recreated_mint_in_a_running_operator() {
+        let mint = Pubkey::new_unique();
+        let spl = spl_token::id();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+
+        // First withdrawal runs against the Token-2022 profile.
+        let (mut ps, mut server) =
+            processor_state_for(&storage, &mint, allowed_mint_bytes_token_2022(0)).await;
+        assume_mint_allowlisted(&mut ps, &mint);
+        let instance_pda = ps.release_funds_state.as_ref().unwrap().instance_pda;
+
+        let (_, _, first) =
+            run_one_withdrawal(&mut ps, storage.clone(), withdrawal_for(&mint, 5)).await;
+        let Some(TransactionBuilder::ReleaseFunds(first)) = first else {
+            panic!("the first withdrawal must be dispatched");
+        };
+        assert_eq!(
+            first.builder.instruction().accounts[9].pubkey,
+            spl_token_2022::id()
+        );
+
+        // Recreated as SPL: the same AllowedMint account now pins the SPL program.
+        server.reset();
+        mock_account_read(
+            &mut server,
+            &find_allowed_mint_pda(&instance_pda, &mint),
+            &PRIVATE_CHANNEL_ESCROW_PROGRAM_ID,
+            allowed_mint_bytes(false, false, false),
+        );
+
+        let txn = withdrawal_for(&mint, 6);
+        let recipient = Pubkey::from_str(&txn.recipient).unwrap();
+        let (outcome, _, builder) = run_one_withdrawal(&mut ps, storage, txn).await;
+
+        assert!(outcome.is_ok(), "the second withdrawal must not error");
+        let Some(TransactionBuilder::ReleaseFunds(release)) = builder else {
+            panic!("the second withdrawal must be dispatched");
+        };
+        // ReleaseFunds places user_ata, instance_ata and token_program at 7, 8, 9.
+        let accounts = release.builder.instruction().accounts;
+        assert_eq!(accounts[9].pubkey, spl);
+        assert_eq!(
+            accounts[8].pubkey,
+            get_associated_token_address_with_program_id(&instance_pda, &mint, &spl)
+        );
+        assert_eq!(
+            accounts[7].pubkey,
+            get_associated_token_address_with_program_id(&recipient, &mint, &spl)
+        );
+    }
+
+    /// The pre-flight reads the escrow ATA too, so it has to derive it from the same
+    /// fresh profile. Only the SPL ATA is answered here: reading the one the stale
+    /// Token-2022 view derives goes unanswered and fails the run.
+    #[tokio::test]
+    async fn frozen_check_reads_the_escrow_ata_of_the_allowed_mint_program() {
+        let mint = Pubkey::new_unique();
+        let spl = spl_token::id();
+        let storage = Arc::new(Storage::Mock(MockStorage::new()));
+        insert_token_2022_mint_row(&storage, &mint);
+
+        // Pinned with a freeze authority, which is what makes the pre-flight read
+        // the escrow ATA.
+        let (mut ps, mut server) =
+            processor_state_for(&storage, &mint, allowed_mint_bytes(false, false, true)).await;
+        assume_mint_allowlisted(&mut ps, &mint);
+        let instance_pda = ps.release_funds_state.as_ref().unwrap().instance_pda;
+        let instance_ata = get_associated_token_address_with_program_id(&instance_pda, &mint, &spl);
+
+        // Token account, 165-byte base layout: state at 108, 2 means Frozen.
+        let mut ata_data = vec![0u8; 165];
+        ata_data[108] = 2;
+        let _ata_mock = mock_account_read(&mut server, &instance_ata, &spl, ata_data);
+
+        let (outcome, update, builder) =
+            run_one_withdrawal(&mut ps, storage, withdrawal_for(&mint, 5)).await;
+
+        assert!(outcome.is_ok(), "the escrow ATA read must be answered");
+        let update = update.expect("row must be parked");
+        assert_eq!(update.status, TransactionStatus::ManualReview);
+        assert!(update
+            .error_message
+            .expect("error_message must be set")
+            .contains("escrow ATA frozen for mint:"));
+        assert!(builder.is_none(), "nothing may be dispatched");
+    }
+
     /// An allowlist account whose layout this operator cannot decode parks the row
     /// instead of raising a transient the task would restart on forever.
     #[tokio::test]
@@ -2307,9 +2304,10 @@ mod tests {
 
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
-        insert_mint_row(&storage, &mint_pubkey);
+        let allowed_mint = AllowedMint::from_bytes(&allowed_mint_bytes(false, false, false))
+            .expect("the SPL allowlist bytes decode");
 
-        let mut processor_state = ProcessorState {
+        let processor_state = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
@@ -2324,8 +2322,7 @@ mod tests {
         );
         txn.initiator = initiator.to_string();
 
-        let builder = build_release_funds(&mut processor_state, &txn)
-            .await
+        let builder = build_release_funds(&processor_state, &txn, &allowed_mint)
             .expect("a valid withdrawal row must build");
         let TransactionBuilder::ReleaseFunds(release) = builder else {
             panic!("a withdrawal must build a ReleaseFunds builder");
@@ -2355,9 +2352,10 @@ mod tests {
 
         let mock = MockStorage::new();
         let storage = Arc::new(Storage::Mock(mock));
-        insert_mint_row(&storage, &mint_pubkey);
+        let allowed_mint = AllowedMint::from_bytes(&allowed_mint_bytes(false, false, false))
+            .expect("the SPL allowlist bytes decode");
 
-        let mut processor_state = ProcessorState {
+        let processor_state = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
@@ -2374,8 +2372,7 @@ mod tests {
         txn.instruction_index = 4;
         txn.inner_index = Some(2);
 
-        let builder = build_release_funds(&mut processor_state, &txn)
-            .await
+        let builder = build_release_funds(&processor_state, &txn, &allowed_mint)
             .expect("a valid withdrawal row must build");
         let TransactionBuilder::ReleaseFunds(release) = builder else {
             panic!("a withdrawal must build a ReleaseFunds builder");
@@ -2733,9 +2730,10 @@ mod tests {
     async fn release_wire_len(extras: usize) -> usize {
         let mint = Pubkey::new_unique();
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        insert_mint_row(&storage, &mint);
+        let allowed_mint = AllowedMint::from_bytes(&allowed_mint_bytes(false, false, false))
+            .expect("the SPL allowlist bytes decode");
 
-        let mut processor_state = ProcessorState {
+        let processor_state = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),
             mint_cache: crate::operator::MintCache::new(storage),
@@ -2748,8 +2746,7 @@ mod tests {
             TransactionType::Withdrawal,
         );
 
-        let mut tx_builder = build_release_funds(&mut processor_state, &txn)
-            .await
+        let mut tx_builder = build_release_funds(&processor_state, &txn, &allowed_mint)
             .expect("a valid withdrawal row must build");
         let compute_unit_price = tx_builder.compute_unit_price();
         let compute_budget = tx_builder.compute_budget();
@@ -2838,7 +2835,7 @@ mod tests {
     #[tokio::test]
     async fn transient_error_requeues_the_head_and_the_buffered_rows() {
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
-        // No mint row and no RPC, so the metadata read fails as transient.
+        // No RPC, so the allowlist read fails as transient.
         let mut ps = ProcessorState {
             admin_pubkey: Pubkey::new_unique(),
             release_funds_state: Some(make_release_funds_state()),

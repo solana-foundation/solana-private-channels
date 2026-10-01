@@ -28,12 +28,15 @@ pub async fn seed_allowed_mint(
     effective_slot: i64,
 ) -> Result<(), StorageError> {
     storage
-        .upsert_mints_batch(&[DbMint::new(
-            mint_address.to_string(),
-            decimals,
-            token_program.to_string(),
-            TokenAmount(TEST_WITHDRAW_FEE),
-        )])
+        .upsert_mints_batch(&[DbMint {
+            allow_mint_slot: effective_slot,
+            ..DbMint::new(
+                mint_address.to_string(),
+                decimals,
+                token_program.to_string(),
+                TokenAmount(TEST_WITHDRAW_FEE),
+            )
+        }])
         .await?;
     storage
         .insert_mint_statuses_batch(&[DbMintStatus {

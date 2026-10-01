@@ -3021,19 +3021,12 @@ impl PostgresDb {
                 ON CONFLICT (mint_address) DO UPDATE
                 SET decimals = EXCLUDED.decimals,
                     token_program = EXCLUDED.token_program,
-                    -- Slot-ordered like mint_status_history: a backfill or resync
-                    -- replaying an older AllowMint cannot restore older values.
-                    withdraw_fee = CASE
-                        WHEN EXCLUDED.allow_mint_slot >= mints.allow_mint_slot
-                        THEN EXCLUDED.withdraw_fee
-                        ELSE mints.withdraw_fee
-                    END,
-                    min_withdraw_amount = CASE
-                        WHEN EXCLUDED.allow_mint_slot >= mints.allow_mint_slot
-                        THEN EXCLUDED.min_withdraw_amount
-                        ELSE mints.min_withdraw_amount
-                    END,
-                    allow_mint_slot = GREATEST(mints.allow_mint_slot, EXCLUDED.allow_mint_slot)
+                    withdraw_fee = EXCLUDED.withdraw_fee,
+                    min_withdraw_amount = EXCLUDED.min_withdraw_amount,
+                    allow_mint_slot = EXCLUDED.allow_mint_slot
+                -- Slot-ordered like mint_status_history: a backfill or resync
+                -- replaying an older AllowMint cannot restore older values.
+                WHERE mints.allow_mint_slot <= EXCLUDED.allow_mint_slot
                 "#,
             )
             .bind(&mint.mint_address)

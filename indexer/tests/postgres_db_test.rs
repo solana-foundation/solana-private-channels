@@ -798,21 +798,27 @@ async fn upsert_and_get_mints() -> Result<(), Box<dyn std::error::Error>> {
 async fn upsert_mint_updates_decimals() -> Result<(), Box<dyn std::error::Error>> {
     let (_pool, storage, _pg) = start_postgres().await?;
 
-    let m = DbMint::new(
-        "mint_upd".to_string(),
-        6,
-        "TokenkegQ".to_string(),
-        TokenAmount(1),
-    );
+    let m = DbMint {
+        allow_mint_slot: 100,
+        ..DbMint::new(
+            "mint_upd".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[m]).await?;
 
-    // Upsert with new decimals
-    let m2 = DbMint::new(
-        "mint_upd".to_string(),
-        9,
-        "TokenkegQ".to_string(),
-        TokenAmount(1),
-    );
+    // Upsert with new decimals from a newer slot
+    let m2 = DbMint {
+        allow_mint_slot: 106,
+        ..DbMint::new(
+            "mint_upd".to_string(),
+            9,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
     storage.upsert_mints_batch(&[m2]).await?;
 
     let got = storage.get_mint("mint_upd").await?.unwrap();
@@ -865,6 +871,73 @@ async fn upsert_mint_withdraw_config_ignores_an_older_allow_mint(
     assert_eq!(got.withdraw_fee, repriced_fee);
     assert_eq!(got.min_withdraw_amount, repriced_min_withdraw_amount);
     assert_eq!(got.allow_mint_slot, 110);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_profile_ignores_older_allow_mint() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let live_slot = 106;
+
+    let live = DbMint {
+        allow_mint_slot: live_slot,
+        ..DbMint::new(
+            "mint_live".to_string(),
+            9,
+            "TokenzQdB".to_string(),
+            TokenAmount(1),
+        )
+    };
+    storage.upsert_mints_batch(&[live]).await?;
+
+    // A gap repair delivering the older AllowMint after the live one.
+    let repaired = DbMint {
+        allow_mint_slot: 103,
+        ..DbMint::new(
+            "mint_live".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
+    storage.upsert_mints_batch(&[repaired]).await?;
+
+    let got = storage.get_mint("mint_live").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
+    assert_eq!(got.allow_mint_slot, live_slot);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_mint_same_slot_later_profile_wins() -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let slot = 106;
+
+    // A close and recreate between two AllowMints in one slot, in block order.
+    let first = DbMint {
+        allow_mint_slot: slot,
+        ..DbMint::new(
+            "mint_same".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )
+    };
+    let second = DbMint {
+        allow_mint_slot: slot,
+        ..DbMint::new(
+            "mint_same".to_string(),
+            9,
+            "TokenzQdB".to_string(),
+            TokenAmount(1),
+        )
+    };
+    storage.upsert_mints_batch(&[first, second]).await?;
+
+    let got = storage.get_mint("mint_same").await?.unwrap();
+    assert_eq!(got.decimals, 9);
+    assert_eq!(got.token_program, "TokenzQdB");
     Ok(())
 }
 

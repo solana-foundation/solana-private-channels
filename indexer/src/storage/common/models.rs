@@ -211,9 +211,8 @@ pub struct DbMint {
     /// Smallest channel withdrawal amount from the latest AllowMint, 0 for
     /// none. Read and written with `withdraw_fee`.
     pub min_withdraw_amount: TokenAmount,
-    /// Slot of the AllowMint `withdraw_fee` and `min_withdraw_amount` came from.
-    /// The upsert only replaces them from a slot at or after this one, so a
-    /// replay cannot restore older values.
+    /// Slot of the AllowMint this row came from. An upsert from an older slot
+    /// is ignored, so a replay or gap repair cannot restore older values.
     pub allow_mint_slot: i64,
     pub created_at: DateTime<Utc>,
 }

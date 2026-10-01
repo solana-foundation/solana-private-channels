@@ -132,10 +132,10 @@ fn make_mint_builder(mint: Pubkey) -> MintToBuilder {
 /// for `txn_id` (when false, the helper hits its no-cached-builder
 /// Transient branch on first lookup).
 ///
-/// `populate_mint_cache` controls whether `mock_storage.mints` carries a
-/// `DbMint` for the mint pubkey. The mint-cache-miss test relies on
-/// passing `false` here so `get_mint_metadata` returns the
-/// `Transient("mint not in mint cache")` branch.
+/// `seed_mint_row` controls whether `mock_storage.mints` carries a
+/// `DbMint` for the mint pubkey. The decimals-unavailable test relies on
+/// passing `false` here so `get_mint_decimals` returns the
+/// `Transient("mint decimals unavailable")` branch.
 struct Fixture {
     state: private_channel_indexer::operator::sender::types::SenderState,
     mock: MockRpcServer,
@@ -147,15 +147,15 @@ async fn build_fixture(populate_builder: bool) -> Fixture {
     build_fixture_inner(populate_builder, true).await
 }
 
-async fn build_fixture_inner(populate_builder: bool, populate_mint_cache: bool) -> Fixture {
+async fn build_fixture_inner(populate_builder: bool, seed_mint_row: bool) -> Fixture {
     ensure_admin_signer_env();
     let mock = MockRpcServer::start().await;
     let mock_storage = MockStorage::new();
 
     let mint = Pubkey::new_unique();
-    if populate_mint_cache {
-        // Pre-populate the mint cache so `get_mint_metadata` resolves from
-        // storage rather than falling back to RPC. This keeps the
+    if seed_mint_row {
+        // Seed the mint row so `get_mint_decimals` resolves from storage
+        // rather than falling back to RPC. This keeps the
         // per-scenario RPC scripts focused on the JIT helper's own calls
         // (account probe, blockhash, send, confirm, backoff).
         mock_storage.mints.lock().unwrap().insert(
@@ -434,14 +434,14 @@ async fn jit_returns_manual_review_when_post_init_authority_mismatch() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Mint cache miss — Transient.
+// Mint decimals unavailable, Transient.
 // ─────────────────────────────────────────────────────────────────────
 //
 // Pre-check sees uninit (would normally fall through to init), but
-// `get_mint_metadata` fails because the mint cache is empty. Routes to
-// Transient with the cache-miss reason string.
+// `get_mint_decimals` fails because there is no mint row. Routes to
+// Transient with the decimals-unavailable reason string.
 #[tokio::test]
-async fn jit_returns_transient_when_mint_cache_miss() {
+async fn jit_returns_transient_when_mint_decimals_unavailable() {
     let Fixture {
         mut state,
         mock,
@@ -456,8 +456,8 @@ async fn jit_returns_transient_when_mint_cache_miss() {
     match outcome {
         JitOutcome::Transient(reason) => {
             assert!(
-                reason.contains("mint not in mint cache"),
-                "cache-miss must surface the cache-miss reason; got {reason:?}"
+                reason.contains("mint decimals unavailable"),
+                "a missing mint row must surface the decimals-unavailable reason; got {reason:?}"
             );
         }
         other => panic!("expected Transient, got {:?}", debug_outcome(&other)),
