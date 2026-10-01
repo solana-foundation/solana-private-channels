@@ -257,7 +257,8 @@ new key with SPL `SetAuthority` first. The old key stays the on-chain
 `mint_authority` until you do, so deposits fail with `OwnerMismatch`
 (see [`deposit_failed.md`](deposit_failed.md)) and the old key keeps the ability to
 mint. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
-rotates on its own.
+rotates on its own. Resync reads each receipt mint's own history as well as the
+new admin's, so deposits the old key minted before the rotation stay terminal.
 
 ## Recover (only after backing is confirmed)
 

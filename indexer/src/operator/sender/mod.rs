@@ -7,7 +7,10 @@ pub(crate) mod test_support;
 mod transaction;
 pub mod types;
 
-pub use mint::{enumerate_consumed_mints, ConsumedMint, ConsumedMintKind, ConsumedSet, JitOutcome};
+pub use mint::{
+    enumerate_consumed_mints, extend_with_mint_history, ConsumedMint, ConsumedMintKind,
+    ConsumedSet, JitOutcome,
+};
 pub(crate) use remint::{classify_signatures, FinalityRpc, SigFinality};
 pub(crate) use state::{
     release_seen_at_confirmed, validate_bitmap_consistency, verify_release_landed, ReleaseVerdict,
