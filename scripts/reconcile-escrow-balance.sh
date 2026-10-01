@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # reconcile-escrow-balance.sh — Reconcile on-chain escrow balance vs DB expected balance per mint
 #
-# Usage: ./scripts/reconcile-escrow-balance.sh <ESCROW_OWNER> <MINT> <DB_CONNECTION_STRING>
+# Usage: ./scripts/reconcile-escrow-balance.sh <ESCROW_OWNER> <MINT>
 #
 # Arguments:
 #   ESCROW_OWNER       — Instance PDA that owns escrow token accounts
 #   MINT               — Token mint address to reconcile
-#   DB_CONNECTION_STRING — Postgres connection URL to indexer DB
 #
 # Environment variables:
 #   SOLANA_RPC_URL  — RPC endpoint (default: http://localhost:8899)
 #   ALERT_WEBHOOK   — Optional webhook URL for mismatch alerts
+#   PGSERVICE, or PGHOST/PGPORT/PGDATABASE/PGUSER: indexer DB connection (libpq)
+#   PGPASSFILE: mode-0600 password file (default: ~/.pgpass)
+#
+# The DB password never goes in any argv: argv is visible to every local user.
 #
 # Requirements: spl-token CLI, psql, jq, curl
 #
@@ -21,28 +24,36 @@
 
 set -euo pipefail
 
-if [ $# -lt 3 ]; then
-    echo "Usage: $0 <ESCROW_OWNER> <MINT> <DB_CONNECTION_STRING>"
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 <ESCROW_OWNER> <MINT>"
     echo ""
     echo "Example:"
-    echo "  $0 5xYz...PDA So11...mint 'postgresql://user:pass@localhost:5432/private_channel'"
+    echo "  PGSERVICE=indexer $0 5xYz...PDA So11...mint"
     echo ""
     echo "Environment variables:"
     echo "  SOLANA_RPC_URL  — RPC endpoint (default: http://localhost:8899)"
     echo "  ALERT_WEBHOOK   — Optional webhook URL for mismatch alerts"
+    echo "  PGSERVICE, or PGHOST/PGPORT/PGDATABASE/PGUSER: indexer DB connection"
+    echo "  PGPASSFILE: mode-0600 password file (default: ~/.pgpass)"
     exit 2
 fi
 
 ESCROW_OWNER="$1"
 MINT="$2"
-DB_URL="$3"
 RPC_URL="${SOLANA_RPC_URL:-http://localhost:8899}"
+
+# Without either, libpq quietly falls back to a default database.
+if [ -z "${PGSERVICE:-}" ] && [ -z "${PGDATABASE:-}" ]; then
+    echo "ERROR: set PGSERVICE or PGDATABASE to the indexer DB."
+    exit 2
+fi
 
 echo "=== Solana Private Channels Escrow Balance Reconciliation ==="
 echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Escrow owner: ${ESCROW_OWNER}"
 echo "Mint:         ${MINT}"
 echo "RPC:          ${RPC_URL}"
+echo "DB:           ${PGSERVICE:-${PGHOST:-local}/${PGDATABASE}}"
 echo ""
 
 # Step 1: Get on-chain token balance (raw units)
@@ -68,14 +79,17 @@ echo "On-chain balance (raw): ${ONCHAIN_BALANCE}"
 
 # Step 2: Query database for expected balance (raw units)
 echo "Querying database for expected balance..."
-DB_EXPECTED=$(psql "$DB_URL" -t -A -v "mint=${MINT}" -c "
+# -w fails instead of prompting when libpq skips the pgpass file; -X ignores ~/.psqlrc.
+# psql does not interpolate :'mint' inside -c, so the query goes on stdin.
+DB_EXPECTED=$(psql -X -w -t -A -v ON_ERROR_STOP=1 -v "mint=${MINT}" 2>&1 <<'SQL'
     SELECT
         COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE 0 END), 0) -
         COALESCE(SUM(CASE WHEN transaction_type = 'withdrawal' THEN amount ELSE 0 END), 0)
         AS expected_balance
     FROM transactions
     WHERE mint = :'mint' AND status = 'completed';
-" 2>&1) || {
+SQL
+) || {
     echo "ERROR: Failed to query database."
     echo "Detail: ${DB_EXPECTED}"
     exit 2
