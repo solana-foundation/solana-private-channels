@@ -278,12 +278,27 @@ async fn create_tables(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Lets a cursor signature be found, or proven absent, without walking the PK. Built
+/// only by the write node under its lease, since the plain build blocks inserts until done.
+/// Non-unique: a signature has one row per address. Plain so a failed build never stays invalid.
+pub async fn ensure_address_signatures_signature_index(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS address_signatures_signature_idx
+         ON address_signatures (signature) INCLUDE (slot)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::write_batch::AddressSignatureRow;
     use crate::test_helpers::{
-        postgres_container_url, start_test_postgres, start_test_postgres_raw,
-        start_test_postgres_with_new_instance,
+        flush_address_signatures_sync, postgres_container_url, start_test_postgres,
+        start_test_postgres_raw, start_test_postgres_with_new_instance,
+        start_test_postgres_with_url,
     };
     use serial_test::serial;
     use solana_sdk::account::{AccountSharedData, ReadableAccount};
@@ -420,6 +435,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 0, "blocks table should exist and be empty");
+    }
+
+    /// Opening the DB (as the admin CLI does) must not build the index; the write node's
+    /// call must build a valid, non-unique one over existing rows, and repeat safely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signature_index_is_built_only_by_the_explicit_call() {
+        let (db, _pg, url) = start_test_postgres_with_url().await;
+        PostgresAccountsDB::new(&url, false).await.unwrap();
+        let exists: bool = sqlx::query_scalar(
+            "SELECT to_regclass('address_signatures_signature_idx') IS NOT NULL",
+        )
+        .fetch_one(db.pool.as_ref())
+        .await
+        .unwrap();
+        assert!(!exists, "create_tables must not build the signature index");
+
+        let rows: Vec<AddressSignatureRow> = (0..10)
+            .map(|slot| AddressSignatureRow {
+                address: Pubkey::new_unique().to_bytes().to_vec(),
+                slot,
+                signature: solana_sdk::signature::Signature::new_unique()
+                    .as_ref()
+                    .to_vec(),
+            })
+            .collect();
+        flush_address_signatures_sync(&crate::accounts::AccountsDB::Postgres(db.clone()), &rows)
+            .await;
+
+        ensure_address_signatures_signature_index(db.pool.as_ref())
+            .await
+            .unwrap();
+        ensure_address_signatures_signature_index(db.pool.as_ref())
+            .await
+            .unwrap();
+
+        let (valid, unique): (bool, bool) = sqlx::query_as(
+            "SELECT i.indisvalid, i.indisunique FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             WHERE c.relname = 'address_signatures_signature_idx'",
+        )
+        .fetch_one(db.pool.as_ref())
+        .await
+        .expect("address_signatures_signature_idx should exist");
+        assert!(valid && !unique, "valid={valid} unique={unique}");
+        let def: String = sqlx::query_scalar(
+            "SELECT pg_get_indexdef('address_signatures_signature_idx'::regclass)",
+        )
+        .fetch_one(db.pool.as_ref())
+        .await
+        .unwrap();
+        assert!(def.contains("(signature) INCLUDE (slot)"), "{def}");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM address_signatures")
+            .fetch_one(db.pool.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(count, 10);
     }
 
     /// The synchronous TransactionProcessingCallback::get_account_shared_data
