@@ -219,13 +219,15 @@ Solana Private Channels restricts which programs can execute in the payment chan
 | **Solana Private Channels Withdraw Program** | Supported | Token burns for withdrawal flow |
 | **DvP Swap Program** | Supported | Delivery-versus-payment swaps |
 
+A transaction that lists the spl-token native mint (`So11111111111111111111111111111111111111112`) in its account keys is also rejected. spl-token builds a native (wSOL) account without loading the mint, so refusing the key is what keeps fabricated gasless lamports from becoming wSOL.
+
 **Source**: [`is_allowed_program_instruction` in `core/src/transactions.rs`](../core/src/transactions.rs) (predicate), [`core/src/rpc/send_transaction_impl.rs`](../core/src/rpc/send_transaction_impl.rs) (enforcement)
 
 ### AdminVM Program Support
 
 The AdminVM (used for operator mint operations) only supports SPL Token `InitializeMint`. All other instruction types are rejected.
 
-An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidArgument`, so fabricated gasless lamports can never become a wSOL balance.
+An `InitializeMint` or `InitializeMint2` that targets the spl-token native mint (`So11111111111111111111111111111111111111112`) is rejected with `InvalidArgument`, a second guard behind the ingress check that refuses any transaction listing the native mint.
 
 **Source**: [`core/src/vm/admin.rs`](../core/src/vm/admin.rs)
 

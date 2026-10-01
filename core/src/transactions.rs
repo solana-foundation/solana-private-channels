@@ -55,6 +55,9 @@ pub fn is_allowed_program_instruction(program_id: &Pubkey, data: &[u8]) -> bool 
         || *program_id == dvp_swap_program_client::DVP_SWAP_PROGRAM_ID
 }
 
+/// Rejection reason for a transaction that lists the spl-token native mint.
+pub const NATIVE_MINT_UNSUPPORTED: &str = "The native mint (wSOL) is not supported on this channel";
+
 /// Rejection reason shared by every admission path, so clients see one wording.
 pub const ADDRESS_LOOKUP_UNSUPPORTED: &str =
     "Address lookup tables are not supported; submit a transaction with no address table lookups";

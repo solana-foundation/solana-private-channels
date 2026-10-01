@@ -342,9 +342,9 @@ impl AdminVm {
             return Err(InstructionError::NotEnoughAccountKeys);
         };
 
-        // A native mint would let spl-token count fabricated gasless lamports as
-        // wSOL. Refused before the account read so no target state can bypass it.
-        // InvalidArgument is an error the operator gives no special meaning.
+        // Ingress already refuses the native mint; this keeps the admin path from
+        // creating it too. Checked before the account read so no target state can
+        // bypass it. InvalidArgument is an error the operator gives no special meaning.
         if mint_pubkey == spl_token::native_mint::id() {
             debug!(
                 "[admin-vm] InitializeMint: native mint {} refused",

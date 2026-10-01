@@ -24,7 +24,7 @@ This document defines the safety and correctness invariants that Solana Private 
 | C14 | A regular transaction MUST NOT increase the durable lamport supply beyond one lamport per account it creates, and MUST NOT alter any account it did not touch | MUST | Done | #115, #131 |
 | C15 | Every account key an admitted transaction can reference MUST be resolvable at admission | MUST | Done | #182 |
 | C16 | A slot MUST commit only if it extends the stored ledger, and a write-capable node MUST hold the writer lease | MUST | Done | #134 |
-| C17 | The spl-token native mint MUST NOT exist on the channel, so lamports never become a token balance. Revisit if a lamport-valued path, a new token-account allocator, or CreateAccount/Allocate/Assign at ingress is added | MUST | Done | - |
+| C17 | A transaction that lists the spl-token native mint MUST be rejected at ingress, and the admin VM MUST NOT create it, so fabricated lamports never become wSOL. Revisit if a second ingress path or a lamport-valued exit is added | MUST | Done | - |
 
 ## On-chain Programs
 

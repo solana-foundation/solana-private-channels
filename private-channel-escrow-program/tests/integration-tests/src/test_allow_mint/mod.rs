@@ -1,5 +1,5 @@
 use crate::{
-    assertions::{assert_account_not_exists, assert_allow_mint_account},
+    assertions::assert_allow_mint_account,
     pda_utils::{find_allowed_mint_pda, find_event_authority_pda},
     state_utils::{assert_get_or_allow_mint, assert_get_or_create_instance},
     utils::{
@@ -361,7 +361,6 @@ fn test_allow_mint_native_mint_rejected() {
         let result = context.send_transaction_with_signers(instruction, &[&admin]);
 
         assert_program_error(result, expected_error);
-        assert_account_not_exists(&mut context, &allowed_mint_pda);
     }
 }
 

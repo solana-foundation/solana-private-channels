@@ -5,6 +5,7 @@ use crate::rpc::{
 };
 use crate::transactions::{
     has_address_table_lookups, is_allowed_program_instruction, ADDRESS_LOOKUP_UNSUPPORTED,
+    NATIVE_MINT_UNSUPPORTED,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use jsonrpsee::core::RpcResult;
@@ -62,6 +63,18 @@ pub async fn send_transaction_impl(
     // force. Agave rejects the same shape when admitting packets to its buffer.
     SanitizedTransaction::validate_account_locks(sanitized_tx.message(), MAX_TX_ACCOUNT_LOCKS)
         .map_err(|err| custom_error(INVALID_PARAMS_CODE, format!("invalid transaction: {err}")))?;
+
+    // spl-token builds a native (wSOL) account without loading the mint, so this is
+    // the gate that keeps fabricated gasless lamports from becoming wSOL. A CPI can
+    // only reach listed keys, and lookup tables are refused above.
+    if sanitized_tx
+        .message()
+        .account_keys()
+        .iter()
+        .any(|key| *key == spl_token::native_mint::id())
+    {
+        return Err(custom_error(INVALID_PARAMS_CODE, NATIVE_MINT_UNSUPPORTED));
+    }
 
     // Admission is per instruction, not per program: System is limited to Transfer.
     let is_allowed_transaction = sanitized_tx
@@ -547,6 +560,46 @@ mod tests {
             rx.is_empty(),
             "rejected tx must not reach the ingress queue"
         );
+    }
+
+    // spl-token builds a native account without loading the mint, so any tx that
+    // lists the native mint is refused, whichever instruction or CPI would use it.
+    #[tokio::test]
+    async fn native_mint_reference_rejected() {
+        let payer = Keypair::new();
+        let native = spl_token::native_mint::id();
+        let ata_create = spl_associated_token_account::instruction::create_associated_token_account(
+            &payer.pubkey(),
+            &payer.pubkey(),
+            &native,
+            &spl_token::id(),
+        );
+        let init_account = spl_token::instruction::initialize_account3(
+            &spl_token::id(),
+            &Pubkey::new_unique(),
+            &native,
+            &payer.pubkey(),
+        )
+        .unwrap();
+
+        for ix in [ata_create, init_account] {
+            let (deps, rx) = make_write_deps();
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&payer.pubkey()),
+                &[&payer],
+                Hash::default(),
+            );
+            let err = send_transaction_impl(&deps, encode_tx(&tx), None)
+                .await
+                .expect_err("a tx listing the native mint must be rejected");
+            assert_eq!(err.code(), INVALID_PARAMS_CODE);
+            assert_eq!(err.message(), NATIVE_MINT_UNSUPPORTED);
+            assert!(
+                rx.is_empty(),
+                "rejected tx must not reach the ingress queue"
+            );
+        }
     }
 
     // The guard must not catch ordinary v0 traffic, which is what modern
