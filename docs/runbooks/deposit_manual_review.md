@@ -337,7 +337,7 @@ which recovery branch to take:
 
 | Finding | Branch |
 |---|---|
-| Found, slot ≤ deposit slot. | **3a — indexer gap.** In the same slot it ran before the deposit, or the deposit would have failed. |
+| Found, slot ≤ deposit slot. | **3a — indexer gap.** Same slot is fine: the deposit succeeded, so the mint was allowed when it ran. |
 | Found, slot > deposit slot. | **Escalate (Tier 1).** Retroactive allowlist; treasury policy call. |
 | Not found after a full pass. | **3b — terminal.** |
 | Found but bound to a different `instance`. | **3c — Tier 3 defect.** |

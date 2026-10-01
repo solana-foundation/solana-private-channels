@@ -1141,9 +1141,8 @@ pub async fn process_deposit_funds(
             })?;
 
             // Refuse to mint when the mint was not allowed coming into the
-            // deposit's slot or by a change inside it, per
-            // `mint_status_history`. If we minted
-            // anyway, two things would break:
+            // deposit's slot or by a change inside it, per `mint_status_history`.
+            // If we minted anyway, two things would break:
             //   1. We'd issue PrivateChannel tokens with no Mainnet escrow
             //      backing them.
             //   2. Reconciliation wouldn't catch it: the balance check

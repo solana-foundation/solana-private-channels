@@ -519,8 +519,9 @@ async fn deposit_gate_rejects_after_block_against_real_postgres(
     let mint_str = mint.to_string();
 
     // AllowMint effective at slot 10, BlockMint effective at slot 20.
+    let block_slot = 20;
     insert_mint_row_at_slot(&storage, &mint_str, 10).await?;
-    insert_block_row_at_slot(&storage, &mint_str, 20).await?;
+    insert_block_row_at_slot(&storage, &mint_str, block_slot).await?;
 
     let cache = MintCache::new(storage.clone());
 
@@ -534,7 +535,7 @@ async fn deposit_gate_rejects_after_block_against_real_postgres(
     // so it passes.
     let cache = MintCache::new(storage.clone());
     cache
-        .assert_mint_allowed_at_slot(&mint, 20, 3)
+        .assert_mint_allowed_at_slot(&mint, block_slot, 3)
         .await
         .expect("deposit in the block's own slot must pass the gate");
 

@@ -1681,6 +1681,42 @@ async fn allow_then_block_in_one_transaction_ends_blocked_pg(
     Ok(())
 }
 
+/// The orphan query orders an earlier slot's changes by block position, like the
+/// gate: the allow in the middle is the status coming into the next slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_orders_an_earlier_slot_by_block_position_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let slot = 20;
+    let first_block = DbMintStatus {
+        transaction_index: 3,
+        ..mk_status("mint_mixed", "blocked", slot, "sig-b")
+    };
+    let allow = DbMintStatus {
+        transaction_index: 7,
+        ..mk_status("mint_mixed", "allowed", slot, "sig-c")
+    };
+    let second_block = DbMintStatus {
+        transaction_index: 5,
+        ..mk_status("mint_mixed", "blocked", slot, "sig-d")
+    };
+    // The winner sits in the middle, so neither the first nor the last inserted
+    // row can win a tie. Only the stored position picks it.
+    storage
+        .insert_mint_statuses_batch(&[first_block, allow, second_block])
+        .await?;
+    let deposit = DbTransaction {
+        slot: slot + 1,
+        mint: "mint_mixed".to_string(),
+        ..make_db_transaction("deposit_after_mixed_slot", TransactionType::Deposit)
+    };
+    storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "expected no orphans, got {ids:?}");
+    Ok(())
+}
+
 // ── pending_release_signatures (verify-before-demote) ─────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
