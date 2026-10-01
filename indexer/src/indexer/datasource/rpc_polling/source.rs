@@ -1631,9 +1631,13 @@ mod tests {
         let handle = source.start(tx, cancel.clone()).await.unwrap();
 
         // Cancel only once a request is pending, or the test would pass without one.
-        while accepted.load(Ordering::SeqCst) == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(3 * RPC_REQUEST_TIMEOUT, async {
+            while accepted.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the source never opened a connection");
         cancel.cancel();
 
         tokio::time::timeout(3 * RPC_REQUEST_TIMEOUT, handle)
