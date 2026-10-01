@@ -204,7 +204,8 @@ the halt reason:
    `finalized`. This is authoritative custody. Other token accounts the escrow PDA
    owns (`getTokenAccountsByOwner`) are not custody: the program never moves them. See [`_verify_onchain_release.md`](_verify_onchain_release.md).
 2. **On-chain PrivateChannel supply.** Read the channel mint's `Mint.supply`
-   (`getAccountInfo` on the mint, decode the SPL Mint). This is the total minted,
+   (`getAccountInfo` on the mint, decode the SPL Mint; an account there not owned by
+   SPL Token means nothing was minted, supply 0). This is the total minted,
    already net of burns. `supply - custody` is the halt gap.
 3. **In-flight envelope.** Confirm the gap is not merely un-settled work:
 
@@ -257,7 +258,8 @@ new key with SPL `SetAuthority` first. The old key stays the on-chain
 `mint_authority` until you do, so deposits fail with `OwnerMismatch`
 (see [`deposit_failed.md`](deposit_failed.md)) and the old key keeps the ability to
 mint. This is separate from the escrow `Instance.admin`, which `SetNewAdmin`
-rotates on its own.
+rotates on its own. Resync reads each receipt mint's own history as well as the
+new admin's, so deposits the old key minted before the rotation stay terminal.
 
 The old key also stays each mint's withdraw-fee treasury, exempt from the fee
 and minimum, until a deposit of that mint rewrites it. Sweep its collected fees

@@ -19,13 +19,14 @@ field that disagrees as `field: channel X, row Y`, one of:
 - `mint`, `recipient ATA` or `amount` - the channel `MintTo` does not pay what
   the source event says.
 
-A sibling refusal fires when one source event has two successful authority-signed
-mints, a double issuance even if both pay the right amount:
+A sibling refusal fires when one source event has two successful channel mints,
+a double issuance even if both pay the right amount. After an admin rotation the
+two can be signed by different keys, one of them rotated out:
 
 ```
 consumed-set unavailable, resync aborted before drop: source event <id> has two
-successful channel mints signed by the authority, <sig_a> and <sig_b>; one
-event may be minted once, see docs/runbooks/resync_consumed_mint_mismatch.md
+successful channel mints, <sig_a> and <sig_b>; one event may be minted once, see
+docs/runbooks/resync_consumed_mint_mismatch.md
 ```
 
 Handle it the same way, inspecting both signatures.
@@ -36,12 +37,17 @@ deletes anything. The database is exactly as it was.
 
 ## What it means
 
-Only the operator's mint authority can produce these channel transactions:
-resync ignores any the authority did not sign. So a mismatch means one of:
+Only a key holding a receipt mint's mint authority can produce these channel
+transactions. Resync reads two histories: the current authority's, where it
+ignores any transaction the authority did not sign, and each rebuilt row's
+receipt mint, where it counts only a successful `MintTo` on that mint. The
+second one also lists mints by any key that held the mint authority before an
+admin rotation. So a mismatch means one of:
 
 - An operator bug issued a mint with the wrong mint, recipient or amount, or
   labelled it with the wrong marker.
-- The mint authority key signed a transaction the operator did not build.
+- A current or rotated-out mint authority key signed a transaction the operator
+  did not build.
 
 Either way the channel issuance for this event cannot be trusted, and rerunning
 the resync will fail the same way.
@@ -114,12 +120,14 @@ lag, rerun once it catches up
 ```
 
 Every `completed` deposit (escrow resync) or `failed_reminted` withdrawal
-(withdraw resync) must appear in the authority's channel history. A missing one
+(withdraw resync) must appear in the channel history: the current authority's
+or its receipt mint's. A missing one
 would be rebuilt `pending` and paid again. The usual cause is lag: the channel
 writes its address index after each block commits, and a read replica can trail
 the primary. Wait, then rerun. If it keeps refusing, check that the write node has
-been up since its last crash (it rebuilds missing index rows at startup) and that
-the configured authority is the one that minted the named row.
+been up since its last crash (it rebuilds missing index rows at startup) and check
+the receipt mint's history for the named row's mint
+(`getSignaturesForAddress <row mint>` on the channel).
 
 **The channel history was pruned:**
 
@@ -136,7 +144,8 @@ already paid. Resync is not supported on a truncated channel. Escalate
 ### Resyncing an empty database
 
 With no rows, the missing-row check has nothing to compare, and the pruning check
-does not cover lag. Before resyncing an empty database, or rerunning a resync that
+does not cover lag. The checklist covers the receipt mint addresses too, since
+they live in the same address index. Before resyncing an empty database, or rerunning a resync that
 was interrupted after its wipe, confirm all three:
 
 1. The write node has been up since its last crash, so its startup index repair

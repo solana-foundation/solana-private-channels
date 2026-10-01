@@ -36,7 +36,7 @@ fn main() -> Result<()> {
             "Usage: {} <rpc-url> <escrow-admin-keypair-path> <instance-id> <mint-address> <withdraw-fee> <min-withdraw-amount>",
             args[0]
         );
-        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv So11111111111111111111111111111111111111112 10000 1000000", args[0]);
+        eprintln!("Example: {} https://api.devnet.solana.com ./keypairs/escrow-admin.json 9F2CJEevdBVaPJwr1iCayZMT9Acvg7twG4JnjYf9G2zv 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU 10000 1000000", args[0]);
         eprintln!("\n<withdraw-fee> is in the mint's base units, charged on top of every PrivateChannel withdrawal.");
         eprintln!("<min-withdraw-amount> is the smallest amount a PrivateChannel withdrawal may move, in base units.");
         eprintln!("0 is allowed for either but removes its bound on release costs; use it only where every participant is known.");

@@ -161,6 +161,28 @@ async fn a_read_node_starts_alongside_a_write_node() {
     writer.shutdown().await;
 }
 
+/// The write node builds the cursor signature index at boot, under its lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_node_builds_the_signature_index() {
+    let (_pg, url) = start_postgres().await;
+    let writer = run_node(write_node_config(url.clone(), get_free_port()))
+        .await
+        .expect("the write node must start");
+
+    let mut conn = PgConnection::connect(&url).await.expect("connect");
+    let valid: Option<bool> = sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+         WHERE c.relname = 'address_signatures_signature_idx'",
+    )
+    .fetch_optional(&mut conn)
+    .await
+    .expect("query pg_index");
+    assert_eq!(valid, Some(true));
+
+    writer.shutdown().await;
+}
+
 /// A second write-capable node against one primary must be refused at startup,
 /// and the refusal must not outlive the node that caused it: an operator
 /// restarting a write node needs the replacement to come straight up.

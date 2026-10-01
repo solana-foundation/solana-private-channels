@@ -25,9 +25,9 @@ use crate::{
 use private_channel_metrics::{HealthState, MetricLabel};
 use solana_sdk::pubkey::Pubkey;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -95,6 +95,9 @@ pub struct TransactionProcessor {
     // Resync's pre-drop pass: derive rows and check them against `consumed`, but write
     // nothing and send no checkpoint, so the live database is left as it was.
     validate_only: bool,
+    // Filled with each derived row's mint in the validate-only pass, so resync knows which
+    // receipt mints' histories to scan. Ignored on every other path.
+    row_mints: Option<Arc<Mutex<BTreeSet<String>>>>,
 }
 
 impl TransactionProcessor {
@@ -108,6 +111,7 @@ impl TransactionProcessor {
             retry: WriteRetryPolicy::default(),
             consumed: None,
             validate_only: false,
+            row_mints: None,
         }
     }
 
@@ -129,6 +133,12 @@ impl TransactionProcessor {
     /// Inject the pre-drop consumed-set so the rebuild reconciles each row in place.
     pub fn with_consumed_set(mut self, consumed: Arc<ConsumedSet>) -> Self {
         self.consumed = Some(consumed);
+        self
+    }
+
+    /// Collect each derived row's mint into `sink` during the validate-only pass.
+    pub fn with_row_mint_sink(mut self, sink: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.row_mints = Some(sink);
         self
     }
 
@@ -316,6 +326,17 @@ impl TransactionProcessor {
         }
 
         if self.validate_only {
+            if let Some(row_mints) = &self.row_mints {
+                // A poisoned set of strings is still complete, and dropping it would skip mints.
+                row_mints
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(
+                        transactions
+                            .iter()
+                            .map(|transaction| transaction.mint.clone()),
+                    );
+            }
             return self.validate_against_consumed(&transactions);
         }
 
@@ -2237,7 +2258,7 @@ mod tests {
     }
 
     /// The pre-drop validation pass derives rows exactly as the rebuild does but must
-    /// leave the live database untouched: no rows, no checkpoint.
+    /// leave the live database untouched: no rows, no checkpoint. It reports each row's mint.
     #[tokio::test]
     async fn validate_only_writes_nothing() {
         let mut consumed = ConsumedSet::new();
@@ -2252,7 +2273,10 @@ mod tests {
         );
         let (processor, mut checkpoint_rx, mock) =
             make_processor_with_consumed(deposit_instance(), consumed);
-        let mut processor = processor.validate_only();
+        let row_mints = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let mut processor = processor
+            .validate_only()
+            .with_row_mint_sink(row_mints.clone());
         processor.buffer(make_deposit_instruction(
             RECONCILE_SLOT,
             Some(SERVICED_DEPOSIT_SIG.to_string()),
@@ -2268,6 +2292,11 @@ mod tests {
         assert!(
             checkpoint_rx.try_recv().is_err(),
             "no checkpoint may be sent"
+        );
+        assert_eq!(
+            *row_mints.lock().unwrap(),
+            std::collections::BTreeSet::from([make_pubkey(2).to_string()]),
+            "the sink must hold exactly the rebuilt row's mint"
         );
     }
 
