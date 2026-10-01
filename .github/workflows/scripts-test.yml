@@ -1,0 +1,48 @@
+name: Script Tests
+
+on:
+  push:
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    paths:
+      - "scripts/**"
+      - "versions.env"
+      - ".github/workflows/scripts-test.yml"
+  pull_request:
+    branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
+    paths:
+      - "scripts/**"
+      - "versions.env"
+      - ".github/workflows/scripts-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  script-tests:
+    name: Script Tests
+    # Private-runner jobs skip fork PRs: that runner only runs code from this repo's branches.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: private-channel-runner-1
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # update-admin-env.test.sh needs solana-keygen.
+      - name: Setup Solana CLI
+        uses: ./.github/actions/setup-solana
+
+      # reconcile-escrow-balance.test.sh needs jq.
+      - name: Install jq
+        run: command -v jq >/dev/null || { sudo apt-get update && sudo apt-get install -y jq; }
+
+      - name: Run script tests
+        run: |
+          for test_script in scripts/tests/*.test.sh; do
+            echo "Running $test_script"
+            bash "$test_script"
+          done
