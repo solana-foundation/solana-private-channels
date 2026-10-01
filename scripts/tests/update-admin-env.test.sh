@@ -11,6 +11,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 script="$repo_root/scripts/update-admin-env.sh"
 
+# A permissive umask, so only upsert-env.sh can make the runtime file owner-only.
+umask 022
+
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 

@@ -59,8 +59,9 @@ EOF
 done
 
 # A legacy caller still passing a DB URL is refused before any child sees it.
+# PGDATABASE is set so the argument count is the only reason left to refuse.
 legacy_status=0
-PATH="$shim_dir" "$real_bash" "$script" EscrowOwnerPda111 MintAddress111 "$db_url" \
+PATH="$shim_dir" PGDATABASE="$db_name" "$real_bash" "$script" EscrowOwnerPda111 MintAddress111 "$db_url" \
   > /dev/null || legacy_status=$?
 [[ "$legacy_status" == 2 ]] || fail "legacy DB URL argument exited $legacy_status, expected 2"
 
