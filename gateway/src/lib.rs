@@ -13,7 +13,7 @@ use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use http_body_util::{BodyExt, Empty, Full, LengthLimitError, Limited};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -27,14 +27,23 @@ use socket2::{SockRef, TcpKeepalive};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// Error type of every response body the gateway returns.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Metric error type for a forwarded request that ran past `Limits::upstream_timeout`.
+const UPSTREAM_TIMEOUT: &str = "upstream_timeout";
 
 /// Maximum allowed request body size (64 KB).
 const MAX_BODY_SIZE: usize = 64 * 1024;
@@ -156,6 +165,16 @@ pub struct Args {
     )]
     pub auth_fetch_timeout_secs: u64,
 
+    /// Seconds a forwarded request may spend on the write or read node, headers and
+    /// body together, before it fails with 504 or a closed connection. 1 to 3600.
+    #[arg(
+        long,
+        env = "GATEWAY_UPSTREAM_TIMEOUT_SECS",
+        default_value = "30",
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
+    pub upstream_timeout_secs: u64,
+
     /// Idle seconds before the OS starts sending TCP keepalive probes. Must be
     /// non-zero.
     #[arg(
@@ -220,6 +239,8 @@ pub struct Limits {
     /// covering the request and the response body together. A hung read node
     /// fails the gated request with 503 instead of parking it.
     pub auth_fetch_timeout: Duration,
+    /// Max time for one forwarded request's upstream exchange, headers and body.
+    pub upstream_timeout: Duration,
     /// Idle time before the OS starts sending TCP keepalive probes.
     pub tcp_keepalive_idle: Duration,
     /// Interval between TCP keepalive probes.
@@ -238,6 +259,7 @@ impl Default for Limits {
             header_read_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(15),
             auth_fetch_timeout: Duration::from_secs(3),
+            upstream_timeout: Duration::from_secs(30),
             tcp_keepalive_idle: Duration::from_secs(60),
             tcp_keepalive_interval: Duration::from_secs(15),
             rate_limit_per_second: NonZeroU32::new(50).unwrap(),
@@ -410,6 +432,57 @@ impl Drop for IpConnGuard {
                 map.remove(&self.ip);
             }
         }
+    }
+}
+
+/// Upstream response body that errors once the request deadline passes. An error, unlike
+/// a clean end, makes hyper drop the connection, so a cut-off page can't pass as complete.
+struct DeadlineBody {
+    inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl DeadlineBody {
+    fn new(
+        inner: http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>,
+        deadline: tokio::time::Instant,
+    ) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep_until(deadline)),
+        }
+    }
+}
+
+impl Body for DeadlineBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        // Inner first, so data already on hand still goes out after the deadline.
+        if let Poll::Ready(frame) = Pin::new(&mut this.inner).poll_frame(cx) {
+            return Poll::Ready(frame);
+        }
+        // Polling the sleep also registers the wakeup for when the deadline passes.
+        if this.sleep.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        metrics::GATEWAY_ERRORS_TOTAL
+            .with_label_values(&[UPSTREAM_TIMEOUT])
+            .inc();
+        Poll::Ready(Some(Err("upstream response deadline exceeded".into())))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -734,7 +807,7 @@ impl Gateway {
         &self,
         status: StatusCode,
         body: Option<Bytes>,
-    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
         let mut builder = Response::builder().status(status).header(
             "Access-Control-Allow-Origin",
             self.cors_allowed_origin.as_str(),
@@ -754,6 +827,18 @@ impl Gateway {
                 .body(Empty::new().map_err(|never| match never {}).boxed_unsync())
                 .unwrap(),
         }
+    }
+
+    /// 504 that also closes the connection, so pipelined requests can't queue behind a stalled node.
+    fn gateway_timeout_response(
+        &self,
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
+        let mut response = self.error_response(StatusCode::GATEWAY_TIMEOUT, None);
+        response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+        response
     }
 
     /// Confirms whether `user_id` currently holds the Operator role in the auth
@@ -798,7 +883,7 @@ impl Gateway {
         status: StatusCode,
         body: Bytes,
         start: Instant,
-    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+    ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>> {
         Self::record_metrics(
             Some("auth_rejected"),
             method_label,
@@ -826,7 +911,7 @@ impl Gateway {
         method_label: &str,
         params: &Value,
         start: Instant,
-    ) -> Result<CallPolicy, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>>
+    ) -> Result<CallPolicy, Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>>>
     {
         // Auth off, so nothing is redacted either. Every method is ungated in this
         // mode, so a caller reads the balance straight from getTokenAccountBalance
@@ -1011,10 +1096,8 @@ impl Gateway {
         rate_key: IpAddr,
         rate_limiter: Arc<IpRateLimiter>,
         access: Access,
-    ) -> Result<
-        Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
-        hyper::Error,
-    > {
+    ) -> Result<Response<http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>>, hyper::Error>
+    {
         let start = Instant::now();
 
         if req.method() == hyper::Method::OPTIONS {
@@ -1310,8 +1393,10 @@ impl Gateway {
             }
         };
 
-        match self.client.request(forwarded_req).await {
-            Ok(response) => {
+        // One deadline covers the headers and the body, so a stalled node can't pin the connection.
+        let deadline = tokio::time::Instant::now() + self.limits.upstream_timeout;
+        match tokio::time::timeout_at(deadline, self.client.request(forwarded_req)).await {
+            Ok(Ok(response)) => {
                 let status = response.status().as_u16().to_string();
                 info!(
                     "Forwarded to {} - Status: {}",
@@ -1342,15 +1427,27 @@ impl Gateway {
                     ),
                 );
                 if !call_policy.redact_errors {
+                    let body =
+                        DeadlineBody::new(body.map_err(BoxError::from).boxed_unsync(), deadline);
                     return Ok(Response::from_parts(parts, body.boxed_unsync()));
                 }
 
                 // Rewriting the page means buffering it instead of streaming.
-                let collected = match body.collect().await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(e) => {
+                let collected = match tokio::time::timeout_at(deadline, body.collect()).await {
+                    Ok(Ok(collected)) => collected.to_bytes(),
+                    Ok(Err(e)) => {
                         error!("Failed to read response from {}: {}", target_url, e);
                         return Ok(self.error_response(StatusCode::BAD_GATEWAY, None));
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Response from {} stalled past {:?}",
+                            target_url, self.limits.upstream_timeout
+                        );
+                        metrics::GATEWAY_ERRORS_TOTAL
+                            .with_label_values(&[UPSTREAM_TIMEOUT])
+                            .inc();
+                        return Ok(self.gateway_timeout_response());
                     }
                 };
                 let rewritten = redact_transaction_errors(collected);
@@ -1365,7 +1462,7 @@ impl Gateway {
                         .boxed_unsync(),
                 ))
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("Failed to forward request to {}: {}", target_url, e);
                 Self::record_metrics(
                     Some("backend_error"),
@@ -1375,6 +1472,20 @@ impl Gateway {
                     start.elapsed().as_secs_f64(),
                 );
                 Ok(self.error_response(StatusCode::BAD_GATEWAY, None))
+            }
+            Err(_) => {
+                warn!(
+                    "{} did not answer within {:?}",
+                    target_url, self.limits.upstream_timeout
+                );
+                Self::record_metrics(
+                    Some(UPSTREAM_TIMEOUT),
+                    method_label,
+                    target_label,
+                    "504",
+                    start.elapsed().as_secs_f64(),
+                );
+                Ok(self.gateway_timeout_response())
             }
         }
     }
@@ -1573,6 +1684,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         header_read_timeout: Duration::from_secs(args.header_read_timeout_secs),
         body_read_timeout: Duration::from_secs(args.body_read_timeout_secs),
         auth_fetch_timeout: Duration::from_secs(args.auth_fetch_timeout_secs),
+        upstream_timeout: Duration::from_secs(args.upstream_timeout_secs),
         tcp_keepalive_idle: Duration::from_secs(args.tcp_keepalive_idle_secs),
         tcp_keepalive_interval: Duration::from_secs(args.tcp_keepalive_interval_secs),
         rate_limit_per_second: args.rate_limit_per_second,
@@ -2588,5 +2700,268 @@ mod tests {
 
         let response = send_raw(addr, gated_request(&user_token()).as_bytes()).await;
         assert_status(&response, 403);
+    }
+
+    /// Upstream deadline used by the stall tests below.
+    const DEADLINE: Duration = Duration::from_millis(300);
+
+    fn stall_limits() -> Limits {
+        Limits {
+            upstream_timeout: DEADLINE,
+            ..Default::default()
+        }
+    }
+
+    /// A raw JSON-RPC POST for `method`.
+    fn rpc_request(method: &str) -> String {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
+        format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Reads until the gateway closes the connection, failing if it is still open after 3s.
+    async fn read_to_close(conn: &mut TcpStream) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match conn.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+        })
+        .await
+        .expect("gateway hung instead of closing the connection");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// An instant reply would mean the socket broke, not that the deadline fired.
+    fn assert_deadline_fired(elapsed: Duration) {
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected the upstream deadline to fire, got a reply after {elapsed:?}"
+        );
+    }
+
+    /// Spawn a backend that sends headers and 10 of 64 body bytes, then stalls.
+    async fn start_stalled_body_backend() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"jsonrpc\"",
+                    )
+                    .await;
+                held.push(stream);
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_headers_return_504() {
+        // Reads stall on the read node, sendTransaction on the write node.
+        for method in ["getSlot", "sendTransaction"] {
+            let stalled = format!("http://{}", start_black_hole_backend().await);
+            let (write_url, read_url) = if method == "sendTransaction" {
+                (stalled.as_str(), "http://127.0.0.1:1")
+            } else {
+                ("http://127.0.0.1:1", stalled.as_str())
+            };
+            let addr = start_gateway_with_limits(write_url, read_url, stall_limits()).await;
+
+            // Two pipelined requests: the 504 must close the connection and drop the second.
+            let mut conn = TcpStream::connect(addr).await.unwrap();
+            let start = Instant::now();
+            let req = rpc_request(method);
+            conn.write_all(format!("{req}{req}").as_bytes())
+                .await
+                .unwrap();
+            let response = read_to_close(&mut conn).await;
+
+            assert_status(&response, 504);
+            assert_eq!(
+                response.matches("HTTP/1.1 ").count(),
+                1,
+                "{method}: the pipelined request must not be served: {response}"
+            );
+            assert_deadline_fired(start.elapsed());
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_streamed_body_aborts_connection() {
+        let backend = start_stalled_body_backend().await;
+        let addr = start_gateway_with_limits(
+            "http://127.0.0.1:1",
+            &format!("http://{backend}"),
+            stall_limits(),
+        )
+        .await;
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut conn).await;
+
+        // Headers were already sent, so the only signal left is a body shorter than declared.
+        assert_status(&response, 200);
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(
+            body.len() < 64,
+            "a stalled body must end short of its Content-Length: {response}"
+        );
+        assert_deadline_fired(start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn stalled_redacted_body_returns_504() {
+        // An anonymous getSignatureStatuses is ungated but redacted, so the body is
+        // collected before anything is sent, and no DB query runs.
+        let backend = start_stalled_body_backend().await;
+        let addr = start_auth_gateway(&format!("http://{backend}"), stall_limits()).await;
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        conn.write_all(rpc_request("getSignatureStatuses").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut conn).await;
+
+        assert_status(&response, 504);
+        assert_deadline_fired(start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn stalled_read_frees_slot_for_send_transaction() {
+        let read_node = start_black_hole_backend().await;
+        let write_node = start_mock_http_backend(r#"{"result":"sig123"}"#).await;
+        let addr = start_gateway_with_limits(
+            &format!("http://{write_node}"),
+            &format!("http://{read_node}"),
+            Limits {
+                max_connections: NonZeroUsize::new(1).unwrap(),
+                ..stall_limits()
+            },
+        )
+        .await;
+
+        // A read against the stalled node takes the only slot.
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(rpc_request("getSlot").as_bytes())
+            .await
+            .unwrap();
+        let response = read_to_close(&mut stalled).await;
+        assert_status(&response, 504);
+
+        // The gateway closed that connection, so a write gets the slot.
+        let response = send_raw(addr, rpc_request("sendTransaction").as_bytes()).await;
+        assert_status(&response, 200);
+        assert!(
+            response.contains("sig123"),
+            "write should reach the healthy node: {response}"
+        );
+    }
+
+    #[test]
+    fn upstream_timeout_flag_is_bounded() {
+        let parse = |secs: &str| {
+            Args::try_parse_from([
+                "gateway",
+                "--write-url",
+                "http://w",
+                "--read-url",
+                "http://r",
+                "--upstream-timeout-secs",
+                secs,
+            ])
+        };
+        // Zero fails every request, and a huge value overflows the deadline math.
+        assert!(parse("0").is_err());
+        assert!(parse("3601").is_err());
+        assert_eq!(parse("3600").unwrap().upstream_timeout_secs, 3600);
+    }
+
+    /// Body that never yields, like an upstream that stopped sending.
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            Poll::Pending
+        }
+    }
+
+    fn full_body(
+        data: &'static str,
+    ) -> http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError> {
+        Full::new(Bytes::from(data))
+            .map_err(|never| match never {})
+            .boxed_unsync()
+    }
+
+    #[tokio::test]
+    async fn deadline_body_passes_frames_and_framing() {
+        let far = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        // A known length must survive the wrapper, or hyper would switch to chunked.
+        let body = DeadlineBody::new(full_body("abc"), far);
+        assert_eq!(body.size_hint().exact(), Some(3));
+        assert!(!body.is_end_stream());
+        assert_eq!(&body.collect().await.unwrap().to_bytes()[..], b"abc");
+
+        let empty = DeadlineBody::new(
+            Empty::new().map_err(|never| match never {}).boxed_unsync(),
+            far,
+        );
+        assert!(empty.is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn deadline_body_errors_once_deadline_passes() {
+        let start = Instant::now();
+        let mut body = DeadlineBody::new(
+            PendingBody.boxed_unsync(),
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        );
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("the deadline should end a stalled body");
+        assert!(
+            matches!(frame, Some(Err(_))),
+            "a stalled body must error, not end cleanly"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[tokio::test]
+    async fn deadline_body_prefers_ready_inner_after_deadline() {
+        // Data already on hand is delivered even past the deadline, so a finished page is never cut.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut body = DeadlineBody::new(full_body("abc"), deadline);
+        tokio::time::sleep_until(deadline + Duration::from_millis(50)).await;
+
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(&frame.into_data().unwrap()[..], b"abc");
+        assert!(body.frame().await.is_none());
     }
 }

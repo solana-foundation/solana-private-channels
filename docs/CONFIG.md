@@ -63,6 +63,7 @@ Uses the same binary with `--mode read` (or `PRIVATE_CHANNEL_MODE=read`). Points
 | `--write-url` | `GATEWAY_WRITE_URL` | — | Write node URL |
 | `--read-url` | `GATEWAY_READ_URL` | — | Read node URL |
 | `--cors-allowed-origin` | `GATEWAY_CORS_ALLOWED_ORIGIN` | `*` | CORS origin |
+| `--upstream-timeout-secs` | `GATEWAY_UPSTREAM_TIMEOUT_SECS` | `30` | Max seconds (1 to 3600) for one forwarded request against the write or read node, headers and body; past it the caller gets a 504, or a closed connection if the body had started |
 
 Routes `sendTransaction` and `isBlockhashValid` to the write node; all other RPC methods go to the read node.
 
