@@ -79,14 +79,17 @@ echo "On-chain balance (raw): ${ONCHAIN_BALANCE}"
 
 # Step 2: Query database for expected balance (raw units)
 echo "Querying database for expected balance..."
-DB_EXPECTED=$(psql -t -A -v "mint=${MINT}" -c "
+# -w fails instead of prompting when libpq skips the pgpass file; -X ignores ~/.psqlrc.
+# psql does not interpolate :'mint' inside -c, so the query goes on stdin.
+DB_EXPECTED=$(psql -X -w -t -A -v ON_ERROR_STOP=1 -v "mint=${MINT}" 2>&1 <<'SQL'
     SELECT
         COALESCE(SUM(CASE WHEN transaction_type = 'deposit' THEN amount ELSE 0 END), 0) -
         COALESCE(SUM(CASE WHEN transaction_type = 'withdrawal' THEN amount ELSE 0 END), 0)
         AS expected_balance
     FROM transactions
     WHERE mint = :'mint' AND status = 'completed';
-" 2>&1) || {
+SQL
+) || {
     echo "ERROR: Failed to query database."
     echo "Detail: ${DB_EXPECTED}"
     exit 2

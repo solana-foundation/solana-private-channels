@@ -1,17 +1,26 @@
 name: Script Tests
 
+concurrency:
+  group: scripts-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Makefile and setup-solana install the solana-keygen the tests need.
 on:
   push:
     branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
     paths:
       - "scripts/**"
       - "versions.env"
+      - "Makefile"
+      - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"
   pull_request:
     branches: [main, hardening/pre-release-audit, hardening/cantina-reaudit]
     paths:
       - "scripts/**"
       - "versions.env"
+      - "Makefile"
+      - ".github/actions/setup-solana/**"
       - ".github/workflows/scripts-test.yml"
 
 permissions:

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
+# With two arguments the value comes on stdin; a terminal there means it was forgotten.
+if [[ $# -lt 2 || $# -gt 3 ]] || [[ $# -eq 2 && -t 0 ]]; then
   echo "Usage: $0 <env-file> <key> [value]  (omit value to read it from stdin)" >&2
   exit 1
 fi
@@ -38,6 +39,8 @@ fi
 
 if grep -q "^${key}=" "$env_file"; then
   tmp_file="$(mktemp)"
+  # A failed awk or mv must not leave the value behind in $TMPDIR.
+  trap 'rm -f "$tmp_file"' EXIT
   # ENVIRON, not -v: awk's argv is as visible as ours.
   value="$value" awk -v key="$key" '
     $0 ~ "^" key "=" {

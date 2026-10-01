@@ -29,14 +29,15 @@ tracked_env="$workdir/.env.tracked"
 runtime_env="$workdir/.env.runtime"
 : > "$tracked_env"
 
-# Record every child argv. PATH holds only the shims, so a command nobody
-# shimmed fails with "command not found" instead of running unrecorded. The bash
-# shim also records the scripts themselves, which run via `#!/usr/bin/env bash`.
+# Record the argv of every command run through PATH. PATH holds only the shims,
+# so a command nobody shimmed fails with "command not found" instead of running
+# unrecorded; one called by absolute path is not seen. The bash shim also records
+# the scripts themselves, which run via `#!/usr/bin/env bash`.
 argv_log="$workdir/argv.log"
 shim_dir="$workdir/bin"
 mkdir -p "$shim_dir"
 real_bash="$(command -v bash)"
-for command_name in awk bash cat chmod dirname grep mkdir mktemp mv solana-keygen tr; do
+for command_name in awk bash cat chmod dirname grep mkdir mktemp mv rm solana-keygen tr; do
   real_path="$(command -v "$command_name")" || continue
   cat > "$shim_dir/$command_name" <<EOF
 #!$real_bash
@@ -75,12 +76,12 @@ admin_key_bytes="$(tr -d '\n' < "$admin_keypair")"
 admin_priv="$(grep '^ADMIN_PRIVATE_KEY=' "$runtime_env" | cut -d= -f2-)"
 [[ "$admin_priv" == "$admin_key_bytes" ]] || fail "ADMIN_PRIVATE_KEY does not match the keypair"
 
-# 3. No spawned process may carry the private key in its argv. The check means
-# nothing unless the upsert-env.sh child was recorded at all.
+# 3. No command run through PATH may carry the private key in its argv. The
+# check means nothing unless the upsert-env.sh child was recorded at all.
 grep -qF "upsert-env.sh $runtime_env ADMIN_PRIVATE_KEY" "$argv_log" \
   || fail "upsert-env.sh child never observed"
 if grep -qF "$admin_key_bytes" "$argv_log"; then
   fail "admin private key appeared in a child process argv"
 fi
 
-echo "PASS: the admin private key stays out of the tracked template and every argv, in an owner-only file"
+echo "PASS: the admin private key stays out of the tracked template and off every PATH command line, in an owner-only file"

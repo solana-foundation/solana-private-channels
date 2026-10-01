@@ -18,21 +18,15 @@ fail() {
   exit 1
 }
 
-db_host="localhost"
-db_port="5432"
 db_name="private_channel"
-db_user="indexer"
 db_password="reconcile-test-password"
-db_url="postgresql://${db_user}:${db_password}@${db_host}:${db_port}/${db_name}"
+db_url="postgresql://indexer:${db_password}@localhost:5432/${db_name}"
 expected_balance="1000"
 
-pgpass_file="$workdir/pgpass"
-printf '%s:%s:%s:%s:%s\n' "$db_host" "$db_port" "$db_name" "$db_user" "$db_password" > "$pgpass_file"
-chmod 600 "$pgpass_file"
-
-# Record every child argv. PATH holds only the shims, so a command nobody
-# shimmed fails with "command not found" instead of running unrecorded. The fake
-# spl-token and psql both report expected_balance, so the balances match.
+# Record the argv of every command run through PATH. PATH holds only the shims,
+# so a command nobody shimmed fails with "command not found" instead of running
+# unrecorded; one called by absolute path is not seen. The fake spl-token and
+# psql both report expected_balance, so the balances match.
 argv_log="$workdir/argv.log"
 shim_dir="$workdir/bin"
 mkdir -p "$shim_dir"
@@ -65,17 +59,17 @@ PATH="$shim_dir" PGDATABASE="$db_name" "$real_bash" "$script" EscrowOwnerPda111 
   > /dev/null || legacy_status=$?
 [[ "$legacy_status" == 2 ]] || fail "legacy DB URL argument exited $legacy_status, expected 2"
 
-# Operators export DATABASE_URL, so the password sits in the environment the
-# script inherits; nothing may forward it into an argv.
-PATH="$shim_dir" PGHOST="$db_host" PGPORT="$db_port" PGDATABASE="$db_name" \
-  PGUSER="$db_user" PGPASSFILE="$pgpass_file" DATABASE_URL="$db_url" \
+# psql is fake, so nothing logs in; this run only shows the password stays off
+# command lines. Operators export DATABASE_URL, so the password sits in the
+# environment the script inherits, and nothing may forward it into an argv.
+PATH="$shim_dir" PGDATABASE="$db_name" DATABASE_URL="$db_url" \
   "$real_bash" "$script" EscrowOwnerPda111 MintAddress111 > /dev/null \
   || fail "reconciliation did not pass on matching balances"
 grep -q '^psql ' "$argv_log" || fail "psql was never invoked"
 
-# 1. The DB password may not appear in any spawned process argv.
+# 1. The DB password may not appear in the argv of any command run through PATH.
 if grep -qF "$db_password" "$argv_log"; then
   fail "the DB password appeared in a child process argv"
 fi
 
-echo "PASS: the DB password stays out of every process argv"
+echo "PASS: the DB password stays off the command line of every command run through PATH"
