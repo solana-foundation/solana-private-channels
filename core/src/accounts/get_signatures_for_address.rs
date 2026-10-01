@@ -276,9 +276,9 @@ mod tests {
     use crate::accounts::write_batch::AddressSignatureRow;
     use crate::test_helpers::{flush_address_signatures_sync, start_test_postgres_raw};
 
-    /// An absent cursor must be an indexed miss, not a walk of the whole primary key.
+    /// The cursor lookup SQL must plan through the signature index, not a walk of the whole PK.
     #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_cursor_absent_signature_uses_signature_index() {
+    async fn resolve_cursor_sql_plans_through_signature_index() {
         let (db, _pg) = start_test_postgres_raw().await;
         ensure_address_signatures_signature_index(db.pool.as_ref())
             .await
@@ -298,9 +298,9 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        let absent = Signature::new_unique();
+        // A plain EXPLAIN plan does not depend on the bound value, so any signature works.
         let plan: Vec<String> = sqlx::query_scalar(&format!("EXPLAIN {RESOLVE_CURSOR_SQL}"))
-            .bind(absent.as_ref() as &[u8])
+            .bind(Signature::new_unique().as_ref() as &[u8])
             .fetch_all(&mut *tx)
             .await
             .unwrap();
