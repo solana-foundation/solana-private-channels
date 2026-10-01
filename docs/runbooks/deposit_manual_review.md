@@ -337,8 +337,8 @@ which recovery branch to take:
 
 | Finding | Branch |
 |---|---|
-| Found, slot < deposit slot. | **3a — indexer gap.** |
-| Found, slot ≥ deposit slot. | **Escalate (Tier 1).** Retroactive allowlist; treasury policy call. |
+| Found, slot ≤ deposit slot. | **3a — indexer gap.** In the same slot it ran before the deposit, or the deposit would have failed. |
+| Found, slot > deposit slot. | **Escalate (Tier 1).** Retroactive allowlist; treasury policy call. |
 | Not found after a full pass. | **3b — terminal.** |
 | Found but bound to a different `instance`. | **3c — Tier 3 defect.** |
 
@@ -365,12 +365,19 @@ VALUES
   (:mint, :decimals, :token_program, :withdraw_fee, :min_withdraw_amount,
    :allow_mint_slot, NOW());
 
--- Clears the slot-aware gate. effective_slot/signature come from the AllowMint.
+-- Clears the slot-aware gate. Every value comes from the AllowMint:
+--   :allow_mint_tx_index    its transaction's position in getBlock(slot).transactions,
+--                           counting failed transactions too
+--   :allow_mint_ix_index    its instruction's position in that transaction
+--   :allow_mint_inner_index its position in that instruction's inner instructions,
+--                           or NULL when it is a top-level instruction
 INSERT INTO mint_status_history
-  (mint_address, status, effective_slot, signature, created_at)
+  (mint_address, status, effective_slot, transaction_index, instruction_index,
+   inner_index, signature, created_at)
 VALUES
-  (:mint, 'allowed', :allow_mint_slot, :allow_mint_signature, NOW())
-ON CONFLICT (mint_address, effective_slot) DO NOTHING;
+  (:mint, 'allowed', :allow_mint_slot, :allow_mint_tx_index, :allow_mint_ix_index,
+   :allow_mint_inner_index, :allow_mint_signature, NOW())
+ON CONFLICT (signature, instruction_index, COALESCE(inner_index, -1)) DO NOTHING;
 
 UPDATE transactions SET status = 'pending', recovery_requeue_attempts = 0, updated_at = NOW()
  WHERE id = :transaction_id;

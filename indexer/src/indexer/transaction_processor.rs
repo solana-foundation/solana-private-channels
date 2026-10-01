@@ -306,6 +306,9 @@ impl TransactionProcessor {
                         status: change.status.as_str().to_string(),
                         withdrawals_blocked: change.withdrawals_blocked,
                         effective_slot: slot as i64,
+                        transaction_index: instruction_meta.transaction_index as i32,
+                        instruction_index: instruction_meta.instruction_index as i32,
+                        inner_index: instruction_meta.inner_index.map(|inner| inner as i32),
                         signature: sig,
                         created_at: chrono::Utc::now(),
                     });
@@ -883,6 +886,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -921,6 +925,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -953,6 +958,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -978,6 +984,7 @@ mod tests {
             slot,
             program_type: ProgramType::Withdraw,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -999,6 +1006,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -1058,6 +1066,7 @@ mod tests {
             slot,
             program_type: ProgramType::Escrow,
             signature: sig,
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         }
@@ -1232,6 +1241,7 @@ mod tests {
             slot: 100,
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         };
@@ -1272,6 +1282,7 @@ mod tests {
             slot: 200,
             program_type: ProgramType::Escrow,
             signature: Some("sig_exploit".to_string()),
+            transaction_index: 0,
             instruction_index: 0,
             inner_index: None,
         };
@@ -1508,6 +1519,30 @@ mod tests {
 
         let cp = recv_slot(&mut checkpoint_rx).await;
         assert_eq!(cp.slot, 250);
+    }
+
+    /// A history row keeps the block position of the instruction it came from.
+    #[tokio::test]
+    async fn finalize_writes_block_position_on_mint_status_history() {
+        let (mut processor, _checkpoint_rx, mock) = make_processor_with_mock(allow_mint_instance());
+        let slot = 250;
+        let (transaction_index, instruction_index, inner_index) = (4, 2, 1);
+        processor.buffer(InstructionWithMetadata {
+            transaction_index,
+            instruction_index,
+            inner_index: Some(inner_index),
+            ..make_block_mint_instruction(slot, Some("sig-block".to_string()), true, false)
+        });
+        processor
+            .finalize_and_checkpoint(slot, ProgramType::Escrow)
+            .await
+            .unwrap();
+
+        let rows = mock.mint_status_history.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transaction_index, transaction_index as i32);
+        assert_eq!(rows[0].instruction_index, instruction_index as i32);
+        assert_eq!(rows[0].inner_index, Some(inner_index as i32));
     }
 
     // ========================================================================

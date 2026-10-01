@@ -98,6 +98,9 @@ async fn insert_mint_row_at_slot(
                 mint_address: mint.to_string(),
                 status: "allowed".to_string(),
                 effective_slot,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: format!("test-seed-{mint}-{effective_slot}"),
                 created_at: chrono::Utc::now(),
             },
@@ -122,6 +125,9 @@ async fn insert_block_row_at_slot(
                 mint_address: mint.to_string(),
                 status: "blocked".to_string(),
                 effective_slot,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: format!("test-block-{mint}-{effective_slot}"),
                 created_at: chrono::Utc::now(),
             },
@@ -503,7 +509,7 @@ async fn gate_and_orphan_query_agree_on_same_row() -> Result<(), Box<dyn std::er
 // ── Deposit-after-block gate against real Postgres ───────────────────────────
 
 /// End-to-end proof through real Postgres that a `"blocked"` row gates deposits:
-/// allowed at slot N then blocked at M (> N) → gate accepts N <= slot < M, refuses slot >= M.
+/// allowed at slot N then blocked at M (> N) → gate accepts N <= slot <= M, refuses slot > M.
 #[tokio::test(flavor = "multi_thread")]
 async fn deposit_gate_rejects_after_block_against_real_postgres(
 ) -> Result<(), Box<dyn std::error::Error>> {

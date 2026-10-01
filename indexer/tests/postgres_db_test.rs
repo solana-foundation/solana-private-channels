@@ -1370,6 +1370,9 @@ fn mk_status(mint: &str, status: &str, slot: i64, sig: &str) -> DbMintStatus {
         status: status.to_string(),
         withdrawals_blocked: false,
         effective_slot: slot,
+        transaction_index: 0,
+        instruction_index: 0,
+        inner_index: None,
         signature: sig.to_string(),
         created_at: Utc::now(),
     }
@@ -1471,6 +1474,110 @@ async fn get_mint_status_at_slot_returns_blocked_after_block_entry(
         .await?;
     let res = storage.get_mint_status_at_slot("mint_blk", 25).await?;
     assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+/// A deposit in the block's slot may have run before the block, so it passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_allowed_in_the_block_slot_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_same", "allowed", 10, "sig-a"),
+            mk_status("mint_same", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let res = storage
+        .get_mint_status_at_slot("mint_same", block_slot)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Allowed);
+    Ok(())
+}
+
+/// Blocked coming into the slot and no allow inside it: still blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_mint_status_at_slot_returns_blocked_with_no_allow_in_or_before_the_slot_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_shut", "blocked", 10, "sig-a"),
+            mk_status("mint_shut", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let res = storage
+        .get_mint_status_at_slot("mint_shut", block_slot)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Blocked);
+    Ok(())
+}
+
+/// The orphan query follows the gate: a deposit in the block's slot is not an orphan.
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_query_passes_deposit_in_the_block_slot_pg() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_pool, storage, _pg) = start_postgres().await?;
+    let block_slot = 20;
+    storage
+        .insert_mint_statuses_batch(&[
+            mk_status("mint_same", "allowed", 10, "sig-a"),
+            mk_status("mint_same", "blocked", block_slot, "sig-b"),
+        ])
+        .await?;
+    let deposit = DbTransaction {
+        slot: block_slot,
+        mint: "mint_same".to_string(),
+        ..make_db_transaction("deposit_in_block_slot", TransactionType::Deposit)
+    };
+    storage.insert_db_transaction(&deposit).await?;
+
+    let ids = storage.get_orphan_deposit_ids().await?;
+    assert!(ids.is_empty(), "expected no orphans, got {ids:?}");
+    Ok(())
+}
+
+/// Two changes in one slot are both kept and ordered by block position, not by
+/// insertion order, so the later transaction decides later slots and the mirror.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_slot_changes_are_both_kept_and_ordered_by_block_position_pg(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (pool, storage, _pg) = start_postgres().await?;
+    storage
+        .upsert_mints_batch(&[DbMint::new(
+            "mint_same".to_string(),
+            6,
+            "TokenkegQ".to_string(),
+            TokenAmount(1),
+        )])
+        .await?;
+    let slot = 20;
+    let block = DbMintStatus {
+        transaction_index: 3,
+        ..mk_status("mint_same", "blocked", slot, "sig-b")
+    };
+    let allow = DbMintStatus {
+        transaction_index: 7,
+        ..mk_status("mint_same", "allowed", slot, "sig-c")
+    };
+    // Inserted in reverse, so only the stored position can put the allow last.
+    storage.insert_mint_statuses_batch(&[allow, block]).await?;
+    storage.sync_mint_status(&["mint_same".to_string()]).await?;
+
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM mint_status_history WHERE mint_address = $1")
+            .bind("mint_same")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(count, 2);
+    let res = storage
+        .get_mint_status_at_slot("mint_same", slot + 1)
+        .await?;
+    assert_eq!(res, MintStatusAtSlot::Allowed);
+    let mint = storage.get_mint("mint_same").await?.unwrap();
+    assert_eq!(mint.status, "allowed");
     Ok(())
 }
 

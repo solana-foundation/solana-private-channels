@@ -432,8 +432,8 @@ impl MintCache {
         TOKEN_PROGRAM_ID
     }
 
-    /// Operator gate: refuses deposits whose mint was not in `allowed`
-    /// status at the deposit's slot, per `mint_status_history`.
+    /// Operator gate: refuses deposits whose mint was not allowed coming into
+    /// the deposit's slot or by a change inside it, per `mint_status_history`.
     pub async fn assert_mint_allowed_at_slot(
         &self,
         mint: &Pubkey,
@@ -898,6 +898,9 @@ mod tests {
             mint_address: mint.to_string(),
             status: status.to_string(),
             effective_slot: slot,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{mint}-{slot}"),
             created_at: chrono::Utc::now(),
         });

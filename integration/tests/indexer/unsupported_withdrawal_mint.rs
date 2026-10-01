@@ -207,6 +207,9 @@ async fn unsupported_withdrawal_mint_is_parked_without_stopping_the_operator(
             mint_address: env.mint.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{}", env.mint),
             created_at: Utc::now(),
         }])
@@ -374,6 +377,9 @@ async fn setup_gate_env(db_name: &str) -> Result<GateEnv, Box<dyn std::error::Er
             mint_address: env.mint.to_string(),
             status: "allowed".to_string(),
             effective_slot: 0,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("test-seed-{}", env.mint),
             created_at: Utc::now(),
         }])

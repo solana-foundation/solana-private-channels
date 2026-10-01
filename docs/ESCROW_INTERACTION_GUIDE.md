@@ -111,7 +111,7 @@ const allowMintIx = await getAllowMintInstructionAsync({
 - `minWithdrawAmount` is required and may be `0`. It limits how many releases one balance can queue at once, not the total: the amount returns on Solana and can be redeposited, so only the fee bounds it. The operator admin, as treasury, has no minimum. It reprices with the fee.
 
   AllowMint is the only way to reprice, and calling it again does three things beyond changing the fee and minimum:
-  - **Re-opens both gates.** To keep the mint blocked, send a `BlockMint` in a later transaction, once the AllowMint is confirmed. Not in the same one: both would share a slot, the indexer records one status per mint and slot, and it would keep the AllowMint's, so its mirror would read open while the chain is blocked.
+  - **Re-opens both gates.** To keep the mint blocked, send a `BlockMint` after the AllowMint. It can go in the same transaction, after the AllowMint instruction: the indexer orders changes by their position in the block, so its mirror reads blocked.
   - **Re-pins the mint profile.** Any profile change since the last allow is accepted silently, so `MintProfileChanged` no longer catches it. Review the mint before repricing.
   - **Applies on the next deposit.** The operator writes the fee and minimum to the channel with each deposit, so until one lands withdrawals follow the old values. Make a small deposit yourself to apply them now.
 

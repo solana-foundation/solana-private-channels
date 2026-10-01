@@ -220,7 +220,7 @@ impl Storage {
     }
 
     /// Append Allow/Block transition rows to `mint_status_history`.
-    /// Idempotent on (mint_address, effective_slot)
+    /// Idempotent on the source instruction (signature, instruction_index, inner_index).
     pub async fn insert_mint_statuses_batch(
         &self,
         statuses: &[DbMintStatus],
@@ -342,8 +342,9 @@ impl Storage {
         get_serviced_rows::get_serviced_rows(self, own, after_id, limit).await
     }
 
-    /// `transactions.id` for every `deposit` row whose mint was not in
-    /// `allowed` status at the deposit's slot, per `mint_status_history`.
+    /// `transactions.id` for every `deposit` row whose mint was not allowed
+    /// coming into the deposit's slot or by a change inside it, per
+    /// `mint_status_history`.
     ///
     /// A non-empty result means the indexer recorded a deposit for a mint
     /// that was either never allowlisted or was blocked at the time of the
@@ -1589,6 +1590,9 @@ mod tests {
                 status: "allowed".to_string(),
                 withdrawals_blocked: true,
                 effective_slot: 20,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: "sig-block-withdrawals".to_string(),
                 created_at: Utc::now(),
             }])
@@ -1608,6 +1612,9 @@ mod tests {
                 status: "allowed".to_string(),
                 withdrawals_blocked: false,
                 effective_slot: 30,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: "sig-reallow".to_string(),
                 created_at: Utc::now(),
             }])
@@ -2033,6 +2040,9 @@ mod tests {
                 mint_address: mint.clone(),
                 status: "allowed".to_string(),
                 effective_slot: 100,
+                transaction_index: 0,
+                instruction_index: 0,
+                inner_index: None,
                 signature: "sig-1".to_string(),
                 created_at: Utc::now(),
             }])
@@ -2056,6 +2066,9 @@ mod tests {
             mint_address: mint.clone(),
             status: "allowed".to_string(),
             effective_slot: 100,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: "sig-1".to_string(),
             created_at: Utc::now(),
         };
@@ -2093,6 +2106,9 @@ mod tests {
             mint_address: mint.to_string(),
             status: status.to_string(),
             effective_slot: slot,
+            transaction_index: 0,
+            instruction_index: 0,
+            inner_index: None,
             signature: format!("sig-{mint}-{slot}"),
             created_at: Utc::now(),
         }
@@ -2202,26 +2218,87 @@ mod tests {
         assert_eq!(res, MintStatusAtSlot::Allowed);
     }
 
-    /// Accepted limitation: a same-slot allow + block can't both be stored — PK
-    /// `(mint_address, effective_slot)` with `ON CONFLICT DO NOTHING` and no
-    /// intra-slot tiebreak, so the first inserted wins. Rare (admin-only); pinned
-    /// here so it can't change silently. Allow inserted first → block dropped.
+    /// A deposit in the block's slot may have run before the block, so it passes.
     #[tokio::test]
-    async fn get_mint_status_at_slot_same_slot_allow_then_block_keeps_first_inserted() {
+    async fn get_mint_status_at_slot_returns_allowed_in_the_block_slot() {
         let (storage, _mock) = make_mock_storage();
+        let block_slot = 20;
         storage
             .insert_mint_statuses_batch(&[
                 status_row("mint_a", "allowed", 10),
-                status_row("mint_a", "blocked", 10),
+                status_row("mint_a", "blocked", block_slot),
             ])
             .await
             .unwrap();
-        let res = storage.get_mint_status_at_slot("mint_a", 10).await.unwrap();
-        assert_eq!(
-            res,
-            MintStatusAtSlot::Allowed,
-            "first-inserted row wins on a same-slot conflict; the block is dropped",
-        );
+        let res = storage
+            .get_mint_status_at_slot("mint_a", block_slot)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+    }
+
+    /// Blocked coming into the slot and no allow inside it: still blocked.
+    #[tokio::test]
+    async fn get_mint_status_at_slot_returns_blocked_with_no_allow_in_or_before_the_slot() {
+        let (storage, _mock) = make_mock_storage();
+        let block_slot = 20;
+        storage
+            .insert_mint_statuses_batch(&[
+                status_row("mint_a", "blocked", 10),
+                status_row("mint_a", "blocked", block_slot),
+            ])
+            .await
+            .unwrap();
+        let res = storage
+            .get_mint_status_at_slot("mint_a", block_slot)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Blocked);
+    }
+
+    /// Two changes in one slot are both kept and ordered by block position, not by
+    /// insertion order, so the later transaction decides later slots and the mirror.
+    #[tokio::test]
+    async fn same_slot_changes_are_both_kept_and_ordered_by_block_position() {
+        let (storage, mock) = make_mock_storage();
+        storage
+            .upsert_mints_batch(&[DbMint::new(
+                "mint_a".to_string(),
+                6,
+                TOKEN_PROGRAM.to_string(),
+                TokenAmount(1),
+            )])
+            .await
+            .unwrap();
+        let slot = 20;
+        let block = DbMintStatus {
+            transaction_index: 3,
+            signature: "sig-b".to_string(),
+            ..status_row("mint_a", "blocked", slot)
+        };
+        let allow = DbMintStatus {
+            transaction_index: 7,
+            signature: "sig-c".to_string(),
+            ..status_row("mint_a", "allowed", slot)
+        };
+        // Inserted in reverse, so only the stored position can put the allow last.
+        storage
+            .insert_mint_statuses_batch(&[allow, block])
+            .await
+            .unwrap();
+        storage
+            .sync_mint_status(&["mint_a".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(mock.mint_status_history.lock().unwrap().len(), 2);
+        let res = storage
+            .get_mint_status_at_slot("mint_a", slot + 1)
+            .await
+            .unwrap();
+        assert_eq!(res, MintStatusAtSlot::Allowed);
+        let mint = storage.get_mint("mint_a").await.unwrap().unwrap();
+        assert_eq!(mint.status, "allowed");
     }
 
     // ── orphan query against status history ──────────────────────────

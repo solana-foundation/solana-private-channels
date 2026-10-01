@@ -12,6 +12,9 @@ pub struct InstructionWithMetadata {
     pub slot: u64,
     pub program_type: ProgramType,
     pub signature: Option<String>,
+    /// Position of the transaction in its block, counting every transaction (failed and
+    /// unrelated ones too). Orders same-slot mint status changes.
+    pub transaction_index: u32,
     /// Absolute position of this instruction within its transaction's instruction
     /// list. Paired with `signature` it forms the durable per-instruction identity,
     /// so multiple economic events sharing one signature stay distinct.
