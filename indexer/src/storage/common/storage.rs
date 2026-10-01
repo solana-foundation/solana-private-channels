@@ -1565,7 +1565,7 @@ mod tests {
         );
     }
 
-    /// The withdrawal gate rides the same slot-ordered history as `status`, which
+    /// The withdrawal gate rides the same position-ordered history as `status`, which
     /// is what stops a replayed BlockMint from reopening it. The withdrawal
     /// pre-flight reads the mirrored column per withdrawal, so this is the query
     /// that decides whether a blocked mint actually stops releasing.
@@ -2057,7 +2057,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_mint_statuses_batch_idempotent_on_pk_conflict() {
+    async fn insert_mint_statuses_batch_idempotent_on_source_conflict() {
         use std::sync::Arc;
         let storage = Arc::new(Storage::Mock(MockStorage::new()));
         let mint = solana_sdk::pubkey::Pubkey::new_unique().to_string();
@@ -2271,7 +2271,7 @@ mod tests {
             .await
             .unwrap();
         let slot = 20;
-        let block = DbMintStatus {
+        let first_block = DbMintStatus {
             transaction_index: 3,
             signature: "sig-b".to_string(),
             ..status_row("mint_a", "blocked", slot)
@@ -2281,9 +2281,15 @@ mod tests {
             signature: "sig-c".to_string(),
             ..status_row("mint_a", "allowed", slot)
         };
-        // Inserted in reverse, so only the stored position can put the allow last.
+        let second_block = DbMintStatus {
+            transaction_index: 5,
+            signature: "sig-d".to_string(),
+            ..status_row("mint_a", "blocked", slot)
+        };
+        // The winner sits in the middle, so neither the first nor the last inserted
+        // row can win a tie. Only the stored position picks it.
         storage
-            .insert_mint_statuses_batch(&[allow, block])
+            .insert_mint_statuses_batch(&[first_block, allow, second_block])
             .await
             .unwrap();
         storage
@@ -2291,7 +2297,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(mock.mint_status_history.lock().unwrap().len(), 2);
+        assert_eq!(mock.mint_status_history.lock().unwrap().len(), 3);
         let res = storage
             .get_mint_status_at_slot("mint_a", slot + 1)
             .await

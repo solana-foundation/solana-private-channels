@@ -530,6 +530,14 @@ async fn deposit_gate_rejects_after_block_against_real_postgres(
         .await
         .expect("deposit in the allowed window must pass the gate");
 
+    // Deposit at slot 20, the block's own slot, may have run before the block,
+    // so it passes.
+    let cache = MintCache::new(storage.clone());
+    cache
+        .assert_mint_allowed_at_slot(&mint, 20, 3)
+        .await
+        .expect("deposit in the block's own slot must pass the gate");
+
     // Deposit at slot 25 — after the block took effect — must be refused.
     // A fresh cache rules out any in-memory shortcut: every call hits the DB.
     let cache = MintCache::new(storage.clone());

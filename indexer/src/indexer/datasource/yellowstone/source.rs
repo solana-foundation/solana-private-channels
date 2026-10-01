@@ -914,6 +914,7 @@ mod tests {
     use serde_json::json;
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status::UiTransactionEncoding;
+    use std::str::FromStr;
     use tokio::sync::mpsc;
 
     /// An empty block whose parent link names the previous slot, so a run of these
@@ -2281,7 +2282,6 @@ mod tests {
     /// us: the block filter has already dropped the unrelated transactions.
     #[tokio::test]
     async fn block_rows_carry_the_reported_transaction_index() {
-        use std::str::FromStr;
         let program_id = Pubkey::from_str("J231K9UEpS4y4KAPwGc4gsMNCjKFRMYcQBcjVW7vBhVi").unwrap();
         // The only transaction left after filtering, at position 5 in the full block.
         let reported_index: u64 = 5;
