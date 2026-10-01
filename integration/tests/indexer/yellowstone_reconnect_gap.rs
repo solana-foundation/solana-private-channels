@@ -21,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "yellowstone_helpers.rs"]
 mod yellowstone_helpers;
-use yellowstone_helpers::{block_after, empty_block, slot_update};
+use yellowstone_grpc_proto::geyser::SubscribeUpdate;
+use yellowstone_helpers::{block_after, empty_block, ping_update, slot_update};
 
 /// An empty block chained onto `slot - 1`. It also answers the signatures view, so the
 /// escrow gap-fill can confirm it empty.
@@ -710,4 +711,168 @@ async fn first_block_still_arms_when_no_slot_update_arrives() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     server.shutdown().await;
+}
+
+// Progress watchdog: only a Slot or Block at a new highest slot proves the stream is live.
+
+/// Wide enough that CI scheduling jitter cannot fake or hide a stall.
+const WATCHDOG_WINDOW: Duration = Duration::from_secs(1);
+
+/// A source with no gap repair and a short watchdog, sending into a channel of capacity `cap`.
+async fn start_watchdog_source(
+    server: &MockYellowstoneServer,
+    cap: usize,
+) -> (
+    mpsc::Receiver<ProcessorMessage>,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::channel::<ProcessorMessage>(cap);
+    let cancel = CancellationToken::new();
+    let mut source = YellowstoneSource::new(
+        server.url(),
+        None,
+        "confirmed".to_string(),
+        ProgramType::Escrow,
+        None,
+    )
+    .with_stall_timeout(WATCHDOG_WINDOW);
+    let handle = source
+        .start(tx, cancel.clone())
+        .await
+        .expect("yellowstone source start");
+    (rx, cancel, handle)
+}
+
+/// Keeps the processor channel empty so the source never waits on it.
+fn spawn_drain(mut rx: mpsc::Receiver<ProcessorMessage>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { while rx.recv().await.is_some() {} })
+}
+
+/// True once the source has opened a second subscription, i.e. it reconnected.
+fn reconnected(server: &MockYellowstoneServer) -> bool {
+    server.call_count("subscribe") > 1
+}
+
+/// Enqueues `make(i)` every `every` for up to `budget` and returns whether the source reconnected.
+async fn feed_until_reconnect(
+    server: &MockYellowstoneServer,
+    every: Duration,
+    budget: Duration,
+    make: impl Fn(u64) -> SubscribeUpdate,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut i = 0;
+    while tokio::time::Instant::now() < deadline {
+        if reconnected(server) {
+            return true;
+        }
+        server.enqueue(UpdateMatcher, Update::ok(make(i)));
+        i += 1;
+        tokio::time::sleep(every).await;
+    }
+    reconnected(server)
+}
+
+async fn stop_watchdog_source(
+    server: MockYellowstoneServer,
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    server.shutdown().await;
+}
+
+/// The finding: a stream that keeps pinging but sends no chain data must still be torn down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ping_only_stream_forces_reconnect() {
+    let server = MockYellowstoneServer::start().await;
+    let (mut rx, cancel, handle) = start_watchdog_source(&server, 64).await;
+
+    server.enqueue(UpdateMatcher, Update::ok(empty_block(100)));
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+    assert!(
+        matches!(
+            first,
+            Ok(Some(ProcessorMessage::SlotComplete { slot: 100, .. }))
+        ),
+        "expected slot 100 before the pings; got {first:?}"
+    );
+
+    // Pings keep flowing until the assert, so a silent tail cannot be what trips the watchdog.
+    let did_reconnect = feed_until_reconnect(
+        &server,
+        Duration::from_millis(50),
+        Duration::from_secs(15),
+        |_| ping_update(),
+    )
+    .await;
+    assert!(
+        did_reconnect,
+        "pings alone must not keep the stream alive; subscribe count stuck at {}",
+        server.call_count("subscribe")
+    );
+
+    stop_watchdog_source(server, cancel, handle).await;
+}
+
+/// Slot updates alone are chain progress, so a stream carrying only them is never torn down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advancing_slots_keep_the_stream_alive() {
+    let server = MockYellowstoneServer::start().await;
+    let (rx, cancel, handle) = start_watchdog_source(&server, 64).await;
+    let drain = spawn_drain(rx);
+
+    // Longer than the window plus the 5s reconnect backoff, so any stall would show.
+    let did_reconnect = feed_until_reconnect(
+        &server,
+        Duration::from_millis(100),
+        Duration::from_secs(7),
+        |i| slot_update(100 + i),
+    )
+    .await;
+    assert!(
+        !did_reconnect,
+        "advancing slots must keep the stream alive; subscribe count {}",
+        server.call_count("subscribe")
+    );
+
+    stop_watchdog_source(server, cancel, handle).await;
+    drain.abort();
+}
+
+/// Waiting on a slow processor is not stream silence, even for a block whose slot was already seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_processor_does_not_trip_the_watchdog() {
+    let server = MockYellowstoneServer::start().await;
+    // Capacity 1: block 100 fills the channel, so block 101 waits until the test drains it.
+    let (rx, cancel, handle) = start_watchdog_source(&server, 1).await;
+
+    server.enqueue_sequence([
+        Update::ok(empty_block(100)),
+        Update::ok(slot_update(101)),
+        Update::ok(empty_block(101)),
+    ]);
+    tokio::time::sleep(WATCHDOG_WINDOW * 3).await;
+    let drain = spawn_drain(rx);
+
+    // Nothing is queued yet, so right after block 101 unblocks only the watchdog can fire.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The block tail also shows blocks alone keep the stream alive.
+    let did_reconnect = feed_until_reconnect(
+        &server,
+        Duration::from_millis(100),
+        Duration::from_secs(7),
+        |i| empty_block(102 + i),
+    )
+    .await;
+    assert!(
+        !did_reconnect,
+        "a slow processor must not trip the watchdog; subscribe count {}",
+        server.call_count("subscribe")
+    );
+
+    stop_watchdog_source(server, cancel, handle).await;
+    drain.abort();
 }
